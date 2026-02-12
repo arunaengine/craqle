@@ -1,0 +1,12 @@
+[package]
+name = "aruna-search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aruna-core = { workspace = true }
+aruna-rdf-store = { workspace = true }
+oxrdf = { workspace = true }
+tantivy = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

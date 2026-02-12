@@ -1,0 +1,10 @@
+[package]
+name = "aruna-shacl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aruna-core = { workspace = true }
+aruna-rdf-store = { workspace = true }
+oxrdf = { workspace = true }
+thiserror = { workspace = true }

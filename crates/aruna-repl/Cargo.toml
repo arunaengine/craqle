@@ -1,0 +1,13 @@
+[package]
+name = "aruna-repl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aruna-core = { workspace = true }
+aruna-rdf-store = { workspace = true }
+aruna-sparql = { workspace = true }
+aruna-shacl = { workspace = true }
+oxrdf = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
