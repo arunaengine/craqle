@@ -1,0 +1,17 @@
+[package]
+name = "aruna-rdf-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aruna-core = { workspace = true }
+blake3 = { workspace = true }
+fjall = { workspace = true }
+oxrdf = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
