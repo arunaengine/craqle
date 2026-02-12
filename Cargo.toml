@@ -38,3 +38,42 @@ rocraters = { package = "ro-crate-rs", path = "/home/beavis/projects/ro-crate-rs
 # Testing
 proptest = "1"
 tempfile = "3"
+
+[package]
+name = "craqle"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["search"]
+search = ["dep:tantivy"]
+
+[dependencies]
+blake3 = { workspace = true }
+chrono = { workspace = true }
+fjall = { workspace = true }
+oxrdf = { workspace = true }
+postcard = { workspace = true }
+rocraters = { workspace = true }
+serde_json = { workspace = true }
+spargebra = { workspace = true }
+spareval = { workspace = true }
+tantivy = { workspace = true, optional = true }
+globset = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+criterion = "0.8.2"
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "partial_loading"
+harness = false
+
+[[bench]]
+name = "large_rocrate_latency"
+harness = false
