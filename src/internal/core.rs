@@ -236,3 +236,122 @@ pub enum QuadOp {
         subject: EncodedTerm,
         predicate: EncodedTerm,
         object: EncodedTerm,
+        dot: Dot,
+    },
+    Remove {
+        subject: EncodedTerm,
+        predicate: EncodedTerm,
+        object: EncodedTerm,
+        witnessed: VectorClock,
+    },
+}
+
+// ── Replication Batch ───────────────────────────────────────────────────────
+
+/// The unit of replication: a committed set of operations on a single graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Batch {
+    pub graph: GraphId,
+    pub actor: ActorId,
+    pub counter: u64,
+    pub base_clock: VectorClock,
+    pub ops: Vec<QuadOp>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Snapshot of a live quad and its OR-Set dot set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotQuadState {
+    pub subject: EncodedTerm,
+    pub predicate: EncodedTerm,
+    pub object: EncodedTerm,
+    pub dots: Vec<Dot>,
+}
+
+/// Full graph snapshot used for bootstrap/catch-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphReplicaSnapshot {
+    pub graph: GraphId,
+    pub clock: VectorClock,
+    pub quads: Vec<SnapshotQuadState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSnapshotQuadState {
+    pub subject: u32,
+    pub predicate: u32,
+    pub object: u32,
+    pub dots: Vec<Dot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphReplicaCompactSnapshot {
+    pub graph: GraphId,
+    pub clock: VectorClock,
+    pub terms: Vec<EncodedTerm>,
+    pub quads: Vec<CompactSnapshotQuadState>,
+}
+
+// ── Violations ──────────────────────────────────────────────────────────────
+
+/// Structural violations detectable by SHACL guards or post-merge checks.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CrateViolation {
+    #[error("missing root data entity (<./> rdf:type schema:Dataset)")]
+    MissingRootDataEntity,
+
+    #[error("missing metadata descriptor (ro-crate-metadata.json)")]
+    MissingMetadataDescriptor,
+
+    #[error("missing required property `{property}` on entity `{entity}`")]
+    MissingRequiredProperty { entity: String, property: String },
+
+    #[error("orphaned data entity `{entity_id}` not reachable from root")]
+    OrphanedDataEntity { entity_id: String },
+
+    #[error("datePublished must have exactly one value, found {count}")]
+    InvalidDatePublishedCardinality { count: usize },
+
+    #[error("entity `{entity_id}` is missing rdf:type")]
+    EntityMissingType { entity_id: String },
+
+    #[error("custom rule `{rule}` failed: {message}")]
+    Custom { rule: String, message: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphDiagnostics {
+    pub orphaned_entities: Vec<String>,
+}
+
+impl GraphDiagnostics {
+    pub fn from_orphaned_entities(mut orphaned_entities: Vec<String>) -> Self {
+        orphaned_entities.sort();
+        orphaned_entities.dedup();
+        Self { orphaned_entities }
+    }
+
+    pub fn has_orphans(&self) -> bool {
+        !self.orphaned_entities.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphPolicy {
+    pub public: bool,
+    pub permission_paths: Vec<String>,
+}
+
+impl GraphPolicy {
+    pub fn normalized(mut self) -> Self {
+        self.permission_paths.sort();
+        self.permission_paths.dedup();
+        self
+    }
+}
+
+// ── Materialized Changes (SPARQL evaluator output) ──────────────────────────
+
+/// A concrete quad change produced by SPARQL Update evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedQuadChange {
