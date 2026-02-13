@@ -117,3 +117,122 @@ impl EncodedTerm {
                 &self.0[2..],
             )))
         } else {
+            None
+        }
+    }
+
+    pub fn to_named_node(&self) -> Option<NamedNode> {
+        if self.0.starts_with('<') && self.0.ends_with('>') {
+            Some(NamedNode::new_unchecked(&self.0[1..self.0.len() - 1]))
+        } else {
+            None
+        }
+    }
+}
+
+impl From<&NamedNode> for EncodedTerm {
+    fn from(n: &NamedNode) -> Self {
+        Self::from_named_node(n)
+    }
+}
+
+impl From<NamedNode> for EncodedTerm {
+    fn from(n: NamedNode) -> Self {
+        Self::from_named_node(&n)
+    }
+}
+
+impl From<&oxrdf::NamedOrBlankNode> for EncodedTerm {
+    fn from(subject: &oxrdf::NamedOrBlankNode) -> Self {
+        match subject {
+            oxrdf::NamedOrBlankNode::NamedNode(node) => Self::from_named_node(node),
+            oxrdf::NamedOrBlankNode::BlankNode(node) => Self(format!("_:{}", node.as_str())),
+        }
+    }
+}
+
+fn parse_ntriples_literal(s: &str) -> Option<oxrdf::Literal> {
+    let bytes = s.as_bytes();
+    if bytes.first().copied()? != b'"' {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut index = 1usize;
+    let mut closed = false;
+
+    while index < s.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                closed = true;
+                break;
+            }
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index)?;
+                match escaped {
+                    b'"' => value.push('"'),
+                    b'\\' => value.push('\\'),
+                    b'n' => value.push('\n'),
+                    b'r' => value.push('\r'),
+                    b't' => value.push('\t'),
+                    b'b' => value.push('\u{0008}'),
+                    b'f' => value.push('\u{000C}'),
+                    b'u' => {
+                        let code_point = parse_hex_escape(&s[index + 1..], 4)?;
+                        value.push(char::from_u32(code_point)?);
+                        index += 4;
+                    }
+                    b'U' => {
+                        let code_point = parse_hex_escape(&s[index + 1..], 8)?;
+                        value.push(char::from_u32(code_point)?);
+                        index += 8;
+                    }
+                    _ => return None,
+                }
+                index += 1;
+            }
+            _ => {
+                let ch = s[index..].chars().next()?;
+                value.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+
+    if !closed {
+        return None;
+    }
+
+    let rest = &s[index..];
+
+    if let Some(lang) = rest.strip_prefix('@') {
+        Some(oxrdf::Literal::new_language_tagged_literal_unchecked(
+            value, lang,
+        ))
+    } else if let Some(dt) = rest.strip_prefix("^^<") {
+        let dt = dt.strip_suffix('>')?;
+        Some(oxrdf::Literal::new_typed_literal(
+            value,
+            NamedNode::new_unchecked(dt),
+        ))
+    } else {
+        Some(oxrdf::Literal::new_simple_literal(value))
+    }
+}
+
+fn parse_hex_escape(value: &str, width: usize) -> Option<u32> {
+    if value.len() < width {
+        return None;
+    }
+    u32::from_str_radix(&value[..width], 16).ok()
+}
+
+/// CRDT quad operation: either an add (with dot) or a remove (with witnessed vector clock).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QuadOp {
+    Add {
+        subject: EncodedTerm,
+        predicate: EncodedTerm,
+        object: EncodedTerm,
