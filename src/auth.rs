@@ -155,3 +155,81 @@ impl GrantAuthorizer {
 
         match cache.get_or_init(|| compile_grant_matcher(&self.grants, action)) {
             Ok(matcher) => Ok(matcher),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
+
+impl Authorizer for GrantAuthorizer {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        policy: &GraphPolicy,
+        action: Action,
+    ) -> Result<(), AuthorizationError> {
+        if action == Action::Read && policy.public {
+            return Ok(());
+        }
+
+        let matching_grants: Vec<&PermissionGrant> = self
+            .grants
+            .iter()
+            .filter(|grant| grant.level.allows(action))
+            .collect();
+
+        if matching_grants.is_empty() || policy.permission_paths.is_empty() {
+            return Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_string(),
+            });
+        }
+
+        let matcher = self.matcher(action)?;
+
+        if policy
+            .permission_paths
+            .iter()
+            .any(|path| matcher.is_match(path.as_str()))
+        {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_string(),
+            })
+        }
+    }
+}
+
+/// Authorizer that allows every request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllowAllAuthorizer;
+
+impl Authorizer for AllowAllAuthorizer {
+    fn authorize(
+        &self,
+        _graph: &GraphId,
+        _policy: &GraphPolicy,
+        _action: Action,
+    ) -> Result<(), AuthorizationError> {
+        Ok(())
+    }
+}
+
+/// Authorizer that denies every request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DenyAllAuthorizer;
+
+impl Authorizer for DenyAllAuthorizer {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &GraphPolicy,
+        action: Action,
+    ) -> Result<(), AuthorizationError> {
+        Err(AuthorizationError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_string(),
+        })
+    }
+}
