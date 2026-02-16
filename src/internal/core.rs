@@ -355,3 +355,121 @@ impl GraphPolicy {
 /// A concrete quad change produced by SPARQL Update evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterializedQuadChange {
+    Insert {
+        graph: GraphId,
+        subject: EncodedTerm,
+        predicate: EncodedTerm,
+        object: EncodedTerm,
+    },
+    Delete {
+        graph: GraphId,
+        subject: EncodedTerm,
+        predicate: EncodedTerm,
+        object: EncodedTerm,
+    },
+}
+
+// ── Search Filter ───────────────────────────────────────────────────────────
+
+/// Predicates that trigger Tantivy reindexing.
+#[derive(Debug, Clone)]
+pub struct PredicateFilter {
+    pub predicates: HashSet<NamedNode>,
+}
+
+impl Default for PredicateFilter {
+    fn default() -> Self {
+        let preds = [
+            "http://schema.org/name",
+            "http://schema.org/description",
+            "http://schema.org/keywords",
+        ];
+        Self {
+            predicates: preds.iter().map(|p| NamedNode::new_unchecked(*p)).collect(),
+        }
+    }
+}
+
+// ── Well-known IRIs ─────────────────────────────────────────────────────────
+
+pub mod vocab {
+    use oxrdf::NamedNode;
+
+    pub fn rdf_type() -> NamedNode {
+        NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+    }
+    pub fn schema_dataset() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/Dataset")
+    }
+    pub fn schema_creative_work() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/CreativeWork")
+    }
+    pub fn schema_name() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/name")
+    }
+    pub fn schema_description() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/description")
+    }
+    pub fn schema_date_published() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/datePublished")
+    }
+    pub fn schema_license() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/license")
+    }
+    pub fn schema_has_part() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/hasPart")
+    }
+    pub fn schema_about() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/about")
+    }
+    pub fn schema_conforms_to() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/conformsTo")
+    }
+    pub fn schema_media_object() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/MediaObject")
+    }
+    #[deprecated(note = "renamed to schema_media_object")]
+    pub fn schema_file() -> NamedNode {
+        schema_media_object()
+    }
+    pub fn schema_keywords() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/keywords")
+    }
+    pub fn schema_identifier() -> NamedNode {
+        NamedNode::new_unchecked("http://schema.org/identifier")
+    }
+
+    pub fn root_entity() -> NamedNode {
+        NamedNode::new_unchecked("./")
+    }
+    pub fn metadata_descriptor() -> NamedNode {
+        NamedNode::new_unchecked("ro-crate-metadata.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxrdf::{Literal, Term};
+
+    #[test]
+    fn encoded_term_round_trips_escaped_literals() {
+        let literal = Literal::new_typed_literal(
+            "Quote: \" slash: \\\\ newline:\n snowman:\u{2603}",
+            NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#string"),
+        );
+        let encoded = EncodedTerm::from_term(&Term::Literal(literal.clone()));
+        let decoded = encoded.to_term().unwrap();
+
+        assert_eq!(decoded, Term::Literal(literal));
+    }
+
+    #[test]
+    fn encoded_term_round_trips_language_literals() {
+        let literal = Literal::new_language_tagged_literal_unchecked("bonjour", "fr-ca");
+        let encoded = EncodedTerm::from_term(&Term::Literal(literal.clone()));
+        let decoded = encoded.to_term().unwrap();
+
+        assert_eq!(decoded, Term::Literal(literal));
+    }
+}
