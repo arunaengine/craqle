@@ -77,3 +77,81 @@ where
         action: Action,
     ) -> Result<(), AuthorizationError> {
         self(graph, policy, action)
+    }
+}
+
+/// Built-in authorizer adapter using path grants against graph policy paths.
+/// Built-in authorizer adapter using path grants against graph policy paths.
+pub struct GrantAuthorizer {
+    pub grants: Vec<PermissionGrant>,
+    read_matcher: OnceLock<std::result::Result<GlobSet, AuthorizationError>>,
+    write_matcher: OnceLock<std::result::Result<GlobSet, AuthorizationError>>,
+}
+
+impl std::fmt::Debug for GrantAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrantAuthorizer")
+            .field("grants", &self.grants)
+            .finish()
+    }
+}
+
+impl Clone for GrantAuthorizer {
+    fn clone(&self) -> Self {
+        Self::new(self.grants.clone())
+    }
+}
+
+impl Default for GrantAuthorizer {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl PartialEq for GrantAuthorizer {
+    fn eq(&self, other: &Self) -> bool {
+        self.grants == other.grants
+    }
+}
+
+impl Eq for GrantAuthorizer {}
+
+fn compile_grant_matcher(
+    grants: &[PermissionGrant],
+    action: Action,
+) -> std::result::Result<GlobSet, AuthorizationError> {
+    let mut builder = GlobSetBuilder::new();
+    for grant in grants.iter().filter(|grant| grant.level.allows(action)) {
+        let glob =
+            Glob::new(&grant.pattern).map_err(|error| AuthorizationError::InvalidPattern {
+                pattern: grant.pattern.clone(),
+                message: error.to_string(),
+            })?;
+        builder.add(glob);
+    }
+
+    builder
+        .build()
+        .map_err(|error| AuthorizationError::InvalidPattern {
+            pattern: "<globset>".to_string(),
+            message: error.to_string(),
+        })
+}
+
+impl GrantAuthorizer {
+    pub fn new(grants: Vec<PermissionGrant>) -> Self {
+        Self {
+            grants,
+            read_matcher: OnceLock::new(),
+            write_matcher: OnceLock::new(),
+        }
+    }
+
+    fn matcher(&self, action: Action) -> Result<&GlobSet, AuthorizationError> {
+        let cache = match action {
+            Action::Read => &self.read_matcher,
+            Action::Write => &self.write_matcher,
+        };
+
+        match cache.get_or_init(|| compile_grant_matcher(&self.grants, action)) {
+            Ok(matcher) => Ok(matcher),
