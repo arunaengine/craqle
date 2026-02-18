@@ -173,3 +173,178 @@ impl IndexState {
     fn insert_quad(&mut self, quad: EncodedQuad) {
         match self.by_graph_subject.entry((quad.graph, quad.subject)) {
             Entry::Occupied(mut entry) => {
+                entry.get_mut().push((quad.predicate, quad.object));
+            }
+            Entry::Vacant(entry) => {
+                self.graph_subjects
+                    .entry(quad.graph)
+                    .or_default()
+                    .push(quad.subject);
+                entry.insert(vec![(quad.predicate, quad.object)]);
+            }
+        }
+    }
+
+    fn remove_quad(&mut self, quad: EncodedQuad) {
+        if let Some(entries) = self.by_graph_subject.get_mut(&(quad.graph, quad.subject))
+            && let Some(index) = entries
+                .iter()
+                .position(|entry| *entry == (quad.predicate, quad.object))
+        {
+            entries.swap_remove(index);
+        }
+    }
+}
+
+#[derive(Default)]
+struct DerivedIndexState {
+    by_subject: HashMap<TermId, Vec<(TermId, TermId, TermId)>>,
+    by_predicate_object: HashMap<(TermId, TermId), Vec<(TermId, TermId)>>,
+    by_object: HashMap<TermId, Vec<(TermId, TermId, TermId)>>,
+}
+
+impl DerivedIndexState {
+    fn insert_quad(&mut self, quad: EncodedQuad) {
+        self.by_subject.entry(quad.subject).or_default().push((
+            quad.predicate,
+            quad.object,
+            quad.graph,
+        ));
+        self.by_predicate_object
+            .entry((quad.predicate, quad.object))
+            .or_default()
+            .push((quad.graph, quad.subject));
+        self.by_object.entry(quad.object).or_default().push((
+            quad.graph,
+            quad.subject,
+            quad.predicate,
+        ));
+    }
+
+    fn remove_quad(&mut self, quad: EncodedQuad) {
+        if let Some(entries) = self.by_subject.get_mut(&quad.subject) {
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| *entry == (quad.predicate, quad.object, quad.graph))
+            {
+                entries.swap_remove(index);
+            }
+            if entries.is_empty() {
+                self.by_subject.remove(&quad.subject);
+            }
+        }
+
+        if let Some(entries) = self
+            .by_predicate_object
+            .get_mut(&(quad.predicate, quad.object))
+        {
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| *entry == (quad.graph, quad.subject))
+            {
+                entries.swap_remove(index);
+            }
+            if entries.is_empty() {
+                self.by_predicate_object
+                    .remove(&(quad.predicate, quad.object));
+            }
+        }
+
+        if let Some(entries) = self.by_object.get_mut(&quad.object) {
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| *entry == (quad.graph, quad.subject, quad.predicate))
+            {
+                entries.swap_remove(index);
+            }
+            if entries.is_empty() {
+                self.by_object.remove(&quad.object);
+            }
+        }
+    }
+}
+
+pub struct GraphStore {
+    db: Database,
+    terms: Keyspace,
+    quads: Keyspace,
+    graphs: Keyspace,
+    log: Keyspace,
+    term_locks: Vec<Mutex<()>>,
+    indexes: RwLock<IndexState>,
+    derived_indexes: RwLock<Option<DerivedIndexState>>,
+    object_order_cache: RwLock<ObjectOrderCache>,
+    diagnostics_cache: RwLock<HashMap<TermId, GraphDiagnostics>>,
+    dirty_counter: AtomicU64,
+}
+
+fn decode_u64_bytes(bytes: &[u8], context: &'static str) -> Result<u64> {
+    let raw: [u8; 8] = bytes.try_into().map_err(|_| StoreError::InvalidEncoding {
+        context,
+        message: format!("expected 8 bytes, found {}", bytes.len()),
+    })?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn encode_dots(dots: &[Dot]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1 + dots.len() * 24);
+    bytes.push(DOT_ENCODING_TAG);
+    for dot in dots {
+        bytes.extend_from_slice(dot.actor.0.as_bytes());
+        bytes.extend_from_slice(&dot.counter.to_be_bytes());
+    }
+    bytes
+}
+
+fn decode_dots(bytes: &[u8]) -> Result<Vec<Dot>> {
+    if bytes.first().copied() != Some(DOT_ENCODING_TAG) {
+        return Ok(postcard::from_bytes(bytes)?);
+    }
+    if !(bytes.len() - 1).is_multiple_of(24) {
+        return Err(StoreError::InvalidEncoding {
+            context: "quad dots",
+            message: format!("invalid dot payload length {}", bytes.len()),
+        });
+    }
+
+    let mut dots = Vec::with_capacity((bytes.len() - 1) / 24);
+    for chunk in bytes[1..].chunks_exact(24) {
+        dots.push(Dot {
+            actor: ActorId(uuid::Uuid::from_bytes(chunk[..16].try_into().unwrap())),
+            counter: u64::from_be_bytes(chunk[16..24].try_into().unwrap()),
+        });
+    }
+    Ok(dots)
+}
+
+fn normalize_dots(dots: &mut Vec<Dot>) {
+    dots.sort_by_key(|dot| (dot.actor, dot.counter));
+    dots.dedup();
+}
+
+fn encode_stored_batch(stored_batch: &StoredBatch) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(1 + stored_batch.ops.len() * 64);
+    bytes.push(BATCH_LOG_ENCODING_TAG);
+    bytes.extend_from_slice(&postcard::to_allocvec(stored_batch)?);
+    Ok(bytes)
+}
+
+fn hash_term(term: &EncodedTerm) -> TermId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"craqle-term/v1\0");
+    hasher.update(term.0.as_bytes());
+    let hash = hasher.finalize();
+    TermId(u128::from_be_bytes(
+        hash.as_bytes()[..16].try_into().unwrap(),
+    ))
+}
+
+fn graph_meta_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_META_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn graph_dirty_key(graph: TermId, subject: TermId) -> [u8; 33] {
+    let mut key = [0u8; 33];
