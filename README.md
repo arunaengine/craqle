@@ -184,3 +184,188 @@ Hidden policy data is excluded from:
 ## Rules And Validation
 
 The `rules` module contains the built-in RO-Crate structural rules and also supports future custom rules.
+
+You can attach custom rules through `CraqleOptions`:
+
+```rust
+use craqle::{CraqleNode, CraqleOptions, CrateViolation, GraphId, MaterializedQuadChange};
+use craqle::rules::{CandidateCheck, GraphSnapshot, Rule};
+
+struct MyRule;
+
+impl Rule for MyRule {
+    fn check_candidate(
+        &self,
+        _store: &craqle::store::GraphStore,
+        _graph: &GraphId,
+        _delta: &[MaterializedQuadChange],
+    ) -> craqle::store::Result<CandidateCheck> {
+        Ok(CandidateCheck::Pass)
+    }
+
+    fn check_post_state(&self, _post: &GraphSnapshot) -> Result<(), CrateViolation> {
+        Ok(())
+    }
+}
+
+let node = CraqleNode::open_with_options(
+    "./data/craqle",
+    CraqleOptions::default().with_rule(MyRule),
+)?;
+```
+
+The rule system is optimized so that rules can evaluate candidate changes directly against the store and delta without always forcing a full graph materialization. The expensive full post-state view is only built when a rule actually needs it, so custom rules can stay cheap on very large graphs.
+
+## RO-Crate Validity And Orphans
+
+Craqle never serves an invalid visible RO-Crate.
+
+When merges disconnect data-entity subtrees:
+
+- the visible active graph stays valid
+- disconnected entities are preserved in hidden orphan state
+- exports, SPARQL, and search only see the active graph
+- hidden diagnostics track orphan warnings and counts
+
+This keeps convergence while preventing invalid user-visible RO-Crate exports.
+
+## Search Model
+
+The search index is intentionally minimal.
+
+Each indexed document stores:
+
+- `doc_key`
+- `all_text`
+
+`all_text` includes subject IDs plus text-like literal content. Search returns:
+
+- `graph_id`
+- `subject_iri`
+- `score`
+
+If you need rich metadata such as names, descriptions, creators, or types, do a follow-up SPARQL query against the RDF graph.
+
+For convenience, the root API also provides `describe_subject(...)`, `hydrate_search_hits(...)`, and `search_resources(...)` so applications can resolve search hits back into RDF properties without bloating the search index.
+
+## RO-Crate Update Planning
+
+Craqle can preview the canonical RDF change set implied by a full RO-Crate document before applying it:
+
+```rust
+let changes = node.preview_rocrate_update(&writer, &graph, updated_jsonld)?;
+```
+
+This uses the same canonical diff path as `apply_rocrate_document(...)`, so applications can inspect or log the exact graph changes that would be committed.
+
+Unknown compact property names or compact IRIs are rejected instead of being guessed, which keeps the document-update path closer to canonical RDF semantics.
+
+## Working With Existing Fjall State
+
+Craqle can open its own store directory, but it can also be embedded into an already-managed Fjall environment.
+
+```rust
+use std::sync::Arc;
+
+use craqle::{CraqleNode, CraqleOptions};
+use craqle::search::SearchIndex;
+use fjall::Database;
+
+let db = Database::builder("./existing-fjall").open()?;
+let search = Arc::new(SearchIndex::open("./existing-search")?);
+
+let node = CraqleNode::from_database_and_search(db, search, CraqleOptions::default())?;
+```
+
+This makes it easier to integrate Craqle into an existing application runtime instead of forcing ownership of the whole storage environment.
+
+## Querying And Internal Federation
+
+Node-local queries are always local:
+
+```rust
+let rows = node.query(&reader, sparql)?;
+```
+
+The simulation layer also supports opt-in internal fanout for multi-node testing:
+
+```rust
+let rows = cluster.query_from_peer(0, &reader, sparql, QueryOptions { local_only: false })?;
+```
+
+`QueryOptions::local_only` matters only for cluster/simulation fanout helpers.
+
+## Testing
+
+Craqle has two main test layers:
+
+- unit tests inside `src/internal/*.rs` for store, search, SPARQL, and core behavior
+- integration suites in `tests/api.rs`, `tests/replication.rs`, `tests/validation.rs`, `tests/search_integration.rs`, `tests/rocrate.rs`, `tests/perf_smoke.rs`, `tests/perf_latency.rs`, and `tests/perf_capacity.rs`
+
+Useful commands:
+
+```bash
+cargo test --lib
+cargo test --test api
+cargo test --test replication
+cargo test --workspace
+cargo bench --bench partial_loading --no-run
+cargo bench --bench large_rocrate_latency --no-run
+cargo test --release --test perf_latency large_multi_crate_latency_profile -- --ignored --nocapture
+cargo test --release --test perf_capacity single_graph_2_5_million_summary_and_disk_profile -- --ignored --nocapture
+cargo test --release --test perf_capacity many_small_graphs_summary_and_disk_profile -- --ignored --nocapture
+```
+
+Environment overrides:
+
+- `CRAQLE_BENCH_ENTITY_COUNTS`
+- `CRAQLE_HEAVY_ENTITY_COUNT`
+- `CRAQLE_HEAVY_BATCH_SIZE`
+- `CRAQLE_LARGE_BENCH_CRATE_COUNT`
+- `CRAQLE_LARGE_BENCH_ENTITIES_PER_CRATE`
+- `CRAQLE_LARGE_BENCH_CONTEXTUALS_PER_CRATE`
+- `CRAQLE_LARGE_BENCH_BATCH_SIZE`
+- `CRAQLE_PERF_CRATE_COUNT`
+- `CRAQLE_PERF_ENTITIES_PER_CRATE`
+- `CRAQLE_PERF_CONTEXTUALS_PER_CRATE`
+- `CRAQLE_PERF_BATCH_SIZE`
+- `CRAQLE_PERF_QUERY_SAMPLES`
+- `CRAQLE_CAPACITY_SINGLE_GRAPH_COUNT`
+- `CRAQLE_CAPACITY_SINGLE_ENTITIES_PER_GRAPH`
+- `CRAQLE_CAPACITY_SINGLE_CONTEXTUALS_PER_GRAPH`
+- `CRAQLE_CAPACITY_SINGLE_BATCH_SIZE`
+- `CRAQLE_CAPACITY_SINGLE_SUMMARY_SAMPLES`
+- `CRAQLE_CAPACITY_MANY_GRAPH_COUNT`
+- `CRAQLE_CAPACITY_MANY_ENTITIES_PER_GRAPH`
+- `CRAQLE_CAPACITY_MANY_CONTEXTUALS_PER_GRAPH`
+- `CRAQLE_CAPACITY_MANY_BATCH_SIZE`
+- `CRAQLE_CAPACITY_MANY_SUMMARY_SAMPLES`
+
+## Current Limitations
+
+- transport is abstracted as `SyncMessage`; no production network stack is built in
+- search is deliberately minimal and expects metadata hydration from RDF queries
+- internal federation is available through simulation helpers, not a production cluster runtime
+- the local `ro-crate-rs` dependency must expose the `rdf` feature for Cargo resolution to succeed
+
+## Code Layout
+
+- `src/lib.rs` - public library surface
+- `src/internal/core.rs` - types, vector clocks, CRDT ops, vocab
+- `src/internal/store.rs` - Fjall-backed RDF store
+- `src/internal/sparql.rs` - SPARQL execution and FTS query rewrite
+- `src/internal/rules.rs` - built-in and custom validation rules
+- `src/internal/replication.rs` - replication and catch-up logic
+- `src/internal/rocrate.rs` - RO-Crate import/export layer
+- `src/internal/search.rs` - Tantivy-backed search index
+- `src/sim.rs` - in-process simulation and internal federation hooks
+- `tests/api.rs` - public API integration coverage
+- `tests/replication.rs` - replication and convergence scenarios
+- `tests/validation.rs` - rule and orphan handling scenarios
+- `tests/search_integration.rs` - search and FTS integration scenarios
+- `tests/rocrate.rs` - RO-Crate import/export lifecycle scenarios
+- `tests/perf_smoke.rs` - ignored performance smoke tests
+- `tests/perf_latency.rs` - ignored release-mode end-to-end latency profiles
+- `tests/perf_capacity.rs` - ignored release-mode summary and disk-footprint capacity profiles
+- `benches/large_rocrate_latency.rs` - Criterion benchmark for multi-crate large-scale reads
+- `API_EXAMPLES.md` - longer workflow examples
