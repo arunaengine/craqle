@@ -348,3 +348,177 @@ fn graph_meta_key(graph: TermId) -> [u8; 17] {
 
 fn graph_dirty_key(graph: TermId, subject: TermId) -> [u8; 33] {
     let mut key = [0u8; 33];
+    key[0] = GRAPH_DIRTY_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key[17..33].copy_from_slice(&subject.to_be_bytes());
+    key
+}
+
+fn graph_dirty_graph_prefix(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_DIRTY_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn graph_dirty_prefix() -> [u8; 1] {
+    [GRAPH_DIRTY_PREFIX]
+}
+
+fn graph_reindex_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_REINDEX_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn graph_reindex_prefix() -> [u8; 1] {
+    [GRAPH_REINDEX_PREFIX]
+}
+
+fn graph_meta_prefix() -> [u8; 1] {
+    [GRAPH_META_PREFIX]
+}
+
+fn log_head_key(graph: TermId, actor: &ActorId) -> [u8; 33] {
+    let mut key = [0u8; 33];
+    key[0] = LOG_HEAD_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key[17..33].copy_from_slice(actor.0.as_bytes());
+    key
+}
+
+fn log_batch_key(graph: TermId, actor: &ActorId, counter: u64) -> [u8; 41] {
+    let mut key = [0u8; 41];
+    key[0] = LOG_BATCH_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key[17..33].copy_from_slice(actor.0.as_bytes());
+    key[33..41].copy_from_slice(&counter.to_be_bytes());
+    key
+}
+
+fn log_batch_prefix(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = LOG_BATCH_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<TermId> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| StoreError::InvalidEncoding {
+        context,
+        message: format!("expected 16 bytes, found {}", bytes.len()),
+    })?;
+    Ok(TermId::from_be_bytes(raw))
+}
+
+impl GraphStore {
+    fn term_lock_index(&self, id: TermId) -> usize {
+        (id.0 as usize) % self.term_locks.len()
+    }
+
+    fn pending_term_in_batch<'a>(
+        &self,
+        batch: Option<&'a WriteBatch>,
+        id: TermId,
+    ) -> Option<&'a str> {
+        batch
+            .and_then(|batch| batch.pending_terms.get(&id))
+            .map(String::as_str)
+    }
+
+    fn encode_term_internal(
+        &self,
+        batch: Option<&mut WriteBatch>,
+        term: &EncodedTerm,
+    ) -> Result<TermId> {
+        let id = hash_term(term);
+        let key = id.to_be_bytes();
+
+        if let Some(existing) = self.pending_term_in_batch(batch.as_deref(), id) {
+            if existing == term.0 {
+                return Ok(id);
+            }
+            return Err(StoreError::TermCollision {
+                attempted: term.0.clone(),
+                existing: existing.to_string(),
+            });
+        }
+
+        if let Some(existing) = self.terms.get(key)? {
+            let existing = String::from_utf8(existing.to_vec()).map_err(|error| {
+                StoreError::InvalidEncoding {
+                    context: "terms",
+                    message: error.to_string(),
+                }
+            })?;
+            if existing == term.0 {
+                return Ok(id);
+            }
+            return Err(StoreError::TermCollision {
+                attempted: term.0.clone(),
+                existing,
+            });
+        }
+
+        let _guard = self.term_locks[self.term_lock_index(id)].lock().unwrap();
+        if let Some(existing) = self.pending_term_in_batch(batch.as_deref(), id) {
+            if existing == term.0 {
+                return Ok(id);
+            }
+            return Err(StoreError::TermCollision {
+                attempted: term.0.clone(),
+                existing: existing.to_string(),
+            });
+        }
+
+        if let Some(existing) = self.terms.get(key)? {
+            let existing = String::from_utf8(existing.to_vec()).map_err(|error| {
+                StoreError::InvalidEncoding {
+                    context: "terms",
+                    message: error.to_string(),
+                }
+            })?;
+            if existing == term.0 {
+                return Ok(id);
+            }
+            return Err(StoreError::TermCollision {
+                attempted: term.0.clone(),
+                existing,
+            });
+        }
+
+        if let Some(batch) = batch {
+            batch.insert(&self.terms, key, term.0.as_bytes());
+            batch.pending_terms.insert(id, term.0.clone());
+        } else {
+            self.terms.insert(key, term.0.as_bytes())?;
+        }
+        Ok(id)
+    }
+
+    fn read_graph_meta_by_id(&self, graph: TermId) -> Result<Option<StoredGraphMeta>> {
+        self.graphs
+            .get(graph_meta_key(graph))?
+            .map(|bytes| postcard::from_bytes(bytes.as_ref()))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn write_graph_meta_immediate(&self, graph: TermId, meta: &StoredGraphMeta) -> Result<()> {
+        self.graphs
+            .insert(graph_meta_key(graph), postcard::to_allocvec(meta)?)?;
+        Ok(())
+    }
+
+    fn read_quad_dots(&self, key: &[u8]) -> Result<Vec<Dot>> {
+        match self.quads.get(key)? {
+            Some(bytes) => decode_dots(bytes.as_ref()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn current_quad_dots(&self, batch: &WriteBatch, key: &[u8]) -> Result<Vec<Dot>> {
+        if let Some(state) = batch.pending_quad_states.get(key) {
+            return Ok(state.clone().unwrap_or_default());
+        }
