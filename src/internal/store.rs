@@ -522,3 +522,178 @@ impl GraphStore {
         if let Some(state) = batch.pending_quad_states.get(key) {
             return Ok(state.clone().unwrap_or_default());
         }
+        self.read_quad_dots(key)
+    }
+
+    fn write_quad_state(
+        &self,
+        batch: &mut WriteBatch,
+        quad: EncodedQuad,
+        mut dots: Vec<Dot>,
+    ) -> Result<bool> {
+        normalize_dots(&mut dots);
+        let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
+        let previous = self.current_quad_dots(batch, &key)?;
+        let was_live = !previous.is_empty();
+        let is_live = !dots.is_empty();
+
+        batch.touched_graphs.insert(quad.graph);
+        batch.pending_quad_states.insert(
+            key.to_vec(),
+            if is_live { Some(dots.clone()) } else { None },
+        );
+
+        if is_live {
+            batch.insert(&self.quads, key, encode_dots(&dots));
+        } else {
+            batch.remove(&self.quads, key);
+        }
+
+        match (was_live, is_live) {
+            (false, true) => {
+                batch.quad_mutations.push(QuadMutation::Insert(quad));
+                Ok(true)
+            }
+            (true, false) => {
+                batch.quad_mutations.push(QuadMutation::Remove(quad));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn build_indexes(&self) -> Result<IndexState> {
+        let mut indexes = IndexState::default();
+        for guard in self.quads.iter() {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 64 {
+                continue;
+            }
+            if decode_dots(value.as_ref())?.is_empty() {
+                continue;
+            }
+            indexes.insert_quad(Self::decode_quad_key(key.as_ref())?);
+        }
+        Ok(indexes)
+    }
+
+    fn rebuild_indexes(&self) -> Result<()> {
+        let indexes = self.build_indexes()?;
+        *self.indexes.write().unwrap() = indexes;
+        *self.derived_indexes.write().unwrap() = None;
+        self.object_order_cache.write().unwrap().clear();
+        self.diagnostics_cache.write().unwrap().clear();
+        Ok(())
+    }
+
+    fn apply_quad_mutations(&self, mutations: Vec<QuadMutation>, _touched_graphs: HashSet<TermId>) {
+        if mutations.is_empty() {
+            return;
+        }
+
+        let mut indexes = self.indexes.write().unwrap();
+        for mutation in &mutations {
+            match mutation {
+                QuadMutation::Insert(quad) => indexes.insert_quad(*quad),
+                QuadMutation::Remove(quad) => indexes.remove_quad(*quad),
+            }
+        }
+        drop(indexes);
+
+        if let Some(derived) = self.derived_indexes.write().unwrap().as_mut() {
+            for mutation in &mutations {
+                match mutation {
+                    QuadMutation::Insert(quad) => derived.insert_quad(*quad),
+                    QuadMutation::Remove(quad) => derived.remove_quad(*quad),
+                }
+            }
+        }
+
+        let mut cache = self.object_order_cache.write().unwrap();
+        for mutation in &mutations {
+            let quad = match mutation {
+                QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
+            };
+            cache.remove(&(quad.graph, quad.subject, quad.predicate));
+        }
+    }
+
+    fn build_derived_indexes(&self) -> DerivedIndexState {
+        let indexes = self.indexes.read().unwrap();
+        let mut derived = DerivedIndexState::default();
+        for (&(graph, subject), entries) in &indexes.by_graph_subject {
+            for &(predicate, object) in entries {
+                derived.insert_quad(EncodedQuad {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+            }
+        }
+        derived
+    }
+
+    fn with_derived_indexes<R>(&self, f: impl FnOnce(&DerivedIndexState) -> R) -> R {
+        {
+            let guard = self.derived_indexes.read().unwrap();
+            if let Some(derived) = guard.as_ref() {
+                return f(derived);
+            }
+        }
+
+        let mut guard = self.derived_indexes.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.build_derived_indexes());
+        }
+        f(guard.as_ref().expect("derived indexes initialized"))
+    }
+
+    fn compute_graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
+        let snapshot = crate::rules::GraphSnapshot::from_store(self, graph)?;
+        Ok(GraphDiagnostics::from_orphaned_entities(
+            crate::rules::orphaned_data_entities(&snapshot)
+                .into_iter()
+                .map(|term| {
+                    term.to_named_node()
+                        .map(|named_node| named_node.as_str().to_string())
+                        .unwrap_or(term.0)
+                })
+                .collect(),
+        ))
+    }
+
+    fn prime_graph_diagnostics(&self) -> Result<()> {
+        let mut cache = self.diagnostics_cache.write().unwrap();
+        cache.clear();
+        for graph in self.graphs()? {
+            if let Some(graph_id) = self.graph_id_for(&graph)? {
+                cache.insert(graph_id, self.compute_graph_diagnostics(&graph)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn graph_id_for(&self, graph: &GraphId) -> Result<Option<TermId>> {
+        self.lookup_term(&EncodedTerm::from_named_node(&graph.0))
+    }
+
+    fn graph_subject_quads(
+        &self,
+        graph: TermId,
+        subject: TermId,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+    ) -> Vec<EncodedQuad> {
+        let indexes = self.indexes.read().unwrap();
+        let Some(entries) = indexes.by_graph_subject.get(&(graph, subject)) else {
+            return Vec::new();
+        };
+
+        let mut quads = Vec::new();
+        for &(candidate_predicate, candidate_object) in entries {
+            if predicate.is_some_and(|expected| expected != candidate_predicate) {
+                continue;
+            }
+            if object.is_some_and(|expected| expected != candidate_object) {
+                continue;
