@@ -871,3 +871,178 @@ impl GraphStore {
             .by_graph_subject
             .get(&(graph, subject))
             .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(candidate_predicate, object)| {
+                        (*candidate_predicate == predicate).then_some(*object)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut ordered = object_ids
+            .into_iter()
+            .map(|object| Ok((self.decode_term(object)?.0, object)))
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let ordered = Arc::new(
+            ordered
+                .into_iter()
+                .map(|(_, object)| object)
+                .collect::<Vec<_>>(),
+        );
+        self.object_order_cache
+            .write()
+            .unwrap()
+            .insert((graph, subject, predicate), ordered.clone());
+        Ok(ordered)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let worker_threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(32);
+        #[allow(deprecated)]
+        let db = Database::builder(path.as_ref())
+            .cache_size(recommended_db_cache_bytes())
+            .journal_compression(CompressionType::None)
+            .max_journaling_size(16 * 1_024 * 1_024 * 1_024)
+            .max_write_buffer_size(Some(24 * 1_024 * 1_024 * 1_024))
+            .worker_threads(worker_threads)
+            .open()?;
+        Self::from_database(db)
+    }
+
+    pub fn from_database(db: Database) -> Result<Self> {
+        let point_read_heavy = || {
+            KeyspaceCreateOptions::default()
+                .expect_point_read_hits(true)
+                .max_memtable_size(256 * 1_024 * 1_024)
+        };
+        let write_heavy = || {
+            KeyspaceCreateOptions::default()
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .index_block_compression_policy(CompressionPolicy::disabled())
+                .compaction_strategy(Arc::new(
+                    Leveled::default()
+                        .with_l0_threshold(WRITE_HEAVY_L0_THRESHOLD)
+                        .with_table_target_size(WRITE_HEAVY_TABLE_TARGET_BYTES)
+                        .with_level_ratio_policy(vec![WRITE_HEAVY_LEVEL_RATIO]),
+                ))
+                .max_memtable_size(WRITE_HEAVY_MEMTABLE_BYTES)
+        };
+
+        let store = Self {
+            terms: db.keyspace("terms", point_read_heavy)?,
+            quads: db.keyspace("quads", write_heavy)?,
+            graphs: db.keyspace("graphs", point_read_heavy)?,
+            log: db.keyspace("log", write_heavy)?,
+            db,
+            term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            indexes: RwLock::new(IndexState::default()),
+            derived_indexes: RwLock::new(None),
+            object_order_cache: RwLock::new(HashMap::new()),
+            diagnostics_cache: RwLock::new(HashMap::new()),
+            dirty_counter: AtomicU64::new(1),
+        };
+
+        store.rebuild_indexes()?;
+        store.prime_graph_diagnostics()?;
+        Ok(store)
+    }
+
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
+    pub fn manual_compact(&self) -> Result<()> {
+        self.db.persist(PersistMode::SyncAll)?;
+        for keyspace in [&self.terms, &self.quads, &self.graphs, &self.log] {
+            keyspace.major_compact()?;
+        }
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    pub fn encode_term(&self, term: &EncodedTerm) -> Result<TermId> {
+        self.encode_term_internal(None, term)
+    }
+
+    pub fn resolve_term_cached(
+        &self,
+        batch: &mut WriteBatch,
+        cache: &mut HashMap<String, TermId>,
+        term: &EncodedTerm,
+    ) -> Result<TermId> {
+        if let Some(&id) = cache.get(term.0.as_str()) {
+            return Ok(id);
+        }
+        let id = self.encode_term_internal(Some(batch), term)?;
+        cache.insert(term.0.clone(), id);
+        Ok(id)
+    }
+
+    pub fn seed_term_cache<'a, I>(
+        &self,
+        batch: &mut WriteBatch,
+        cache: &mut HashMap<String, TermId>,
+        terms: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a EncodedTerm>,
+    {
+        for term in terms {
+            if cache.contains_key(term.0.as_str()) {
+                continue;
+            }
+            let id = self.encode_term_internal(Some(batch), term)?;
+            cache.insert(term.0.clone(), id);
+        }
+        Ok(())
+    }
+
+    pub fn decode_term(&self, id: TermId) -> Result<EncodedTerm> {
+        match self.terms.get(id.to_be_bytes())? {
+            Some(bytes) => Ok(EncodedTerm(String::from_utf8(bytes.to_vec()).map_err(
+                |error| StoreError::InvalidEncoding {
+                    context: "terms",
+                    message: error.to_string(),
+                },
+            )?)),
+            None => Err(StoreError::TermNotFound(id.0)),
+        }
+    }
+
+    pub fn lookup_term(&self, term: &EncodedTerm) -> Result<Option<TermId>> {
+        let id = hash_term(term);
+        let Some(existing) = self.terms.get(id.to_be_bytes())? else {
+            return Ok(None);
+        };
+        let existing =
+            String::from_utf8(existing.to_vec()).map_err(|error| StoreError::InvalidEncoding {
+                context: "terms",
+                message: error.to_string(),
+            })?;
+        if existing == term.0 {
+            return Ok(Some(id));
+        }
+        Err(StoreError::TermCollision {
+            attempted: term.0.clone(),
+            existing,
+        })
+    }
+
+    pub fn resolve_term(&self, term: &EncodedTerm) -> Result<TermId> {
+        self.encode_term(term)
+    }
+
+    pub fn create_graph(&self, graph: &GraphId) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        if self.read_graph_meta_by_id(graph_id)?.is_none() {
+            self.write_graph_meta_immediate(graph_id, &StoredGraphMeta::default())?;
+        }
+        Ok(())
+    }
+
+    pub fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
