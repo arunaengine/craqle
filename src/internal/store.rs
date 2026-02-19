@@ -697,3 +697,177 @@ impl GraphStore {
             }
             if object.is_some_and(|expected| expected != candidate_object) {
                 continue;
+            }
+            quads.push(EncodedQuad {
+                graph,
+                subject,
+                predicate: candidate_predicate,
+                object: candidate_object,
+            });
+        }
+        quads
+    }
+
+    fn graph_scan(
+        &self,
+        graph: TermId,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+    ) -> Vec<EncodedQuad> {
+        let subject_ids = self
+            .indexes
+            .read()
+            .unwrap()
+            .graph_subjects
+            .get(&graph)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut quads = Vec::new();
+        for subject in subject_ids {
+            quads.extend(self.graph_subject_quads(graph, subject, predicate, object));
+        }
+        quads
+    }
+
+    fn cross_graph_subject_scan(
+        &self,
+        subject: TermId,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+    ) -> Vec<EncodedQuad> {
+        self.with_derived_indexes(|indexes| {
+            let Some(entries) = indexes.by_subject.get(&subject) else {
+                return Vec::new();
+            };
+
+            let mut quads = Vec::new();
+            for &(candidate_predicate, candidate_object, graph) in entries {
+                if predicate.is_some_and(|expected| expected != candidate_predicate) {
+                    continue;
+                }
+                if object.is_some_and(|expected| expected != candidate_object) {
+                    continue;
+                }
+                quads.push(EncodedQuad {
+                    graph,
+                    subject,
+                    predicate: candidate_predicate,
+                    object: candidate_object,
+                });
+            }
+            quads
+        })
+    }
+
+    fn predicate_object_scan(
+        &self,
+        graph: Option<TermId>,
+        predicate: TermId,
+        object: TermId,
+    ) -> Vec<EncodedQuad> {
+        self.with_derived_indexes(|indexes| {
+            let Some(entries) = indexes.by_predicate_object.get(&(predicate, object)) else {
+                return Vec::new();
+            };
+
+            let mut quads = Vec::new();
+            for &(candidate_graph, subject) in entries {
+                if graph.is_some_and(|expected| expected != candidate_graph) {
+                    continue;
+                }
+                quads.push(EncodedQuad {
+                    graph: candidate_graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+            }
+            quads
+        })
+    }
+
+    fn object_scan(&self, graph: Option<TermId>, object: TermId) -> Vec<EncodedQuad> {
+        self.with_derived_indexes(|indexes| {
+            let Some(entries) = indexes.by_object.get(&object) else {
+                return Vec::new();
+            };
+
+            let mut quads = Vec::new();
+            for &(candidate_graph, subject, predicate) in entries {
+                if graph.is_some_and(|expected| expected != candidate_graph) {
+                    continue;
+                }
+                quads.push(EncodedQuad {
+                    graph: candidate_graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+            }
+            quads
+        })
+    }
+
+    fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
+        if bytes.len() != 64 {
+            return Err(StoreError::InvalidEncoding {
+                context: "quad key",
+                message: format!("expected 64 bytes, found {}", bytes.len()),
+            });
+        }
+        Ok(EncodedQuad {
+            graph: decode_term_id(&bytes[0..16], "quad graph")?,
+            subject: decode_term_id(&bytes[16..32], "quad subject")?,
+            predicate: decode_term_id(&bytes[32..48], "quad predicate")?,
+            object: decode_term_id(&bytes[48..64], "quad object")?,
+        })
+    }
+
+    fn quad_key(graph: TermId, subject: TermId, predicate: TermId, object: TermId) -> [u8; 64] {
+        let mut key = [0u8; 64];
+        key[0..16].copy_from_slice(&graph.to_be_bytes());
+        key[16..32].copy_from_slice(&subject.to_be_bytes());
+        key[32..48].copy_from_slice(&predicate.to_be_bytes());
+        key[48..64].copy_from_slice(&object.to_be_bytes());
+        key
+    }
+
+    fn count_objects_for_ids(&self, graph: TermId, subject: TermId, predicate: TermId) -> usize {
+        self.indexes
+            .read()
+            .unwrap()
+            .by_graph_subject
+            .get(&(graph, subject))
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(candidate_predicate, _)| *candidate_predicate == predicate)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn ordered_objects_for_subject_predicate(
+        &self,
+        graph: TermId,
+        subject: TermId,
+        predicate: TermId,
+    ) -> Result<Arc<Vec<TermId>>> {
+        if let Some(cached) = self
+            .object_order_cache
+            .read()
+            .unwrap()
+            .get(&(graph, subject, predicate))
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let object_ids = self
+            .indexes
+            .read()
+            .unwrap()
+            .by_graph_subject
+            .get(&(graph, subject))
+            .map(|entries| {
