@@ -1046,3 +1046,177 @@ impl GraphStore {
     }
 
     pub fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(false);
+        };
+        Ok(self.read_graph_meta_by_id(graph_id)?.is_some())
+    }
+
+    pub fn graph_is_empty(&self, graph: &GraphId) -> Result<bool> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(true);
+        };
+        let indexes = self.indexes.read().unwrap();
+        Ok(indexes
+            .graph_subjects
+            .get(&graph_id)
+            .is_none_or(Vec::is_empty))
+    }
+
+    pub fn contains_subject(&self, graph: &GraphId, subject: &EncodedTerm) -> Result<bool> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(false);
+        };
+        let Some(subject_id) = self.lookup_term(subject)? else {
+            return Ok(false);
+        };
+
+        let indexes = self.indexes.read().unwrap();
+        Ok(indexes
+            .by_graph_subject
+            .contains_key(&(graph_id, subject_id)))
+    }
+
+    pub fn graphs(&self) -> Result<Vec<GraphId>> {
+        let mut graphs = Vec::new();
+        for guard in self.graphs.prefix(graph_meta_prefix()) {
+            let (key, _) = guard.into_inner()?;
+            if key.len() != 17 {
+                continue;
+            }
+            let graph_id = decode_term_id(&key[1..17], "graph meta key")?;
+            let term = self.decode_term(graph_id)?;
+            if let Some(named_node) = term.to_named_node() {
+                graphs.push(GraphId(named_node));
+            }
+        }
+        Ok(graphs)
+    }
+
+    pub fn set_graph_diagnostics(
+        &self,
+        graph: &GraphId,
+        diagnostics: &GraphDiagnostics,
+    ) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        self.diagnostics_cache
+            .write()
+            .unwrap()
+            .insert(graph_id, diagnostics.clone());
+        Ok(())
+    }
+
+    pub fn graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphDiagnostics::default());
+        };
+
+        if let Some(cached) = self.diagnostics_cache.read().unwrap().get(&graph_id) {
+            return Ok(cached.clone());
+        }
+
+        let diagnostics = self.compute_graph_diagnostics(graph)?;
+        self.diagnostics_cache
+            .write()
+            .unwrap()
+            .insert(graph_id, diagnostics.clone());
+        Ok(diagnostics)
+    }
+
+    pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        meta.policy = policy.clone().normalized();
+        self.write_graph_meta_immediate(graph_id, &meta)
+    }
+
+    pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphPolicy::default());
+        };
+        Ok(self
+            .read_graph_meta_by_id(graph_id)?
+            .unwrap_or_default()
+            .policy)
+    }
+
+    pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
+        let vector_clock = self.get_vector_clock(graph)?;
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphReplicaSnapshot {
+                graph: graph.clone(),
+                clock: vector_clock,
+                quads: Vec::new(),
+            });
+        };
+
+        let mut quads = Vec::new();
+        let mut term_cache = HashMap::new();
+        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+            quads.push(SnapshotQuadState {
+                subject: self.decode_term_cached(&mut term_cache, quad.subject)?,
+                predicate: self.decode_term_cached(&mut term_cache, quad.predicate)?,
+                object: self.decode_term_cached(&mut term_cache, quad.object)?,
+                dots: self.read_quad_dots(&Self::quad_key(
+                    graph_id,
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                ))?,
+            });
+            Ok(())
+        })?;
+
+        Ok(GraphReplicaSnapshot {
+            graph: graph.clone(),
+            clock: vector_clock,
+            quads,
+        })
+    }
+
+    pub fn compact_graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaCompactSnapshot> {
+        let vector_clock = self.get_vector_clock(graph)?;
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphReplicaCompactSnapshot {
+                graph: graph.clone(),
+                clock: vector_clock,
+                terms: Vec::new(),
+                quads: Vec::new(),
+            });
+        };
+
+        let mut term_to_index = HashMap::new();
+        let mut terms = Vec::new();
+        let mut quads = Vec::new();
+        let mut decode_cache = HashMap::new();
+        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+            let subject = self.decode_term_cached(&mut decode_cache, quad.subject)?;
+            let predicate = self.decode_term_cached(&mut decode_cache, quad.predicate)?;
+            let object = self.decode_term_cached(&mut decode_cache, quad.object)?;
+            quads.push(CompactSnapshotQuadState {
+                subject: intern_snapshot_term(&mut term_to_index, &mut terms, subject),
+                predicate: intern_snapshot_term(&mut term_to_index, &mut terms, predicate),
+                object: intern_snapshot_term(&mut term_to_index, &mut terms, object),
+                dots: self.read_quad_dots(&Self::quad_key(
+                    graph_id,
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                ))?,
+            });
+            Ok(())
+        })?;
+
+        Ok(GraphReplicaCompactSnapshot {
+            graph: graph.clone(),
+            clock: vector_clock,
+            terms,
+            quads,
+        })
+    }
+
+    pub fn import_graph_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<()> {
+        if self.contains_graph(&snapshot.graph)? {
+            let existing = self.graph_snapshot(&snapshot.graph)?;
+            if !existing.quads.is_empty() || !existing.clock.0.is_empty() {
+                return Err(StoreError::SnapshotImport(format!(
