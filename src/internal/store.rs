@@ -1395,3 +1395,177 @@ impl GraphStore {
     pub fn insert_quad(
         &self,
         batch: &mut WriteBatch,
+        graph: TermId,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        dot: &Dot,
+    ) -> Result<bool> {
+        let key = Self::quad_key(graph, subject, predicate, object);
+        let mut dots = self.current_quad_dots(batch, &key)?;
+        if dots.contains(dot) {
+            return Ok(false);
+        }
+        dots.push(*dot);
+        self.write_quad_state(
+            batch,
+            EncodedQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            },
+            dots,
+        )
+    }
+
+    pub fn remove_quad(
+        &self,
+        batch: &mut WriteBatch,
+        graph: TermId,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        witnessed: &VectorClock,
+    ) -> Result<bool> {
+        let key = Self::quad_key(graph, subject, predicate, object);
+        let mut dots = self.current_quad_dots(batch, &key)?;
+        let before = dots.len();
+        dots.retain(|dot| !witnessed.contains(dot));
+        if before == dots.len() {
+            return Ok(false);
+        }
+        self.write_quad_state(
+            batch,
+            EncodedQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            },
+            dots,
+        )
+    }
+
+    pub fn quads_for_pattern(
+        &self,
+        graph: Option<TermId>,
+        subject: Option<TermId>,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+    ) -> Result<Vec<EncodedQuad>> {
+        Ok(match (graph, subject, predicate, object) {
+            (Some(graph), Some(subject), predicate, object) => {
+                self.graph_subject_quads(graph, subject, predicate, object)
+            }
+            (Some(graph), None, Some(predicate), Some(object)) => {
+                self.predicate_object_scan(Some(graph), predicate, object)
+            }
+            (Some(graph), None, Some(predicate), None) => {
+                self.graph_scan(graph, Some(predicate), None)
+            }
+            (Some(graph), None, None, Some(object)) => self.object_scan(Some(graph), object),
+            (Some(graph), None, None, None) => self.graph_scan(graph, None, None),
+            (None, Some(subject), predicate, object) => {
+                self.cross_graph_subject_scan(subject, predicate, object)
+            }
+            (None, None, Some(predicate), Some(object)) => {
+                self.predicate_object_scan(None, predicate, object)
+            }
+            (None, None, None, Some(object)) => self.object_scan(None, object),
+            (None, None, Some(predicate), None) => self.with_derived_indexes(|indexes| {
+                let mut quads = Vec::new();
+                for (&subject, entries) in &indexes.by_subject {
+                    for &(candidate_predicate, candidate_object, graph) in entries {
+                        if candidate_predicate != predicate {
+                            continue;
+                        }
+                        quads.push(EncodedQuad {
+                            graph,
+                            subject,
+                            predicate: candidate_predicate,
+                            object: candidate_object,
+                        });
+                    }
+                }
+                quads
+            }),
+            (None, None, None, None) => {
+                let graph_ids = self
+                    .indexes
+                    .read()
+                    .unwrap()
+                    .graph_subjects
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let mut quads = Vec::new();
+                for graph in graph_ids {
+                    quads.extend(self.graph_scan(graph, None, None));
+                }
+                quads
+            }
+        })
+    }
+
+    pub fn for_each_quad_in_graph<E, F>(
+        &self,
+        graph: TermId,
+        mut visit: F,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<StoreError>,
+        F: FnMut(EncodedQuad) -> std::result::Result<(), E>,
+    {
+        let subjects = self
+            .indexes
+            .read()
+            .unwrap()
+            .graph_subjects
+            .get(&graph)
+            .cloned()
+            .unwrap_or_default();
+        for subject in subjects {
+            for quad in self.graph_subject_quads(graph, subject, None, None) {
+                visit(quad)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(VectorClock::new());
+        };
+        Ok(self
+            .read_graph_meta_by_id(graph_id)?
+            .unwrap_or_default()
+            .clock)
+    }
+
+    pub fn set_vector_clock(
+        &self,
+        batch: &mut WriteBatch,
+        graph: &GraphId,
+        clock: &VectorClock,
+    ) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        meta.clock = clock.clone();
+        batch.insert(
+            &self.graphs,
+            graph_meta_key(graph_id),
+            postcard::to_allocvec(&meta)?,
+        );
+        Ok(())
+    }
+
+    pub fn next_counter(
+        &self,
+        batch: &mut WriteBatch,
+        graph: &GraphId,
+        actor: &ActorId,
+    ) -> Result<u64> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let key = log_head_key(graph_id, actor);
+        let counter = match self.log.get(key)? {
