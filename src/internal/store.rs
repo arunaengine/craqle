@@ -1220,3 +1220,178 @@ impl GraphStore {
             let existing = self.graph_snapshot(&snapshot.graph)?;
             if !existing.quads.is_empty() || !existing.clock.0.is_empty() {
                 return Err(StoreError::SnapshotImport(format!(
+                    "graph `{}` already contains data",
+                    snapshot.graph.as_str()
+                )));
+            }
+        } else {
+            self.create_graph(&snapshot.graph)?;
+        }
+
+        let mut batch = self.new_batch();
+        let graph_id = self.resolve_term(&EncodedTerm::from_named_node(&snapshot.graph.0))?;
+        let mut term_cache = HashMap::new();
+        self.seed_term_cache(
+            &mut batch,
+            &mut term_cache,
+            snapshot
+                .quads
+                .iter()
+                .flat_map(|quad| [&quad.subject, &quad.predicate, &quad.object]),
+        )?;
+
+        for quad in &snapshot.quads {
+            let state = EncodedQuad {
+                graph: graph_id,
+                subject: self.resolve_term_cached(&mut batch, &mut term_cache, &quad.subject)?,
+                predicate: self.resolve_term_cached(
+                    &mut batch,
+                    &mut term_cache,
+                    &quad.predicate,
+                )?,
+                object: self.resolve_term_cached(&mut batch, &mut term_cache, &quad.object)?,
+            };
+            self.write_quad_state(&mut batch, state, quad.dots.clone())?;
+        }
+
+        self.enqueue_fts_reindex(&mut batch, &snapshot.graph)?;
+        self.set_vector_clock(&mut batch, &snapshot.graph, &snapshot.clock)?;
+        self.commit(batch)
+    }
+
+    pub fn import_compact_graph_snapshot(
+        &self,
+        snapshot: &GraphReplicaCompactSnapshot,
+    ) -> Result<()> {
+        if self.contains_graph(&snapshot.graph)? {
+            let existing = self.graph_snapshot(&snapshot.graph)?;
+            if !existing.quads.is_empty() || !existing.clock.0.is_empty() {
+                return Err(StoreError::SnapshotImport(format!(
+                    "graph `{}` already contains data",
+                    snapshot.graph.as_str()
+                )));
+            }
+        } else {
+            self.create_graph(&snapshot.graph)?;
+        }
+
+        let mut batch = self.new_batch();
+        let graph_id = self.resolve_term(&EncodedTerm::from_named_node(&snapshot.graph.0))?;
+        let mut term_cache = HashMap::new();
+        self.seed_term_cache(&mut batch, &mut term_cache, snapshot.terms.iter())?;
+
+        let mut term_ids = Vec::with_capacity(snapshot.terms.len());
+        for term in &snapshot.terms {
+            term_ids.push(self.resolve_term_cached(&mut batch, &mut term_cache, term)?);
+        }
+
+        for quad in &snapshot.quads {
+            let state = EncodedQuad {
+                graph: graph_id,
+                subject: *term_ids.get(quad.subject as usize).ok_or_else(|| {
+                    StoreError::SnapshotImport(format!(
+                        "quad subject index {} out of bounds for {} terms",
+                        quad.subject,
+                        term_ids.len()
+                    ))
+                })?,
+                predicate: *term_ids.get(quad.predicate as usize).ok_or_else(|| {
+                    StoreError::SnapshotImport(format!(
+                        "quad predicate index {} out of bounds for {} terms",
+                        quad.predicate,
+                        term_ids.len()
+                    ))
+                })?,
+                object: *term_ids.get(quad.object as usize).ok_or_else(|| {
+                    StoreError::SnapshotImport(format!(
+                        "quad object index {} out of bounds for {} terms",
+                        quad.object,
+                        term_ids.len()
+                    ))
+                })?,
+            };
+            self.write_quad_state(&mut batch, state, quad.dots.clone())?;
+        }
+
+        self.enqueue_fts_reindex(&mut batch, &snapshot.graph)?;
+        self.set_vector_clock(&mut batch, &snapshot.graph, &snapshot.clock)?;
+        self.commit(batch)
+    }
+
+    pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            let empty = *blake3::hash(&[]).as_bytes();
+            return Ok((0, empty, empty));
+        };
+
+        let mut count = 0u64;
+        let mut xor = [0u8; 32];
+        let mut sum = [0u8; 32];
+        let mut term_cache = HashMap::new();
+        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(
+                self.decode_term_cached(&mut term_cache, quad.subject)?
+                    .0
+                    .as_bytes(),
+            );
+            hasher.update(&[0]);
+            hasher.update(
+                self.decode_term_cached(&mut term_cache, quad.predicate)?
+                    .0
+                    .as_bytes(),
+            );
+            hasher.update(&[0]);
+            hasher.update(
+                self.decode_term_cached(&mut term_cache, quad.object)?
+                    .0
+                    .as_bytes(),
+            );
+            let quad_hash = hasher.finalize();
+            for (index, byte) in quad_hash.as_bytes().iter().enumerate() {
+                xor[index] ^= byte;
+                sum[index] = sum[index].wrapping_add(*byte);
+            }
+            count += 1;
+            Ok(())
+        })?;
+        Ok((count, xor, sum))
+    }
+
+    pub fn subject_triple_count_by_ids(&self, graph: TermId, subject: TermId) -> Result<usize> {
+        Ok(self
+            .indexes
+            .read()
+            .unwrap()
+            .by_graph_subject
+            .get(&(graph, subject))
+            .map(Vec::len)
+            .unwrap_or(0))
+    }
+
+    pub fn predicate_object_count_by_ids(
+        &self,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<usize> {
+        Ok(self.with_derived_indexes(|indexes| {
+            indexes
+                .by_predicate_object
+                .get(&(predicate, object))
+                .map(|entries| entries.iter().filter(|(g, _)| *g == graph).count())
+                .unwrap_or(0)
+        }))
+    }
+
+    pub fn apply_subject_predicate_count_deltas(
+        &self,
+        _batch: &mut WriteBatch,
+        _deltas: &HashMap<(TermId, TermId, TermId), i64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn insert_quad(
+        &self,
+        batch: &mut WriteBatch,
