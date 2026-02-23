@@ -1744,3 +1744,177 @@ impl GraphStore {
         }
 
         for subject in subjects {
+            self.enqueue_fts_by_graph_id(batch, graph_id, *subject)?;
+        }
+        Ok(())
+    }
+
+    pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph: &GraphId) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        self.enqueue_fts_reindex_by_graph_id(batch, graph_id)
+    }
+
+    fn enqueue_fts_reindex_by_graph_id(
+        &self,
+        batch: &mut WriteBatch,
+        graph_id: TermId,
+    ) -> Result<()> {
+        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        batch.insert(
+            &self.graphs,
+            graph_reindex_key(graph_id),
+            token.to_be_bytes(),
+        );
+        Ok(())
+    }
+
+    pub fn drain_fts_queue(&self, limit: usize) -> Result<Vec<(GraphId, TermId, u64)>> {
+        let mut result = Vec::new();
+        let mut term_cache = HashMap::new();
+
+        for guard in self.graphs.prefix(graph_dirty_prefix()) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 33 {
+                continue;
+            }
+            let graph_id = decode_term_id(&key[1..17], "graph dirty graph")?;
+            let subject_id = decode_term_id(&key[17..33], "graph dirty subject")?;
+            let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
+            let graph = self
+                .decode_term_cached(&mut term_cache, graph_id)?
+                .to_named_node()
+                .map(GraphId);
+            if let Some(graph) = graph {
+                result.push((graph, subject_id, token));
+            }
+            if result.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn drain_fts_reindex_queue(&self, limit: usize) -> Result<Vec<(GraphId, u64)>> {
+        let mut result = Vec::new();
+        let mut term_cache = HashMap::new();
+
+        for guard in self.graphs.prefix(graph_reindex_prefix()) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 17 {
+                continue;
+            }
+            let graph_id = decode_term_id(&key[1..17], "graph reindex graph")?;
+            let token = decode_u64_bytes(value.as_ref(), "graph reindex token")?;
+            let graph = self
+                .decode_term_cached(&mut term_cache, graph_id)?
+                .to_named_node()
+                .map(GraphId);
+            if let Some(graph) = graph {
+                result.push((graph, token));
+            }
+            if result.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn acknowledge_fts_queue(&self, queued: &[(GraphId, TermId, u64)]) -> Result<()> {
+        if queued.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        for (graph, subject, token) in queued {
+            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let key = graph_dirty_key(graph_id, *subject);
+            if self.graphs.get(key)?.is_some_and(|current| {
+                decode_u64_bytes(current.as_ref(), "graph dirty token").ok() == Some(*token)
+            }) {
+                batch.remove(&self.graphs, key);
+            }
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn acknowledge_fts_reindex_queue(&self, queued: &[(GraphId, u64)]) -> Result<()> {
+        if queued.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        for (graph, token) in queued {
+            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let key = graph_reindex_key(graph_id);
+            if self.graphs.get(key)?.is_some_and(|current| {
+                decode_u64_bytes(current.as_ref(), "graph reindex token").ok() == Some(*token)
+            }) {
+                batch.remove(&self.graphs, key);
+            }
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_fts_queue_for_graph(&self, graph: &GraphId) -> Result<()> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(());
+        };
+
+        let mut batch = self.db.batch();
+        let mut dirty = false;
+        for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.graphs, key);
+            dirty = true;
+        }
+
+        let reindex_key = graph_reindex_key(graph_id);
+        if self.graphs.get(reindex_key)?.is_some() {
+            batch.remove(&self.graphs, reindex_key);
+            dirty = true;
+        }
+
+        if dirty {
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_fts_reindex_for_graph(&self, graph: &GraphId) -> Result<()> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(());
+        };
+
+        let reindex_key = graph_reindex_key(graph_id);
+        if self.graphs.get(reindex_key)?.is_none() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        batch.remove(&self.graphs, reindex_key);
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_fts_queue_subjects(
+        &self,
+        graph: &GraphId,
+        subjects: &[EncodedTerm],
+    ) -> Result<()> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(());
+        };
+
+        let mut batch = self.db.batch();
+        let mut dirty = false;
+        for subject in subjects {
+            let Some(subject_id) = self.lookup_term(subject)? else {
+                continue;
+            };
+            let key = graph_dirty_key(graph_id, subject_id);
+            if self.graphs.get(key)?.is_some() {
+                batch.remove(&self.graphs, key);
