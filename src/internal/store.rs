@@ -2093,3 +2093,177 @@ impl GraphStore {
                     .map(|index| index + 1)
                     .unwrap_or(0),
                 None => 0,
+            },
+            None => 0,
+        };
+
+        object_ids
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|object| self.decode_term(*object))
+            .collect()
+    }
+}
+
+fn intern_snapshot_term(
+    term_to_index: &mut HashMap<EncodedTerm, u32>,
+    terms: &mut Vec<EncodedTerm>,
+    term: EncodedTerm,
+) -> u32 {
+    if let Some(&index) = term_to_index.get(&term) {
+        return index;
+    }
+
+    let index = terms.len() as u32;
+    term_to_index.insert(term.clone(), index);
+    terms.push(term);
+    index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_store() -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    fn insert_quad(
+        store: &GraphStore,
+        graph: &GraphId,
+        subject: &EncodedTerm,
+        predicate: &EncodedTerm,
+        object: &EncodedTerm,
+        dot: Dot,
+    ) {
+        if !store.contains_graph(graph).unwrap() {
+            store.create_graph(graph).unwrap();
+        }
+        let mut batch = store.new_batch();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let subject_id = store.resolve_term(subject).unwrap();
+        let predicate_id = store.resolve_term(predicate).unwrap();
+        let object_id = store.resolve_term(object).unwrap();
+        store
+            .insert_quad(
+                &mut batch,
+                graph_id,
+                subject_id,
+                predicate_id,
+                object_id,
+                &dot,
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+    }
+
+    #[test]
+    fn deterministic_term_ids_round_trip() {
+        let (_dir, store) = setup_store();
+        let term = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:term"));
+        let id = store.encode_term(&term).unwrap();
+        assert_eq!(Some(id), store.lookup_term(&term).unwrap());
+        assert_eq!(term, store.decode_term(id).unwrap());
+    }
+
+    #[test]
+    fn graph_queries_use_in_memory_indexes() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:graph");
+        let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:s"));
+        let predicate =
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:p"));
+        let object = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:o"));
+
+        insert_quad(
+            &store,
+            &graph,
+            &subject,
+            &predicate,
+            &object,
+            Dot {
+                actor: ActorId::random(),
+                counter: 1,
+            },
+        );
+
+        let graph_id = store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .unwrap();
+        let subject_id = store.lookup_term(&subject).unwrap().unwrap();
+        let quads = store
+            .quads_for_pattern(Some(graph_id), Some(subject_id), None, None)
+            .unwrap();
+        assert_eq!(1, quads.len());
+        assert_eq!(
+            quads[0].object,
+            store.lookup_term(&object).unwrap().unwrap()
+        );
+    }
+
+    #[test]
+    fn fts_dirty_set_deduplicates_subjects() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:graph");
+        store.create_graph(&graph).unwrap();
+        let subject = store
+            .resolve_term(&EncodedTerm::from_named_node(
+                &oxrdf::NamedNode::new_unchecked("urn:test:subject"),
+            ))
+            .unwrap();
+
+        let mut batch = store.new_batch();
+        store.enqueue_fts(&mut batch, &graph, subject).unwrap();
+        store.enqueue_fts(&mut batch, &graph, subject).unwrap();
+        store.commit(batch).unwrap();
+
+        let queued = store.drain_fts_queue(10).unwrap();
+        assert_eq!(1, queued.len());
+        store.acknowledge_fts_queue(&queued).unwrap();
+        assert!(store.drain_fts_queue(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_graph_reindex_queue_round_trips() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:graph");
+        store.create_graph(&graph).unwrap();
+
+        let mut batch = store.new_batch();
+        store.enqueue_fts_reindex(&mut batch, &graph).unwrap();
+        store.commit(batch).unwrap();
+
+        let queued = store.drain_fts_reindex_queue(10).unwrap();
+        assert_eq!(1, queued.len());
+        assert_eq!(queued[0].0, graph);
+        store.acknowledge_fts_reindex_queue(&queued).unwrap();
+        assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_fts_queue_for_graph_removes_subject_and_reindex_entries() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:graph");
+        store.create_graph(&graph).unwrap();
+        let subject = store
+            .resolve_term(&EncodedTerm::from_named_node(
+                &oxrdf::NamedNode::new_unchecked("urn:test:subject"),
+            ))
+            .unwrap();
+
+        let mut batch = store.new_batch();
+        store.enqueue_fts(&mut batch, &graph, subject).unwrap();
+        store.enqueue_fts_reindex(&mut batch, &graph).unwrap();
+        store.commit(batch).unwrap();
+
+        store.clear_fts_queue_for_graph(&graph).unwrap();
+        assert!(store.drain_fts_queue(10).unwrap().is_empty());
+        assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+    }
+}
