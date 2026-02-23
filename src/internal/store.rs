@@ -1569,3 +1569,178 @@ impl GraphStore {
         let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
         let key = log_head_key(graph_id, actor);
         let counter = match self.log.get(key)? {
+            Some(value) => decode_u64_bytes(value.as_ref(), "log head")? + 1,
+            None => 1,
+        };
+        batch.insert(&self.log, key, counter.to_be_bytes());
+        Ok(counter)
+    }
+
+    pub(crate) fn append_compact_batch_log(
+        &self,
+        batch: &mut WriteBatch,
+        graph: &GraphId,
+        stored_batch: &StoredBatch,
+    ) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        batch.insert(
+            &self.log,
+            log_batch_key(graph_id, &stored_batch.actor, stored_batch.counter),
+            encode_stored_batch(stored_batch)?,
+        );
+        Ok(())
+    }
+
+    pub fn batch_log_entry(
+        &self,
+        graph: &GraphId,
+        actor: ActorId,
+        counter: u64,
+    ) -> Result<Option<crate::core::Batch>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(None);
+        };
+        self.log
+            .get(log_batch_key(graph_id, &actor, counter))?
+            .map(|bytes| self.decode_batch_log_bytes(graph, bytes.as_ref()))
+            .transpose()
+    }
+
+    pub fn batches_beyond_vector_clock(
+        &self,
+        graph: &GraphId,
+        vector_clock: &VectorClock,
+    ) -> Result<Vec<crate::core::Batch>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut batches = Vec::new();
+        let mut term_cache = HashMap::new();
+        for guard in self.log.prefix(log_batch_prefix(graph_id)) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 41 {
+                continue;
+            }
+            let actor = ActorId(uuid::Uuid::from_bytes(key[17..33].try_into().unwrap()));
+            let counter = u64::from_be_bytes(key[33..41].try_into().unwrap());
+            if vector_clock.contains(&Dot { actor, counter }) {
+                continue;
+            }
+            batches.push(self.decode_batch_log_bytes_with_cache(
+                graph,
+                value.as_ref(),
+                &mut term_cache,
+            )?);
+        }
+        Ok(batches)
+    }
+
+    fn decode_batch_log_bytes(&self, graph: &GraphId, bytes: &[u8]) -> Result<crate::core::Batch> {
+        let mut term_cache = HashMap::new();
+        self.decode_batch_log_bytes_with_cache(graph, bytes, &mut term_cache)
+    }
+
+    fn decode_batch_log_bytes_with_cache(
+        &self,
+        graph: &GraphId,
+        bytes: &[u8],
+        term_cache: &mut HashMap<TermId, EncodedTerm>,
+    ) -> Result<crate::core::Batch> {
+        if bytes.first().copied() != Some(BATCH_LOG_ENCODING_TAG) {
+            return Ok(postcard::from_bytes(bytes)?);
+        }
+
+        let stored: StoredBatch = postcard::from_bytes(&bytes[1..])?;
+        let mut ops = Vec::with_capacity(stored.ops.len());
+        for op in stored.ops {
+            match op {
+                StoredQuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    dot,
+                } => ops.push(QuadOp::Add {
+                    subject: self.decode_term_cached(term_cache, subject)?,
+                    predicate: self.decode_term_cached(term_cache, predicate)?,
+                    object: self.decode_term_cached(term_cache, object)?,
+                    dot,
+                }),
+                StoredQuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    witnessed,
+                } => ops.push(QuadOp::Remove {
+                    subject: self.decode_term_cached(term_cache, subject)?,
+                    predicate: self.decode_term_cached(term_cache, predicate)?,
+                    object: self.decode_term_cached(term_cache, object)?,
+                    witnessed,
+                }),
+            }
+        }
+
+        Ok(crate::core::Batch {
+            graph: graph.clone(),
+            actor: stored.actor,
+            counter: stored.counter,
+            base_clock: stored.base_clock,
+            ops,
+            timestamp: stored.timestamp,
+        })
+    }
+
+    pub(crate) fn decode_term_cached(
+        &self,
+        cache: &mut HashMap<TermId, EncodedTerm>,
+        id: TermId,
+    ) -> Result<EncodedTerm> {
+        if let Some(term) = cache.get(&id) {
+            return Ok(term.clone());
+        }
+        let term = self.decode_term(id)?;
+        cache.insert(id, term.clone());
+        Ok(term)
+    }
+
+    pub fn enqueue_fts(
+        &self,
+        batch: &mut WriteBatch,
+        graph: &GraphId,
+        subject: TermId,
+    ) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        self.enqueue_fts_by_graph_id(batch, graph_id, subject)
+    }
+
+    fn enqueue_fts_by_graph_id(
+        &self,
+        batch: &mut WriteBatch,
+        graph_id: TermId,
+        subject: TermId,
+    ) -> Result<()> {
+        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        batch.insert(
+            &self.graphs,
+            graph_dirty_key(graph_id, subject),
+            token.to_be_bytes(),
+        );
+        Ok(())
+    }
+
+    pub fn enqueue_fts_subjects(
+        &self,
+        batch: &mut WriteBatch,
+        graph: &GraphId,
+        subjects: &HashSet<TermId>,
+    ) -> Result<()> {
+        if subjects.is_empty() {
+            return Ok(());
+        }
+
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        if subjects.len() >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD {
+            return self.enqueue_fts_reindex_by_graph_id(batch, graph_id);
+        }
+
+        for subject in subjects {
