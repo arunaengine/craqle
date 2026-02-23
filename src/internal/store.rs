@@ -1918,3 +1918,178 @@ impl GraphStore {
             let key = graph_dirty_key(graph_id, subject_id);
             if self.graphs.get(key)?.is_some() {
                 batch.remove(&self.graphs, key);
+                dirty = true;
+            }
+        }
+
+        if dirty {
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_fts_queue(&self) -> Result<()> {
+        let mut batch = self.db.batch();
+        let mut dirty = false;
+        for guard in self.graphs.prefix(graph_dirty_prefix()) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.graphs, key);
+            dirty = true;
+        }
+        for guard in self.graphs.prefix(graph_reindex_prefix()) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.graphs, key);
+            dirty = true;
+        }
+        if dirty {
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn new_batch(&self) -> WriteBatch {
+        WriteBatch::new(self.db.batch())
+    }
+
+    pub fn commit(&self, batch: WriteBatch) -> Result<()> {
+        let WriteBatch {
+            inner,
+            pending_quad_states: _,
+            pending_terms: _,
+            quad_mutations,
+            touched_graphs,
+        } = batch;
+        inner.commit()?;
+        self.apply_quad_mutations(quad_mutations, touched_graphs);
+        Ok(())
+    }
+
+    pub fn triples_for_subject(
+        &self,
+        graph: TermId,
+        subject: TermId,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
+        let predicates = self
+            .indexes
+            .read()
+            .unwrap()
+            .by_graph_subject
+            .get(&(graph, subject))
+            .cloned()
+            .unwrap_or_default();
+        let mut triples = Vec::new();
+        for (predicate, object) in predicates {
+            let predicate_term = self.decode_term(predicate)?;
+            triples.push((predicate_term, self.decode_term(object)?));
+        }
+        Ok(triples)
+    }
+
+    pub fn triples_for_subject_excluding_predicate(
+        &self,
+        graph: TermId,
+        subject: TermId,
+        excluded_predicate: TermId,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
+        let predicates = self
+            .indexes
+            .read()
+            .unwrap()
+            .by_graph_subject
+            .get(&(graph, subject))
+            .cloned()
+            .unwrap_or_default();
+        let mut triples = Vec::new();
+        for (predicate, object) in predicates {
+            if predicate == excluded_predicate {
+                continue;
+            }
+            let predicate_term = self.decode_term(predicate)?;
+            triples.push((predicate_term, self.decode_term(object)?));
+        }
+        Ok(triples)
+    }
+
+    pub fn count_objects_for_subject_predicate(
+        &self,
+        graph: &GraphId,
+        subject: &EncodedTerm,
+        predicate: &EncodedTerm,
+    ) -> Result<usize> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(0);
+        };
+        let Some(subject_id) = self.lookup_term(subject)? else {
+            return Ok(0);
+        };
+        let Some(predicate_id) = self.lookup_term(predicate)? else {
+            return Ok(0);
+        };
+        Ok(self.count_objects_for_ids(graph_id, subject_id, predicate_id))
+    }
+
+    pub fn objects_for_subject_predicate_page(
+        &self,
+        graph: &GraphId,
+        subject: &EncodedTerm,
+        predicate: &EncodedTerm,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(usize, Vec<EncodedTerm>)> {
+        if limit == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok((0, Vec::new()));
+        };
+        let Some(subject_id) = self.lookup_term(subject)? else {
+            return Ok((0, Vec::new()));
+        };
+        let Some(predicate_id) = self.lookup_term(predicate)? else {
+            return Ok((0, Vec::new()));
+        };
+
+        let object_ids =
+            self.ordered_objects_for_subject_predicate(graph_id, subject_id, predicate_id)?;
+        let total = object_ids.len();
+        let page = object_ids
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|object| self.decode_term(*object))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((total, page))
+    }
+
+    pub fn objects_for_subject_predicate_page_after(
+        &self,
+        graph: &GraphId,
+        subject: &EncodedTerm,
+        predicate: &EncodedTerm,
+        after: Option<&EncodedTerm>,
+        limit: usize,
+    ) -> Result<Vec<EncodedTerm>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(Vec::new());
+        };
+        let Some(subject_id) = self.lookup_term(subject)? else {
+            return Ok(Vec::new());
+        };
+        let Some(predicate_id) = self.lookup_term(predicate)? else {
+            return Ok(Vec::new());
+        };
+        let object_ids =
+            self.ordered_objects_for_subject_predicate(graph_id, subject_id, predicate_id)?;
+        let start = match after {
+            Some(after) => match self.lookup_term(after)? {
+                Some(after_id) => object_ids
+                    .iter()
+                    .position(|object| *object == after_id)
+                    .map(|index| index + 1)
+                    .unwrap_or(0),
+                None => 0,
