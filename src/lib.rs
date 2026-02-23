@@ -52,3 +52,56 @@ pub use crate::core::{
     SnapshotQuadState,
 };
 pub use crate::replication::{MergeError, UpdateError};
+pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
+pub use crate::search::SearchHit;
+pub use crate::sparql::QueryResults;
+pub use auth::{
+    Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
+    PermissionGrant, PermissionLevel,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum CraqleError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("authorization: {0}")]
+    Authorization(#[from] AuthorizationError),
+    #[error("store: {0}")]
+    Store(#[from] store::StoreError),
+    #[error("search: {0}")]
+    Search(#[from] search::SearchError),
+    #[error("sparql: {0}")]
+    Sparql(#[from] sparql::SparqlError),
+    #[error("update: {0}")]
+    Update(#[from] replication::UpdateError),
+    #[error("merge: {0}")]
+    Merge(#[from] replication::MergeError),
+    #[error("rocrate: {0}")]
+    RoCrate(#[from] rocrate::RoCrateError),
+    #[error("sync input rejected: {0}")]
+    SyncInputRejected(String),
+    #[error("unsupported update across multiple graphs")]
+    MultiGraphUpdateUnsupported,
+}
+
+pub type Result<T> = std::result::Result<T, CraqleError>;
+
+/// Input for creating a new RO-Crate graph.
+#[derive(Debug, Clone)]
+pub struct CreateCrateRequest {
+    pub graph: GraphId,
+    pub name: String,
+    pub description: String,
+    pub date_published: String,
+    pub license: String,
+    pub policy: GraphPolicy,
+}
+
+impl CreateCrateRequest {
+    pub fn new(
+        graph: GraphId,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        date_published: impl Into<String>,
+        license: impl Into<String>,
+        policy: GraphPolicy,
