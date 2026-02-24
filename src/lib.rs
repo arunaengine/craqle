@@ -158,3 +158,56 @@ const MAX_REMOTE_BATCHES: usize = 10_000;
 /// lower-level storage or replication internals.
 pub struct CraqleNode {
     actor: ActorId,
+    store: Arc<GraphStore>,
+    search: Arc<SearchIndex>,
+    sparql: Arc<SparqlEngine>,
+    replication: Arc<ReplicationEngine>,
+}
+
+/// Configuration used when constructing a [`CraqleNode`].
+pub struct CraqleOptions {
+    actor: ActorId,
+}
+
+impl Default for CraqleOptions {
+    fn default() -> Self {
+        Self {
+            actor: ActorId::random(),
+        }
+    }
+}
+
+impl CraqleOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_actor(mut self, actor: ActorId) -> Self {
+        self.actor = actor;
+        self
+    }
+
+    fn into_actor(self) -> ActorId {
+        self.actor
+    }
+}
+
+impl CraqleNode {
+    /// Open a node rooted at `path` with default options.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, CraqleOptions::default())
+    }
+
+    /// Open a node rooted at `path` with an explicit actor id.
+    pub fn open_with_actor(path: impl AsRef<Path>, actor: ActorId) -> Result<Self> {
+        Self::open_with_options(path, CraqleOptions::default().with_actor(actor))
+    }
+
+    /// Open a node rooted at `path` with custom options.
+    pub fn open_with_options(path: impl AsRef<Path>, options: CraqleOptions) -> Result<Self> {
+        let root = path.as_ref();
+        std::fs::create_dir_all(root)?;
+
+        let store = Arc::new(GraphStore::open(root.join("store"))?);
+        let search = Arc::new(SearchIndex::open(root.join("search"))?);
+        let node = Self::from_store_and_search(store, search.clone(), options);
