@@ -265,3 +265,56 @@ impl CraqleNode {
             graph,
             name,
             description,
+            date_published,
+            license,
+            policy,
+        } = request;
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self.manager().create_crate(
+            graph.clone(),
+            &name,
+            &description,
+            &date_published,
+            &license,
+        )?;
+        self.persist_graph_policy(&graph, policy)?;
+        self.finish_batch(&graph, batch)
+    }
+
+    /// Create or replace a root-linked data entity using a typed request.
+    pub fn add_data_entity_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateEntityRequest,
+    ) -> Result<Batch> {
+        self.add_data_entity_with_triples(
+            auth,
+            &request.graph,
+            &request.entity_id,
+            &request.entity_type,
+            &request.name,
+            request.additional_triples,
+        )
+    }
+
+    /// Create or replace a root-linked data entity.
+    pub fn add_data_entity(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+    ) -> Result<Batch> {
+        self.add_data_entity_with_triples(auth, graph, entity_id, entity_type, name, Vec::new())
+    }
+
+    /// Create or replace a root-linked data entity with extra RDF properties.
+    pub fn add_data_entity_with_triples(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
