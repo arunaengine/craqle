@@ -105,3 +105,56 @@ impl CreateCrateRequest {
         date_published: impl Into<String>,
         license: impl Into<String>,
         policy: GraphPolicy,
+    ) -> Self {
+        Self {
+            graph,
+            name: name.into(),
+            description: description.into(),
+            date_published: date_published.into(),
+            license: license.into(),
+            policy,
+        }
+    }
+}
+
+/// Input for creating or replacing a single RO-Crate entity.
+#[derive(Debug, Clone)]
+pub struct CreateEntityRequest {
+    pub graph: GraphId,
+    pub entity_id: String,
+    pub entity_type: String,
+    pub name: String,
+    pub additional_triples: Vec<(NamedNode, Term)>,
+}
+
+/// Input for updating one property value on an existing entity.
+#[derive(Debug, Clone)]
+pub struct UpdatePropertyRequest {
+    pub graph: GraphId,
+    pub entity_id: String,
+    pub predicate: String,
+    pub old_value: Option<String>,
+    pub new_value: String,
+}
+
+/// Search hit together with hydrated RDF properties.
+#[derive(Debug, Clone)]
+pub struct HydratedSearchHit {
+    pub hit: SearchHit,
+    pub properties: Vec<(EncodedTerm, EncodedTerm)>,
+}
+
+const MAX_SYNC_BATCH_OPS: usize = 50_000;
+const MAX_SYNC_POLICY_PATHS: usize = 1_024;
+const MAX_SYNC_SNAPSHOT_QUADS: usize = 250_000;
+const MAX_SYNC_SNAPSHOT_TERMS: usize = 500_000;
+const MAX_REMOTE_BATCHES: usize = 10_000;
+
+/// Main application handle for local RO-Crate operations.
+///
+/// Prefer this root API for service integration. It offers authorization-aware
+/// RO-Crate creation, entity append/update operations, JSON-LD export, search,
+/// and replication message handling without requiring direct access to the
+/// lower-level storage or replication internals.
+pub struct CraqleNode {
+    actor: ActorId,
