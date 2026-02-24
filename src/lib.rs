@@ -211,3 +211,57 @@ impl CraqleNode {
         let store = Arc::new(GraphStore::open(root.join("store"))?);
         let search = Arc::new(SearchIndex::open(root.join("search"))?);
         let node = Self::from_store_and_search(store, search.clone(), options);
+        if search.needs_rebuild() {
+            node.reindex_search()?;
+        }
+        Ok(node)
+    }
+
+    pub fn from_store_and_search(
+        store: Arc<GraphStore>,
+        search: Arc<SearchIndex>,
+        options: CraqleOptions,
+    ) -> Self {
+        let actor = options.into_actor();
+        let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
+        let replication = Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
+
+        Self {
+            actor,
+            store,
+            search,
+            sparql,
+            replication,
+        }
+    }
+
+    /// Return the local actor id used for authored replication batches.
+    pub fn actor(&self) -> ActorId {
+        self.actor
+    }
+
+    pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
+        Ok(self.store.graph_policy(graph)?)
+    }
+
+    pub fn graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
+        Ok(self.store.graph_diagnostics(graph)?)
+    }
+
+    pub fn graph_violations(&self, graph: &GraphId) -> Result<Vec<CrateViolation>> {
+        Ok(crate::rules::post_merge_violations_from_store(
+            &self.store,
+            graph,
+        )?)
+    }
+
+    /// Create a new RO-Crate graph.
+    pub fn create_crate(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+    ) -> Result<Batch> {
+        let CreateCrateRequest {
+            graph,
+            name,
+            description,
