@@ -318,3 +318,56 @@ impl CraqleNode {
         entity_id: &str,
         entity_type: &str,
         name: &str,
+        additional_triples: Vec<(NamedNode, Term)>,
+    ) -> Result<Batch> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let batch = self.manager().add_data_entity(
+            graph,
+            entity_id,
+            entity_type,
+            name,
+            additional_triples,
+        )?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Append many new root-linked data entities in one committed batch.
+    pub fn append_new_root_data_entities(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        entities: Vec<NewDataEntity>,
+    ) -> Result<AppendDataEntitiesReport> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let report = self
+            .manager()
+            .append_new_root_data_entities(graph, entities)?;
+        self.finish_report(graph, report)
+    }
+
+    /// Append many new child data entities under an existing parent entity.
+    pub fn append_new_data_entities_under(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        parent_id: &str,
+        entities: Vec<NewDataEntity>,
+    ) -> Result<AppendDataEntitiesReport> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let report = self
+            .manager()
+            .append_new_data_entities_under(graph, parent_id, entities)?;
+        self.finish_report(graph, report)
+    }
+
+    /// Create or replace a contextual entity using a typed request.
+    pub fn add_contextual_entity_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateEntityRequest,
+    ) -> Result<Batch> {
+        self.add_contextual_entity_with_triples(
+            auth,
+            &request.graph,
+            &request.entity_id,
+            &request.entity_type,
