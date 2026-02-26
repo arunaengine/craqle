@@ -699,3 +699,144 @@ pub fn post_merge_violations_from_store(
 }
 
 fn first_subject_missing_type_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<Option<EncodedTerm>> {
+    let rdf_type = encoded_nn(&vocab::rdf_type());
+    for subject in impacted_subjects(delta, graph) {
+        let triple_count = subject_triple_count_after(store, graph, &subject, delta)?;
+        if triple_count == 0 {
+            continue;
+        }
+        if count_sp_after(store, graph, &subject, &rdf_type, delta)? == 0 {
+            return Ok(Some(subject));
+        }
+    }
+
+    Ok(None)
+}
+
+fn first_orphan_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<Option<EncodedTerm>> {
+    let terms = ReachabilityTerms::new();
+
+    let reachable = reachable_entities_after(store, graph, delta, &terms.root, &terms.has_part)?;
+    for entity in impacted_reachability_entities(delta, graph, &terms.rdf_type, &terms.has_part)? {
+        if entity == terms.root {
+            continue;
+        }
+        if is_data_entity_after(store, graph, delta, &entity, &terms)?
+            && !reachable.contains(&entity)
+        {
+            return Ok(Some(entity));
+        }
+    }
+
+    Ok(None)
+}
+
+fn first_orphan_after_localized(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+    summary: &DeltaSummary,
+) -> crate::store::Result<Option<EncodedTerm>> {
+    let terms = ReachabilityTerms::new();
+
+    let mut candidate_entities = BTreeSet::new();
+    let mut caches = ReachabilityCaches::default();
+    for seed in &summary.reachability_seeds {
+        collect_descendants_after_cached(
+            store,
+            graph,
+            delta,
+            seed,
+            &terms.has_part,
+            &mut caches.children,
+            &mut candidate_entities,
+        )?;
+    }
+
+    for entity in candidate_entities {
+        if entity == terms.root {
+            continue;
+        }
+
+        if is_data_entity_after_cached(store, graph, delta, &entity, &terms, &mut caches)?
+            && !is_reachable_after_cached(store, graph, delta, &entity, &terms, &mut caches)?
+        {
+            return Ok(Some(entity));
+        }
+    }
+
+    Ok(None)
+}
+
+fn summarize_delta(graph: &GraphId, delta: &[MaterializedQuadChange]) -> DeltaSummary {
+    let root = encoded_nn(&vocab::root_entity());
+    let metadata = encoded_nn(&vocab::metadata_descriptor());
+    let rdf_type = encoded_nn(&vocab::rdf_type());
+    let dataset = encoded_nn(&vocab::schema_dataset());
+    let media_object = encoded_nn(&vocab::schema_media_object());
+    let creative_work = encoded_nn(&vocab::schema_creative_work());
+    let about = encoded_nn(&vocab::schema_about());
+    let has_part = encoded_nn(&vocab::schema_has_part());
+    let root_name = encoded_nn(&vocab::schema_name());
+    let root_description = encoded_nn(&vocab::schema_description());
+    let root_date_published = encoded_nn(&vocab::schema_date_published());
+    let root_license = encoded_nn(&vocab::schema_license());
+
+    let mut summary = DeltaSummary::default();
+
+    for change in delta {
+        let (change_graph, subject, predicate, object) = match change {
+            MaterializedQuadChange::Insert {
+                graph,
+                subject,
+                predicate,
+                object,
+            }
+            | MaterializedQuadChange::Delete {
+                graph,
+                subject,
+                predicate,
+                object,
+            } => (graph, subject, predicate, object),
+        };
+
+        if change_graph != graph {
+            continue;
+        }
+
+        summary.impacted_subjects.insert(subject.clone());
+        if matches!(change, MaterializedQuadChange::Insert { .. }) {
+            summary.inserted_subjects.insert(subject.clone());
+        }
+
+        if subject == &root {
+            if predicate == &root_name {
+                summary.touches_root_name = true;
+            }
+            if predicate == &root_description {
+                summary.touches_root_description = true;
+            }
+            if predicate == &root_date_published {
+                summary.touches_root_date_published = true;
+            }
+            if predicate == &root_license {
+                summary.touches_root_license = true;
+            }
+            if predicate == &rdf_type && object == &dataset {
+                summary.touches_root_dataset = true;
+            }
+        }
+
+        if subject == &metadata
+            && ((predicate == &rdf_type && object == &creative_work)
+                || (predicate == &about && object == &root))
+        {
+            summary.touches_metadata_descriptor = true;
