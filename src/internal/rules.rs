@@ -279,3 +279,143 @@ impl Rule for RootEntityRule {
     }
 
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
+        let root = encoded_nn(&vocab::root_entity());
+        let rdf_type = encoded_nn(&vocab::rdf_type());
+        let dataset = encoded_nn(&vocab::schema_dataset());
+
+        if !has_triple(post, &root, &rdf_type, &dataset) {
+            return Err(CrateViolation::MissingRootDataEntity);
+        }
+        Ok(())
+    }
+}
+
+pub struct MetadataDescriptorRule;
+
+impl Rule for MetadataDescriptorRule {
+    fn check_candidate_with_summary(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+        summary: &DeltaSummary,
+    ) -> crate::store::Result<CandidateCheck> {
+        if !delta.is_empty() && !summary.touches_metadata_descriptor {
+            return Ok(CandidateCheck::Pass);
+        }
+        self.check_candidate(store, graph, delta)
+    }
+
+    fn check_candidate(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+    ) -> crate::store::Result<CandidateCheck> {
+        let descriptor = encoded_nn(&vocab::metadata_descriptor());
+        let rdf_type = encoded_nn(&vocab::rdf_type());
+        let creative_work = encoded_nn(&vocab::schema_creative_work());
+        let about = encoded_nn(&vocab::schema_about());
+        let root = encoded_nn(&vocab::root_entity());
+
+        let has_type =
+            triple_exists_after(store, graph, &descriptor, &rdf_type, &creative_work, delta)?;
+        let has_about = triple_exists_after(store, graph, &descriptor, &about, &root, delta)?;
+
+        Ok(if has_type && has_about {
+            CandidateCheck::Pass
+        } else {
+            CandidateCheck::Violation(CrateViolation::MissingMetadataDescriptor)
+        })
+    }
+
+    fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
+        let descriptor = encoded_nn(&vocab::metadata_descriptor());
+        let rdf_type = encoded_nn(&vocab::rdf_type());
+        let creative_work = encoded_nn(&vocab::schema_creative_work());
+        let about = encoded_nn(&vocab::schema_about());
+        let root = encoded_nn(&vocab::root_entity());
+
+        let has_type = has_triple(post, &descriptor, &rdf_type, &creative_work);
+        let has_about = has_triple(post, &descriptor, &about, &root);
+
+        if !has_type || !has_about {
+            return Err(CrateViolation::MissingMetadataDescriptor);
+        }
+        Ok(())
+    }
+}
+
+pub struct RequiredRootPropertiesRule;
+
+impl Rule for RequiredRootPropertiesRule {
+    fn check_candidate_with_summary(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+        summary: &DeltaSummary,
+    ) -> crate::store::Result<CandidateCheck> {
+        if !delta.is_empty() && !summary.touches_required_root_properties() {
+            return Ok(CandidateCheck::Pass);
+        }
+
+        let root = encoded_nn(&vocab::root_entity());
+        let required: &[(oxrdf::NamedNode, &str)] = &[
+            (vocab::schema_name(), "schema:name"),
+            (vocab::schema_description(), "schema:description"),
+            (vocab::schema_date_published(), "schema:datePublished"),
+            (vocab::schema_license(), "schema:license"),
+        ];
+
+        for ((nn, label), touched) in required
+            .iter()
+            .zip(summary.touched_required_root_properties())
+        {
+            if !delta.is_empty() && !touched {
+                continue;
+            }
+            let pred = encoded_nn(nn);
+            if count_sp_after(store, graph, &root, &pred, delta)? < 1 {
+                return Ok(CandidateCheck::Violation(
+                    CrateViolation::MissingRequiredProperty {
+                        entity: "./".to_string(),
+                        property: label.to_string(),
+                    },
+                ));
+            }
+        }
+
+        Ok(CandidateCheck::Pass)
+    }
+
+    fn check_candidate(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+    ) -> crate::store::Result<CandidateCheck> {
+        let root = encoded_nn(&vocab::root_entity());
+        let required: &[(oxrdf::NamedNode, &str)] = &[
+            (vocab::schema_name(), "schema:name"),
+            (vocab::schema_description(), "schema:description"),
+            (vocab::schema_date_published(), "schema:datePublished"),
+            (vocab::schema_license(), "schema:license"),
+        ];
+
+        for (nn, label) in required {
+            let pred = encoded_nn(nn);
+            if count_sp_after(store, graph, &root, &pred, delta)? < 1 {
+                return Ok(CandidateCheck::Violation(
+                    CrateViolation::MissingRequiredProperty {
+                        entity: "./".to_string(),
+                        property: label.to_string(),
+                    },
+                ));
+            }
+        }
+
+        Ok(CandidateCheck::Pass)
+    }
+
+    fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
