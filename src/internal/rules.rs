@@ -419,3 +419,143 @@ impl Rule for RequiredRootPropertiesRule {
     }
 
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
+        let root = encoded_nn(&vocab::root_entity());
+
+        let required: &[(oxrdf::NamedNode, &str)] = &[
+            (vocab::schema_name(), "schema:name"),
+            (vocab::schema_description(), "schema:description"),
+            (vocab::schema_date_published(), "schema:datePublished"),
+            (vocab::schema_license(), "schema:license"),
+        ];
+
+        for (nn, label) in required {
+            let pred = encoded_nn(nn);
+            if count_sp(post, &root, &pred) < 1 {
+                return Err(CrateViolation::MissingRequiredProperty {
+                    entity: "./".to_string(),
+                    property: label.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct DatePublishedCardinalityRule;
+
+impl Rule for DatePublishedCardinalityRule {
+    fn check_candidate_with_summary(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+        summary: &DeltaSummary,
+    ) -> crate::store::Result<CandidateCheck> {
+        if !delta.is_empty() && !summary.touches_root_date_published {
+            return Ok(CandidateCheck::Pass);
+        }
+        self.check_candidate(store, graph, delta)
+    }
+
+    fn check_candidate(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+    ) -> crate::store::Result<CandidateCheck> {
+        let root = encoded_nn(&vocab::root_entity());
+        let date_pub = encoded_nn(&vocab::schema_date_published());
+        let count = count_sp_after(store, graph, &root, &date_pub, delta)?;
+
+        Ok(if count == 1 {
+            CandidateCheck::Pass
+        } else {
+            CandidateCheck::Violation(CrateViolation::InvalidDatePublishedCardinality { count })
+        })
+    }
+
+    fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
+        let root = encoded_nn(&vocab::root_entity());
+        let date_pub = encoded_nn(&vocab::schema_date_published());
+        let count = count_sp(post, &root, &date_pub);
+
+        if count != 1 {
+            return Err(CrateViolation::InvalidDatePublishedCardinality { count });
+        }
+        Ok(())
+    }
+}
+
+pub struct EntityTypeRule;
+
+impl Rule for EntityTypeRule {
+    fn check_candidate_with_summary(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+        summary: &DeltaSummary,
+    ) -> crate::store::Result<CandidateCheck> {
+        if delta.is_empty() {
+            return Ok(CandidateCheck::NeedSnapshot);
+        }
+
+        let rdf_type = encoded_nn(&vocab::rdf_type());
+        let mut candidates = summary.type_changed_subjects.clone();
+        for subject in &summary.inserted_subjects {
+            if current_subject_triple_count(store, graph, subject)? == 0 {
+                candidates.insert(subject.clone());
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(CandidateCheck::Pass);
+        }
+
+        for subject in candidates {
+            let triple_count = subject_triple_count_after(store, graph, &subject, delta)?;
+            if triple_count == 0 {
+                continue;
+            }
+            if count_sp_after(store, graph, &subject, &rdf_type, delta)? == 0 {
+                return Ok(CandidateCheck::Violation(
+                    CrateViolation::EntityMissingType {
+                        entity_id: subject.0,
+                    },
+                ));
+            }
+        }
+
+        Ok(CandidateCheck::Pass)
+    }
+
+    fn check_candidate(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+    ) -> crate::store::Result<CandidateCheck> {
+        if delta.is_empty() {
+            return Ok(CandidateCheck::NeedSnapshot);
+        }
+
+        if let Some(subject) = first_subject_missing_type_after(store, graph, delta)? {
+            return Ok(CandidateCheck::Violation(
+                CrateViolation::EntityMissingType {
+                    entity_id: subject.0,
+                },
+            ));
+        }
+
+        Ok(CandidateCheck::Pass)
+    }
+
+    fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
+        let rdf_type = encoded_nn(&vocab::rdf_type());
+
+        let subjects: HashSet<&EncodedTerm> = post.triples.iter().map(|(s, _, _)| s).collect();
+
+        for subject in &subjects {
+            let has_type = post
+                .triples
+                .iter()
