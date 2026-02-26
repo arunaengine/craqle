@@ -559,3 +559,143 @@ impl Rule for EntityTypeRule {
             let has_type = post
                 .triples
                 .iter()
+                .any(|(s, p, _)| s == *subject && p == &rdf_type);
+            if !has_type {
+                let id = subject.0.clone();
+                return Err(CrateViolation::EntityMissingType { entity_id: id });
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct ReachabilityRule;
+
+impl Rule for ReachabilityRule {
+    fn check_candidate_with_summary(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+        summary: &DeltaSummary,
+    ) -> crate::store::Result<CandidateCheck> {
+        if delta.is_empty() {
+            return Ok(CandidateCheck::NeedSnapshot);
+        }
+        if !summary.touches_reachability {
+            return Ok(CandidateCheck::Pass);
+        }
+
+        Ok(
+            match first_orphan_after_localized(store, graph, delta, summary)? {
+                Some(entity) => CandidateCheck::Violation(CrateViolation::OrphanedDataEntity {
+                    entity_id: entity.0,
+                }),
+                None => CandidateCheck::Pass,
+            },
+        )
+    }
+
+    fn check_candidate(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        delta: &[MaterializedQuadChange],
+    ) -> crate::store::Result<CandidateCheck> {
+        if delta.is_empty() {
+            return Ok(CandidateCheck::NeedSnapshot);
+        }
+
+        Ok(match first_orphan_after(store, graph, delta)? {
+            Some(entity) => CandidateCheck::Violation(CrateViolation::OrphanedDataEntity {
+                entity_id: entity.0,
+            }),
+            None => CandidateCheck::Pass,
+        })
+    }
+
+    fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
+        if let Some(entity) = orphaned_data_entities(post).into_iter().next() {
+            return Err(CrateViolation::OrphanedDataEntity {
+                entity_id: entity.0,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Create the default set of RO-Crate 1.2 rules.
+pub fn default_rules() -> Vec<Box<dyn Rule>> {
+    vec![
+        Box::new(RootEntityRule),
+        Box::new(MetadataDescriptorRule),
+        Box::new(RequiredRootPropertiesRule),
+        Box::new(DatePublishedCardinalityRule),
+        Box::new(EntityTypeRule),
+        Box::new(ReachabilityRule),
+    ]
+}
+
+/// Run all rules against the post-state, collecting violations.
+pub fn validate_change_set(
+    rules: &[Box<dyn Rule>],
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+) -> std::result::Result<(), RuleEvaluationError> {
+    let mut violations = Vec::new();
+    let mut post = None;
+    let summary = summarize_delta(graph, delta);
+
+    for rule in rules {
+        match rule.check_candidate_with_summary(store, graph, delta, &summary)? {
+            CandidateCheck::Pass => {}
+            CandidateCheck::Violation(violation) => violations.push(violation),
+            CandidateCheck::NeedSnapshot => {
+                if post.is_none() {
+                    let snapshot = GraphSnapshot::from_store(store, graph)?;
+                    post = Some(apply_delta(&snapshot, delta));
+                }
+                let post = post.as_ref().unwrap();
+                if let Err(violation) = rule.check_post_state(post) {
+                    violations.push(violation);
+                }
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(RuleEvaluationError::Violations(violations))
+    }
+}
+
+pub fn post_merge_violations_from_store(
+    store: &GraphStore,
+    graph: &GraphId,
+) -> crate::store::Result<Vec<CrateViolation>> {
+    let rules = default_rules();
+    let mut violations = Vec::new();
+    let mut snapshot = None;
+
+    for rule in &rules {
+        match rule.check_candidate(store, graph, &[])? {
+            CandidateCheck::Pass => {}
+            CandidateCheck::Violation(violation) => violations.push(violation),
+            CandidateCheck::NeedSnapshot => {
+                if snapshot.is_none() {
+                    snapshot = Some(GraphSnapshot::from_store(store, graph)?);
+                }
+                if let Err(violation) = rule.check_post_state(snapshot.as_ref().unwrap()) {
+                    violations.push(violation);
+                }
+            }
+        }
+    }
+
+    Ok(violations)
+}
+
+fn first_subject_missing_type_after(
