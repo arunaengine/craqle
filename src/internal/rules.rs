@@ -1260,3 +1260,143 @@ fn has_incoming_has_part_after(
                 predicate,
                 object,
                 ..
+            } if change_graph == graph && predicate == has_part && object == entity => count -= 1,
+            _ => {}
+        }
+    }
+    Ok(count > 0)
+}
+
+fn current_incoming_has_part_count(
+    store: &GraphStore,
+    graph: &GraphId,
+    entity: &EncodedTerm,
+    has_part: &EncodedTerm,
+) -> crate::store::Result<usize> {
+    let Some(graph_id) = graph_term_id(store, graph)? else {
+        return Ok(0);
+    };
+    let Some(predicate_id) = store.lookup_term(has_part)? else {
+        return Ok(0);
+    };
+    let Some(object_id) = store.lookup_term(entity)? else {
+        return Ok(0);
+    };
+    store.predicate_object_count_by_ids(graph_id, predicate_id, object_id)
+}
+
+fn graph_term_id(
+    store: &GraphStore,
+    graph: &GraphId,
+) -> crate::store::Result<Option<crate::store::TermId>> {
+    store.lookup_term(&EncodedTerm::from_named_node(&graph.0))
+}
+
+fn triple_exists_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    predicate: &EncodedTerm,
+    object: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<bool> {
+    let mut exists = current_triple_exists(store, graph, subject, predicate, object)?;
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject: change_subject,
+                predicate: change_predicate,
+                object: change_object,
+            } if change_graph == graph
+                && change_subject == subject
+                && change_predicate == predicate
+                && change_object == object =>
+            {
+                exists = true;
+            }
+            MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject: change_subject,
+                predicate: change_predicate,
+                object: change_object,
+            } if change_graph == graph
+                && change_subject == subject
+                && change_predicate == predicate
+                && change_object == object =>
+            {
+                exists = false;
+            }
+            _ => {}
+        }
+    }
+    Ok(exists)
+}
+
+fn count_sp_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    predicate: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<usize> {
+    let mut count = store.count_objects_for_subject_predicate(graph, subject, predicate)? as i64;
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject: change_subject,
+                predicate: change_predicate,
+                ..
+            } if change_graph == graph
+                && change_subject == subject
+                && change_predicate == predicate =>
+            {
+                count += 1;
+            }
+            MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject: change_subject,
+                predicate: change_predicate,
+                ..
+            } if change_graph == graph
+                && change_subject == subject
+                && change_predicate == predicate =>
+            {
+                count -= 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(count.max(0) as usize)
+}
+
+fn current_triple_exists(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    predicate: &EncodedTerm,
+    object: &EncodedTerm,
+) -> crate::store::Result<bool> {
+    let Some(graph_id) = graph_term_id(store, graph)? else {
+        return Ok(false);
+    };
+    let Some(subject_id) = store.lookup_term(subject)? else {
+        return Ok(false);
+    };
+    let Some(predicate_id) = store.lookup_term(predicate)? else {
+        return Ok(false);
+    };
+    let Some(object_id) = store.lookup_term(object)? else {
+        return Ok(false);
+    };
+
+    Ok(!store
+        .quads_for_pattern(
+            Some(graph_id),
+            Some(subject_id),
+            Some(predicate_id),
+            Some(object_id),
+        )?
+        .is_empty())
+}
