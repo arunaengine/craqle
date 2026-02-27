@@ -980,3 +980,143 @@ fn reachable_entities_after(
 
 fn children_after(
     store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    has_part: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    let mut children = current_children(store, graph, subject, has_part)?;
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject: change_subject,
+                predicate,
+                object,
+            } if change_graph == graph && change_subject == subject && predicate == has_part => {
+                children.insert(object.clone());
+            }
+            MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject: change_subject,
+                predicate,
+                object,
+            } if change_graph == graph && change_subject == subject && predicate == has_part => {
+                children.remove(object);
+            }
+            _ => {}
+        }
+    }
+    Ok(children)
+}
+
+fn current_children(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    has_part: &EncodedTerm,
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    let Some(graph_id) = graph_term_id(store, graph)? else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(subject_id) = store.lookup_term(subject)? else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(store
+        .triples_for_subject(graph_id, subject_id)?
+        .into_iter()
+        .filter_map(|(predicate, object)| (predicate == *has_part).then_some(object))
+        .collect())
+}
+
+fn children_after_cached(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    has_part: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+    cache: &mut HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    if let Some(children) = cache.get(subject) {
+        return Ok(children.clone());
+    }
+
+    let children = children_after(store, graph, subject, has_part, delta)?;
+    cache.insert(subject.clone(), children.clone());
+    Ok(children)
+}
+
+fn collect_descendants_after_cached(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+    root: &EncodedTerm,
+    has_part: &EncodedTerm,
+    children_cache: &mut HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
+    out: &mut BTreeSet<EncodedTerm>,
+) -> crate::store::Result<()> {
+    let mut queue = VecDeque::from([root.clone()]);
+    while let Some(subject) = queue.pop_front() {
+        if !out.insert(subject.clone()) {
+            continue;
+        }
+        for child in children_after_cached(store, graph, &subject, has_part, delta, children_cache)?
+        {
+            queue.push_back(child);
+        }
+    }
+    Ok(())
+}
+
+fn parents_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    entity: &EncodedTerm,
+    has_part: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    let mut parents = current_parents(store, graph, entity, has_part)?;
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject,
+                predicate,
+                object,
+            } if change_graph == graph && predicate == has_part && object == entity => {
+                parents.insert(subject.clone());
+            }
+            MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject,
+                predicate,
+                object,
+            } if change_graph == graph && predicate == has_part && object == entity => {
+                parents.remove(subject);
+            }
+            _ => {}
+        }
+    }
+    Ok(parents)
+}
+
+fn parents_after_cached(
+    store: &GraphStore,
+    graph: &GraphId,
+    entity: &EncodedTerm,
+    has_part: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+    cache: &mut HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    if let Some(parents) = cache.get(entity) {
+        return Ok(parents.clone());
+    }
+
+    let parents = parents_after(store, graph, entity, has_part, delta)?;
+    cache.insert(entity.clone(), parents.clone());
+    Ok(parents)
+}
+
+fn current_parents(
+    store: &GraphStore,
+    graph: &GraphId,
