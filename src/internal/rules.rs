@@ -840,3 +840,143 @@ fn summarize_delta(graph: &GraphId, delta: &[MaterializedQuadChange]) -> DeltaSu
                 || (predicate == &about && object == &root))
         {
             summary.touches_metadata_descriptor = true;
+        }
+
+        if predicate == &has_part {
+            summary.touches_reachability = true;
+            summary.reachability_seeds.insert(object.clone());
+        }
+
+        if predicate == &rdf_type {
+            summary.type_changed_subjects.insert(subject.clone());
+            if object == &dataset || object == &media_object {
+                summary.touches_reachability = true;
+                summary.reachability_seeds.insert(subject.clone());
+            }
+        }
+    }
+
+    summary
+}
+
+fn impacted_subjects(delta: &[MaterializedQuadChange], graph: &GraphId) -> BTreeSet<EncodedTerm> {
+    delta
+        .iter()
+        .filter_map(|change| match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject,
+                ..
+            }
+            | MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject,
+                ..
+            } if change_graph == graph => Some(subject.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn subject_triple_count_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<usize> {
+    let mut count = current_subject_triple_count(store, graph, subject)? as i64;
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject: change_subject,
+                ..
+            } if change_graph == graph && change_subject == subject => count += 1,
+            MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject: change_subject,
+                ..
+            } if change_graph == graph && change_subject == subject => count -= 1,
+            _ => {}
+        }
+    }
+    Ok(count.max(0) as usize)
+}
+
+fn current_subject_triple_count(
+    store: &GraphStore,
+    graph: &GraphId,
+    subject: &EncodedTerm,
+) -> crate::store::Result<usize> {
+    let Some(graph_id) = graph_term_id(store, graph)? else {
+        return Ok(0);
+    };
+    let Some(subject_id) = store.lookup_term(subject)? else {
+        return Ok(0);
+    };
+    store.subject_triple_count_by_ids(graph_id, subject_id)
+}
+
+fn impacted_reachability_entities(
+    delta: &[MaterializedQuadChange],
+    graph: &GraphId,
+    rdf_type: &EncodedTerm,
+    has_part: &EncodedTerm,
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    let dataset = encoded_nn(&vocab::schema_dataset());
+    let media_object = encoded_nn(&vocab::schema_media_object());
+    let mut entities = BTreeSet::new();
+
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                subject,
+                predicate,
+                object,
+            }
+            | MaterializedQuadChange::Delete {
+                graph: change_graph,
+                subject,
+                predicate,
+                object,
+            } if change_graph == graph => {
+                if predicate == has_part {
+                    entities.insert(subject.clone());
+                    entities.insert(object.clone());
+                }
+                if predicate == rdf_type && (object == &dataset || object == &media_object) {
+                    entities.insert(subject.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(entities)
+}
+
+fn reachable_entities_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+    root: &EncodedTerm,
+    has_part: &EncodedTerm,
+) -> crate::store::Result<HashSet<EncodedTerm>> {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([root.clone()]);
+    reachable.insert(root.clone());
+
+    while let Some(subject) = queue.pop_front() {
+        for child in children_after(store, graph, &subject, has_part, delta)? {
+            if reachable.insert(child.clone()) {
+                queue.push_back(child);
+            }
+        }
+    }
+
+    Ok(reachable)
+}
+
+fn children_after(
+    store: &GraphStore,
