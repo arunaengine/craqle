@@ -1120,3 +1120,143 @@ fn parents_after_cached(
 fn current_parents(
     store: &GraphStore,
     graph: &GraphId,
+    entity: &EncodedTerm,
+    has_part: &EncodedTerm,
+) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+    let Some(graph_id) = graph_term_id(store, graph)? else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(predicate_id) = store.lookup_term(has_part)? else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(object_id) = store.lookup_term(entity)? else {
+        return Ok(BTreeSet::new());
+    };
+
+    store
+        .quads_for_pattern(Some(graph_id), None, Some(predicate_id), Some(object_id))?
+        .into_iter()
+        .map(|quad| store.decode_term(quad.subject))
+        .collect::<crate::store::Result<BTreeSet<_>>>()
+}
+
+fn is_reachable_after_cached(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+    entity: &EncodedTerm,
+    terms: &ReachabilityTerms,
+    caches: &mut ReachabilityCaches,
+) -> crate::store::Result<bool> {
+    if entity == &terms.root {
+        return Ok(true);
+    }
+    if let Some(reachable) = caches.reachability.get(entity) {
+        return Ok(*reachable);
+    }
+    if !caches.visiting.insert(entity.clone()) {
+        return Ok(false);
+    }
+
+    let mut reachable = false;
+    for parent in parents_after_cached(
+        store,
+        graph,
+        entity,
+        &terms.has_part,
+        delta,
+        &mut caches.parents,
+    )? {
+        if is_reachable_after_cached(store, graph, delta, &parent, terms, caches)? {
+            reachable = true;
+            break;
+        }
+    }
+
+    caches.visiting.remove(entity);
+    caches.reachability.insert(entity.clone(), reachable);
+    Ok(reachable)
+}
+
+fn is_data_entity_after_cached(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+    entity: &EncodedTerm,
+    terms: &ReachabilityTerms,
+    caches: &mut ReachabilityCaches,
+) -> crate::store::Result<bool> {
+    let has_data_type =
+        triple_exists_after(store, graph, entity, &terms.rdf_type, &terms.dataset, delta)?
+            || triple_exists_after(
+                store,
+                graph,
+                entity,
+                &terms.rdf_type,
+                &terms.media_object,
+                delta,
+            )?;
+    let has_outgoing = !children_after_cached(
+        store,
+        graph,
+        entity,
+        &terms.has_part,
+        delta,
+        &mut caches.children,
+    )?
+    .is_empty();
+    let has_incoming = !parents_after_cached(
+        store,
+        graph,
+        entity,
+        &terms.has_part,
+        delta,
+        &mut caches.parents,
+    )?
+    .is_empty();
+    Ok(has_data_type || has_outgoing || has_incoming)
+}
+
+fn is_data_entity_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    delta: &[MaterializedQuadChange],
+    entity: &EncodedTerm,
+    terms: &ReachabilityTerms,
+) -> crate::store::Result<bool> {
+    let has_data_type =
+        triple_exists_after(store, graph, entity, &terms.rdf_type, &terms.dataset, delta)?
+            || triple_exists_after(
+                store,
+                graph,
+                entity,
+                &terms.rdf_type,
+                &terms.media_object,
+                delta,
+            )?;
+    let has_outgoing = !children_after(store, graph, entity, &terms.has_part, delta)?.is_empty();
+    let has_incoming = has_incoming_has_part_after(store, graph, entity, &terms.has_part, delta)?;
+    Ok(has_data_type || has_outgoing || has_incoming)
+}
+
+fn has_incoming_has_part_after(
+    store: &GraphStore,
+    graph: &GraphId,
+    entity: &EncodedTerm,
+    has_part: &EncodedTerm,
+    delta: &[MaterializedQuadChange],
+) -> crate::store::Result<bool> {
+    let mut count = current_incoming_has_part_count(store, graph, entity, has_part)? as i64;
+    for change in delta {
+        match change {
+            MaterializedQuadChange::Insert {
+                graph: change_graph,
+                predicate,
+                object,
+                ..
+            } if change_graph == graph && predicate == has_part && object == entity => count += 1,
+            MaterializedQuadChange::Delete {
+                graph: change_graph,
+                predicate,
+                object,
+                ..
