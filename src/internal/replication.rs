@@ -46,3 +46,51 @@ pub struct ReplicationEngine {
 enum DiagnosticsRefresh {
     Immediate,
     Deferred,
+}
+
+const MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH: usize = 10_000;
+
+impl ReplicationEngine {
+    pub fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
+        Self {
+            store,
+            sparql,
+            rules: crate::rules::default_rules(),
+            actor,
+            gap_buffer: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn store(&self) -> &Arc<GraphStore> {
+        &self.store
+    }
+
+    /// Execute a SPARQL Update locally with full validation.
+    /// Returns `None` if the update produced no changes.
+    pub fn local_update(&self, sparql_update: &str) -> Result<Option<Batch>, UpdateError> {
+        let changes = self.sparql.evaluate_update(sparql_update)?;
+
+        if changes.is_empty() {
+            return Ok(None);
+        }
+
+        let graph = match &changes[0] {
+            MaterializedQuadChange::Insert { graph, .. }
+            | MaterializedQuadChange::Delete { graph, .. } => graph.clone(),
+        };
+        self.ensure_change_set_targets(&graph, &changes)?;
+
+        match crate::rules::validate_change_set(&self.rules, &self.store, &graph, &changes) {
+            Ok(()) => {}
+            Err(crate::rules::RuleEvaluationError::Store(error)) => {
+                return Err(UpdateError::Store(error));
+            }
+            Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
+                return Err(UpdateError::ValidationFailed(violations));
+            }
+        }
+
+        self.commit_changes(&graph, changes).map(Some)
+    }
+
+    /// Insert raw quads (bypasses SPARQL, still validates).
