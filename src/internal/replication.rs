@@ -94,3 +94,50 @@ impl ReplicationEngine {
     }
 
     /// Insert raw quads (bypasses SPARQL, still validates).
+    pub fn local_insert_quads(
+        &self,
+        graph: &GraphId,
+        quads: Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>,
+    ) -> Result<Batch, UpdateError> {
+        let changes: Vec<MaterializedQuadChange> = quads
+            .into_iter()
+            .map(|(s, p, o)| MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: s,
+                predicate: p,
+                object: o,
+            })
+            .collect();
+
+        self.local_apply_changes(graph, changes)
+    }
+
+    /// Apply a pre-materialized change set locally with full validation.
+    pub fn local_apply_changes(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+
+        if changes.is_empty() {
+            return Ok(Batch {
+                graph: graph.clone(),
+                actor: self.actor,
+                counter: 0,
+                base_clock: self.store.get_vector_clock(graph)?,
+                ops: vec![],
+                timestamp: Utc::now(),
+            });
+        }
+
+        match crate::rules::validate_change_set(&self.rules, &self.store, graph, &changes) {
+            Ok(()) => {}
+            Err(crate::rules::RuleEvaluationError::Store(error)) => {
+                return Err(UpdateError::Store(error));
+            }
+            Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
+                return Err(UpdateError::ValidationFailed(violations));
+            }
+        }
+
