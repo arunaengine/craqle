@@ -237,3 +237,50 @@ impl ReplicationEngine {
     ) -> Result<Batch, UpdateError> {
         let mut batch = self.store.new_batch();
         let can_preserve_clean_diagnostics = diagnostics_refresh == DiagnosticsRefresh::Immediate
+            && validated_orphan_free
+            && !self.store.graph_diagnostics(graph)?.has_orphans();
+
+        if !self.store.contains_graph(graph)? {
+            self.store.create_graph(graph)?;
+        }
+
+        let mut vector_clock = self.store.get_vector_clock(graph)?;
+        let counter = self.store.next_counter(&mut batch, graph, &self.actor)?;
+        let dot = Dot {
+            actor: self.actor,
+            counter,
+        };
+        let base_clock = vector_clock.clone();
+        let g = self
+            .store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
+
+        let mut ops = Vec::with_capacity(changes.len());
+        let mut stored_ops = Vec::with_capacity(changes.len());
+        let mut affected_subjects = std::collections::HashSet::new();
+        let mut term_cache = HashMap::new();
+
+        self.store.seed_term_cache(
+            &mut batch,
+            &mut term_cache,
+            changes.iter().flat_map(|change| match change {
+                MaterializedQuadChange::Insert {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                }
+                | MaterializedQuadChange::Delete {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                } => [subject, predicate, object],
+            }),
+        )?;
+
+        for change in changes {
+            match change {
+                MaterializedQuadChange::Insert {
+                    subject,
+                    predicate,
