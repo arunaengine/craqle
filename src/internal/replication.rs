@@ -284,3 +284,51 @@ impl ReplicationEngine {
                 MaterializedQuadChange::Insert {
                     subject,
                     predicate,
+                    object,
+                    ..
+                } => {
+                    let s =
+                        self.store
+                            .resolve_term_cached(&mut batch, &mut term_cache, &subject)?;
+                    let p =
+                        self.store
+                            .resolve_term_cached(&mut batch, &mut term_cache, &predicate)?;
+                    let o = self
+                        .store
+                        .resolve_term_cached(&mut batch, &mut term_cache, &object)?;
+
+                    self.store.insert_quad(&mut batch, g, s, p, o, &dot)?;
+
+                    affected_subjects.insert(s);
+
+                    ops.push(QuadOp::Add {
+                        subject,
+                        predicate,
+                        object,
+                        dot,
+                    });
+                    stored_ops.push(crate::store::StoredQuadOp::Add {
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                        dot,
+                    });
+                }
+                MaterializedQuadChange::Delete {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                } => {
+                    let s =
+                        self.store
+                            .resolve_term_cached(&mut batch, &mut term_cache, &subject)?;
+                    let p =
+                        self.store
+                            .resolve_term_cached(&mut batch, &mut term_cache, &predicate)?;
+                    let o = self
+                        .store
+                        .resolve_term_cached(&mut batch, &mut term_cache, &object)?;
+
+                    self.store
+                        .remove_quad(&mut batch, g, s, p, o, &vector_clock)?;
