@@ -332,3 +332,51 @@ impl ReplicationEngine {
 
                     self.store
                         .remove_quad(&mut batch, g, s, p, o, &vector_clock)?;
+
+                    affected_subjects.insert(s);
+
+                    ops.push(QuadOp::Remove {
+                        subject,
+                        predicate,
+                        object,
+                        witnessed: vector_clock.clone(),
+                    });
+                    stored_ops.push(crate::store::StoredQuadOp::Remove {
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                        witnessed: vector_clock.clone(),
+                    });
+                }
+            }
+        }
+
+        vector_clock.advance(self.actor, counter);
+        self.store
+            .set_vector_clock(&mut batch, graph, &vector_clock)?;
+
+        let repl_batch = Batch {
+            graph: graph.clone(),
+            actor: self.actor,
+            counter,
+            base_clock,
+            ops,
+            timestamp: Utc::now(),
+        };
+
+        self.store.append_compact_batch_log(
+            &mut batch,
+            graph,
+            &crate::store::StoredBatch {
+                actor: repl_batch.actor,
+                counter: repl_batch.counter,
+                base_clock: repl_batch.base_clock.clone(),
+                ops: stored_ops,
+                timestamp: repl_batch.timestamp,
+            },
+        )?;
+
+        match diagnostics_refresh {
+            DiagnosticsRefresh::Immediate => {
+                self.store
+                    .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
