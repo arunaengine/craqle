@@ -141,3 +141,51 @@ impl ReplicationEngine {
             }
         }
 
+        self.commit_changes(graph, changes)
+    }
+
+    /// Apply a pre-materialized change set locally without full graph validation.
+    ///
+    /// Intended for trusted higher-level RO-Crate operations that maintain
+    /// structural invariants incrementally.
+    pub fn local_apply_changes_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+
+        if changes.is_empty() {
+            return Ok(Batch {
+                graph: graph.clone(),
+                actor: self.actor,
+                counter: 0,
+                base_clock: self.store.get_vector_clock(graph)?,
+                ops: vec![],
+                timestamp: Utc::now(),
+            });
+        }
+
+        self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Immediate, false)
+    }
+
+    /// Apply a trusted bulk change set locally and defer graph-diagnostics
+    /// recomputation until the caller explicitly rebuilds diagnostics.
+    pub fn local_apply_changes_bulk_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+
+        if changes.is_empty() {
+            return Ok(Batch {
+                graph: graph.clone(),
+                actor: self.actor,
+                counter: 0,
+                base_clock: self.store.get_vector_clock(graph)?,
+                ops: vec![],
+                timestamp: Utc::now(),
+            });
+        }
+
