@@ -189,3 +189,51 @@ impl ReplicationEngine {
             });
         }
 
+        self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Deferred, false)
+    }
+
+    pub fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<(), UpdateError> {
+        let snapshot = GraphSnapshot::from_store(&self.store, graph).map_err(UpdateError::Store)?;
+        self.refresh_graph_diagnostics(graph, &snapshot)
+            .map_err(UpdateError::Store)
+    }
+
+    fn ensure_change_set_targets(
+        &self,
+        graph: &GraphId,
+        changes: &[MaterializedQuadChange],
+    ) -> Result<(), UpdateError> {
+        for change in changes {
+            let change_graph = match change {
+                MaterializedQuadChange::Insert { graph, .. }
+                | MaterializedQuadChange::Delete { graph, .. } => graph,
+            };
+            if change_graph != graph {
+                return Err(UpdateError::InvalidChangeSet(format!(
+                    "all changes must target `{}` but found `{}`",
+                    graph.as_str(),
+                    change_graph.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Internal: assign dots, write to store, build replication batch.
+    fn commit_changes(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> Result<Batch, UpdateError> {
+        self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Immediate, true)
+    }
+
+    fn commit_changes_with_mode(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        diagnostics_refresh: DiagnosticsRefresh,
+        validated_orphan_free: bool,
+    ) -> Result<Batch, UpdateError> {
+        let mut batch = self.store.new_batch();
+        let can_preserve_clean_diagnostics = diagnostics_refresh == DiagnosticsRefresh::Immediate
