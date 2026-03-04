@@ -380,3 +380,50 @@ impl ReplicationEngine {
             DiagnosticsRefresh::Immediate => {
                 self.store
                     .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
+            }
+            DiagnosticsRefresh::Deferred => {
+                self.store.enqueue_fts_reindex(&mut batch, graph)?;
+            }
+        }
+
+        self.store.commit(batch)?;
+        if diagnostics_refresh == DiagnosticsRefresh::Immediate {
+            if can_preserve_clean_diagnostics {
+                self.store
+                    .set_graph_diagnostics(graph, &crate::core::GraphDiagnostics::default())
+                    .map_err(UpdateError::Store)?;
+            } else {
+                let snapshot =
+                    GraphSnapshot::from_store(&self.store, graph).map_err(UpdateError::Store)?;
+                self.refresh_graph_diagnostics(graph, &snapshot)
+                    .map_err(UpdateError::Store)?;
+            }
+        }
+
+        Ok(repl_batch)
+    }
+
+    /// Apply a remote batch using OR-Set CRDT semantics.
+    pub fn apply_remote_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
+        let mut touched_graphs = HashSet::new();
+        self.apply_remote_batch_internal(incoming, true, &mut touched_graphs)
+    }
+
+    pub fn apply_remote_batches(
+        &self,
+        incoming: Vec<Batch>,
+    ) -> Result<Vec<MergeResult>, MergeError> {
+        let mut touched_graphs = HashSet::new();
+        let mut results = Vec::with_capacity(incoming.len());
+        for batch in incoming {
+            results.push(self.apply_remote_batch_internal(batch, false, &mut touched_graphs)?);
+        }
+
+        for graph in touched_graphs {
+            self.finalize_remote_graph(&graph)?;
+        }
+
+        Ok(results)
+    }
+
+    fn apply_remote_batch_internal(
