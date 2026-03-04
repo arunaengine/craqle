@@ -185,3 +185,96 @@ mod tests {
         names.sort();
 
         assert_eq!(names, vec!["Peer 0 Title", "Peer 1 Title"]);
+    }
+
+    #[test]
+    fn test_concurrent_metadata_editing_scenario() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-metadata");
+
+        let mgr0 = manager(net.peer(0));
+        mgr0.create_crate(
+            graph.clone(),
+            "Original Dataset",
+            "Original description",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        mgr0.update_property(&graph, "./", "schema:name", None, "Updated Dataset v2")
+            .unwrap();
+        let mgr1 = manager(net.peer(1));
+        mgr1.update_property(
+            &graph,
+            "./",
+            "schema:description",
+            None,
+            "Improved description with more detail",
+        )
+        .unwrap();
+
+        net.sync_until_converged(10).unwrap();
+
+        let exported = mgr1.export_jsonld(&graph).unwrap();
+        assert!(exported.contains("Updated Dataset v2"));
+        assert!(exported.contains("Improved description with more detail"));
+        assert!(violation_messages(&net, 0, &graph).is_empty());
+        assert!(violation_messages(&net, 1, &graph).is_empty());
+
+        assert!(!reindex_and_search(&net, 0, "updated").is_empty());
+        assert!(!reindex_and_search(&net, 1, "improved").is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_entity_addition_scenario() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-entities");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
+        let mgr0 = manager(net.peer(0));
+        let mgr1 = manager(net.peer(1));
+        mgr0.add_data_entity(
+            &graph,
+            "results.csv",
+            "http://schema.org/MediaObject",
+            "Results CSV",
+            vec![],
+        )
+        .unwrap();
+        mgr1.add_data_entity(
+            &graph,
+            "analysis.py",
+            "http://schema.org/MediaObject",
+            "Analysis Script",
+            vec![],
+        )
+        .unwrap();
+
+        net.sync_until_converged(10).unwrap();
+
+        let state = graph_state(&net, 0, &graph);
+        assert!(state.iter().any(|(s, _, _)| s.contains("results.csv")));
+        assert!(state.iter().any(|(s, _, _)| s.contains("analysis.py")));
+        assert!(
+            state
+                .iter()
+                .any(|(_, p, o)| p.contains("hasPart") && o.contains("results.csv"))
+        );
+        assert!(
+            state
+                .iter()
+                .any(|(_, p, o)| p.contains("hasPart") && o.contains("analysis.py"))
+        );
+        assert!(violation_messages(&net, 0, &graph).is_empty());
+    }
+
+    #[test]
+    fn test_observed_remove_removes_quad_everywhere() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-observed-remove");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
