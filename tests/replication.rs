@@ -92,3 +92,96 @@ mod tests {
 
         // Peer 2 (isolated) makes a change
         let mgr2 = manager(net.peer(2));
+        mgr2.add_data_entity(
+            &graph,
+            "data/entity_c.csv",
+            "http://schema.org/MediaObject",
+            "Entity C",
+            vec![],
+        )
+        .unwrap();
+
+        // Sync 0 and 1
+        net.sync_until_converged(10).unwrap();
+
+        // Heal partition
+        net.heal(0, 2);
+        net.heal(1, 2);
+
+        // Full sync
+        net.sync_until_converged(10).unwrap();
+
+        // All three peers must converge
+        let f0 = net.peer(0).vector_clock(&graph).unwrap();
+        let f1 = net.peer(1).vector_clock(&graph).unwrap();
+        let f2 = net.peer(2).vector_clock(&graph).unwrap();
+        assert_eq!(f0, f1);
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn test_idempotent_batch_replay() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate1");
+
+        // Create and sync
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
+        let f_before = net.peer(1).vector_clock(&graph).unwrap();
+
+        // Sync again (duplicate delivery)
+        net.sync_until_converged(10).unwrap();
+
+        let f_after = net.peer(1).vector_clock(&graph).unwrap();
+        assert_eq!(f_before, f_after, "duplicate sync must be idempotent");
+    }
+
+    #[test]
+    fn test_concurrent_same_field_update_keeps_both_values() {
+        let (_tmp, mut net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate1");
+
+        let mgr = manager(net.peer(0));
+        mgr.create_crate(
+            graph.clone(),
+            "Original",
+            "Concurrent title updates",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        let update0 = format!(
+            "DELETE {{ GRAPH <{}> {{ ?root schema:name \"Original\" }} }} INSERT {{ GRAPH <{}> {{ ?root schema:name \"Peer 0 Title\" }} }} WHERE {{ GRAPH <{}> {{ ?root rdf:type schema:Dataset . ?root schema:name \"Original\" . }} }}",
+            graph.as_str(),
+            graph.as_str(),
+            graph.as_str()
+        );
+        let update1 = format!(
+            "DELETE {{ GRAPH <{}> {{ ?root schema:name \"Original\" }} }} INSERT {{ GRAPH <{}> {{ ?root schema:name \"Peer 1 Title\" }} }} WHERE {{ GRAPH <{}> {{ ?root rdf:type schema:Dataset . ?root schema:name \"Original\" . }} }}",
+            graph.as_str(),
+            graph.as_str(),
+            graph.as_str()
+        );
+
+        net.peer_mut(0).update(&update0).unwrap();
+        net.peer_mut(1).update(&update1).unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        let query = format!(
+            "SELECT ?name WHERE {{ GRAPH <{}> {{ ?root rdf:type schema:Dataset . ?root schema:name ?name . }} }}",
+            graph.as_str()
+        );
+        let results = net
+            .peer(0)
+            .query(&GrantAuthorizer::default(), &query)
+            .unwrap();
+        let mut names: Vec<String> = solution_rows(results)
+            .iter()
+            .map(|binding| binding_literal(binding.get("name").unwrap()))
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["Peer 0 Title", "Peer 1 Title"]);
