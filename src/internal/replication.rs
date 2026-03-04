@@ -427,3 +427,51 @@ impl ReplicationEngine {
     }
 
     fn apply_remote_batch_internal(
+        &self,
+        incoming: Batch,
+        finalize_graph: bool,
+        touched_graphs: &mut HashSet<GraphId>,
+    ) -> Result<MergeResult, MergeError> {
+        let graph = &incoming.graph;
+
+        if !self.store.contains_graph(graph)? {
+            self.store.create_graph(graph)?;
+        }
+
+        let mut vector_clock = self.store.get_vector_clock(graph)?;
+
+        if vector_clock.contains(&Dot {
+            actor: incoming.actor,
+            counter: incoming.counter,
+        }) {
+            return Ok(MergeResult { applied: false });
+        }
+
+        if !self.batch_is_ready(&vector_clock, &incoming) {
+            self.buffer_remote_batch(incoming)?;
+            return Ok(MergeResult { applied: false });
+        }
+
+        self.apply_single_batch(&incoming, &mut vector_clock)?;
+        touched_graphs.insert(graph.clone());
+        self.apply_ready_buffered_batches(graph, &mut vector_clock, touched_graphs)?;
+
+        if finalize_graph {
+            self.finalize_remote_graph(graph)?;
+        }
+
+        Ok(MergeResult { applied: true })
+    }
+
+    fn finalize_remote_graph(&self, graph: &GraphId) -> Result<(), MergeError> {
+        let snapshot = GraphSnapshot::from_store(&self.store, graph).map_err(MergeError::Store)?;
+        self.refresh_graph_diagnostics(graph, &snapshot)
+            .map_err(MergeError::Store)
+    }
+
+    fn apply_single_batch(
+        &self,
+        incoming: &Batch,
+        vector_clock: &mut VectorClock,
+    ) -> Result<(), MergeError> {
+        let graph = &incoming.graph;
