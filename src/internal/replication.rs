@@ -523,3 +523,50 @@ impl ReplicationEngine {
                     self.store.insert_quad(&mut batch, g, s, p, o, dot)?;
                     affected_subjects.insert(s);
                     stored_ops.push(crate::store::StoredQuadOp::Add {
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                        dot: *dot,
+                    });
+                }
+                QuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    witnessed,
+                } => {
+                    let s = self
+                        .store
+                        .resolve_term_cached(&mut batch, &mut term_cache, subject)?;
+                    let p =
+                        self.store
+                            .resolve_term_cached(&mut batch, &mut term_cache, predicate)?;
+                    let o = self
+                        .store
+                        .resolve_term_cached(&mut batch, &mut term_cache, object)?;
+                    self.store.remove_quad(&mut batch, g, s, p, o, witnessed)?;
+                    affected_subjects.insert(s);
+                    stored_ops.push(crate::store::StoredQuadOp::Remove {
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                        witnessed: witnessed.clone(),
+                    });
+                }
+            }
+        }
+
+        vector_clock.advance(incoming.actor, incoming.counter);
+        self.store
+            .set_vector_clock(&mut batch, graph, vector_clock)?;
+
+        self.store.append_compact_batch_log(
+            &mut batch,
+            graph,
+            &crate::store::StoredBatch {
+                actor: incoming.actor,
+                counter: incoming.counter,
+                base_clock: incoming.base_clock.clone(),
+                ops: stored_ops,
+                timestamp: incoming.timestamp,
+            },

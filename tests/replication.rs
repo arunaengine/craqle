@@ -371,3 +371,96 @@ mod tests {
                 )],
             )
             .unwrap();
+        let batch = net
+            .peer(0)
+            .catchup_batches(&graph, &net.peer(1).vector_clock(&graph).unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        net.deliver_batch_to_peer(1, batch.clone()).unwrap();
+        let clock = net.peer(1).vector_clock(&graph).unwrap();
+        let state = graph_state(&net, 1, &graph);
+        net.deliver_batch_to_peer(1, batch).unwrap();
+        assert_eq!(clock, net.peer(1).vector_clock(&graph).unwrap());
+        assert_eq!(state, graph_state(&net, 1, &graph));
+    }
+
+    #[test]
+    fn test_three_peer_partition_scenario() {
+        let (_tmp, mut net) = setup_network(3);
+        let graph = GraphId::new("urn:test:crate-partition");
+        manager(net.peer(0))
+            .create_crate(
+                graph.clone(),
+                "Partitioned Crate",
+                "Original description",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        net.partition(0, 2);
+        net.partition(1, 2);
+
+        manager(net.peer(0))
+            .add_data_entity(
+                &graph,
+                "entity-a.txt",
+                "http://schema.org/MediaObject",
+                "Entity A",
+                vec![],
+            )
+            .unwrap();
+        net.sync_pair(0, 1).unwrap();
+
+        let mgr1 = manager(net.peer(1));
+        mgr1.add_data_entity(
+            &graph,
+            "entity-b.txt",
+            "http://schema.org/MediaObject",
+            "Entity B",
+            vec![],
+        )
+        .unwrap();
+        net.sync_pair(0, 1).unwrap();
+
+        let mgr2 = manager(net.peer(2));
+        mgr2.add_data_entity(
+            &graph,
+            "entity-c.txt",
+            "http://schema.org/MediaObject",
+            "Entity C",
+            vec![],
+        )
+        .unwrap();
+        mgr2.update_property(
+            &graph,
+            "./",
+            "schema:description",
+            None,
+            "Updated by isolated peer",
+        )
+        .unwrap();
+
+        net.heal(0, 2);
+        net.heal(1, 2);
+        net.sync_until_converged(20).unwrap();
+
+        for peer in 0..3 {
+            let exported = manager(net.peer(peer)).export_jsonld(&graph).unwrap();
+            assert!(exported.contains("Entity A"));
+            assert!(exported.contains("Entity B"));
+            assert!(exported.contains("Entity C"));
+            assert!(exported.contains("Updated by isolated peer"));
+        }
+    }
+
+    #[test]
+    fn test_snapshot_bootstrap_scenario() {
+        let (_tmp, mut net) = setup_network(3);
+        let graph = GraphId::new("urn:test:crate-snapshot");
+        net.partition(0, 2);
+        net.partition(1, 2);
