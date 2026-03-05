@@ -278,3 +278,96 @@ mod tests {
         create_test_crate(&net, 0, &graph);
         net.sync_until_converged(10).unwrap();
 
+        keyword_insert(net.peer(0), &graph, "observed-keyword");
+        net.sync_until_converged(10).unwrap();
+        keyword_delete(net.peer(1), &graph, "observed-keyword");
+        net.sync_until_converged(10).unwrap();
+
+        let state = graph_state(&net, 0, &graph);
+        assert!(
+            !state
+                .iter()
+                .any(|(_, _, object)| object.contains("observed-keyword"))
+        );
+        assert_eq!(state, graph_state(&net, 1, &graph));
+    }
+
+    #[test]
+    fn test_concurrent_remove_is_add_wins() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-add-wins");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
+        keyword_insert(net.peer(0), &graph, "race-keyword");
+        keyword_delete(net.peer(1), &graph, "race-keyword");
+        net.sync_until_converged(10).unwrap();
+
+        let state = graph_state(&net, 0, &graph);
+        assert!(
+            state
+                .iter()
+                .any(|(_, _, object)| object.contains("race-keyword"))
+        );
+        assert_eq!(state, graph_state(&net, 1, &graph));
+    }
+
+    #[test]
+    fn test_out_of_order_delivery_within_actor_scenario() {
+        let (_tmp, mut net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-out-of-order");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
+        net.peer_mut(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    literal_term("kw-one"),
+                )],
+            )
+            .unwrap();
+        net.peer_mut(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    literal_term("kw-two"),
+                )],
+            )
+            .unwrap();
+
+        let batches = net
+            .peer(0)
+            .catchup_batches(&graph, &net.peer(1).vector_clock(&graph).unwrap())
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+        let clock_before = net.peer(1).vector_clock(&graph).unwrap();
+
+        net.deliver_batch_to_peer(1, batches[1].clone()).unwrap();
+        assert_eq!(net.peer(1).vector_clock(&graph).unwrap(), clock_before);
+
+        net.deliver_batch_to_peer(1, batches[0].clone()).unwrap();
+        assert_eq!(graph_state(&net, 0, &graph), graph_state(&net, 1, &graph));
+    }
+
+    #[test]
+    fn test_duplicate_batch_replay_explicit() {
+        let (_tmp, mut net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-duplicate");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
+        net.peer_mut(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    literal_term("duplicate-keyword"),
+                )],
+            )
+            .unwrap();
