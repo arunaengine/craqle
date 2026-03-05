@@ -570,3 +570,51 @@ impl ReplicationEngine {
                 ops: stored_ops,
                 timestamp: incoming.timestamp,
             },
+        )?;
+
+        self.store
+            .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
+
+        self.store.commit(batch)?;
+        Ok(())
+    }
+
+    fn batch_is_ready(&self, vector_clock: &VectorClock, incoming: &Batch) -> bool {
+        let expected = vector_clock
+            .0
+            .get(&incoming.actor)
+            .map(|counter| counter + 1)
+            .unwrap_or(1);
+        incoming.counter == expected
+            && incoming
+                .base_clock
+                .0
+                .iter()
+                .all(|(actor, counter)| vector_clock.0.get(actor).copied().unwrap_or(0) >= *counter)
+    }
+
+    fn buffer_remote_batch(&self, incoming: Batch) -> Result<(), MergeError> {
+        let mut buffer = self.gap_buffer.lock().unwrap();
+        let graph_buffer = buffer.entry(incoming.graph.clone()).or_default();
+        if graph_buffer
+            .iter()
+            .any(|batch| batch.actor == incoming.actor && batch.counter == incoming.counter)
+        {
+            return Ok(());
+        }
+        if graph_buffer.len() >= MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH {
+            return Err(MergeError::InputRejected(format!(
+                "gap buffer on graph `{}` exceeded {} pending batches",
+                incoming.graph.as_str(),
+                MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH
+            )));
+        }
+        graph_buffer.push(incoming);
+        Ok(())
+    }
+
+    fn apply_ready_buffered_batches(
+        &self,
+        graph: &GraphId,
+        vector_clock: &mut VectorClock,
+        touched_graphs: &mut HashSet<GraphId>,
