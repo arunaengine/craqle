@@ -618,3 +618,51 @@ impl ReplicationEngine {
         graph: &GraphId,
         vector_clock: &mut VectorClock,
         touched_graphs: &mut HashSet<GraphId>,
+    ) -> Result<(), MergeError> {
+        loop {
+            let next = {
+                let mut buffer = self.gap_buffer.lock().unwrap();
+                let Some(graph_buffer) = buffer.get_mut(graph) else {
+                    return Ok(());
+                };
+                let Some((index, _)) = graph_buffer
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, batch)| self.batch_is_ready(vector_clock, batch))
+                    .min_by_key(|(_, batch)| (batch.actor, batch.counter))
+                else {
+                    return Ok(());
+                };
+                let batch = graph_buffer.swap_remove(index);
+                if graph_buffer.is_empty() {
+                    buffer.remove(graph);
+                }
+                batch
+            };
+
+            self.apply_single_batch(&next, vector_clock)?;
+            touched_graphs.insert(graph.clone());
+        }
+    }
+
+    fn refresh_graph_diagnostics(
+        &self,
+        graph: &GraphId,
+        snapshot: &GraphSnapshot,
+    ) -> crate::store::Result<()> {
+        let previous = self.store.graph_diagnostics(graph)?;
+        let current = GraphDiagnostics::from_orphaned_entities(
+            crate::rules::orphaned_data_entities(snapshot)
+                .into_iter()
+                .map(|term| encoded_identifier_value(&term))
+                .collect(),
+        );
+
+        if previous == current {
+            return Ok(());
+        }
+
+        self.store.set_graph_diagnostics(graph, &current)?;
+        self.enqueue_orphan_fts_updates(graph, &previous, &current)
+    }
+

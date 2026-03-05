@@ -98,3 +98,103 @@ impl CraqleCluster {
             return Ok(());
         }
 
+        let graphs = self.all_graphs()?;
+        for graph in &graphs {
+            if self.maybe_bootstrap_with_snapshot(left, right, graph)? {
+                continue;
+            }
+            if self.maybe_bootstrap_with_snapshot(right, left, graph)? {
+                continue;
+            }
+
+            let left_clock = self.peers[left].vector_clock(graph)?;
+            let right_clock = self.peers[right].vector_clock(graph)?;
+
+            self.sync_policy(left, right, graph)?;
+            self.sync_policy(right, left, graph)?;
+            self.peers[right]
+                .apply_remote_batches(self.peers[left].catchup_batches(graph, &right_clock)?)?;
+            self.peers[left]
+                .apply_remote_batches(self.peers[right].catchup_batches(graph, &left_clock)?)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn sync_round(&self) -> Result<()> {
+        let peer_count = self.peers.len();
+        for sender in 0..peer_count {
+            for receiver in 0..peer_count {
+                if sender == receiver || !self.connected[sender][receiver] {
+                    continue;
+                }
+                for graph in self.all_graphs()? {
+                    self.sync_policy(sender, receiver, &graph)?;
+                    let clock = self.peers[receiver].vector_clock(&graph)?;
+                    self.peers[receiver].apply_remote_batches(
+                        self.peers[sender].catchup_batches(&graph, &clock)?,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn sync_until_converged(&self, max_rounds: usize) -> Result<()> {
+        self.do_catchup()?;
+
+        for _ in 0..max_rounds {
+            self.sync_round()?;
+            self.do_catchup()?;
+            if self.check_convergence()? {
+                return Ok(());
+            }
+        }
+
+        if self.check_convergence()? {
+            Ok(())
+        } else {
+            Err(SimulationError::ConvergenceFailed(
+                "peers did not converge within the allotted rounds".to_string(),
+            ))
+        }
+    }
+
+    pub fn partition(&mut self, left: usize, right: usize) {
+        self.connected[left][right] = false;
+        self.connected[right][left] = false;
+    }
+
+    pub fn heal(&mut self, left: usize, right: usize) {
+        self.connected[left][right] = true;
+        self.connected[right][left] = true;
+    }
+
+    pub fn reindex_search(&self) -> Result<()> {
+        for peer in &self.peers {
+            peer.reindex_search()?;
+        }
+        Ok(())
+    }
+
+    pub fn query_from_peer(
+        &self,
+        peer: usize,
+        auth: &dyn Authorizer,
+        sparql: &str,
+        options: QueryOptions,
+    ) -> Result<QueryResults> {
+        if options.local_only {
+            return Ok(self.peers[peer].query(auth, sparql)?);
+        }
+
+        let mut results = Vec::new();
+        for index in self.federated_peer_indexes(peer) {
+            results.push(self.peers[index].query(auth, sparql)?);
+        }
+        Ok(merge_query_results(results))
+    }
+
+    pub fn search_from_peer(
+        &self,
