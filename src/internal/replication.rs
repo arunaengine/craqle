@@ -475,3 +475,51 @@ impl ReplicationEngine {
         vector_clock: &mut VectorClock,
     ) -> Result<(), MergeError> {
         let graph = &incoming.graph;
+        let mut batch = self.store.new_batch();
+        let mut affected_subjects = std::collections::HashSet::new();
+        let mut term_cache = HashMap::new();
+        let mut stored_ops = Vec::with_capacity(incoming.ops.len());
+
+        self.store.seed_term_cache(
+            &mut batch,
+            &mut term_cache,
+            incoming.ops.iter().flat_map(|op| match op {
+                QuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                }
+                | QuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                } => [subject, predicate, object],
+            }),
+        )?;
+
+        let g = self
+            .store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
+
+        for op in &incoming.ops {
+            match op {
+                QuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    dot,
+                } => {
+                    let s = self
+                        .store
+                        .resolve_term_cached(&mut batch, &mut term_cache, subject)?;
+                    let p =
+                        self.store
+                            .resolve_term_cached(&mut batch, &mut term_cache, predicate)?;
+                    let o = self
+                        .store
+                        .resolve_term_cached(&mut batch, &mut term_cache, object)?;
+                    self.store.insert_quad(&mut batch, g, s, p, o, dot)?;
+                    affected_subjects.insert(s);
+                    stored_ops.push(crate::store::StoredQuadOp::Add {
