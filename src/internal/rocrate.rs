@@ -123,3 +123,127 @@ impl RoCrateManager {
                     &graph_id,
                     METADATA_ID,
                     &vocab::schema_about(),
+                    encoded_identifier(ROOT_ID),
+                ),
+                insert_change(
+                    &graph_id,
+                    ROOT_ID,
+                    &vocab::rdf_type(),
+                    EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                ),
+                insert_change(
+                    &graph_id,
+                    ROOT_ID,
+                    &vocab::schema_name(),
+                    encoded_literal(name),
+                ),
+                insert_change(
+                    &graph_id,
+                    ROOT_ID,
+                    &vocab::schema_description(),
+                    encoded_literal(description),
+                ),
+                insert_change(
+                    &graph_id,
+                    ROOT_ID,
+                    &vocab::schema_date_published(),
+                    encoded_literal(date_published),
+                ),
+                insert_change(
+                    &graph_id,
+                    ROOT_ID,
+                    &vocab::schema_license(),
+                    encoded_license_value(license)?,
+                ),
+            ];
+            return Ok(self.engine.local_apply_changes(&graph_id, changes)?);
+        }
+
+        let rocrate = RoCrate {
+            context: default_context(),
+            graph: vec![
+                GraphVector::MetadataDescriptor(MetadataDescriptor {
+                    id: METADATA_ID.to_string(),
+                    type_: DataType::Term("CreativeWork".to_string()),
+                    conforms_to: Id::Id(ROCRATE_SPEC_URL.to_string()),
+                    about: Id::Id(ROOT_ID.to_string()),
+                    dynamic_entity: Some(HashMap::new()),
+                }),
+                GraphVector::RootDataEntity(RootDataEntity {
+                    id: ROOT_ID.to_string(),
+                    type_: DataType::Term("Dataset".to_string()),
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    date_published: date_published.to_string(),
+                    license: license_from_str(license)?,
+                    dynamic_entity: Some(HashMap::new()),
+                }),
+            ],
+        };
+
+        self.replace_graph_with_rocrate(&graph_id, rocrate)
+    }
+
+    /// Add a data entity with automatic hasPart linkage from root.
+    pub fn add_data_entity(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+    ) -> Result<Batch, RoCrateError> {
+        let entity_id = normalize_entity_id(entity_id);
+        self.require_rocrate_initialized(graph_id)?;
+        self.upsert_data_entity_incremental(
+            graph_id,
+            ROOT_ID,
+            &entity_id,
+            entity_type,
+            name,
+            additional_triples,
+        )
+    }
+
+    pub fn append_new_root_data_entities(
+        &self,
+        graph_id: &GraphId,
+        entities: Vec<NewDataEntity>,
+    ) -> Result<AppendDataEntitiesReport, RoCrateError> {
+        self.append_new_data_entities_under(graph_id, ROOT_ID, entities)
+    }
+
+    pub fn append_new_data_entities_under(
+        &self,
+        graph_id: &GraphId,
+        parent_id: &str,
+        entities: Vec<NewDataEntity>,
+    ) -> Result<AppendDataEntitiesReport, RoCrateError> {
+        self.require_rocrate_initialized(graph_id)?;
+
+        let parent_id = normalize_entity_id(parent_id);
+        if !self.visible_subject_exists(graph_id, &parent_id)? {
+            return Err(RoCrateError::EntityNotFound(parent_id));
+        }
+
+        let mut seen = HashSet::new();
+        let mut changes = Vec::with_capacity(entities.len() * 6);
+        for entity in entities {
+            let entity_id = normalize_entity_id(&entity.entity_id);
+            if !seen.insert(entity_id.clone()) {
+                return Err(RoCrateError::InvalidBatch(format!(
+                    "duplicate entity id `{entity_id}` in batch"
+                )));
+            }
+
+            changes.push(insert_change(
+                graph_id,
+                &parent_id,
+                &vocab::schema_has_part(),
+                encoded_identifier(&entity_id),
+            ));
+
+            for (predicate, object) in entity_subject_triples(
+                &entity_id,
+                &entity.entity_type,
+                &entity.name,
