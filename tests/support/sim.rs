@@ -198,3 +198,103 @@ impl CraqleCluster {
 
     pub fn search_from_peer(
         &self,
+        peer: usize,
+        auth: &dyn Authorizer,
+        query: &str,
+        limit: usize,
+        options: QueryOptions,
+    ) -> Result<Vec<SearchHit>> {
+        if options.local_only {
+            return Ok(self.peers[peer].search(auth, query, limit)?);
+        }
+
+        let mut hits = Vec::new();
+        for index in self.federated_peer_indexes(peer) {
+            hits.extend(self.peers[index].search(auth, query, limit)?);
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.graph_id.cmp(&right.graph_id))
+                .then_with(|| left.subject_iri.cmp(&right.subject_iri))
+        });
+        hits.dedup_by(|left, right| {
+            left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn do_catchup(&self) -> Result<()> {
+        let peer_count = self.peers.len();
+        let graphs = self.all_graphs()?;
+
+        for graph in &graphs {
+            for receiver in 0..peer_count {
+                for sender in 0..peer_count {
+                    if sender == receiver || !self.connected[sender][receiver] {
+                        continue;
+                    }
+
+                    if self.maybe_bootstrap_with_snapshot(sender, receiver, graph)? {
+                        continue;
+                    }
+
+                    let clock = self.peers[receiver].vector_clock(graph)?;
+                    self.sync_policy(sender, receiver, graph)?;
+                    self.peers[receiver]
+                        .apply_remote_batches(self.peers[sender].catchup_batches(graph, &clock)?)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn maybe_bootstrap_with_snapshot(
+        &self,
+        sender: usize,
+        receiver: usize,
+        graph: &GraphId,
+    ) -> Result<bool> {
+        let receiver_clock = self.peers[receiver].vector_clock(graph)?;
+        if !receiver_clock.0.is_empty() {
+            return Ok(false);
+        }
+
+        let (receiver_quads, _, _) = self.peers[receiver].graph_fingerprint(graph)?;
+        if receiver_quads != 0 {
+            return Ok(false);
+        }
+
+        let (sender_quads, _, _) = self.peers[sender].graph_fingerprint(graph)?;
+        if sender_quads < SNAPSHOT_BOOTSTRAP_THRESHOLD_QUADS {
+            return Ok(false);
+        }
+
+        let policy = self.peers[sender].graph_policy(graph)?;
+        let snapshot = self.peers[sender].compact_graph_snapshot(graph)?;
+        match self.peers[receiver].import_compact_graph_snapshot(&snapshot, policy) {
+            Ok(()) => Ok(true),
+            Err(CraqleError::SyncInputRejected(_)) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn sync_policy(&self, sender: usize, receiver: usize, graph: &GraphId) -> Result<()> {
+        if self.peers[sender].contains_graph(graph)? {
+            let policy = self.peers[sender].graph_policy(graph)?;
+            self.peers[receiver].import_graph_policy(graph, policy)?;
+        }
+        Ok(())
+    }
+
+    fn all_graphs(&self) -> Result<Vec<GraphId>> {
+        let mut graphs = HashSet::new();
+        for peer in &self.peers {
+            for graph in peer.graphs()? {
+                graphs.insert(graph.as_str().to_string());
+            }

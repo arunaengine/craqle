@@ -666,3 +666,50 @@ impl ReplicationEngine {
         self.enqueue_orphan_fts_updates(graph, &previous, &current)
     }
 
+    fn enqueue_orphan_fts_updates(
+        &self,
+        graph: &GraphId,
+        previous: &GraphDiagnostics,
+        current: &GraphDiagnostics,
+    ) -> crate::store::Result<()> {
+        let previous: std::collections::HashSet<&String> =
+            previous.orphaned_entities.iter().collect();
+        let current: std::collections::HashSet<&String> =
+            current.orphaned_entities.iter().collect();
+        let mut batch = self.store.new_batch();
+        let mut dirty = false;
+
+        for entity_id in previous.symmetric_difference(&current) {
+            let subject =
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity_id.as_str()));
+            let Some(subject_tid) = self.store.lookup_term(&subject)? else {
+                continue;
+            };
+            self.store.enqueue_fts(&mut batch, graph, subject_tid)?;
+            dirty = true;
+        }
+
+        if dirty {
+            self.store.commit(batch)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get batches that a remote peer needs beyond their current vector clock.
+    pub fn batches_for_catchup(
+        &self,
+        graph: &GraphId,
+        remote_clock: &VectorClock,
+    ) -> Result<Vec<Batch>, MergeError> {
+        Ok(self
+            .store
+            .batches_beyond_vector_clock(graph, remote_clock)?)
+    }
+}
+
+fn encoded_identifier_value(term: &EncodedTerm) -> String {
+    term.to_named_node()
+        .map(|node| node.as_str().to_string())
+        .unwrap_or_else(|| term.0.clone())
+}
