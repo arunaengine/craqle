@@ -620,3 +620,128 @@ impl RoCrateManager {
         Ok(store
             .triples_for_subject_excluding_predicate(graph_tid, subject_tid, excluded_tid)?
             .into_iter()
+            .filter(|(_, object)| !orphaned.contains(object))
+            .collect())
+    }
+
+    fn has_part_link(
+        &self,
+        graph_id: &GraphId,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<bool, RoCrateError> {
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let child = encoded_identifier(child_id);
+        Ok(self
+            .subject_triples(graph_id, parent_id)?
+            .into_iter()
+            .any(|(predicate, object)| predicate == has_part && object == child))
+    }
+
+    // Builds the JSON-LD export shape shared by full export, summary export,
+    // and paged export. The caller controls which root-linked data entities are
+    // included in the `hasPart` page.
+    fn build_partial_export_view(
+        &self,
+        graph_id: &GraphId,
+        page_entities: &[EncodedTerm],
+    ) -> Result<RoCrate, RoCrateError> {
+        let metadata = export_metadata_descriptor(self.subject_triples(graph_id, METADATA_ID)?)?;
+        let root = export_root_entity(
+            self.subject_triples_excluding_predicate(graph_id, ROOT_ID, &vocab::schema_has_part())?,
+            page_entities,
+        )?;
+
+        let mut graph = vec![
+            GraphVector::MetadataDescriptor(metadata),
+            GraphVector::RootDataEntity(root),
+        ];
+
+        for subject_id in self.collect_partial_view_contextual_entities(graph_id, page_entities)? {
+            let triples = self.subject_triples(graph_id, &subject_id)?;
+            if triples.is_empty() {
+                continue;
+            }
+            graph.push(export_graph_entity(&subject_id, triples)?);
+        }
+
+        for entity in page_entities {
+            let Some(subject) = entity.to_named_node() else {
+                continue;
+            };
+            let subject_id = subject.as_str().to_string();
+            if subject_id == ROOT_ID || subject_id == METADATA_ID {
+                continue;
+            }
+            let triples = self.subject_triples(graph_id, &subject_id)?;
+            if triples.is_empty() {
+                continue;
+            }
+            graph.push(export_graph_entity(&subject_id, triples)?);
+        }
+
+        Ok(RoCrate {
+            context: default_context(),
+            graph,
+        })
+    }
+
+    fn current_rocrate(&self, graph_id: &GraphId) -> Result<RoCrate, RoCrateError> {
+        self.build_partial_export_view(graph_id, &self.visible_root_linked_data_entities(graph_id)?)
+    }
+
+    fn replace_graph_with_rocrate(
+        &self,
+        graph_id: &GraphId,
+        mut rocrate: RoCrate,
+    ) -> Result<Batch, RoCrateError> {
+        let changes = self.plan_rocrate_replacement(graph_id, &mut rocrate)?;
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
+    fn plan_import_value(
+        &self,
+        graph_id: &GraphId,
+        value: serde_json::Value,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        validate_jsonld_import(&value)?;
+        let target = jsonld_triples(&value)?;
+        if !self.engine.store().contains_graph(graph_id)? {
+            return Ok(insert_changes(graph_id, target));
+        }
+
+        let current = self.current_triples(graph_id)?;
+        if current.is_empty() {
+            return Ok(insert_changes(graph_id, target));
+        }
+
+        diff_triples(graph_id, &current, &target)
+    }
+
+    fn graph_is_missing_or_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
+        Ok(self.engine.store().graph_is_empty(graph_id)?)
+    }
+
+    fn import_jsonld_into_empty_graph(
+        &self,
+        graph_id: GraphId,
+        value: serde_json::Value,
+    ) -> Result<Batch, RoCrateError> {
+        validate_jsonld_import(&value)?;
+        let target = jsonld_triples(&value)?;
+        validate_complete_import_triples(&target)?;
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, insert_changes(&graph_id, target))?;
+        self.engine
+            .store()
+            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        Ok(batch)
+    }
+
+    fn replace_jsonld_in_existing_graph(
+        &self,
+        graph_id: GraphId,
+        value: serde_json::Value,
+    ) -> Result<Batch, RoCrateError> {
+        validate_jsonld_import(&value)?;
