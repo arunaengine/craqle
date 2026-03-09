@@ -496,3 +496,127 @@ impl RoCrateManager {
         if current
             .iter()
             .any(|(predicate, object)| predicate == &rdf_type && object == &dataset)
+        {
+            Ok(())
+        } else {
+            Err(RoCrateError::InvalidGraph(format!(
+                "graph `{}` is not initialized as an RO-Crate",
+                graph_id.as_str()
+            )))
+        }
+    }
+
+    fn upsert_data_entity_incremental(
+        &self,
+        graph_id: &GraphId,
+        parent_id: &str,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+    ) -> Result<Batch, RoCrateError> {
+        if self.subject_triples(graph_id, parent_id)?.is_empty() {
+            return Err(RoCrateError::EntityNotFound(parent_id.to_string()));
+        }
+        let mut changes = self.replace_subject_changes(
+            graph_id,
+            entity_id,
+            entity_subject_triples(entity_id, entity_type, name, &additional_triples)?,
+        )?;
+        if !self.has_part_link(graph_id, parent_id, entity_id)? {
+            changes.push(insert_change(
+                graph_id,
+                parent_id,
+                &vocab::schema_has_part(),
+                encoded_identifier(entity_id),
+            ));
+        }
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
+    fn replace_subject_changes(
+        &self,
+        graph_id: &GraphId,
+        subject_id: &str,
+        desired_triples: Vec<(EncodedTerm, EncodedTerm)>,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let current = self.subject_triples(graph_id, subject_id)?;
+        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = desired_triples.into_iter().collect();
+        let current: BTreeSet<(EncodedTerm, EncodedTerm)> = current.into_iter().collect();
+
+        let mut changes = Vec::new();
+        for (predicate, object) in current.difference(&desired) {
+            changes.push(MaterializedQuadChange::Delete {
+                graph: graph_id.clone(),
+                subject: subject.clone(),
+                predicate: predicate.clone(),
+                object: object.clone(),
+            });
+        }
+        for (predicate, object) in desired.difference(&current) {
+            changes.push(MaterializedQuadChange::Insert {
+                graph: graph_id.clone(),
+                subject: subject.clone(),
+                predicate: predicate.clone(),
+                object: object.clone(),
+            });
+        }
+        Ok(changes)
+    }
+
+    fn subject_triples(
+        &self,
+        graph_id: &GraphId,
+        subject_id: &str,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
+        let orphaned = self.orphaned_entities(graph_id)?;
+        let store = self.engine.store();
+        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
+        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+            return Ok(Vec::new());
+        };
+        let subject_term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        if orphaned.contains(&subject_term) {
+            return Ok(Vec::new());
+        }
+        let Some(subject_tid) = store.lookup_term(&subject_term)? else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .triples_for_subject(graph_tid, subject_tid)?
+            .into_iter()
+            .filter(|(_, object)| !orphaned.contains(object))
+            .collect())
+    }
+
+    fn subject_triples_excluding_predicate(
+        &self,
+        graph_id: &GraphId,
+        subject_id: &str,
+        excluded_predicate: &NamedNode,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
+        let orphaned = self.orphaned_entities(graph_id)?;
+        let store = self.engine.store();
+        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
+        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+            return Ok(Vec::new());
+        };
+        let subject_term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        if orphaned.contains(&subject_term) {
+            return Ok(Vec::new());
+        }
+        let Some(subject_tid) = store.lookup_term(&subject_term)? else {
+            return Ok(Vec::new());
+        };
+        let excluded_term = EncodedTerm::from_named_node(excluded_predicate);
+        let Some(excluded_tid) = store.lookup_term(&excluded_term)? else {
+            return Ok(store
+                .triples_for_subject(graph_tid, subject_tid)?
+                .into_iter()
+                .filter(|(_, object)| !orphaned.contains(object))
+                .collect());
+        };
+        Ok(store
+            .triples_for_subject_excluding_predicate(graph_tid, subject_tid, excluded_tid)?
+            .into_iter()
