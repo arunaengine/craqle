@@ -372,3 +372,127 @@ impl RoCrateManager {
             return self.import_jsonld_into_empty_graph_trusted(graph_id, value);
         }
 
+        self.replace_jsonld_in_existing_graph(graph_id, value)
+    }
+
+    /// Strict import path that validates complete RO-Crate semantics even for
+    /// new-graph bootstrap imports.
+    pub fn import_jsonld_checked(
+        &self,
+        graph_id: GraphId,
+        jsonld: &str,
+    ) -> Result<Batch, RoCrateError> {
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        if self.graph_is_missing_or_empty(&graph_id)? {
+            return self.import_jsonld_into_empty_graph(graph_id, value);
+        }
+
+        self.replace_jsonld_in_existing_graph(graph_id, value)
+    }
+
+    /// Fast path for trusted bootstrap imports into a new or empty graph.
+    ///
+    /// This skips semantic RO-Crate validation and current-state diffing, and
+    /// is intended for callers that already trust the input document.
+    pub fn bootstrap_jsonld_trusted(
+        &self,
+        graph_id: GraphId,
+        jsonld: &str,
+    ) -> Result<Batch, RoCrateError> {
+        if !self.graph_is_missing_or_empty(&graph_id)? {
+            return Err(RoCrateError::InvalidGraph(format!(
+                "trusted bootstrap requires graph `{}` to be new or empty",
+                graph_id.as_str()
+            )));
+        }
+
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        self.import_jsonld_into_empty_graph_trusted(graph_id, value)
+    }
+
+    /// Compute the canonical change set for replacing a graph with a JSON-LD RO-Crate.
+    pub fn plan_import_jsonld(
+        &self,
+        graph_id: &GraphId,
+        jsonld: &str,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        self.plan_import_value(graph_id, value)
+    }
+
+    /// Update a property on an entity.
+    ///
+    /// When `old_value` is `Some(v)`, only the triple matching `v` is replaced.
+    /// When `old_value` is `None`, **all** existing values for the given predicate
+    /// are removed before inserting `new_value` (replace-all semantics).
+    pub fn update_property(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        predicate: &str,
+        old_value: Option<&str>,
+        new_value: &str,
+    ) -> Result<Batch, RoCrateError> {
+        self.require_rocrate_initialized(graph_id)?;
+        let entity_id = normalize_entity_id(entity_id);
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
+        let current = self.subject_triples(graph_id, &entity_id)?;
+        if current.is_empty() {
+            return Err(RoCrateError::EntityNotFound(entity_id));
+        }
+
+        let property = normalize_property(predicate);
+        let predicate_node = property_named_node(&property)?;
+        let predicate_term = EncodedTerm::from_named_node(&predicate_node);
+        let mut changes = Vec::new();
+
+        match old_value {
+            Some(old_value) => {
+                let old_object = property_value_encoded(&property, old_value)?;
+                if current
+                    .iter()
+                    .any(|(pred, obj)| pred == &predicate_term && obj == &old_object)
+                {
+                    changes.push(MaterializedQuadChange::Delete {
+                        graph: graph_id.clone(),
+                        subject: subject.clone(),
+                        predicate: predicate_term.clone(),
+                        object: old_object,
+                    });
+                }
+            }
+            None => {
+                for (pred, obj) in &current {
+                    if pred == &predicate_term {
+                        changes.push(MaterializedQuadChange::Delete {
+                            graph: graph_id.clone(),
+                            subject: subject.clone(),
+                            predicate: pred.clone(),
+                            object: obj.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        changes.push(MaterializedQuadChange::Insert {
+            graph: graph_id.clone(),
+            subject,
+            predicate: predicate_term,
+            object: property_value_encoded(&property, new_value)?,
+        });
+
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
+    fn graph_is_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
+        Ok(self.current_triples(graph_id)?.is_empty())
+    }
+
+    fn require_rocrate_initialized(&self, graph_id: &GraphId) -> Result<(), RoCrateError> {
+        let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+        let dataset = EncodedTerm::from_named_node(&vocab::schema_dataset());
+        let current = self.subject_triples(graph_id, ROOT_ID)?;
+        if current
+            .iter()
+            .any(|(predicate, object)| predicate == &rdf_type && object == &dataset)
