@@ -247,3 +247,128 @@ impl RoCrateManager {
                 &entity_id,
                 &entity.entity_type,
                 &entity.name,
+                &entity.additional_triples,
+            )? {
+                changes.push(MaterializedQuadChange::Insert {
+                    graph: graph_id.clone(),
+                    subject: EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)),
+                    predicate,
+                    object,
+                });
+            }
+        }
+
+        let change_count = changes.len();
+        let entity_count = seen.len();
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(graph_id, changes)?;
+        Ok(AppendDataEntitiesReport {
+            batch,
+            entity_count,
+            change_count,
+        })
+    }
+
+    /// Add a contextual entity (no hasPart linkage needed).
+    pub fn add_contextual_entity(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+    ) -> Result<Batch, RoCrateError> {
+        self.require_rocrate_initialized(graph_id)?;
+        let entity_id = normalize_entity_id(entity_id);
+        let mut changes = self.replace_subject_changes(
+            graph_id,
+            &entity_id,
+            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
+        )?;
+        Ok(self
+            .engine
+            .local_apply_changes(graph_id, std::mem::take(&mut changes))?)
+    }
+
+    /// Export a graph to RO-Crate JSON-LD.
+    pub fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
+        Ok(serde_json::to_string_pretty(
+            &self.current_rocrate(graph_id)?,
+        )?)
+    }
+
+    /// Export a lightweight partial RO-Crate view without data entities.
+    pub fn export_jsonld_summary(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
+        Ok(serde_json::to_string(
+            &self.build_partial_export_view(graph_id, &[])?,
+        )?)
+    }
+
+    /// Export an offset-based partial RO-Crate page of root-linked data entities.
+    pub fn export_jsonld_page(
+        &self,
+        graph_id: &GraphId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<RoCratePage, RoCrateError> {
+        let (total, page) = self.root_linked_data_entity_page(graph_id, offset, limit)?;
+        let jsonld = serde_json::to_string(&self.build_partial_export_view(graph_id, &page)?)?;
+        let returned = page.len();
+        let has_more = offset + returned < total;
+        let next_cursor = has_more
+            .then(|| page.last().and_then(encoded_named_node_value))
+            .flatten();
+
+        Ok(RoCratePage {
+            jsonld,
+            total_data_entities: total,
+            returned_data_entities: returned,
+            next_offset: has_more.then_some(offset + returned),
+            next_cursor,
+        })
+    }
+
+    /// Export a cursor-based partial RO-Crate page of root-linked data entities.
+    pub fn export_jsonld_page_after(
+        &self,
+        graph_id: &GraphId,
+        after_entity_id: Option<&str>,
+        limit: usize,
+    ) -> Result<RoCratePage, RoCrateError> {
+        let (total, mut page) = self.root_linked_data_entity_page_after(
+            graph_id,
+            after_entity_id,
+            limit.saturating_add(1),
+        )?;
+        page.truncate(limit.saturating_add(1));
+        let has_more = page.len() > limit;
+        if has_more {
+            page.truncate(limit);
+        }
+        let returned = page.len();
+        let next_cursor = has_more
+            .then(|| page.last().and_then(encoded_named_node_value))
+            .flatten();
+        let jsonld = serde_json::to_string(&self.build_partial_export_view(graph_id, &page)?)?;
+
+        Ok(RoCratePage {
+            jsonld,
+            total_data_entities: total,
+            returned_data_entities: returned,
+            next_offset: None,
+            next_cursor,
+        })
+    }
+
+    /// Import a JSON-LD RO-Crate metadata file into a named graph.
+    ///
+    /// New or empty graphs use the trusted bootstrap fast path. Existing graphs
+    /// use a validated full-document replacement path that diffs against the
+    /// current graph state.
+    pub fn import_jsonld(&self, graph_id: GraphId, jsonld: &str) -> Result<Batch, RoCrateError> {
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        if self.graph_is_missing_or_empty(&graph_id)? {
+            return self.import_jsonld_into_empty_graph_trusted(graph_id, value);
+        }
+
