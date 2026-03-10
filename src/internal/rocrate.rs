@@ -745,3 +745,127 @@ impl RoCrateManager {
         value: serde_json::Value,
     ) -> Result<Batch, RoCrateError> {
         validate_jsonld_import(&value)?;
+        let target = jsonld_triples(&value)?;
+        validate_complete_import_triples(&target)?;
+        let changes = match self.append_like_replace_changes(&graph_id, &target)? {
+            Some(changes) => changes,
+            None => diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?,
+        };
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+        self.engine
+            .store()
+            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        Ok(batch)
+    }
+
+    fn import_jsonld_into_empty_graph_trusted(
+        &self,
+        graph_id: GraphId,
+        value: serde_json::Value,
+    ) -> Result<Batch, RoCrateError> {
+        let target = jsonld_triples(&value)?;
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, insert_changes(&graph_id, target))?;
+        self.engine
+            .store()
+            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        Ok(batch)
+    }
+
+    fn plan_rocrate_replacement(
+        &self,
+        graph_id: &GraphId,
+        rocrate: &mut RoCrate,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        normalize_rocrate(rocrate);
+        diff_triples(
+            graph_id,
+            &self.current_triples(graph_id)?,
+            &rocrate_triples(rocrate)?,
+        )
+    }
+
+    fn current_triples(&self, graph_id: &GraphId) -> Result<BTreeSet<TripleKey>, RoCrateError> {
+        let orphaned = self.orphaned_entities(graph_id)?;
+        let store = self.engine.store();
+        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
+        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+            return Ok(BTreeSet::new());
+        };
+
+        let mut triples = BTreeSet::new();
+        let mut term_cache = HashMap::new();
+        store.for_each_quad_in_graph::<crate::store::StoreError, _>(graph_tid, |quad| {
+            let subject = store.decode_term_cached(&mut term_cache, quad.subject)?;
+            let predicate = store.decode_term_cached(&mut term_cache, quad.predicate)?;
+            let object = store.decode_term_cached(&mut term_cache, quad.object)?;
+            if triple_is_visible(&subject, &object, &orphaned) {
+                triples.insert((subject, predicate, object));
+            }
+            Ok(())
+        })?;
+        Ok(triples)
+    }
+
+    fn append_like_replace_changes(
+        &self,
+        graph_id: &GraphId,
+        target: &BTreeSet<TripleKey>,
+    ) -> Result<Option<Vec<MaterializedQuadChange>>, RoCrateError> {
+        let orphaned = self.orphaned_entities(graph_id)?;
+        let store = self.engine.store();
+        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
+        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+            return Ok(Some(insert_changes(graph_id, target.clone())));
+        };
+
+        let mut remaining = target.clone();
+        let mut term_cache = HashMap::new();
+        let append_like =
+            match store.for_each_quad_in_graph::<AppendLikeCheckError, _>(graph_tid, |quad| {
+                let subject = store.decode_term_cached(&mut term_cache, quad.subject)?;
+                let predicate = store.decode_term_cached(&mut term_cache, quad.predicate)?;
+                let object = store.decode_term_cached(&mut term_cache, quad.object)?;
+                if !triple_is_visible(&subject, &object, &orphaned) {
+                    return Ok(());
+                }
+                if !remaining.remove(&(subject, predicate, object)) {
+                    return Err(AppendLikeCheckError::NeedsFullDiff);
+                }
+                Ok(())
+            }) {
+                Ok(()) => true,
+                Err(AppendLikeCheckError::NeedsFullDiff) => false,
+                Err(AppendLikeCheckError::Store(error)) => return Err(error.into()),
+            };
+
+        if append_like {
+            Ok(Some(insert_changes(graph_id, remaining)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn visible_subject_exists(
+        &self,
+        graph_id: &GraphId,
+        subject_id: &str,
+    ) -> Result<bool, RoCrateError> {
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        if self.orphaned_entities(graph_id)?.contains(&subject) {
+            return Ok(false);
+        }
+        Ok(self.engine.store().contains_subject(graph_id, &subject)?)
+    }
+
+    fn orphaned_entities(&self, graph_id: &GraphId) -> Result<HashSet<EncodedTerm>, RoCrateError> {
+        Ok(self
+            .engine
+            .store()
+            .graph_diagnostics(graph_id)?
+            .orphaned_entities
+            .into_iter()
+            .map(|entity_id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)))
