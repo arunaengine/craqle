@@ -993,3 +993,128 @@ impl RoCrateManager {
                 if candidate_id == ROOT_ID
                     || candidate_id == METADATA_ID
                     || page_subjects.contains(&candidate_id)
+                {
+                    continue;
+                }
+
+                let triples = self.subject_triples(graph_id, &candidate_id)?;
+                if triples.is_empty() || !triples_describe_contextual_entity(&triples) {
+                    continue;
+                }
+
+                if contextuals.insert(candidate_id.clone()) {
+                    queue.push_back(candidate_id);
+                }
+            }
+        }
+
+        Ok(contextuals.into_iter().collect())
+    }
+}
+
+fn insert_change(
+    graph_id: &GraphId,
+    subject_id: &str,
+    predicate: &NamedNode,
+    object: EncodedTerm,
+) -> MaterializedQuadChange {
+    MaterializedQuadChange::Insert {
+        graph: graph_id.clone(),
+        subject: EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id)),
+        predicate: EncodedTerm::from_named_node(predicate),
+        object,
+    }
+}
+
+fn triple_is_visible(
+    subject: &EncodedTerm,
+    object: &EncodedTerm,
+    orphaned: &HashSet<EncodedTerm>,
+) -> bool {
+    !orphaned.contains(subject) && !orphaned.contains(object)
+}
+
+fn diff_triples(
+    graph_id: &GraphId,
+    current: &BTreeSet<TripleKey>,
+    target: &BTreeSet<TripleKey>,
+) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+    let mut changes = Vec::new();
+    for triple in current.difference(target) {
+        changes.push(MaterializedQuadChange::Delete {
+            graph: graph_id.clone(),
+            subject: triple.0.clone(),
+            predicate: triple.1.clone(),
+            object: triple.2.clone(),
+        });
+    }
+    for triple in target.difference(current) {
+        changes.push(MaterializedQuadChange::Insert {
+            graph: graph_id.clone(),
+            subject: triple.0.clone(),
+            predicate: triple.1.clone(),
+            object: triple.2.clone(),
+        });
+    }
+    Ok(changes)
+}
+
+fn insert_changes(graph_id: &GraphId, triples: BTreeSet<TripleKey>) -> Vec<MaterializedQuadChange> {
+    triples
+        .into_iter()
+        .map(
+            |(subject, predicate, object)| MaterializedQuadChange::Insert {
+                graph: graph_id.clone(),
+                subject,
+                predicate,
+                object,
+            },
+        )
+        .collect()
+}
+
+fn validate_complete_import_triples(triples: &BTreeSet<TripleKey>) -> Result<(), RoCrateError> {
+    let root = EncodedTerm::from_named_node(&vocab::root_entity());
+    let metadata = EncodedTerm::from_named_node(&vocab::metadata_descriptor());
+    let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+    let dataset = EncodedTerm::from_named_node(&vocab::schema_dataset());
+    let creative_work = EncodedTerm::from_named_node(&vocab::schema_creative_work());
+    let about = EncodedTerm::from_named_node(&vocab::schema_about());
+    let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+    let media_object = EncodedTerm::from_named_node(&vocab::schema_media_object());
+    let root_name = EncodedTerm::from_named_node(&vocab::schema_name());
+    let root_description = EncodedTerm::from_named_node(&vocab::schema_description());
+    let root_date_published = EncodedTerm::from_named_node(&vocab::schema_date_published());
+    let root_license = EncodedTerm::from_named_node(&vocab::schema_license());
+
+    let mut subjects = BTreeSet::new();
+    let mut typed_subjects = HashSet::new();
+    let mut adjacency: HashMap<EncodedTerm, Vec<EncodedTerm>> = HashMap::new();
+    let mut data_entities = BTreeSet::new();
+    let mut has_root_dataset = false;
+    let mut has_metadata_type = false;
+    let mut root_name_count = 0usize;
+    let mut root_description_count = 0usize;
+    let mut root_date_published_count = 0usize;
+    let mut root_license_count = 0usize;
+
+    for (subject, predicate, object) in triples {
+        subjects.insert(subject.clone());
+
+        if subject == &root && predicate == &root_name {
+            root_name_count += 1;
+        }
+        if subject == &root && predicate == &root_description {
+            root_description_count += 1;
+        }
+        if subject == &root && predicate == &root_date_published {
+            root_date_published_count += 1;
+        }
+        if subject == &root && predicate == &root_license {
+            root_license_count += 1;
+        }
+
+        if predicate == &rdf_type {
+            typed_subjects.insert(subject.clone());
+            if subject == &root && object == &dataset {
+                has_root_dataset = true;
