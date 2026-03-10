@@ -1118,3 +1118,127 @@ fn validate_complete_import_triples(triples: &BTreeSet<TripleKey>) -> Result<(),
             typed_subjects.insert(subject.clone());
             if subject == &root && object == &dataset {
                 has_root_dataset = true;
+            }
+            if subject == &metadata && object == &creative_work {
+                has_metadata_type = true;
+            }
+            if subject != &root && (object == &dataset || object == &media_object) {
+                data_entities.insert(subject.clone());
+            }
+        }
+
+        if predicate == &has_part {
+            adjacency
+                .entry(subject.clone())
+                .or_default()
+                .push(object.clone());
+            if subject != &root {
+                data_entities.insert(subject.clone());
+            }
+            if object != &root {
+                data_entities.insert(object.clone());
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    let metadata_about_root = triples.contains(&(metadata.clone(), about.clone(), root.clone()));
+
+    if !has_root_dataset {
+        violations.push(crate::core::CrateViolation::MissingRootDataEntity);
+    }
+    if !(has_metadata_type && metadata_about_root) {
+        violations.push(crate::core::CrateViolation::MissingMetadataDescriptor);
+    }
+    if root_name_count < 1 {
+        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
+            entity: ROOT_ID.to_string(),
+            property: "schema:name".to_string(),
+        });
+    }
+    if root_description_count < 1 {
+        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
+            entity: ROOT_ID.to_string(),
+            property: "schema:description".to_string(),
+        });
+    }
+    if root_date_published_count < 1 {
+        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
+            entity: ROOT_ID.to_string(),
+            property: "schema:datePublished".to_string(),
+        });
+    }
+    if root_license_count < 1 {
+        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
+            entity: ROOT_ID.to_string(),
+            property: "schema:license".to_string(),
+        });
+    }
+    if root_date_published_count != 1 {
+        violations.push(
+            crate::core::CrateViolation::InvalidDatePublishedCardinality {
+                count: root_date_published_count,
+            },
+        );
+    }
+
+    if let Some(subject) = subjects
+        .iter()
+        .find(|subject| !typed_subjects.contains(*subject))
+    {
+        violations.push(crate::core::CrateViolation::EntityMissingType {
+            entity_id: subject.0.clone(),
+        });
+    }
+
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([root.clone()]);
+    reachable.insert(root.clone());
+    while let Some(current) = queue.pop_front() {
+        if let Some(children) = adjacency.get(&current) {
+            for child in children {
+                if reachable.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(orphan) = data_entities
+        .into_iter()
+        .find(|entity| !reachable.contains(entity))
+    {
+        violations.push(crate::core::CrateViolation::OrphanedDataEntity {
+            entity_id: orphan.0,
+        });
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(RoCrateError::Update(
+            crate::replication::UpdateError::ValidationFailed(violations),
+        ))
+    }
+}
+
+fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError> {
+    let object = value.as_object().ok_or_else(|| {
+        RoCrateError::UnsupportedJsonLd("top-level JSON-LD document must be an object".to_string())
+    })?;
+
+    let graph = object
+        .get("@graph")
+        .or_else(|| object.get("graph"))
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(
+                "RO-Crate import requires a top-level `@graph` array".to_string(),
+            )
+        })?;
+
+    let entries = graph.as_array().ok_or_else(|| {
+        RoCrateError::UnsupportedJsonLd("`@graph` must be a JSON array".to_string())
+    })?;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let entity = entry.as_object().ok_or_else(|| {
