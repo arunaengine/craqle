@@ -1242,3 +1242,127 @@ fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError>
 
     for (index, entry) in entries.iter().enumerate() {
         let entity = entry.as_object().ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(format!("@graph entry {index} must be an object"))
+        })?;
+
+        for (property, property_value) in entity {
+            if matches!(
+                property.as_str(),
+                "@id" | "id" | "@type" | "type" | "@context"
+            ) {
+                continue;
+            }
+            validate_property_value(property, property_value)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_property_value(property: &str, value: &serde_json::Value) -> Result<(), RoCrateError> {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => Ok(()),
+        serde_json::Value::Array(values) => {
+            for entry in values {
+                validate_property_value(property, entry)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(object) if is_reference_object(object) => Ok(()),
+        serde_json::Value::Object(object) if is_value_object(object) => {
+            validate_value_object(property, object)
+        }
+        serde_json::Value::Object(_) => Err(RoCrateError::UnsupportedJsonLd(format!(
+            "property `{property}` contains an inline nested object; nested entities must be top-level `@graph` entries referenced by `@id`"
+        ))),
+    }
+}
+
+fn is_reference_object(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_identifier = object.contains_key("@id") || object.contains_key("id");
+    has_identifier
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "@id" | "id" | "@type" | "type"))
+}
+
+fn is_value_object(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_value = object.contains_key("@value") || object.contains_key("value");
+    has_value
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "@value" | "value" | "@type" | "type" | "@language" | "language"
+            )
+        })
+}
+
+fn validate_value_object(
+    property: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RoCrateError> {
+    let value = object
+        .get("@value")
+        .or_else(|| object.get("value"))
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(format!(
+                "property `{property}` value object is missing `@value`"
+            ))
+        })?;
+
+    if matches!(
+        value,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) {
+        return Err(RoCrateError::UnsupportedJsonLd(format!(
+            "property `{property}` value object must contain a scalar `@value`"
+        )));
+    }
+
+    let language = object.get("@language").or_else(|| object.get("language"));
+    let datatype = object.get("@type").or_else(|| object.get("type"));
+
+    if language.is_some() && datatype.is_some() {
+        return Err(RoCrateError::UnsupportedJsonLd(format!(
+            "property `{property}` value object must not combine `@language` and `@type`"
+        )));
+    }
+
+    if let Some(language) = language {
+        if !matches!(value, serde_json::Value::String(_)) {
+            return Err(RoCrateError::UnsupportedJsonLd(format!(
+                "property `{property}` language-tagged values must use string `@value`"
+            )));
+        }
+        if !language.is_string() {
+            return Err(RoCrateError::UnsupportedJsonLd(format!(
+                "property `{property}` language tag must be a string"
+            )));
+        }
+    }
+
+    if let Some(datatype) = datatype {
+        let Some(datatype) = datatype.as_str() else {
+            return Err(RoCrateError::UnsupportedJsonLd(format!(
+                "property `{property}` datatype must be a string"
+            )));
+        };
+        let _ = if datatype.starts_with("http://") || datatype.starts_with("https://") {
+            NamedNode::new_unchecked(datatype)
+        } else {
+            expand_known_compact_iri(datatype)?
+        };
+    }
+
+    Ok(())
+}
+
+fn jsonld_triples(value: &serde_json::Value) -> Result<BTreeSet<TripleKey>, RoCrateError> {
+    let object = value.as_object().ok_or_else(|| {
+        RoCrateError::UnsupportedJsonLd("top-level JSON-LD document must be an object".to_string())
+    })?;
+    let graph = object
+        .get("@graph")
