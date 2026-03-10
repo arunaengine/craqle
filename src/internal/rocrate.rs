@@ -869,3 +869,127 @@ impl RoCrateManager {
             .orphaned_entities
             .into_iter()
             .map(|entity_id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)))
+            .collect())
+    }
+
+    fn visible_root_linked_data_entities(
+        &self,
+        graph_id: &GraphId,
+    ) -> Result<Vec<EncodedTerm>, RoCrateError> {
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let mut entities: Vec<EncodedTerm> = self
+            .subject_triples(graph_id, ROOT_ID)?
+            .into_iter()
+            .filter(|(predicate, _)| predicate == &has_part)
+            .map(|(_, object)| object)
+            .collect();
+        entities.sort();
+        entities.dedup();
+        Ok(entities)
+    }
+
+    fn root_linked_data_entity_page(
+        &self,
+        graph_id: &GraphId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(usize, Vec<EncodedTerm>), RoCrateError> {
+        if self.orphaned_entities(graph_id)?.is_empty() {
+            let root = EncodedTerm::from_named_node(&vocab::root_entity());
+            let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+            return Ok(self
+                .engine
+                .store()
+                .objects_for_subject_predicate_page(graph_id, &root, &has_part, offset, limit)?);
+        }
+
+        let visible = self.visible_root_linked_data_entities(graph_id)?;
+        let total = visible.len();
+        let page = visible.into_iter().skip(offset).take(limit).collect();
+        Ok((total, page))
+    }
+
+    fn root_linked_data_entity_page_after(
+        &self,
+        graph_id: &GraphId,
+        after_entity_id: Option<&str>,
+        limit: usize,
+    ) -> Result<(usize, Vec<EncodedTerm>), RoCrateError> {
+        let after = after_entity_id.map(normalize_entity_id);
+        if self.orphaned_entities(graph_id)?.is_empty() {
+            let root = EncodedTerm::from_named_node(&vocab::root_entity());
+            let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+            let after = after
+                .as_ref()
+                .map(|id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(id.as_str())));
+            let total = self
+                .engine
+                .store()
+                .count_objects_for_subject_predicate(graph_id, &root, &has_part)?;
+            let page = self
+                .engine
+                .store()
+                .objects_for_subject_predicate_page_after(
+                    graph_id,
+                    &root,
+                    &has_part,
+                    after.as_ref(),
+                    limit,
+                )?;
+            return Ok((total, page));
+        }
+
+        let visible = self.visible_root_linked_data_entities(graph_id)?;
+        let total = visible.len();
+        let mut page: Vec<EncodedTerm> = visible
+            .into_iter()
+            .skip_while(|entity| {
+                after.as_deref().is_some_and(|after_id| {
+                    encoded_named_node_value(entity).as_deref() != Some(after_id)
+                })
+            })
+            .collect();
+        if after.is_some() && !page.is_empty() {
+            page.remove(0);
+        }
+        page.truncate(limit);
+        Ok((total, page))
+    }
+
+    fn collect_partial_view_contextual_entities(
+        &self,
+        graph_id: &GraphId,
+        page_entities: &[EncodedTerm],
+    ) -> Result<Vec<String>, RoCrateError> {
+        let page_subjects: HashSet<String> = page_entities
+            .iter()
+            .filter_map(encoded_named_node_value)
+            .collect();
+        let mut queue = VecDeque::from([METADATA_ID.to_string(), ROOT_ID.to_string()]);
+        queue.extend(page_subjects.iter().cloned());
+
+        let mut expanded = HashSet::new();
+        let mut contextuals = BTreeSet::new();
+
+        while let Some(subject_id) = queue.pop_front() {
+            if !expanded.insert(subject_id.clone()) {
+                continue;
+            }
+
+            let references = if subject_id == ROOT_ID {
+                self.subject_triples_excluding_predicate(
+                    graph_id,
+                    ROOT_ID,
+                    &vocab::schema_has_part(),
+                )?
+            } else {
+                self.subject_triples(graph_id, &subject_id)?
+            };
+
+            for (_, object) in references {
+                let Some(candidate_id) = encoded_named_node_value(&object) else {
+                    continue;
+                };
+                if candidate_id == ROOT_ID
+                    || candidate_id == METADATA_ID
+                    || page_subjects.contains(&candidate_id)
