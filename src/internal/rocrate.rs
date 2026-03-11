@@ -1366,3 +1366,128 @@ fn jsonld_triples(value: &serde_json::Value) -> Result<BTreeSet<TripleKey>, RoCr
     })?;
     let graph = object
         .get("@graph")
+        .or_else(|| object.get("graph"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(
+                "RO-Crate import requires a top-level `@graph` array".to_string(),
+            )
+        })?;
+
+    let mut triples = BTreeSet::new();
+    for (index, entry) in graph.iter().enumerate() {
+        let entity = entry.as_object().ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(format!("@graph entry {index} must be an object"))
+        })?;
+        let subject_id = entity_identifier(entity, index)?;
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&subject_id));
+
+        if let Some(type_value) = entity.get("@type").or_else(|| entity.get("type")) {
+            let predicate = EncodedTerm::from_named_node(&vocab::rdf_type());
+            for object in property_value_terms("type", type_value)? {
+                triples.insert((subject.clone(), predicate.clone(), object));
+            }
+        }
+
+        for (property, property_value) in entity {
+            if matches!(
+                property.as_str(),
+                "@context" | "@graph" | "graph" | "@id" | "id" | "@type" | "type"
+            ) {
+                continue;
+            }
+            let normalized_property = normalize_property(property);
+            let predicate =
+                EncodedTerm::from_named_node(&property_named_node(&normalized_property)?);
+            for object in property_value_terms(&normalized_property, property_value)? {
+                triples.insert((subject.clone(), predicate.clone(), object));
+            }
+        }
+    }
+
+    Ok(triples)
+}
+
+fn entity_identifier(
+    entity: &serde_json::Map<String, serde_json::Value>,
+    index: usize,
+) -> Result<String, RoCrateError> {
+    let raw = entity
+        .get("@id")
+        .or_else(|| entity.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(format!(
+                "@graph entry {index} must define string `@id`"
+            ))
+        })?;
+    Ok(normalize_entity_id(raw))
+}
+
+fn property_value_terms(
+    property: &str,
+    value: &serde_json::Value,
+) -> Result<Vec<EncodedTerm>, RoCrateError> {
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Bool(boolean) => Ok(vec![encoded_typed_literal(
+            boolean.to_string(),
+            XSD_BOOLEAN_IRI,
+        )]),
+        serde_json::Value::Number(number) => Ok(vec![encoded_number_literal(number)]),
+        serde_json::Value::String(text) => Ok(vec![property_value_encoded(property, text)?]),
+        serde_json::Value::Array(values) => {
+            let mut objects = Vec::new();
+            for entry in values {
+                objects.extend(property_value_terms(property, entry)?);
+            }
+            Ok(objects)
+        }
+        serde_json::Value::Object(object) if is_reference_object(object) => {
+            let id = object
+                .get("@id")
+                .or_else(|| object.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RoCrateError::UnsupportedJsonLd(format!(
+                        "property `{property}` reference object is missing string `@id`"
+                    ))
+                })?;
+            Ok(vec![encoded_reference_term(&normalize_entity_id(id))?])
+        }
+        serde_json::Value::Object(object) if is_value_object(object) => {
+            Ok(vec![encoded_value_object(object)?])
+        }
+        serde_json::Value::Object(_) => Err(RoCrateError::UnsupportedJsonLd(format!(
+            "property `{property}` contains an inline nested object; nested entities must be top-level `@graph` entries referenced by `@id`"
+        ))),
+    }
+}
+
+fn encoded_number_literal(number: &serde_json::Number) -> EncodedTerm {
+    if number.as_i64().is_some() || number.as_u64().is_some() {
+        encoded_typed_literal(number.to_string(), XSD_INTEGER_IRI)
+    } else {
+        encoded_typed_literal(number.to_string(), XSD_DOUBLE_IRI)
+    }
+}
+
+fn encoded_value_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<EncodedTerm, RoCrateError> {
+    let value = object
+        .get("@value")
+        .or_else(|| object.get("value"))
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd("value object missing `@value`".to_string())
+        })?;
+    let language = object
+        .get("@language")
+        .or_else(|| object.get("language"))
+        .and_then(serde_json::Value::as_str);
+    let datatype = object
+        .get("@type")
+        .or_else(|| object.get("type"))
+        .and_then(serde_json::Value::as_str);
+
+    match value {
