@@ -1491,3 +1491,127 @@ fn encoded_value_object(
         .and_then(serde_json::Value::as_str);
 
     match value {
+        serde_json::Value::String(text) => {
+            if let Some(language) = language {
+                Ok(encoded_language_literal(text, language))
+            } else if let Some(datatype) = datatype {
+                Ok(encoded_typed_literal(text.clone(), datatype_iri(datatype)?))
+            } else {
+                Ok(encoded_literal(text))
+            }
+        }
+        serde_json::Value::Bool(boolean) => Ok(encoded_typed_literal(
+            boolean.to_string(),
+            datatype
+                .map(datatype_iri)
+                .transpose()?
+                .unwrap_or_else(|| XSD_BOOLEAN_IRI.to_string()),
+        )),
+        serde_json::Value::Number(number) => Ok(encoded_typed_literal(
+            number.to_string(),
+            datatype.map(datatype_iri).transpose()?.unwrap_or_else(|| {
+                if number.as_i64().is_some() || number.as_u64().is_some() {
+                    XSD_INTEGER_IRI.to_string()
+                } else {
+                    XSD_DOUBLE_IRI.to_string()
+                }
+            }),
+        )),
+        serde_json::Value::Null => Ok(encoded_literal("")),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(
+            RoCrateError::UnsupportedJsonLd("value object `@value` must be scalar".to_string()),
+        ),
+    }
+}
+
+fn datatype_iri(datatype: &str) -> Result<String, RoCrateError> {
+    if datatype.starts_with("http://") || datatype.starts_with("https://") {
+        Ok(datatype.to_string())
+    } else {
+        Ok(expand_known_compact_iri(datatype)?.as_str().to_string())
+    }
+}
+
+fn entity_subject_triples(
+    _entity_id: &str,
+    entity_type: &str,
+    name: &str,
+    additional_triples: &[(NamedNode, oxrdf::Term)],
+) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
+    let mut triples = vec![
+        (
+            EncodedTerm::from_named_node(&vocab::rdf_type()),
+            encoded_class_term(entity_type)?,
+        ),
+        (
+            EncodedTerm::from_named_node(&vocab::schema_name()),
+            encoded_literal(name),
+        ),
+    ];
+
+    for (predicate, object) in additional_triples {
+        triples.push((
+            EncodedTerm::from_named_node(predicate),
+            EncodedTerm::from_term(object),
+        ));
+    }
+
+    Ok(triples)
+}
+
+fn property_named_node(property: &str) -> Result<NamedNode, RoCrateError> {
+    match property {
+        "@type" | "type" => Ok(vocab::rdf_type()),
+        "name" => Ok(vocab::schema_name()),
+        "description" => Ok(vocab::schema_description()),
+        "keywords" => Ok(vocab::schema_keywords()),
+        "datePublished" => Ok(vocab::schema_date_published()),
+        "license" => Ok(vocab::schema_license()),
+        "about" => Ok(vocab::schema_about()),
+        "conformsTo" => Ok(vocab::schema_conforms_to()),
+        other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
+        other if other.contains(':') => expand_known_compact_iri(other),
+        other => Ok(NamedNode::new_unchecked(format!(
+            "http://schema.org/{}",
+            normalize_term(other)
+        ))),
+    }
+}
+
+fn property_value_encoded(property: &str, value: &str) -> Result<EncodedTerm, RoCrateError> {
+    match property {
+        "@type" | "type" => encoded_class_term(value),
+        "license" | "about" | "conformsTo" => {
+            if looks_like_identifier(value) {
+                encoded_reference_term(value)
+            } else {
+                Ok(encoded_literal(value))
+            }
+        }
+        _ => Ok(encoded_literal(value)),
+    }
+}
+
+fn encoded_class_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
+    let iri = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else if value.contains(':') {
+        expand_known_compact_iri(value)?.as_str().to_string()
+    } else {
+        format!("http://schema.org/{}", normalize_term(value))
+    };
+    Ok(EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+        &iri,
+    )))
+}
+
+fn encoded_identifier(value: &str) -> EncodedTerm {
+    EncodedTerm::from_named_node(&NamedNode::new_unchecked(value))
+}
+
+fn encoded_literal(value: &str) -> EncodedTerm {
+    EncodedTerm::from_term(&Term::Literal(oxrdf::Literal::new_simple_literal(value)))
+}
+
+fn encoded_typed_literal(value: impl Into<String>, datatype: impl AsRef<str>) -> EncodedTerm {
+    EncodedTerm::from_term(&Term::Literal(oxrdf::Literal::new_typed_literal(
