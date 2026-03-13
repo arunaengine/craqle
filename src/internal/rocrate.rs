@@ -1864,3 +1864,127 @@ fn literal_string(term: &EncodedTerm) -> Result<String, RoCrateError> {
 
 fn id_from_encoded_term(term: &EncodedTerm) -> Id {
     match term.to_term() {
+        Some(Term::NamedNode(node)) => Id::Id(node.as_str().to_string()),
+        Some(Term::BlankNode(node)) => Id::Id(format!("_:{}", node.as_str())),
+        Some(Term::Literal(literal)) => Id::Id(literal.value().to_string()),
+        _ => Id::Id(term.0.clone()),
+    }
+}
+
+fn license_from_encoded_term(term: &EncodedTerm) -> License {
+    match term.to_term() {
+        Some(Term::NamedNode(node)) => License::Id(Id::Id(node.as_str().to_string())),
+        Some(Term::BlankNode(node)) => License::Id(Id::Id(format!("_:{}", node.as_str()))),
+        Some(Term::Literal(literal)) => License::Description(literal.value().to_string()),
+        _ => License::Description(term.0.clone()),
+    }
+}
+
+fn insert_entity_value(
+    dynamic: &mut HashMap<String, EntityValue>,
+    key: String,
+    value: EntityValue,
+) {
+    match dynamic.remove(&key) {
+        None => {
+            dynamic.insert(key, value);
+        }
+        Some(EntityValue::EntityVec(mut values)) => {
+            values.push(value);
+            dynamic.insert(key, EntityValue::EntityVec(values));
+        }
+        Some(existing) => {
+            dynamic.insert(key, EntityValue::EntityVec(vec![existing, value]));
+        }
+    }
+}
+
+fn entity_value_from_encoded_term(term: &EncodedTerm) -> EntityValue {
+    match term.to_term() {
+        Some(Term::NamedNode(node)) => EntityValue::EntityId(Id::Id(node.as_str().to_string())),
+        Some(Term::BlankNode(node)) => {
+            EntityValue::EntityId(Id::Id(format!("_:{}", node.as_str())))
+        }
+        Some(Term::Literal(literal)) => literal_entity_value(term, &literal),
+        _ => EntityValue::EntityString(term.0.clone()),
+    }
+}
+
+fn literal_entity_value(term: &EncodedTerm, literal: &oxrdf::Literal) -> EntityValue {
+    let value = literal.value().to_string();
+    let annotation = literal_annotation(&term.0).unwrap_or(LiteralAnnotation::Simple);
+    match annotation {
+        LiteralAnnotation::Simple => EntityValue::EntityString(value),
+        LiteralAnnotation::Language(language) => literal_value_object(value, Some(language), None),
+        LiteralAnnotation::Datatype(datatype) => match datatype.as_str() {
+            XSD_STRING_IRI => EntityValue::EntityString(value),
+            XSD_BOOLEAN_IRI => value
+                .parse::<bool>()
+                .map(EntityValue::EntityBool)
+                .unwrap_or_else(|_| literal_value_object(value, None, Some(datatype))),
+            XSD_INTEGER_IRI => value
+                .parse::<i64>()
+                .map(EntityValue::Entityi64)
+                .unwrap_or_else(|_| literal_value_object(value, None, Some(datatype))),
+            XSD_DOUBLE_IRI => value
+                .parse::<f64>()
+                .map(EntityValue::Entityf64)
+                .unwrap_or_else(|_| literal_value_object(value, None, Some(datatype))),
+            _ => literal_value_object(value, None, Some(datatype)),
+        },
+    }
+}
+
+fn literal_value_object(
+    value: String,
+    language: Option<String>,
+    datatype: Option<String>,
+) -> EntityValue {
+    let mut object = HashMap::new();
+    object.insert("@value".to_string(), EntityValue::EntityString(value));
+    if let Some(language) = language {
+        object.insert("@language".to_string(), EntityValue::EntityString(language));
+    }
+    if let Some(datatype) = datatype {
+        object.insert("@type".to_string(), EntityValue::EntityString(datatype));
+    }
+    EntityValue::EntityObject(object)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiteralAnnotation {
+    Simple,
+    Language(String),
+    Datatype(String),
+}
+
+fn literal_annotation(encoded: &str) -> Option<LiteralAnnotation> {
+    let suffix = literal_suffix(encoded)?;
+    if let Some(language) = suffix.strip_prefix('@') {
+        Some(LiteralAnnotation::Language(language.to_string()))
+    } else if let Some(datatype) = suffix.strip_prefix("^^<") {
+        Some(LiteralAnnotation::Datatype(
+            datatype.strip_suffix('>')?.to_string(),
+        ))
+    } else {
+        Some(LiteralAnnotation::Simple)
+    }
+}
+
+fn literal_suffix(encoded: &str) -> Option<&str> {
+    let bytes = encoded.as_bytes();
+    if bytes.first().copied()? != b'"' {
+        return None;
+    }
+
+    let mut index = 1usize;
+    while index < encoded.len() {
+        match bytes[index] {
+            b'"' => return encoded.get(index + 1..),
+            b'\\' => {
+                index += 2;
+            }
+            _ => {
+                index += encoded[index..].chars().next()?.len_utf8();
+            }
+        }
