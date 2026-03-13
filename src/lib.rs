@@ -371,3 +371,56 @@ impl CraqleNode {
             &request.graph,
             &request.entity_id,
             &request.entity_type,
+            &request.name,
+            request.additional_triples,
+        )
+    }
+
+    /// Create or replace a contextual entity.
+    pub fn add_contextual_entity(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+    ) -> Result<Batch> {
+        self.add_contextual_entity_with_triples(
+            auth,
+            graph,
+            entity_id,
+            entity_type,
+            name,
+            Vec::new(),
+        )
+    }
+
+    /// Create or replace a contextual entity with extra RDF properties.
+    pub fn add_contextual_entity_with_triples(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, Term)>,
+    ) -> Result<Batch> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let batch = self.manager().add_contextual_entity(
+            graph,
+            entity_id,
+            entity_type,
+            name,
+            additional_triples,
+        )?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Set the hidden access policy for a graph.
+    pub fn set_graph_policy(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        policy: GraphPolicy,
+    ) -> Result<()> {
+        let policy = policy.normalized();
