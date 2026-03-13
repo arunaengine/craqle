@@ -1739,3 +1739,128 @@ fn export_root_entity(
                 "hasPart".to_string(),
                 if ids.len() == 1 {
                     EntityValue::EntityId(Id::Id(ids[0].clone()))
+                } else {
+                    EntityValue::EntityId(Id::IdArray(ids))
+                },
+            );
+        }
+    }
+
+    Ok(RootDataEntity {
+        id: ROOT_ID.to_string(),
+        type_: data_type_from_terms(type_terms, "Dataset"),
+        name: name.ok_or_else(|| RoCrateError::InvalidGraph("root entity missing name".into()))?,
+        description: description
+            .ok_or_else(|| RoCrateError::InvalidGraph("root entity missing description".into()))?,
+        date_published: date_published.ok_or_else(|| {
+            RoCrateError::InvalidGraph("root entity missing datePublished".into())
+        })?,
+        license: license.unwrap_or_else(|| License::Id(Id::Id(ROCRATE_SPEC_URL.to_string()))),
+        dynamic_entity: (!dynamic.is_empty()).then_some(dynamic),
+    })
+}
+
+fn export_graph_entity(
+    subject_id: &str,
+    triples: Vec<(EncodedTerm, EncodedTerm)>,
+) -> Result<GraphVector, RoCrateError> {
+    let mut type_terms = Vec::new();
+    let mut dynamic = HashMap::new();
+
+    for (predicate, object) in triples {
+        let key = predicate_key(&predicate);
+        match key.as_str() {
+            "type" | "@type" => {
+                if let Some(value) = object_named_node_value(&object) {
+                    type_terms.push(value);
+                }
+            }
+            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+        }
+    }
+
+    let data_type = data_type_from_terms(type_terms.clone(), "Thing");
+    let dynamic_entity = (!dynamic.is_empty()).then_some(dynamic);
+    if type_terms
+        .iter()
+        .any(|term| term == "Dataset" || term == "MediaObject" || term == "File")
+    {
+        Ok(GraphVector::DataEntity(DataEntity {
+            id: subject_id.to_string(),
+            type_: data_type,
+            dynamic_entity,
+        }))
+    } else {
+        Ok(GraphVector::ContextualEntity(ContextualEntity {
+            id: subject_id.to_string(),
+            type_: data_type,
+            dynamic_entity,
+        }))
+    }
+}
+
+fn predicate_key(predicate: &EncodedTerm) -> String {
+    predicate
+        .to_named_node()
+        .map(|node| normalize_compact_term(node.as_str()))
+        .unwrap_or_else(|| predicate.0.clone())
+}
+
+fn object_named_node_value(object: &EncodedTerm) -> Option<String> {
+    object
+        .to_named_node()
+        .map(|node| normalize_compact_term(node.as_str()))
+}
+
+fn encoded_named_node_value(object: &EncodedTerm) -> Option<String> {
+    object.to_named_node().map(|node| node.as_str().to_string())
+}
+
+fn normalize_compact_term(value: &str) -> String {
+    value
+        .strip_prefix("http://schema.org/")
+        .or_else(|| value.strip_prefix("https://schema.org/"))
+        .or_else(|| value.strip_prefix("http://www.w3.org/1999/02/22-rdf-syntax-ns#"))
+        .or_else(|| value.strip_prefix("http://www.w3.org/2000/01/rdf-schema#"))
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn data_type_from_terms(terms: Vec<String>, default: &str) -> DataType {
+    let mut terms = if terms.is_empty() {
+        vec![default.to_string()]
+    } else {
+        terms
+    };
+    terms.sort();
+    terms.dedup();
+    if terms.len() == 1 {
+        DataType::Term(terms.remove(0))
+    } else {
+        DataType::TermArray(terms)
+    }
+}
+
+fn triples_describe_contextual_entity(triples: &[(EncodedTerm, EncodedTerm)]) -> bool {
+    !triples.iter().any(|(predicate, object)| {
+        predicate == &EncodedTerm::from_named_node(&vocab::rdf_type())
+            && object_named_node_value(object)
+                .is_some_and(|term| matches!(term.as_str(), "Dataset" | "MediaObject" | "File"))
+    })
+}
+
+fn literal_string(term: &EncodedTerm) -> Result<String, RoCrateError> {
+    match term.to_term() {
+        Some(Term::Literal(literal)) => Ok(literal.value().to_string()),
+        Some(other) => Err(RoCrateError::InvalidGraph(format!(
+            "expected literal, found `{other}`"
+        ))),
+        None => Err(RoCrateError::InvalidGraph(format!(
+            "failed to parse term `{}`",
+            term.0
+        ))),
+    }
+}
+
+fn id_from_encoded_term(term: &EncodedTerm) -> Id {
+    match term.to_term() {

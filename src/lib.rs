@@ -424,3 +424,56 @@ impl CraqleNode {
         policy: GraphPolicy,
     ) -> Result<()> {
         let policy = policy.normalized();
+        self.ensure_policy_action(graph, &policy, auth, Action::Write)?;
+        self.persist_graph_policy(graph, policy)?;
+        Ok(())
+    }
+
+    /// Export the full visible RO-Crate as JSON-LD.
+    pub fn export_rocrate(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<String> {
+        self.ensure_graph_action(graph, auth, Action::Read)?;
+        Ok(self.manager().export_jsonld(graph)?)
+    }
+
+    /// Export a summary JSON-LD view without paged data entities.
+    pub fn export_rocrate_summary(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<String> {
+        self.ensure_graph_action(graph, auth, Action::Read)?;
+        Ok(self.manager().export_jsonld_summary(graph)?)
+    }
+
+    /// Export a paged JSON-LD view using an offset cursor.
+    pub fn export_rocrate_page(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<RoCratePage> {
+        self.ensure_graph_action(graph, auth, Action::Read)?;
+        Ok(self.manager().export_jsonld_page(graph, offset, limit)?)
+    }
+
+    /// Export a paged JSON-LD view using an entity-id cursor.
+    pub fn export_rocrate_page_after(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        after_entity_id: Option<&str>,
+        limit: usize,
+    ) -> Result<RoCratePage> {
+        self.ensure_graph_action(graph, auth, Action::Read)?;
+        Ok(self
+            .manager()
+            .export_jsonld_page_after(graph, after_entity_id, limit)?)
+    }
+
+    /// Replace the current visible RO-Crate state from a JSON-LD document.
+    pub fn apply_rocrate_document(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+    ) -> Result<Batch> {
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
+        self.finish_batch(&graph, batch)
