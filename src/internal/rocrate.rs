@@ -1615,3 +1615,127 @@ fn encoded_literal(value: &str) -> EncodedTerm {
 
 fn encoded_typed_literal(value: impl Into<String>, datatype: impl AsRef<str>) -> EncodedTerm {
     EncodedTerm::from_term(&Term::Literal(oxrdf::Literal::new_typed_literal(
+        value.into(),
+        NamedNode::new_unchecked(datatype.as_ref()),
+    )))
+}
+
+fn encoded_language_literal(value: &str, language: &str) -> EncodedTerm {
+    EncodedTerm::from_term(&Term::Literal(
+        oxrdf::Literal::new_language_tagged_literal_unchecked(value, language),
+    ))
+}
+
+fn encoded_reference_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
+    if value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('#')
+        || value.starts_with("_:")
+    {
+        Ok(encoded_identifier(value))
+    } else if value.contains(':') {
+        Ok(EncodedTerm::from_named_node(&expand_known_compact_iri(
+            value,
+        )?))
+    } else {
+        Err(RoCrateError::UnsupportedTerm(value.to_string()))
+    }
+}
+
+fn encoded_license_value(license: &str) -> Result<EncodedTerm, RoCrateError> {
+    if looks_like_identifier(license) {
+        encoded_reference_term(license)
+    } else {
+        Ok(encoded_literal(license))
+    }
+}
+
+fn expand_known_compact_iri(value: &str) -> Result<NamedNode, RoCrateError> {
+    if let Some(local) = value.strip_prefix("schema:") {
+        Ok(NamedNode::new_unchecked(format!(
+            "http://schema.org/{local}"
+        )))
+    } else if let Some(local) = value.strip_prefix("rdf:") {
+        Ok(NamedNode::new_unchecked(format!(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#{local}"
+        )))
+    } else if let Some(local) = value.strip_prefix("rdfs:") {
+        Ok(NamedNode::new_unchecked(format!(
+            "http://www.w3.org/2000/01/rdf-schema#{local}"
+        )))
+    } else {
+        Err(RoCrateError::UnsupportedTerm(value.to_string()))
+    }
+}
+
+fn export_metadata_descriptor(
+    triples: Vec<(EncodedTerm, EncodedTerm)>,
+) -> Result<MetadataDescriptor, RoCrateError> {
+    let mut type_terms = Vec::new();
+    let mut conforms_to = None;
+    let mut about = None;
+    let mut dynamic = HashMap::new();
+
+    for (predicate, object) in triples {
+        let key = predicate_key(&predicate);
+        match key.as_str() {
+            "type" | "@type" => {
+                if let Some(value) = object_named_node_value(&object) {
+                    type_terms.push(value);
+                }
+            }
+            "conformsTo" => conforms_to = Some(id_from_encoded_term(&object)),
+            "about" => about = Some(id_from_encoded_term(&object)),
+            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+        }
+    }
+
+    Ok(MetadataDescriptor {
+        id: METADATA_ID.to_string(),
+        type_: data_type_from_terms(type_terms, "CreativeWork"),
+        conforms_to: conforms_to.unwrap_or_else(|| Id::Id(ROCRATE_SPEC_URL.to_string())),
+        about: about.unwrap_or_else(|| Id::Id(ROOT_ID.to_string())),
+        dynamic_entity: (!dynamic.is_empty()).then_some(dynamic),
+    })
+}
+
+fn export_root_entity(
+    triples: Vec<(EncodedTerm, EncodedTerm)>,
+    page_entities: &[EncodedTerm],
+) -> Result<RootDataEntity, RoCrateError> {
+    let mut type_terms = Vec::new();
+    let mut name = None;
+    let mut description = None;
+    let mut date_published = None;
+    let mut license = None;
+    let mut dynamic = HashMap::new();
+
+    for (predicate, object) in triples {
+        let key = predicate_key(&predicate);
+        match key.as_str() {
+            "type" | "@type" => {
+                if let Some(value) = object_named_node_value(&object) {
+                    type_terms.push(value);
+                }
+            }
+            "name" => name = Some(literal_string(&object)?),
+            "description" => description = Some(literal_string(&object)?),
+            "datePublished" => date_published = Some(literal_string(&object)?),
+            "license" => license = Some(license_from_encoded_term(&object)),
+            "hasPart" => {}
+            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+        }
+    }
+
+    if !page_entities.is_empty() {
+        let ids = page_entities
+            .iter()
+            .filter_map(|term| term.to_named_node().map(|node| node.as_str().to_string()))
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            dynamic.insert(
+                "hasPart".to_string(),
+                if ids.len() == 1 {
+                    EntityValue::EntityId(Id::Id(ids[0].clone()))
