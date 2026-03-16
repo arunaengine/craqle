@@ -116,3 +116,121 @@ fn write_access_is_required_for_updates() {
         CreateCrateRequest::new(
             graph.clone(),
             "Protected Dataset",
+            "Only writers may mutate this crate",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/public/demo".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let err = node
+        .apply_sparql_update(
+            &reader,
+            "INSERT DATA { GRAPH <urn:test:update> { <urn:test:item> schema:name \"forbidden\" } }",
+        )
+        .unwrap_err();
+    assert!(matches!(err, CraqleError::Authorization(_)));
+
+    node.apply_sparql_update(
+        &writer,
+        "INSERT { GRAPH <urn:test:update> { ?root schema:hasPart <urn:test:item> . <urn:test:item> rdf:type schema:MediaObject . <urn:test:item> schema:name \"allowed\" } } WHERE { GRAPH <urn:test:update> { ?root rdf:type schema:Dataset . ?root schema:datePublished ?date . } }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn explicit_batch_and_snapshot_sync_replicate_graphs_and_policy() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let node_a = CraqleNode::open(dir_a.path()).unwrap();
+    let node_b = CraqleNode::open(dir_b.path()).unwrap();
+    let graph = GraphId::new("urn:test:sync");
+    let auth = writer_auth();
+
+    node_a
+        .create_crate(
+            &auth,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Synced Dataset",
+                "Replicated through sync messages",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: false,
+                    permission_paths: vec!["/datasets/private/project-a".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+
+    let policy = node_a.graph_policy(&graph).unwrap();
+    let snapshot = node_a.graph_snapshot(&graph).unwrap();
+    node_b.import_graph_snapshot(&snapshot, policy).unwrap();
+
+    node_a
+        .add_data_entity(
+            &auth,
+            &graph,
+            "data/synced.txt",
+            "http://schema.org/MediaObject",
+            "Synced File",
+        )
+        .unwrap();
+    let batches = node_a
+        .catchup_batches(&graph, &node_b.vector_clock(&graph).unwrap())
+        .unwrap();
+    node_b.apply_remote_batches(batches).unwrap();
+    node_b
+        .import_graph_policy(&graph, node_a.graph_policy(&graph).unwrap())
+        .unwrap();
+
+    assert_eq!(
+        node_b.graph_policy(&graph).unwrap().permission_paths,
+        vec!["/datasets/private/project-a".to_string()]
+    );
+    let rows = match node_b
+        .query(
+            &auth,
+            "SELECT ?name WHERE { GRAPH <urn:test:sync> { ?s schema:name ?name } }",
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .any(|row| row.values().any(|value| value.0.contains("Synced File")))
+    );
+}
+
+#[test]
+fn search_filters_private_graphs_by_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            GraphId::new("urn:test:public-search"),
+            "Public Proteomics",
+            "Visible search document",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/demo".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
