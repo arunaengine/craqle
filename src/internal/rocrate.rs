@@ -1988,3 +1988,127 @@ fn literal_suffix(encoded: &str) -> Option<&str> {
                 index += encoded[index..].chars().next()?.len_utf8();
             }
         }
+    }
+
+    None
+}
+
+fn default_context() -> RoCrateContext {
+    RoCrateContext::ReferenceContext(ROCRATE_CONTEXT_URL.to_string())
+}
+
+fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateError> {
+    let rdf_graph = rocrate_to_rdf_with_options(
+        rocrate,
+        ContextResolverBuilder::default(),
+        ConversionOptions::AllowRelative,
+    )?;
+
+    let mut triples = BTreeSet::new();
+    for triple in rdf_graph {
+        triples.insert(triple_key_from_rdf(&triple));
+    }
+    Ok(triples)
+}
+
+fn triple_key_from_rdf(triple: &Triple) -> TripleKey {
+    (
+        EncodedTerm::from(&triple.subject),
+        EncodedTerm::from_named_node(&triple.predicate),
+        EncodedTerm::from_term(&triple.object),
+    )
+}
+
+fn normalize_rocrate(rocrate: &mut RoCrate) {
+    for entry in &mut rocrate.graph {
+        if let GraphVector::MetadataDescriptor(metadata) = entry {
+            normalize_metadata_descriptor(metadata);
+        }
+    }
+}
+
+fn normalize_metadata_descriptor(metadata: &mut MetadataDescriptor) {
+    if let Some(dynamic) = &mut metadata.dynamic_entity
+        && let Some(value) = dynamic
+            .remove("conformsTo")
+            .or_else(|| dynamic.remove("schema:conformsTo"))
+            .or_else(|| dynamic.remove("http://schema.org/conformsTo"))
+            .or_else(|| dynamic.remove("https://schema.org/conformsTo"))
+        && let Some(id) = first_identifier(&value)
+    {
+        metadata.conforms_to = Id::Id(id);
+    }
+
+    if let Id::Id(id) = &metadata.conforms_to
+        && id == ROCRATE_CONTEXT_URL
+    {
+        metadata.conforms_to = Id::Id(ROCRATE_SPEC_URL.to_string());
+    }
+}
+
+fn first_identifier(value: &EntityValue) -> Option<String> {
+    match value {
+        EntityValue::EntityId(Id::Id(id)) => Some(id.clone()),
+        EntityValue::EntityId(Id::IdArray(ids)) => preferred_identifier(ids),
+        EntityValue::EntityVec(values) => values.iter().find_map(first_identifier),
+        _ => None,
+    }
+}
+
+fn preferred_identifier(ids: &[String]) -> Option<String> {
+    ids.iter()
+        .find(|id| id.as_str() != ROCRATE_CONTEXT_URL)
+        .cloned()
+        .or_else(|| ids.first().cloned())
+}
+
+fn normalize_property(property: &str) -> String {
+    property
+        .strip_prefix("schema:")
+        .or_else(|| property.strip_prefix("http://schema.org/"))
+        .or_else(|| property.strip_prefix("https://schema.org/"))
+        .map(str::to_string)
+        .unwrap_or_else(|| property.to_string())
+}
+
+fn normalize_term(term: &str) -> String {
+    normalize_property(term)
+}
+
+fn normalize_entity_id(id: &str) -> String {
+    if id == ROOT_ID
+        || id == METADATA_ID
+        || id.starts_with("./")
+        || id.starts_with("../")
+        || id.starts_with('#')
+        || id.starts_with("_:")
+        || id.contains("://")
+        || (id.contains(':') && !id.contains('/'))
+    {
+        id.to_string()
+    } else {
+        format!("./{id}")
+    }
+}
+
+fn license_from_str(license: &str) -> Result<License, RoCrateError> {
+    if looks_like_identifier(license) {
+        Ok(License::Id(Id::Id(
+            encoded_reference_term(license)?
+                .to_named_node()
+                .map(|node| node.as_str().to_string())
+                .unwrap_or_else(|| license.to_string()),
+        )))
+    } else {
+        Ok(License::Description(license.to_string()))
+    }
+}
+
+fn looks_like_identifier(value: &str) -> bool {
+    value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('#')
+        || value.starts_with("_:")
+        || value.contains("://")
+        || (value.contains(':') && !value.contains(' '))
+}
