@@ -97,3 +97,101 @@ mod tests {
         assert!(
             hits.iter().any(|hit| hit.graph_id == graph.as_str()
                 && hit.subject_iri == "./bulk/entity-000123.dat")
+        );
+
+        let keyword_hits = node.search(&reader, "trusted-bulk-keyword", 10).unwrap();
+        assert!(!keyword_hits.is_empty());
+    }
+
+    #[test]
+    fn test_import_jsonld_with_policy_rejects_invalid_new_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:invalid-bootstrap-import");
+        let writer = writer_auth();
+
+        let invalid = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                    "about": { "@id": "./" }
+                },
+                {
+                    "@id": "./data/file.txt",
+                    "@type": "MediaObject",
+                    "name": "Orphaned file"
+                }
+            ]
+        });
+
+        let err = node
+            .apply_rocrate_document_checked_with_policy(
+                &writer,
+                graph,
+                &invalid.to_string(),
+                public_policy(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CraqleError::RoCrate(RoCrateError::Update(UpdateError::ValidationFailed(_)))
+        ));
+    }
+
+    #[test]
+    fn test_trusted_bootstrap_rejects_non_empty_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:trusted-bootstrap-non-empty");
+        let writer = writer_auth();
+
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Existing Dataset",
+                "Existing graph",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+
+        let jsonld = benchmark_rocrate_document(5, "trusted-existing-keyword", "Trusted Existing");
+        let err = node
+            .bootstrap_rocrate_document(&writer, graph, &jsonld, public_policy())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CraqleError::RoCrate(RoCrateError::InvalidGraph(_))
+        ));
+    }
+
+    #[test]
+    fn test_batched_append_updates_search_without_manual_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:append-search");
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Append Search Dataset",
+                "Batched append search refresh",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+
+        node.append_new_root_data_entities(
