@@ -584,3 +584,56 @@ impl CraqleNode {
     pub fn insert_quads(
         &self,
         graph: &GraphId,
+        quads: Vec<(CoreEncodedTerm, CoreEncodedTerm, CoreEncodedTerm)>,
+    ) -> Result<Batch> {
+        let batch = self.replication.local_insert_quads(graph, quads)?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Advanced: apply an explicit change set with validation.
+    pub fn apply_changes(
+        &self,
+        graph: &GraphId,
+        changes: Vec<CoreMaterializedQuadChange>,
+    ) -> Result<Batch> {
+        let batch = self.replication.local_apply_changes(graph, changes)?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Advanced: apply an explicit change set without post-state validation.
+    pub fn apply_changes_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<CoreMaterializedQuadChange>,
+    ) -> Result<Batch> {
+        let batch = self
+            .replication
+            .local_apply_changes_unchecked(graph, changes)?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Advanced: apply a large change set using the bulk write path.
+    pub fn apply_changes_bulk_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<CoreMaterializedQuadChange>,
+    ) -> Result<Batch> {
+        let batch = self
+            .replication
+            .local_apply_changes_bulk_unchecked(graph, changes)?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Rebuild graph diagnostics from the current visible graph state.
+    pub fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<()> {
+        self.replication.rebuild_graph_diagnostics(graph)?;
+        Ok(())
+    }
+
+    /// Update a property using a typed request.
+    pub fn update_property_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: UpdatePropertyRequest,
+    ) -> Result<Batch> {
+        self.update_property(
