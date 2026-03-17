@@ -637,3 +637,56 @@ impl CraqleNode {
         request: UpdatePropertyRequest,
     ) -> Result<Batch> {
         self.update_property(
+            auth,
+            &request.graph,
+            &request.entity_id,
+            &request.predicate,
+            request.old_value.as_deref(),
+            &request.new_value,
+        )
+    }
+
+    /// Replace or add a single property value on an entity.
+    pub fn update_property(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        entity_id: &str,
+        predicate: &str,
+        old_value: Option<&str>,
+        new_value: &str,
+    ) -> Result<Batch> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let batch = self
+            .manager()
+            .update_property(graph, entity_id, predicate, old_value, new_value)?;
+        self.finish_batch(graph, batch)
+    }
+
+    /// Execute a SPARQL query against the local node.
+    pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
+        let visible = self.visible_graphs(auth)?;
+        Ok(self.sparql.query_with_graphs(sparql, &visible)?)
+    }
+
+    /// Search visible resources in the local search index.
+    pub fn search(
+        &self,
+        auth: &dyn Authorizer,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let mut hits = Vec::new();
+        for graph in self.visible_graphs(auth)? {
+            hits.extend(self.search.search_in_graph(graph.as_str(), query, limit)?);
+        }
+
+        hits.sort_by_key(|hit| {
+            (
+                Reverse(score_key(hit.score)),
+                hit.graph_id.clone(),
+                hit.subject_iri.clone(),
+            )
+        });
+        hits.dedup_by(|left, right| {
+            left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
