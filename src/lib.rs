@@ -531,3 +531,56 @@ impl CraqleNode {
         let batch = self
             .manager()
             .bootstrap_jsonld_trusted(graph.clone(), jsonld)?;
+        self.persist_graph_policy(&graph, policy)?;
+        self.finish_batch(&graph, batch)
+    }
+
+    /// Preview the canonical RDF changes implied by a JSON-LD document.
+    pub fn preview_rocrate_update(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        jsonld: &str,
+    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+        if self.store.contains_graph(graph)? {
+            self.ensure_graph_action(graph, auth, Action::Write)?;
+        }
+        Ok(self.manager().plan_import_jsonld(graph, jsonld)?)
+    }
+
+    /// Apply a SPARQL update and publish the resulting replication batch.
+    pub fn apply_sparql_update(
+        &self,
+        auth: &dyn Authorizer,
+        sparql_update: &str,
+    ) -> Result<Option<Batch>> {
+        let changes = self.sparql.evaluate_update(sparql_update)?;
+        if changes.is_empty() {
+            return Ok(None);
+        }
+
+        let graph = single_graph_for_changes(&changes)?;
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let batch = self.replication.local_apply_changes(&graph, changes)?;
+        Ok(Some(self.finish_batch(&graph, batch)?))
+    }
+
+    /// Advanced: apply a SPARQL update locally without authorization checks.
+    pub fn local_update(&self, sparql_update: &str) -> Result<Option<Batch>> {
+        let batch = self.replication.local_update(sparql_update)?;
+        if let Some(batch) = batch {
+            let graph = batch.graph.clone();
+            return Ok(Some(self.finish_batch(&graph, batch)?));
+        }
+        Ok(None)
+    }
+
+    /// Alias for [`CraqleNode::local_update`].
+    pub fn update(&self, sparql_update: &str) -> Result<Option<Batch>> {
+        self.local_update(sparql_update)
+    }
+
+    /// Advanced: insert raw quads directly into one graph.
+    pub fn insert_quads(
+        &self,
+        graph: &GraphId,
