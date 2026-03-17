@@ -477,3 +477,57 @@ impl CraqleNode {
         self.ensure_graph_action(&graph, auth, Action::Write)?;
         let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
         self.finish_batch(&graph, batch)
+    }
+
+    /// Create or replace a visible RO-Crate state from a JSON-LD document and
+    /// persist graph policy when bootstrapping a new graph.
+    ///
+    /// New or empty graphs automatically take the trusted bootstrap fast path.
+    pub fn apply_rocrate_document_with_policy(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+    ) -> Result<Batch> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
+        self.persist_graph_policy(&graph, policy)?;
+        self.finish_batch(&graph, batch)
+    }
+
+    /// Strict variant of `apply_rocrate_document_with_policy` that validates
+    /// complete RO-Crate semantics even for new-graph bootstrap imports.
+    pub fn apply_rocrate_document_checked_with_policy(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+    ) -> Result<Batch> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager()
+            .import_jsonld_checked(graph.clone(), jsonld)?;
+        self.persist_graph_policy(&graph, policy)?;
+        self.finish_batch(&graph, batch)
+    }
+
+    /// Fast path for trusted RO-Crate bootstrap into a new or empty graph.
+    ///
+    /// This skips semantic RO-Crate validation and graph diffing, so it should
+    /// only be used when the input document is already trusted.
+    pub fn bootstrap_rocrate_document(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+    ) -> Result<Batch> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager()
+            .bootstrap_jsonld_trusted(graph.clone(), jsonld)?;
