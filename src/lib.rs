@@ -690,3 +690,56 @@ impl CraqleNode {
         });
         hits.dedup_by(|left, right| {
             left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Resolve one visible subject into `(predicate, object)` pairs.
+    pub fn describe_subject(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        subject_id: &str,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
+        self.ensure_graph_action(graph, auth, Action::Read)?;
+
+        let orphaned = self.orphaned_entities(graph)?;
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        if orphaned.contains(&subject) {
+            return Ok(Vec::new());
+        }
+
+        let graph_term = EncodedTerm::from_named_node(&graph.0);
+        let Some(graph_id) = self.store.lookup_term(&graph_term)? else {
+            return Ok(Vec::new());
+        };
+        let Some(subject_id) = self.store.lookup_term(&subject)? else {
+            return Ok(Vec::new());
+        };
+
+        Ok(self
+            .store
+            .triples_for_subject(graph_id, subject_id)?
+            .into_iter()
+            .filter(|(_, object)| !orphaned.contains(object))
+            .collect())
+    }
+
+    /// Hydrate search hits with visible RDF properties.
+    pub fn hydrate_search_hits(
+        &self,
+        auth: &dyn Authorizer,
+        hits: &[SearchHit],
+    ) -> Result<Vec<HydratedSearchHit>> {
+        let mut hydrated = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let graph = GraphId::new(&hit.graph_id);
+            hydrated.push(HydratedSearchHit {
+                hit: hit.clone(),
+                properties: self.describe_subject(auth, &graph, &hit.subject_iri)?,
+            });
+        }
+        Ok(hydrated)
+    }
+
