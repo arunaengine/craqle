@@ -743,3 +743,57 @@ impl CraqleNode {
         Ok(hydrated)
     }
 
+    /// Search and hydrate visible resources in one call.
+    pub fn search_resources(
+        &self,
+        auth: &dyn Authorizer,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HydratedSearchHit>> {
+        let hits = self.search(auth, query, limit)?;
+        self.hydrate_search_hits(auth, &hits)
+    }
+
+    /// Rebuild the full-text index from store state.
+    pub fn reindex_search(&self) -> Result<()> {
+        for graph in self.store.graphs()? {
+            self.refresh_search_for_graph(&graph)?;
+        }
+        Ok(())
+    }
+
+    /// Run manual store compaction as a post-ingest maintenance step.
+    pub fn manual_compact_store(&self) -> Result<()> {
+        self.store.manual_compact()?;
+        Ok(())
+    }
+
+    pub fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+        self.validate_sync_policy(graph, &policy)?;
+        self.persist_graph_policy(graph, policy.normalized())
+    }
+
+    pub fn apply_remote_batch(&self, batch: Batch) -> Result<()> {
+        self.validate_remote_batch(&batch)?;
+        let graph = batch.graph.clone();
+        let result = self.replication.apply_remote_batch(batch)?;
+        if result.applied {
+            self.refresh_search_for_graph(&graph)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_remote_batches(&self, batches: Vec<Batch>) -> Result<()> {
+        if batches.len() > MAX_REMOTE_BATCHES {
+            return Err(CraqleError::SyncInputRejected(format!(
+                "remote sync payload exceeded {} batches",
+                MAX_REMOTE_BATCHES
+            )));
+        }
+
+        let mut graphs = HashSet::new();
+        for batch in &batches {
+            self.validate_remote_batch(batch)?;
+            graphs.insert(batch.graph.clone());
+        }
+
