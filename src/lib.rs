@@ -850,3 +850,56 @@ impl CraqleNode {
     pub fn import_graph_snapshot(
         &self,
         snapshot: &GraphReplicaSnapshot,
+        policy: GraphPolicy,
+    ) -> Result<()> {
+        self.validate_sync_policy(&snapshot.graph, &policy)?;
+        if snapshot.quads.len() > MAX_SYNC_SNAPSHOT_QUADS {
+            return Err(CraqleError::SyncInputRejected(format!(
+                "snapshot for graph `{}` exceeded {} quads",
+                snapshot.graph.as_str(),
+                MAX_SYNC_SNAPSHOT_QUADS
+            )));
+        }
+        self.store.import_graph_snapshot(snapshot)?;
+        self.persist_graph_policy(&snapshot.graph, policy.normalized())?;
+        self.refresh_search_for_graph(&snapshot.graph)
+    }
+
+    pub fn import_compact_graph_snapshot(
+        &self,
+        snapshot: &GraphReplicaCompactSnapshot,
+        policy: GraphPolicy,
+    ) -> Result<()> {
+        self.validate_sync_policy(&snapshot.graph, &policy)?;
+        if snapshot.quads.len() > MAX_SYNC_SNAPSHOT_QUADS {
+            return Err(CraqleError::SyncInputRejected(format!(
+                "compact snapshot for graph `{}` exceeded {} quads",
+                snapshot.graph.as_str(),
+                MAX_SYNC_SNAPSHOT_QUADS
+            )));
+        }
+        if snapshot.terms.len() > MAX_SYNC_SNAPSHOT_TERMS {
+            return Err(CraqleError::SyncInputRejected(format!(
+                "compact snapshot for graph `{}` exceeded {} interned terms",
+                snapshot.graph.as_str(),
+                MAX_SYNC_SNAPSHOT_TERMS
+            )));
+        }
+        self.store.import_compact_graph_snapshot(snapshot)?;
+        self.persist_graph_policy(&snapshot.graph, policy.normalized())?;
+        self.refresh_search_for_graph(&snapshot.graph)
+    }
+
+    fn ensure_graph_action(
+        &self,
+        graph: &GraphId,
+        auth: &dyn Authorizer,
+        action: Action,
+    ) -> Result<()> {
+        let policy = self.store.graph_policy(graph)?;
+        auth.authorize(graph, &policy, action)?;
+        Ok(())
+    }
+
+    fn ensure_policy_action(
+        &self,
