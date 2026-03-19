@@ -903,3 +903,56 @@ impl CraqleNode {
 
     fn ensure_policy_action(
         &self,
+        graph: &GraphId,
+        next_policy: &GraphPolicy,
+        auth: &dyn Authorizer,
+        action: Action,
+    ) -> Result<()> {
+        let policy = if self.store.contains_graph(graph)? {
+            self.store.graph_policy(graph)?
+        } else {
+            next_policy.clone()
+        };
+
+        auth.authorize(graph, &policy, action)?;
+        Ok(())
+    }
+
+    fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+        self.store.set_graph_policy(graph, &policy)?;
+        Ok(())
+    }
+
+    fn orphaned_entities(&self, graph: &GraphId) -> Result<std::collections::HashSet<EncodedTerm>> {
+        Ok(self
+            .store
+            .graph_diagnostics(graph)?
+            .orphaned_entities
+            .into_iter()
+            .map(|entity_id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)))
+            .collect())
+    }
+
+    fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
+        self.refresh_search_for_graph(graph)?;
+        Ok(batch)
+    }
+
+    fn finish_report(
+        &self,
+        graph: &GraphId,
+        report: AppendDataEntitiesReport,
+    ) -> Result<AppendDataEntitiesReport> {
+        self.refresh_search_for_graph(graph)?;
+        Ok(report)
+    }
+
+    fn refresh_search_for_graph(&self, graph: &GraphId) -> Result<()> {
+        self.search.reindex_from_store(&self.store, graph)?;
+        self.search.commit()?;
+        self.store.clear_fts_queue_for_graph(graph)?;
+        Ok(())
+    }
+
+    fn validate_remote_batch(&self, batch: &Batch) -> Result<()> {
+        if batch.ops.len() > MAX_SYNC_BATCH_OPS {
