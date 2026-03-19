@@ -797,3 +797,56 @@ impl CraqleNode {
             graphs.insert(batch.graph.clone());
         }
 
+        self.replication.apply_remote_batches(batches)?;
+        for graph in graphs {
+            self.refresh_search_for_graph(&graph)?;
+        }
+        Ok(())
+    }
+
+    pub fn catchup_batches(
+        &self,
+        graph: &GraphId,
+        remote_clock: &VectorClock,
+    ) -> Result<Vec<Batch>> {
+        Ok(self.replication.batches_for_catchup(graph, remote_clock)?)
+    }
+
+    pub fn compact_graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaCompactSnapshot> {
+        Ok(self.store.compact_graph_snapshot(graph)?)
+    }
+
+    pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
+        let mut visible = Vec::new();
+        for graph in self.store.graphs()? {
+            let policy = self.store.graph_policy(&graph)?;
+            if auth.authorize(&graph, &policy, Action::Read).is_ok() {
+                visible.push(graph);
+            }
+        }
+        Ok(visible)
+    }
+
+    pub fn graphs(&self) -> Result<Vec<GraphId>> {
+        Ok(self.store.graphs()?)
+    }
+
+    pub fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
+        Ok(self.store.contains_graph(graph)?)
+    }
+
+    pub fn vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
+        Ok(self.store.get_vector_clock(graph)?)
+    }
+
+    pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
+        Ok(self.store.graph_fingerprint(graph)?)
+    }
+
+    pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
+        Ok(self.store.graph_snapshot(graph)?)
+    }
+
+    pub fn import_graph_snapshot(
+        &self,
+        snapshot: &GraphReplicaSnapshot,
