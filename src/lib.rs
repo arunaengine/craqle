@@ -956,3 +956,56 @@ impl CraqleNode {
 
     fn validate_remote_batch(&self, batch: &Batch) -> Result<()> {
         if batch.ops.len() > MAX_SYNC_BATCH_OPS {
+            return Err(CraqleError::SyncInputRejected(format!(
+                "remote batch for graph `{}` exceeded {} operations",
+                batch.graph.as_str(),
+                MAX_SYNC_BATCH_OPS
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_sync_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
+        if policy.permission_paths.len() > MAX_SYNC_POLICY_PATHS {
+            return Err(CraqleError::SyncInputRejected(format!(
+                "sync policy for graph `{}` exceeded {} permission paths",
+                graph.as_str(),
+                MAX_SYNC_POLICY_PATHS
+            )));
+        }
+        Ok(())
+    }
+
+    fn manager(&self) -> RoCrateManager {
+        RoCrateManager::new(self.replication.clone())
+    }
+}
+
+fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<GraphId> {
+    let Some(first) = changes.first() else {
+        return Err(CraqleError::MultiGraphUpdateUnsupported);
+    };
+    let graph = match first {
+        CoreMaterializedQuadChange::Insert { graph, .. }
+        | CoreMaterializedQuadChange::Delete { graph, .. } => graph.clone(),
+    };
+
+    if changes.iter().all(|change| match change {
+        CoreMaterializedQuadChange::Insert {
+            graph: change_graph,
+            ..
+        }
+        | CoreMaterializedQuadChange::Delete {
+            graph: change_graph,
+            ..
+        } => *change_graph == graph,
+    }) {
+        Ok(graph)
+    } else {
+        Err(CraqleError::MultiGraphUpdateUnsupported)
+    }
+}
+
+fn score_key(score: f32) -> i64 {
+    (score as f64 * 1_000_000.0) as i64
+}
