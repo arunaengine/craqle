@@ -213,3 +213,110 @@ impl SearchIndex {
         &self,
         store: &crate::store::GraphStore,
         graph: &crate::core::GraphId,
+        subjects: &[crate::core::EncodedTerm],
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut caches = StoreSyncCaches::default();
+        {
+            let mut writer = self.writer.lock().unwrap();
+            for subject in subjects {
+                let subject_iri = term_to_string(subject);
+                if !seen.insert(subject_iri.clone()) {
+                    continue;
+                }
+
+                let Some(subject_tid) = store.lookup_term(subject)? else {
+                    self.delete_resource_with_writer(&mut writer, graph.as_str(), &subject_iri);
+                    continue;
+                };
+
+                self.sync_subject_from_store_cached(
+                    &mut writer,
+                    store,
+                    graph,
+                    subject_tid,
+                    &mut caches,
+                )?;
+            }
+        }
+        self.commit()
+    }
+
+    fn add_resource_document(
+        &self,
+        writer: &mut IndexWriter,
+        graph_id: &str,
+        subject_iri: &str,
+        all_text: Option<&str>,
+    ) -> Result<()> {
+        self.add_resource_document_with_delete(writer, graph_id, subject_iri, all_text, true)
+    }
+
+    fn add_resource_document_with_delete(
+        &self,
+        writer: &mut IndexWriter,
+        graph_id: &str,
+        subject_iri: &str,
+        all_text: Option<&str>,
+        delete_existing: bool,
+    ) -> Result<()> {
+        if delete_existing {
+            writer.delete_term(Term::from_field_text(
+                self.f_doc_key,
+                &doc_key(graph_id, subject_iri),
+            ));
+        }
+
+        self.add_resource_document_without_delete(writer, graph_id, subject_iri, all_text)
+    }
+
+    fn add_resource_document_without_delete(
+        &self,
+        writer: &mut IndexWriter,
+        graph_id: &str,
+        subject_iri: &str,
+        all_text: Option<&str>,
+    ) -> Result<()> {
+        let mut all_text_parts: Vec<&str> = vec![graph_id, subject_iri];
+        if let Some(extra) = all_text {
+            all_text_parts.push(extra);
+        }
+        let all_text = all_text_parts.join(" ");
+
+        let mut doc = TantivyDocument::default();
+        doc.add_text(self.f_doc_key, doc_key(graph_id, subject_iri));
+        doc.add_text(self.f_graph_id, graph_id);
+        doc.add_text(self.f_subject_iri, subject_iri);
+        doc.add_text(self.f_all_text, &all_text);
+
+        writer.add_document(doc)?;
+        self.dirty.store(true, Ordering::SeqCst);
+        self.empty.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Delete a document for the given graph/resource pair.
+    pub fn delete_resource(&self, graph_id: &str, subject_iri: &str) -> Result<()> {
+        let writer = self.writer.lock().unwrap();
+        writer.delete_term(Term::from_field_text(
+            self.f_doc_key,
+            &doc_key(graph_id, subject_iri),
+        ));
+        self.dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Full-text search across all graphs.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let searcher = self.reader.searcher();
+        let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
+        let parsed = query_parser.parse_query(query)?;
+
+        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            hits.push(self.doc_to_hit(doc, score));
+        }
+        Ok(hits)
+    }
