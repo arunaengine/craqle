@@ -106,3 +106,110 @@ impl SearchIndex {
                 (recreate_index_dir(dir, &schema)?, true)
             }
         } else {
+            (create_index_dir(dir, &schema)?, true)
+        };
+
+        let (f_doc_key, f_graph_id, f_subject_iri, f_all_text) = schema_fields(&index.schema())?;
+        let reader = index.reader()?;
+        let writer = index.writer(DISK_INDEX_WRITER_HEAP_BYTES)?;
+
+        Ok(Self {
+            index,
+            reader,
+            writer: Mutex::new(writer),
+            dirty: AtomicBool::new(false),
+            empty: AtomicBool::new(needs_rebuild),
+            needs_rebuild,
+            f_doc_key,
+            f_graph_id,
+            f_subject_iri,
+            f_all_text,
+        })
+    }
+
+    /// Create an in-memory index (useful for tests).
+    pub fn open_in_memory() -> Result<Self> {
+        let schema = build_schema();
+
+        let (f_doc_key, f_graph_id, f_subject_iri, f_all_text) = schema_fields(&schema)?;
+        let index = Index::create_in_ram(schema);
+        let reader = index.reader()?;
+        let writer = index.writer(MEMORY_INDEX_WRITER_HEAP_BYTES)?;
+
+        Ok(Self {
+            index,
+            reader,
+            writer: Mutex::new(writer),
+            dirty: AtomicBool::new(false),
+            empty: AtomicBool::new(true),
+            needs_rebuild: false,
+            f_doc_key,
+            f_graph_id,
+            f_subject_iri,
+            f_all_text,
+        })
+    }
+
+    /// Returns `true` when the on-disk index had to be created or migrated.
+    pub fn needs_rebuild(&self) -> bool {
+        self.needs_rebuild
+    }
+
+    /// Add or update a document for the given resource.
+    ///
+    /// Deletes any existing document with the same `subject_iri` in the same
+    /// `graph_id` before inserting the new one.
+    pub fn index_resource(
+        &self,
+        graph_id: &str,
+        subject_iri: &str,
+        all_text: Option<&str>,
+    ) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        self.add_resource_document(&mut writer, graph_id, subject_iri, all_text)
+    }
+
+    pub fn replace_graph_documents<I>(&self, graph_id: &str, documents: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (String, Option<String>)>,
+    {
+        {
+            let mut writer = self.writer.lock().unwrap();
+            writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
+            self.dirty.store(true, Ordering::SeqCst);
+            for (subject_iri, all_text) in documents {
+                self.add_resource_document_with_delete(
+                    &mut writer,
+                    graph_id,
+                    &subject_iri,
+                    all_text.as_deref(),
+                    false,
+                )?;
+            }
+        }
+        self.commit()
+    }
+
+    pub fn upsert_resource_documents<I>(&self, graph_id: &str, documents: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (String, Option<String>)>,
+    {
+        {
+            let mut writer = self.writer.lock().unwrap();
+            for (subject_iri, all_text) in documents {
+                self.add_resource_document_with_delete(
+                    &mut writer,
+                    graph_id,
+                    &subject_iri,
+                    all_text.as_deref(),
+                    true,
+                )?;
+            }
+        }
+        self.commit()
+    }
+
+    pub fn sync_subjects_from_store(
+        &self,
+        store: &crate::store::GraphStore,
+        graph: &crate::core::GraphId,
