@@ -642,3 +642,110 @@ fn split_doc_key(doc_key: &str) -> Option<(String, String)> {
 
 fn orphaned_subjects(
     store: &crate::store::GraphStore,
+    graph: &crate::core::GraphId,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(store
+        .graph_diagnostics(graph)?
+        .orphaned_entities
+        .into_iter()
+        .collect())
+}
+
+/// Convert an EncodedTerm to a plain string (IRI without angle brackets,
+/// or the raw string representation for other term types).
+fn term_to_string(term: &crate::core::EncodedTerm) -> String {
+    if term.0.starts_with('<') && term.0.ends_with('>') {
+        term.0[1..term.0.len() - 1].to_string()
+    } else {
+        term.0.clone()
+    }
+}
+
+fn append_searchable_text(buffer: &mut String, term: &crate::core::EncodedTerm) {
+    let Some(value) = searchable_term_text(term) else {
+        return;
+    };
+    if !buffer.is_empty() {
+        buffer.push(' ');
+    }
+    buffer.push_str(&value);
+}
+
+fn searchable_predicates() -> [crate::core::EncodedTerm; 4] {
+    [
+        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_name()),
+        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_description()),
+        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_keywords()),
+        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_identifier()),
+    ]
+}
+
+fn is_searchable_predicate(
+    predicate: &crate::core::EncodedTerm,
+    searchable_predicates: &[crate::core::EncodedTerm],
+) -> bool {
+    searchable_predicates
+        .iter()
+        .any(|candidate| candidate == predicate)
+}
+
+fn searchable_term_text(term: &crate::core::EncodedTerm) -> Option<Cow<'_, str>> {
+    if term.0.starts_with('<') && term.0.ends_with('>') {
+        return Some(Cow::Borrowed(&term.0[1..term.0.len() - 1]));
+    }
+    if term.0.starts_with("_:") {
+        return Some(Cow::Borrowed(&term.0[2..]));
+    }
+    match term.to_term()? {
+        oxrdf::Term::Literal(lit) => Some(Cow::Owned(lit.value().to_string())),
+        oxrdf::Term::NamedNode(nn) => Some(Cow::Owned(nn.as_str().to_string())),
+        oxrdf::Term::BlankNode(bn) => Some(Cow::Owned(bn.as_str().to_string())),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+fn load_orphaned_subjects<'a>(
+    cache: &'a mut HashMap<crate::core::GraphId, HashSet<String>>,
+    store: &crate::store::GraphStore,
+    graph: &crate::core::GraphId,
+) -> Result<&'a HashSet<String>> {
+    if !cache.contains_key(graph) {
+        cache.insert(graph.clone(), orphaned_subjects(store, graph)?);
+    }
+    Ok(cache.get(graph).expect("orphan cache inserted"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_index_and_search() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("Protein Structure Analysis A dataset about protein folding biology protein"),
+        )?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity2",
+            Some("Climate Data Global temperature measurements climate weather"),
+        )?;
+
+        idx.commit()?;
+
+        let hits = idx.search("protein", 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
+        assert_eq!(hits[0].graph_id, "http://example.org/graph1");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_in_graph() -> Result<()> {
