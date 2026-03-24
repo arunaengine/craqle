@@ -535,3 +535,110 @@ impl SearchIndex {
     fn flush_pending_documents(
         &self,
         graph_iri: &str,
+        delete_existing: bool,
+        pending_documents: &mut Vec<(String, Option<String>)>,
+    ) -> Result<()> {
+        if pending_documents.is_empty() {
+            return Ok(());
+        }
+
+        let mut writer = self.writer.lock().unwrap();
+        for (subject_iri, extra_text) in pending_documents.drain(..) {
+            self.add_resource_document_with_delete(
+                &mut writer,
+                graph_iri,
+                &subject_iri,
+                extra_text.as_deref(),
+                delete_existing,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn sync_subject_from_store_cached(
+        &self,
+        writer: &mut IndexWriter,
+        store: &crate::store::GraphStore,
+        graph: &crate::core::GraphId,
+        subject_tid: crate::store::TermId,
+        caches: &mut StoreSyncCaches,
+    ) -> Result<()> {
+        let graph_iri = graph.as_str();
+        let subject = store.decode_term_cached(&mut caches.terms, subject_tid)?;
+        let subject_iri = term_to_string(&subject);
+        let orphaned = load_orphaned_subjects(&mut caches.orphaned_subjects, store, graph)?;
+        if orphaned.contains(subject_iri.as_str()) {
+            self.delete_resource_with_writer(writer, graph_iri, &subject_iri);
+            return Ok(());
+        }
+
+        let graph_tid = match caches.graph_terms.get(graph) {
+            Some(cached) => *cached,
+            None => {
+                let graph_term = crate::core::EncodedTerm::from_named_node(&graph.0);
+                let resolved = store.lookup_term(&graph_term)?;
+                caches.graph_terms.insert(graph.clone(), resolved);
+                resolved
+            }
+        };
+        let Some(graph_tid) = graph_tid else {
+            self.delete_resource_with_writer(writer, graph_iri, &subject_iri);
+            return Ok(());
+        };
+
+        let triples = store.triples_for_subject(graph_tid, subject_tid)?;
+        if triples.is_empty() {
+            self.delete_resource_with_writer(writer, graph_iri, &subject_iri);
+            return Ok(());
+        }
+
+        let searchable_predicates = searchable_predicates();
+        let mut extra_text = String::new();
+        for (predicate, object) in triples {
+            if !is_searchable_predicate(&predicate, &searchable_predicates) {
+                continue;
+            }
+            append_searchable_text(&mut extra_text, &object);
+        }
+
+        self.add_resource_document_with_delete(
+            writer,
+            graph_iri,
+            &subject_iri,
+            (!extra_text.is_empty()).then_some(extra_text).as_deref(),
+            true,
+        )
+    }
+
+    fn delete_resource_with_writer(
+        &self,
+        writer: &mut IndexWriter,
+        graph_id: &str,
+        subject_iri: &str,
+    ) {
+        writer.delete_term(Term::from_field_text(
+            self.f_doc_key,
+            &doc_key(graph_id, subject_iri),
+        ));
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Extract the first text value for a field from a TantivyDocument.
+fn first_text(doc: &TantivyDocument, field: Field) -> Option<String> {
+    doc.get_all(field)
+        .next()
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
+fn doc_key(graph_id: &str, subject_iri: &str) -> String {
+    format!("{graph_id}\u{1f}{subject_iri}")
+}
+
+fn split_doc_key(doc_key: &str) -> Option<(String, String)> {
+    let (graph_id, subject_iri) = doc_key.split_once('\u{1f}')?;
+    Some((graph_id.to_string(), subject_iri.to_string()))
+}
+
+fn orphaned_subjects(
+    store: &crate::store::GraphStore,
