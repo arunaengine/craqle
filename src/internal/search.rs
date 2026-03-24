@@ -427,3 +427,111 @@ impl SearchIndex {
         let Some(subject_tid) = store.lookup_term(subject)? else {
             return self.delete_resource(graph.as_str(), &term_to_string(subject));
         };
+        let mut writer = self.writer.lock().unwrap();
+        let mut caches = StoreSyncCaches::default();
+        self.sync_subject_from_store_cached(&mut writer, store, graph, subject_tid, &mut caches)
+    }
+
+    /// Reindex all entities in a graph from the RDF store.
+    ///
+    /// Scans the store for triples with searchable predicates, groups them by
+    /// subject, and indexes each subject as a document.
+    ///
+    /// Returns the number of entities indexed.
+    pub fn reindex_from_store(
+        &self,
+        store: &crate::store::GraphStore,
+        graph: &crate::core::GraphId,
+    ) -> Result<usize> {
+        let graph_iri = graph.as_str();
+        let graph_term = crate::core::EncodedTerm::from_named_node(&graph.0);
+        let graph_tid = match store.lookup_term(&graph_term)? {
+            Some(tid) => tid,
+            None => return Ok(0),
+        };
+
+        let orphaned = orphaned_subjects(store, graph)?;
+        let searchable_predicates = searchable_predicates();
+        let mut count = 0usize;
+        let mut current_subject: Option<crate::store::TermId> = None;
+        let mut current_subject_iri = String::new();
+        let mut current_subject_visible = false;
+        let mut current_text = String::new();
+        let mut pending_documents = Vec::new();
+        let mut term_cache = HashMap::new();
+        let delete_existing = false;
+        {
+            let writer = self.writer.lock().unwrap();
+            writer.delete_term(Term::from_field_text(self.f_graph_id, graph_iri));
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+
+        store.for_each_quad_in_graph::<SearchError, _>(graph_tid, |quad| {
+            if current_subject != Some(quad.subject) {
+                if current_subject_visible {
+                    pending_documents.push((
+                        std::mem::take(&mut current_subject_iri),
+                        (!current_text.is_empty()).then(|| std::mem::take(&mut current_text)),
+                    ));
+                    count += 1;
+                    if pending_documents.len() >= REINDEX_FLUSH_CHUNK {
+                        self.flush_pending_documents(
+                            graph_iri,
+                            delete_existing,
+                            &mut pending_documents,
+                        )?;
+                    }
+                }
+
+                let subject_term = store.decode_term_cached(&mut term_cache, quad.subject)?;
+                current_subject_iri = term_to_string(&subject_term);
+                current_subject_visible = !orphaned.contains(&current_subject_iri);
+                current_text.clear();
+                current_subject = Some(quad.subject);
+            }
+
+            if current_subject_visible {
+                let predicate_term = store.decode_term_cached(&mut term_cache, quad.predicate)?;
+                if !is_searchable_predicate(&predicate_term, &searchable_predicates) {
+                    return Ok(());
+                }
+                let object_term = store.decode_term_cached(&mut term_cache, quad.object)?;
+                append_searchable_text(&mut current_text, &object_term);
+            }
+            Ok(())
+        })?;
+
+        if current_subject_visible {
+            pending_documents.push((
+                current_subject_iri,
+                (!current_text.is_empty()).then_some(current_text),
+            ));
+            count += 1;
+        }
+
+        self.flush_pending_documents(graph_iri, delete_existing, &mut pending_documents)?;
+
+        Ok(count)
+    }
+
+    fn doc_to_hit(&self, doc: TantivyDocument, score: f32) -> SearchHit {
+        let graph_id = first_text(&doc, self.f_graph_id);
+        let subject_iri = first_text(&doc, self.f_subject_iri);
+        let (graph_id, subject_iri) = match (graph_id, subject_iri) {
+            (Some(graph_id), Some(subject_iri)) => (graph_id, subject_iri),
+            _ => {
+                let doc_key = first_text(&doc, self.f_doc_key).unwrap_or_default();
+                split_doc_key(&doc_key).unwrap_or_default()
+            }
+        };
+
+        SearchHit {
+            graph_id,
+            subject_iri,
+            score,
+        }
+    }
+
+    fn flush_pending_documents(
+        &self,
+        graph_iri: &str,
