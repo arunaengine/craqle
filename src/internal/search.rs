@@ -320,3 +320,110 @@ impl SearchIndex {
         }
         Ok(hits)
     }
+
+    /// Full-text search restricted to a single graph.
+    pub fn search_in_graph(
+        &self,
+        graph_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let searcher = self.reader.searcher();
+        let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
+        let parsed = query_parser.parse_query(query)?;
+        let graph_filter = TermQuery::new(
+            Term::from_field_text(self.f_graph_id, graph_id),
+            IndexRecordOption::Basic,
+        );
+        let combined = BooleanQuery::new(vec![
+            (Occur::Must, parsed),
+            (Occur::Must, Box::new(graph_filter)),
+        ]);
+
+        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            hits.push(self.doc_to_hit(doc, score));
+        }
+        Ok(hits)
+    }
+
+    /// Commit pending writes and reload the reader so subsequent searches
+    /// reflect the latest changes.
+    pub fn commit(&self) -> Result<()> {
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        {
+            let mut writer = self.writer.lock().unwrap();
+            writer.commit()?;
+        }
+        self.reader.reload()?;
+        Ok(())
+    }
+
+    /// Sync queued subject updates from the RDF store into Tantivy.
+    pub fn process_queued_updates(
+        &self,
+        store: &crate::store::GraphStore,
+        limit: usize,
+    ) -> Result<usize> {
+        let queued_graphs = store.drain_fts_reindex_queue(limit)?;
+        if !queued_graphs.is_empty() {
+            let mut processed = 0usize;
+            for (graph, _) in &queued_graphs {
+                self.reindex_from_store(store, graph)?;
+                store.clear_fts_queue_for_graph(graph)?;
+                processed += 1;
+            }
+
+            if processed > 0 {
+                self.commit()?;
+                store.acknowledge_fts_reindex_queue(&queued_graphs)?;
+            }
+            return Ok(processed);
+        }
+
+        let queued = store.drain_fts_queue(limit)?;
+        if queued.is_empty() {
+            return Ok(0);
+        }
+
+        let mut seen = HashSet::with_capacity(queued.len());
+        let mut caches = StoreSyncCaches::default();
+        let mut writer = self.writer.lock().unwrap();
+        let mut processed = 0usize;
+
+        for (graph, subject_tid, _) in &queued {
+            if !seen.insert((graph.clone(), *subject_tid)) {
+                continue;
+            }
+            self.sync_subject_from_store_cached(
+                &mut writer,
+                store,
+                graph,
+                *subject_tid,
+                &mut caches,
+            )?;
+            processed += 1;
+        }
+
+        drop(writer);
+
+        if processed > 0 {
+            self.commit()?;
+            store.acknowledge_fts_queue(&queued)?;
+        }
+        Ok(processed)
+    }
+
+    pub fn sync_subject_from_store(
+        &self,
+        store: &crate::store::GraphStore,
+        graph: &crate::core::GraphId,
+        subject: &crate::core::EncodedTerm,
+    ) -> Result<()> {
+        let Some(subject_tid) = store.lookup_term(subject)? else {
+            return self.delete_resource(graph.as_str(), &term_to_string(subject));
+        };
