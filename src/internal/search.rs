@@ -749,3 +749,110 @@ mod tests {
 
     #[test]
     fn test_search_in_graph() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("Protein Data"),
+        )?;
+
+        idx.index_resource(
+            "http://example.org/graph2",
+            "http://example.org/entity2",
+            Some("Protein Structures"),
+        )?;
+
+        idx.commit()?;
+
+        let hits = idx.search_in_graph("http://example.org/graph1", "protein", 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].graph_id, "http://example.org/graph1");
+
+        let all_hits = idx.search("protein", 10)?;
+        assert_eq!(all_hits.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_upsert_replaces_old_document() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("Old Name"),
+        )?;
+        idx.commit()?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("New Name"),
+        )?;
+        idx.commit()?;
+
+        let hits = idx.search("name", 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_same_subject_in_multiple_graphs_do_not_collide() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource("http://example.org/graph1", "./", Some("Graph One Root"))?;
+        idx.index_resource("http://example.org/graph2", "./", Some("Graph Two Root"))?;
+        idx.commit()?;
+
+        let graph1_hits = idx.search_in_graph("http://example.org/graph1", "graph", 10)?;
+        let graph2_hits = idx.search_in_graph("http://example.org/graph2", "graph", 10)?;
+
+        assert_eq!(graph1_hits.len(), 1);
+        assert_eq!(graph2_hits.len(), 1);
+        assert_eq!(graph1_hits[0].graph_id, "http://example.org/graph1");
+        assert_eq!(graph2_hits[0].graph_id, "http://example.org/graph2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_indexes_subject_ids() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource("http://example.org/graph1", "urn:test:dataset123", None)?;
+        idx.commit()?;
+
+        let hits = idx.search("dataset123", 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_iri, "urn:test:dataset123");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_persistent_index_roundtrips_across_reopen() -> Result<()> {
+        let dir = tempdir().unwrap();
+
+        let idx = SearchIndex::open(dir.path())?;
+        assert!(idx.needs_rebuild());
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("persisted proteomics record"),
+        )?;
+        idx.commit()?;
+        drop(idx);
+
+        let reopened = SearchIndex::open(dir.path())?;
+        assert!(!reopened.needs_rebuild());
+        let hits = reopened.search_in_graph("http://example.org/graph1", "proteomics", 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
+
+        Ok(())
+    }
+}
