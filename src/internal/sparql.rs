@@ -366,3 +366,186 @@ fn rewrite_graph_pattern(
             )?),
             variables,
             aggregates,
+        },
+        GraphPattern::Service {
+            name,
+            inner,
+            silent,
+        } => match name {
+            NamedNodePattern::NamedNode(node) if node.as_str() == FTS_SERVICE_IRI => {
+                rewrite_fts_service(*inner, search, store, visible_graphs)?
+            }
+            other => GraphPattern::Service {
+                name: other,
+                inner: Box::new(rewrite_graph_pattern(
+                    *inner,
+                    search,
+                    store,
+                    visible_graphs,
+                )?),
+                silent,
+            },
+        },
+    })
+}
+
+fn rewrite_fts_service(
+    pattern: GraphPattern,
+    search: &SearchIndex,
+    store: &GraphStore,
+    visible_graphs: Option<&HashSet<String>>,
+) -> Result<GraphPattern> {
+    let spec = parse_fts_service_spec(pattern)?;
+    if spec.limit == 0 {
+        return Ok(GraphPattern::Values {
+            variables: requested_fts_variables(&spec),
+            bindings: Vec::new(),
+        });
+    }
+
+    flush_queued_search_updates(search, store)?;
+    let hits = match &spec.graph {
+        Some(FtsGraphBinding::Fixed(graph)) => {
+            if visible_graphs.is_some_and(|visible| !visible.contains(graph.as_str())) {
+                Vec::new()
+            } else {
+                search.search_in_graph(
+                    graph.as_str(),
+                    spec.query.as_deref().unwrap_or(""),
+                    spec.limit,
+                )?
+            }
+        }
+        _ => search.search(spec.query.as_deref().unwrap_or(""), spec.limit)?,
+    };
+
+    let variables = requested_fts_variables(&spec);
+    if variables.is_empty() {
+        return Err(SparqlError::Unsupported(
+            "FTS SERVICE must bind at least one variable".into(),
+        ));
+    }
+
+    let subject_filter = match &spec.subject {
+        Some(FtsSubjectPattern::NamedNode(node)) => Some(node.as_str()),
+        _ => None,
+    };
+
+    let mut bindings = Vec::new();
+    for hit in hits {
+        if visible_graphs.is_some_and(|visible| !visible.contains(hit.graph_id.as_str())) {
+            continue;
+        }
+        if subject_filter.is_some_and(|subject| hit.subject_iri != subject) {
+            continue;
+        }
+        bindings.push(fts_binding_row(&variables, &spec, &hit)?);
+    }
+
+    Ok(GraphPattern::Values {
+        variables,
+        bindings,
+    })
+}
+
+fn visible_graph_iris(
+    store: &GraphStore,
+    visible_graphs: &VisibleGraphSet,
+) -> Result<VisibleGraphIris> {
+    let Some(visible_graphs) = visible_graphs else {
+        return Ok(None);
+    };
+
+    let mut iris = HashSet::with_capacity(visible_graphs.len());
+    for graph_id in visible_graphs {
+        let graph_term = store.decode_term(*graph_id)?;
+        let Some(graph_name) = graph_term.to_named_node() else {
+            return Err(SparqlError::InvalidTerm(graph_term.0));
+        };
+        iris.insert(graph_name.as_str().to_string());
+    }
+    Ok(Some(iris))
+}
+
+fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
+    let GraphPattern::Bgp { patterns } = pattern else {
+        return Err(SparqlError::Unsupported(
+            "FTS SERVICE currently supports only basic graph patterns".into(),
+        ));
+    };
+
+    let mut spec = FtsServiceSpec {
+        limit: 20,
+        ..Default::default()
+    };
+
+    for pattern in patterns {
+        let predicate = match pattern.predicate {
+            NamedNodePattern::NamedNode(node) => node,
+            NamedNodePattern::Variable(_) => {
+                return Err(SparqlError::Unsupported(
+                    "FTS SERVICE does not support variable predicates".into(),
+                ));
+            }
+        };
+
+        set_or_check_subject(&mut spec, pattern.subject)?;
+
+        match predicate.as_str() {
+            FTS_QUERY_IRI => {
+                let TermPattern::Literal(literal) = pattern.object else {
+                    return Err(SparqlError::Unsupported(
+                        "fts:query must be bound to a string literal".into(),
+                    ));
+                };
+                spec.query = Some(literal.value().to_string());
+            }
+            FTS_LIMIT_IRI => {
+                let TermPattern::Literal(literal) = pattern.object else {
+                    return Err(SparqlError::Unsupported(
+                        "fts:limit must be bound to an integer literal".into(),
+                    ));
+                };
+                spec.limit = literal.value().parse::<usize>().map_err(|_| {
+                    SparqlError::Unsupported("fts:limit must be a positive integer".into())
+                })?;
+            }
+            FTS_SCORE_IRI => {
+                let TermPattern::Variable(variable) = pattern.object else {
+                    return Err(SparqlError::Unsupported(
+                        "fts:score must bind to a variable".into(),
+                    ));
+                };
+                spec.score_var = Some(variable);
+            }
+            FTS_GRAPH_IRI => {
+                spec.graph = Some(match pattern.object {
+                    TermPattern::Variable(variable) => FtsGraphBinding::Variable(variable),
+                    TermPattern::NamedNode(node) => FtsGraphBinding::Fixed(node),
+                    _ => {
+                        return Err(SparqlError::Unsupported(
+                            "fts:graph must bind to a variable or graph IRI".into(),
+                        ));
+                    }
+                });
+            }
+            other => {
+                return Err(SparqlError::Unsupported(format!(
+                    "unsupported FTS predicate `{other}`"
+                )));
+            }
+        }
+    }
+
+    if spec.subject.is_none() {
+        return Err(SparqlError::Unsupported(
+            "FTS SERVICE must specify a subject binding".into(),
+        ));
+    }
+    if spec.query.is_none() {
+        return Err(SparqlError::Unsupported(
+            "FTS SERVICE requires an fts:query literal".into(),
+        ));
+    }
+
+    Ok(spec)
