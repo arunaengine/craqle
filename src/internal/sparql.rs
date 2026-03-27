@@ -733,3 +733,187 @@ impl<'a> StoreDataset<'a> {
         &self,
         graph: TermId,
     ) -> std::result::Result<HashSet<TermId>, StoreDatasetError> {
+        if let Some(cached) = self.orphan_cache.borrow().get(&graph) {
+            return Ok(cached.clone());
+        }
+
+        let graph_term = self.decode_term(graph)?;
+        let Some(graph_name) = graph_term.to_named_node() else {
+            return Err(StoreDatasetError::InvalidTerm(graph_term.0));
+        };
+
+        let diagnostics = self.store.graph_diagnostics(&GraphId(graph_name))?;
+        let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
+        for entity_id in diagnostics.orphaned_entities {
+            let term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
+            if let Some(term_id) = self.store.lookup_term(&term)? {
+                orphaned.insert(term_id);
+            }
+        }
+
+        self.orphan_cache
+            .borrow_mut()
+            .insert(graph, orphaned.clone());
+        Ok(orphaned)
+    }
+
+    fn quad_is_visible(
+        &self,
+        quad: &crate::store::EncodedQuad,
+    ) -> std::result::Result<bool, StoreDatasetError> {
+        if !self.graph_is_visible(quad.graph) {
+            return Ok(false);
+        }
+        let orphaned = self.orphaned_subjects_for_graph(quad.graph)?;
+        Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
+    }
+}
+
+impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
+    type InternalTerm = StoreTerm;
+    type Error = StoreDatasetError;
+
+    #[allow(refining_impl_trait)]
+    fn internal_quads_for_pattern(
+        &self,
+        subject: Option<&Self::InternalTerm>,
+        predicate: Option<&Self::InternalTerm>,
+        object: Option<&Self::InternalTerm>,
+        graph_name: Option<Option<&Self::InternalTerm>>,
+    ) -> std::vec::IntoIter<std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>
+    {
+        let subject = self.resolve_pattern_term(subject);
+        let predicate = self.resolve_pattern_term(predicate);
+        let object = self.resolve_pattern_term(object);
+
+        if matches!(subject, ResolvedPatternTerm::Missing)
+            || matches!(predicate, ResolvedPatternTerm::Missing)
+            || matches!(object, ResolvedPatternTerm::Missing)
+        {
+            return Vec::<std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>::new(
+            )
+            .into_iter();
+        }
+
+        let subject = match subject {
+            ResolvedPatternTerm::Any => None,
+            ResolvedPatternTerm::Existing(id) => Some(id),
+            ResolvedPatternTerm::Missing => unreachable!(),
+        };
+        let predicate = match predicate {
+            ResolvedPatternTerm::Any => None,
+            ResolvedPatternTerm::Existing(id) => Some(id),
+            ResolvedPatternTerm::Missing => unreachable!(),
+        };
+        let object = match object {
+            ResolvedPatternTerm::Any => None,
+            ResolvedPatternTerm::Existing(id) => Some(id),
+            ResolvedPatternTerm::Missing => unreachable!(),
+        };
+
+        let rows = match graph_name {
+            Some(None) => match self
+                .store
+                .quads_for_pattern(None, subject, predicate, object)
+            {
+                Ok(quads) => {
+                    let mut seen = HashSet::new();
+                    quads
+                        .into_iter()
+                        .filter_map(move |quad| match self.quad_is_visible(&quad) {
+                            Ok(true) => {
+                                let key = (quad.subject, quad.predicate, quad.object);
+                                if seen.insert(key) {
+                                    Some(Ok(InternalQuad {
+                                        subject: StoreTerm::Existing(quad.subject),
+                                        predicate: StoreTerm::Existing(quad.predicate),
+                                        object: StoreTerm::Existing(quad.object),
+                                        graph_name: None,
+                                    }))
+                                } else {
+                                    None
+                                }
+                            }
+                            Ok(false) => None,
+                            Err(error) => Some(Err(error)),
+                        })
+                        .collect()
+                }
+                Err(error) => vec![Err(error.into())],
+            },
+            Some(Some(StoreTerm::Existing(graph))) => {
+                if !self.graph_is_visible(*graph) {
+                    return Vec::new().into_iter();
+                }
+                match self
+                    .store
+                    .quads_for_pattern(Some(*graph), subject, predicate, object)
+                {
+                    Ok(quads) => quads
+                        .into_iter()
+                        .filter_map(|quad| match self.quad_is_visible(&quad) {
+                            Ok(true) => Some(Ok(InternalQuad {
+                                subject: StoreTerm::Existing(quad.subject),
+                                predicate: StoreTerm::Existing(quad.predicate),
+                                object: StoreTerm::Existing(quad.object),
+                                graph_name: Some(StoreTerm::Existing(quad.graph)),
+                            })),
+                            Ok(false) => None,
+                            Err(error) => Some(Err(error)),
+                        })
+                        .collect(),
+                    Err(error) => vec![Err(error.into())],
+                }
+            }
+            Some(Some(StoreTerm::Missing(_))) => Vec::new(),
+            None => match self
+                .store
+                .quads_for_pattern(None, subject, predicate, object)
+            {
+                Ok(quads) => quads
+                    .into_iter()
+                    .filter_map(|quad| match self.quad_is_visible(&quad) {
+                        Ok(true) => Some(Ok(InternalQuad {
+                            subject: StoreTerm::Existing(quad.subject),
+                            predicate: StoreTerm::Existing(quad.predicate),
+                            object: StoreTerm::Existing(quad.object),
+                            graph_name: Some(StoreTerm::Existing(quad.graph)),
+                        })),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect(),
+                Err(error) => vec![Err(error.into())],
+            },
+        };
+
+        rows.into_iter()
+    }
+
+    #[allow(refining_impl_trait)]
+    fn internal_named_graphs(
+        &self,
+    ) -> std::vec::IntoIter<std::result::Result<Self::InternalTerm, Self::Error>> {
+        self.all_named_graph_terms().into_iter()
+    }
+
+    fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
+        let encoded = EncodedTerm::from_term(&term);
+        Ok(match self.store.lookup_term(&encoded)? {
+            Some(id) => StoreTerm::Existing(id),
+            None => StoreTerm::Missing(encoded),
+        })
+    }
+
+    fn externalize_term(&self, term: Self::InternalTerm) -> std::result::Result<Term, Self::Error> {
+        self.externalize_store_term(term)
+    }
+}
+
+fn collect_query_results(results: spareval::QueryResults<'_>) -> Result<QueryResults> {
+    match results {
+        spareval::QueryResults::Solutions(solutions) => {
+            let variables: Vec<String> = solutions
+                .variables()
+                .iter()
+                .map(|variable| variable.as_str().to_string())
