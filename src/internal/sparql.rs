@@ -182,3 +182,187 @@ impl SparqlEngine {
         Ok(Some(visible))
     }
 }
+
+#[derive(Debug, Clone)]
+enum FtsSubjectPattern {
+    Variable(Variable),
+    NamedNode(NamedNode),
+}
+
+#[derive(Debug, Clone)]
+enum FtsGraphBinding {
+    Variable(Variable),
+    Fixed(NamedNode),
+}
+
+#[derive(Debug, Clone, Default)]
+struct FtsServiceSpec {
+    subject: Option<FtsSubjectPattern>,
+    query: Option<String>,
+    limit: usize,
+    score_var: Option<Variable>,
+    graph: Option<FtsGraphBinding>,
+}
+
+fn rewrite_fts_query(
+    query: &mut Query,
+    search: &SearchIndex,
+    store: &GraphStore,
+    visible_graphs: Option<&HashSet<String>>,
+) -> Result<()> {
+    match query {
+        Query::Select { pattern, .. }
+        | Query::Ask { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Construct { pattern, .. } => {
+            let current = std::mem::replace(pattern, GraphPattern::Bgp { patterns: vec![] });
+            *pattern = rewrite_graph_pattern(current, search, store, visible_graphs)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_graph_pattern(
+    pattern: GraphPattern,
+    search: &SearchIndex,
+    store: &GraphStore,
+    visible_graphs: Option<&HashSet<String>>,
+) -> Result<GraphPattern> {
+    Ok(match pattern {
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
+            pattern
+        }
+        GraphPattern::Join { left, right } => GraphPattern::Join {
+            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
+            right: Box::new(rewrite_graph_pattern(
+                *right,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => GraphPattern::LeftJoin {
+            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
+            right: Box::new(rewrite_graph_pattern(
+                *right,
+                search,
+                store,
+                visible_graphs,
+            )?),
+            expression,
+        },
+        GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
+            expr,
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::Union { left, right } => GraphPattern::Union {
+            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
+            right: Box::new(rewrite_graph_pattern(
+                *right,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::Graph { name, inner } => GraphPattern::Graph {
+            name,
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::Extend {
+            inner,
+            variable,
+            expression,
+        } => GraphPattern::Extend {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+            variable,
+            expression,
+        },
+        GraphPattern::Minus { left, right } => GraphPattern::Minus {
+            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
+            right: Box::new(rewrite_graph_pattern(
+                *right,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+            expression,
+        },
+        GraphPattern::Project { inner, variables } => GraphPattern::Project {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+            variables,
+        },
+        GraphPattern::Distinct { inner } => GraphPattern::Distinct {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::Reduced { inner } => GraphPattern::Reduced {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+        },
+        GraphPattern::Slice {
+            inner,
+            start,
+            length,
+        } => GraphPattern::Slice {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+            start,
+            length,
+        },
+        GraphPattern::Group {
+            inner,
+            variables,
+            aggregates,
+        } => GraphPattern::Group {
+            inner: Box::new(rewrite_graph_pattern(
+                *inner,
+                search,
+                store,
+                visible_graphs,
+            )?),
+            variables,
+            aggregates,
