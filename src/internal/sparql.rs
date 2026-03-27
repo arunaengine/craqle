@@ -549,3 +549,187 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     }
 
     Ok(spec)
+}
+
+fn set_or_check_subject(spec: &mut FtsServiceSpec, subject: TermPattern) -> Result<()> {
+    let subject = match subject {
+        TermPattern::Variable(variable) => FtsSubjectPattern::Variable(variable),
+        TermPattern::NamedNode(node) => FtsSubjectPattern::NamedNode(node),
+        _ => {
+            return Err(SparqlError::Unsupported(
+                "FTS SERVICE subject must be a variable or named node".into(),
+            ));
+        }
+    };
+
+    match (&spec.subject, &subject) {
+        (None, _) => {
+            spec.subject = Some(subject);
+            Ok(())
+        }
+        (Some(FtsSubjectPattern::Variable(left)), FtsSubjectPattern::Variable(right))
+            if left == right =>
+        {
+            Ok(())
+        }
+        (Some(FtsSubjectPattern::NamedNode(left)), FtsSubjectPattern::NamedNode(right))
+            if left == right =>
+        {
+            Ok(())
+        }
+        _ => Err(SparqlError::Unsupported(
+            "all triples inside an FTS SERVICE must share the same subject".into(),
+        )),
+    }
+}
+
+fn requested_fts_variables(spec: &FtsServiceSpec) -> Vec<Variable> {
+    let mut variables = Vec::new();
+    if let Some(FtsSubjectPattern::Variable(variable)) = &spec.subject {
+        variables.push(variable.clone());
+    }
+    if let Some(FtsGraphBinding::Variable(variable)) = &spec.graph {
+        variables.push(variable.clone());
+    }
+    if let Some(variable) = &spec.score_var {
+        variables.push(variable.clone());
+    }
+    variables
+}
+
+fn fts_binding_row(
+    variables: &[Variable],
+    spec: &FtsServiceSpec,
+    hit: &crate::search::SearchHit,
+) -> Result<Vec<Option<GroundTerm>>> {
+    let mut row = Vec::with_capacity(variables.len());
+    for variable in variables {
+        let value = if matches!(&spec.subject, Some(FtsSubjectPattern::Variable(bound)) if bound == variable)
+        {
+            Some(ground_named_node(&hit.subject_iri))
+        } else if matches!(&spec.graph, Some(FtsGraphBinding::Variable(bound)) if bound == variable)
+        {
+            Some(ground_named_node(&hit.graph_id))
+        } else if spec
+            .score_var
+            .as_ref()
+            .is_some_and(|bound| bound == variable)
+        {
+            Some(GroundTerm::Literal(Literal::from(hit.score as f64)))
+        } else {
+            None
+        };
+        row.push(value);
+    }
+    Ok(row)
+}
+
+fn ground_named_node(iri: &str) -> GroundTerm {
+    GroundTerm::NamedNode(NamedNode::new_unchecked(iri))
+}
+
+fn flush_queued_search_updates(search: &SearchIndex, store: &GraphStore) -> Result<()> {
+    loop {
+        let processed = search.process_queued_updates(store, FTS_QUEUE_FLUSH_CHUNK)?;
+        if processed == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StoreTerm {
+    Existing(TermId),
+    Missing(EncodedTerm),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StoreDatasetError {
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
+    #[error("invalid RDF term: {0}")]
+    InvalidTerm(String),
+}
+
+struct StoreDataset<'a> {
+    store: &'a GraphStore,
+    orphan_cache: RefCell<HashMap<TermId, HashSet<TermId>>>,
+    visible_graphs: VisibleGraphSet,
+}
+
+enum ResolvedPatternTerm {
+    Any,
+    Existing(TermId),
+    Missing,
+}
+
+impl<'a> StoreDataset<'a> {
+    fn new(store: &'a GraphStore, visible_graphs: VisibleGraphSet) -> Self {
+        Self {
+            store,
+            orphan_cache: RefCell::new(HashMap::new()),
+            visible_graphs,
+        }
+    }
+
+    fn resolve_pattern_term(&self, term: Option<&StoreTerm>) -> ResolvedPatternTerm {
+        match term {
+            None => ResolvedPatternTerm::Any,
+            Some(StoreTerm::Existing(id)) => ResolvedPatternTerm::Existing(*id),
+            Some(StoreTerm::Missing(_)) => ResolvedPatternTerm::Missing,
+        }
+    }
+
+    fn decode_term(&self, id: TermId) -> std::result::Result<EncodedTerm, StoreDatasetError> {
+        self.store.decode_term(id).map_err(Into::into)
+    }
+
+    fn externalize_encoded_term(
+        &self,
+        term: EncodedTerm,
+    ) -> std::result::Result<Term, StoreDatasetError> {
+        term.to_term().ok_or(StoreDatasetError::InvalidTerm(term.0))
+    }
+
+    fn externalize_store_term(
+        &self,
+        term: StoreTerm,
+    ) -> std::result::Result<Term, StoreDatasetError> {
+        match term {
+            StoreTerm::Existing(id) => self.externalize_encoded_term(self.decode_term(id)?),
+            StoreTerm::Missing(term) => self.externalize_encoded_term(term),
+        }
+    }
+
+    fn all_named_graph_terms(&self) -> Vec<std::result::Result<StoreTerm, StoreDatasetError>> {
+        match self.store.graphs() {
+            Ok(graphs) => graphs
+                .into_iter()
+                .map(|graph| {
+                    let encoded = EncodedTerm::from_named_node(&graph.0);
+                    match self.store.lookup_term(&encoded)? {
+                        Some(id) => Ok(StoreTerm::Existing(id)),
+                        None => Err(StoreDatasetError::InvalidTerm(graph.as_str().to_string())),
+                    }
+                })
+                .filter(|result| match result {
+                    Ok(StoreTerm::Existing(id)) => self.graph_is_visible(*id),
+                    Ok(StoreTerm::Missing(_)) => false,
+                    Err(_) => true,
+                })
+                .collect(),
+            Err(error) => vec![Err(error.into())],
+        }
+    }
+
+    fn graph_is_visible(&self, graph: TermId) -> bool {
+        self.visible_graphs
+            .as_ref()
+            .is_none_or(|visible| visible.contains(&graph))
+    }
+
+    fn orphaned_subjects_for_graph(
+        &self,
+        graph: TermId,
+    ) -> std::result::Result<HashSet<TermId>, StoreDatasetError> {
