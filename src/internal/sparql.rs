@@ -917,3 +917,186 @@ fn collect_query_results(results: spareval::QueryResults<'_>) -> Result<QueryRes
                 .variables()
                 .iter()
                 .map(|variable| variable.as_str().to_string())
+                .collect();
+
+            let mut rows = Vec::new();
+            for solution in solutions {
+                let solution = solution.map_err(map_eval_error)?;
+                let mut row = HashMap::new();
+                for variable in &variables {
+                    if let Some(term) = solution.get(variable.as_str()) {
+                        row.insert(variable.clone(), EncodedTerm::from_term(term));
+                    }
+                }
+                rows.push(row);
+            }
+            Ok(QueryResults::Solutions(rows))
+        }
+        spareval::QueryResults::Boolean(value) => Ok(QueryResults::Boolean(value)),
+        spareval::QueryResults::Graph(triples) => {
+            let mut graph = Vec::new();
+            for triple in triples {
+                let Triple {
+                    subject,
+                    predicate,
+                    object,
+                } = triple.map_err(map_eval_error)?;
+                graph.push((
+                    EncodedTerm::from(&subject),
+                    EncodedTerm::from_named_node(&predicate),
+                    EncodedTerm::from_term(&object),
+                ));
+            }
+            Ok(QueryResults::Graph(graph))
+        }
+    }
+}
+
+fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
+    SparqlError::Evaluation(error.to_string())
+}
+
+fn quad_to_insert(quad: &spargebra::term::Quad) -> Result<MaterializedQuadChange> {
+    Ok(MaterializedQuadChange::Insert {
+        graph: spargebra_graph_name_to_graph_id(&quad.graph_name)?,
+        subject: EncodedTerm::from(&quad.subject),
+        predicate: EncodedTerm::from_named_node(&quad.predicate),
+        object: EncodedTerm::from_term(&quad.object),
+    })
+}
+
+fn ground_quad_to_delete(quad: &spargebra::term::GroundQuad) -> Result<MaterializedQuadChange> {
+    Ok(MaterializedQuadChange::Delete {
+        graph: spargebra_graph_name_to_graph_id(&quad.graph_name)?,
+        subject: EncodedTerm::from_named_node(&quad.subject),
+        predicate: EncodedTerm::from_named_node(&quad.predicate),
+        object: ground_term_to_encoded(&quad.object),
+    })
+}
+
+fn delete_insert_quad_to_change(quad: DeleteInsertQuad) -> Result<MaterializedQuadChange> {
+    match quad {
+        DeleteInsertQuad::Delete(quad) => Ok(MaterializedQuadChange::Delete {
+            graph: oxrdf_graph_name_to_graph_id(&quad.graph_name)?,
+            subject: EncodedTerm::from(&quad.subject),
+            predicate: EncodedTerm::from_named_node(&quad.predicate),
+            object: EncodedTerm::from_term(&quad.object),
+        }),
+        DeleteInsertQuad::Insert(quad) => Ok(MaterializedQuadChange::Insert {
+            graph: oxrdf_graph_name_to_graph_id(&quad.graph_name)?,
+            subject: EncodedTerm::from(&quad.subject),
+            predicate: EncodedTerm::from_named_node(&quad.predicate),
+            object: EncodedTerm::from_term(&quad.object),
+        }),
+    }
+}
+
+fn spargebra_graph_name_to_graph_id(graph_name: &spargebra::term::GraphName) -> Result<GraphId> {
+    match graph_name {
+        spargebra::term::GraphName::NamedNode(node) => Ok(GraphId(node.clone())),
+        spargebra::term::GraphName::DefaultGraph => Err(SparqlError::Unsupported(
+            "default graph updates are not supported; use GRAPH <iri> { ... }".into(),
+        )),
+    }
+}
+
+fn oxrdf_graph_name_to_graph_id(graph_name: &oxrdf::GraphName) -> Result<GraphId> {
+    match graph_name {
+        oxrdf::GraphName::NamedNode(node) => Ok(GraphId(node.clone())),
+        oxrdf::GraphName::BlankNode(node) => Err(SparqlError::Unsupported(format!(
+            "blank node graph names are not supported: _:{}",
+            node.as_str()
+        ))),
+        oxrdf::GraphName::DefaultGraph => Err(SparqlError::Unsupported(
+            "default graph updates are not supported; use GRAPH <iri> { ... }".into(),
+        )),
+    }
+}
+
+fn ground_term_to_encoded(term: &spargebra::term::GroundTerm) -> EncodedTerm {
+    #[allow(unreachable_patterns)]
+    match term {
+        spargebra::term::GroundTerm::NamedNode(node) => EncodedTerm::from_named_node(node),
+        spargebra::term::GroundTerm::Literal(literal) => EncodedTerm(literal.to_string()),
+        _ => EncodedTerm(term.to_string()),
+    }
+}
+
+fn materialize_graph_target_removals(
+    store: &GraphStore,
+    target: &GraphTarget,
+) -> Result<Vec<MaterializedQuadChange>> {
+    let graphs = match target {
+        GraphTarget::NamedNode(node) => vec![GraphId(node.clone())],
+        GraphTarget::DefaultGraph => Vec::new(),
+        GraphTarget::NamedGraphs | GraphTarget::AllGraphs => store.graphs()?,
+    };
+
+    let mut changes = Vec::new();
+    for graph in graphs {
+        let graph_term = EncodedTerm::from_named_node(&graph.0);
+        let Some(graph_id) = store.lookup_term(&graph_term)? else {
+            continue;
+        };
+
+        store.for_each_quad_in_graph::<SparqlError, _>(graph_id, |quad| {
+            changes.push(MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: store.decode_term(quad.subject)?,
+                predicate: store.decode_term(quad.predicate)?,
+                object: store.decode_term(quad.object)?,
+            });
+            Ok(())
+        })?;
+    }
+    Ok(changes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{ActorId, Dot, GraphDiagnostics};
+    use oxrdf::{Literal, Term};
+
+    fn setup_engine() -> (
+        tempfile::TempDir,
+        Arc<GraphStore>,
+        Arc<SearchIndex>,
+        SparqlEngine,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open(dir.path()).unwrap());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let engine = SparqlEngine::new(store.clone(), search.clone());
+        (dir, store, search, engine)
+    }
+
+    fn insert_quad(
+        store: &GraphStore,
+        graph: &GraphId,
+        subject: &str,
+        predicate: &str,
+        object: EncodedTerm,
+    ) {
+        if !store.contains_graph(graph).unwrap() {
+            store.create_graph(graph).unwrap();
+        }
+        let mut batch = store.new_batch();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let subject_id = store
+            .resolve_term(&EncodedTerm::from_named_node(
+                &oxrdf::NamedNode::new_unchecked(subject),
+            ))
+            .unwrap();
+        let predicate_id = store
+            .resolve_term(&EncodedTerm::from_named_node(
+                &oxrdf::NamedNode::new_unchecked(predicate),
+            ))
+            .unwrap();
+        let object_id = store.resolve_term(&object).unwrap();
+        store
+            .insert_quad(
+                &mut batch,
+                graph_id,
