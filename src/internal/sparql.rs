@@ -1284,3 +1284,186 @@ mod tests {
                 {
                     SELECT ?s (COUNT(?kw) AS ?kwCount)
                     WHERE {
+                        ?s schema:keywords ?kw .
+                    }
+                    GROUP BY ?s
+                    HAVING(COUNT(?kw) >= 1)
+                }
+                ?s schema:name ?name .
+            }
+            ORDER BY DESC(?kwCount) ?name
+            LIMIT 2
+        "#;
+
+        let rows = solution_rows(engine.query(query).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("name").unwrap().0, "\"Beta\"");
+        assert_eq!(rows[1].get("name").unwrap().0, "\"Alpha\"");
+    }
+
+    #[test]
+    fn orphaned_entities_are_hidden_from_select_queries() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:g1");
+        insert_quad(
+            &store,
+            &graph,
+            "./",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                "http://schema.org/Dataset",
+            )),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "./",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Root Dataset"))),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "./data/",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                "http://schema.org/Dataset",
+            )),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "./data/",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Hidden Dataset",
+            ))),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "./data/file.txt",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                "http://schema.org/MediaObject",
+            )),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "./data/file.txt",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Hidden File"))),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "./data/",
+            "http://schema.org/hasPart",
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("./data/file.txt")),
+        );
+        store
+            .set_graph_diagnostics(
+                &graph,
+                &GraphDiagnostics::from_orphaned_entities(vec![
+                    "./data/".to_string(),
+                    "./data/file.txt".to_string(),
+                ]),
+            )
+            .unwrap();
+
+        let rows = solution_rows(
+            engine
+                .query("SELECT ?name WHERE { GRAPH <urn:test:g1> { ?s schema:name ?name } }")
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name").unwrap().0, "\"Root Dataset\"");
+
+        let hidden_rows = solution_rows(
+            engine
+                .query(
+                    "SELECT ?s ?child WHERE { GRAPH <urn:test:g1> { ?s schema:hasPart ?child } }",
+                )
+                .unwrap(),
+        );
+        assert!(hidden_rows.is_empty());
+    }
+
+    #[test]
+    fn delete_insert_where_materializes_concrete_changes() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:g1");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e1",
+            "http://schema.org/position",
+            EncodedTerm::from_term(&Term::Literal(Literal::from(0_i32))),
+        );
+
+        let changes = engine
+            .evaluate_update(
+                "DELETE { GRAPH <urn:test:g1> { ?s <http://schema.org/position> ?o } } \
+                 INSERT { GRAPH <urn:test:g1> { ?s <http://schema.org/position> ?o2 } } \
+                 WHERE { GRAPH <urn:test:g1> { ?s <http://schema.org/position> ?o . BIND(?o + 1 AS ?o2) } }",
+            )
+            .unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert!(matches!(changes[0], MaterializedQuadChange::Delete { .. }));
+        assert!(matches!(changes[1], MaterializedQuadChange::Insert { .. }));
+    }
+
+    #[test]
+    fn service_fts_binds_hits_and_scores() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:g1");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Proteomics Atlas",
+            ))),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e1",
+            "http://schema.org/description",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Large-scale proteomics experiment",
+            ))),
+        );
+
+        let query = r#"
+            SELECT ?s ?g ?score ?name
+            WHERE {
+                SERVICE <urn:craqle:fts> {
+                    ?s fts:query "proteomics" .
+                    ?s fts:score ?score .
+                    ?s fts:graph ?g .
+                    ?s fts:limit 5 .
+                }
+                GRAPH ?g {
+                    ?s schema:name ?name .
+                }
+            }
+        "#;
+
+        let rows = solution_rows(engine.query(query).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("s").unwrap().0, "<urn:test:e1>");
+        assert_eq!(rows[0].get("g").unwrap().0, "<urn:test:g1>");
+        assert_eq!(rows[0].get("name").unwrap().0, "\"Proteomics Atlas\"");
+        assert!(
+            rows[0]
+                .get("score")
+                .unwrap()
+                .0
+                .contains("http://www.w3.org/2001/XMLSchema#double")
+        );
+    }
+}
