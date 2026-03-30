@@ -1100,3 +1100,187 @@ mod tests {
             .insert_quad(
                 &mut batch,
                 graph_id,
+                subject_id,
+                predicate_id,
+                object_id,
+                &Dot {
+                    actor: ActorId::random(),
+                    counter: 1,
+                },
+            )
+            .unwrap();
+        store.enqueue_fts(&mut batch, graph, subject_id).unwrap();
+        store.commit(batch).unwrap();
+    }
+
+    fn solution_rows(results: QueryResults) -> Vec<HashMap<String, EncodedTerm>> {
+        match results {
+            QueryResults::Solutions(rows) => rows,
+            other => panic!("expected solutions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_queries_use_union_default_graph() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph1 = GraphId::new("urn:test:g1");
+        let graph2 = GraphId::new("urn:test:g2");
+        insert_quad(
+            &store,
+            &graph1,
+            "urn:test:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+        );
+        insert_quad(
+            &store,
+            &graph2,
+            "urn:test:e2",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset Two"))),
+        );
+
+        let rows = solution_rows(
+            engine
+                .query("SELECT ?s ?name WHERE { ?s schema:name ?name }")
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn query_supports_union_optional_bind_and_filter() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:g1");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e1",
+            "http://schema.org/description",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Primary record",
+            ))),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e2",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset Two"))),
+        );
+
+        let query = r#"
+            SELECT ?s ?label ?desc
+            WHERE {
+                {
+                    GRAPH <urn:test:g1> {
+                        ?s schema:name ?label .
+                        OPTIONAL { ?s schema:description ?desc }
+                        FILTER(?label = "Dataset One")
+                    }
+                }
+                UNION
+                {
+                    GRAPH <urn:test:g1> {
+                        ?s schema:name ?label .
+                        OPTIONAL { ?s schema:description ?desc }
+                        FILTER(?label = "Dataset Two")
+                    }
+                }
+                BIND(CONCAT(STR(?label), "!") AS ?tag)
+                FILTER(CONTAINS(?tag, "Dataset"))
+            }
+        "#;
+
+        let rows = solution_rows(engine.query(query).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.contains_key("desc")));
+    }
+
+    #[test]
+    fn ask_and_construct_queries_are_supported() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:g1");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+        );
+
+        assert_eq!(
+            engine
+                .query("ASK { GRAPH <urn:test:g1> { <urn:test:e1> schema:name \"Dataset One\" } }")
+                .unwrap(),
+            QueryResults::Boolean(true)
+        );
+
+        let graph = engine
+            .query(
+                "CONSTRUCT { ?s <urn:test:derived> ?name } WHERE { GRAPH <urn:test:g1> { ?s schema:name ?name } }",
+            )
+            .unwrap();
+        match graph {
+            QueryResults::Graph(triples) => {
+                assert_eq!(triples.len(), 1);
+                assert!(triples[0].1.0.contains("urn:test:derived"));
+            }
+            other => panic!("expected graph results, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_queries_support_group_order_and_subqueries() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph1 = GraphId::new("urn:test:g1");
+        let graph2 = GraphId::new("urn:test:g2");
+        insert_quad(
+            &store,
+            &graph1,
+            "urn:test:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Alpha"))),
+        );
+        insert_quad(
+            &store,
+            &graph1,
+            "urn:test:e1",
+            "http://schema.org/keywords",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("omics"))),
+        );
+        insert_quad(
+            &store,
+            &graph2,
+            "urn:test:e2",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Beta"))),
+        );
+        insert_quad(
+            &store,
+            &graph2,
+            "urn:test:e2",
+            "http://schema.org/keywords",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("omics"))),
+        );
+        insert_quad(
+            &store,
+            &graph2,
+            "urn:test:e2",
+            "http://schema.org/keywords",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("proteomics"))),
+        );
+
+        let query = r#"
+            SELECT ?s ?name ?kwCount
+            WHERE {
+                {
+                    SELECT ?s (COUNT(?kw) AS ?kwCount)
+                    WHERE {
