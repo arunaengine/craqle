@@ -298,3 +298,103 @@ impl CraqleCluster {
             for graph in peer.graphs()? {
                 graphs.insert(graph.as_str().to_string());
             }
+        }
+        let mut graphs: Vec<GraphId> = graphs
+            .into_iter()
+            .map(|graph| GraphId::new(&graph))
+            .collect();
+        graphs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(graphs)
+    }
+
+    fn check_convergence(&self) -> Result<bool> {
+        let graphs = self.all_graphs()?;
+
+        for graph in &graphs {
+            let mut reference_clock: Option<VectorClock> = None;
+            let mut reference_fingerprint: Option<(u64, [u8; 32], [u8; 32])> = None;
+
+            for (idx, peer) in self.peers.iter().enumerate() {
+                let has_connection = (0..self.peers.len()).any(|other| {
+                    idx != other && (self.connected[idx][other] || self.connected[other][idx])
+                });
+                if !has_connection {
+                    continue;
+                }
+
+                let clock = peer.vector_clock(graph)?;
+                if let Some(reference) = &reference_clock {
+                    if *reference != clock {
+                        return Ok(false);
+                    }
+                } else {
+                    reference_clock = Some(clock);
+                }
+
+                let fingerprint = peer.graph_fingerprint(graph)?;
+                if let Some(reference) = &reference_fingerprint {
+                    if *reference != fingerprint {
+                        return Ok(false);
+                    }
+                } else {
+                    reference_fingerprint = Some(fingerprint);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn federated_peer_indexes(&self, peer: usize) -> Vec<usize> {
+        let mut indexes = vec![peer];
+        for other in 0..self.peers.len() {
+            if other != peer && (self.connected[peer][other] || self.connected[other][peer]) {
+                indexes.push(other);
+            }
+        }
+        indexes.sort_unstable();
+        indexes.dedup();
+        indexes
+    }
+}
+
+fn merge_query_results(results: Vec<QueryResults>) -> QueryResults {
+    let Some(first) = results.first() else {
+        return QueryResults::Solutions(Vec::new());
+    };
+
+    match first {
+        QueryResults::Solutions(_) => {
+            let mut seen = HashSet::new();
+            let mut merged = Vec::new();
+            for result in results {
+                if let QueryResults::Solutions(rows) = result {
+                    for row in rows {
+                        let mut key: Vec<(String, EncodedTerm)> =
+                            row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        key.sort_by(|left, right| left.0.cmp(&right.0));
+                        if seen.insert(key) {
+                            merged.push(row);
+                        }
+                    }
+                }
+            }
+            QueryResults::Solutions(merged)
+        }
+        QueryResults::Boolean(_) => {
+            QueryResults::Boolean(results.into_iter().any(|result| match result {
+                QueryResults::Boolean(value) => value,
+                _ => false,
+            }))
+        }
+        QueryResults::Graph(_) => {
+            let mut merged = BTreeSet::new();
+            for result in results {
+                if let QueryResults::Graph(triples) = result {
+                    merged.extend(triples);
+                }
+            }
+            QueryResults::Graph(merged.into_iter().collect())
+        }
+    }
+}
