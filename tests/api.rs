@@ -352,3 +352,121 @@ fn cluster_sync_converges_through_public_api() {
 fn cluster_query_options_can_fan_out_across_peers() {
     let dir = tempfile::tempdir().unwrap();
     let cluster = CraqleCluster::new(2, dir.path()).unwrap();
+    let writer = writer_auth();
+    let anonymous = GrantAuthorizer::default();
+
+    cluster
+        .peer(0)
+        .create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new("urn:test:peer0"),
+                "Peer Zero Dataset",
+                "Lives only on peer zero",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/peer0".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    cluster
+        .peer(1)
+        .create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new("urn:test:peer1"),
+                "Peer One Dataset",
+                "Lives only on peer one",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/peer1".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+
+    let local_rows = match cluster
+        .query_from_peer(
+            0,
+            &anonymous,
+            "SELECT ?name WHERE { ?s schema:name ?name }",
+            QueryOptions { local_only: true },
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+    assert_eq!(local_rows.len(), 1);
+
+    let federated_rows = match cluster
+        .query_from_peer(
+            0,
+            &anonymous,
+            "SELECT ?name WHERE { ?s schema:name ?name }",
+            QueryOptions { local_only: false },
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+    assert!(federated_rows.len() > local_rows.len());
+
+    let hits = cluster
+        .search_from_peer(
+            0,
+            &anonymous,
+            "peer",
+            10,
+            QueryOptions { local_only: false },
+        )
+        .unwrap();
+    assert!(hits.iter().any(|hit| hit.graph_id == "urn:test:peer1"));
+}
+
+#[test]
+fn federated_queries_do_not_leak_remote_private_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = CraqleCluster::new(2, dir.path()).unwrap();
+    let writer = writer_auth();
+    let anonymous = GrantAuthorizer::default();
+
+    cluster
+        .peer(0)
+        .create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new("urn:test:federated-public"),
+                "Public Federated Dataset",
+                "Visible everywhere",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/federated".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    cluster
+        .peer(1)
+        .create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new("urn:test:federated-private"),
+                "Private Federated Dataset",
+                "Must not leak through remote fanout",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: false,
+                    permission_paths: vec!["/datasets/private/federated".to_string()],
+                },
+            ),
+        )
