@@ -470,3 +470,121 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
                 },
             ),
         )
+        .unwrap();
+
+    let rows = match cluster
+        .query_from_peer(
+            0,
+            &anonymous,
+            "SELECT ?name WHERE { ?s schema:name ?name }",
+            QueryOptions { local_only: false },
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| row.get("name").unwrap().0.clone())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|name| name.contains("Public Federated Dataset"))
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.contains("Private Federated Dataset"))
+    );
+
+    let hits = cluster
+        .search_from_peer(
+            0,
+            &anonymous,
+            "federated",
+            10,
+            QueryOptions { local_only: false },
+        )
+        .unwrap();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.graph_id == "urn:test:federated-public")
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.graph_id == "urn:test:federated-private")
+    );
+}
+
+#[test]
+fn import_jsonld_rejects_inline_nested_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let graph = GraphId::new("urn:test:inline-object");
+    let writer = writer_auth();
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Inline Object Test",
+            "Used to validate RO-Crate import semantics",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/inline-object".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let invalid = r#"
+    {
+      "@context": "https://w3id.org/ro/crate/1.2/context",
+      "@graph": [
+        {
+          "@id": "ro-crate-metadata.json",
+          "@type": "CreativeWork",
+          "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+          "about": {"@id": "./"}
+        },
+        {
+          "@id": "./",
+          "@type": "Dataset",
+          "name": "Inline Object Test",
+          "description": "Should be rejected",
+          "datePublished": "2025-01-01",
+          "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+          "creator": {
+            "@type": "Person",
+            "name": "Nested Person"
+          }
+        }
+      ]
+    }
+    "#;
+
+    let err = node
+        .apply_rocrate_document(&writer, graph, invalid)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(_))
+    ));
+}
+
+#[test]
+fn update_property_rejects_unknown_compact_property_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let graph = GraphId::new("urn:test:unknown-property");
+    let writer = writer_auth();
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
