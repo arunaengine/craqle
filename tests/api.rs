@@ -588,3 +588,120 @@ fn update_property_rejects_unknown_compact_property_names() {
     node.create_crate(
         &writer,
         CreateCrateRequest::new(
+            graph.clone(),
+            "Unknown Property Test",
+            "Reject unsupported compact properties",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/unknown-property".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let err = node
+        .update_property(&writer, &graph, "./", "foo:bar", None, "value")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CraqleError::RoCrate(RoCrateError::UnsupportedTerm(term)) if term == "foo:bar"
+    ));
+}
+
+#[test]
+fn add_data_entity_rejects_unknown_compact_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let graph = GraphId::new("urn:test:unknown-type");
+    let writer = writer_auth();
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Unknown Type Test",
+            "Reject unsupported compact type names",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/unknown-type".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let err = node
+        .add_data_entity(&writer, &graph, "data/file.txt", "foo:Thing", "Bad Type")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CraqleError::RoCrate(RoCrateError::UnsupportedTerm(term)) if term == "foo:Thing"
+    ));
+}
+
+#[test]
+fn preview_rocrate_update_returns_canonical_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let graph = GraphId::new("urn:test:preview-rocrate");
+    let writer = writer_auth();
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Preview Dataset",
+            "Original description",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/preview-rocrate".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let updated = r#"
+    {
+      "@context": "https://w3id.org/ro/crate/1.2/context",
+      "@graph": [
+        {
+          "@id": "ro-crate-metadata.json",
+          "@type": "CreativeWork",
+          "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+          "about": {"@id": "./"}
+        },
+        {
+          "@id": "./",
+          "@type": "Dataset",
+          "name": "Preview Dataset",
+          "description": "Updated description",
+          "datePublished": "2025-01-01",
+          "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+        }
+      ]
+    }
+    "#;
+
+    let changes = node
+        .preview_rocrate_update(&writer, &graph, updated)
+        .unwrap();
+    assert!(changes.iter().any(|change| {
+        matches!(
+            change,
+            MaterializedQuadChange::Delete { object, .. } if object.0.contains("Original description")
+        )
+    }));
+    assert!(changes.iter().any(|change| {
+        matches!(
+            change,
+            MaterializedQuadChange::Insert { object, .. } if object.0.contains("Updated description")
+        )
+    }));
+}
