@@ -234,3 +234,121 @@ fn search_filters_private_graphs_by_policy() {
     node.create_crate(
         &writer,
         CreateCrateRequest::new(
+            GraphId::new("urn:test:private-search"),
+            "Private Proteomics",
+            "Hidden search document",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/private/project-a".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let anonymous_hits = node
+        .search(&GrantAuthorizer::default(), "proteomics", 10)
+        .unwrap();
+    assert_eq!(anonymous_hits.len(), 1);
+    assert_eq!(anonymous_hits[0].subject_iri, "./");
+
+    let writer_hits = node.search(&writer, "proteomics", 10).unwrap();
+    assert_eq!(writer_hits.len(), 2);
+}
+
+#[test]
+fn search_hits_can_be_hydrated_from_rdf() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    let reader = GrantAuthorizer::default();
+    let graph = GraphId::new("urn:test:hydrate-search");
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Hydrated Search Dataset",
+            "Search results can be hydrated from RDF",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/hydrate-search".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let hits = node.search(&reader, "hydrated", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+
+    let hydrated = node.hydrate_search_hits(&reader, &hits).unwrap();
+    assert_eq!(hydrated.len(), 1);
+    assert!(
+        hydrated[0]
+            .properties
+            .iter()
+            .any(|(predicate, object)| predicate
+                == &EncodedTerm::from_named_node(&vocab::schema_name())
+                && object.0.contains("Hydrated Search Dataset"))
+    );
+
+    let hydrated_search = node.search_resources(&reader, "hydrated", 10).unwrap();
+    assert_eq!(hydrated_search.len(), 1);
+}
+
+#[test]
+fn cluster_sync_converges_through_public_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = CraqleCluster::new(2, dir.path()).unwrap();
+    let graph = GraphId::new("urn:test:cluster");
+    let writer = writer_auth();
+    let anonymous = GrantAuthorizer::default();
+
+    cluster
+        .peer(0)
+        .create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Cluster Dataset",
+                "Synced via simulation helper",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/cluster".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    cluster
+        .peer(0)
+        .add_data_entity(
+            &writer,
+            &graph,
+            "data/cluster.txt",
+            "http://schema.org/MediaObject",
+            "Cluster File",
+        )
+        .unwrap();
+
+    cluster.sync_until_converged(10).unwrap();
+
+    let exported = cluster.peer(1).export_rocrate(&anonymous, &graph).unwrap();
+    assert!(exported.contains("Cluster File"));
+
+    cluster.reindex_search().unwrap();
+    let hits = cluster.peer(1).search(&anonymous, "cluster", 10).unwrap();
+    assert!(!hits.is_empty());
+
+    cluster.partition(0, 1);
+    cluster.heal(0, 1);
+}
+
+#[test]
+fn cluster_query_options_can_fan_out_across_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = CraqleCluster::new(2, dir.path()).unwrap();
