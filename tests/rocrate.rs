@@ -490,3 +490,101 @@ mod tests {
         let mgr1 = manager(net.peer(1));
         mgr1.add_data_entity(
             &graph,
+            "results/report.pdf",
+            "http://schema.org/MediaObject",
+            "Report",
+            vec![],
+        )
+        .unwrap();
+        mgr1.update_property(
+            &graph,
+            "./",
+            "schema:description",
+            None,
+            "Data from experiment X with updated notes",
+        )
+        .unwrap();
+
+        mgr0.add_data_entity_under(
+            &graph,
+            "./",
+            "results/figures/",
+            "http://schema.org/Dataset",
+            "Figures Directory",
+            vec![],
+        )
+        .unwrap();
+        mgr0.add_data_entity_under(
+            &graph,
+            "results/figures/",
+            "results/figures/fig1.png",
+            "http://schema.org/MediaObject",
+            "Figure 1",
+            vec![],
+        )
+        .unwrap();
+
+        net.sync_until_converged(20).unwrap();
+
+        let exported = mgr1.export_jsonld(&graph).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert!(json["@graph"].as_array().unwrap().len() >= 8);
+        assert!(exported.contains("Alice Example"));
+        assert!(exported.contains("results/report.pdf"));
+        assert!(exported.contains("results/figures/fig1.png"));
+
+        let experiment_hits = reindex_and_search(&net, 0, "experiment");
+        let report_hits = reindex_and_search(&net, 1, "report");
+        assert!(experiment_hits.iter().any(|subject| subject == "./"));
+        assert!(
+            report_hits
+                .iter()
+                .any(|subject| subject.contains("report.pdf"))
+        );
+    }
+
+    #[test]
+    fn test_benchmark_exports_can_omit_or_page_data_entities() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-export-page");
+        let mgr = manager(net.peer(0));
+
+        mgr.create_crate(
+            graph.clone(),
+            "Benchmark Export Crate",
+            "Testing summary and paged exports",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        for idx in 0..5 {
+            mgr.add_data_entity(
+                &graph,
+                &format!("data/page-{idx}.dat"),
+                "http://schema.org/MediaObject",
+                &format!("Page {idx}"),
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let summary = mgr.export_jsonld_summary(&graph).unwrap();
+        assert!(summary.contains("Benchmark Export Crate"));
+        assert!(!summary.contains("page-0.dat"));
+
+        let page = mgr.export_jsonld_page(&graph, 1, 2).unwrap();
+        assert_eq!(page.total_data_entities, 5);
+        assert_eq!(page.returned_data_entities, 2);
+        assert_eq!(page.next_offset, Some(3));
+        assert_eq!(page.next_cursor.as_deref(), Some("./data/page-2.dat"));
+        assert!(page.jsonld.contains("page-1.dat") || page.jsonld.contains("page-2.dat"));
+    }
+
+    #[test]
+    fn test_benchmark_exports_include_linked_contextual_entities() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-export-contextual");
+        let mgr = manager(net.peer(0));
+
+        mgr.create_crate(
+            graph.clone(),
