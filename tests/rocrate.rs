@@ -588,3 +588,101 @@ mod tests {
 
         mgr.create_crate(
             graph.clone(),
+            "Contextual Export Crate",
+            "Summary and page exports should retain contextual entities",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        mgr.add_contextual_entity(
+            &graph,
+            "#alice",
+            "http://schema.org/Person",
+            "Alice Example",
+            vec![],
+        )
+        .unwrap();
+        net.peer(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                        "http://schema.org/creator",
+                    )),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("#alice")),
+                )],
+            )
+            .unwrap();
+        mgr.add_data_entity(
+            &graph,
+            "data/sample.dat",
+            "http://schema.org/MediaObject",
+            "Sample Data",
+            vec![(
+                oxrdf::NamedNode::new_unchecked("http://schema.org/creator"),
+                oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked("#alice")),
+            )],
+        )
+        .unwrap();
+
+        let summary = mgr.export_jsonld_summary(&graph).unwrap();
+        assert!(summary.contains("Contextual Export Crate"));
+        assert!(summary.contains("Alice Example"));
+        assert!(!summary.contains("sample.dat"));
+
+        let page = mgr.export_jsonld_page_after(&graph, None, 1).unwrap();
+        assert!(page.jsonld.contains("sample.dat"));
+        assert!(page.jsonld.contains("Alice Example"));
+    }
+
+    #[test]
+    fn test_benchmark_export_cursor_pages_can_resume() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-export-cursor");
+        let mgr = manager(net.peer(0));
+
+        mgr.create_crate(
+            graph.clone(),
+            "Cursor Export Crate",
+            "Testing cursor-based partial export",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        for idx in 0..5 {
+            mgr.add_data_entity(
+                &graph,
+                &format!("data/cursor-{idx}.dat"),
+                "http://schema.org/MediaObject",
+                &format!("Cursor {idx}"),
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let first_page = mgr.export_jsonld_page_after(&graph, None, 2).unwrap();
+        assert_eq!(first_page.total_data_entities, 5);
+        assert_eq!(first_page.returned_data_entities, 2);
+        assert_eq!(first_page.next_offset, None);
+        assert_eq!(
+            first_page.next_cursor.as_deref(),
+            Some("./data/cursor-1.dat")
+        );
+        assert!(first_page.jsonld.contains("cursor-0.dat"));
+        assert!(first_page.jsonld.contains("cursor-1.dat"));
+
+        let second_page = mgr
+            .export_jsonld_page_after(&graph, first_page.next_cursor.as_deref(), 2)
+            .unwrap();
+        assert_eq!(second_page.total_data_entities, 5);
+        assert_eq!(second_page.returned_data_entities, 2);
+        assert_eq!(
+            second_page.next_cursor.as_deref(),
+            Some("./data/cursor-3.dat")
+        );
+        assert!(second_page.jsonld.contains("cursor-2.dat"));
+        assert!(second_page.jsonld.contains("cursor-3.dat"));
+        assert!(!second_page.jsonld.contains("cursor-0.dat"));
+    }
+}
