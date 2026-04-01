@@ -293,3 +293,102 @@ mod tests {
                         EncodedTerm::from_named_node(&vocab::root_entity()),
                         EncodedTerm::from_named_node(&vocab::schema_keywords()),
                         literal_term("kw-a"),
+                    ),
+                    (
+                        EncodedTerm::from_named_node(&vocab::root_entity()),
+                        EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                        literal_term("kw-b"),
+                    ),
+                ],
+            )
+            .unwrap();
+        mgr.update_property(
+            &graph,
+            "./",
+            "schema:keywords",
+            Some("kw-a"),
+            "kw-a-updated",
+        )
+        .unwrap();
+
+        let exported = mgr.export_jsonld(&graph).unwrap();
+        assert!(exported.contains("Updated description"));
+        assert!(!exported.contains("Original description"));
+        assert!(exported.contains("kw-a-updated"));
+        assert!(exported.contains("kw-b"));
+        assert!(!exported.contains("\"kw-a\""));
+    }
+
+    #[test]
+    fn test_import_export_preserves_language_and_typed_value_objects() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:value-objects");
+        let mgr = manager(net.peer(0));
+
+        let jsonld = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                    "about": { "@id": "./" }
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "Typed Demo",
+                    "description": "Checks typed literal fidelity",
+                    "datePublished": "2025-03-01",
+                    "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
+                    "hasPart": { "@id": "./data/file.txt" },
+                    "comment": {
+                        "@value": "bonjour",
+                        "@language": "fr"
+                    }
+                },
+                {
+                    "@id": "./data/file.txt",
+                    "@type": "MediaObject",
+                    "name": "File",
+                    "measurement": {
+                        "@value": "42",
+                        "@type": "http://example.org/datatype/custom-int"
+                    }
+                }
+            ]
+        });
+
+        mgr.import_jsonld(graph.clone(), &jsonld.to_string())
+            .unwrap();
+        let exported = mgr.export_jsonld(&graph).unwrap();
+        let exported_json: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        let graph_entries = exported_json["@graph"].as_array().unwrap();
+        let root = graph_entries
+            .iter()
+            .find(|entry| entry["@id"] == "./")
+            .unwrap();
+        let file = graph_entries
+            .iter()
+            .find(|entry| entry["@id"] == "./data/file.txt")
+            .unwrap();
+
+        assert_eq!(root["comment"]["@language"], "fr");
+        assert_eq!(root["comment"]["@value"], "bonjour");
+        assert_eq!(
+            file["measurement"]["@type"],
+            "http://example.org/datatype/custom-int"
+        );
+        assert_eq!(file["measurement"]["@value"], "42");
+    }
+
+    #[test]
+    fn test_full_rocrate_lifecycle_scenario() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:crate-lifecycle");
+        let mgr0 = manager(net.peer(0));
+        mgr0.create_crate(
+            graph.clone(),
+            "Experiment Results",
+            "Data from experiment X",
+            "2025-01-15",
