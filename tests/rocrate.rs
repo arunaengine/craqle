@@ -392,3 +392,101 @@ mod tests {
             "Experiment Results",
             "Data from experiment X",
             "2025-01-15",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        mgr0.add_data_entity(
+            &graph,
+            "data/sample1.fastq",
+            "http://schema.org/MediaObject",
+            "Sample 1",
+            vec![],
+        )
+        .unwrap();
+        mgr0.add_data_entity(
+            &graph,
+            "data/sample2.fastq",
+            "http://schema.org/MediaObject",
+            "Sample 2",
+            vec![],
+        )
+        .unwrap();
+        mgr0.add_data_entity(
+            &graph,
+            "analysis/pipeline.nf",
+            "http://schema.org/MediaObject",
+            "Pipeline",
+            vec![],
+        )
+        .unwrap();
+        mgr0.add_contextual_entity(
+            &graph,
+            "#alice",
+            "http://schema.org/Person",
+            "Alice Example",
+            vec![(
+                oxrdf::NamedNode::new_unchecked("http://schema.org/identifier"),
+                oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    "https://orcid.org/0000-0001-2345-6789",
+                )),
+            )],
+        )
+        .unwrap();
+        net.peer(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                        "http://schema.org/creator",
+                    )),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("#alice")),
+                )],
+            )
+            .unwrap();
+        mgr0.add_contextual_entity(
+            &graph,
+            "#lab",
+            "http://schema.org/Organization",
+            "Example Lab",
+            vec![],
+        )
+        .unwrap();
+        net.peer(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                        "http://schema.org/publisher",
+                    )),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("#lab")),
+                )],
+            )
+            .unwrap();
+        mgr0.add_contextual_entity(
+            &graph,
+            "#grant",
+            "http://schema.org/Grant",
+            "Grant ABC",
+            vec![],
+        )
+        .unwrap();
+        net.peer(0)
+            .insert_quads(
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                        "http://schema.org/funder",
+                    )),
+                    EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("#grant")),
+                )],
+            )
+            .unwrap();
+
+        net.sync_until_converged(10).unwrap();
+
+        let mgr1 = manager(net.peer(1));
+        mgr1.add_data_entity(
+            &graph,
