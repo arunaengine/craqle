@@ -195,3 +195,101 @@ mod tests {
         .unwrap();
 
         node.append_new_root_data_entities(
+            &writer,
+            &graph,
+            benchmark_media_object_entities(
+                0,
+                250,
+                "append-bulk-keyword",
+                "Append Entity",
+                "append record",
+                "APPEND",
+            ),
+        )
+        .unwrap();
+
+        let hits = node.search(&reader, "APPEND-000123", 10).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.graph_id == graph.as_str()
+                && hit.subject_iri == "./bulk/entity-000123.dat")
+        );
+
+        let keyword_hits = node.search(&reader, "append-bulk-keyword", 10).unwrap();
+        assert!(!keyword_hits.is_empty());
+    }
+
+    #[test]
+    fn test_graph_reindex_marker_refreshes_search_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:graph-reindex-search");
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Graph Reindex Dataset",
+                "Graph-level reindex marker test",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+
+        node.append_new_root_data_entities(
+            &writer,
+            &graph,
+            benchmark_media_object_entities(
+                0,
+                25,
+                "graph-reindex-keyword",
+                "Graph Reindex Entity",
+                "graph reindex record",
+                "REINDEX",
+            ),
+        )
+        .unwrap();
+
+        node.reindex_search().unwrap();
+
+        let hits = node.search(&reader, "REINDEX-000010", 10).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.graph_id == graph.as_str()
+                && hit.subject_iri == "./bulk/entity-000010.dat")
+        );
+    }
+
+    #[test]
+    fn test_update_property_rewrites_rocrate() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate1");
+
+        let mgr = manager(net.peer(0));
+        mgr.create_crate(
+            graph.clone(),
+            "Original Name",
+            "Original description",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+
+        mgr.update_property(
+            &graph,
+            "./",
+            "schema:description",
+            Some("Original description"),
+            "Updated description",
+        )
+        .unwrap();
+        net.peer(0)
+            .insert_quads(
+                &graph,
+                vec![
+                    (
+                        EncodedTerm::from_named_node(&vocab::root_entity()),
+                        EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                        literal_term("kw-a"),
