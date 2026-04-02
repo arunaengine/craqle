@@ -464,3 +464,96 @@ mod tests {
         let graph = GraphId::new("urn:test:crate-snapshot");
         net.partition(0, 2);
         net.partition(1, 2);
+
+        let mgr0 = manager(net.peer(0));
+        mgr0.create_crate(
+            graph.clone(),
+            "Snapshot Crate",
+            "Bootstrap scenario",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        for idx in 0..5 {
+            mgr0.add_data_entity(
+                &graph,
+                &format!("data/file-{idx}.txt"),
+                "http://schema.org/MediaObject",
+                &format!("File {idx}"),
+                vec![],
+            )
+            .unwrap();
+        }
+        net.sync_pair(0, 1).unwrap();
+
+        let snapshot = net.snapshot_graph(0, &graph).unwrap();
+        net.load_snapshot(2, &snapshot).unwrap();
+
+        let mgr1 = manager(net.peer(1));
+        mgr1.add_data_entity(
+            &graph,
+            "data/new-after-snapshot.txt",
+            "http://schema.org/MediaObject",
+            "Late File",
+            vec![],
+        )
+        .unwrap();
+        net.sync_pair(0, 1).unwrap();
+
+        net.heal(0, 2);
+        net.heal(1, 2);
+        net.sync_until_converged(20).unwrap();
+
+        let state0 = graph_state(&net, 0, &graph);
+        assert_eq!(state0, graph_state(&net, 1, &graph));
+        assert_eq!(state0, graph_state(&net, 2, &graph));
+    }
+
+    #[derive(Debug, Clone)]
+    enum RandomOp {
+        Add { peer: usize, keyword: u8 },
+        Remove { peer: usize, keyword: u8 },
+        SyncAll,
+    }
+
+    fn random_op_strategy() -> impl Strategy<Value = RandomOp> {
+        prop_oneof![
+            (0usize..3, 0u8..6).prop_map(|(peer, keyword)| RandomOp::Add { peer, keyword }),
+            (0usize..3, 0u8..6).prop_map(|(peer, keyword)| RandomOp::Remove { peer, keyword }),
+            Just(RandomOp::SyncAll),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn prop_crdt_converges_under_random_ops(ops in prop::collection::vec(random_op_strategy(), 1..40)) {
+            let (_tmp, net) = setup_network(3);
+            let graph = GraphId::new("urn:test:crate-proptest");
+            create_test_crate(&net, 0, &graph);
+            net.sync_until_converged(10).unwrap();
+
+            for op in ops {
+                match op {
+                    RandomOp::Add { peer, keyword } => {
+                        keyword_insert(net.peer(peer), &graph, &format!("kw-{keyword}"));
+                    }
+                    RandomOp::Remove { peer, keyword } => {
+                        keyword_delete(net.peer(peer), &graph, &format!("kw-{keyword}"));
+                    }
+                    RandomOp::SyncAll => net.sync_until_converged(20).unwrap(),
+                }
+            }
+
+            net.sync_until_converged(100).unwrap();
+
+            let state0 = graph_state(&net, 0, &graph);
+            let clock0 = net.peer(0).vector_clock(&graph).unwrap();
+            for peer in 1..3 {
+                prop_assert_eq!(state0.clone(), graph_state(&net, peer, &graph));
+                prop_assert_eq!(clock0.clone(), net.peer(peer).vector_clock(&graph).unwrap());
+            }
+        }
+    }
+}
