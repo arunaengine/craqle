@@ -224,3 +224,116 @@ mod tests {
             let hits = node
                 .search(&GrantAuthorizer::default(), "proteomics", 10)
                 .unwrap();
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.subject_iri.contains("proteomics-01.tsv"))
+            );
+        }
+
+        let reopened = CraqleNode::open(tmp.path().join("peer0")).unwrap();
+        let hits = reopened
+            .search(&GrantAuthorizer::default(), "proteomics", 10)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.subject_iri.contains("proteomics-01.tsv"))
+        );
+    }
+
+    #[test]
+    fn test_remote_batch_sync_updates_search_without_reindex() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:remote-batch-search");
+        let writer = writer_auth();
+
+        net.peer(0)
+            .create_crate(
+                &writer,
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "Remote Batch Dataset",
+                    "Receiver should update search directly",
+                    "2025-01-01",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    public_policy(),
+                ),
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        net.peer(0)
+            .append_new_root_data_entities(
+                &writer,
+                &graph,
+                benchmark_media_object_entities(
+                    0,
+                    50,
+                    "remote-batch-keyword",
+                    "Remote Batch Entity",
+                    "remote batch record",
+                    "RBATCH",
+                ),
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        let hits = net
+            .peer(1)
+            .search(&GrantAuthorizer::default(), "RBATCH-000049", 10)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.subject_iri.contains("entity-000049.dat"))
+        );
+    }
+
+    #[test]
+    fn test_snapshot_sync_updates_search_without_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:remote-snapshot-search");
+        let writer = writer_auth();
+
+        let sender = CraqleNode::open(tmp.path().join("sender")).unwrap();
+        let receiver = CraqleNode::open(tmp.path().join("receiver")).unwrap();
+
+        sender
+            .create_crate(
+                &writer,
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "Snapshot Dataset",
+                    "Snapshot receiver should update search directly",
+                    "2025-01-01",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    public_policy(),
+                ),
+            )
+            .unwrap();
+        sender
+            .append_new_root_data_entities(
+                &writer,
+                &graph,
+                benchmark_media_object_entities(
+                    0,
+                    25,
+                    "snapshot-keyword",
+                    "Snapshot Entity",
+                    "snapshot record",
+                    "SNAP",
+                ),
+            )
+            .unwrap();
+
+        let policy = sender.graph_policy(&graph).unwrap();
+        let snapshot = sender.graph_snapshot(&graph).unwrap();
+        receiver.import_graph_snapshot(&snapshot, policy).unwrap();
+
+        let hits = receiver
+            .search(&GrantAuthorizer::default(), "SNAP-000024", 10)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.subject_iri.contains("entity-000024.dat"))
+        );
+    }
+}
