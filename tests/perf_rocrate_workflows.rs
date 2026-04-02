@@ -175,3 +175,180 @@ mod tests {
         let search_start = Instant::now();
         let hits = node
             .search(&reader, &format!("APPEND-{probe:06}"), 10)
+            .unwrap();
+        let search_elapsed = search_start.elapsed();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.subject_iri == format!("./bulk/entity-{probe:06}.dat"))
+        );
+
+        println!(
+            "base+append: {} entities, batch {}, build {}, apply {}, diagnostics read {:?}, first search {:?}",
+            entity_count,
+            batch_size,
+            format_stats("build", &build_latencies),
+            format_stats("apply", &apply_latencies),
+            diagnostics_elapsed,
+            search_elapsed,
+        );
+    }
+
+    fn run_replace_workflow(entity_count: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+        let graph = GraphId::new("urn:perf:workflow:replace");
+        let jsonld = benchmark_rocrate_document(
+            entity_count,
+            "workflow-replace-keyword",
+            "Workflow Replace Dataset",
+        );
+
+        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+            .unwrap();
+
+        let replace_build_start = Instant::now();
+        let updated_jsonld = updated_rocrate_document(&jsonld, entity_count);
+        let replace_build_elapsed = replace_build_start.elapsed();
+
+        let replace_start = Instant::now();
+        node.apply_rocrate_document(&writer, graph.clone(), &updated_jsonld)
+            .unwrap();
+        let replace_elapsed = replace_start.elapsed();
+
+        let search_start = Instant::now();
+        let hits = node
+            .search(&reader, "updated replacement marker", 10)
+            .unwrap();
+        let search_elapsed = search_start.elapsed();
+        assert!(!hits.is_empty());
+
+        println!(
+            "full replace update: {} entities, updated document build {:?}, replace {:?}, first search {:?}",
+            entity_count, replace_build_elapsed, replace_elapsed, search_elapsed,
+        );
+    }
+
+    fn run_incremental_update_workflow(entity_count: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+        let graph = GraphId::new("urn:perf:workflow:incremental-update");
+        let probe = usize::min(entity_count.saturating_sub(1), 123);
+        let jsonld = benchmark_rocrate_document(
+            entity_count,
+            "workflow-incremental-keyword",
+            "Workflow Incremental Dataset",
+        );
+
+        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+            .unwrap();
+
+        let update_start = Instant::now();
+        node.update_property(
+            &writer,
+            &graph,
+            &format!("./bulk/entity-{probe:06}.dat"),
+            "schema:name",
+            Some(&format!("Imported Entity {probe}")),
+            "Incremental Update Marker",
+        )
+        .unwrap();
+        let update_elapsed = update_start.elapsed();
+
+        let search_start = Instant::now();
+        let hits = node
+            .search(&reader, "Incremental Update Marker", 10)
+            .unwrap();
+        let search_elapsed = search_start.elapsed();
+        assert!(!hits.is_empty());
+
+        println!(
+            "incremental update: {} entities, single property update {:?}, first search {:?}",
+            entity_count, update_elapsed, search_elapsed,
+        );
+    }
+
+    fn run_append_like_replace_workflow(entity_count: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+        let graph = GraphId::new("urn:perf:workflow:append-like-replace");
+        let extra_count = usize::min(10_000, usize::max(1_000, entity_count / 10));
+        let jsonld = benchmark_rocrate_document(
+            entity_count,
+            "workflow-append-like-keyword",
+            "Workflow Append-Like Dataset",
+        );
+
+        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+            .unwrap();
+
+        let replace_build_start = Instant::now();
+        let updated_jsonld =
+            append_entities_to_rocrate_document(&jsonld, entity_count, extra_count);
+        let replace_build_elapsed = replace_build_start.elapsed();
+
+        let replace_start = Instant::now();
+        node.apply_rocrate_document(&writer, graph.clone(), &updated_jsonld)
+            .unwrap();
+        let replace_elapsed = replace_start.elapsed();
+
+        let probe = entity_count + extra_count - 1;
+        let search_start = Instant::now();
+        let hits = node
+            .search(&reader, &format!("DOC-{probe:06}"), 10)
+            .unwrap();
+        let search_elapsed = search_start.elapsed();
+        assert!(!hits.is_empty());
+
+        println!(
+            "append-like replace: base {} entities, +{} entities, document build {:?}, replace {:?}, first search {:?}",
+            entity_count, extra_count, replace_build_elapsed, replace_elapsed, search_elapsed,
+        );
+    }
+
+    fn updated_rocrate_document(jsonld: &str, entity_count: usize) -> String {
+        let probe = usize::min(entity_count.saturating_sub(1), 123);
+        let mut value: serde_json::Value = serde_json::from_str(jsonld).unwrap();
+        let graph = value["@graph"].as_array_mut().unwrap();
+        for entry in graph {
+            if entry["@id"] == "./" {
+                entry["description"] =
+                    serde_json::Value::String("updated replacement marker".to_string());
+            }
+            if entry["@id"] == format!("./bulk/entity-{probe:06}.dat") {
+                entry["name"] = serde_json::Value::String("Updated Replacement Entity".to_string());
+            }
+        }
+        value.to_string()
+    }
+
+    fn append_entities_to_rocrate_document(jsonld: &str, start: usize, count: usize) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(jsonld).unwrap();
+        let graph = value["@graph"].as_array_mut().unwrap();
+        let root_index = graph.iter().position(|entry| entry["@id"] == "./").unwrap();
+
+        for idx in start..(start + count) {
+            graph[root_index]["hasPart"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "@id": format!("./bulk/entity-{idx:06}.dat")
+                }));
+            graph.push(serde_json::json!({
+                "@id": format!("./bulk/entity-{idx:06}.dat"),
+                "@type": "MediaObject",
+                "name": format!("Imported Entity {idx}"),
+                "description": format!("workflow-append-like-keyword imported record {idx}"),
+                "keywords": "workflow-append-like-keyword",
+                "identifier": format!("DOC-{idx:06}"),
+            }));
+        }
+
+        value.to_string()
+    }
+}
