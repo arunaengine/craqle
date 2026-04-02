@@ -138,3 +138,143 @@ impl<'a> TestRoCrateApi<'a> {
         )
     }
 
+    pub fn export_jsonld(&self, graph: &GraphId) -> craqle::Result<String> {
+        self.node.export_rocrate(&GrantAuthorizer::default(), graph)
+    }
+
+    pub fn export_jsonld_summary(&self, graph: &GraphId) -> craqle::Result<String> {
+        self.node
+            .export_rocrate_summary(&GrantAuthorizer::default(), graph)
+    }
+
+    pub fn export_jsonld_page(
+        &self,
+        graph: &GraphId,
+        offset: usize,
+        limit: usize,
+    ) -> craqle::Result<RoCratePage> {
+        self.node
+            .export_rocrate_page(&GrantAuthorizer::default(), graph, offset, limit)
+    }
+
+    pub fn export_jsonld_page_after(
+        &self,
+        graph: &GraphId,
+        after_entity_id: Option<&str>,
+        limit: usize,
+    ) -> craqle::Result<RoCratePage> {
+        self.node.export_rocrate_page_after(
+            &GrantAuthorizer::default(),
+            graph,
+            after_entity_id,
+            limit,
+        )
+    }
+
+    pub fn import_jsonld(&self, graph: GraphId, jsonld: &str) -> craqle::Result<Batch> {
+        self.node
+            .apply_rocrate_document_with_policy(&self.writer, graph, jsonld, public_policy())
+    }
+
+    pub fn import_jsonld_checked(&self, graph: GraphId, jsonld: &str) -> craqle::Result<Batch> {
+        self.node.apply_rocrate_document_checked_with_policy(
+            &self.writer,
+            graph,
+            jsonld,
+            public_policy(),
+        )
+    }
+
+    pub fn bootstrap_jsonld_trusted(&self, graph: GraphId, jsonld: &str) -> craqle::Result<Batch> {
+        self.node
+            .bootstrap_rocrate_document(&self.writer, graph, jsonld, public_policy())
+    }
+}
+
+pub fn binding_literal(term: &EncodedTerm) -> String {
+    match term.to_term() {
+        Some(oxrdf::Term::Literal(literal)) => literal.value().to_string(),
+        Some(other) => panic!("expected literal binding, got {other}"),
+        None => panic!("failed to decode binding {}", term.0),
+    }
+}
+
+pub fn binding_i64(term: &EncodedTerm) -> i64 {
+    binding_literal(term).parse::<i64>().unwrap()
+}
+
+pub fn solution_rows(results: QueryResults) -> Vec<std::collections::HashMap<String, EncodedTerm>> {
+    match results {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solution bindings, got {other:?}"),
+    }
+}
+
+pub fn graph_state(
+    net: &sim::CraqleCluster,
+    peer: usize,
+    graph: &GraphId,
+) -> BTreeSet<(String, String, String)> {
+    net.peer(peer)
+        .graph_snapshot(graph)
+        .unwrap()
+        .quads
+        .into_iter()
+        .map(|quad| (quad.subject.0, quad.predicate.0, quad.object.0))
+        .collect()
+}
+
+pub fn graph_contains(
+    net: &sim::CraqleCluster,
+    peer: usize,
+    graph: &GraphId,
+    subject: &str,
+) -> bool {
+    graph_state(net, peer, graph)
+        .iter()
+        .any(|(s, _, _)| s.contains(subject))
+}
+
+pub fn violation_messages(net: &sim::CraqleCluster, peer: usize, graph: &GraphId) -> Vec<String> {
+    net.peer(peer)
+        .graph_violations(graph)
+        .unwrap()
+        .into_iter()
+        .map(|violation| violation.to_string())
+        .collect()
+}
+
+pub fn keyword_insert(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
+    peer.insert_quads(
+        graph,
+        vec![(
+            EncodedTerm::from_named_node(&vocab::root_entity()),
+            EncodedTerm::from_named_node(&vocab::schema_keywords()),
+            literal_term(keyword),
+        )],
+    )
+    .unwrap();
+}
+
+pub fn keyword_delete(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
+    peer.apply_changes(
+        graph,
+        vec![MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: EncodedTerm::from_named_node(&vocab::root_entity()),
+            predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+            object: literal_term(keyword),
+        }],
+    )
+    .unwrap();
+}
+
+pub fn reindex_and_search(net: &sim::CraqleCluster, peer: usize, query: &str) -> Vec<String> {
+    net.reindex_search().unwrap();
+    net.peer(peer)
+        .search(&GrantAuthorizer::default(), query, 10)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.subject_iri)
+        .collect()
+}
