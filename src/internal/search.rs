@@ -1,13 +1,13 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, Value,
+    Field, IndexRecordOption, Schema, SchemaBuilder, Value, STORED, STRING, TEXT,
 };
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
@@ -312,7 +312,7 @@ impl SearchIndex {
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
         let parsed = query_parser.parse_query(query)?;
 
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -340,7 +340,7 @@ impl SearchIndex {
             (Occur::Must, Box::new(graph_filter)),
         ]);
 
-        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
