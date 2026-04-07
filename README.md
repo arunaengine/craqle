@@ -4,7 +4,7 @@ Craqle is an experimental Rust library for storing, validating, querying, search
 
 The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Replication uses OR-Set CRDT semantics over RDF quad changes, with vector clocks for causality. Invalid visible RO-Crates are not exported.
 
-This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. There is no built-in production server or transport yet, search is intentionally minimal, and the replication layer is still low-level. The workspace currently depends on a local `ro-crate-rs` path dependency with the `rdf` feature enabled.
+This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. There is no built-in production server or transport yet, search is intentionally minimal, and the replication layer is still low-level. The workspace currently depends on the `arunaengine/ro-crate-rs` fork on branch `feat/rdfperformance` with the `rdf` feature enabled.
 
 - create and update RO-Crates as named RDF graphs
 - import and export RO-Crate JSON-LD
@@ -86,7 +86,7 @@ let batch = node.apply_rocrate_document(&writer, graph.clone(), updated_jsonld)?
 - There is no built-in production server or network transport.
 - Search is intentionally minimal even though it uses Tantivy; for richer results you still hydrate metadata from RDF.
 - The replication layer is low-level and not a finished sync product.
-- The workspace currently depends on a local `ro-crate-rs` path dependency with the `rdf` feature enabled.
+- The workspace currently depends on the `arunaengine/ro-crate-rs` fork on branch `feat/rdfperformance` with the `rdf` feature enabled.
 
 There is also a small demo in `examples/demo.rs`:
 
