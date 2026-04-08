@@ -36,6 +36,7 @@ mod tests {
 
         let build_start = Instant::now();
         let jsonld = benchmark_rocrate_document(
+            &graph,
             entity_count,
             "workflow-import-keyword",
             "Workflow Import Dataset",
@@ -200,6 +201,7 @@ mod tests {
         let reader = GrantAuthorizer::default();
         let graph = GraphId::new("urn:perf:workflow:replace");
         let jsonld = benchmark_rocrate_document(
+            &graph,
             entity_count,
             "workflow-replace-keyword",
             "Workflow Replace Dataset",
@@ -209,7 +211,7 @@ mod tests {
             .unwrap();
 
         let replace_build_start = Instant::now();
-        let updated_jsonld = updated_rocrate_document(&jsonld, entity_count);
+        let updated_jsonld = updated_rocrate_document(&jsonld, graph.as_str(), entity_count);
         let replace_build_elapsed = replace_build_start.elapsed();
 
         let replace_start = Instant::now();
@@ -238,6 +240,7 @@ mod tests {
         let graph = GraphId::new("urn:perf:workflow:incremental-update");
         let probe = usize::min(entity_count.saturating_sub(1), 123);
         let jsonld = benchmark_rocrate_document(
+            &graph,
             entity_count,
             "workflow-incremental-keyword",
             "Workflow Incremental Dataset",
@@ -279,6 +282,7 @@ mod tests {
         let graph = GraphId::new("urn:perf:workflow:append-like-replace");
         let extra_count = usize::min(10_000, usize::max(1_000, entity_count / 10));
         let jsonld = benchmark_rocrate_document(
+            &graph,
             entity_count,
             "workflow-append-like-keyword",
             "Workflow Append-Like Dataset",
@@ -289,7 +293,7 @@ mod tests {
 
         let replace_build_start = Instant::now();
         let updated_jsonld =
-            append_entities_to_rocrate_document(&jsonld, entity_count, extra_count);
+            append_entities_to_rocrate_document(&jsonld, graph.as_str(), entity_count, extra_count);
         let replace_build_elapsed = replace_build_start.elapsed();
 
         let replace_start = Instant::now();
@@ -311,12 +315,12 @@ mod tests {
         );
     }
 
-    fn updated_rocrate_document(jsonld: &str, entity_count: usize) -> String {
+    fn updated_rocrate_document(jsonld: &str, root_id: &str, entity_count: usize) -> String {
         let probe = usize::min(entity_count.saturating_sub(1), 123);
         let mut value: serde_json::Value = serde_json::from_str(jsonld).unwrap();
         let graph = value["@graph"].as_array_mut().unwrap();
         for entry in graph {
-            if entry["@id"] == "./" {
+            if entry["@id"] == root_id {
                 entry["description"] =
                     serde_json::Value::String("updated replacement marker".to_string());
             }
@@ -327,10 +331,18 @@ mod tests {
         value.to_string()
     }
 
-    fn append_entities_to_rocrate_document(jsonld: &str, start: usize, count: usize) -> String {
+    fn append_entities_to_rocrate_document(
+        jsonld: &str,
+        root_id: &str,
+        start: usize,
+        count: usize,
+    ) -> String {
         let mut value: serde_json::Value = serde_json::from_str(jsonld).unwrap();
         let graph = value["@graph"].as_array_mut().unwrap();
-        let root_index = graph.iter().position(|entry| entry["@id"] == "./").unwrap();
+        let root_index = graph
+            .iter()
+            .position(|entry| entry["@id"] == root_id)
+            .unwrap();
 
         for idx in start..(start + count) {
             graph[root_index]["hasPart"]

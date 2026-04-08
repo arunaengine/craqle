@@ -248,7 +248,7 @@ pub fn keyword_insert(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
     peer.insert_quads(
         graph,
         vec![(
-            EncodedTerm::from_named_node(&vocab::root_entity()),
+            EncodedTerm::from_named_node(&graph.0),
             EncodedTerm::from_named_node(&vocab::schema_keywords()),
             literal_term(keyword),
         )],
@@ -261,7 +261,7 @@ pub fn keyword_delete(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
         graph,
         vec![MaterializedQuadChange::Delete {
             graph: graph.clone(),
-            subject: EncodedTerm::from_named_node(&vocab::root_entity()),
+            subject: EncodedTerm::from_named_node(&graph.0),
             predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
             object: literal_term(keyword),
         }],

@@ -203,12 +203,18 @@ mod tests {
         .unwrap();
         net.sync_until_converged(10).unwrap();
 
-        mgr0.update_property(&graph, "./", "schema:name", None, "Updated Dataset v2")
-            .unwrap();
+        mgr0.update_property(
+            &graph,
+            graph.as_str(),
+            "schema:name",
+            None,
+            "Updated Dataset v2",
+        )
+        .unwrap();
         let mgr1 = manager(net.peer(1));
         mgr1.update_property(
             &graph,
-            "./",
+            graph.as_str(),
             "schema:description",
             None,
             "Improved description with more detail",
@@ -323,7 +329,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&vocab::schema_keywords()),
                     literal_term("kw-one"),
                 )],
@@ -333,7 +339,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&vocab::schema_keywords()),
                     literal_term("kw-two"),
                 )],
@@ -365,7 +371,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&vocab::schema_keywords()),
                     literal_term("duplicate-keyword"),
                 )],
@@ -438,7 +444,7 @@ mod tests {
         .unwrap();
         mgr2.update_property(
             &graph,
-            "./",
+            graph.as_str(),
             "schema:description",
             None,
             "Updated by isolated peer",

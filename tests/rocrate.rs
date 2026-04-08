@@ -67,7 +67,8 @@ mod tests {
         let writer = writer_auth();
         let reader = GrantAuthorizer::default();
 
-        let jsonld = benchmark_rocrate_document(250, "import-bulk-keyword", "Imported Dataset");
+        let jsonld =
+            benchmark_rocrate_document(&graph, 250, "import-bulk-keyword", "Imported Dataset");
         node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
 
@@ -89,7 +90,8 @@ mod tests {
         let writer = writer_auth();
         let reader = GrantAuthorizer::default();
 
-        let jsonld = benchmark_rocrate_document(250, "trusted-bulk-keyword", "Trusted Dataset");
+        let jsonld =
+            benchmark_rocrate_document(&graph, 250, "trusted-bulk-keyword", "Trusted Dataset");
         node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
 
@@ -117,7 +119,7 @@ mod tests {
                     "@id": "ro-crate-metadata.json",
                     "@type": "CreativeWork",
                     "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                    "about": { "@id": "./" }
+                    "about": { "@id": graph.as_str() }
                 },
                 {
                     "@id": "./data/file.txt",
@@ -162,7 +164,8 @@ mod tests {
         )
         .unwrap();
 
-        let jsonld = benchmark_rocrate_document(5, "trusted-existing-keyword", "Trusted Existing");
+        let jsonld =
+            benchmark_rocrate_document(&graph, 5, "trusted-existing-keyword", "Trusted Existing");
         let err = node
             .bootstrap_rocrate_document(&writer, graph, &jsonld, public_policy())
             .unwrap_err();
@@ -279,7 +282,7 @@ mod tests {
 
         mgr.update_property(
             &graph,
-            "./",
+            graph.as_str(),
             "schema:description",
             Some("Original description"),
             "Updated description",
@@ -290,12 +293,12 @@ mod tests {
                 &graph,
                 vec![
                     (
-                        EncodedTerm::from_named_node(&vocab::root_entity()),
+                        EncodedTerm::from_named_node(&graph.0),
                         EncodedTerm::from_named_node(&vocab::schema_keywords()),
                         literal_term("kw-a"),
                     ),
                     (
-                        EncodedTerm::from_named_node(&vocab::root_entity()),
+                        EncodedTerm::from_named_node(&graph.0),
                         EncodedTerm::from_named_node(&vocab::schema_keywords()),
                         literal_term("kw-b"),
                     ),
@@ -304,7 +307,7 @@ mod tests {
             .unwrap();
         mgr.update_property(
             &graph,
-            "./",
+            graph.as_str(),
             "schema:keywords",
             Some("kw-a"),
             "kw-a-updated",
@@ -332,10 +335,10 @@ mod tests {
                     "@id": "ro-crate-metadata.json",
                     "@type": "CreativeWork",
                     "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                    "about": { "@id": "./" }
+                    "about": { "@id": graph.as_str() }
                 },
                 {
-                    "@id": "./",
+                    "@id": graph.as_str(),
                     "@type": "Dataset",
                     "name": "Typed Demo",
                     "description": "Checks typed literal fidelity",
@@ -366,7 +369,7 @@ mod tests {
         let graph_entries = exported_json["@graph"].as_array().unwrap();
         let root = graph_entries
             .iter()
-            .find(|entry| entry["@id"] == "./")
+            .find(|entry| entry["@id"] == graph.as_str())
             .unwrap();
         let file = graph_entries
             .iter()
@@ -436,7 +439,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
                         "http://schema.org/creator",
                     )),
@@ -456,7 +459,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
                         "http://schema.org/publisher",
                     )),
@@ -476,7 +479,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
                         "http://schema.org/funder",
                     )),
@@ -498,7 +501,7 @@ mod tests {
         .unwrap();
         mgr1.update_property(
             &graph,
-            "./",
+            graph.as_str(),
             "schema:description",
             None,
             "Data from experiment X with updated notes",
@@ -507,7 +510,7 @@ mod tests {
 
         mgr0.add_data_entity_under(
             &graph,
-            "./",
+            graph.as_str(),
             "results/figures/",
             "http://schema.org/Dataset",
             "Figures Directory",
@@ -535,7 +538,11 @@ mod tests {
 
         let experiment_hits = reindex_and_search(&net, 0, "experiment");
         let report_hits = reindex_and_search(&net, 1, "report");
-        assert!(experiment_hits.iter().any(|subject| subject == "./"));
+        assert!(
+            experiment_hits
+                .iter()
+                .any(|subject| subject == graph.as_str())
+        );
         assert!(
             report_hits
                 .iter()
@@ -606,7 +613,7 @@ mod tests {
             .insert_quads(
                 &graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
                         "http://schema.org/creator",
                     )),

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use craqle::{
     AppendDataEntitiesReport, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
-    NewDataEntity, PermissionGrant, PermissionLevel, vocab,
+    NewDataEntity, PermissionGrant, PermissionLevel,
 };
 use oxrdf::{NamedNode, Term};
 
@@ -92,16 +92,17 @@ pub fn benchmark_media_object_entities(
 }
 
 pub fn benchmark_rocrate_document(
+    graph: &GraphId,
     entity_count: usize,
     keyword: &str,
     dataset_name: &str,
 ) -> String {
-    let mut graph = Vec::with_capacity(entity_count + 2);
-    graph.push(serde_json::json!({
+    let mut entries = Vec::with_capacity(entity_count + 2);
+    entries.push(serde_json::json!({
         "@id": "ro-crate-metadata.json",
         "@type": "CreativeWork",
         "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-        "about": { "@id": "./" }
+        "about": { "@id": graph.as_str() }
     }));
 
     let has_part = (0..entity_count)
@@ -112,8 +113,8 @@ pub fn benchmark_rocrate_document(
         })
         .collect::<Vec<_>>();
 
-    graph.push(serde_json::json!({
-        "@id": "./",
+    entries.push(serde_json::json!({
+        "@id": graph.as_str(),
         "@type": "Dataset",
         "name": dataset_name,
         "description": format!("{dataset_name} benchmark import"),
@@ -124,7 +125,7 @@ pub fn benchmark_rocrate_document(
     }));
 
     for idx in 0..entity_count {
-        graph.push(serde_json::json!({
+        entries.push(serde_json::json!({
             "@id": format!("./bulk/entity-{idx:06}.dat"),
             "@type": "MediaObject",
             "name": format!("Imported Entity {idx}"),
@@ -136,7 +137,7 @@ pub fn benchmark_rocrate_document(
 
     serde_json::json!({
         "@context": "https://w3id.org/ro/crate/1.2/context",
-        "@graph": graph,
+        "@graph": entries,
     })
     .to_string()
 }
@@ -203,7 +204,7 @@ pub fn attach_contextual_entities(
             node.insert_quads(
                 graph,
                 vec![(
-                    EncodedTerm::from_named_node(&vocab::root_entity()),
+                    EncodedTerm::from_named_node(&graph.0),
                     EncodedTerm::from_named_node(&NamedNode::new_unchecked(predicate)),
                     EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)),
                 )],

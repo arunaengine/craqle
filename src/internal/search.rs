@@ -1,13 +1,13 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, SchemaBuilder, Value, STORED, STRING, TEXT,
+    Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, Value,
 };
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
@@ -804,8 +804,16 @@ mod tests {
     fn test_same_subject_in_multiple_graphs_do_not_collide() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
-        idx.index_resource("http://example.org/graph1", "./", Some("Graph One Root"))?;
-        idx.index_resource("http://example.org/graph2", "./", Some("Graph Two Root"))?;
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/graph1",
+            Some("Graph One Root"),
+        )?;
+        idx.index_resource(
+            "http://example.org/graph2",
+            "http://example.org/graph2",
+            Some("Graph Two Root"),
+        )?;
         idx.commit()?;
 
         let graph1_hits = idx.search_in_graph("http://example.org/graph1", "graph", 10)?;

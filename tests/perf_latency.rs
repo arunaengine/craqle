@@ -238,7 +238,7 @@ mod tests {
             .update_property(
                 &writer_auth(),
                 target_graph,
-                "./",
+                target_graph.as_str(),
                 "schema:description",
                 None,
                 "Release latency profile with updated description",
@@ -255,7 +255,7 @@ mod tests {
             .update_property(
                 &writer_auth(),
                 target_graph,
-                "./",
+                target_graph.as_str(),
                 "http://schema.org/keywords",
                 Some("common-keyword"),
                 "common-keyword-updated",

@@ -215,11 +215,12 @@ fn search_filters_private_graphs_by_policy() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();
+    let public_graph = GraphId::new("urn:test:public-search");
 
     node.create_crate(
         &writer,
         CreateCrateRequest::new(
-            GraphId::new("urn:test:public-search"),
+            public_graph.clone(),
             "Public Proteomics",
             "Visible search document",
             "2025-01-01",
@@ -251,7 +252,7 @@ fn search_filters_private_graphs_by_policy() {
         .search(&GrantAuthorizer::default(), "proteomics", 10)
         .unwrap();
     assert_eq!(anonymous_hits.len(), 1);
-    assert_eq!(anonymous_hits[0].subject_iri, "./");
+    assert_eq!(anonymous_hits[0].subject_iri, public_graph.as_str());
 
     let writer_hits = node.search(&writer, "proteomics", 10).unwrap();
     assert_eq!(writer_hits.len(), 2);
@@ -543,34 +544,38 @@ fn import_jsonld_rejects_inline_nested_objects() {
     )
     .unwrap();
 
-    let invalid = r#"
-    {
+    let invalid = format!(
+        r#"
+    {{
       "@context": "https://w3id.org/ro/crate/1.2/context",
       "@graph": [
-        {
+        {{
           "@id": "ro-crate-metadata.json",
           "@type": "CreativeWork",
-          "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
-          "about": {"@id": "./"}
-        },
-        {
-          "@id": "./",
+          "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+          "about": {{"@id": "{}"}}
+        }},
+        {{
+          "@id": "{}",
           "@type": "Dataset",
           "name": "Inline Object Test",
           "description": "Should be rejected",
           "datePublished": "2025-01-01",
-          "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
-          "creator": {
+          "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}},
+          "creator": {{
             "@type": "Person",
             "name": "Nested Person"
-          }
-        }
+          }}
+        }}
       ]
-    }
-    "#;
+    }}
+    "#,
+        graph.as_str(),
+        graph.as_str()
+    );
 
     let err = node
-        .apply_rocrate_document(&writer, graph, invalid)
+        .apply_rocrate_document(&writer, graph, &invalid)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -602,7 +607,7 @@ fn update_property_rejects_unknown_compact_property_names() {
     .unwrap();
 
     let err = node
-        .update_property(&writer, &graph, "./", "foo:bar", None, "value")
+        .update_property(&writer, &graph, graph.as_str(), "foo:bar", None, "value")
         .unwrap_err();
 
     assert!(matches!(
@@ -667,30 +672,34 @@ fn preview_rocrate_update_returns_canonical_changes() {
     )
     .unwrap();
 
-    let updated = r#"
-    {
+    let updated = format!(
+        r#"
+    {{
       "@context": "https://w3id.org/ro/crate/1.2/context",
       "@graph": [
-        {
+        {{
           "@id": "ro-crate-metadata.json",
           "@type": "CreativeWork",
-          "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
-          "about": {"@id": "./"}
-        },
-        {
-          "@id": "./",
+          "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+          "about": {{"@id": "{}"}}
+        }},
+        {{
+          "@id": "{}",
           "@type": "Dataset",
           "name": "Preview Dataset",
           "description": "Updated description",
           "datePublished": "2025-01-01",
-          "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
-        }
+          "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+        }}
       ]
-    }
-    "#;
+    }}
+    "#,
+        graph.as_str(),
+        graph.as_str()
+    );
 
     let changes = node
-        .preview_rocrate_update(&writer, &graph, updated)
+        .preview_rocrate_update(&writer, &graph, &updated)
         .unwrap();
     assert!(changes.iter().any(|change| {
         matches!(
