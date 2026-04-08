@@ -26,6 +26,7 @@ mod sparql;
 mod store;
 
 mod auth;
+mod transport;
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -46,7 +47,6 @@ pub use crate::core::{
     ActorId, Batch, CrateViolation, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy,
     MaterializedQuadChange, PredicateFilter, VectorClock, vocab,
 };
-#[doc(hidden)]
 pub use crate::core::{
     CompactSnapshotQuadState, Dot, GraphReplicaCompactSnapshot, GraphReplicaSnapshot, QuadOp,
     SnapshotQuadState,
@@ -55,6 +55,7 @@ pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
 pub use crate::search::SearchHit;
 pub use crate::sparql::QueryResults;
+pub use crate::transport::SyncMessage;
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
@@ -669,6 +670,11 @@ impl CraqleNode {
         Ok(self.sparql.query_with_graphs(sparql, &visible)?)
     }
 
+    /// Execute a SPARQL query against an explicit set of local graphs.
+    pub fn query_graphs(&self, graphs: &[GraphId], sparql: &str) -> Result<QueryResults> {
+        Ok(self.sparql.query_with_graphs(sparql, graphs)?)
+    }
+
     /// Search visible resources in the local search index.
     pub fn search(
         &self,
@@ -833,6 +839,20 @@ impl CraqleNode {
 
     pub fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
         Ok(self.store.contains_graph(graph)?)
+    }
+
+    pub fn delete_graph(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<()> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        self.delete_graph_unchecked(graph)
+    }
+
+    pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
+        self.store.delete_graph(graph)?;
+        self.search.replace_graph_documents(
+            graph.as_str(),
+            std::iter::empty::<(String, Option<String>)>(),
+        )?;
+        Ok(())
     }
 
     pub fn vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {

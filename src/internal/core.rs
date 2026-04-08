@@ -32,19 +32,30 @@ impl From<&str> for GraphId {
     }
 }
 
-/// Unique, stable identifier for a simulated peer.
+/// Unique, stable identifier for a replica actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ActorId(pub Uuid);
+pub struct ActorId(pub [u8; 32]);
 
 impl ActorId {
     pub fn random() -> Self {
-        Self(Uuid::new_v4())
+        Self(*blake3::hash(Uuid::new_v4().as_bytes()).as_bytes())
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
 impl std::fmt::Display for ActorId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -439,9 +450,6 @@ pub mod vocab {
         NamedNode::new_unchecked("http://schema.org/identifier")
     }
 
-    pub fn root_entity() -> NamedNode {
-        NamedNode::new_unchecked("./")
-    }
     pub fn metadata_descriptor() -> NamedNode {
         NamedNode::new_unchecked("ro-crate-metadata.json")
     }
