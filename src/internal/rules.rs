@@ -5,6 +5,7 @@ use crate::store::GraphStore;
 
 /// A snapshot view of a graph for validation.
 pub struct GraphSnapshot {
+    pub graph: GraphId,
     /// All quads in the graph, as (subject, predicate, object) encoded terms.
     pub triples: Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>,
 }
@@ -17,6 +18,7 @@ impl GraphSnapshot {
             Some(id) => id,
             None => {
                 return Ok(Self {
+                    graph: graph.clone(),
                     triples: Vec::new(),
                 });
             }
@@ -30,7 +32,14 @@ impl GraphSnapshot {
             triples.push((s, p, o));
             Ok(())
         })?;
-        Ok(Self { triples })
+        Ok(Self {
+            graph: graph.clone(),
+            triples,
+        })
+    }
+
+    fn root(&self) -> EncodedTerm {
+        graph_root(&self.graph)
     }
 }
 
@@ -98,9 +107,9 @@ struct ReachabilityTerms {
 }
 
 impl ReachabilityTerms {
-    fn new() -> Self {
+    fn new(graph: &GraphId) -> Self {
         Self {
-            root: encoded_nn(&vocab::root_entity()),
+            root: graph_root(graph),
             rdf_type: encoded_nn(&vocab::rdf_type()),
             has_part: encoded_nn(&vocab::schema_has_part()),
             dataset: encoded_nn(&vocab::schema_dataset()),
@@ -139,6 +148,10 @@ fn encoded_nn(nn: &oxrdf::NamedNode) -> EncodedTerm {
     EncodedTerm::from_named_node(nn)
 }
 
+fn graph_root(graph: &GraphId) -> EncodedTerm {
+    EncodedTerm::from_named_node(&graph.0)
+}
+
 /// Apply delta to a snapshot to produce the post-state.
 pub fn apply_delta(snapshot: &GraphSnapshot, delta: &[MaterializedQuadChange]) -> GraphSnapshot {
     let mut triple_set: HashSet<(EncodedTerm, EncodedTerm, EncodedTerm)> =
@@ -166,6 +179,7 @@ pub fn apply_delta(snapshot: &GraphSnapshot, delta: &[MaterializedQuadChange]) -
     }
 
     GraphSnapshot {
+        graph: snapshot.graph.clone(),
         triples: triple_set.into_iter().collect(),
     }
 }
@@ -193,7 +207,7 @@ fn has_triple(
 }
 
 pub fn orphaned_data_entities(snapshot: &GraphSnapshot) -> BTreeSet<EncodedTerm> {
-    let root = encoded_nn(&vocab::root_entity());
+    let root = snapshot.root();
     let rdf_type = encoded_nn(&vocab::rdf_type());
     let has_part = encoded_nn(&vocab::schema_has_part());
     let media_object = encoded_nn(&vocab::schema_media_object());
@@ -265,7 +279,7 @@ impl Rule for RootEntityRule {
         graph: &GraphId,
         delta: &[MaterializedQuadChange],
     ) -> crate::store::Result<CandidateCheck> {
-        let root = encoded_nn(&vocab::root_entity());
+        let root = graph_root(graph);
         let rdf_type = encoded_nn(&vocab::rdf_type());
         let dataset = encoded_nn(&vocab::schema_dataset());
 
@@ -279,7 +293,7 @@ impl Rule for RootEntityRule {
     }
 
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
-        let root = encoded_nn(&vocab::root_entity());
+        let root = post.root();
         let rdf_type = encoded_nn(&vocab::rdf_type());
         let dataset = encoded_nn(&vocab::schema_dataset());
 
@@ -316,7 +330,7 @@ impl Rule for MetadataDescriptorRule {
         let rdf_type = encoded_nn(&vocab::rdf_type());
         let creative_work = encoded_nn(&vocab::schema_creative_work());
         let about = encoded_nn(&vocab::schema_about());
-        let root = encoded_nn(&vocab::root_entity());
+        let root = graph_root(graph);
 
         let has_type =
             triple_exists_after(store, graph, &descriptor, &rdf_type, &creative_work, delta)?;
@@ -334,7 +348,7 @@ impl Rule for MetadataDescriptorRule {
         let rdf_type = encoded_nn(&vocab::rdf_type());
         let creative_work = encoded_nn(&vocab::schema_creative_work());
         let about = encoded_nn(&vocab::schema_about());
-        let root = encoded_nn(&vocab::root_entity());
+        let root = post.root();
 
         let has_type = has_triple(post, &descriptor, &rdf_type, &creative_work);
         let has_about = has_triple(post, &descriptor, &about, &root);
@@ -360,7 +374,7 @@ impl Rule for RequiredRootPropertiesRule {
             return Ok(CandidateCheck::Pass);
         }
 
-        let root = encoded_nn(&vocab::root_entity());
+        let root = graph_root(graph);
         let required: &[(oxrdf::NamedNode, &str)] = &[
             (vocab::schema_name(), "schema:name"),
             (vocab::schema_description(), "schema:description"),
@@ -379,7 +393,7 @@ impl Rule for RequiredRootPropertiesRule {
             if count_sp_after(store, graph, &root, &pred, delta)? < 1 {
                 return Ok(CandidateCheck::Violation(
                     CrateViolation::MissingRequiredProperty {
-                        entity: "./".to_string(),
+                        entity: graph.as_str().to_string(),
                         property: label.to_string(),
                     },
                 ));
@@ -395,7 +409,7 @@ impl Rule for RequiredRootPropertiesRule {
         graph: &GraphId,
         delta: &[MaterializedQuadChange],
     ) -> crate::store::Result<CandidateCheck> {
-        let root = encoded_nn(&vocab::root_entity());
+        let root = graph_root(graph);
         let required: &[(oxrdf::NamedNode, &str)] = &[
             (vocab::schema_name(), "schema:name"),
             (vocab::schema_description(), "schema:description"),
@@ -408,7 +422,7 @@ impl Rule for RequiredRootPropertiesRule {
             if count_sp_after(store, graph, &root, &pred, delta)? < 1 {
                 return Ok(CandidateCheck::Violation(
                     CrateViolation::MissingRequiredProperty {
-                        entity: "./".to_string(),
+                        entity: graph.as_str().to_string(),
                         property: label.to_string(),
                     },
                 ));
@@ -419,7 +433,7 @@ impl Rule for RequiredRootPropertiesRule {
     }
 
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
-        let root = encoded_nn(&vocab::root_entity());
+        let root = post.root();
 
         let required: &[(oxrdf::NamedNode, &str)] = &[
             (vocab::schema_name(), "schema:name"),
@@ -432,7 +446,7 @@ impl Rule for RequiredRootPropertiesRule {
             let pred = encoded_nn(nn);
             if count_sp(post, &root, &pred) < 1 {
                 return Err(CrateViolation::MissingRequiredProperty {
-                    entity: "./".to_string(),
+                    entity: post.graph.as_str().to_string(),
                     property: label.to_string(),
                 });
             }
@@ -463,7 +477,7 @@ impl Rule for DatePublishedCardinalityRule {
         graph: &GraphId,
         delta: &[MaterializedQuadChange],
     ) -> crate::store::Result<CandidateCheck> {
-        let root = encoded_nn(&vocab::root_entity());
+        let root = graph_root(graph);
         let date_pub = encoded_nn(&vocab::schema_date_published());
         let count = count_sp_after(store, graph, &root, &date_pub, delta)?;
 
@@ -475,7 +489,7 @@ impl Rule for DatePublishedCardinalityRule {
     }
 
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
-        let root = encoded_nn(&vocab::root_entity());
+        let root = post.root();
         let date_pub = encoded_nn(&vocab::schema_date_published());
         let count = count_sp(post, &root, &date_pub);
 
@@ -722,7 +736,7 @@ fn first_orphan_after(
     graph: &GraphId,
     delta: &[MaterializedQuadChange],
 ) -> crate::store::Result<Option<EncodedTerm>> {
-    let terms = ReachabilityTerms::new();
+    let terms = ReachabilityTerms::new(graph);
 
     let reachable = reachable_entities_after(store, graph, delta, &terms.root, &terms.has_part)?;
     for entity in impacted_reachability_entities(delta, graph, &terms.rdf_type, &terms.has_part)? {
@@ -745,7 +759,7 @@ fn first_orphan_after_localized(
     delta: &[MaterializedQuadChange],
     summary: &DeltaSummary,
 ) -> crate::store::Result<Option<EncodedTerm>> {
-    let terms = ReachabilityTerms::new();
+    let terms = ReachabilityTerms::new(graph);
 
     let mut candidate_entities = BTreeSet::new();
     let mut caches = ReachabilityCaches::default();
@@ -777,7 +791,7 @@ fn first_orphan_after_localized(
 }
 
 fn summarize_delta(graph: &GraphId, delta: &[MaterializedQuadChange]) -> DeltaSummary {
-    let root = encoded_nn(&vocab::root_entity());
+    let root = graph_root(graph);
     let metadata = encoded_nn(&vocab::metadata_descriptor());
     let rdf_type = encoded_nn(&vocab::rdf_type());
     let dataset = encoded_nn(&vocab::schema_dataset());

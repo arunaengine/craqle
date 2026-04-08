@@ -1308,7 +1308,7 @@ mod tests {
         insert_quad(
             &store,
             &graph,
-            "./",
+            graph.as_str(),
             "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
             EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
                 "http://schema.org/Dataset",
@@ -1317,7 +1317,7 @@ mod tests {
         insert_quad(
             &store,
             &graph,
-            "./",
+            graph.as_str(),
             "http://schema.org/name",
             EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Root Dataset"))),
         );

@@ -83,7 +83,7 @@ mod tests {
             .update_property(
                 &writer,
                 &graph,
-                "./",
+                graph.as_str(),
                 "schema:name",
                 None,
                 "Microbial Proteomics Study",
@@ -111,7 +111,7 @@ mod tests {
         let metagenomic = reindex_and_search(&net, 0, "metagenomic");
         let genomics = reindex_and_search(&net, 0, "genomics");
 
-        assert!(proteomics.iter().any(|subject| subject == "./"));
+        assert!(proteomics.iter().any(|subject| subject == graph.as_str()));
         assert!(
             metagenomic
                 .iter()

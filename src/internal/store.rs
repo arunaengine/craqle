@@ -287,10 +287,10 @@ fn decode_u64_bytes(bytes: &[u8], context: &'static str) -> Result<u64> {
 }
 
 fn encode_dots(dots: &[Dot]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(1 + dots.len() * 24);
+    let mut bytes = Vec::with_capacity(1 + dots.len() * 40);
     bytes.push(DOT_ENCODING_TAG);
     for dot in dots {
-        bytes.extend_from_slice(dot.actor.0.as_bytes());
+        bytes.extend_from_slice(dot.actor.as_bytes());
         bytes.extend_from_slice(&dot.counter.to_be_bytes());
     }
     bytes
@@ -300,18 +300,18 @@ fn decode_dots(bytes: &[u8]) -> Result<Vec<Dot>> {
     if bytes.first().copied() != Some(DOT_ENCODING_TAG) {
         return Ok(postcard::from_bytes(bytes)?);
     }
-    if !(bytes.len() - 1).is_multiple_of(24) {
+    if !(bytes.len() - 1).is_multiple_of(40) {
         return Err(StoreError::InvalidEncoding {
             context: "quad dots",
             message: format!("invalid dot payload length {}", bytes.len()),
         });
     }
 
-    let mut dots = Vec::with_capacity((bytes.len() - 1) / 24);
-    for chunk in bytes[1..].chunks_exact(24) {
+    let mut dots = Vec::with_capacity((bytes.len() - 1) / 40);
+    for chunk in bytes[1..].chunks_exact(40) {
         dots.push(Dot {
-            actor: ActorId(uuid::Uuid::from_bytes(chunk[..16].try_into().unwrap())),
-            counter: u64::from_be_bytes(chunk[16..24].try_into().unwrap()),
+            actor: ActorId::from_bytes(chunk[..32].try_into().unwrap()),
+            counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
         });
     }
     Ok(dots)
@@ -380,26 +380,33 @@ fn graph_meta_prefix() -> [u8; 1] {
     [GRAPH_META_PREFIX]
 }
 
-fn log_head_key(graph: TermId, actor: &ActorId) -> [u8; 33] {
-    let mut key = [0u8; 33];
+fn log_head_key(graph: TermId, actor: &ActorId) -> [u8; 49] {
+    let mut key = [0u8; 49];
     key[0] = LOG_HEAD_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
-    key[17..33].copy_from_slice(actor.0.as_bytes());
+    key[17..49].copy_from_slice(actor.as_bytes());
     key
 }
 
-fn log_batch_key(graph: TermId, actor: &ActorId, counter: u64) -> [u8; 41] {
-    let mut key = [0u8; 41];
+fn log_batch_key(graph: TermId, actor: &ActorId, counter: u64) -> [u8; 57] {
+    let mut key = [0u8; 57];
     key[0] = LOG_BATCH_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
-    key[17..33].copy_from_slice(actor.0.as_bytes());
-    key[33..41].copy_from_slice(&counter.to_be_bytes());
+    key[17..49].copy_from_slice(actor.as_bytes());
+    key[49..57].copy_from_slice(&counter.to_be_bytes());
     key
 }
 
 fn log_batch_prefix(graph: TermId) -> [u8; 17] {
     let mut key = [0u8; 17];
     key[0] = LOG_BATCH_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn log_head_prefix(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = LOG_HEAD_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
     key
 }
@@ -1052,6 +1059,46 @@ impl GraphStore {
         Ok(self.read_graph_meta_by_id(graph_id)?.is_some())
     }
 
+    pub fn delete_graph(&self, graph: &GraphId) -> Result<()> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(());
+        };
+
+        let mut batch = self.new_batch();
+        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+            self.write_quad_state(&mut batch, quad, Vec::new())?;
+            Ok(())
+        })?;
+
+        batch.remove(&self.graphs, graph_meta_key(graph_id));
+        for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.graphs, key);
+        }
+
+        let reindex_key = graph_reindex_key(graph_id);
+        if self.graphs.get(reindex_key)?.is_some() {
+            batch.remove(&self.graphs, reindex_key);
+        }
+
+        for guard in self.log.prefix(log_head_prefix(graph_id)) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.log, key);
+        }
+        for guard in self.log.prefix(log_batch_prefix(graph_id)) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.log, key);
+        }
+
+        self.commit(batch)?;
+        self.diagnostics_cache.write().unwrap().remove(&graph_id);
+        self.object_order_cache
+            .write()
+            .unwrap()
+            .retain(|(graph_term, _, _), _| *graph_term != graph_id);
+        Ok(())
+    }
+
     pub fn graph_is_empty(&self, graph: &GraphId) -> Result<bool> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(true);
@@ -1619,11 +1666,11 @@ impl GraphStore {
         let mut term_cache = HashMap::new();
         for guard in self.log.prefix(log_batch_prefix(graph_id)) {
             let (key, value) = guard.into_inner()?;
-            if key.len() != 41 {
+            if key.len() != 57 {
                 continue;
             }
-            let actor = ActorId(uuid::Uuid::from_bytes(key[17..33].try_into().unwrap()));
-            let counter = u64::from_be_bytes(key[33..41].try_into().unwrap());
+            let actor = ActorId::from_bytes(key[17..49].try_into().unwrap());
+            let counter = u64::from_be_bytes(key[49..57].try_into().unwrap());
             if vector_clock.contains(&Dot { actor, counter }) {
                 continue;
             }
