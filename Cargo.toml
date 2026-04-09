@@ -33,7 +33,7 @@ anyhow = "1"
 globset = "0.4"
 
 # RO-Crate implementation
-rocraters = { package = "ro-crate-rs", git = "ssh://git@github.com/arunaengine/ro-crate-rs.git", branch = "feat/rdfperformance", features = [
+rocraters = { package = "ro-crate-rs", git = "https://github.com/arunaengine/ro-crate-rs.git", branch = "feat/rdfperformance", features = [
     "rdf",
 ] }
 
