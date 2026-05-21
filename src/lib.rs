@@ -848,10 +848,15 @@ impl CraqleNode {
 
     pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
         self.store.delete_graph(graph)?;
-        self.search.replace_graph_documents(
-            graph.as_str(),
-            std::iter::empty::<(String, Option<String>)>(),
-        )?;
+        cfg_select! {
+            feature = "search" => {
+                self.search.replace_graph_documents(
+                    graph.as_str(),
+                    std::iter::empty::<(String, Option<String>)>(),
+                )?;
+            }
+            _ => ()
+        }
         Ok(())
     }
 
