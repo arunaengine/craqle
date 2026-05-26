@@ -18,6 +18,8 @@ pub enum UpdateError {
     InvalidChangeSet(String),
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
+    #[error("sync: {0}")]
+    Sync(#[from] crate::sync::CraqleSyncError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,7 @@ pub struct ReplicationEngine {
     sparql: Arc<SparqlEngine>,
     rules: Vec<Box<dyn Rule>>,
     actor: ActorId,
+    sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
     gap_buffer: std::sync::Mutex<HashMap<GraphId, Vec<Batch>>>,
 }
 
@@ -52,11 +55,21 @@ const MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH: usize = 10_000;
 
 impl ReplicationEngine {
     pub fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
+        Self::new_with_sync(store, sparql, actor, None)
+    }
+
+    pub fn new_with_sync(
+        store: Arc<GraphStore>,
+        sparql: Arc<SparqlEngine>,
+        actor: ActorId,
+        sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+    ) -> Self {
         Self {
             store,
             sparql,
             rules: crate::rules::default_rules(),
             actor,
+            sync,
             gap_buffer: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -235,6 +248,10 @@ impl ReplicationEngine {
         diagnostics_refresh: DiagnosticsRefresh,
         validated_orphan_free: bool,
     ) -> Result<Batch, UpdateError> {
+        if let Some(sync) = &self.sync {
+            return self.publish_and_apply_changes(sync, graph, changes);
+        }
+
         let mut batch = self.store.new_batch();
         let can_preserve_clean_diagnostics = diagnostics_refresh == DiagnosticsRefresh::Immediate
             && validated_orphan_free
@@ -403,6 +420,24 @@ impl ReplicationEngine {
         Ok(repl_batch)
     }
 
+    fn publish_and_apply_changes(
+        &self,
+        sync: &Arc<dyn crate::sync::CraqleGraphSync>,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> Result<Batch, UpdateError> {
+        let record = sync.publish_changes(&self.store, graph, changes)?;
+        let Some(batch) = crate::sync::batch_from_irokle_record(&record)? else {
+            return Err(UpdateError::InvalidChangeSet(
+                "irokle changes publish did not return a quad-change record".to_string(),
+            ));
+        };
+
+        self.apply_irokle_batch(batch.clone())
+            .map_err(update_error_from_merge)?;
+        Ok(batch)
+    }
+
     /// Apply a remote batch using OR-Set CRDT semantics.
     pub fn apply_remote_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
         let mut touched_graphs = HashSet::new();
@@ -424,6 +459,43 @@ impl ReplicationEngine {
         }
 
         Ok(results)
+    }
+
+    /// Apply a causally ordered batch produced from an Irokle graph event.
+    ///
+    /// Irokle actor sequences include genesis and topic-control operations, so
+    /// they are not contiguous over Craqle domain events. The Irokle DAG already
+    /// enforces causal delivery; this path intentionally bypasses Craqle's old
+    /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
+    pub fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
+        let graph = &incoming.graph;
+
+        if !self.store.contains_graph(graph)? {
+            self.store.create_graph(graph)?;
+        }
+
+        let mut vector_clock = self.store.get_vector_clock(graph)?;
+        if vector_clock.contains(&Dot {
+            actor: incoming.actor,
+            counter: incoming.counter,
+        }) {
+            return Ok(MergeResult { applied: false });
+        }
+
+        self.apply_single_batch(&incoming, &mut vector_clock)?;
+        self.finalize_remote_graph(graph)?;
+        Ok(MergeResult { applied: true })
+    }
+
+    pub fn apply_irokle_record(
+        &self,
+        record: &irokle::reducer::EventRecord<crate::sync::CraqleGraphEvent>,
+    ) -> Result<Option<MergeResult>, MergeError> {
+        let batch = crate::sync::batch_from_irokle_record(record)
+            .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        batch
+            .map(|batch| self.apply_irokle_batch(batch))
+            .transpose()
     }
 
     fn apply_remote_batch_internal(
@@ -712,4 +784,11 @@ fn encoded_identifier_value(term: &EncodedTerm) -> String {
     term.to_named_node()
         .map(|node| node.as_str().to_string())
         .unwrap_or_else(|| term.0.clone())
+}
+
+fn update_error_from_merge(error: MergeError) -> UpdateError {
+    match error {
+        MergeError::Store(error) => UpdateError::Store(error),
+        MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
+    }
 }
