@@ -364,7 +364,7 @@ impl GraphPolicy {
 // ── Materialized Changes (SPARQL evaluator output) ──────────────────────────
 
 /// A concrete quad change produced by SPARQL Update evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaterializedQuadChange {
     Insert {
         graph: GraphId,

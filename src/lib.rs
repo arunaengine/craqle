@@ -26,7 +26,7 @@ mod sparql;
 mod store;
 
 mod auth;
-mod transport;
+mod sync;
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -55,7 +55,7 @@ pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
 pub use crate::search::SearchHit;
 pub use crate::sparql::QueryResults;
-pub use crate::transport::SyncMessage;
+pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
@@ -81,6 +81,8 @@ pub enum CraqleError {
     RoCrate(#[from] rocrate::RoCrateError),
     #[error("sync input rejected: {0}")]
     SyncInputRejected(String),
+    #[error("sync: {0}")]
+    Sync(#[from] sync::CraqleSyncError),
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
 }
@@ -163,17 +165,20 @@ pub struct CraqleNode {
     search: Arc<SearchIndex>,
     sparql: Arc<SparqlEngine>,
     replication: Arc<ReplicationEngine>,
+    sync: Option<Arc<dyn sync::CraqleGraphSync>>,
 }
 
 /// Configuration used when constructing a [`CraqleNode`].
 pub struct CraqleOptions {
     actor: ActorId,
+    sync: Option<Arc<dyn sync::CraqleGraphSync>>,
 }
 
 impl Default for CraqleOptions {
     fn default() -> Self {
         Self {
             actor: ActorId::random(),
+            sync: None,
         }
     }
 }
@@ -188,8 +193,17 @@ impl CraqleOptions {
         self
     }
 
-    fn into_actor(self) -> ActorId {
-        self.actor
+    pub fn with_irokle<S: irokle::Storage>(
+        mut self,
+        node: irokle::Irokle<S>,
+        options: CraqleIrokleOptions,
+    ) -> Self {
+        self.sync = Some(Arc::new(IrokleGraphSync::new(node, options)));
+        self
+    }
+
+    fn into_parts(self) -> (ActorId, Option<Arc<dyn sync::CraqleGraphSync>>) {
+        (self.actor, self.sync)
     }
 }
 
@@ -223,9 +237,13 @@ impl CraqleNode {
         search: Arc<SearchIndex>,
         options: CraqleOptions,
     ) -> Self {
-        let actor = options.into_actor();
+        let (actor, sync) = options.into_parts();
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
-        let replication = Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
+        let replication = Arc::new(if sync.is_some() {
+            ReplicationEngine::new_with_sync(store.clone(), sparql.clone(), actor, sync.clone())
+        } else {
+            ReplicationEngine::new(store.clone(), sparql.clone(), actor)
+        });
 
         Self {
             actor,
@@ -233,12 +251,59 @@ impl CraqleNode {
             search,
             sparql,
             replication,
+            sync,
         }
     }
 
     /// Return the local actor id used for authored replication batches.
     pub fn actor(&self) -> ActorId {
         self.actor
+    }
+
+    pub fn irokle_topic_id(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {
+        let Some(sync) = &self.sync else {
+            return Ok(None);
+        };
+        Ok(sync.graph_topic_id(&self.store, graph)?)
+    }
+
+    pub fn ensure_irokle_topic(&self, graph: &GraphId) -> Result<irokle::TopicId> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        Ok(sync.ensure_graph_topic(&self.store, graph)?)
+    }
+
+    pub fn add_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        Ok(sync.add_peer(&self.store, graph, peer)?)
+    }
+
+    pub fn remove_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        Ok(sync.remove_peer(&self.store, graph, peer)?)
+    }
+
+    pub fn irokle_sync_status(&self, graph: &GraphId) -> Result<Vec<irokle::SyncPeerStatus>> {
+        let Some(sync) = &self.sync else {
+            return Ok(Vec::new());
+        };
+        Ok(sync.sync_status(&self.store, graph)?)
+    }
+
+    pub fn reconcile_irokle(&self) -> Result<usize> {
+        let Some(sync) = &self.sync else {
+            return Ok(0);
+        };
+
+        let mut applied = 0;
+        for topic_id in sync.craqle_topic_ids()? {
+            for record in sync.topic_history(topic_id)? {
+                sync.bind_graph_topic(&self.store, record.event.graph(), topic_id)?;
+                if self.apply_irokle_record(&record)? {
+                    applied += 1;
+                }
+            }
+        }
+        Ok(applied)
     }
 
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
@@ -776,7 +841,7 @@ impl CraqleNode {
 
     pub fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
-        self.persist_graph_policy(graph, policy.normalized())
+        self.set_local_graph_policy(graph, policy.normalized())
     }
 
     pub fn apply_remote_batch(&self, batch: Batch) -> Result<()> {
@@ -886,7 +951,7 @@ impl CraqleNode {
             )));
         }
         self.store.import_graph_snapshot(snapshot)?;
-        self.persist_graph_policy(&snapshot.graph, policy.normalized())?;
+        self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
         self.refresh_search_for_graph(&snapshot.graph)
     }
 
@@ -911,7 +976,7 @@ impl CraqleNode {
             )));
         }
         self.store.import_compact_graph_snapshot(snapshot)?;
-        self.persist_graph_policy(&snapshot.graph, policy.normalized())?;
+        self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
         self.refresh_search_for_graph(&snapshot.graph)
     }
 
@@ -944,6 +1009,16 @@ impl CraqleNode {
     }
 
     fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+        if let Some(sync) = &self.sync {
+            let record = sync.publish_policy(&self.store, graph, policy.clone())?;
+            self.apply_irokle_record(&record)?;
+            return Ok(());
+        }
+
+        self.set_local_graph_policy(graph, policy)
+    }
+
+    fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.store.set_graph_policy(graph, &policy)?;
         Ok(())
     }
@@ -977,6 +1052,31 @@ impl CraqleNode {
         self.search.commit()?;
         self.store.clear_fts_queue_for_graph(graph)?;
         Ok(())
+    }
+
+    fn apply_irokle_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<bool> {
+        match &record.event {
+            CraqleGraphEvent::Policy { graph, policy } => {
+                let policy = policy.clone().normalized();
+                if self.store.graph_policy(graph)? == policy {
+                    return Ok(false);
+                }
+                self.set_local_graph_policy(graph, policy)?;
+                Ok(true)
+            }
+            CraqleGraphEvent::QuadChanges { graph, .. } => {
+                let Some(result) = self.replication.apply_irokle_record(record)? else {
+                    return Ok(false);
+                };
+                if result.applied {
+                    self.refresh_search_for_graph(graph)?;
+                }
+                Ok(result.applied)
+            }
+        }
     }
 
     fn validate_remote_batch(&self, batch: &Batch) -> Result<()> {

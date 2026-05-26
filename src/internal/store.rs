@@ -116,6 +116,8 @@ pub(crate) struct StoredBatch {
 struct StoredGraphMeta {
     policy: GraphPolicy,
     clock: VectorClock,
+    #[serde(default)]
+    irokle_topic: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -1185,6 +1187,23 @@ impl GraphStore {
             .read_graph_meta_by_id(graph_id)?
             .unwrap_or_default()
             .policy)
+    }
+
+    pub fn irokle_topic_id(&self, graph: &GraphId) -> Result<Option<[u8; 32]>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_graph_meta_by_id(graph_id)?
+            .unwrap_or_default()
+            .irokle_topic)
+    }
+
+    pub fn set_irokle_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        meta.irokle_topic = Some(topic_id);
+        self.write_graph_meta_immediate(graph_id, &meta)
     }
 
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
