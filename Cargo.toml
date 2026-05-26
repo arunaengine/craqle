@@ -55,6 +55,7 @@ search = ["dep:tantivy"]
 blake3 = { workspace = true }
 chrono = { workspace = true }
 fjall = { workspace = true }
+irokle = { path = "../../irokle", features = ["fjall"] }
 oxrdf = { workspace = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
