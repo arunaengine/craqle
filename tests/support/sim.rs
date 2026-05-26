@@ -4,11 +4,11 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use craqle::{
-    Authorizer, Batch, CraqleError, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
-    GraphReplicaSnapshot, QueryResults, SearchHit, VectorClock,
+    Authorizer, Batch, CraqleError, CraqleGraphEvent, CraqleIrokleOptions, CraqleNode,
+    CraqleOptions, EncodedTerm, GraphId, GraphReplicaSnapshot, QueryResults, SearchHit,
+    VectorClock,
 };
-
-const SNAPSHOT_BOOTSTRAP_THRESHOLD_QUADS: u64 = 50_000;
+use irokle::Event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QueryOptions {
@@ -19,6 +19,8 @@ pub struct QueryOptions {
 pub enum SimulationError {
     #[error("craqle: {0}")]
     Craqle(#[from] CraqleError),
+    #[error("irokle: {0}")]
+    Irokle(#[from] irokle::Error),
     #[error("convergence failed: {0}")]
     ConvergenceFailed(String),
 }
@@ -27,6 +29,7 @@ pub type Result<T> = std::result::Result<T, SimulationError>;
 
 pub struct CraqleCluster {
     peers: Vec<CraqleNode>,
+    irokles: Vec<irokle::Irokle>,
     connected: Vec<Vec<bool>>,
 }
 
@@ -43,16 +46,30 @@ impl CraqleCluster {
     where
         F: FnMut(usize) -> CraqleOptions,
     {
+        let mut irokles = Vec::with_capacity(peer_count);
+        for _ in 0..peer_count {
+            irokles.push(irokle::Irokle::builder().build()?);
+        }
+        let peer_ids: BTreeSet<_> = irokles.iter().map(irokle::Irokle::peer_id).collect();
         let mut peers = Vec::with_capacity(peer_count);
         for idx in 0..peer_count {
+            let initial_peers = peer_ids
+                .iter()
+                .copied()
+                .filter(|peer| *peer != irokles[idx].peer_id())
+                .collect::<BTreeSet<_>>();
             peers.push(CraqleNode::open_with_options(
                 data_dir.as_ref().join(format!("peer_{idx}")),
-                options(idx),
+                options(idx).with_irokle(
+                    irokles[idx].clone(),
+                    CraqleIrokleOptions::new().with_initial_peers(initial_peers),
+                ),
             )?);
         }
 
         Ok(Self {
             peers,
+            irokles,
             connected: vec![vec![true; peer_count]; peer_count],
         })
     }
@@ -67,6 +84,10 @@ impl CraqleCluster {
 
     pub fn peer_mut(&mut self, index: usize) -> &CraqleNode {
         &self.peers[index]
+    }
+
+    pub fn irokle(&self, index: usize) -> &irokle::Irokle {
+        &self.irokles[index]
     }
 
     pub fn deliver_batch_to_peer(&self, index: usize, batch: Batch) -> Result<()> {
@@ -98,24 +119,9 @@ impl CraqleCluster {
             return Ok(());
         }
 
-        let graphs = self.all_graphs()?;
-        for graph in &graphs {
-            if self.maybe_bootstrap_with_snapshot(left, right, graph)? {
-                continue;
-            }
-            if self.maybe_bootstrap_with_snapshot(right, left, graph)? {
-                continue;
-            }
-
-            let left_clock = self.peers[left].vector_clock(graph)?;
-            let right_clock = self.peers[right].vector_clock(graph)?;
-
-            self.sync_policy(left, right, graph)?;
-            self.sync_policy(right, left, graph)?;
-            self.peers[right]
-                .apply_remote_batches(self.peers[left].catchup_batches(graph, &right_clock)?)?;
-            self.peers[left]
-                .apply_remote_batches(self.peers[right].catchup_batches(graph, &left_clock)?)?;
+        for topic_id in self.all_craqle_topic_ids()? {
+            self.sync_topic_one_way(left, right, topic_id)?;
+            self.sync_topic_one_way(right, left, topic_id)?;
         }
 
         Ok(())
@@ -123,17 +129,14 @@ impl CraqleCluster {
 
     pub fn sync_round(&self) -> Result<()> {
         let peer_count = self.peers.len();
+        let topics = self.all_craqle_topic_ids()?;
         for sender in 0..peer_count {
             for receiver in 0..peer_count {
                 if sender == receiver || !self.connected[sender][receiver] {
                     continue;
                 }
-                for graph in self.all_graphs()? {
-                    self.sync_policy(sender, receiver, &graph)?;
-                    let clock = self.peers[receiver].vector_clock(&graph)?;
-                    self.peers[receiver].apply_remote_batches(
-                        self.peers[sender].catchup_batches(&graph, &clock)?,
-                    )?;
+                for topic_id in &topics {
+                    self.sync_topic_one_way(sender, receiver, *topic_id)?;
                 }
             }
         }
@@ -142,11 +145,11 @@ impl CraqleCluster {
     }
 
     pub fn sync_until_converged(&self, max_rounds: usize) -> Result<()> {
-        self.do_catchup()?;
+        self.reconcile_all()?;
 
         for _ in 0..max_rounds {
             self.sync_round()?;
-            self.do_catchup()?;
+            self.reconcile_all()?;
             if self.check_convergence()? {
                 return Ok(());
             }
@@ -228,68 +231,42 @@ impl CraqleCluster {
         Ok(hits)
     }
 
-    fn do_catchup(&self) -> Result<()> {
-        let peer_count = self.peers.len();
-        let graphs = self.all_graphs()?;
-
-        for graph in &graphs {
-            for receiver in 0..peer_count {
-                for sender in 0..peer_count {
-                    if sender == receiver || !self.connected[sender][receiver] {
-                        continue;
-                    }
-
-                    if self.maybe_bootstrap_with_snapshot(sender, receiver, graph)? {
-                        continue;
-                    }
-
-                    let clock = self.peers[receiver].vector_clock(graph)?;
-                    self.sync_policy(sender, receiver, graph)?;
-                    self.peers[receiver]
-                        .apply_remote_batches(self.peers[sender].catchup_batches(graph, &clock)?)?;
-                }
-            }
+    fn reconcile_all(&self) -> Result<()> {
+        for peer in &self.peers {
+            peer.reconcile_irokle()?;
         }
-
         Ok(())
     }
 
-    fn maybe_bootstrap_with_snapshot(
+    fn sync_topic_one_way(
         &self,
         sender: usize,
         receiver: usize,
-        graph: &GraphId,
-    ) -> Result<bool> {
-        let receiver_clock = self.peers[receiver].vector_clock(graph)?;
-        if !receiver_clock.0.is_empty() {
-            return Ok(false);
+        topic_id: irokle::TopicId,
+    ) -> Result<()> {
+        let remote_summary = self.irokles[receiver].sync_summary(topic_id)?;
+        let data = self.irokles[sender]
+            .plan_sync_data(self.irokles[receiver].peer_id(), &remote_summary)?;
+        if data.ops.is_empty() {
+            return Ok(());
         }
-
-        let (receiver_quads, _, _) = self.peers[receiver].graph_fingerprint(graph)?;
-        if receiver_quads != 0 {
-            return Ok(false);
-        }
-
-        let (sender_quads, _, _) = self.peers[sender].graph_fingerprint(graph)?;
-        if sender_quads < SNAPSHOT_BOOTSTRAP_THRESHOLD_QUADS {
-            return Ok(false);
-        }
-
-        let policy = self.peers[sender].graph_policy(graph)?;
-        let snapshot = self.peers[sender].compact_graph_snapshot(graph)?;
-        match self.peers[receiver].import_compact_graph_snapshot(&snapshot, policy) {
-            Ok(()) => Ok(true),
-            Err(CraqleError::SyncInputRejected(_)) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
+        let ack =
+            self.irokles[receiver].receive_sync_data_from(self.irokles[sender].peer_id(), data)?;
+        let _ = self.irokles[sender].apply_sync_ack(&ack);
+        self.peers[receiver].reconcile_irokle()?;
+        Ok(())
     }
 
-    fn sync_policy(&self, sender: usize, receiver: usize, graph: &GraphId) -> Result<()> {
-        if self.peers[sender].contains_graph(graph)? {
-            let policy = self.peers[sender].graph_policy(graph)?;
-            self.peers[receiver].import_graph_policy(graph, policy)?;
+    fn all_craqle_topic_ids(&self) -> Result<Vec<irokle::TopicId>> {
+        let mut topics = BTreeSet::new();
+        for node in &self.irokles {
+            for topic in node.list_topics()? {
+                if topic.event_type_id == CraqleGraphEvent::TYPE_ID {
+                    topics.insert(topic.topic_id);
+                }
+            }
         }
-        Ok(())
+        Ok(topics.into_iter().collect())
     }
 
     fn all_graphs(&self) -> Result<Vec<GraphId>> {

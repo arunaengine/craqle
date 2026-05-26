@@ -346,17 +346,22 @@ mod tests {
             )
             .unwrap();
 
-        let batches = net
-            .peer(0)
-            .catchup_batches(&graph, &net.peer(1).vector_clock(&graph).unwrap())
+        let topic_id = net.peer(0).irokle_topic_id(&graph).unwrap().unwrap();
+        let summary = net.irokle(1).sync_summary(topic_id).unwrap();
+        let mut data = net
+            .irokle(0)
+            .plan_sync_data(net.irokle(1).peer_id(), &summary)
             .unwrap();
-        assert_eq!(batches.len(), 2);
-        let clock_before = net.peer(1).vector_clock(&graph).unwrap();
+        assert_eq!(data.ops.len(), 2);
+        data.ops.reverse();
 
-        net.deliver_batch_to_peer(1, batches[1].clone()).unwrap();
-        assert_eq!(net.peer(1).vector_clock(&graph).unwrap(), clock_before);
+        let ack = net
+            .irokle(1)
+            .receive_sync_data_from(net.irokle(0).peer_id(), data)
+            .unwrap();
+        let _ = net.irokle(0).apply_sync_ack(&ack);
+        net.peer(1).reconcile_irokle().unwrap();
 
-        net.deliver_batch_to_peer(1, batches[0].clone()).unwrap();
         assert_eq!(graph_state(&net, 0, &graph), graph_state(&net, 1, &graph));
     }
 

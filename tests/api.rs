@@ -1,8 +1,15 @@
 mod support;
 
 use craqle::*;
+use serde::{Deserialize, Serialize};
 
 use support::{CraqleCluster, QueryOptions};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
+#[irokle(type_id = "craqle.test.other-app.v1")]
+struct OtherAppEvent {
+    value: String,
+}
 
 fn writer_auth() -> GrantAuthorizer {
     GrantAuthorizer::new(vec![PermissionGrant::new(
@@ -207,6 +214,55 @@ fn explicit_batch_and_snapshot_sync_replicate_graphs_and_policy() {
     assert!(
         rows.iter()
             .any(|row| row.values().any(|value| value.0.contains("Synced File")))
+    );
+}
+
+#[test]
+fn external_irokle_instance_can_be_shared_with_other_topics() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let other_topic = irokle
+        .create_topic::<OtherAppEvent>(irokle::TopicConfig::default())
+        .unwrap();
+    other_topic
+        .publish(OtherAppEvent {
+            value: "owned by another app".to_string(),
+        })
+        .unwrap();
+
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:shared-irokle");
+
+    node.create_crate(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Shared Irokle Dataset",
+            "Craqle uses one graph topic beside other app topics",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/shared".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    let craqle_topic = node.irokle_topic_id(&graph).unwrap().unwrap();
+    assert_ne!(craqle_topic, other_topic.id());
+    assert_eq!(irokle.list_topics().unwrap().len(), 2);
+    assert_eq!(
+        other_topic
+            .history(irokle::history::HistoryOrder::OldestFirst)
+            .unwrap()[0]
+            .event
+            .value,
+        "owned by another app"
     );
 }
 
