@@ -2,9 +2,9 @@
 
 Craqle is an experimental Rust library for storing, validating, querying, searching, and replicating RO-Crates as RDF named graphs.
 
-The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Replication uses Irokle graph topics plus OR-Set CRDT semantics over RDF quad changes. Invalid visible RO-Crates are not exported.
+The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Irokle graph topics provide the durable operation log and sync obligations, while Craqle reduces those events into an OR-Set RDF projection. Invalid visible RO-Crates are not exported.
 
-This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. Search is intentionally minimal. The workspace currently depends on the `arunaengine/ro-crate-rs` fork on branch `feat/rdfperformance` with the `rdf` feature enabled.
+This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. Search is intentionally minimal. The workspace currently depends on `intbio-ncl/ro-crate-rs` on branch `main` with the `rdf` feature enabled.
 
 - create and update RO-Crates as named RDF graphs
 - import and export RO-Crate JSON-LD
@@ -15,7 +15,7 @@ This is still early work. Expect breaking changes to the API, storage layout, an
 
 ## Irokle Sync
 
-Craqle can publish graph events into an external Irokle node that is shared with other applications:
+Craqle publishes graph events into an Irokle node for durable operation history and sync obligations. The Irokle node can be shared with other applications:
 
 ```rust
 let irokle = irokle::Irokle::builder()
@@ -27,7 +27,9 @@ let node = CraqleNode::open_with_options(
 )?;
 ```
 
-Each graph gets its own Irokle topic. Local writes are published as durable `CraqleGraphEvent` records first, then reduced into Craqle's RDF projection. After Irokle transport sync receives remote topic data, call `reconcile_irokle()` to apply new graph events locally.
+Each graph gets its own Irokle topic. Local writes are published as durable `CraqleGraphEvent` records first, then reduced into Craqle's RDF projection. Opening a node with Irokle configured replays durable graph events before returning, so the Irokle log is authoritative if a process stops after publishing but before projection catches up. After Irokle transport sync receives new remote topic data, call `reconcile_irokle()` to apply those graph events locally.
+
+Enable Craqle's `iroh` feature when the embedded Irokle dependency should include Irokle's Iroh transport and async write-concern obligation scheduling.
 
 ## Examples
 
@@ -101,7 +103,7 @@ let batch = node.apply_rocrate_document(&writer, graph.clone(), updated_jsonld)?
 - The API is still moving and there are no stability guarantees yet.
 - Search is intentionally minimal even though it uses Tantivy; for richer results you still hydrate metadata from RDF.
 - Irokle transport integration is library-level; Craqle does not provide a standalone sync server.
-- The workspace currently depends on the `arunaengine/ro-crate-rs` fork on branch `feat/rdfperformance` with the `rdf` feature enabled.
+- The workspace currently depends on `intbio-ncl/ro-crate-rs` on branch `main` with the `rdf` feature enabled.
 
 There is also a small demo in `examples/demo.rs`:
 

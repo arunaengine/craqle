@@ -60,6 +60,7 @@ pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
 };
+pub use irokle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CraqleError {
@@ -226,6 +227,7 @@ impl CraqleNode {
         let store = Arc::new(GraphStore::open(root.join("store"))?);
         let search = Arc::new(SearchIndex::open(root.join("search"))?);
         let node = Self::from_store_and_search(store, search.clone(), options);
+        node.reconcile_irokle()?;
         if search.needs_rebuild() {
             node.reindex_search()?;
         }

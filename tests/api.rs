@@ -267,6 +267,67 @@ fn external_irokle_instance_can_be_shared_with_other_topics() {
 }
 
 #[test]
+fn opening_with_irokle_replays_durable_graph_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let craqle_dir = dir.path().join("craqle");
+    let irokle_dir = dir.path().join("irokle");
+    let graph = GraphId::new("urn:test:irokle-replay");
+    let signer;
+
+    {
+        let irokle = irokle::Irokle::builder()
+            .with_fjall_path(&irokle_dir)
+            .unwrap()
+            .build()
+            .unwrap();
+        signer = irokle.signer().clone();
+        let topic = irokle
+            .create_topic::<CraqleGraphEvent>(irokle::TopicConfig::default())
+            .unwrap();
+        topic
+            .publish(CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes: vec![MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: EncodedTerm::from_named_node(&graph.0),
+                    predicate: EncodedTerm::from_named_node(&vocab::schema_name()),
+                    object: EncodedTerm("\"Recovered From Irokle\"".to_string()),
+                }],
+            })
+            .unwrap();
+    }
+
+    let irokle = irokle::Irokle::builder()
+        .with_signer(signer)
+        .with_fjall_path(&irokle_dir)
+        .unwrap()
+        .build()
+        .unwrap();
+    let node = CraqleNode::open_with_options(
+        &craqle_dir,
+        CraqleOptions::new().with_irokle(irokle, CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+
+    assert!(node.contains_graph(&graph).unwrap());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_some());
+    let rows = match node
+        .query_graphs(
+            &[graph.clone()],
+            "SELECT ?name WHERE { GRAPH <urn:test:irokle-replay> { ?s <http://schema.org/name> ?name } }",
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+    assert!(rows.iter().any(|row| {
+        row.values()
+            .any(|value| value.0.contains("Recovered From Irokle"))
+    }));
+}
+
+#[test]
 fn search_filters_private_graphs_by_policy() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
