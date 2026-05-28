@@ -313,7 +313,7 @@ fn opening_with_irokle_replays_durable_graph_events() {
     assert!(node.irokle_topic_id(&graph).unwrap().is_some());
     let rows = match node
         .query_graphs(
-            &[graph.clone()],
+            std::slice::from_ref(&graph),
             "SELECT ?name WHERE { GRAPH <urn:test:irokle-replay> { ?s <http://schema.org/name> ?name } }",
         )
         .unwrap()

@@ -31,19 +31,10 @@ impl CraqleGraphEvent {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CraqleIrokleOptions {
     pub initial_peers: BTreeSet<irokle::PeerId>,
     pub replication_policy: ReplicationPolicy,
-}
-
-impl Default for CraqleIrokleOptions {
-    fn default() -> Self {
-        Self {
-            initial_peers: BTreeSet::new(),
-            replication_policy: ReplicationPolicy::default(),
-        }
-    }
 }
 
 impl CraqleIrokleOptions {

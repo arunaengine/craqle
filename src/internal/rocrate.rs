@@ -716,7 +716,7 @@ impl RoCrateManager {
         value: serde_json::Value,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         validate_jsonld_import(&value)?;
-        let target = jsonld_triples(&graph_id, &value)?;
+        let target = jsonld_triples(graph_id, &value)?;
         if !self.engine.store().contains_graph(graph_id)? {
             return Ok(insert_changes(graph_id, target));
         }
@@ -1710,13 +1710,13 @@ fn encoded_language_literal(value: &str, language: &str) -> EncodedTerm {
 }
 
 fn encoded_reference_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
-    if value.starts_with("./")
+    let is_identifier = value.starts_with("./")
         || value.starts_with("../")
         || value.starts_with('#')
         || value.starts_with("_:")
-    {
-        Ok(encoded_identifier(value))
-    } else if NamedNode::new(value).is_ok() {
+        || NamedNode::new(value).is_ok();
+
+    if is_identifier {
         Ok(encoded_identifier(value))
     } else if value.contains(':') {
         Ok(EncodedTerm::from_named_node(&expand_known_compact_iri(
