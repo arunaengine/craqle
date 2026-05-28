@@ -52,16 +52,16 @@ impl CraqleCluster {
         }
         let peer_ids: BTreeSet<_> = irokles.iter().map(irokle::Irokle::peer_id).collect();
         let mut peers = Vec::with_capacity(peer_count);
-        for idx in 0..peer_count {
+        for (idx, irokle) in irokles.iter().enumerate() {
             let initial_peers = peer_ids
                 .iter()
                 .copied()
-                .filter(|peer| *peer != irokles[idx].peer_id())
+                .filter(|peer| *peer != irokle.peer_id())
                 .collect::<BTreeSet<_>>();
             peers.push(CraqleNode::open_with_options(
                 data_dir.as_ref().join(format!("peer_{idx}")),
                 options(idx).with_irokle(
-                    irokles[idx].clone(),
+                    irokle.clone(),
                     CraqleIrokleOptions::new().with_initial_peers(initial_peers),
                 ),
             )?);
