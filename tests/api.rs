@@ -364,6 +364,7 @@ fn search_filters_private_graphs_by_policy() {
         ),
     )
     .unwrap();
+    node.flush_search_updates().unwrap();
 
     let anonymous_hits = node
         .search(&GrantAuthorizer::default(), "proteomics", 10)
@@ -398,6 +399,7 @@ fn search_hits_can_be_hydrated_from_rdf() {
         ),
     )
     .unwrap();
+    node.flush_search_updates().unwrap();
 
     let hits = node.search(&reader, "hydrated", 10).unwrap();
     assert_eq!(hits.len(), 1);
@@ -536,6 +538,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
     };
     assert!(federated_rows.len() > local_rows.len());
 
+    cluster.flush_search_updates().unwrap();
     let hits = cluster
         .search_from_peer(
             0,

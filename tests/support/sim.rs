@@ -151,11 +151,13 @@ impl CraqleCluster {
             self.sync_round()?;
             self.reconcile_all()?;
             if self.check_convergence()? {
+                self.flush_search_updates()?;
                 return Ok(());
             }
         }
 
         if self.check_convergence()? {
+            self.flush_search_updates()?;
             Ok(())
         } else {
             Err(SimulationError::ConvergenceFailed(
@@ -177,6 +179,13 @@ impl CraqleCluster {
     pub fn reindex_search(&self) -> Result<()> {
         for peer in &self.peers {
             peer.reindex_search()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_search_updates(&self) -> Result<()> {
+        for peer in &self.peers {
+            peer.flush_search_updates()?;
         }
         Ok(())
     }

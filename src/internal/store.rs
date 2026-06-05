@@ -61,6 +61,7 @@ const BATCH_LOG_ENCODING_TAG: u8 = b'B';
 const GRAPH_META_PREFIX: u8 = b'M';
 const GRAPH_DIRTY_PREFIX: u8 = b'D';
 const GRAPH_REINDEX_PREFIX: u8 = b'R';
+const GRAPH_SEARCH_DELETE_PREFIX: u8 = b'X';
 const LOG_HEAD_PREFIX: u8 = b'H';
 const LOG_BATCH_PREFIX: u8 = b'B';
 const TERM_LOCK_SHARDS: usize = 64;
@@ -376,6 +377,17 @@ fn graph_reindex_key(graph: TermId) -> [u8; 17] {
 
 fn graph_reindex_prefix() -> [u8; 1] {
     [GRAPH_REINDEX_PREFIX]
+}
+
+fn graph_search_delete_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_SEARCH_DELETE_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn graph_search_delete_prefix() -> [u8; 1] {
+    [GRAPH_SEARCH_DELETE_PREFIX]
 }
 
 fn graph_meta_prefix() -> [u8; 1] {
@@ -1082,6 +1094,13 @@ impl GraphStore {
         if self.graphs.get(reindex_key)?.is_some() {
             batch.remove(&self.graphs, reindex_key);
         }
+
+        let delete_token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        batch.insert(
+            &self.graphs,
+            graph_search_delete_key(graph_id),
+            delete_token.to_be_bytes(),
+        );
 
         for guard in self.log.prefix(log_head_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
@@ -1887,6 +1906,32 @@ impl GraphStore {
         Ok(result)
     }
 
+    pub fn drain_fts_delete_queue(&self, limit: usize) -> Result<Vec<(GraphId, u64)>> {
+        let mut result = Vec::new();
+        let mut term_cache = HashMap::new();
+
+        for guard in self.graphs.prefix(graph_search_delete_prefix()) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 17 {
+                continue;
+            }
+            let graph_id = decode_term_id(&key[1..17], "graph search delete graph")?;
+            let token = decode_u64_bytes(value.as_ref(), "graph search delete token")?;
+            let graph = self
+                .decode_term_cached(&mut term_cache, graph_id)?
+                .to_named_node()
+                .map(GraphId);
+            if let Some(graph) = graph {
+                result.push((graph, token));
+            }
+            if result.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
     pub fn acknowledge_fts_queue(&self, queued: &[(GraphId, TermId, u64)]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -1925,6 +1970,91 @@ impl GraphStore {
         Ok(())
     }
 
+    pub fn acknowledge_fts_delete_queue(&self, queued: &[(GraphId, u64)]) -> Result<()> {
+        if queued.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        for (graph, token) in queued {
+            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let key = graph_search_delete_key(graph_id);
+            if self.graphs.get(key)?.is_some_and(|current| {
+                decode_u64_bytes(current.as_ref(), "graph search delete token").ok() == Some(*token)
+            }) {
+                batch.remove(&self.graphs, key);
+            }
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn acknowledge_fts_subjects_for_reindexed_graphs(
+        &self,
+        queued: &[(GraphId, u64)],
+    ) -> Result<()> {
+        if queued.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        let mut dirty = false;
+        for (graph, reindex_token) in queued {
+            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+                let (key, value) = guard.into_inner()?;
+                let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
+                if token <= *reindex_token {
+                    batch.remove(&self.graphs, key);
+                    dirty = true;
+                }
+            }
+        }
+
+        if dirty {
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge_fts_queues_for_deleted_graphs(
+        &self,
+        queued: &[(GraphId, u64)],
+    ) -> Result<()> {
+        if queued.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        let mut dirty = false;
+        for (graph, delete_token) in queued {
+            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+                let (key, value) = guard.into_inner()?;
+                let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
+                if token <= *delete_token {
+                    batch.remove(&self.graphs, key);
+                    dirty = true;
+                }
+            }
+
+            let reindex_key = graph_reindex_key(graph_id);
+            if self.graphs.get(reindex_key)?.is_some_and(|current| {
+                decode_u64_bytes(current.as_ref(), "graph reindex token")
+                    .ok()
+                    .is_some_and(|token| token <= *delete_token)
+            }) {
+                batch.remove(&self.graphs, reindex_key);
+                dirty = true;
+            }
+        }
+
+        if dirty {
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
     pub fn clear_fts_queue_for_graph(&self, graph: &GraphId) -> Result<()> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(());
@@ -1941,6 +2071,12 @@ impl GraphStore {
         let reindex_key = graph_reindex_key(graph_id);
         if self.graphs.get(reindex_key)?.is_some() {
             batch.remove(&self.graphs, reindex_key);
+            dirty = true;
+        }
+
+        let delete_key = graph_search_delete_key(graph_id);
+        if self.graphs.get(delete_key)?.is_some() {
+            batch.remove(&self.graphs, delete_key);
             dirty = true;
         }
 
@@ -2003,6 +2139,11 @@ impl GraphStore {
             dirty = true;
         }
         for guard in self.graphs.prefix(graph_reindex_prefix()) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.graphs, key);
+            dirty = true;
+        }
+        for guard in self.graphs.prefix(graph_search_delete_prefix()) {
             let (key, _) = guard.into_inner()?;
             batch.remove(&self.graphs, key);
             dirty = true;
