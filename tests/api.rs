@@ -276,7 +276,7 @@ fn opening_with_irokle_replays_durable_graph_events() {
 
     {
         let irokle = irokle::Irokle::builder()
-            .with_fjall_path(&irokle_dir)
+            .with_fjall_path_and_persist_mode(&irokle_dir, fjall::PersistMode::Buffer)
             .unwrap()
             .build()
             .unwrap();
@@ -299,7 +299,7 @@ fn opening_with_irokle_replays_durable_graph_events() {
 
     let irokle = irokle::Irokle::builder()
         .with_signer(signer)
-        .with_fjall_path(&irokle_dir)
+        .with_fjall_path_and_persist_mode(&irokle_dir, fjall::PersistMode::Buffer)
         .unwrap()
         .build()
         .unwrap();

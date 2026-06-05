@@ -257,11 +257,16 @@ fn collect_search_worker_messages(
 }
 
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
+    let mut processed_any = false;
     loop {
         let processed = search.process_queued_updates(store, SEARCH_QUEUE_FLUSH_CHUNK)?;
         if processed == 0 {
+            if processed_any {
+                store.persist()?;
+            }
             return Ok(());
         }
+        processed_any = true;
     }
 }
 
@@ -385,17 +390,21 @@ impl CraqleNode {
 
     pub fn ensure_irokle_topic(&self, graph: &GraphId) -> Result<irokle::TopicId> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        Ok(sync.ensure_graph_topic(&self.store, graph)?)
+        let topic_id = sync.ensure_graph_topic(&self.store, graph)?;
+        self.persist_fjall()?;
+        Ok(topic_id)
     }
 
     pub fn add_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        Ok(sync.add_peer(&self.store, graph, peer)?)
+        sync.add_peer(&self.store, graph, peer)?;
+        self.persist_fjall()
     }
 
     pub fn remove_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        Ok(sync.remove_peer(&self.store, graph, peer)?)
+        sync.remove_peer(&self.store, graph, peer)?;
+        self.persist_fjall()
     }
 
     pub fn irokle_sync_status(&self, graph: &GraphId) -> Result<Vec<irokle::SyncPeerStatus>> {
@@ -418,6 +427,9 @@ impl CraqleNode {
                     applied += 1;
                 }
             }
+        }
+        if applied > 0 {
+            self.persist_fjall()?;
         }
         Ok(applied)
     }
@@ -608,7 +620,7 @@ impl CraqleNode {
         let policy = policy.normalized();
         self.ensure_policy_action(graph, &policy, auth, Action::Write)?;
         self.persist_graph_policy(graph, policy)?;
-        Ok(())
+        self.persist_fjall()
     }
 
     /// Export the full visible RO-Crate as JSON-LD.
@@ -962,7 +974,8 @@ impl CraqleNode {
 
     pub fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
-        self.set_local_graph_policy(graph, policy.normalized())
+        self.set_local_graph_policy(graph, policy.normalized())?;
+        self.persist_fjall()
     }
 
     pub fn apply_remote_batch(&self, batch: Batch) -> Result<()> {
@@ -970,6 +983,7 @@ impl CraqleNode {
         let result = self.replication.apply_remote_batch(batch)?;
         if result.applied {
             self.schedule_search_update();
+            self.persist_fjall()?;
         }
         Ok(())
     }
@@ -991,6 +1005,7 @@ impl CraqleNode {
         let results = self.replication.apply_remote_batches(batches)?;
         if !graphs.is_empty() && results.into_iter().any(|result| result.applied) {
             self.schedule_search_update();
+            self.persist_fjall()?;
         }
         Ok(())
     }
@@ -1034,7 +1049,7 @@ impl CraqleNode {
     pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
         self.store.delete_graph(graph)?;
         self.schedule_search_update();
-        Ok(())
+        self.persist_fjall()
     }
 
     pub fn vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
@@ -1065,7 +1080,7 @@ impl CraqleNode {
         self.store.import_graph_snapshot(snapshot)?;
         self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
         self.schedule_search_update();
-        Ok(())
+        self.persist_fjall()
     }
 
     pub fn import_compact_graph_snapshot(
@@ -1091,7 +1106,7 @@ impl CraqleNode {
         self.store.import_compact_graph_snapshot(snapshot)?;
         self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
         self.schedule_search_update();
-        Ok(())
+        self.persist_fjall()
     }
 
     fn ensure_graph_action(
@@ -1149,6 +1164,7 @@ impl CraqleNode {
 
     fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
         self.schedule_search_update_for_graph(graph)?;
+        self.persist_fjall()?;
         Ok(batch)
     }
 
@@ -1158,6 +1174,7 @@ impl CraqleNode {
         report: AppendDataEntitiesReport,
     ) -> Result<AppendDataEntitiesReport> {
         self.schedule_search_update_for_graph(graph)?;
+        self.persist_fjall()?;
         Ok(report)
     }
 
@@ -1167,6 +1184,7 @@ impl CraqleNode {
             self.store.enqueue_fts_reindex(&mut batch, &graph)?;
         }
         self.store.commit(batch)?;
+        self.persist_fjall()?;
         self.schedule_search_update();
         Ok(())
     }
@@ -1186,7 +1204,11 @@ impl CraqleNode {
         self.search.reindex_from_store(&self.store, graph)?;
         self.search.commit()?;
         self.store.clear_fts_queue_for_graph(graph)?;
-        Ok(())
+        self.persist_fjall()
+    }
+
+    pub fn persist_fjall(&self) -> Result<()> {
+        Ok(self.store.persist()?)
     }
 
     fn apply_irokle_record(
