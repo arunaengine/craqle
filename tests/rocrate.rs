@@ -71,6 +71,7 @@ mod tests {
             benchmark_rocrate_document(&graph, 250, "import-bulk-keyword", "Imported Dataset");
         node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
+        node.flush_search_updates().unwrap();
 
         let hits = node.search(&reader, "DOC-000123", 10).unwrap();
         assert!(
@@ -94,6 +95,7 @@ mod tests {
             benchmark_rocrate_document(&graph, 250, "trusted-bulk-keyword", "Trusted Dataset");
         node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
+        node.flush_search_updates().unwrap();
 
         let hits = node.search(&reader, "DOC-000123", 10).unwrap();
         assert!(
@@ -210,6 +212,7 @@ mod tests {
             ),
         )
         .unwrap();
+        node.flush_search_updates().unwrap();
 
         let hits = node.search(&reader, "APPEND-000123", 10).unwrap();
         assert!(

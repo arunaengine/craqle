@@ -31,7 +31,8 @@ mod sync;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
@@ -84,6 +85,8 @@ pub enum CraqleError {
     SyncInputRejected(String),
     #[error("sync: {0}")]
     Sync(#[from] sync::CraqleSyncError),
+    #[error("search worker: {0}")]
+    SearchWorker(String),
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
 }
@@ -153,6 +156,114 @@ const MAX_SYNC_POLICY_PATHS: usize = 1_024;
 const MAX_SYNC_SNAPSHOT_QUADS: usize = 250_000;
 const MAX_SYNC_SNAPSHOT_TERMS: usize = 500_000;
 const MAX_REMOTE_BATCHES: usize = 10_000;
+const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
+
+enum SearchWorkerMessage {
+    Wake,
+    Flush(mpsc::Sender<std::result::Result<(), String>>),
+    Stop,
+}
+
+struct SearchUpdateWorker {
+    sender: mpsc::Sender<SearchWorkerMessage>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SearchUpdateWorker {
+    fn start(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            run_search_update_worker(receiver, store, search);
+        });
+
+        Self {
+            sender,
+            handle: Some(handle),
+        }
+    }
+
+    fn wake(&self) {
+        let _ = self.sender.send(SearchWorkerMessage::Wake);
+    }
+
+    fn flush(&self) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.sender
+            .send(SearchWorkerMessage::Flush(sender))
+            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?;
+        receiver
+            .recv()
+            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?
+            .map_err(CraqleError::SearchWorker)
+    }
+}
+
+impl Drop for SearchUpdateWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.send(SearchWorkerMessage::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_search_update_worker(
+    receiver: mpsc::Receiver<SearchWorkerMessage>,
+    store: Arc<GraphStore>,
+    search: Arc<SearchIndex>,
+) {
+    loop {
+        let mut flush_replies = Vec::new();
+        if collect_search_worker_messages(&receiver, &mut flush_replies) {
+            for reply in flush_replies {
+                let _ = reply.send(Err("stopped".to_string()));
+            }
+            break;
+        }
+
+        let result = match flush_search_queue(&store, &search) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        let failed = result.is_err();
+        for reply in flush_replies {
+            let _ = reply.send(result.clone());
+        }
+        if failed {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+fn collect_search_worker_messages(
+    receiver: &mpsc::Receiver<SearchWorkerMessage>,
+    flush_replies: &mut Vec<mpsc::Sender<std::result::Result<(), String>>>,
+) -> bool {
+    match receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(SearchWorkerMessage::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(SearchWorkerMessage::Flush(reply)) => flush_replies.push(reply),
+        Ok(SearchWorkerMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+    }
+
+    while let Ok(message) = receiver.try_recv() {
+        match message {
+            SearchWorkerMessage::Wake => {}
+            SearchWorkerMessage::Flush(reply) => flush_replies.push(reply),
+            SearchWorkerMessage::Stop => return true,
+        }
+    }
+
+    false
+}
+
+fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
+    loop {
+        let processed = search.process_queued_updates(store, SEARCH_QUEUE_FLUSH_CHUNK)?;
+        if processed == 0 {
+            return Ok(());
+        }
+    }
+}
 
 /// Main application handle for local RO-Crate operations.
 ///
@@ -164,6 +275,7 @@ pub struct CraqleNode {
     actor: ActorId,
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
+    search_worker: SearchUpdateWorker,
     sparql: Arc<SparqlEngine>,
     replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
@@ -229,7 +341,7 @@ impl CraqleNode {
         let node = Self::from_store_and_search(store, search.clone(), options);
         node.reconcile_irokle()?;
         if search.needs_rebuild() {
-            node.reindex_search()?;
+            node.schedule_full_search_reindex()?;
         }
         Ok(node)
     }
@@ -240,6 +352,7 @@ impl CraqleNode {
         options: CraqleOptions,
     ) -> Self {
         let (actor, sync) = options.into_parts();
+        let search_worker = SearchUpdateWorker::start(store.clone(), search.clone());
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
         let replication = Arc::new(if sync.is_some() {
             ReplicationEngine::new_with_sync(store.clone(), sparql.clone(), actor, sync.clone())
@@ -251,6 +364,7 @@ impl CraqleNode {
             actor,
             store,
             search,
+            search_worker,
             sparql,
             replication,
             sync,
@@ -827,6 +941,11 @@ impl CraqleNode {
         self.hydrate_search_hits(auth, &hits)
     }
 
+    /// Block until the background full-text indexer has processed queued work.
+    pub fn flush_search_updates(&self) -> Result<()> {
+        self.search_worker.flush()
+    }
+
     /// Rebuild the full-text index from store state.
     pub fn reindex_search(&self) -> Result<()> {
         for graph in self.store.graphs()? {
@@ -848,10 +967,9 @@ impl CraqleNode {
 
     pub fn apply_remote_batch(&self, batch: Batch) -> Result<()> {
         self.validate_remote_batch(&batch)?;
-        let graph = batch.graph.clone();
         let result = self.replication.apply_remote_batch(batch)?;
         if result.applied {
-            self.refresh_search_for_graph(&graph)?;
+            self.schedule_search_update();
         }
         Ok(())
     }
@@ -870,9 +988,9 @@ impl CraqleNode {
             graphs.insert(batch.graph.clone());
         }
 
-        self.replication.apply_remote_batches(batches)?;
-        for graph in graphs {
-            self.refresh_search_for_graph(&graph)?;
+        let results = self.replication.apply_remote_batches(batches)?;
+        if !graphs.is_empty() && results.into_iter().any(|result| result.applied) {
+            self.schedule_search_update();
         }
         Ok(())
     }
@@ -915,15 +1033,7 @@ impl CraqleNode {
 
     pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
         self.store.delete_graph(graph)?;
-        cfg_select! {
-            feature = "search" => {
-                self.search.replace_graph_documents(
-                    graph.as_str(),
-                    std::iter::empty::<(String, Option<String>)>(),
-                )?;
-            }
-            _ => ()
-        }
+        self.schedule_search_update();
         Ok(())
     }
 
@@ -954,7 +1064,8 @@ impl CraqleNode {
         }
         self.store.import_graph_snapshot(snapshot)?;
         self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
-        self.refresh_search_for_graph(&snapshot.graph)
+        self.schedule_search_update();
+        Ok(())
     }
 
     pub fn import_compact_graph_snapshot(
@@ -979,7 +1090,8 @@ impl CraqleNode {
         }
         self.store.import_compact_graph_snapshot(snapshot)?;
         self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
-        self.refresh_search_for_graph(&snapshot.graph)
+        self.schedule_search_update();
+        Ok(())
     }
 
     fn ensure_graph_action(
@@ -1036,7 +1148,7 @@ impl CraqleNode {
     }
 
     fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
-        self.refresh_search_for_graph(graph)?;
+        self.schedule_search_update_for_graph(graph)?;
         Ok(batch)
     }
 
@@ -1045,8 +1157,29 @@ impl CraqleNode {
         graph: &GraphId,
         report: AppendDataEntitiesReport,
     ) -> Result<AppendDataEntitiesReport> {
-        self.refresh_search_for_graph(graph)?;
+        self.schedule_search_update_for_graph(graph)?;
         Ok(report)
+    }
+
+    fn schedule_full_search_reindex(&self) -> Result<()> {
+        let mut batch = self.store.new_batch();
+        for graph in self.store.graphs()? {
+            self.store.enqueue_fts_reindex(&mut batch, &graph)?;
+        }
+        self.store.commit(batch)?;
+        self.schedule_search_update();
+        Ok(())
+    }
+
+    fn schedule_search_update_for_graph(&self, graph: &GraphId) -> Result<()> {
+        if self.store.contains_graph(graph)? {
+            self.schedule_search_update();
+        }
+        Ok(())
+    }
+
+    fn schedule_search_update(&self) {
+        self.search_worker.wake();
     }
 
     fn refresh_search_for_graph(&self, graph: &GraphId) -> Result<()> {
@@ -1074,7 +1207,7 @@ impl CraqleNode {
                     return Ok(false);
                 };
                 if result.applied {
-                    self.refresh_search_for_graph(graph)?;
+                    self.schedule_search_update_for_graph(graph)?;
                 }
                 Ok(result.applied)
             }

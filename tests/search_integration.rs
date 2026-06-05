@@ -24,6 +24,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        net.flush_search_updates().unwrap();
 
         let hits = net
             .peer(0)
@@ -220,6 +221,7 @@ mod tests {
                 )],
             )
             .unwrap();
+            node.flush_search_updates().unwrap();
 
             let hits = node
                 .search(&GrantAuthorizer::default(), "proteomics", 10)
@@ -231,6 +233,7 @@ mod tests {
         }
 
         let reopened = CraqleNode::open(tmp.path().join("peer0")).unwrap();
+        reopened.flush_search_updates().unwrap();
         let hits = reopened
             .search(&GrantAuthorizer::default(), "proteomics", 10)
             .unwrap();
@@ -327,6 +330,7 @@ mod tests {
         let policy = sender.graph_policy(&graph).unwrap();
         let snapshot = sender.graph_snapshot(&graph).unwrap();
         receiver.import_graph_snapshot(&snapshot, policy).unwrap();
+        receiver.flush_search_updates().unwrap();
 
         let hits = receiver
             .search(&GrantAuthorizer::default(), "SNAP-000024", 10)
@@ -335,5 +339,47 @@ mod tests {
             hits.iter()
                 .any(|hit| hit.subject_iri.contains("entity-000024.dat"))
         );
+    }
+
+    #[test]
+    fn test_graph_delete_removes_search_results_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:delete-search");
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Deleted Search Dataset",
+                "This should disappear from search",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+        assert!(!node.search(&reader, "deleted", 10).unwrap().is_empty());
+
+        node.delete_graph(&writer, &graph).unwrap();
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Replacement Search Dataset",
+                "Only replacement text should be searchable",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        assert!(node.search(&reader, "deleted", 10).unwrap().is_empty());
+        assert!(!node.search(&reader, "replacement", 10).unwrap().is_empty());
     }
 }

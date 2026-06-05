@@ -59,7 +59,6 @@ const FTS_QUERY_IRI: &str = "urn:craqle:fts:query";
 const FTS_LIMIT_IRI: &str = "urn:craqle:fts:limit";
 const FTS_SCORE_IRI: &str = "urn:craqle:fts:score";
 const FTS_GRAPH_IRI: &str = "urn:craqle:fts:graph";
-const FTS_QUEUE_FLUSH_CHUNK: usize = 50_000;
 
 impl SparqlEngine {
     pub fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
@@ -628,13 +627,7 @@ fn ground_named_node(iri: &str) -> GroundTerm {
     GroundTerm::NamedNode(NamedNode::new_unchecked(iri))
 }
 
-fn flush_queued_search_updates(search: &SearchIndex, store: &GraphStore) -> Result<()> {
-    loop {
-        let processed = search.process_queued_updates(store, FTS_QUEUE_FLUSH_CHUNK)?;
-        if processed == 0 {
-            break;
-        }
-    }
+fn flush_queued_search_updates(_search: &SearchIndex, _store: &GraphStore) -> Result<()> {
     Ok(())
 }
 
@@ -1417,7 +1410,7 @@ mod tests {
 
     #[test]
     fn service_fts_binds_hits_and_scores() {
-        let (_dir, store, _search, engine) = setup_engine();
+        let (_dir, store, search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:g1");
         insert_quad(
             &store,
@@ -1437,6 +1430,7 @@ mod tests {
                 "Large-scale proteomics experiment",
             ))),
         );
+        while search.process_queued_updates(&store, 50_000).unwrap() != 0 {}
 
         let query = r#"
             SELECT ?s ?g ?score ?name
