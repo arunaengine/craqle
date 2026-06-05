@@ -513,7 +513,9 @@ impl GraphStore {
             batch.insert(&self.terms, key, term.0.as_bytes());
             batch.pending_terms.insert(id, term.0.clone());
         } else {
-            self.terms.insert(key, term.0.as_bytes())?;
+            let mut batch = self.buffered_batch();
+            batch.insert(&self.terms, key, term.0.as_bytes());
+            batch.commit()?;
         }
         Ok(id)
     }
@@ -524,12 +526,6 @@ impl GraphStore {
             .map(|bytes| postcard::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(Into::into)
-    }
-
-    fn write_graph_meta_immediate(&self, graph: TermId, meta: &StoredGraphMeta) -> Result<()> {
-        self.graphs
-            .insert(graph_meta_key(graph), postcard::to_allocvec(meta)?)?;
-        Ok(())
     }
 
     fn read_quad_dots(&self, key: &[u8]) -> Result<Vec<Dot>> {
@@ -926,6 +922,7 @@ impl GraphStore {
             .min(32);
         #[allow(deprecated)]
         let db = Database::builder(path.as_ref())
+            .manual_journal_persist(true)
             .cache_size(recommended_db_cache_bytes())
             .journal_compression(CompressionType::None)
             .max_journaling_size(16 * 1_024 * 1_024 * 1_024)
@@ -978,11 +975,11 @@ impl GraphStore {
     }
 
     pub fn manual_compact(&self) -> Result<()> {
-        self.db.persist(PersistMode::SyncAll)?;
+        self.db.persist(PersistMode::SyncData)?;
         for keyspace in [&self.terms, &self.quads, &self.graphs, &self.log] {
             keyspace.major_compact()?;
         }
-        self.db.persist(PersistMode::SyncAll)?;
+        self.db.persist(PersistMode::SyncData)?;
         Ok(())
     }
 
@@ -1059,9 +1056,16 @@ impl GraphStore {
     }
 
     pub fn create_graph(&self, graph: &GraphId) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut batch = self.new_batch();
+        let graph_id =
+            self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
         if self.read_graph_meta_by_id(graph_id)?.is_none() {
-            self.write_graph_meta_immediate(graph_id, &StoredGraphMeta::default())?;
+            batch.insert(
+                &self.graphs,
+                graph_meta_key(graph_id),
+                postcard::to_allocvec(&StoredGraphMeta::default())?,
+            );
+            self.commit(batch)?;
         }
         Ok(())
     }
@@ -1192,10 +1196,17 @@ impl GraphStore {
     }
 
     pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut batch = self.new_batch();
+        let graph_id =
+            self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
         let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
         meta.policy = policy.clone().normalized();
-        self.write_graph_meta_immediate(graph_id, &meta)
+        batch.insert(
+            &self.graphs,
+            graph_meta_key(graph_id),
+            postcard::to_allocvec(&meta)?,
+        );
+        self.commit(batch)
     }
 
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
@@ -1219,10 +1230,17 @@ impl GraphStore {
     }
 
     pub fn set_irokle_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut batch = self.new_batch();
+        let graph_id =
+            self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
         let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
         meta.irokle_topic = Some(topic_id);
-        self.write_graph_meta_immediate(graph_id, &meta)
+        batch.insert(
+            &self.graphs,
+            graph_meta_key(graph_id),
+            postcard::to_allocvec(&meta)?,
+        );
+        self.commit(batch)
     }
 
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
@@ -1634,7 +1652,8 @@ impl GraphStore {
         graph: &GraphId,
         clock: &VectorClock,
     ) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
         let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
         meta.clock = clock.clone();
         batch.insert(
@@ -1651,7 +1670,8 @@ impl GraphStore {
         graph: &GraphId,
         actor: &ActorId,
     ) -> Result<u64> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
         let key = log_head_key(graph_id, actor);
         let counter = match self.log.get(key)? {
             Some(value) => decode_u64_bytes(value.as_ref(), "log head")? + 1,
@@ -1667,7 +1687,8 @@ impl GraphStore {
         graph: &GraphId,
         stored_batch: &StoredBatch,
     ) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
         batch.insert(
             &self.log,
             log_batch_key(graph_id, &stored_batch.actor, stored_batch.counter),
@@ -1794,7 +1815,8 @@ impl GraphStore {
         graph: &GraphId,
         subject: TermId,
     ) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
         self.enqueue_fts_by_graph_id(batch, graph_id, subject)
     }
 
@@ -1823,7 +1845,8 @@ impl GraphStore {
             return Ok(());
         }
 
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
         if subjects.len() >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD {
             return self.enqueue_fts_reindex_by_graph_id(batch, graph_id);
         }
@@ -1835,7 +1858,8 @@ impl GraphStore {
     }
 
     pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph: &GraphId) -> Result<()> {
-        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
         self.enqueue_fts_reindex_by_graph_id(batch, graph_id)
     }
 
@@ -1937,9 +1961,11 @@ impl GraphStore {
             return Ok(());
         }
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         for (graph, subject, token) in queued {
-            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let Some(graph_id) = self.graph_id_for(graph)? else {
+                continue;
+            };
             let key = graph_dirty_key(graph_id, *subject);
             if self.graphs.get(key)?.is_some_and(|current| {
                 decode_u64_bytes(current.as_ref(), "graph dirty token").ok() == Some(*token)
@@ -1947,7 +1973,7 @@ impl GraphStore {
                 batch.remove(&self.graphs, key);
             }
         }
-        batch.commit()?;
+        self.commit_fjall_batch(batch)?;
         Ok(())
     }
 
@@ -1956,9 +1982,11 @@ impl GraphStore {
             return Ok(());
         }
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         for (graph, token) in queued {
-            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let Some(graph_id) = self.graph_id_for(graph)? else {
+                continue;
+            };
             let key = graph_reindex_key(graph_id);
             if self.graphs.get(key)?.is_some_and(|current| {
                 decode_u64_bytes(current.as_ref(), "graph reindex token").ok() == Some(*token)
@@ -1966,7 +1994,7 @@ impl GraphStore {
                 batch.remove(&self.graphs, key);
             }
         }
-        batch.commit()?;
+        self.commit_fjall_batch(batch)?;
         Ok(())
     }
 
@@ -1975,9 +2003,11 @@ impl GraphStore {
             return Ok(());
         }
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         for (graph, token) in queued {
-            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let Some(graph_id) = self.graph_id_for(graph)? else {
+                continue;
+            };
             let key = graph_search_delete_key(graph_id);
             if self.graphs.get(key)?.is_some_and(|current| {
                 decode_u64_bytes(current.as_ref(), "graph search delete token").ok() == Some(*token)
@@ -1985,7 +2015,7 @@ impl GraphStore {
                 batch.remove(&self.graphs, key);
             }
         }
-        batch.commit()?;
+        self.commit_fjall_batch(batch)?;
         Ok(())
     }
 
@@ -1997,10 +2027,12 @@ impl GraphStore {
             return Ok(());
         }
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         let mut dirty = false;
         for (graph, reindex_token) in queued {
-            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let Some(graph_id) = self.graph_id_for(graph)? else {
+                continue;
+            };
             for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
                 let (key, value) = guard.into_inner()?;
                 let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
@@ -2012,7 +2044,7 @@ impl GraphStore {
         }
 
         if dirty {
-            batch.commit()?;
+            self.commit_fjall_batch(batch)?;
         }
         Ok(())
     }
@@ -2025,10 +2057,12 @@ impl GraphStore {
             return Ok(());
         }
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         let mut dirty = false;
         for (graph, delete_token) in queued {
-            let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let Some(graph_id) = self.graph_id_for(graph)? else {
+                continue;
+            };
             for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
                 let (key, value) = guard.into_inner()?;
                 let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
@@ -2050,7 +2084,7 @@ impl GraphStore {
         }
 
         if dirty {
-            batch.commit()?;
+            self.commit_fjall_batch(batch)?;
         }
         Ok(())
     }
@@ -2060,7 +2094,7 @@ impl GraphStore {
             return Ok(());
         };
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         let mut dirty = false;
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
@@ -2081,7 +2115,7 @@ impl GraphStore {
         }
 
         if dirty {
-            batch.commit()?;
+            self.commit_fjall_batch(batch)?;
         }
         Ok(())
     }
@@ -2096,9 +2130,9 @@ impl GraphStore {
             return Ok(());
         }
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         batch.remove(&self.graphs, reindex_key);
-        batch.commit()?;
+        self.commit_fjall_batch(batch)?;
         Ok(())
     }
 
@@ -2111,7 +2145,7 @@ impl GraphStore {
             return Ok(());
         };
 
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         let mut dirty = false;
         for subject in subjects {
             let Some(subject_id) = self.lookup_term(subject)? else {
@@ -2125,13 +2159,13 @@ impl GraphStore {
         }
 
         if dirty {
-            batch.commit()?;
+            self.commit_fjall_batch(batch)?;
         }
         Ok(())
     }
 
     pub fn clear_fts_queue(&self) -> Result<()> {
-        let mut batch = self.db.batch();
+        let mut batch = self.buffered_batch();
         let mut dirty = false;
         for guard in self.graphs.prefix(graph_dirty_prefix()) {
             let (key, _) = guard.into_inner()?;
@@ -2149,13 +2183,27 @@ impl GraphStore {
             dirty = true;
         }
         if dirty {
-            batch.commit()?;
+            self.commit_fjall_batch(batch)?;
         }
         Ok(())
     }
 
     pub fn new_batch(&self) -> WriteBatch {
-        WriteBatch::new(self.db.batch())
+        WriteBatch::new(self.buffered_batch())
+    }
+
+    fn buffered_batch(&self) -> fjall::OwnedWriteBatch {
+        self.db.batch().durability(Some(PersistMode::Buffer))
+    }
+
+    pub fn persist(&self) -> Result<()> {
+        self.db.persist(PersistMode::SyncData)?;
+        Ok(())
+    }
+
+    fn commit_fjall_batch(&self, batch: fjall::OwnedWriteBatch) -> Result<()> {
+        batch.commit()?;
+        Ok(())
     }
 
     pub fn commit(&self, batch: WriteBatch) -> Result<()> {

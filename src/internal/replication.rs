@@ -249,7 +249,17 @@ impl ReplicationEngine {
         validated_orphan_free: bool,
     ) -> Result<Batch, UpdateError> {
         if let Some(sync) = &self.sync {
-            return self.publish_and_apply_changes(sync, graph, changes);
+            let can_preserve_clean_diagnostics = diagnostics_refresh
+                == DiagnosticsRefresh::Immediate
+                && validated_orphan_free
+                && !self.store.graph_diagnostics(graph)?.has_orphans();
+            return self.publish_and_apply_changes(
+                sync,
+                graph,
+                changes,
+                diagnostics_refresh,
+                can_preserve_clean_diagnostics,
+            );
         }
 
         let mut batch = self.store.new_batch();
@@ -425,6 +435,8 @@ impl ReplicationEngine {
         sync: &Arc<dyn crate::sync::CraqleGraphSync>,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
+        diagnostics_refresh: DiagnosticsRefresh,
+        can_preserve_clean_diagnostics: bool,
     ) -> Result<Batch, UpdateError> {
         let record = sync.publish_changes(&self.store, graph, changes)?;
         let Some(batch) = crate::sync::batch_from_irokle_record(&record)? else {
@@ -433,8 +445,12 @@ impl ReplicationEngine {
             ));
         };
 
-        self.apply_irokle_batch(batch.clone())
-            .map_err(update_error_from_merge)?;
+        self.apply_irokle_batch_with_mode(
+            batch.clone(),
+            diagnostics_refresh,
+            can_preserve_clean_diagnostics,
+        )
+        .map_err(update_error_from_merge)?;
         Ok(batch)
     }
 
@@ -468,6 +484,15 @@ impl ReplicationEngine {
     /// enforces causal delivery; this path intentionally bypasses Craqle's old
     /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
     pub fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
+        self.apply_irokle_batch_with_mode(incoming, DiagnosticsRefresh::Immediate, false)
+    }
+
+    fn apply_irokle_batch_with_mode(
+        &self,
+        incoming: Batch,
+        diagnostics_refresh: DiagnosticsRefresh,
+        can_preserve_clean_diagnostics: bool,
+    ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
         if !self.store.contains_graph(graph)? {
@@ -482,8 +507,18 @@ impl ReplicationEngine {
             return Ok(MergeResult { applied: false });
         }
 
-        self.apply_single_batch(&incoming, &mut vector_clock)?;
-        self.finalize_remote_graph(graph)?;
+        self.apply_single_batch_with_mode(&incoming, &mut vector_clock, diagnostics_refresh)?;
+        match diagnostics_refresh {
+            DiagnosticsRefresh::Immediate => {
+                if can_preserve_clean_diagnostics {
+                    self.store
+                        .set_graph_diagnostics(graph, &crate::core::GraphDiagnostics::default())?;
+                } else {
+                    self.finalize_remote_graph(graph)?;
+                }
+            }
+            DiagnosticsRefresh::Deferred => {}
+        }
         Ok(MergeResult { applied: true })
     }
 
@@ -545,6 +580,15 @@ impl ReplicationEngine {
         &self,
         incoming: &Batch,
         vector_clock: &mut VectorClock,
+    ) -> Result<(), MergeError> {
+        self.apply_single_batch_with_mode(incoming, vector_clock, DiagnosticsRefresh::Immediate)
+    }
+
+    fn apply_single_batch_with_mode(
+        &self,
+        incoming: &Batch,
+        vector_clock: &mut VectorClock,
+        diagnostics_refresh: DiagnosticsRefresh,
     ) -> Result<(), MergeError> {
         let graph = &incoming.graph;
         let mut batch = self.store.new_batch();
@@ -644,8 +688,13 @@ impl ReplicationEngine {
             },
         )?;
 
-        self.store
-            .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
+        match diagnostics_refresh {
+            DiagnosticsRefresh::Immediate => {
+                self.store
+                    .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?
+            }
+            DiagnosticsRefresh::Deferred => self.store.enqueue_fts_reindex(&mut batch, graph)?,
+        }
 
         self.store.commit(batch)?;
         Ok(())

@@ -7,7 +7,7 @@ use crate::store::GraphStore;
 use chrono::Utc;
 use irokle::history::HistoryOrder;
 use irokle::reducer::EventRecord;
-use irokle::{Event, ReplicationPolicy, TopicConfig};
+use irokle::{Event, PublishOptions, ReplicationPolicy, TopicConfig, WriteConcern};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
@@ -35,6 +35,9 @@ impl CraqleGraphEvent {
 pub struct CraqleIrokleOptions {
     pub initial_peers: BTreeSet<irokle::PeerId>,
     pub replication_policy: ReplicationPolicy,
+    /// Write concern for Craqle graph-event publishes. Defaults to local
+    /// durability so Iroh async-replication bookkeeping does not block writes.
+    pub write_concern: WriteConcern,
 }
 
 impl CraqleIrokleOptions {
@@ -52,6 +55,11 @@ impl CraqleIrokleOptions {
 
     pub fn with_replication_policy(mut self, policy: ReplicationPolicy) -> Self {
         self.replication_policy = policy;
+        self
+    }
+
+    pub fn with_write_concern(mut self, write_concern: WriteConcern) -> Self {
+        self.write_concern = write_concern;
         self
     }
 }
@@ -167,10 +175,13 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         changes: Vec<MaterializedQuadChange>,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, graph)?;
-        Ok(topic.publish(CraqleGraphEvent::QuadChanges {
-            graph: graph.clone(),
-            changes,
-        })?)
+        Ok(topic.publish_with(
+            CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes,
+            },
+            self.publish_options(),
+        )?)
     }
 
     fn publish_policy(
@@ -180,10 +191,13 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         policy: GraphPolicy,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, graph)?;
-        Ok(topic.publish(CraqleGraphEvent::Policy {
-            graph: graph.clone(),
-            policy,
-        })?)
+        Ok(topic.publish_with(
+            CraqleGraphEvent::Policy {
+                graph: graph.clone(),
+                policy,
+            },
+            self.publish_options(),
+        )?)
     }
 
     fn graph_topic_id(
@@ -283,6 +297,14 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             return Ok(Vec::new());
         };
         Ok(self.node.sync_status(topic_id)?)
+    }
+}
+
+impl<S: irokle::Storage> IrokleGraphSync<S> {
+    fn publish_options(&self) -> PublishOptions {
+        PublishOptions {
+            write_concern: self.options.write_concern.clone(),
+        }
     }
 }
 
