@@ -290,6 +290,20 @@ pub struct CraqleNode {
 pub struct CraqleOptions {
     actor: ActorId,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+    search_storage: SearchStorage,
+}
+
+/// Storage backend used for the full-text search index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchStorage {
+    Disk,
+    Memory,
+}
+
+impl Default for SearchStorage {
+    fn default() -> Self {
+        Self::Disk
+    }
 }
 
 impl Default for CraqleOptions {
@@ -297,6 +311,7 @@ impl Default for CraqleOptions {
         Self {
             actor: ActorId::random(),
             sync: None,
+            search_storage: SearchStorage::default(),
         }
     }
 }
@@ -308,6 +323,11 @@ impl CraqleOptions {
 
     pub fn with_actor(mut self, actor: ActorId) -> Self {
         self.actor = actor;
+        self
+    }
+
+    pub fn with_search_storage(mut self, search_storage: SearchStorage) -> Self {
+        self.search_storage = search_storage;
         self
     }
 
@@ -340,12 +360,18 @@ impl CraqleNode {
     pub fn open_with_options(path: impl AsRef<Path>, options: CraqleOptions) -> Result<Self> {
         let root = path.as_ref();
         std::fs::create_dir_all(root)?;
+        let search_storage = options.search_storage;
 
         let store = Arc::new(GraphStore::open(root.join("store"))?);
-        let search = Arc::new(SearchIndex::open(root.join("search"))?);
+        let search = Arc::new(match search_storage {
+            SearchStorage::Disk => SearchIndex::open(root.join("search"))?,
+            SearchStorage::Memory => SearchIndex::open_in_memory()?,
+        });
+        let search_needs_rebuild =
+            search.needs_rebuild() || search_storage == SearchStorage::Memory;
         let node = Self::from_store_and_search(store, search.clone(), options);
         node.reconcile_irokle()?;
-        if search.needs_rebuild() {
+        if search_needs_rebuild {
             node.schedule_full_search_reindex()?;
         }
         Ok(node)
