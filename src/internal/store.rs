@@ -975,11 +975,11 @@ impl GraphStore {
     }
 
     pub fn manual_compact(&self) -> Result<()> {
-        self.db.persist(PersistMode::SyncData)?;
+        self.db.persist(PersistMode::Buffer)?;
         for keyspace in [&self.terms, &self.quads, &self.graphs, &self.log] {
             keyspace.major_compact()?;
         }
-        self.db.persist(PersistMode::SyncData)?;
+        self.db.persist(PersistMode::Buffer)?;
         Ok(())
     }
 
@@ -2197,7 +2197,7 @@ impl GraphStore {
     }
 
     pub fn persist(&self) -> Result<()> {
-        self.db.persist(PersistMode::SyncData)?;
+        self.db.persist(PersistMode::Buffer)?;
         Ok(())
     }
 
