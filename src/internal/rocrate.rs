@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::replication::ReplicationEngine;
@@ -112,84 +113,158 @@ impl RoCrateManager {
         date_published: &str,
         license: &str,
     ) -> Result<Batch, RoCrateError> {
-        let root_id = root_id(&graph_id);
-        if self.graph_is_empty(&graph_id)? {
-            let changes = vec![
-                insert_change(
+        let total_started = Instant::now();
+        let result = (|| {
+            let root_id = root_id(&graph_id);
+            let is_empty = crate::trace_latency_step(
+                "craqle.rocrate.create_crate",
+                "graph_is_empty",
+                &graph_id,
+                || self.graph_is_empty(&graph_id),
+            )?;
+            if is_empty {
+                let started = Instant::now();
+                let license_value = encoded_license_value(license)?;
+                crate::record_latency_step(
+                    "craqle.rocrate.create_crate",
+                    "encode_license",
                     &graph_id,
-                    METADATA_ID,
-                    &vocab::rdf_type(),
-                    EncodedTerm::from_named_node(&vocab::schema_creative_work()),
-                ),
-                insert_change(
-                    &graph_id,
-                    METADATA_ID,
-                    &vocab::schema_conforms_to(),
-                    encoded_identifier(ROCRATE_SPEC_URL),
-                ),
-                insert_change(
-                    &graph_id,
-                    METADATA_ID,
-                    &vocab::schema_about(),
-                    encoded_identifier(root_id),
-                ),
-                insert_change(
-                    &graph_id,
-                    root_id,
-                    &vocab::rdf_type(),
-                    EncodedTerm::from_named_node(&vocab::schema_dataset()),
-                ),
-                insert_change(
-                    &graph_id,
-                    root_id,
-                    &vocab::schema_name(),
-                    encoded_literal(name),
-                ),
-                insert_change(
-                    &graph_id,
-                    root_id,
-                    &vocab::schema_description(),
-                    encoded_literal(description),
-                ),
-                insert_change(
-                    &graph_id,
-                    root_id,
-                    &vocab::schema_date_published(),
-                    encoded_literal(date_published),
-                ),
-                insert_change(
-                    &graph_id,
-                    root_id,
-                    &vocab::schema_license(),
-                    encoded_license_value(license)?,
-                ),
-            ];
-            return Ok(self.engine.local_apply_changes(&graph_id, changes)?);
-        }
+                    started,
+                    true,
+                );
 
-        let rocrate = RoCrate {
-            context: default_context(),
-            graph: vec![
-                GraphVector::MetadataDescriptor(MetadataDescriptor {
-                    id: METADATA_ID.to_string(),
-                    type_: DataType::Term("CreativeWork".to_string()),
-                    conforms_to: Id::Id(ROCRATE_SPEC_URL.to_string()),
-                    about: Id::Id(root_id.to_string()),
-                    dynamic_entity: Some(HashMap::new()),
-                }),
-                GraphVector::RootDataEntity(RootDataEntity {
-                    id: root_id.to_string(),
-                    type_: DataType::Term("Dataset".to_string()),
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    date_published: date_published.to_string(),
-                    license: license_from_str(license)?,
-                    dynamic_entity: Some(HashMap::new()),
-                }),
-            ],
-        };
+                let started = Instant::now();
+                let changes = vec![
+                    insert_change(
+                        &graph_id,
+                        METADATA_ID,
+                        &vocab::rdf_type(),
+                        EncodedTerm::from_named_node(&vocab::schema_creative_work()),
+                    ),
+                    insert_change(
+                        &graph_id,
+                        METADATA_ID,
+                        &vocab::schema_conforms_to(),
+                        encoded_identifier(ROCRATE_SPEC_URL),
+                    ),
+                    insert_change(
+                        &graph_id,
+                        METADATA_ID,
+                        &vocab::schema_about(),
+                        encoded_identifier(root_id),
+                    ),
+                    insert_change(
+                        &graph_id,
+                        root_id,
+                        &vocab::rdf_type(),
+                        EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                    ),
+                    insert_change(
+                        &graph_id,
+                        root_id,
+                        &vocab::schema_name(),
+                        encoded_literal(name),
+                    ),
+                    insert_change(
+                        &graph_id,
+                        root_id,
+                        &vocab::schema_description(),
+                        encoded_literal(description),
+                    ),
+                    insert_change(
+                        &graph_id,
+                        root_id,
+                        &vocab::schema_date_published(),
+                        encoded_literal(date_published),
+                    ),
+                    insert_change(&graph_id, root_id, &vocab::schema_license(), license_value),
+                ];
+                crate::record_latency_step(
+                    "craqle.rocrate.create_crate",
+                    "build_base_changes",
+                    &graph_id,
+                    started,
+                    true,
+                );
+                tracing::debug!(
+                    event = "craqle.rocrate.create_crate.changes",
+                    operation = "craqle.rocrate.create_crate",
+                    step = "build_base_changes",
+                    graph = %graph_id.as_str(),
+                    change_count = changes.len() as u64,
+                );
+                return Ok(crate::trace_latency_step(
+                    "craqle.rocrate.create_crate",
+                    "local_apply_changes",
+                    &graph_id,
+                    || self.engine.local_apply_changes(&graph_id, changes),
+                )?);
+            }
 
-        self.replace_graph_with_rocrate(&graph_id, rocrate)
+            let started = Instant::now();
+            let license = license_from_str(license)?;
+            crate::record_latency_step(
+                "craqle.rocrate.create_crate",
+                "parse_license",
+                &graph_id,
+                started,
+                true,
+            );
+
+            let started = Instant::now();
+            let rocrate = RoCrate {
+                context: default_context(),
+                graph: vec![
+                    GraphVector::MetadataDescriptor(MetadataDescriptor {
+                        id: METADATA_ID.to_string(),
+                        type_: DataType::Term("CreativeWork".to_string()),
+                        conforms_to: Id::Id(ROCRATE_SPEC_URL.to_string()),
+                        about: Id::Id(root_id.to_string()),
+                        dynamic_entity: Some(HashMap::new()),
+                    }),
+                    GraphVector::RootDataEntity(RootDataEntity {
+                        id: root_id.to_string(),
+                        type_: DataType::Term("Dataset".to_string()),
+                        name: name.to_string(),
+                        description: description.to_string(),
+                        date_published: date_published.to_string(),
+                        license,
+                        dynamic_entity: Some(HashMap::new()),
+                    }),
+                ],
+            };
+            crate::record_latency_step(
+                "craqle.rocrate.create_crate",
+                "build_replacement_rocrate",
+                &graph_id,
+                started,
+                true,
+            );
+
+            crate::trace_latency_step(
+                "craqle.rocrate.create_crate",
+                "replace_graph_with_rocrate",
+                &graph_id,
+                || self.replace_graph_with_rocrate(&graph_id, rocrate),
+            )
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        let batch_ops = result
+            .as_ref()
+            .map(|batch| batch.ops.len() as u64)
+            .unwrap_or(0);
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.rocrate.create_crate",
+            graph = %graph_id.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            batch_ops = batch_ops,
+        );
+        result
     }
 
     /// Add a data entity with automatic hasPart linkage from root.
