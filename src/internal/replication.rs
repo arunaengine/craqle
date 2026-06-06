@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::core::*;
 use crate::rules::{GraphSnapshot, Rule};
@@ -131,30 +132,78 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        let total_started = Instant::now();
+        let change_count = changes.len() as u64;
+        let result = (|| {
+            crate::trace_latency_step(
+                "craqle.replication.local_apply_changes",
+                "ensure_change_set_targets",
+                graph,
+                || self.ensure_change_set_targets(graph, &changes),
+            )?;
 
-        if changes.is_empty() {
-            return Ok(Batch {
-                graph: graph.clone(),
-                actor: self.actor,
-                counter: 0,
-                base_clock: self.store.get_vector_clock(graph)?,
-                ops: vec![],
-                timestamp: Utc::now(),
-            });
-        }
-
-        match crate::rules::validate_change_set(&self.rules, &self.store, graph, &changes) {
-            Ok(()) => {}
-            Err(crate::rules::RuleEvaluationError::Store(error)) => {
-                return Err(UpdateError::Store(error));
+            if changes.is_empty() {
+                let base_clock = crate::trace_latency_step(
+                    "craqle.replication.local_apply_changes",
+                    "get_vector_clock_empty_change_set",
+                    graph,
+                    || self.store.get_vector_clock(graph),
+                )?;
+                return Ok(Batch {
+                    graph: graph.clone(),
+                    actor: self.actor,
+                    counter: 0,
+                    base_clock,
+                    ops: vec![],
+                    timestamp: Utc::now(),
+                });
             }
-            Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
-                return Err(UpdateError::ValidationFailed(violations));
-            }
-        }
 
-        self.commit_changes(graph, changes)
+            crate::trace_latency_step(
+                "craqle.replication.local_apply_changes",
+                "validate_change_set",
+                graph,
+                || match crate::rules::validate_change_set(
+                    &self.rules,
+                    &self.store,
+                    graph,
+                    &changes,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(crate::rules::RuleEvaluationError::Store(error)) => {
+                        Err(UpdateError::Store(error))
+                    }
+                    Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
+                        Err(UpdateError::ValidationFailed(violations))
+                    }
+                },
+            )?;
+
+            crate::trace_latency_step(
+                "craqle.replication.local_apply_changes",
+                "commit_changes",
+                graph,
+                || self.commit_changes(graph, changes),
+            )
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        let batch_ops = result
+            .as_ref()
+            .map(|batch| batch.ops.len() as u64)
+            .unwrap_or(0);
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.replication.local_apply_changes",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            change_count = change_count,
+            batch_ops = batch_ops,
+        );
+        result
     }
 
     /// Apply a pre-materialized change set locally without full graph validation.
@@ -248,18 +297,58 @@ impl ReplicationEngine {
         diagnostics_refresh: DiagnosticsRefresh,
         validated_orphan_free: bool,
     ) -> Result<Batch, UpdateError> {
+        let total_started = Instant::now();
+        let change_count = changes.len() as u64;
         if let Some(sync) = &self.sync {
-            let can_preserve_clean_diagnostics = diagnostics_refresh
-                == DiagnosticsRefresh::Immediate
-                && validated_orphan_free
-                && !self.store.graph_diagnostics(graph)?.has_orphans();
-            return self.publish_and_apply_changes(
-                sync,
-                graph,
-                changes,
-                diagnostics_refresh,
-                can_preserve_clean_diagnostics,
+            let result = (|| {
+                let can_preserve_clean_diagnostics = if diagnostics_refresh
+                    == DiagnosticsRefresh::Immediate
+                    && validated_orphan_free
+                {
+                    !crate::trace_latency_step(
+                        "craqle.replication.commit_changes_with_mode",
+                        "graph_diagnostics",
+                        graph,
+                        || self.store.graph_diagnostics(graph),
+                    )?
+                    .has_orphans()
+                } else {
+                    false
+                };
+                crate::trace_latency_step(
+                    "craqle.replication.commit_changes_with_mode",
+                    "publish_and_apply_changes",
+                    graph,
+                    || {
+                        self.publish_and_apply_changes(
+                            sync,
+                            graph,
+                            changes,
+                            diagnostics_refresh,
+                            can_preserve_clean_diagnostics,
+                        )
+                    },
+                )
+            })();
+
+            let elapsed = total_started.elapsed();
+            let result_status = if result.is_ok() { "ok" } else { "error" };
+            let batch_ops = result
+                .as_ref()
+                .map(|batch| batch.ops.len() as u64)
+                .unwrap_or(0);
+            tracing::debug!(
+                event = "craqle.latency.total",
+                operation = "craqle.replication.commit_changes_with_mode",
+                graph = %graph.as_str(),
+                duration_ms = elapsed.as_millis() as u64,
+                duration_us = elapsed.as_micros() as u64,
+                result = result_status,
+                sync_enabled = true,
+                change_count = change_count,
+                batch_ops = batch_ops,
             );
+            return result;
         }
 
         let mut batch = self.store.new_batch();
@@ -438,20 +527,60 @@ impl ReplicationEngine {
         diagnostics_refresh: DiagnosticsRefresh,
         can_preserve_clean_diagnostics: bool,
     ) -> Result<Batch, UpdateError> {
-        let record = sync.publish_changes(&self.store, graph, changes)?;
-        let Some(batch) = crate::sync::batch_from_irokle_record(&record)? else {
-            return Err(UpdateError::InvalidChangeSet(
-                "irokle changes publish did not return a quad-change record".to_string(),
-            ));
-        };
+        let total_started = Instant::now();
+        let change_count = changes.len() as u64;
+        let result = (|| {
+            let record = crate::trace_latency_step(
+                "craqle.replication.publish_and_apply_changes",
+                "irokle_publish_changes",
+                graph,
+                || sync.publish_changes(&self.store, graph, changes),
+            )?;
+            let batch = crate::trace_latency_step(
+                "craqle.replication.publish_and_apply_changes",
+                "batch_from_irokle_record",
+                graph,
+                || crate::sync::batch_from_irokle_record(&record),
+            )?;
+            let Some(batch) = batch else {
+                return Err(UpdateError::InvalidChangeSet(
+                    "irokle changes publish did not return a quad-change record".to_string(),
+                ));
+            };
 
-        self.apply_irokle_batch_with_mode(
-            batch.clone(),
-            diagnostics_refresh,
-            can_preserve_clean_diagnostics,
-        )
-        .map_err(update_error_from_merge)?;
-        Ok(batch)
+            crate::trace_latency_step(
+                "craqle.replication.publish_and_apply_changes",
+                "apply_irokle_batch_with_mode",
+                graph,
+                || {
+                    self.apply_irokle_batch_with_mode(
+                        batch.clone(),
+                        diagnostics_refresh,
+                        can_preserve_clean_diagnostics,
+                    )
+                    .map_err(update_error_from_merge)
+                },
+            )?;
+            Ok(batch)
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        let batch_ops = result
+            .as_ref()
+            .map(|batch| batch.ops.len() as u64)
+            .unwrap_or(0);
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.replication.publish_and_apply_changes",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            change_count = change_count,
+            batch_ops = batch_ops,
+        );
+        result
     }
 
     /// Apply a remote batch using OR-Set CRDT semantics.
@@ -493,33 +622,105 @@ impl ReplicationEngine {
         diagnostics_refresh: DiagnosticsRefresh,
         can_preserve_clean_diagnostics: bool,
     ) -> Result<MergeResult, MergeError> {
-        let graph = &incoming.graph;
+        let graph_id = incoming.graph.clone();
+        let op_count = incoming.ops.len() as u64;
+        let total_started = Instant::now();
+        let result = (|| {
+            let graph = &incoming.graph;
 
-        if !self.store.contains_graph(graph)? {
-            self.store.create_graph(graph)?;
-        }
-
-        let mut vector_clock = self.store.get_vector_clock(graph)?;
-        if vector_clock.contains(&Dot {
-            actor: incoming.actor,
-            counter: incoming.counter,
-        }) {
-            return Ok(MergeResult { applied: false });
-        }
-
-        self.apply_single_batch_with_mode(&incoming, &mut vector_clock, diagnostics_refresh)?;
-        match diagnostics_refresh {
-            DiagnosticsRefresh::Immediate => {
-                if can_preserve_clean_diagnostics {
-                    self.store
-                        .set_graph_diagnostics(graph, &crate::core::GraphDiagnostics::default())?;
-                } else {
-                    self.finalize_remote_graph(graph)?;
-                }
+            if !crate::trace_latency_step(
+                "craqle.replication.apply_irokle_batch_with_mode",
+                "contains_graph",
+                graph,
+                || self.store.contains_graph(graph),
+            )? {
+                crate::trace_latency_step(
+                    "craqle.replication.apply_irokle_batch_with_mode",
+                    "create_graph",
+                    graph,
+                    || self.store.create_graph(graph),
+                )?;
             }
-            DiagnosticsRefresh::Deferred => {}
-        }
-        Ok(MergeResult { applied: true })
+
+            let mut vector_clock = crate::trace_latency_step(
+                "craqle.replication.apply_irokle_batch_with_mode",
+                "get_vector_clock",
+                graph,
+                || self.store.get_vector_clock(graph),
+            )?;
+            let started = Instant::now();
+            let already_applied = vector_clock.contains(&Dot {
+                actor: incoming.actor,
+                counter: incoming.counter,
+            });
+            crate::record_latency_step(
+                "craqle.replication.apply_irokle_batch_with_mode",
+                "contains_dot",
+                graph,
+                started,
+                true,
+            );
+            if already_applied {
+                return Ok(MergeResult { applied: false });
+            }
+
+            crate::trace_latency_step(
+                "craqle.replication.apply_irokle_batch_with_mode",
+                "apply_single_batch_with_mode",
+                graph,
+                || {
+                    self.apply_single_batch_with_mode(
+                        &incoming,
+                        &mut vector_clock,
+                        diagnostics_refresh,
+                    )
+                },
+            )?;
+            match diagnostics_refresh {
+                DiagnosticsRefresh::Immediate => {
+                    if can_preserve_clean_diagnostics {
+                        crate::trace_latency_step(
+                            "craqle.replication.apply_irokle_batch_with_mode",
+                            "set_clean_graph_diagnostics",
+                            graph,
+                            || {
+                                self.store.set_graph_diagnostics(
+                                    graph,
+                                    &crate::core::GraphDiagnostics::default(),
+                                )
+                            },
+                        )?;
+                    } else {
+                        crate::trace_latency_step(
+                            "craqle.replication.apply_irokle_batch_with_mode",
+                            "finalize_remote_graph",
+                            graph,
+                            || self.finalize_remote_graph(graph),
+                        )?;
+                    }
+                }
+                DiagnosticsRefresh::Deferred => {}
+            }
+            Ok(MergeResult { applied: true })
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        let applied = result
+            .as_ref()
+            .map(|result| result.applied)
+            .unwrap_or(false);
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.replication.apply_irokle_batch_with_mode",
+            graph = %graph_id.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            applied = applied,
+            op_count = op_count,
+        );
+        result
     }
 
     pub fn apply_irokle_record(
@@ -591,113 +792,194 @@ impl ReplicationEngine {
         diagnostics_refresh: DiagnosticsRefresh,
     ) -> Result<(), MergeError> {
         let graph = &incoming.graph;
+        let total_started = Instant::now();
+        let op_count = incoming.ops.len() as u64;
+        let started = Instant::now();
         let mut batch = self.store.new_batch();
+        crate::record_latency_step(
+            "craqle.replication.apply_single_batch_with_mode",
+            "new_batch",
+            graph,
+            started,
+            true,
+        );
         let mut affected_subjects = std::collections::HashSet::new();
         let mut term_cache = HashMap::new();
         let mut stored_ops = Vec::with_capacity(incoming.ops.len());
 
-        self.store.seed_term_cache(
-            &mut batch,
-            &mut term_cache,
-            incoming.ops.iter().flat_map(|op| match op {
-                QuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    ..
-                }
-                | QuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    ..
-                } => [subject, predicate, object],
-            }),
-        )?;
+        let result = (|| {
+            crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "seed_term_cache",
+                graph,
+                || {
+                    self.store.seed_term_cache(
+                        &mut batch,
+                        &mut term_cache,
+                        incoming.ops.iter().flat_map(|op| match op {
+                            QuadOp::Add {
+                                subject,
+                                predicate,
+                                object,
+                                ..
+                            }
+                            | QuadOp::Remove {
+                                subject,
+                                predicate,
+                                object,
+                                ..
+                            } => [subject, predicate, object],
+                        }),
+                    )
+                },
+            )?;
 
-        let g = self
-            .store
-            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
+            let g = crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "resolve_graph_term",
+                graph,
+                || {
+                    self.store
+                        .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                },
+            )?;
 
-        for op in &incoming.ops {
-            match op {
-                QuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    dot,
-                } => {
-                    let s = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, subject)?;
-                    let p =
+            crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "apply_ops",
+                graph,
+                || {
+                    for op in &incoming.ops {
+                        match op {
+                            QuadOp::Add {
+                                subject,
+                                predicate,
+                                object,
+                                dot,
+                            } => {
+                                let s = self.store.resolve_term_cached(
+                                    &mut batch,
+                                    &mut term_cache,
+                                    subject,
+                                )?;
+                                let p = self.store.resolve_term_cached(
+                                    &mut batch,
+                                    &mut term_cache,
+                                    predicate,
+                                )?;
+                                let o = self.store.resolve_term_cached(
+                                    &mut batch,
+                                    &mut term_cache,
+                                    object,
+                                )?;
+                                self.store.insert_quad(&mut batch, g, s, p, o, dot)?;
+                                affected_subjects.insert(s);
+                                stored_ops.push(crate::store::StoredQuadOp::Add {
+                                    subject: s,
+                                    predicate: p,
+                                    object: o,
+                                    dot: *dot,
+                                });
+                            }
+                            QuadOp::Remove {
+                                subject,
+                                predicate,
+                                object,
+                                witnessed,
+                            } => {
+                                let s = self.store.resolve_term_cached(
+                                    &mut batch,
+                                    &mut term_cache,
+                                    subject,
+                                )?;
+                                let p = self.store.resolve_term_cached(
+                                    &mut batch,
+                                    &mut term_cache,
+                                    predicate,
+                                )?;
+                                let o = self.store.resolve_term_cached(
+                                    &mut batch,
+                                    &mut term_cache,
+                                    object,
+                                )?;
+                                self.store.remove_quad(&mut batch, g, s, p, o, witnessed)?;
+                                affected_subjects.insert(s);
+                                stored_ops.push(crate::store::StoredQuadOp::Remove {
+                                    subject: s,
+                                    predicate: p,
+                                    object: o,
+                                    witnessed: witnessed.clone(),
+                                });
+                            }
+                        }
+                    }
+                    Ok::<(), MergeError>(())
+                },
+            )?;
+
+            vector_clock.advance(incoming.actor, incoming.counter);
+            crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "set_vector_clock",
+                graph,
+                || self.store.set_vector_clock(&mut batch, graph, vector_clock),
+            )?;
+
+            crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "append_compact_batch_log",
+                graph,
+                || {
+                    self.store.append_compact_batch_log(
+                        &mut batch,
+                        graph,
+                        &crate::store::StoredBatch {
+                            actor: incoming.actor,
+                            counter: incoming.counter,
+                            base_clock: incoming.base_clock.clone(),
+                            ops: stored_ops,
+                            timestamp: incoming.timestamp,
+                        },
+                    )
+                },
+            )?;
+
+            crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "enqueue_fts",
+                graph,
+                || match diagnostics_refresh {
+                    DiagnosticsRefresh::Immediate => {
                         self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, predicate)?;
-                    let o = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, object)?;
-                    self.store.insert_quad(&mut batch, g, s, p, o, dot)?;
-                    affected_subjects.insert(s);
-                    stored_ops.push(crate::store::StoredQuadOp::Add {
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        dot: *dot,
-                    });
-                }
-                QuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    witnessed,
-                } => {
-                    let s = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, subject)?;
-                    let p =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, predicate)?;
-                    let o = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, object)?;
-                    self.store.remove_quad(&mut batch, g, s, p, o, witnessed)?;
-                    affected_subjects.insert(s);
-                    stored_ops.push(crate::store::StoredQuadOp::Remove {
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        witnessed: witnessed.clone(),
-                    });
-                }
-            }
-        }
+                            .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)
+                    }
+                    DiagnosticsRefresh::Deferred => {
+                        self.store.enqueue_fts_reindex(&mut batch, graph)
+                    }
+                },
+            )?;
 
-        vector_clock.advance(incoming.actor, incoming.counter);
-        self.store
-            .set_vector_clock(&mut batch, graph, vector_clock)?;
+            crate::trace_latency_step(
+                "craqle.replication.apply_single_batch_with_mode",
+                "commit_batch",
+                graph,
+                || self.store.commit(batch),
+            )?;
+            Ok(())
+        })();
 
-        self.store.append_compact_batch_log(
-            &mut batch,
-            graph,
-            &crate::store::StoredBatch {
-                actor: incoming.actor,
-                counter: incoming.counter,
-                base_clock: incoming.base_clock.clone(),
-                ops: stored_ops,
-                timestamp: incoming.timestamp,
-            },
-        )?;
-
-        match diagnostics_refresh {
-            DiagnosticsRefresh::Immediate => {
-                self.store
-                    .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?
-            }
-            DiagnosticsRefresh::Deferred => self.store.enqueue_fts_reindex(&mut batch, graph)?,
-        }
-
-        self.store.commit(batch)?;
-        Ok(())
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.replication.apply_single_batch_with_mode",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            op_count = op_count,
+        );
+        result
     }
 
     fn batch_is_ready(&self, vector_clock: &VectorClock, incoming: &Batch) -> bool {

@@ -32,7 +32,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
@@ -157,6 +157,38 @@ const MAX_SYNC_SNAPSHOT_QUADS: usize = 250_000;
 const MAX_SYNC_SNAPSHOT_TERMS: usize = 500_000;
 const MAX_REMOTE_BATCHES: usize = 10_000;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
+
+pub(crate) fn record_latency_step(
+    operation: &'static str,
+    step: &'static str,
+    graph: &GraphId,
+    started: Instant,
+    ok: bool,
+) {
+    let elapsed = started.elapsed();
+    let result = if ok { "ok" } else { "error" };
+    tracing::debug!(
+        event = "craqle.latency.step",
+        operation,
+        step,
+        graph = %graph.as_str(),
+        duration_ms = elapsed.as_millis() as u64,
+        duration_us = elapsed.as_micros() as u64,
+        result = result,
+    );
+}
+
+pub(crate) fn trace_latency_step<T, E>(
+    operation: &'static str,
+    step: &'static str,
+    graph: &GraphId,
+    f: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let started = Instant::now();
+    let result = f();
+    record_latency_step(operation, step, graph, started, result.is_ok());
+    result
+}
 
 enum SearchWorkerMessage {
     Wake,
@@ -489,17 +521,71 @@ impl CraqleNode {
             license,
             policy,
         } = request;
-        let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self.manager().create_crate(
-            graph.clone(),
-            &name,
-            &description,
-            &date_published,
-            &license,
-        )?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
+        let total_started = Instant::now();
+        let result = (|| {
+            let started = Instant::now();
+            let policy = policy.normalized();
+            record_latency_step(
+                "craqle.create_crate",
+                "normalize_policy",
+                &graph,
+                started,
+                true,
+            );
+            tracing::debug!(
+                event = "craqle.create_crate.input",
+                operation = "craqle.create_crate",
+                graph = %graph.as_str(),
+                name_len = name.len() as u64,
+                description_len = description.len() as u64,
+                public = policy.public,
+                permission_path_count = policy.permission_paths.len() as u64,
+            );
+
+            trace_latency_step("craqle.create_crate", "authorize", &graph, || {
+                self.ensure_policy_action(&graph, &policy, auth, Action::Write)
+            })?;
+            let batch = trace_latency_step(
+                "craqle.create_crate",
+                "manager_create_crate",
+                &graph,
+                || {
+                    self.manager().create_crate(
+                        graph.clone(),
+                        &name,
+                        &description,
+                        &date_published,
+                        &license,
+                    )
+                },
+            )?;
+            trace_latency_step(
+                "craqle.create_crate",
+                "persist_graph_policy",
+                &graph,
+                || self.persist_graph_policy(&graph, policy),
+            )?;
+            trace_latency_step("craqle.create_crate", "finish_batch", &graph, || {
+                self.finish_batch(&graph, batch)
+            })
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        let batch_ops = result
+            .as_ref()
+            .map(|batch| batch.ops.len() as u64)
+            .unwrap_or(0);
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.create_crate",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            batch_ops = batch_ops,
+        );
+        result
     }
 
     /// Create or replace a root-linked data entity using a typed request.
@@ -1153,24 +1239,56 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         action: Action,
     ) -> Result<()> {
-        let policy = if self.store.contains_graph(graph)? {
-            self.store.graph_policy(graph)?
+        let contains_graph = trace_latency_step(
+            "craqle.ensure_policy_action",
+            "contains_graph",
+            graph,
+            || self.store.contains_graph(graph),
+        )?;
+        let policy = if contains_graph {
+            trace_latency_step("craqle.ensure_policy_action", "graph_policy", graph, || {
+                self.store.graph_policy(graph)
+            })?
         } else {
             next_policy.clone()
         };
 
-        auth.authorize(graph, &policy, action)?;
+        trace_latency_step("craqle.ensure_policy_action", "authorize", graph, || {
+            auth.authorize(graph, &policy, action)
+                .map_err(CraqleError::from)
+        })?;
         Ok(())
     }
 
     fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         if let Some(sync) = &self.sync {
-            let record = sync.publish_policy(&self.store, graph, policy.clone())?;
-            self.apply_irokle_record(&record)?;
+            let record = trace_latency_step(
+                "craqle.persist_graph_policy",
+                "irokle_publish_policy",
+                graph,
+                || sync.publish_policy(&self.store, graph, policy.clone()),
+            )?;
+            let applied = trace_latency_step(
+                "craqle.persist_graph_policy",
+                "apply_policy_record",
+                graph,
+                || self.apply_irokle_record(&record),
+            )?;
+            tracing::debug!(
+                event = "craqle.persist_graph_policy.apply_result",
+                operation = "craqle.persist_graph_policy",
+                graph = %graph.as_str(),
+                applied = applied,
+            );
             return Ok(());
         }
 
-        self.set_local_graph_policy(graph, policy)
+        trace_latency_step(
+            "craqle.persist_graph_policy",
+            "set_local_graph_policy",
+            graph,
+            || self.set_local_graph_policy(graph, policy),
+        )
     }
 
     fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
@@ -1189,9 +1307,32 @@ impl CraqleNode {
     }
 
     fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
-        self.schedule_search_update_for_graph(graph)?;
-        self.persist_fjall()?;
-        Ok(batch)
+        let total_started = Instant::now();
+        let batch_ops = batch.ops.len() as u64;
+        let result = (|| {
+            trace_latency_step(
+                "craqle.finish_batch",
+                "schedule_search_update_for_graph",
+                graph,
+                || self.schedule_search_update_for_graph(graph),
+            )?;
+            trace_latency_step("craqle.finish_batch", "persist_fjall", graph, || {
+                self.persist_fjall()
+            })?;
+            Ok(batch)
+        })();
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.finish_batch",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            batch_ops = batch_ops,
+        );
+        result
     }
 
     fn finish_report(
@@ -1216,8 +1357,21 @@ impl CraqleNode {
     }
 
     fn schedule_search_update_for_graph(&self, graph: &GraphId) -> Result<()> {
-        if self.store.contains_graph(graph)? {
+        if trace_latency_step(
+            "craqle.schedule_search_update_for_graph",
+            "contains_graph",
+            graph,
+            || self.store.contains_graph(graph),
+        )? {
+            let started = Instant::now();
             self.schedule_search_update();
+            record_latency_step(
+                "craqle.schedule_search_update_for_graph",
+                "wake_worker",
+                graph,
+                started,
+                true,
+            );
         }
         Ok(())
     }

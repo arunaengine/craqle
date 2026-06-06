@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use crate::core::{
     ActorId, Batch, Dot, GraphId, GraphPolicy, MaterializedQuadChange, QuadOp, VectorClock,
@@ -162,8 +163,18 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<irokle::Topic<CraqleGraphEvent, S>> {
-        let topic_id = self.ensure_graph_topic(store, graph)?;
-        Ok(self.node.open_topic::<CraqleGraphEvent>(topic_id)?)
+        let topic_id = crate::trace_latency_step(
+            "craqle.irokle.open_graph_topic",
+            "ensure_graph_topic",
+            graph,
+            || self.ensure_graph_topic(store, graph),
+        )?;
+        Ok(crate::trace_latency_step(
+            "craqle.irokle.open_graph_topic",
+            "open_topic",
+            graph,
+            || self.node.open_topic::<CraqleGraphEvent>(topic_id),
+        )?)
     }
 }
 
@@ -174,14 +185,43 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-        let topic = self.open_graph_topic(store, graph)?;
-        Ok(topic.publish_with(
-            CraqleGraphEvent::QuadChanges {
-                graph: graph.clone(),
-                changes,
-            },
-            self.publish_options(),
-        )?)
+        let total_started = Instant::now();
+        let change_count = changes.len() as u64;
+        let result = (|| {
+            let topic = crate::trace_latency_step(
+                "craqle.irokle.publish_changes",
+                "open_graph_topic",
+                graph,
+                || self.open_graph_topic(store, graph),
+            )?;
+            Ok(crate::trace_latency_step(
+                "craqle.irokle.publish_changes",
+                "publish_with",
+                graph,
+                || {
+                    topic.publish_with(
+                        CraqleGraphEvent::QuadChanges {
+                            graph: graph.clone(),
+                            changes,
+                        },
+                        self.publish_options(),
+                    )
+                },
+            )?)
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.irokle.publish_changes",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+            change_count = change_count,
+        );
+        result
     }
 
     fn publish_policy(
@@ -190,14 +230,41 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         graph: &GraphId,
         policy: GraphPolicy,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-        let topic = self.open_graph_topic(store, graph)?;
-        Ok(topic.publish_with(
-            CraqleGraphEvent::Policy {
-                graph: graph.clone(),
-                policy,
-            },
-            self.publish_options(),
-        )?)
+        let total_started = Instant::now();
+        let result = (|| {
+            let topic = crate::trace_latency_step(
+                "craqle.irokle.publish_policy",
+                "open_graph_topic",
+                graph,
+                || self.open_graph_topic(store, graph),
+            )?;
+            Ok(crate::trace_latency_step(
+                "craqle.irokle.publish_policy",
+                "publish_with",
+                graph,
+                || {
+                    topic.publish_with(
+                        CraqleGraphEvent::Policy {
+                            graph: graph.clone(),
+                            policy,
+                        },
+                        self.publish_options(),
+                    )
+                },
+            )?)
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.irokle.publish_policy",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+        );
+        result
     }
 
     fn graph_topic_id(
@@ -215,17 +282,54 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<irokle::TopicId> {
-        if let Some(topic_id) = self.graph_topic_id(store, graph)? {
-            return Ok(topic_id);
-        }
+        let total_started = Instant::now();
+        let result = (|| {
+            if let Some(topic_id) = crate::trace_latency_step(
+                "craqle.irokle.ensure_graph_topic",
+                "graph_topic_id",
+                graph,
+                || self.graph_topic_id(store, graph),
+            )? {
+                tracing::debug!(
+                    event = "craqle.irokle.ensure_graph_topic.reuse",
+                    operation = "craqle.irokle.ensure_graph_topic",
+                    graph = %graph.as_str(),
+                );
+                return Ok(topic_id);
+            }
 
-        let topic = self.node.create_topic::<CraqleGraphEvent>(TopicConfig {
-            initial_peers: self.options.initial_peers.clone(),
-            replication_policy: self.options.replication_policy.clone(),
-        })?;
-        let topic_id = topic.id();
-        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
-        Ok(topic_id)
+            let topic = crate::trace_latency_step(
+                "craqle.irokle.ensure_graph_topic",
+                "create_topic",
+                graph,
+                || {
+                    self.node.create_topic::<CraqleGraphEvent>(TopicConfig {
+                        initial_peers: self.options.initial_peers.clone(),
+                        replication_policy: self.options.replication_policy.clone(),
+                    })
+                },
+            )?;
+            let topic_id = topic.id();
+            crate::trace_latency_step(
+                "craqle.irokle.ensure_graph_topic",
+                "store_topic_id",
+                graph,
+                || store.set_irokle_topic_id(graph, *topic_id.as_bytes()),
+            )?;
+            Ok(topic_id)
+        })();
+
+        let elapsed = total_started.elapsed();
+        let result_status = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            event = "craqle.latency.total",
+            operation = "craqle.irokle.ensure_graph_topic",
+            graph = %graph.as_str(),
+            duration_ms = elapsed.as_millis() as u64,
+            duration_us = elapsed.as_micros() as u64,
+            result = result_status,
+        );
+        result
     }
 
     fn bind_graph_topic(

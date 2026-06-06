@@ -632,6 +632,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 
