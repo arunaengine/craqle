@@ -91,6 +91,26 @@ pub enum CraqleError {
 
 pub type Result<T> = std::result::Result<T, CraqleError>;
 
+/// Request-path durability policy for callers with an external durable WAL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CraqleRequestDurability {
+    /// Persist Craqle's Fjall graph store before returning.
+    #[default]
+    Durable,
+    /// Apply locally but let the caller's already-durable WAL drive recovery.
+    WalAlreadyDurable,
+}
+
+impl CraqleRequestDurability {
+    fn persists_fjall(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+
+    fn publishes_irokle(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+}
+
 /// Input for creating a new RO-Crate graph.
 #[derive(Debug, Clone)]
 pub struct CreateCrateRequest {
@@ -532,6 +552,30 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         request: CreateCrateRequest,
     ) -> Result<Batch> {
+        self.create_crate_with_durability(auth, request, CraqleRequestDurability::Durable)
+    }
+
+    /// Create a new RO-Crate graph with an explicit request durability policy.
+    pub fn create_crate_with_durability(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
+        self.create_crate_with_durability_as(auth, request, durability, None)
+    }
+
+    /// Like [`CraqleNode::create_crate_with_durability`], but non-publishing
+    /// writes are authored under `actor`, so replicas materializing the same
+    /// logical event emit identical CRDT ops.
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
+    pub fn create_crate_with_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
         let CreateCrateRequest {
             graph,
             name,
@@ -815,11 +859,31 @@ impl CraqleNode {
         jsonld: &str,
         policy: GraphPolicy,
     ) -> Result<Batch> {
+        self.apply_rocrate_document_with_policy_and_durability(
+            auth,
+            graph,
+            jsonld,
+            policy,
+            CraqleRequestDurability::Durable,
+        )
+    }
+
+    /// Create or replace a visible RO-Crate state with explicit durability.
+    pub fn apply_rocrate_document_with_policy_and_durability(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
+        let batch = self
+            .manager_for_durability(durability)
+            .import_jsonld(graph.clone(), jsonld)?;
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
     }
 
     /// Strict variant of `apply_rocrate_document_with_policy` that validates
@@ -1171,56 +1235,39 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         action: Action,
     ) -> Result<()> {
-        let contains_graph = trace_latency_step(
-            "craqle.ensure_policy_action",
-            "contains_graph",
-            graph,
-            || self.store.contains_graph(graph),
-        )?;
-        let policy = if contains_graph {
-            trace_latency_step("craqle.ensure_policy_action", "graph_policy", graph, || {
-                self.store.graph_policy(graph)
-            })?
+        let policy = if self.store.contains_graph(graph)? {
+            self.store.graph_policy(graph)?
         } else {
             next_policy.clone()
         };
-
-        trace_latency_step("craqle.ensure_policy_action", "authorize", graph, || {
-            auth.authorize(graph, &policy, action)
-                .map_err(CraqleError::from)
-        })?;
+        auth.authorize(graph, &policy, action)?;
         Ok(())
     }
 
     fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+        self.persist_graph_policy_with_durability(graph, policy, CraqleRequestDurability::Durable)
+    }
+
+    fn persist_graph_policy_with_durability(
+        &self,
+        graph: &GraphId,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+    ) -> Result<()> {
+        if !durability.publishes_irokle() {
+            return self.set_local_graph_policy(graph, policy);
+        }
+
         if let Some(sync) = &self.sync {
-            let record = trace_latency_step(
-                "craqle.persist_graph_policy",
-                "irokle_publish_policy",
-                graph,
-                || sync.publish_policy(&self.store, graph, policy.clone()),
-            )?;
-            let applied = trace_latency_step(
-                "craqle.persist_graph_policy",
-                "apply_policy_record",
-                graph,
-                || self.apply_irokle_record(&record),
-            )?;
-            tracing::debug!(
-                event = "craqle.persist_graph_policy.apply_result",
-                operation = "craqle.persist_graph_policy",
-                graph = %graph.as_str(),
-                applied = applied,
-            );
+            if self.store.contains_graph(graph)? && self.store.graph_policy(graph)? == policy {
+                return Ok(());
+            }
+            let record = sync.publish_policy(&self.store, graph, policy.clone())?;
+            self.apply_irokle_record(&record)?;
             return Ok(());
         }
 
-        trace_latency_step(
-            "craqle.persist_graph_policy",
-            "set_local_graph_policy",
-            graph,
-            || self.set_local_graph_policy(graph, policy),
-        )
+        self.set_local_graph_policy(graph, policy)
     }
 
     fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
@@ -1239,32 +1286,20 @@ impl CraqleNode {
     }
 
     fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
-        let total_started = Instant::now();
-        let batch_ops = batch.ops.len() as u64;
-        let result = (|| {
-            trace_latency_step(
-                "craqle.finish_batch",
-                "schedule_search_update_for_graph",
-                graph,
-                || self.schedule_search_update_for_graph(graph),
-            )?;
-            trace_latency_step("craqle.finish_batch", "persist_fjall", graph, || {
-                self.persist_fjall()
-            })?;
-            Ok(batch)
-        })();
-        let elapsed = total_started.elapsed();
-        let result_status = if result.is_ok() { "ok" } else { "error" };
-        tracing::debug!(
-            event = "craqle.latency.total",
-            operation = "craqle.finish_batch",
-            graph = %graph.as_str(),
-            duration_ms = elapsed.as_millis() as u64,
-            duration_us = elapsed.as_micros() as u64,
-            result = result_status,
-            batch_ops = batch_ops,
-        );
-        result
+        self.finish_batch_with_durability(graph, batch, CraqleRequestDurability::Durable)
+    }
+
+    fn finish_batch_with_durability(
+        &self,
+        graph: &GraphId,
+        batch: Batch,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
+        self.schedule_search_update_for_graph(graph)?;
+        if durability.persists_fjall() {
+            self.persist_fjall()?;
+        }
+        Ok(batch)
     }
 
     fn finish_report(
@@ -1314,7 +1349,16 @@ impl CraqleNode {
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
     ) -> Result<bool> {
+        if self.store.graph_tombstoned(record.event.graph())? {
+            return Ok(false);
+        }
         match &record.event {
+            CraqleGraphEvent::GraphDeleted { graph } => {
+                self.store.set_graph_tombstone(graph)?;
+                self.store.delete_graph(graph)?;
+                self.schedule_search_update();
+                Ok(true)
+            }
             CraqleGraphEvent::Policy { graph, policy } => {
                 let policy = policy.clone().normalized();
                 if self.store.graph_policy(graph)? == policy {
@@ -1348,6 +1392,26 @@ impl CraqleNode {
 
     fn manager(&self) -> RoCrateManager {
         RoCrateManager::new(self.replication.clone())
+    }
+
+    fn manager_with(
+        &self,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> RoCrateManager {
+        match (durability.publishes_irokle(), actor) {
+            (true, _) => self.manager(),
+            (false, None) => RoCrateManager::new(self.local_replication.clone()),
+            (false, Some(actor)) => RoCrateManager::new(Arc::new(ReplicationEngine::new(
+                self.store.clone(),
+                self.sparql.clone(),
+                actor,
+            ))),
+        }
+    }
+
+    fn manager_for_durability(&self, durability: CraqleRequestDurability) -> RoCrateManager {
+        self.manager_with(durability, None)
     }
 }
 
