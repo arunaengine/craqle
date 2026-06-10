@@ -381,38 +381,17 @@ mod tests {
     }
 
     fn replicate_pending(cluster: &CraqleCluster) -> Result<ReplicationRound> {
-        let drain_start = Instant::now();
-        let mut batches = Vec::new();
-        for graph in cluster.peer(0).graphs()? {
-            batches.extend(
-                cluster
-                    .peer(0)
-                    .catchup_batches(&graph, &cluster.peer(1).vector_clock(&graph)?)?,
-            );
-        }
-        let drain_elapsed = drain_start.elapsed();
-        let message_count = batches.len();
-
-        if batches.is_empty() || cluster.peer_count() < 2 {
-            return Ok(ReplicationRound {
-                message_count,
-                drain_elapsed,
-                apply_elapsed: Duration::default(),
-            });
+        if cluster.peer_count() < 2 {
+            return Ok(ReplicationRound::default());
         }
 
         let apply_start = Instant::now();
-        for graph in cluster.peer(0).graphs()? {
-            cluster
-                .peer(1)
-                .import_graph_policy(&graph, cluster.peer(0).graph_policy(&graph)?)?;
-        }
-        cluster.peer(1).apply_remote_batches(batches)?;
+        let message_count = cluster.sync_pair(0, 1)?;
         let apply_elapsed = apply_start.elapsed();
 
         Ok(ReplicationRound {
             message_count,
-            drain_elapsed,
+            drain_elapsed: Duration::default(),
             apply_elapsed,
         })
     }

@@ -158,31 +158,9 @@ mod tests {
         let fingerprint = net.peer(0).graph_fingerprint(&graph).unwrap();
         let fingerprint_elapsed = fingerprint_start.elapsed();
 
-        let snapshot_start = Instant::now();
-        let snapshot = net.snapshot_graph(0, &graph).unwrap();
-        let snapshot_elapsed = snapshot_start.elapsed();
-        let snapshot_bytes = postcard::to_allocvec(&snapshot).unwrap().len() as u64;
-
-        let snapshot_import_start = Instant::now();
-        net.load_snapshot(1, &snapshot).unwrap();
-        let snapshot_import_elapsed = snapshot_import_start.elapsed();
-
-        let compact_snapshot_start = Instant::now();
-        let compact_snapshot = net.peer(0).compact_graph_snapshot(&graph).unwrap();
-        let compact_snapshot_policy = net.peer(0).graph_policy(&graph).unwrap();
-        let compact_snapshot_elapsed = compact_snapshot_start.elapsed();
-        let compact_snapshot_bytes =
-            postcard::to_allocvec(&(&compact_snapshot, &compact_snapshot_policy))
-                .unwrap()
-                .len() as u64;
-
-        let (_tmp_compact, compact_net) = setup_network(2);
-        let compact_snapshot_import_start = Instant::now();
-        compact_net
-            .peer(1)
-            .import_compact_graph_snapshot(&compact_snapshot, compact_snapshot_policy)
-            .unwrap();
-        let compact_snapshot_import_elapsed = compact_snapshot_import_start.elapsed();
+        let pair_sync_start = Instant::now();
+        let pair_sync_ops = net.sync_pair(0, 1).unwrap();
+        let pair_sync_elapsed = pair_sync_start.elapsed();
 
         let peer0_reindex_start = Instant::now();
         net.peer(0).reindex_search().unwrap();
@@ -219,16 +197,12 @@ mod tests {
             format_bytes(mean_u64(&load.batch_bytes)),
         );
         println!(
-            "post-load steps: diagnostics {:?}, fingerprint {:?} ({} quads), snapshot export {:?} ({}), snapshot import {:?}, compact snapshot {:?} ({}), compact import {:?}, peer0 fts {:?}, peer1 fts {:?}",
+            "post-load steps: diagnostics {:?}, fingerprint {:?} ({} quads), pair sync {:?} ({} ops), peer0 fts {:?}, peer1 fts {:?}",
             diagnostics_elapsed,
             fingerprint_elapsed,
             fingerprint.0,
-            snapshot_elapsed,
-            format_bytes(snapshot_bytes),
-            snapshot_import_elapsed,
-            compact_snapshot_elapsed,
-            format_bytes(compact_snapshot_bytes),
-            compact_snapshot_import_elapsed,
+            pair_sync_elapsed,
+            pair_sync_ops,
             peer0_reindex_elapsed,
             peer1_reindex_elapsed,
         );

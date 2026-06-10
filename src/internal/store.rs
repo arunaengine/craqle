@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::core::*;
-use chrono::{DateTime, Utc};
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, compaction::Leveled,
     config::CompressionPolicy,
@@ -22,8 +21,6 @@ pub enum StoreError {
     TermCollision { attempted: String, existing: String },
     #[error("graph not found: {0}")]
     GraphNotFound(String),
-    #[error("snapshot import failed: {0}")]
-    SnapshotImport(String),
     #[error("invalid stored encoding for {context}: {message}")]
     InvalidEncoding {
         context: &'static str,
@@ -57,13 +54,15 @@ pub struct EncodedQuad {
 }
 
 const DOT_ENCODING_TAG: u8 = b'D';
-const BATCH_LOG_ENCODING_TAG: u8 = b'B';
 const GRAPH_META_PREFIX: u8 = b'M';
 const GRAPH_DIRTY_PREFIX: u8 = b'D';
 const GRAPH_REINDEX_PREFIX: u8 = b'R';
 const GRAPH_SEARCH_DELETE_PREFIX: u8 = b'X';
 const LOG_HEAD_PREFIX: u8 = b'H';
 const LOG_BATCH_PREFIX: u8 = b'B';
+const TOPIC_CLOCK_PREFIX: u8 = b'C';
+const TOPIC_BINDING_PREFIX: u8 = b'T';
+const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
 const TERM_LOCK_SHARDS: usize = 64;
 const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
 const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
@@ -86,31 +85,6 @@ fn recommended_db_cache_bytes() -> u64 {
         .unwrap_or(DEFAULT_DB_CACHE_BYTES);
 
     (available / 8).clamp(DEFAULT_DB_CACHE_BYTES, MAX_DB_CACHE_BYTES)
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) enum StoredQuadOp {
-    Add {
-        subject: TermId,
-        predicate: TermId,
-        object: TermId,
-        dot: Dot,
-    },
-    Remove {
-        subject: TermId,
-        predicate: TermId,
-        object: TermId,
-        witnessed: VectorClock,
-    },
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct StoredBatch {
-    pub(crate) actor: ActorId,
-    pub(crate) counter: u64,
-    pub(crate) base_clock: VectorClock,
-    pub(crate) ops: Vec<StoredQuadOp>,
-    pub(crate) timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -325,14 +299,7 @@ fn normalize_dots(dots: &mut Vec<Dot>) {
     dots.dedup();
 }
 
-fn encode_stored_batch(stored_batch: &StoredBatch) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(1 + stored_batch.ops.len() * 64);
-    bytes.push(BATCH_LOG_ENCODING_TAG);
-    bytes.extend_from_slice(&postcard::to_allocvec(stored_batch)?);
-    Ok(bytes)
-}
-
-fn hash_term(term: &EncodedTerm) -> TermId {
+pub(crate) fn hash_term(term: &EncodedTerm) -> TermId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"craqle-term/v1\0");
     hasher.update(term.0.as_bytes());
@@ -394,6 +361,27 @@ fn graph_meta_prefix() -> [u8; 1] {
     [GRAPH_META_PREFIX]
 }
 
+fn topic_clock_key(topic_id: &[u8; 32]) -> [u8; 33] {
+    let mut key = [0u8; 33];
+    key[0] = TOPIC_CLOCK_PREFIX;
+    key[1..33].copy_from_slice(topic_id);
+    key
+}
+
+fn topic_binding_key(topic_id: &[u8; 32]) -> [u8; 33] {
+    let mut key = [0u8; 33];
+    key[0] = TOPIC_BINDING_PREFIX;
+    key[1..33].copy_from_slice(topic_id);
+    key
+}
+
+fn graph_tombstone_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_TOMBSTONE_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
 fn log_head_key(graph: TermId, actor: &ActorId) -> [u8; 49] {
     let mut key = [0u8; 49];
     key[0] = LOG_HEAD_PREFIX;
@@ -402,15 +390,7 @@ fn log_head_key(graph: TermId, actor: &ActorId) -> [u8; 49] {
     key
 }
 
-fn log_batch_key(graph: TermId, actor: &ActorId, counter: u64) -> [u8; 57] {
-    let mut key = [0u8; 57];
-    key[0] = LOG_BATCH_PREFIX;
-    key[1..17].copy_from_slice(&graph.to_be_bytes());
-    key[17..49].copy_from_slice(actor.as_bytes());
-    key[49..57].copy_from_slice(&counter.to_be_bytes());
-    key
-}
-
+// Prefix of legacy batch-log entries; only used to prune them on graph delete.
 fn log_batch_prefix(graph: TermId) -> [u8; 17] {
     let mut key = [0u8; 17];
     key[0] = LOG_BATCH_PREFIX;
@@ -600,6 +580,7 @@ impl GraphStore {
         *self.derived_indexes.write().unwrap() = None;
         self.object_order_cache.write().unwrap().clear();
         self.diagnostics_cache.write().unwrap().clear();
+        self.graph_term_cache.write().unwrap().clear();
         Ok(())
     }
 
@@ -731,18 +712,30 @@ impl GraphStore {
         predicate: Option<TermId>,
         object: Option<TermId>,
     ) -> Vec<EncodedQuad> {
-        let subject_ids = self
-            .indexes
-            .read()
-            .unwrap()
-            .graph_subjects
-            .get(&graph)
-            .cloned()
-            .unwrap_or_default();
+        let indexes = self.indexes.read().unwrap();
+        let Some(subjects) = indexes.graph_subjects.get(&graph) else {
+            return Vec::new();
+        };
 
         let mut quads = Vec::new();
-        for subject in subject_ids {
-            quads.extend(self.graph_subject_quads(graph, subject, predicate, object));
+        for &subject in subjects {
+            let Some(entries) = indexes.by_graph_subject.get(&(graph, subject)) else {
+                continue;
+            };
+            for &(candidate_predicate, candidate_object) in entries {
+                if predicate.is_some_and(|expected| expected != candidate_predicate) {
+                    continue;
+                }
+                if object.is_some_and(|expected| expected != candidate_object) {
+                    continue;
+                }
+                quads.push(EncodedQuad {
+                    graph,
+                    subject,
+                    predicate: candidate_predicate,
+                    object: candidate_object,
+                });
+            }
         }
         quads
     }
@@ -962,6 +955,7 @@ impl GraphStore {
             derived_indexes: RwLock::new(None),
             object_order_cache: RwLock::new(HashMap::new()),
             diagnostics_cache: RwLock::new(HashMap::new()),
+            graph_term_cache: RwLock::new(HashMap::new()),
             dirty_counter: AtomicU64::new(1),
         };
 
@@ -1117,6 +1111,7 @@ impl GraphStore {
 
         self.commit(batch)?;
         self.diagnostics_cache.write().unwrap().remove(&graph_id);
+        self.graph_term_cache.write().unwrap().remove(&graph_id);
         self.object_order_cache
             .write()
             .unwrap()
@@ -1151,12 +1146,7 @@ impl GraphStore {
 
     pub fn graphs(&self) -> Result<Vec<GraphId>> {
         let mut graphs = Vec::new();
-        for guard in self.graphs.prefix(graph_meta_prefix()) {
-            let (key, _) = guard.into_inner()?;
-            if key.len() != 17 {
-                continue;
-            }
-            let graph_id = decode_term_id(&key[1..17], "graph meta key")?;
+        for graph_id in self.graph_term_ids()? {
             let term = self.decode_term(graph_id)?;
             if let Some(named_node) = term.to_named_node() {
                 graphs.push(GraphId(named_node));
@@ -1240,7 +1230,53 @@ impl GraphStore {
             graph_meta_key(graph_id),
             postcard::to_allocvec(&meta)?,
         );
+        batch.insert(
+            &self.graphs,
+            topic_binding_key(&topic_id),
+            graph.as_str().as_bytes(),
+        );
         self.commit(batch)
+    }
+
+    pub fn topic_graph_binding(&self, topic_id: &[u8; 32]) -> Result<Option<String>> {
+        self.graphs
+            .get(topic_binding_key(topic_id))?
+            .map(|bytes| {
+                String::from_utf8(bytes.to_vec()).map_err(|error| StoreError::InvalidEncoding {
+                    context: "topic binding",
+                    message: error.to_string(),
+                })
+            })
+            .transpose()
+    }
+
+    pub fn applied_topic_clock(&self, topic_id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .graphs
+            .get(topic_clock_key(topic_id))?
+            .map(|bytes| bytes.to_vec()))
+    }
+
+    pub fn set_applied_topic_clock(&self, topic_id: &[u8; 32], clock: &[u8]) -> Result<()> {
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.graphs, topic_clock_key(topic_id), clock);
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn graph_tombstoned(&self, graph: &GraphId) -> Result<bool> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(false);
+        };
+        Ok(self.graphs.get(graph_tombstone_key(graph_id))?.is_some())
+    }
+
+    pub fn set_graph_tombstone(&self, graph: &GraphId) -> Result<()> {
+        let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.graphs, graph_tombstone_key(graph_id), []);
+        batch.commit()?;
+        Ok(())
     }
 
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
@@ -1275,150 +1311,6 @@ impl GraphStore {
             clock: vector_clock,
             quads,
         })
-    }
-
-    pub fn compact_graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaCompactSnapshot> {
-        let vector_clock = self.get_vector_clock(graph)?;
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(GraphReplicaCompactSnapshot {
-                graph: graph.clone(),
-                clock: vector_clock,
-                terms: Vec::new(),
-                quads: Vec::new(),
-            });
-        };
-
-        let mut term_to_index = HashMap::new();
-        let mut terms = Vec::new();
-        let mut quads = Vec::new();
-        let mut decode_cache = HashMap::new();
-        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
-            let subject = self.decode_term_cached(&mut decode_cache, quad.subject)?;
-            let predicate = self.decode_term_cached(&mut decode_cache, quad.predicate)?;
-            let object = self.decode_term_cached(&mut decode_cache, quad.object)?;
-            quads.push(CompactSnapshotQuadState {
-                subject: intern_snapshot_term(&mut term_to_index, &mut terms, subject),
-                predicate: intern_snapshot_term(&mut term_to_index, &mut terms, predicate),
-                object: intern_snapshot_term(&mut term_to_index, &mut terms, object),
-                dots: self.read_quad_dots(&Self::quad_key(
-                    graph_id,
-                    quad.subject,
-                    quad.predicate,
-                    quad.object,
-                ))?,
-            });
-            Ok(())
-        })?;
-
-        Ok(GraphReplicaCompactSnapshot {
-            graph: graph.clone(),
-            clock: vector_clock,
-            terms,
-            quads,
-        })
-    }
-
-    pub fn import_graph_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<()> {
-        if self.contains_graph(&snapshot.graph)? {
-            let existing = self.graph_snapshot(&snapshot.graph)?;
-            if !existing.quads.is_empty() || !existing.clock.0.is_empty() {
-                return Err(StoreError::SnapshotImport(format!(
-                    "graph `{}` already contains data",
-                    snapshot.graph.as_str()
-                )));
-            }
-        } else {
-            self.create_graph(&snapshot.graph)?;
-        }
-
-        let mut batch = self.new_batch();
-        let graph_id = self.resolve_term(&EncodedTerm::from_named_node(&snapshot.graph.0))?;
-        let mut term_cache = HashMap::new();
-        self.seed_term_cache(
-            &mut batch,
-            &mut term_cache,
-            snapshot
-                .quads
-                .iter()
-                .flat_map(|quad| [&quad.subject, &quad.predicate, &quad.object]),
-        )?;
-
-        for quad in &snapshot.quads {
-            let state = EncodedQuad {
-                graph: graph_id,
-                subject: self.resolve_term_cached(&mut batch, &mut term_cache, &quad.subject)?,
-                predicate: self.resolve_term_cached(
-                    &mut batch,
-                    &mut term_cache,
-                    &quad.predicate,
-                )?,
-                object: self.resolve_term_cached(&mut batch, &mut term_cache, &quad.object)?,
-            };
-            self.write_quad_state(&mut batch, state, quad.dots.clone())?;
-        }
-
-        self.enqueue_fts_reindex(&mut batch, &snapshot.graph)?;
-        self.set_vector_clock(&mut batch, &snapshot.graph, &snapshot.clock)?;
-        self.commit(batch)
-    }
-
-    pub fn import_compact_graph_snapshot(
-        &self,
-        snapshot: &GraphReplicaCompactSnapshot,
-    ) -> Result<()> {
-        if self.contains_graph(&snapshot.graph)? {
-            let existing = self.graph_snapshot(&snapshot.graph)?;
-            if !existing.quads.is_empty() || !existing.clock.0.is_empty() {
-                return Err(StoreError::SnapshotImport(format!(
-                    "graph `{}` already contains data",
-                    snapshot.graph.as_str()
-                )));
-            }
-        } else {
-            self.create_graph(&snapshot.graph)?;
-        }
-
-        let mut batch = self.new_batch();
-        let graph_id = self.resolve_term(&EncodedTerm::from_named_node(&snapshot.graph.0))?;
-        let mut term_cache = HashMap::new();
-        self.seed_term_cache(&mut batch, &mut term_cache, snapshot.terms.iter())?;
-
-        let mut term_ids = Vec::with_capacity(snapshot.terms.len());
-        for term in &snapshot.terms {
-            term_ids.push(self.resolve_term_cached(&mut batch, &mut term_cache, term)?);
-        }
-
-        for quad in &snapshot.quads {
-            let state = EncodedQuad {
-                graph: graph_id,
-                subject: *term_ids.get(quad.subject as usize).ok_or_else(|| {
-                    StoreError::SnapshotImport(format!(
-                        "quad subject index {} out of bounds for {} terms",
-                        quad.subject,
-                        term_ids.len()
-                    ))
-                })?,
-                predicate: *term_ids.get(quad.predicate as usize).ok_or_else(|| {
-                    StoreError::SnapshotImport(format!(
-                        "quad predicate index {} out of bounds for {} terms",
-                        quad.predicate,
-                        term_ids.len()
-                    ))
-                })?,
-                object: *term_ids.get(quad.object as usize).ok_or_else(|| {
-                    StoreError::SnapshotImport(format!(
-                        "quad object index {} out of bounds for {} terms",
-                        quad.object,
-                        term_ids.len()
-                    ))
-                })?,
-            };
-            self.write_quad_state(&mut batch, state, quad.dots.clone())?;
-        }
-
-        self.enqueue_fts_reindex(&mut batch, &snapshot.graph)?;
-        self.set_vector_clock(&mut batch, &snapshot.graph, &snapshot.clock)?;
-        self.commit(batch)
     }
 
     pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
@@ -1482,7 +1374,8 @@ impl GraphStore {
             indexes
                 .by_predicate_object
                 .get(&(predicate, object))
-                .map(|entries| entries.iter().filter(|(g, _)| *g == graph).count())
+                .and_then(|graphs| graphs.get(&graph))
+                .map(HashSet::len)
                 .unwrap_or(0)
         }))
     }

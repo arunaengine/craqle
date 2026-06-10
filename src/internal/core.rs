@@ -270,7 +270,7 @@ pub struct Batch {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Snapshot of a live quad and its OR-Set dot set.
+/// Read-only state of a live quad and its OR-Set dot set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotQuadState {
     pub subject: EncodedTerm,
@@ -279,28 +279,12 @@ pub struct SnapshotQuadState {
     pub dots: Vec<Dot>,
 }
 
-/// Full graph snapshot used for bootstrap/catch-up.
+/// Read-only dump of one graph's quad state for diagnostics and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphReplicaSnapshot {
     pub graph: GraphId,
     pub clock: VectorClock,
     pub quads: Vec<SnapshotQuadState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactSnapshotQuadState {
-    pub subject: u32,
-    pub predicate: u32,
-    pub object: u32,
-    pub dots: Vec<Dot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphReplicaCompactSnapshot {
-    pub graph: GraphId,
-    pub clock: VectorClock,
-    pub terms: Vec<EncodedTerm>,
-    pub quads: Vec<CompactSnapshotQuadState>,
 }
 
 // ── Violations ──────────────────────────────────────────────────────────────
