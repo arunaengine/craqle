@@ -8,6 +8,8 @@
 
 #[path = "internal/core.rs"]
 mod core;
+#[path = "internal/planner.rs"]
+mod planner;
 #[path = "internal/replication.rs"]
 mod replication;
 #[path = "internal/rocrate.rs"]
@@ -29,10 +31,9 @@ mod auth;
 mod sync;
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
@@ -48,10 +49,7 @@ pub use crate::core::{
     ActorId, Batch, CrateViolation, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy,
     MaterializedQuadChange, PredicateFilter, VectorClock, vocab,
 };
-pub use crate::core::{
-    CompactSnapshotQuadState, Dot, GraphReplicaCompactSnapshot, GraphReplicaSnapshot, QuadOp,
-    SnapshotQuadState,
-};
+pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
 pub use crate::search::SearchHit;
@@ -151,44 +149,8 @@ pub struct HydratedSearchHit {
     pub properties: Vec<(EncodedTerm, EncodedTerm)>,
 }
 
-const MAX_SYNC_BATCH_OPS: usize = 50_000;
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
-const MAX_SYNC_SNAPSHOT_QUADS: usize = 250_000;
-const MAX_SYNC_SNAPSHOT_TERMS: usize = 500_000;
-const MAX_REMOTE_BATCHES: usize = 10_000;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
-
-pub(crate) fn record_latency_step(
-    operation: &'static str,
-    step: &'static str,
-    graph: &GraphId,
-    started: Instant,
-    ok: bool,
-) {
-    let elapsed = started.elapsed();
-    let result = if ok { "ok" } else { "error" };
-    tracing::debug!(
-        event = "craqle.latency.step",
-        operation,
-        step,
-        graph = %graph.as_str(),
-        duration_ms = elapsed.as_millis() as u64,
-        duration_us = elapsed.as_micros() as u64,
-        result = result,
-    );
-}
-
-pub(crate) fn trace_latency_step<T, E>(
-    operation: &'static str,
-    step: &'static str,
-    graph: &GraphId,
-    f: impl FnOnce() -> std::result::Result<T, E>,
-) -> std::result::Result<T, E> {
-    let started = Instant::now();
-    let result = f();
-    record_latency_step(operation, step, graph, started, result.is_ok());
-    result
-}
 
 enum SearchWorkerMessage {
     Wake,
@@ -479,17 +441,74 @@ impl CraqleNode {
 
         let mut applied = 0;
         for topic_id in sync.craqle_topic_ids()? {
-            for record in sync.topic_history(topic_id)? {
-                sync.bind_graph_topic(&self.store, record.event.graph(), topic_id)?;
-                if self.apply_irokle_record(&record)? {
-                    applied += 1;
-                }
-            }
+            applied += self.reconcile_irokle_topic(sync, topic_id)?;
         }
         if applied > 0 {
             self.persist_fjall()?;
         }
         Ok(applied)
+    }
+
+    fn reconcile_irokle_topic(
+        &self,
+        sync: &Arc<dyn sync::CraqleGraphSync>,
+        topic_id: irokle::TopicId,
+    ) -> Result<usize> {
+        let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
+        let catchup = match sync.topic_records_since(topic_id, stored_cursor.as_deref()) {
+            Ok(catchup) => catchup,
+            Err(error) => {
+                tracing::warn!(
+                    topic = %topic_id,
+                    %error,
+                    "skipping unreadable craqle topic during reconcile",
+                );
+                return Ok(0);
+            }
+        };
+
+        let mut applied = 0;
+        for record in &catchup.records {
+            match self.apply_reconciled_record(sync, topic_id, record) {
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        topic = %topic_id,
+                        %error,
+                        "quarantined craqle record during reconcile",
+                    );
+                }
+            }
+        }
+        if let Some(cursor) = catchup.cursor {
+            self.store
+                .set_applied_topic_clock(topic_id.as_bytes(), &cursor)?;
+        }
+        Ok(applied)
+    }
+
+    fn apply_reconciled_record(
+        &self,
+        sync: &Arc<dyn sync::CraqleGraphSync>,
+        topic_id: irokle::TopicId,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<bool> {
+        let graph = record.event.graph();
+        match self.store.topic_graph_binding(topic_id.as_bytes())? {
+            Some(bound) if bound != graph.as_str() => {
+                tracing::warn!(
+                    topic = %topic_id,
+                    bound = %bound,
+                    claimed = %graph.as_str(),
+                    "rejected craqle record targeting a graph outside its topic binding",
+                );
+                return Ok(false);
+            }
+            Some(_) => {}
+            None => sync.bind_graph_topic(&self.store, graph, topic_id)?,
+        }
+        self.apply_irokle_record(record)
     }
 
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
@@ -1090,50 +1109,6 @@ impl CraqleNode {
         self.persist_fjall()
     }
 
-    pub fn apply_remote_batch(&self, batch: Batch) -> Result<()> {
-        self.validate_remote_batch(&batch)?;
-        let result = self.replication.apply_remote_batch(batch)?;
-        if result.applied {
-            self.schedule_search_update();
-            self.persist_fjall()?;
-        }
-        Ok(())
-    }
-
-    pub fn apply_remote_batches(&self, batches: Vec<Batch>) -> Result<()> {
-        if batches.len() > MAX_REMOTE_BATCHES {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "remote sync payload exceeded {} batches",
-                MAX_REMOTE_BATCHES
-            )));
-        }
-
-        let mut graphs = HashSet::new();
-        for batch in &batches {
-            self.validate_remote_batch(batch)?;
-            graphs.insert(batch.graph.clone());
-        }
-
-        let results = self.replication.apply_remote_batches(batches)?;
-        if !graphs.is_empty() && results.into_iter().any(|result| result.applied) {
-            self.schedule_search_update();
-            self.persist_fjall()?;
-        }
-        Ok(())
-    }
-
-    pub fn catchup_batches(
-        &self,
-        graph: &GraphId,
-        remote_clock: &VectorClock,
-    ) -> Result<Vec<Batch>> {
-        Ok(self.replication.batches_for_catchup(graph, remote_clock)?)
-    }
-
-    pub fn compact_graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaCompactSnapshot> {
-        Ok(self.store.compact_graph_snapshot(graph)?)
-    }
-
     pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
         let mut visible = Vec::new();
         for graph in self.store.graphs()? {
@@ -1172,53 +1147,10 @@ impl CraqleNode {
         Ok(self.store.graph_fingerprint(graph)?)
     }
 
+    /// Read-only dump of one graph's quad and dot state, for diagnostics and
+    /// test assertions. Not a sync mechanism.
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
         Ok(self.store.graph_snapshot(graph)?)
-    }
-
-    pub fn import_graph_snapshot(
-        &self,
-        snapshot: &GraphReplicaSnapshot,
-        policy: GraphPolicy,
-    ) -> Result<()> {
-        self.validate_sync_policy(&snapshot.graph, &policy)?;
-        if snapshot.quads.len() > MAX_SYNC_SNAPSHOT_QUADS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "snapshot for graph `{}` exceeded {} quads",
-                snapshot.graph.as_str(),
-                MAX_SYNC_SNAPSHOT_QUADS
-            )));
-        }
-        self.store.import_graph_snapshot(snapshot)?;
-        self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
-        self.schedule_search_update();
-        self.persist_fjall()
-    }
-
-    pub fn import_compact_graph_snapshot(
-        &self,
-        snapshot: &GraphReplicaCompactSnapshot,
-        policy: GraphPolicy,
-    ) -> Result<()> {
-        self.validate_sync_policy(&snapshot.graph, &policy)?;
-        if snapshot.quads.len() > MAX_SYNC_SNAPSHOT_QUADS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "compact snapshot for graph `{}` exceeded {} quads",
-                snapshot.graph.as_str(),
-                MAX_SYNC_SNAPSHOT_QUADS
-            )));
-        }
-        if snapshot.terms.len() > MAX_SYNC_SNAPSHOT_TERMS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "compact snapshot for graph `{}` exceeded {} interned terms",
-                snapshot.graph.as_str(),
-                MAX_SYNC_SNAPSHOT_TERMS
-            )));
-        }
-        self.store.import_compact_graph_snapshot(snapshot)?;
-        self.set_local_graph_policy(&snapshot.graph, policy.normalized())?;
-        self.schedule_search_update();
-        self.persist_fjall()
     }
 
     fn ensure_graph_action(
@@ -1357,21 +1289,8 @@ impl CraqleNode {
     }
 
     fn schedule_search_update_for_graph(&self, graph: &GraphId) -> Result<()> {
-        if trace_latency_step(
-            "craqle.schedule_search_update_for_graph",
-            "contains_graph",
-            graph,
-            || self.store.contains_graph(graph),
-        )? {
-            let started = Instant::now();
+        if self.store.contains_graph(graph)? {
             self.schedule_search_update();
-            record_latency_step(
-                "craqle.schedule_search_update_for_graph",
-                "wake_worker",
-                graph,
-                started,
-                true,
-            );
         }
         Ok(())
     }
@@ -1414,17 +1333,6 @@ impl CraqleNode {
                 Ok(result.applied)
             }
         }
-    }
-
-    fn validate_remote_batch(&self, batch: &Batch) -> Result<()> {
-        if batch.ops.len() > MAX_SYNC_BATCH_OPS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "remote batch for graph `{}` exceeded {} operations",
-                batch.graph.as_str(),
-                MAX_SYNC_BATCH_OPS
-            )));
-        }
-        Ok(())
     }
 
     fn validate_sync_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {

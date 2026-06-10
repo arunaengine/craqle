@@ -4,9 +4,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use craqle::{
-    Authorizer, Batch, CraqleError, CraqleGraphEvent, CraqleIrokleOptions, CraqleNode,
-    CraqleOptions, EncodedTerm, GraphId, GraphReplicaSnapshot, QueryResults, SearchHit,
-    VectorClock,
+    Authorizer, CraqleError, CraqleGraphEvent, CraqleIrokleOptions, CraqleNode, CraqleOptions,
+    EncodedTerm, GraphId, QueryResults, SearchHit, VectorClock,
 };
 use irokle::Event;
 
@@ -90,58 +89,38 @@ impl CraqleCluster {
         &self.irokles[index]
     }
 
-    pub fn deliver_batch_to_peer(&self, index: usize, batch: Batch) -> Result<()> {
-        self.peers[index].apply_remote_batch(batch)?;
-        Ok(())
-    }
-
-    pub fn snapshot_graph(&self, peer: usize, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
-        Ok(self.peers[peer].graph_snapshot(graph)?)
-    }
-
-    pub fn load_snapshot(&self, peer: usize, snapshot: &GraphReplicaSnapshot) -> Result<()> {
-        let policy = self
-            .peers
-            .iter()
-            .find_map(|node| {
-                node.contains_graph(&snapshot.graph)
-                    .ok()
-                    .and_then(|contains| contains.then(|| node.graph_policy(&snapshot.graph).ok()))
-                    .flatten()
-            })
-            .unwrap_or_default();
-        self.peers[peer].import_graph_snapshot(snapshot, policy)?;
-        Ok(())
-    }
-
-    pub fn sync_pair(&self, left: usize, right: usize) -> Result<()> {
+    /// Sync both directions between two peers; returns the number of ops moved.
+    pub fn sync_pair(&self, left: usize, right: usize) -> Result<usize> {
         if !self.connected[left][right] || !self.connected[right][left] {
-            return Ok(());
+            return Ok(0);
         }
 
+        let mut moved = 0;
         for topic_id in self.all_craqle_topic_ids()? {
-            self.sync_topic_one_way(left, right, topic_id)?;
-            self.sync_topic_one_way(right, left, topic_id)?;
+            moved += self.sync_topic_one_way(left, right, topic_id)?;
+            moved += self.sync_topic_one_way(right, left, topic_id)?;
         }
 
-        Ok(())
+        Ok(moved)
     }
 
-    pub fn sync_round(&self) -> Result<()> {
+    /// One full all-pairs sync round; returns the number of ops moved.
+    pub fn sync_round(&self) -> Result<usize> {
         let peer_count = self.peers.len();
         let topics = self.all_craqle_topic_ids()?;
+        let mut moved = 0;
         for sender in 0..peer_count {
             for receiver in 0..peer_count {
                 if sender == receiver || !self.connected[sender][receiver] {
                     continue;
                 }
                 for topic_id in &topics {
-                    self.sync_topic_one_way(sender, receiver, *topic_id)?;
+                    moved += self.sync_topic_one_way(sender, receiver, *topic_id)?;
                 }
             }
         }
 
-        Ok(())
+        Ok(moved)
     }
 
     pub fn sync_until_converged(&self, max_rounds: usize) -> Result<()> {
@@ -252,18 +231,19 @@ impl CraqleCluster {
         sender: usize,
         receiver: usize,
         topic_id: irokle::TopicId,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let remote_summary = self.irokles[receiver].sync_summary(topic_id)?;
         let data = self.irokles[sender]
             .plan_sync_data(self.irokles[receiver].peer_id(), &remote_summary)?;
         if data.ops.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let moved = data.ops.len();
         let ack =
             self.irokles[receiver].receive_sync_data_from(self.irokles[sender].peer_id(), data)?;
         let _ = self.irokles[sender].apply_sync_ack(&ack);
         self.peers[receiver].reconcile_irokle()?;
-        Ok(())
+        Ok(moved)
     }
 
     fn all_craqle_topic_ids(&self) -> Result<Vec<irokle::TopicId>> {

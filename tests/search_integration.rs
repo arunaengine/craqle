@@ -291,57 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_sync_updates_search_without_reindex() {
-        let tmp = tempfile::tempdir().unwrap();
-        let graph = GraphId::new("urn:test:remote-snapshot-search");
-        let writer = writer_auth();
-
-        let sender = CraqleNode::open(tmp.path().join("sender")).unwrap();
-        let receiver = CraqleNode::open(tmp.path().join("receiver")).unwrap();
-
-        sender
-            .create_crate(
-                &writer,
-                CreateCrateRequest::new(
-                    graph.clone(),
-                    "Snapshot Dataset",
-                    "Snapshot receiver should update search directly",
-                    "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
-                    public_policy(),
-                ),
-            )
-            .unwrap();
-        sender
-            .append_new_root_data_entities(
-                &writer,
-                &graph,
-                benchmark_media_object_entities(
-                    0,
-                    25,
-                    "snapshot-keyword",
-                    "Snapshot Entity",
-                    "snapshot record",
-                    "SNAP",
-                ),
-            )
-            .unwrap();
-
-        let policy = sender.graph_policy(&graph).unwrap();
-        let snapshot = sender.graph_snapshot(&graph).unwrap();
-        receiver.import_graph_snapshot(&snapshot, policy).unwrap();
-        receiver.flush_search_updates().unwrap();
-
-        let hits = receiver
-            .search(&GrantAuthorizer::default(), "SNAP-000024", 10)
-            .unwrap();
-        assert!(
-            hits.iter()
-                .any(|hit| hit.subject_iri.contains("entity-000024.dat"))
-        );
-    }
-
-    #[test]
     fn test_graph_delete_removes_search_results_after_flush() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
