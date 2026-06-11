@@ -619,71 +619,81 @@ impl CraqleNode {
             license,
             policy,
         } = request;
-        let total_started = Instant::now();
-        let result = (|| {
-            let started = Instant::now();
-            let policy = policy.normalized();
-            record_latency_step(
-                "craqle.create_crate",
-                "normalize_policy",
-                &graph,
-                started,
-                true,
-            );
-            tracing::debug!(
-                event = "craqle.create_crate.input",
-                operation = "craqle.create_crate",
-                graph = %graph.as_str(),
-                name_len = name.len() as u64,
-                description_len = description.len() as u64,
-                public = policy.public,
-                permission_path_count = policy.permission_paths.len() as u64,
-            );
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self.manager_with(durability, actor).create_crate(
+            graph.clone(),
+            &name,
+            &description,
+            &date_published,
+            &license,
+        )?;
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
 
-            trace_latency_step("craqle.create_crate", "authorize", &graph, || {
-                self.ensure_policy_action(&graph, &policy, auth, Action::Write)
-            })?;
-            let batch = trace_latency_step(
-                "craqle.create_crate",
-                "manager_create_crate",
-                &graph,
-                || {
-                    self.manager().create_crate(
-                        graph.clone(),
-                        &name,
-                        &description,
-                        &date_published,
-                        &license,
-                    )
-                },
+    /// Create a crate from a scaffold request that was already validated at
+    /// its origin, skipping post-state rule re-validation.
+    ///
+    /// The request fields must be identical to ones that passed
+    /// `validate_create_crate` (or the checked create) at the origin. Use the
+    /// checked variant for any untrusted input.
+    pub fn create_crate_prevalidated_with_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let CreateCrateRequest {
+            graph,
+            name,
+            description,
+            date_published,
+            license,
+            policy,
+        } = request;
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager_with(durability, actor)
+            .create_crate_prevalidated(
+                graph.clone(),
+                &name,
+                &description,
+                &date_published,
+                &license,
             )?;
-            trace_latency_step(
-                "craqle.create_crate",
-                "persist_graph_policy",
-                &graph,
-                || self.persist_graph_policy(&graph, policy),
-            )?;
-            trace_latency_step("craqle.create_crate", "finish_batch", &graph, || {
-                self.finish_batch(&graph, batch)
-            })
-        })();
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
 
-        let elapsed = total_started.elapsed();
-        let result_status = if result.is_ok() { "ok" } else { "error" };
-        let batch_ops = result
-            .as_ref()
-            .map(|batch| batch.ops.len() as u64)
-            .unwrap_or(0);
-        tracing::debug!(
-            event = "craqle.latency.total",
-            operation = "craqle.create_crate",
-            graph = %graph.as_str(),
-            duration_ms = elapsed.as_millis() as u64,
-            duration_us = elapsed.as_micros() as u64,
-            result = result_status,
-            batch_ops = batch_ops,
-        );
-        result
+    /// Validate and materialize a create-crate request without applying it.
+    ///
+    /// Returns the changes that would be applied, but does not mutate the graph
+    /// store, persist policy, enqueue search, or publish Irokle records.
+    pub fn validate_create_crate(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+        let CreateCrateRequest {
+            graph,
+            name,
+            description,
+            date_published,
+            license,
+            policy,
+        } = request;
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        Ok(self.manager().validate_create_crate(
+            &graph,
+            &name,
+            &description,
+            &date_published,
+            &license,
+        )?)
     }
 
     /// Create or replace a root-linked data entity using a typed request.
@@ -930,13 +940,89 @@ impl CraqleNode {
         jsonld: &str,
         policy: GraphPolicy,
     ) -> Result<Batch> {
+        self.apply_rocrate_document_checked_with_policy_and_durability(
+            auth,
+            graph,
+            jsonld,
+            policy,
+            CraqleRequestDurability::Durable,
+        )
+    }
+
+    /// Strict RO-Crate replacement with explicit request durability.
+    pub fn apply_rocrate_document_checked_with_policy_and_durability(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
+        self.apply_rocrate_document_checked_with_policy_and_durability_as(
+            auth, graph, jsonld, policy, durability, None,
+        )
+    }
+
+    /// Strict RO-Crate replacement authored under an explicit CRDT actor for
+    /// non-publishing writes.
+    pub fn apply_rocrate_document_checked_with_policy_and_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
         let batch = self
-            .manager()
+            .manager_with(durability, actor)
             .import_jsonld_checked(graph.clone(), jsonld)?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
+    /// Apply a RO-Crate document that was already strictly validated at its
+    /// origin, skipping semantic re-validation.
+    ///
+    /// The event-log payload replicated to this node must be byte-identical to
+    /// a document that passed `validate_rocrate_document_checked_with_policy`
+    /// (or the checked apply) at the origin. Structural JSON-LD errors are
+    /// still rejected; RO-Crate semantic rules are not re-checked. Use the
+    /// checked variant for any untrusted input.
+    pub fn apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager_with(durability, actor)
+            .import_jsonld_prevalidated(graph.clone(), jsonld)?;
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
+    /// Strictly validate and materialize a RO-Crate document without applying it.
+    ///
+    /// Returns the changes that would be applied, but does not mutate the graph
+    /// store, persist policy, enqueue search, or publish Irokle records.
+    pub fn validate_rocrate_document_checked_with_policy(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        Ok(self.manager().plan_import_jsonld_checked(&graph, jsonld)?)
     }
 
     /// Fast path for trusted RO-Crate bootstrap into a new or empty graph.

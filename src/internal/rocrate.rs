@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::replication::ReplicationEngine;
@@ -113,158 +112,101 @@ impl RoCrateManager {
         date_published: &str,
         license: &str,
     ) -> Result<Batch, RoCrateError> {
-        let total_started = Instant::now();
-        let result = (|| {
-            let root_id = root_id(&graph_id);
-            let is_empty = crate::trace_latency_step(
-                "craqle.rocrate.create_crate",
-                "graph_is_empty",
+        if self.graph_is_empty(&graph_id)? {
+            let license_value = encoded_license_value(license)?;
+            let changes = create_crate_scaffold_changes_with_license(
                 &graph_id,
-                || self.graph_is_empty(&graph_id),
-            )?;
-            if is_empty {
-                let started = Instant::now();
-                let license_value = encoded_license_value(license)?;
-                crate::record_latency_step(
-                    "craqle.rocrate.create_crate",
-                    "encode_license",
-                    &graph_id,
-                    started,
-                    true,
-                );
-
-                let started = Instant::now();
-                let changes = vec![
-                    insert_change(
-                        &graph_id,
-                        METADATA_ID,
-                        &vocab::rdf_type(),
-                        EncodedTerm::from_named_node(&vocab::schema_creative_work()),
-                    ),
-                    insert_change(
-                        &graph_id,
-                        METADATA_ID,
-                        &vocab::schema_conforms_to(),
-                        encoded_identifier(ROCRATE_SPEC_URL),
-                    ),
-                    insert_change(
-                        &graph_id,
-                        METADATA_ID,
-                        &vocab::schema_about(),
-                        encoded_identifier(root_id),
-                    ),
-                    insert_change(
-                        &graph_id,
-                        root_id,
-                        &vocab::rdf_type(),
-                        EncodedTerm::from_named_node(&vocab::schema_dataset()),
-                    ),
-                    insert_change(
-                        &graph_id,
-                        root_id,
-                        &vocab::schema_name(),
-                        encoded_literal(name),
-                    ),
-                    insert_change(
-                        &graph_id,
-                        root_id,
-                        &vocab::schema_description(),
-                        encoded_literal(description),
-                    ),
-                    insert_change(
-                        &graph_id,
-                        root_id,
-                        &vocab::schema_date_published(),
-                        encoded_literal(date_published),
-                    ),
-                    insert_change(&graph_id, root_id, &vocab::schema_license(), license_value),
-                ];
-                crate::record_latency_step(
-                    "craqle.rocrate.create_crate",
-                    "build_base_changes",
-                    &graph_id,
-                    started,
-                    true,
-                );
-                tracing::debug!(
-                    event = "craqle.rocrate.create_crate.changes",
-                    operation = "craqle.rocrate.create_crate",
-                    step = "build_base_changes",
-                    graph = %graph_id.as_str(),
-                    change_count = changes.len() as u64,
-                );
-                return Ok(crate::trace_latency_step(
-                    "craqle.rocrate.create_crate",
-                    "local_apply_changes",
-                    &graph_id,
-                    || self.engine.local_apply_changes(&graph_id, changes),
-                )?);
-            }
-
-            let started = Instant::now();
-            let license = license_from_str(license)?;
-            crate::record_latency_step(
-                "craqle.rocrate.create_crate",
-                "parse_license",
-                &graph_id,
-                started,
-                true,
+                name,
+                description,
+                date_published,
+                license_value,
             );
+            return Ok(self.engine.local_apply_changes(&graph_id, changes)?);
+        }
 
-            let started = Instant::now();
-            let rocrate = RoCrate {
-                context: default_context(),
-                graph: vec![
-                    GraphVector::MetadataDescriptor(MetadataDescriptor {
-                        id: METADATA_ID.to_string(),
-                        type_: DataType::Term("CreativeWork".to_string()),
-                        conforms_to: Id::Id(ROCRATE_SPEC_URL.to_string()),
-                        about: Id::Id(root_id.to_string()),
-                        dynamic_entity: Some(HashMap::new()),
-                    }),
-                    GraphVector::RootDataEntity(RootDataEntity {
-                        id: root_id.to_string(),
-                        type_: DataType::Term("Dataset".to_string()),
-                        name: name.to_string(),
-                        description: description.to_string(),
-                        date_published: date_published.to_string(),
-                        license,
-                        dynamic_entity: Some(HashMap::new()),
-                    }),
-                ],
-            };
-            crate::record_latency_step(
-                "craqle.rocrate.create_crate",
-                "build_replacement_rocrate",
-                &graph_id,
-                started,
-                true,
-            );
-
-            crate::trace_latency_step(
-                "craqle.rocrate.create_crate",
-                "replace_graph_with_rocrate",
-                &graph_id,
-                || self.replace_graph_with_rocrate(&graph_id, rocrate),
-            )
-        })();
-
-        let elapsed = total_started.elapsed();
-        let result_status = if result.is_ok() { "ok" } else { "error" };
-        let batch_ops = result
-            .as_ref()
-            .map(|batch| batch.ops.len() as u64)
-            .unwrap_or(0);
-        tracing::debug!(
-            event = "craqle.latency.total",
-            operation = "craqle.rocrate.create_crate",
-            graph = %graph_id.as_str(),
-            duration_ms = elapsed.as_millis() as u64,
-            duration_us = elapsed.as_micros() as u64,
-            result = result_status,
-            batch_ops = batch_ops,
+        let license = license_from_str(license)?;
+        let rocrate = create_crate_rocrate_with_license(
+            &graph_id,
+            name,
+            description,
+            date_published,
+            license,
         );
-        result
+        self.replace_graph_with_rocrate(&graph_id, rocrate)
+    }
+
+    /// Create-crate path for scaffold requests already validated at their
+    /// origin. Skips post-state rule validation; scaffold output is
+    /// structurally valid by construction.
+    pub fn create_crate_prevalidated(
+        &self,
+        graph_id: GraphId,
+        name: &str,
+        description: &str,
+        date_published: &str,
+        license: &str,
+    ) -> Result<Batch, RoCrateError> {
+        let changes = if self.graph_is_empty(&graph_id)? {
+            create_crate_scaffold_changes_with_license(
+                &graph_id,
+                name,
+                description,
+                date_published,
+                encoded_license_value(license)?,
+            )
+        } else {
+            let mut rocrate = create_crate_rocrate_with_license(
+                &graph_id,
+                name,
+                description,
+                date_published,
+                license_from_str(license)?,
+            );
+            self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+        };
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+        self.engine
+            .store()
+            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        Ok(batch)
+    }
+
+    /// Validate and materialize the changes for creating a crate without applying them.
+    pub fn validate_create_crate(
+        &self,
+        graph_id: &GraphId,
+        name: &str,
+        description: &str,
+        date_published: &str,
+        license: &str,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let current = self.current_triples(graph_id)?;
+        if current.is_empty() {
+            let changes = create_crate_scaffold_changes_with_license(
+                graph_id,
+                name,
+                description,
+                date_published,
+                encoded_license_value(license)?,
+            );
+            let target = triples_from_insert_changes(&changes);
+            validate_complete_import_triples(graph_id, &target)?;
+            return Ok(changes);
+        }
+
+        let mut rocrate = create_crate_rocrate_with_license(
+            graph_id,
+            name,
+            description,
+            date_published,
+            license_from_str(license)?,
+        );
+        normalize_rocrate(&mut rocrate);
+        let target = rocrate_triples(&rocrate)?;
+        validate_complete_import_triples(graph_id, &target)?;
+        diff_triples(graph_id, &current, &target)
     }
 
     /// Add a data entity with automatic hasPart linkage from root.
@@ -465,12 +407,44 @@ impl RoCrateManager {
         graph_id: GraphId,
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        if self.graph_is_missing_or_empty(&graph_id)? {
-            return self.import_jsonld_into_empty_graph(graph_id, value);
-        }
+        let changes = self.plan_import_jsonld_checked(&graph_id, jsonld)?;
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+        self.engine
+            .store()
+            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        Ok(batch)
+    }
 
-        self.replace_jsonld_in_existing_graph(graph_id, value)
+    /// Import path for documents already validated at their origin.
+    ///
+    /// Skips semantic RO-Crate validation (`validate_jsonld_import` and
+    /// `validate_complete_import_triples`) but keeps replace/diff semantics,
+    /// CRDT authoring, and structural JSON-LD error handling. Only callers
+    /// replaying an event log of origin-validated documents may use this.
+    pub fn import_jsonld_prevalidated(
+        &self,
+        graph_id: GraphId,
+        jsonld: &str,
+    ) -> Result<Batch, RoCrateError> {
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        let target = jsonld_triples(&graph_id, &value)?;
+        let changes = if self.graph_is_missing_or_empty(&graph_id)? {
+            insert_changes(&graph_id, target)
+        } else {
+            match self.append_like_replace_changes(&graph_id, &target)? {
+                Some(changes) => changes,
+                None => diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?,
+            }
+        };
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+        self.engine
+            .store()
+            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        Ok(batch)
     }
 
     /// Fast path for trusted bootstrap imports into a new or empty graph.
@@ -501,6 +475,16 @@ impl RoCrateManager {
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         self.plan_import_value(graph_id, value)
+    }
+
+    /// Compute and validate the strict import change set without applying it.
+    pub fn plan_import_jsonld_checked(
+        &self,
+        graph_id: &GraphId,
+        jsonld: &str,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        self.plan_import_value_checked(graph_id, value)
     }
 
     /// Update a property on an entity.
@@ -804,25 +788,26 @@ impl RoCrateManager {
         diff_triples(graph_id, &current, &target)
     }
 
-    fn graph_is_missing_or_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
-        Ok(self.engine.store().graph_is_empty(graph_id)?)
+    fn plan_import_value_checked(
+        &self,
+        graph_id: &GraphId,
+        value: serde_json::Value,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        validate_jsonld_import(&value)?;
+        let target = jsonld_triples(graph_id, &value)?;
+        validate_complete_import_triples(graph_id, &target)?;
+        if self.graph_is_missing_or_empty(graph_id)? {
+            return Ok(insert_changes(graph_id, target));
+        }
+
+        match self.append_like_replace_changes(graph_id, &target)? {
+            Some(changes) => Ok(changes),
+            None => diff_triples(graph_id, &self.current_triples(graph_id)?, &target),
+        }
     }
 
-    fn import_jsonld_into_empty_graph(
-        &self,
-        graph_id: GraphId,
-        value: serde_json::Value,
-    ) -> Result<Batch, RoCrateError> {
-        validate_jsonld_import(&value)?;
-        let target = jsonld_triples(&graph_id, &value)?;
-        validate_complete_import_triples(&graph_id, &target)?;
-        let batch = self
-            .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, insert_changes(&graph_id, target))?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
-        Ok(batch)
+    fn graph_is_missing_or_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
+        Ok(self.engine.store().graph_is_empty(graph_id)?)
     }
 
     fn replace_jsonld_in_existing_graph(
@@ -830,13 +815,7 @@ impl RoCrateManager {
         graph_id: GraphId,
         value: serde_json::Value,
     ) -> Result<Batch, RoCrateError> {
-        validate_jsonld_import(&value)?;
-        let target = jsonld_triples(&graph_id, &value)?;
-        validate_complete_import_triples(&graph_id, &target)?;
-        let changes = match self.append_like_replace_changes(&graph_id, &target)? {
-            Some(changes) => changes,
-            None => diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?,
-        };
+        let changes = self.plan_import_value_checked(&graph_id, value)?;
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
@@ -1110,6 +1089,107 @@ fn insert_change(
         predicate: EncodedTerm::from_named_node(predicate),
         object,
     }
+}
+
+fn create_crate_scaffold_changes_with_license(
+    graph_id: &GraphId,
+    name: &str,
+    description: &str,
+    date_published: &str,
+    license_value: EncodedTerm,
+) -> Vec<MaterializedQuadChange> {
+    let root_id = root_id(graph_id);
+    vec![
+        insert_change(
+            graph_id,
+            METADATA_ID,
+            &vocab::rdf_type(),
+            EncodedTerm::from_named_node(&vocab::schema_creative_work()),
+        ),
+        insert_change(
+            graph_id,
+            METADATA_ID,
+            &vocab::schema_conforms_to(),
+            encoded_identifier(ROCRATE_SPEC_URL),
+        ),
+        insert_change(
+            graph_id,
+            METADATA_ID,
+            &vocab::schema_about(),
+            encoded_identifier(root_id),
+        ),
+        insert_change(
+            graph_id,
+            root_id,
+            &vocab::rdf_type(),
+            EncodedTerm::from_named_node(&vocab::schema_dataset()),
+        ),
+        insert_change(
+            graph_id,
+            root_id,
+            &vocab::schema_name(),
+            encoded_literal(name),
+        ),
+        insert_change(
+            graph_id,
+            root_id,
+            &vocab::schema_description(),
+            encoded_literal(description),
+        ),
+        insert_change(
+            graph_id,
+            root_id,
+            &vocab::schema_date_published(),
+            encoded_literal(date_published),
+        ),
+        insert_change(graph_id, root_id, &vocab::schema_license(), license_value),
+    ]
+}
+
+fn create_crate_rocrate_with_license(
+    graph_id: &GraphId,
+    name: &str,
+    description: &str,
+    date_published: &str,
+    license: License,
+) -> RoCrate {
+    let root_id = root_id(graph_id);
+    RoCrate {
+        context: default_context(),
+        graph: vec![
+            GraphVector::MetadataDescriptor(MetadataDescriptor {
+                id: METADATA_ID.to_string(),
+                type_: DataType::Term("CreativeWork".to_string()),
+                conforms_to: Id::Id(ROCRATE_SPEC_URL.to_string()),
+                about: Id::Id(root_id.to_string()),
+                dynamic_entity: Some(HashMap::new()),
+            }),
+            GraphVector::RootDataEntity(RootDataEntity {
+                id: root_id.to_string(),
+                type_: DataType::Term("Dataset".to_string()),
+                name: name.to_string(),
+                description: description.to_string(),
+                date_published: date_published.to_string(),
+                license,
+                dynamic_entity: Some(HashMap::new()),
+            }),
+        ],
+    }
+}
+
+fn triples_from_insert_changes(changes: &[MaterializedQuadChange]) -> BTreeSet<TripleKey> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            MaterializedQuadChange::Insert {
+                subject,
+                predicate,
+                object,
+                ..
+            } => Some((subject.clone(), predicate.clone(), object.clone())),
+            MaterializedQuadChange::Delete { .. } => None,
+        })
+        .collect()
 }
 
 fn triple_is_visible(
