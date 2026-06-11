@@ -295,9 +295,37 @@ pub struct CraqleNode {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
     search_worker: SearchUpdateWorker,
+    _index_warmer: DerivedIndexWarmer,
     sparql: Arc<SparqlEngine>,
     replication: Arc<ReplicationEngine>,
+    local_replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+}
+
+// Joined on drop so the store (and its fjall lock) cannot outlive the node.
+struct DerivedIndexWarmer {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DerivedIndexWarmer {
+    fn start(store: &Arc<GraphStore>) -> Self {
+        let store = Arc::downgrade(store);
+        Self {
+            handle: Some(std::thread::spawn(move || {
+                if let Some(store) = store.upgrade() {
+                    store.ensure_derived_indexes();
+                }
+            })),
+        }
+    }
+}
+
+impl Drop for DerivedIndexWarmer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Configuration used when constructing a [`CraqleNode`].
@@ -397,8 +425,13 @@ impl CraqleNode {
         options: CraqleOptions,
     ) -> Self {
         let (actor, sync) = options.into_parts();
+        // Cross-graph derived indexes are built off the boot path so the
+        // first multi-graph query does not pay the build under a write lock.
+        let index_warmer = DerivedIndexWarmer::start(&store);
         let search_worker = SearchUpdateWorker::start(store.clone(), search.clone());
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
+        let local_replication =
+            Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
         let replication = Arc::new(if sync.is_some() {
             ReplicationEngine::new_with_sync(store.clone(), sparql.clone(), actor, sync.clone())
         } else {
@@ -410,8 +443,10 @@ impl CraqleNode {
             store,
             search,
             search_worker,
+            _index_warmer: index_warmer,
             sparql,
             replication,
+            local_replication,
             sync,
         }
     }
