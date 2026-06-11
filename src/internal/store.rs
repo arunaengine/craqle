@@ -1085,6 +1085,23 @@ impl GraphStore {
         }
     }
 
+    /// Decode a graph name term through a store-level cache. Term ids are
+    /// content hashes so the mapping is immutable; entries are evicted on
+    /// graph deletion only to bound the cache by the live graph count. Query
+    /// visibility checks decode each touched graph IRI, so caching here turns
+    /// a per-query store read per graph into a map hit.
+    pub fn decode_graph_term(&self, id: TermId) -> Result<EncodedTerm> {
+        if let Some(term) = self.graph_term_cache.read().unwrap().get(&id) {
+            return Ok(term.clone());
+        }
+        let term = self.decode_term(id)?;
+        self.graph_term_cache
+            .write()
+            .unwrap()
+            .insert(id, term.clone());
+        Ok(term)
+    }
+
     pub fn lookup_term(&self, term: &EncodedTerm) -> Result<Option<TermId>> {
         let id = hash_term(term);
         let Some(existing) = self.terms.get(id.to_be_bytes())? else {
@@ -1214,6 +1231,29 @@ impl GraphStore {
         Ok(graphs)
     }
 
+    /// Term ids of all graphs with stored metadata, without decoding the
+    /// graph IRIs (the meta key embeds the term id).
+    pub fn graph_term_ids(&self) -> Result<Vec<TermId>> {
+        self.graph_term_id_iter().collect()
+    }
+
+    /// Lazily streams the graph term ids of [`GraphStore::graph_term_ids`],
+    /// so short-circuiting consumers (ASK, LIMIT) stop without scanning the
+    /// full graph list.
+    pub fn graph_term_id_iter(&self) -> impl Iterator<Item = Result<TermId>> {
+        self.graphs
+            .prefix(graph_meta_prefix())
+            .filter_map(|guard| match guard.into_inner() {
+                Ok((key, _)) => {
+                    if key.len() != 17 {
+                        return None;
+                    }
+                    Some(decode_term_id(&key[1..17], "graph meta key"))
+                }
+                Err(error) => Some(Err(error.into())),
+            })
+    }
+
     pub fn set_graph_diagnostics(
         &self,
         graph: &GraphId,
@@ -1237,6 +1277,28 @@ impl GraphStore {
         }
 
         let diagnostics = self.compute_graph_diagnostics(graph)?;
+        self.diagnostics_cache
+            .write()
+            .unwrap()
+            .insert(graph_id, diagnostics.clone());
+        Ok(diagnostics)
+    }
+
+    /// Like [`GraphStore::graph_diagnostics`], but keyed by the graph term id
+    /// so cache hits avoid decode/lookup round trips through the term table.
+    pub fn graph_diagnostics_by_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
+        if let Some(cached) = self.diagnostics_cache.read().unwrap().get(&graph_id) {
+            return Ok(cached.clone());
+        }
+
+        let graph_term = self.decode_graph_term(graph_id)?;
+        let Some(graph_name) = graph_term.to_named_node() else {
+            return Err(StoreError::InvalidEncoding {
+                context: "graph term",
+                message: graph_term.0,
+            });
+        };
+        let diagnostics = self.compute_graph_diagnostics(&GraphId(graph_name))?;
         self.diagnostics_cache
             .write()
             .unwrap()
