@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::time::Instant;
 
 use crate::core::{
     ActorId, Batch, Dot, GraphId, GraphPolicy, MaterializedQuadChange, QuadOp, VectorClock,
@@ -7,8 +6,9 @@ use crate::core::{
 use crate::store::GraphStore;
 use chrono::Utc;
 use irokle::history::HistoryOrder;
+use irokle::oplog::Oplog;
 use irokle::reducer::EventRecord;
-use irokle::{Event, PublishOptions, ReplicationPolicy, TopicConfig, WriteConcern};
+use irokle::{Event, PublishOptions, ReplicationPolicy, TopicGenesis, WriteConcern};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
@@ -22,14 +22,24 @@ pub enum CraqleGraphEvent {
         graph: GraphId,
         policy: GraphPolicy,
     },
+    GraphDeleted {
+        graph: GraphId,
+    },
 }
 
 impl CraqleGraphEvent {
     pub fn graph(&self) -> &GraphId {
         match self {
-            Self::QuadChanges { graph, .. } | Self::Policy { graph, .. } => graph,
+            Self::QuadChanges { graph, .. }
+            | Self::Policy { graph, .. }
+            | Self::GraphDeleted { graph } => graph,
         }
     }
+}
+
+pub(crate) struct TopicCatchup {
+    pub records: Vec<EventRecord<CraqleGraphEvent>>,
+    pub cursor: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +110,12 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         policy: GraphPolicy,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
+    fn publish_delete(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
+
     fn graph_topic_id(
         &self,
         store: &GraphStore,
@@ -121,10 +137,11 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
 
     fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>>;
 
-    fn topic_history(
+    fn topic_records_since(
         &self,
         topic_id: irokle::TopicId,
-    ) -> SyncResult<Vec<EventRecord<CraqleGraphEvent>>>;
+        cursor: Option<&[u8]>,
+    ) -> SyncResult<TopicCatchup>;
 
     fn add_peer(&self, store: &GraphStore, graph: &GraphId, peer: irokle::PeerId)
     -> SyncResult<()>;
@@ -163,108 +180,58 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<irokle::Topic<CraqleGraphEvent, S>> {
-        let topic_id = crate::trace_latency_step(
-            "craqle.irokle.open_graph_topic",
-            "ensure_graph_topic",
-            graph,
-            || self.ensure_graph_topic(store, graph),
-        )?;
-        Ok(crate::trace_latency_step(
-            "craqle.irokle.open_graph_topic",
-            "open_topic",
-            graph,
-            || self.node.open_topic::<CraqleGraphEvent>(topic_id),
-        )?)
+        let topic_id = self.ensure_graph_topic(store, graph)?;
+        Ok(self.node.open_topic::<CraqleGraphEvent>(topic_id)?)
     }
 }
 
 impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
     fn publish_changes(
         &self,
         store: &GraphStore,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-        let total_started = Instant::now();
-        let change_count = changes.len() as u64;
-        let result = (|| {
-            let topic = crate::trace_latency_step(
-                "craqle.irokle.publish_changes",
-                "open_graph_topic",
-                graph,
-                || self.open_graph_topic(store, graph),
-            )?;
-            Ok(crate::trace_latency_step(
-                "craqle.irokle.publish_changes",
-                "publish_with",
-                graph,
-                || {
-                    topic.publish_with(
-                        CraqleGraphEvent::QuadChanges {
-                            graph: graph.clone(),
-                            changes,
-                        },
-                        self.publish_options(),
-                    )
-                },
-            )?)
-        })();
-
-        let elapsed = total_started.elapsed();
-        let result_status = if result.is_ok() { "ok" } else { "error" };
-        tracing::debug!(
-            event = "craqle.latency.total",
-            operation = "craqle.irokle.publish_changes",
-            graph = %graph.as_str(),
-            duration_ms = elapsed.as_millis() as u64,
-            duration_us = elapsed.as_micros() as u64,
-            result = result_status,
-            change_count = change_count,
-        );
-        result
+        let topic = self.open_graph_topic(store, graph)?;
+        Ok(topic.publish_with(
+            CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes,
+            },
+            self.publish_options(),
+        )?)
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str()))]
     fn publish_policy(
         &self,
         store: &GraphStore,
         graph: &GraphId,
         policy: GraphPolicy,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-        let total_started = Instant::now();
-        let result = (|| {
-            let topic = crate::trace_latency_step(
-                "craqle.irokle.publish_policy",
-                "open_graph_topic",
-                graph,
-                || self.open_graph_topic(store, graph),
-            )?;
-            Ok(crate::trace_latency_step(
-                "craqle.irokle.publish_policy",
-                "publish_with",
-                graph,
-                || {
-                    topic.publish_with(
-                        CraqleGraphEvent::Policy {
-                            graph: graph.clone(),
-                            policy,
-                        },
-                        self.publish_options(),
-                    )
-                },
-            )?)
-        })();
+        let topic = self.open_graph_topic(store, graph)?;
+        Ok(topic.publish_with(
+            CraqleGraphEvent::Policy {
+                graph: graph.clone(),
+                policy,
+            },
+            self.publish_options(),
+        )?)
+    }
 
-        let elapsed = total_started.elapsed();
-        let result_status = if result.is_ok() { "ok" } else { "error" };
-        tracing::debug!(
-            event = "craqle.latency.total",
-            operation = "craqle.irokle.publish_policy",
-            graph = %graph.as_str(),
-            duration_ms = elapsed.as_millis() as u64,
-            duration_us = elapsed.as_micros() as u64,
-            result = result_status,
-        );
-        result
+    fn publish_delete(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        let topic = self.open_graph_topic(store, graph)?;
+        Ok(topic.publish_with(
+            CraqleGraphEvent::GraphDeleted {
+                graph: graph.clone(),
+            },
+            self.publish_options(),
+        )?)
     }
 
     fn graph_topic_id(
@@ -277,59 +244,52 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             .map(irokle::TopicId::from_bytes))
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str()))]
     fn ensure_graph_topic(
         &self,
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<irokle::TopicId> {
-        let total_started = Instant::now();
-        let result = (|| {
-            if let Some(topic_id) = crate::trace_latency_step(
-                "craqle.irokle.ensure_graph_topic",
-                "graph_topic_id",
-                graph,
-                || self.graph_topic_id(store, graph),
-            )? {
-                tracing::debug!(
-                    event = "craqle.irokle.ensure_graph_topic.reuse",
-                    operation = "craqle.irokle.ensure_graph_topic",
-                    graph = %graph.as_str(),
-                );
+        // An existing binding (e.g. from data created before deterministic
+        // topic ids) stays authoritative for its graph.
+        if let Some(topic_id) = self.graph_topic_id(store, graph)? {
+            return Ok(topic_id);
+        }
+
+        let topic_id = graph_topic_id(graph);
+        let mut genesis_error = None;
+        for _ in 0..2 {
+            if let Some(state) = self.node.storage().topic_state(&topic_id)? {
+                if state.event_type_id != CraqleGraphEvent::TYPE_ID {
+                    return Err(CraqleSyncError::Irokle(irokle::Error::EventTypeMismatch {
+                        expected: CraqleGraphEvent::TYPE_ID.to_owned(),
+                        actual: state.event_type_id,
+                    }));
+                }
+                store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
                 return Ok(topic_id);
             }
 
-            let topic = crate::trace_latency_step(
-                "craqle.irokle.ensure_graph_topic",
-                "create_topic",
-                graph,
-                || {
-                    self.node.create_topic::<CraqleGraphEvent>(TopicConfig {
-                        initial_peers: self.options.initial_peers.clone(),
-                        replication_policy: self.options.replication_policy.clone(),
-                    })
-                },
-            )?;
-            let topic_id = topic.id();
-            crate::trace_latency_step(
-                "craqle.irokle.ensure_graph_topic",
-                "store_topic_id",
-                graph,
-                || store.set_irokle_topic_id(graph, *topic_id.as_bytes()),
-            )?;
-            Ok(topic_id)
-        })();
-
-        let elapsed = total_started.elapsed();
-        let result_status = if result.is_ok() { "ok" } else { "error" };
-        tracing::debug!(
-            event = "craqle.latency.total",
-            operation = "craqle.irokle.ensure_graph_topic",
-            graph = %graph.as_str(),
-            duration_ms = elapsed.as_millis() as u64,
-            duration_us = elapsed.as_micros() as u64,
-            result = result_status,
-        );
-        result
+            let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
+            let genesis = TopicGenesis {
+                event_type_id: CraqleGraphEvent::TYPE_ID.to_owned(),
+                initial_peers: self.options.initial_peers.clone(),
+                replication_policy: self.options.replication_policy.clone(),
+            };
+            let oplog = Oplog::with_storage(self.node.storage().clone());
+            match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
+                Ok(_) => {
+                    store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+                    return Ok(topic_id);
+                }
+                // A concurrent sync admission may create the topic between the
+                // state read and the genesis commit; re-check and reuse it.
+                Err(error) => genesis_error = Some(error),
+            }
+        }
+        Err(CraqleSyncError::Irokle(genesis_error.unwrap_or_else(
+            || irokle::Error::Storage(format!("failed to ensure craqle topic {topic_id}")),
+        )))
     }
 
     fn bind_graph_topic(
@@ -362,14 +322,32 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             .collect())
     }
 
-    fn topic_history(
+    fn topic_records_since(
         &self,
         topic_id: irokle::TopicId,
-    ) -> SyncResult<Vec<EventRecord<CraqleGraphEvent>>> {
-        Ok(self
-            .node
-            .open_topic::<CraqleGraphEvent>(topic_id)?
-            .history(HistoryOrder::OldestFirst)?)
+        cursor: Option<&[u8]>,
+    ) -> SyncResult<TopicCatchup> {
+        let mut clock: irokle::ActorClock = match cursor {
+            Some(bytes) => postcard::from_bytes(bytes).unwrap_or_default(),
+            None => irokle::ActorClock::default(),
+        };
+        let topic = self.node.open_topic::<CraqleGraphEvent>(topic_id)?;
+        let records = topic.history_after(&clock, HistoryOrder::OldestFirst)?;
+        if records.is_empty() {
+            return Ok(TopicCatchup {
+                records,
+                cursor: None,
+            });
+        }
+        for record in &records {
+            clock.observe(record.meta.actor_id, record.meta.actor_seq);
+        }
+        let cursor = postcard::to_allocvec(&clock)
+            .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
+        Ok(TopicCatchup {
+            records,
+            cursor: Some(cursor),
+        })
     }
 
     fn add_peer(
@@ -410,6 +388,14 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
             write_concern: self.options.write_concern.clone(),
         }
     }
+}
+
+/// Deterministic per-graph topic id: every node derives the same irokle topic
+/// from the graph IRI alone, so no binding propagation is needed to agree.
+pub(crate) fn graph_topic_id(graph: &GraphId) -> irokle::TopicId {
+    let mut hasher = blake3::Hasher::new_derive_key("craqle-graph-topic-v1");
+    hasher.update(graph.as_str().as_bytes());
+    irokle::TopicId::from_bytes(*hasher.finalize().as_bytes())
 }
 
 pub(crate) fn batch_from_irokle_record(

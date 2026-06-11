@@ -1198,6 +1198,15 @@ impl CraqleNode {
     }
 
     pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
+        if let Some(sync) = &self.sync
+            && sync.graph_topic_id(&self.store, graph)?.is_some()
+            && !self.store.graph_tombstoned(graph)?
+        {
+            let record = sync.publish_delete(&self.store, graph)?;
+            self.apply_irokle_record(&record)?;
+            return self.persist_fjall();
+        }
+        self.store.set_graph_tombstone(graph)?;
         self.store.delete_graph(graph)?;
         self.schedule_search_update();
         self.persist_fjall()
