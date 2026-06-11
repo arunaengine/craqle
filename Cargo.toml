@@ -5,7 +5,7 @@ resolver = "3"
 # RDF ecosystem
 oxrdf = { version = "0.3.3", features = ["serde"] }
 spargebra = "0.4.6"
-spareval = "0.2.6"
+spareval = { version = "0.2.6", features = ["sep-0006"] }
 
 # Storage
 fjall = "3.1.4"

@@ -72,6 +72,15 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
 PREFIX fts: <urn:craqle:fts:>\n";
 
+/// Escape hatch for the craqle plan optimizer: set `CRAQLE_QUERY_OPT` to
+/// `0`/`off`/`false` to evaluate raw sparopt plans (debugging aid).
+fn planner_enabled() -> bool {
+    !matches!(
+        std::env::var("CRAQLE_QUERY_OPT").as_deref(),
+        Ok("0") | Ok("off") | Ok("OFF") | Ok("false") | Ok("FALSE")
+    )
+}
+
 const FTS_SERVICE_IRI: &str = "urn:craqle:fts";
 const FTS_QUERY_IRI: &str = "urn:craqle:fts:query";
 const FTS_LIMIT_IRI: &str = "urn:craqle:fts:limit";
@@ -89,37 +98,96 @@ impl SparqlEngine {
 
     #[cfg(test)]
     pub fn query(&self, sparql: &str) -> Result<QueryResults> {
-        self.query_with_visible_graphs(sparql, None)
+        self.run_query(sparql, GraphScope::All, planner_enabled())
     }
 
     pub fn query_with_graphs(&self, sparql: &str, graphs: &[GraphId]) -> Result<QueryResults> {
-        let visible = self.resolve_visible_graphs(graphs)?;
-        self.query_with_visible_graphs(sparql, visible)
+        self.run_query(sparql, GraphScope::List(graphs), planner_enabled())
     }
 
-    fn query_with_visible_graphs(
+    pub fn query_with_visibility(
         &self,
         sparql: &str,
-        visible_graphs: VisibleGraphSet,
+        visible: &VisibleFn<'_>,
+    ) -> Result<QueryResults> {
+        self.run_query(sparql, GraphScope::Predicate(visible), planner_enabled())
+    }
+
+    /// Like [`SparqlEngine::query_with_visibility`] with explicit control over
+    /// the craqle plan optimizer (used by tests and as a debugging hatch).
+    pub fn query_with_visibility_planned(
+        &self,
+        sparql: &str,
+        visible: &VisibleFn<'_>,
+        optimize: bool,
+    ) -> Result<QueryResults> {
+        self.run_query(sparql, GraphScope::Predicate(visible), optimize)
+    }
+
+    fn run_query(
+        &self,
+        sparql: &str,
+        scope: GraphScope<'_>,
+        optimize: bool,
     ) -> Result<QueryResults> {
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let mut query = SparqlParser::new()
             .parse_query(&full)
             .map_err(|e| SparqlError::Parse(e.to_string()))?;
 
-        let visible_graph_iris = visible_graph_iris(&self.store, &visible_graphs)?;
-        rewrite_fts_query(
-            &mut query,
-            &self.search,
-            &self.store,
-            visible_graph_iris.as_ref(),
-        )?;
+        rewrite_fts_query(&mut query, &self.search, &self.store, scope)?;
+        if optimize {
+            crate::planner::optimize_query(&mut query, &self.store);
+            tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
+        }
 
         let mut prepared = self.evaluator.prepare(&query);
-        prepared.dataset_mut().set_default_graph_as_union();
-        let results = prepared
-            .execute(StoreDataset::new(&self.store, visible_graphs))
-            .map_err(map_eval_error)?;
+        let dataset = match scope {
+            GraphScope::All => {
+                prepared.dataset_mut().set_default_graph_as_union();
+                StoreDataset::new(&self.store, None)
+            }
+            GraphScope::Predicate(visible) => {
+                // Union view with lazy visibility: the predicate runs at most
+                // once per touched graph, so the per-query cost scales with
+                // the graphs evaluation actually reaches, not the corpus.
+                prepared.dataset_mut().set_default_graph_as_union();
+                StoreDataset::with_predicate(&self.store, visible)
+            }
+            GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
+                // Scope the dataset to the visible graph list so patterns are
+                // planned as graph-specific lookups instead of union scans.
+                let mut seen = HashSet::with_capacity(graphs.len());
+                let mut names: Vec<NamedNode> = Vec::with_capacity(graphs.len());
+                for graph in graphs {
+                    if seen.insert(graph.as_str())
+                        && self
+                            .store
+                            .lookup_term(&EncodedTerm::from_named_node(&graph.0))?
+                            .is_some()
+                    {
+                        names.push(graph.0.clone());
+                    }
+                }
+                let default_graphs: Vec<GraphName> =
+                    names.iter().cloned().map(Into::into).collect();
+                let named_graphs: Vec<NamedOrBlankNode> =
+                    names.into_iter().map(Into::into).collect();
+                prepared.dataset_mut().set_default_graph(default_graphs);
+                prepared
+                    .dataset_mut()
+                    .set_available_named_graphs(named_graphs);
+                StoreDataset::new(&self.store, Some(hash_graph_list(graphs)))
+            }
+            GraphScope::List(graphs) => {
+                // Large graph sets: evaluate once over the union view;
+                // StoreDataset filters quads against the visible graph term
+                // ids in O(1) per quad.
+                prepared.dataset_mut().set_default_graph_as_union();
+                StoreDataset::new(&self.store, Some(hash_graph_list(graphs)))
+            }
+        };
+        let results = prepared.execute(dataset).map_err(map_eval_error)?;
 
         collect_query_results(results)
     }
@@ -221,7 +289,7 @@ fn rewrite_fts_query(
     query: &mut Query,
     search: &SearchIndex,
     store: &GraphStore,
-    visible_graphs: Option<&HashSet<String>>,
+    scope: GraphScope<'_>,
 ) -> Result<()> {
     match query {
         Query::Select { pattern, .. }
@@ -229,7 +297,7 @@ fn rewrite_fts_query(
         | Query::Describe { pattern, .. }
         | Query::Construct { pattern, .. } => {
             let current = std::mem::replace(pattern, GraphPattern::Bgp { patterns: vec![] });
-            *pattern = rewrite_graph_pattern(current, search, store, visible_graphs)?;
+            *pattern = rewrite_graph_pattern(current, search, store, scope)?;
         }
     }
     Ok(())
@@ -239,130 +307,74 @@ fn rewrite_graph_pattern(
     pattern: GraphPattern,
     search: &SearchIndex,
     store: &GraphStore,
-    visible_graphs: Option<&HashSet<String>>,
+    scope: GraphScope<'_>,
 ) -> Result<GraphPattern> {
     Ok(match pattern {
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
             pattern
         }
         GraphPattern::Join { left, right } => GraphPattern::Join {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
-            right: Box::new(rewrite_graph_pattern(
-                *right,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
+            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
         },
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => GraphPattern::LeftJoin {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
-            right: Box::new(rewrite_graph_pattern(
-                *right,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
+            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
             expression,
         },
         GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
             expr,
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
         },
         GraphPattern::Union { left, right } => GraphPattern::Union {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
-            right: Box::new(rewrite_graph_pattern(
-                *right,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
+            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+        },
+        GraphPattern::Lateral { left, right } => GraphPattern::Lateral {
+            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
+            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
         },
         GraphPattern::Graph { name, inner } => GraphPattern::Graph {
             name,
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
         },
         GraphPattern::Extend {
             inner,
             variable,
             expression,
         } => GraphPattern::Extend {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
             variable,
             expression,
         },
         GraphPattern::Minus { left, right } => GraphPattern::Minus {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, visible_graphs)?),
-            right: Box::new(rewrite_graph_pattern(
-                *right,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
+            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
         },
         GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
             expression,
         },
         GraphPattern::Project { inner, variables } => GraphPattern::Project {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
             variables,
         },
         GraphPattern::Distinct { inner } => GraphPattern::Distinct {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
         },
         GraphPattern::Reduced { inner } => GraphPattern::Reduced {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
         },
         GraphPattern::Slice {
             inner,
             start,
             length,
         } => GraphPattern::Slice {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
             start,
             length,
         },
@@ -396,7 +408,7 @@ fn rewrite_fts_service(
     pattern: GraphPattern,
     search: &SearchIndex,
     store: &GraphStore,
-    visible_graphs: Option<&HashSet<String>>,
+    scope: GraphScope<'_>,
 ) -> Result<GraphPattern> {
     let spec = parse_fts_service_spec(pattern)?;
     if spec.limit == 0 {
@@ -406,10 +418,24 @@ fn rewrite_fts_service(
         });
     }
 
+    // Built only when a SERVICE clause exists; hit counts are bounded by
+    // `spec.limit`, so the predicate path checks each hit's graph directly.
+    let visible_set: Option<HashSet<&str>> = match scope {
+        GraphScope::List(graphs) => Some(graphs.iter().map(GraphId::as_str).collect()),
+        _ => None,
+    };
+    let graph_visible = |iri: &str| match scope {
+        GraphScope::All => true,
+        GraphScope::List(_) => visible_set
+            .as_ref()
+            .is_some_and(|visible| visible.contains(iri)),
+        GraphScope::Predicate(visible) => visible(&GraphId::new(iri)),
+    };
+
     flush_queued_search_updates(search, store)?;
     let hits = match &spec.graph {
         Some(FtsGraphBinding::Fixed(graph)) => {
-            if visible_graphs.is_some_and(|visible| !visible.contains(graph.as_str())) {
+            if !graph_visible(graph.as_str()) {
                 Vec::new()
             } else {
                 search.search_in_graph(
@@ -436,7 +462,7 @@ fn rewrite_fts_service(
 
     let mut bindings = Vec::new();
     for hit in hits {
-        if visible_graphs.is_some_and(|visible| !visible.contains(hit.graph_id.as_str())) {
+        if !graph_visible(hit.graph_id.as_str()) {
             continue;
         }
         if subject_filter.is_some_and(|subject| hit.subject_iri != subject) {
