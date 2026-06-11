@@ -836,43 +836,169 @@ impl GraphStore {
         object: TermId,
     ) -> Vec<EncodedQuad> {
         self.with_derived_indexes(|indexes| {
-            let Some(entries) = indexes.by_predicate_object.get(&(predicate, object)) else {
+            let Some(graphs) = indexes.by_predicate_object.get(&(predicate, object)) else {
                 return Vec::new();
             };
 
             let mut quads = Vec::new();
-            for &(candidate_graph, subject) in entries {
-                if graph.is_some_and(|expected| expected != candidate_graph) {
-                    continue;
-                }
-                quads.push(EncodedQuad {
-                    graph: candidate_graph,
+            let mut push_graph = |g: TermId, subjects: &HashSet<TermId>| {
+                quads.extend(subjects.iter().map(|&subject| EncodedQuad {
+                    graph: g,
                     subject,
                     predicate,
                     object,
-                });
+                }));
+            };
+            match graph {
+                Some(g) => {
+                    if let Some(subjects) = graphs.get(&g) {
+                        push_graph(g, subjects);
+                    }
+                }
+                None => {
+                    for (&g, subjects) in graphs {
+                        push_graph(g, subjects);
+                    }
+                }
             }
             quads
         })
     }
 
+    /// Graphs containing at least one quad matching (predicate, object), so
+    /// union readers can stream graph-at-a-time and short-circuit (ASK/LIMIT)
+    /// after checking visibility per graph instead of materializing the full
+    /// cross-corpus match set.
+    pub(crate) fn predicate_object_graphs(&self, predicate: TermId, object: TermId) -> Vec<TermId> {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .by_predicate_object
+                .get(&(predicate, object))
+                .map(|graphs| graphs.keys().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn predicate_object_subjects_in_graph(
+        &self,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Vec<TermId> {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .by_predicate_object
+                .get(&(predicate, object))
+                .and_then(|graphs| graphs.get(&graph))
+                .map(|subjects| subjects.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn object_graphs(&self, object: TermId) -> Vec<TermId> {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .by_object
+                .get(&object)
+                .map(|graphs| graphs.keys().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn object_entries_in_graph(
+        &self,
+        graph: TermId,
+        object: TermId,
+    ) -> Vec<(TermId, TermId)> {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .by_object
+                .get(&object)
+                .and_then(|graphs| graphs.get(&graph))
+                .map(|entries| entries.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Approximate corpus-wide quad counts used by the query planner. All are
+    /// O(1) reads against the lazily built derived indexes; values count quad
+    /// instances per graph (no cross-graph triple dedup), which is good
+    /// enough for relative selectivity ordering.
+    pub(crate) fn stat_predicate_object_count(&self, predicate: TermId, object: TermId) -> usize {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .predicate_object_counts
+                .get(&(predicate, object))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    pub(crate) fn stat_predicate_count(&self, predicate: TermId) -> usize {
+        self.with_derived_indexes(|indexes| {
+            indexes.predicate_counts.get(&predicate).copied().unwrap_or(0)
+        })
+    }
+
+    pub(crate) fn stat_object_count(&self, object: TermId) -> usize {
+        self.with_derived_indexes(|indexes| {
+            indexes.object_counts.get(&object).copied().unwrap_or(0)
+        })
+    }
+
+    pub(crate) fn stat_subject_count(&self, subject: TermId) -> usize {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .by_subject
+                .get(&subject)
+                .map(HashSet::len)
+                .unwrap_or(0)
+        })
+    }
+
+    pub(crate) fn stat_total_quads(&self) -> usize {
+        self.with_derived_indexes(|indexes| indexes.total_quads)
+    }
+
+    /// Term ids of all graphs that currently hold at least one quad, from the
+    /// in-memory index (no store reads). Suitable for quad iteration; use
+    /// [`GraphStore::graph_term_id_iter`] when empty graphs must be included.
+    pub(crate) fn populated_graph_ids(&self) -> Vec<TermId> {
+        self.indexes
+            .read()
+            .unwrap()
+            .graph_subjects
+            .keys()
+            .copied()
+            .collect()
+    }
+
     fn object_scan(&self, graph: Option<TermId>, object: TermId) -> Vec<EncodedQuad> {
         self.with_derived_indexes(|indexes| {
-            let Some(entries) = indexes.by_object.get(&object) else {
+            let Some(graphs) = indexes.by_object.get(&object) else {
                 return Vec::new();
             };
 
             let mut quads = Vec::new();
-            for &(candidate_graph, subject, predicate) in entries {
-                if graph.is_some_and(|expected| expected != candidate_graph) {
-                    continue;
-                }
-                quads.push(EncodedQuad {
-                    graph: candidate_graph,
+            let mut push_graph = |g: TermId, entries: &HashSet<(TermId, TermId)>| {
+                quads.extend(entries.iter().map(|&(subject, predicate)| EncodedQuad {
+                    graph: g,
                     subject,
                     predicate,
                     object,
-                });
+                }));
+            };
+            match graph {
+                Some(g) => {
+                    if let Some(entries) = graphs.get(&g) {
+                        push_graph(g, entries);
+                    }
+                }
+                None => {
+                    for (&g, entries) in graphs {
+                        push_graph(g, entries);
+                    }
+                }
             }
             quads
         })
@@ -1634,18 +1760,8 @@ impl GraphStore {
         E: From<StoreError>,
         F: FnMut(EncodedQuad) -> std::result::Result<(), E>,
     {
-        let subjects = self
-            .indexes
-            .read()
-            .unwrap()
-            .graph_subjects
-            .get(&graph)
-            .cloned()
-            .unwrap_or_default();
-        for subject in subjects {
-            for quad in self.graph_subject_quads(graph, subject, None, None) {
-                visit(quad)?;
-            }
+        for quad in self.graph_scan(graph, None, None) {
+            visit(quad)?;
         }
         Ok(())
     }
@@ -1693,121 +1809,6 @@ impl GraphStore {
         };
         batch.insert(&self.log, key, counter.to_be_bytes());
         Ok(counter)
-    }
-
-    pub(crate) fn append_compact_batch_log(
-        &self,
-        batch: &mut WriteBatch,
-        graph: &GraphId,
-        stored_batch: &StoredBatch,
-    ) -> Result<()> {
-        let graph_id =
-            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        batch.insert(
-            &self.log,
-            log_batch_key(graph_id, &stored_batch.actor, stored_batch.counter),
-            encode_stored_batch(stored_batch)?,
-        );
-        Ok(())
-    }
-
-    pub fn batch_log_entry(
-        &self,
-        graph: &GraphId,
-        actor: ActorId,
-        counter: u64,
-    ) -> Result<Option<crate::core::Batch>> {
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(None);
-        };
-        self.log
-            .get(log_batch_key(graph_id, &actor, counter))?
-            .map(|bytes| self.decode_batch_log_bytes(graph, bytes.as_ref()))
-            .transpose()
-    }
-
-    pub fn batches_beyond_vector_clock(
-        &self,
-        graph: &GraphId,
-        vector_clock: &VectorClock,
-    ) -> Result<Vec<crate::core::Batch>> {
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(Vec::new());
-        };
-
-        let mut batches = Vec::new();
-        let mut term_cache = HashMap::new();
-        for guard in self.log.prefix(log_batch_prefix(graph_id)) {
-            let (key, value) = guard.into_inner()?;
-            if key.len() != 57 {
-                continue;
-            }
-            let actor = ActorId::from_bytes(key[17..49].try_into().unwrap());
-            let counter = u64::from_be_bytes(key[49..57].try_into().unwrap());
-            if vector_clock.contains(&Dot { actor, counter }) {
-                continue;
-            }
-            batches.push(self.decode_batch_log_bytes_with_cache(
-                graph,
-                value.as_ref(),
-                &mut term_cache,
-            )?);
-        }
-        Ok(batches)
-    }
-
-    fn decode_batch_log_bytes(&self, graph: &GraphId, bytes: &[u8]) -> Result<crate::core::Batch> {
-        let mut term_cache = HashMap::new();
-        self.decode_batch_log_bytes_with_cache(graph, bytes, &mut term_cache)
-    }
-
-    fn decode_batch_log_bytes_with_cache(
-        &self,
-        graph: &GraphId,
-        bytes: &[u8],
-        term_cache: &mut HashMap<TermId, EncodedTerm>,
-    ) -> Result<crate::core::Batch> {
-        if bytes.first().copied() != Some(BATCH_LOG_ENCODING_TAG) {
-            return Ok(postcard::from_bytes(bytes)?);
-        }
-
-        let stored: StoredBatch = postcard::from_bytes(&bytes[1..])?;
-        let mut ops = Vec::with_capacity(stored.ops.len());
-        for op in stored.ops {
-            match op {
-                StoredQuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    dot,
-                } => ops.push(QuadOp::Add {
-                    subject: self.decode_term_cached(term_cache, subject)?,
-                    predicate: self.decode_term_cached(term_cache, predicate)?,
-                    object: self.decode_term_cached(term_cache, object)?,
-                    dot,
-                }),
-                StoredQuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    witnessed,
-                } => ops.push(QuadOp::Remove {
-                    subject: self.decode_term_cached(term_cache, subject)?,
-                    predicate: self.decode_term_cached(term_cache, predicate)?,
-                    object: self.decode_term_cached(term_cache, object)?,
-                    witnessed,
-                }),
-            }
-        }
-
-        Ok(crate::core::Batch {
-            graph: graph.clone(),
-            actor: stored.actor,
-            counter: stored.counter,
-            base_clock: stored.base_clock,
-            ops,
-            timestamp: stored.timestamp,
-        })
     }
 
     pub(crate) fn decode_term_cached(
@@ -2375,21 +2376,6 @@ impl GraphStore {
     }
 }
 
-fn intern_snapshot_term(
-    term_to_index: &mut HashMap<EncodedTerm, u32>,
-    terms: &mut Vec<EncodedTerm>,
-    term: EncodedTerm,
-) -> u32 {
-    if let Some(&index) = term_to_index.get(&term) {
-        return index;
-    }
-
-    let index = terms.len() as u32;
-    term_to_index.insert(term.clone(), index);
-    terms.push(term);
-    index
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2473,6 +2459,79 @@ mod tests {
         assert_eq!(
             quads[0].object,
             store.lookup_term(&object).unwrap().unwrap()
+        );
+    }
+
+    #[test]
+    fn derived_indexes_track_commits_incrementally() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:graph");
+        let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:s"));
+        let predicate =
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:p"));
+        let object = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:o"));
+
+        // Built before any write: later commits must maintain it in place.
+        store.ensure_derived_indexes();
+
+        let actor = ActorId::random();
+        insert_quad(
+            &store,
+            &graph,
+            &subject,
+            &predicate,
+            &object,
+            Dot { actor, counter: 1 },
+        );
+
+        let subject_id = store.lookup_term(&subject).unwrap().unwrap();
+        let object_id = store.lookup_term(&object).unwrap().unwrap();
+        let predicate_id = store.lookup_term(&predicate).unwrap().unwrap();
+        let graph_id = store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .unwrap();
+
+        let quads = store
+            .quads_for_pattern(None, Some(subject_id), None, None)
+            .unwrap();
+        assert_eq!(1, quads.len());
+        assert_eq!(quads[0].object, object_id);
+        let quads = store
+            .quads_for_pattern(None, None, None, Some(object_id))
+            .unwrap();
+        assert_eq!(1, quads.len());
+        let quads = store
+            .quads_for_pattern(None, None, Some(predicate_id), Some(object_id))
+            .unwrap();
+        assert_eq!(1, quads.len());
+
+        let mut witnessed = VectorClock::new();
+        witnessed.advance(actor, 1);
+        let mut batch = store.new_batch();
+        store
+            .remove_quad(
+                &mut batch,
+                graph_id,
+                subject_id,
+                predicate_id,
+                object_id,
+                &witnessed,
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        assert!(
+            store
+                .quads_for_pattern(None, Some(subject_id), None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .quads_for_pattern(None, None, None, Some(object_id))
+                .unwrap()
+                .is_empty()
         );
     }
 
