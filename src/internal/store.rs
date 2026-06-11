@@ -163,26 +163,47 @@ impl IndexState {
     }
 
     fn remove_quad(&mut self, quad: EncodedQuad) {
-        if let Some(entries) = self.by_graph_subject.get_mut(&(quad.graph, quad.subject))
-            && let Some(index) = entries
-                .iter()
-                .position(|entry| *entry == (quad.predicate, quad.object))
+        let Entry::Occupied(mut entry) = self.by_graph_subject.entry((quad.graph, quad.subject))
+        else {
+            return;
+        };
+        if let Some(index) = entry
+            .get()
+            .iter()
+            .position(|e| *e == (quad.predicate, quad.object))
         {
-            entries.swap_remove(index);
+            entry.get_mut().swap_remove(index);
+        }
+        if entry.get().is_empty() {
+            entry.remove();
+            if let Entry::Occupied(mut subjects) = self.graph_subjects.entry(quad.graph) {
+                if let Some(index) = subjects.get().iter().position(|s| *s == quad.subject) {
+                    subjects.get_mut().swap_remove(index);
+                }
+                if subjects.get().is_empty() {
+                    subjects.remove();
+                }
+            }
         }
     }
 }
 
 #[derive(Default)]
 struct DerivedIndexState {
-    by_subject: HashMap<TermId, Vec<(TermId, TermId, TermId)>>,
-    by_predicate_object: HashMap<(TermId, TermId), Vec<(TermId, TermId)>>,
-    by_object: HashMap<TermId, Vec<(TermId, TermId, TermId)>>,
+    by_subject: HashMap<TermId, HashSet<(TermId, TermId, TermId)>>,
+    by_predicate_object: HashMap<(TermId, TermId), HashMap<TermId, HashSet<TermId>>>,
+    by_object: HashMap<TermId, HashMap<TermId, HashSet<(TermId, TermId)>>>,
+    // Approximate corpus-wide cardinalities for the query planner; quad
+    // instances are counted per graph (no cross-graph triple dedup).
+    predicate_object_counts: HashMap<(TermId, TermId), usize>,
+    predicate_counts: HashMap<TermId, usize>,
+    object_counts: HashMap<TermId, usize>,
+    total_quads: usize,
 }
 
 impl DerivedIndexState {
     fn insert_quad(&mut self, quad: EncodedQuad) {
-        self.by_subject.entry(quad.subject).or_default().push((
+        let is_new = self.by_subject.entry(quad.subject).or_default().insert((
             quad.predicate,
             quad.object,
             quad.graph,
@@ -190,52 +211,85 @@ impl DerivedIndexState {
         self.by_predicate_object
             .entry((quad.predicate, quad.object))
             .or_default()
-            .push((quad.graph, quad.subject));
-        self.by_object.entry(quad.object).or_default().push((
-            quad.graph,
-            quad.subject,
-            quad.predicate,
-        ));
+            .entry(quad.graph)
+            .or_default()
+            .insert(quad.subject);
+        self.by_object
+            .entry(quad.object)
+            .or_default()
+            .entry(quad.graph)
+            .or_default()
+            .insert((quad.subject, quad.predicate));
+        if is_new {
+            *self
+                .predicate_object_counts
+                .entry((quad.predicate, quad.object))
+                .or_default() += 1;
+            *self.predicate_counts.entry(quad.predicate).or_default() += 1;
+            *self.object_counts.entry(quad.object).or_default() += 1;
+            self.total_quads += 1;
+        }
     }
 
     fn remove_quad(&mut self, quad: EncodedQuad) {
-        if let Some(entries) = self.by_subject.get_mut(&quad.subject) {
-            if let Some(index) = entries
-                .iter()
-                .position(|entry| *entry == (quad.predicate, quad.object, quad.graph))
-            {
-                entries.swap_remove(index);
-            }
-            if entries.is_empty() {
-                self.by_subject.remove(&quad.subject);
+        let mut was_present = false;
+        if let Entry::Occupied(mut entry) = self.by_subject.entry(quad.subject) {
+            was_present = entry
+                .get_mut()
+                .remove(&(quad.predicate, quad.object, quad.graph));
+            if entry.get().is_empty() {
+                entry.remove();
             }
         }
+        if was_present {
+            if let Entry::Occupied(mut count) = self
+                .predicate_object_counts
+                .entry((quad.predicate, quad.object))
+            {
+                *count.get_mut() = count.get().saturating_sub(1);
+                if *count.get() == 0 {
+                    count.remove();
+                }
+            }
+            if let Entry::Occupied(mut count) = self.predicate_counts.entry(quad.predicate) {
+                *count.get_mut() = count.get().saturating_sub(1);
+                if *count.get() == 0 {
+                    count.remove();
+                }
+            }
+            if let Entry::Occupied(mut count) = self.object_counts.entry(quad.object) {
+                *count.get_mut() = count.get().saturating_sub(1);
+                if *count.get() == 0 {
+                    count.remove();
+                }
+            }
+            self.total_quads = self.total_quads.saturating_sub(1);
+        }
 
-        if let Some(entries) = self
+        if let Entry::Occupied(mut entry) = self
             .by_predicate_object
-            .get_mut(&(quad.predicate, quad.object))
+            .entry((quad.predicate, quad.object))
         {
-            if let Some(index) = entries
-                .iter()
-                .position(|entry| *entry == (quad.graph, quad.subject))
-            {
-                entries.swap_remove(index);
+            if let Entry::Occupied(mut graphs) = entry.get_mut().entry(quad.graph) {
+                graphs.get_mut().remove(&quad.subject);
+                if graphs.get().is_empty() {
+                    graphs.remove();
+                }
             }
-            if entries.is_empty() {
-                self.by_predicate_object
-                    .remove(&(quad.predicate, quad.object));
+            if entry.get().is_empty() {
+                entry.remove();
             }
         }
 
-        if let Some(entries) = self.by_object.get_mut(&quad.object) {
-            if let Some(index) = entries
-                .iter()
-                .position(|entry| *entry == (quad.graph, quad.subject, quad.predicate))
-            {
-                entries.swap_remove(index);
+        if let Entry::Occupied(mut entry) = self.by_object.entry(quad.object) {
+            if let Entry::Occupied(mut graphs) = entry.get_mut().entry(quad.graph) {
+                graphs.get_mut().remove(&(quad.subject, quad.predicate));
+                if graphs.get().is_empty() {
+                    graphs.remove();
+                }
             }
-            if entries.is_empty() {
-                self.by_object.remove(&quad.object);
+            if entry.get().is_empty() {
+                entry.remove();
             }
         }
     }
@@ -252,6 +306,7 @@ pub struct GraphStore {
     derived_indexes: RwLock<Option<DerivedIndexState>>,
     object_order_cache: RwLock<ObjectOrderCache>,
     diagnostics_cache: RwLock<HashMap<TermId, GraphDiagnostics>>,
+    graph_term_cache: RwLock<HashMap<TermId, EncodedTerm>>,
     dirty_counter: AtomicU64,
 }
 
@@ -630,6 +685,10 @@ impl GraphStore {
             }
         }
         derived
+    }
+
+    pub fn ensure_derived_indexes(&self) {
+        self.with_derived_indexes(|_| ());
     }
 
     fn with_derived_indexes<R>(&self, f: impl FnOnce(&DerivedIndexState) -> R) -> R {
