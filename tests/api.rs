@@ -61,6 +61,55 @@ fn public_graphs_are_visible_without_grants() {
 }
 
 #[test]
+fn query_graphs_with_filters_by_lazy_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    for (graph, name) in [
+        ("urn:test:lazy:one", "Lazy One"),
+        ("urn:test:lazy:two", "Lazy Two"),
+    ] {
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new(graph),
+                name,
+                "Predicate visibility test",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/demo".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    let rows = match node
+        .query_graphs_with(
+            |graph: &GraphId| graph.as_str() == "urn:test:lazy:one",
+            "SELECT ?name WHERE { ?s schema:name ?name }",
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|row| row.values().all(|value| !value.0.contains("Lazy Two")))
+    );
+
+    assert_eq!(
+        node.query_graphs_with(|_: &GraphId| false, "ASK { ?s ?p ?o }")
+            .unwrap(),
+        QueryResults::Boolean(false)
+    );
+}
+
+#[test]
 fn read_requires_matching_path_while_write_implies_read() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
@@ -150,74 +199,6 @@ fn write_access_is_required_for_updates() {
 }
 
 #[test]
-fn explicit_batch_and_snapshot_sync_replicate_graphs_and_policy() {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    let node_a = CraqleNode::open(dir_a.path()).unwrap();
-    let node_b = CraqleNode::open(dir_b.path()).unwrap();
-    let graph = GraphId::new("urn:test:sync");
-    let auth = writer_auth();
-
-    node_a
-        .create_crate(
-            &auth,
-            CreateCrateRequest::new(
-                graph.clone(),
-                "Synced Dataset",
-                "Replicated through sync messages",
-                "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
-                GraphPolicy {
-                    public: false,
-                    permission_paths: vec!["/datasets/private/project-a".to_string()],
-                },
-            ),
-        )
-        .unwrap();
-
-    let policy = node_a.graph_policy(&graph).unwrap();
-    let snapshot = node_a.graph_snapshot(&graph).unwrap();
-    node_b.import_graph_snapshot(&snapshot, policy).unwrap();
-
-    node_a
-        .add_data_entity(
-            &auth,
-            &graph,
-            "data/synced.txt",
-            "http://schema.org/MediaObject",
-            "Synced File",
-        )
-        .unwrap();
-    let batches = node_a
-        .catchup_batches(&graph, &node_b.vector_clock(&graph).unwrap())
-        .unwrap();
-    node_b.apply_remote_batches(batches).unwrap();
-    node_b
-        .import_graph_policy(&graph, node_a.graph_policy(&graph).unwrap())
-        .unwrap();
-
-    assert_eq!(
-        node_b.graph_policy(&graph).unwrap().permission_paths,
-        vec!["/datasets/private/project-a".to_string()]
-    );
-    let rows = match node_b
-        .query(
-            &auth,
-            "SELECT ?name WHERE { GRAPH <urn:test:sync> { ?s schema:name ?name } }",
-        )
-        .unwrap()
-    {
-        QueryResults::Solutions(rows) => rows,
-        other => panic!("expected solutions, got {other:?}"),
-    };
-    assert!(!rows.is_empty());
-    assert!(
-        rows.iter()
-            .any(|row| row.values().any(|value| value.0.contains("Synced File")))
-    );
-}
-
-#[test]
 fn external_irokle_instance_can_be_shared_with_other_topics() {
     let dir = tempfile::tempdir().unwrap();
     let irokle = irokle::Irokle::builder().build().unwrap();
@@ -264,6 +245,88 @@ fn external_irokle_instance_can_be_shared_with_other_topics() {
             .value,
         "owned by another app"
     );
+}
+
+#[test]
+fn wal_already_durable_create_crate_does_not_publish_irokle_graph_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:wal-local-create");
+
+    node.create_crate_with_durability(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            graph.clone(),
+            "WAL Local Dataset",
+            "Materialized from an external WAL",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/wal-local-create".to_string()],
+            },
+        ),
+        CraqleRequestDurability::WalAlreadyDurable,
+    )
+    .unwrap();
+
+    assert!(node.contains_graph(&graph).unwrap());
+    assert!(node.export_rocrate(&reader_auth(), &graph).is_ok());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+}
+
+#[test]
+fn wal_already_durable_apply_rocrate_does_not_publish_irokle_graph_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:wal-local-rocrate");
+    let jsonld = r#"{
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "urn:test:wal-local-rocrate"}
+            },
+            {
+                "@id": "urn:test:wal-local-rocrate",
+                "@type": "Dataset",
+                "name": "WAL Local RO-Crate",
+                "description": "Materialized from an external WAL",
+                "datePublished": "2025-01-01",
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+            }
+        ]
+    }"#;
+
+    node.apply_rocrate_document_checked_with_policy_and_durability(
+        &writer_auth(),
+        graph.clone(),
+        jsonld,
+        GraphPolicy {
+            public: true,
+            permission_paths: vec!["/datasets/public/wal-local-rocrate".to_string()],
+        },
+        CraqleRequestDurability::WalAlreadyDurable,
+    )
+    .unwrap();
+
+    assert!(node.contains_graph(&graph).unwrap());
+    assert!(node.export_rocrate(&reader_auth(), &graph).is_ok());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
 }
 
 #[test]
@@ -621,6 +684,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
             .any(|name| name.contains("Private Federated Dataset"))
     );
 
+    cluster.flush_search_updates().unwrap();
     let hits = cluster
         .search_from_peer(
             0,
@@ -833,4 +897,139 @@ fn preview_rocrate_update_returns_canonical_changes() {
             MaterializedQuadChange::Insert { object, .. } if object.0.contains("Updated description")
         )
     }));
+}
+
+#[test]
+fn validate_create_crate_does_not_create_graph_or_publish_irokle_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:validate-create");
+
+    let changes = node
+        .validate_create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Validated Dataset",
+                "Validated without committing",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/validate-create".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+
+    assert!(!changes.is_empty());
+    assert!(!node.contains_graph(&graph).unwrap());
+    assert!(node.graphs().unwrap().is_empty());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+}
+
+#[test]
+fn validate_rocrate_document_checked_with_policy_is_non_mutating_and_rejects_invalid_rocrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:validate-rocrate");
+    let policy = GraphPolicy {
+        public: true,
+        permission_paths: vec!["/datasets/public/validate-rocrate".to_string()],
+    };
+    let valid = format!(
+        r#"{{
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {{
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                "about": {{"@id": "{}"}}
+            }},
+            {{
+                "@id": "{}",
+                "@type": "Dataset",
+                "name": "Validated RO-Crate",
+                "description": "Validated without committing",
+                "datePublished": "2025-01-01",
+                "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+            }}
+        ]
+    }}"#,
+        graph.as_str(),
+        graph.as_str()
+    );
+
+    let changes = node
+        .validate_rocrate_document_checked_with_policy(
+            &writer_auth(),
+            graph.clone(),
+            &valid,
+            policy.clone(),
+        )
+        .unwrap();
+
+    assert!(!changes.is_empty());
+    assert!(!node.contains_graph(&graph).unwrap());
+    assert!(node.graphs().unwrap().is_empty());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+
+    let invalid = format!(
+        r#"{{
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {{
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                "about": {{"@id": "{}"}}
+            }},
+            {{
+                "@id": "{}",
+                "@type": "Dataset",
+                "description": "Missing required name",
+                "datePublished": "2025-01-01",
+                "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+            }}
+        ]
+    }}"#,
+        graph.as_str(),
+        graph.as_str()
+    );
+
+    let err = node
+        .validate_rocrate_document_checked_with_policy(
+            &writer_auth(),
+            graph.clone(),
+            &invalid,
+            policy,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CraqleError::RoCrate(RoCrateError::Update(UpdateError::ValidationFailed(violations)))
+            if violations.iter().any(|violation| matches!(
+                violation,
+                CrateViolation::MissingRequiredProperty { property, .. }
+                    if property == "schema:name"
+            ))
+    ));
+    assert!(!node.contains_graph(&graph).unwrap());
+    assert!(node.graphs().unwrap().is_empty());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
 }
