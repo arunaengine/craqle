@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
 use crate::search::SearchIndex;
 use crate::store::{GraphStore, StoreError, TermId};
-use oxrdf::{Literal, NamedNode, Term, Triple, Variable};
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use spareval::{
     DeleteInsertQuad, InternalQuad, QueryEvaluationError, QueryEvaluator, QueryableDataset,
 };
@@ -45,7 +46,24 @@ pub struct SparqlEngine {
 }
 
 type VisibleGraphSet = Option<HashSet<TermId>>;
-type VisibleGraphIris = Option<HashSet<String>>;
+
+pub type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
+
+/// Which graphs a query may see. `Predicate` defers the decision to a
+/// callback evaluated lazily per touched graph (memoized per query).
+#[derive(Clone, Copy)]
+enum GraphScope<'a> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    All,
+    List(&'a [GraphId]),
+    Predicate(&'a VisibleFn<'a>),
+}
+
+/// Visible-graph counts up to this limit are scoped through an explicit
+/// spareval dataset spec (planned as per-graph index lookups). Larger sets
+/// are evaluated once over a union view filtered by graph term id, since the
+/// dataset spec costs O(graphs) store reads and per-pattern iterator setup.
+const EXPLICIT_DATASET_GRAPH_LIMIT: usize = 32;
 
 const COMMON_PREFIXES: &str = "\
 PREFIX schema: <http://schema.org/>\n\
@@ -169,17 +187,13 @@ impl SparqlEngine {
 
         Ok(changes)
     }
+}
 
-    fn resolve_visible_graphs(&self, graphs: &[GraphId]) -> Result<VisibleGraphSet> {
-        let mut visible = HashSet::with_capacity(graphs.len());
-        for graph in graphs {
-            let encoded = EncodedTerm::from_named_node(&graph.0);
-            if let Some(term_id) = self.store.lookup_term(&encoded)? {
-                visible.insert(term_id);
-            }
-        }
-        Ok(Some(visible))
-    }
+fn hash_graph_list(graphs: &[GraphId]) -> HashSet<TermId> {
+    graphs
+        .iter()
+        .map(|graph| crate::store::hash_term(&EncodedTerm::from_named_node(&graph.0)))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -357,12 +371,7 @@ fn rewrite_graph_pattern(
             variables,
             aggregates,
         } => GraphPattern::Group {
-            inner: Box::new(rewrite_graph_pattern(
-                *inner,
-                search,
-                store,
-                visible_graphs,
-            )?),
+            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
             variables,
             aggregates,
         },
@@ -372,16 +381,11 @@ fn rewrite_graph_pattern(
             silent,
         } => match name {
             NamedNodePattern::NamedNode(node) if node.as_str() == FTS_SERVICE_IRI => {
-                rewrite_fts_service(*inner, search, store, visible_graphs)?
+                rewrite_fts_service(*inner, search, store, scope)?
             }
             other => GraphPattern::Service {
                 name: other,
-                inner: Box::new(rewrite_graph_pattern(
-                    *inner,
-                    search,
-                    store,
-                    visible_graphs,
-                )?),
+                inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
                 silent,
             },
         },
@@ -445,25 +449,6 @@ fn rewrite_fts_service(
         variables,
         bindings,
     })
-}
-
-fn visible_graph_iris(
-    store: &GraphStore,
-    visible_graphs: &VisibleGraphSet,
-) -> Result<VisibleGraphIris> {
-    let Some(visible_graphs) = visible_graphs else {
-        return Ok(None);
-    };
-
-    let mut iris = HashSet::with_capacity(visible_graphs.len());
-    for graph_id in visible_graphs {
-        let graph_term = store.decode_term(*graph_id)?;
-        let Some(graph_name) = graph_term.to_named_node() else {
-            return Err(SparqlError::InvalidTerm(graph_term.0));
-        };
-        iris.insert(graph_name.as_str().to_string());
-    }
-    Ok(Some(iris))
 }
 
 fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
@@ -647,8 +632,94 @@ enum StoreDatasetError {
 
 struct StoreDataset<'a> {
     store: &'a GraphStore,
-    orphan_cache: RefCell<HashMap<TermId, HashSet<TermId>>>,
-    visible_graphs: VisibleGraphSet,
+    visibility: QuadVisibility<'a>,
+}
+
+/// How the union view decides graph visibility. `Predicate` resolves it
+/// lazily: the first quad touched in a graph decodes the graph IRI, asks the
+/// callback once, and memoizes the verdict by term id for the query.
+#[derive(Clone)]
+enum GraphFilter<'a> {
+    All,
+    Set {
+        members: Rc<HashSet<TermId>>,
+        ordered: Rc<Vec<TermId>>,
+    },
+    Predicate {
+        visible: &'a VisibleFn<'a>,
+        memo: Rc<RefCell<HashMap<TermId, bool>>>,
+    },
+}
+
+/// Cheap-to-clone visibility filter shared with lazy quad iterators, which
+/// must not borrow the dataset itself (`QueryableDataset` iterators may only
+/// capture `'a`).
+#[derive(Clone)]
+struct QuadVisibility<'a> {
+    store: &'a GraphStore,
+    filter: GraphFilter<'a>,
+    orphan_cache: Rc<RefCell<HashMap<TermId, Rc<HashSet<TermId>>>>>,
+}
+
+impl<'a> QuadVisibility<'a> {
+    fn graph_is_visible(&self, graph: TermId) -> std::result::Result<bool, StoreDatasetError> {
+        match &self.filter {
+            GraphFilter::All => Ok(true),
+            GraphFilter::Set { members, .. } => Ok(members.contains(&graph)),
+            GraphFilter::Predicate { visible, memo } => {
+                if let Some(&allowed) = memo.borrow().get(&graph) {
+                    return Ok(allowed);
+                }
+                let term = self.store.decode_graph_term(graph)?;
+                // Non-IRI graph terms fail closed.
+                let allowed = if term.0.starts_with('<') && term.0.ends_with('>') {
+                    let mut iri = term.0;
+                    iri.pop();
+                    iri.remove(0);
+                    visible(&GraphId(NamedNode::new_unchecked(iri)))
+                } else {
+                    false
+                };
+                memo.borrow_mut().insert(graph, allowed);
+                Ok(allowed)
+            }
+        }
+    }
+
+    fn orphaned_subjects_for_graph(
+        &self,
+        graph: TermId,
+    ) -> std::result::Result<Rc<HashSet<TermId>>, StoreDatasetError> {
+        if let Some(cached) = self.orphan_cache.borrow().get(&graph) {
+            return Ok(cached.clone());
+        }
+
+        let diagnostics = self.store.graph_diagnostics_by_id(graph)?;
+        let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
+        for entity_id in diagnostics.orphaned_entities {
+            let term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
+            if let Some(term_id) = self.store.lookup_term(&term)? {
+                orphaned.insert(term_id);
+            }
+        }
+
+        let orphaned = Rc::new(orphaned);
+        self.orphan_cache
+            .borrow_mut()
+            .insert(graph, orphaned.clone());
+        Ok(orphaned)
+    }
+
+    fn quad_is_visible(
+        &self,
+        quad: &crate::store::EncodedQuad,
+    ) -> std::result::Result<bool, StoreDatasetError> {
+        if !self.graph_is_visible(quad.graph)? {
+            return Ok(false);
+        }
+        let orphaned = self.orphaned_subjects_for_graph(quad.graph)?;
+        Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
+    }
 }
 
 enum ResolvedPatternTerm {
@@ -657,12 +728,139 @@ enum ResolvedPatternTerm {
     Missing,
 }
 
+enum EitherIter<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<L, R, T> Iterator for EitherIter<L, R>
+where
+    L: Iterator<Item = T>,
+    R: Iterator<Item = T>,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        match self {
+            Self::Left(left) => left.next(),
+            Self::Right(right) => right.next(),
+        }
+    }
+}
+
+type QuadResultIter<'a> = Box<
+    dyn Iterator<Item = std::result::Result<crate::store::EncodedQuad, StoreDatasetError>> + 'a,
+>;
+
+/// Quads of all visible graphs matching the pattern, evaluated lazily so that
+/// short-circuiting consumers (ASK, LIMIT) stop after a few graphs instead of
+/// materializing the whole union. Streams graph-at-a-time wherever an index
+/// can enumerate candidate graphs, checking visibility per graph before any
+/// per-quad work so the cost tracks the graphs evaluation actually consumes.
+fn union_quads_for_pattern<'a>(
+    store: &'a GraphStore,
+    visibility: &QuadVisibility<'a>,
+    subject: Option<TermId>,
+    predicate: Option<TermId>,
+    object: Option<TermId>,
+) -> QuadResultIter<'a> {
+    if subject.is_none() {
+        let candidate_graphs = match (&visibility.filter, object) {
+            // Bound object: only graphs containing a matching quad.
+            (_, Some(object_id)) => Some(match predicate {
+                Some(predicate_id) => store.predicate_object_graphs(predicate_id, object_id),
+                None => store.object_graphs(object_id),
+            }),
+            // Unbound object: every populated graph is a candidate.
+            (GraphFilter::Set { ordered, .. }, None) => Some(ordered.as_ref().clone()),
+            (GraphFilter::Predicate { .. }, None) => Some(store.populated_graph_ids()),
+            (GraphFilter::All, None) => None,
+        };
+        if let Some(graphs) = candidate_graphs {
+            let visibility = visibility.clone();
+            return Box::new(graphs.into_iter().flat_map(move |graph| {
+                let visible = match visibility.graph_is_visible(graph) {
+                    Ok(visible) => visible,
+                    Err(error) => return EitherIter::Right(std::iter::once(Err(error))),
+                };
+                if !visible {
+                    return EitherIter::Left(Vec::new().into_iter().map(Ok));
+                }
+                let quads = match (predicate, object) {
+                    (Some(predicate_id), Some(object_id)) => store
+                        .predicate_object_subjects_in_graph(graph, predicate_id, object_id)
+                        .into_iter()
+                        .map(|subject| crate::store::EncodedQuad {
+                            graph,
+                            subject,
+                            predicate: predicate_id,
+                            object: object_id,
+                        })
+                        .collect::<Vec<_>>(),
+                    (None, Some(object_id)) => store
+                        .object_entries_in_graph(graph, object_id)
+                        .into_iter()
+                        .map(|(subject, predicate)| crate::store::EncodedQuad {
+                            graph,
+                            subject,
+                            predicate,
+                            object: object_id,
+                        })
+                        .collect::<Vec<_>>(),
+                    (_, None) => {
+                        match store.quads_for_pattern(Some(graph), None, predicate, None) {
+                            Ok(quads) => quads,
+                            Err(error) => {
+                                return EitherIter::Right(std::iter::once(Err(error.into())));
+                            }
+                        }
+                    }
+                };
+                EitherIter::Left(quads.into_iter().map(Ok))
+            }));
+        }
+    }
+
+    match store.quads_for_pattern(None, subject, predicate, object) {
+        Ok(quads) => Box::new(quads.into_iter().map(Ok)),
+        Err(error) => Box::new(std::iter::once(Err(error.into()))),
+    }
+}
+
 impl<'a> StoreDataset<'a> {
     fn new(store: &'a GraphStore, visible_graphs: VisibleGraphSet) -> Self {
+        let filter = match visible_graphs {
+            None => GraphFilter::All,
+            Some(members) => {
+                let mut ordered: Vec<TermId> = members.iter().copied().collect();
+                ordered.sort_unstable();
+                GraphFilter::Set {
+                    members: Rc::new(members),
+                    ordered: Rc::new(ordered),
+                }
+            }
+        };
+        Self::with_filter(store, filter)
+    }
+
+    fn with_predicate(store: &'a GraphStore, visible: &'a VisibleFn<'a>) -> Self {
+        Self::with_filter(
+            store,
+            GraphFilter::Predicate {
+                visible,
+                memo: Rc::new(RefCell::new(HashMap::new())),
+            },
+        )
+    }
+
+    fn with_filter(store: &'a GraphStore, filter: GraphFilter<'a>) -> Self {
         Self {
             store,
-            orphan_cache: RefCell::new(HashMap::new()),
-            visible_graphs,
+            visibility: QuadVisibility {
+                store,
+                filter,
+                orphan_cache: Rc::new(RefCell::new(HashMap::new())),
+            },
         }
     }
 
@@ -694,72 +892,6 @@ impl<'a> StoreDataset<'a> {
             StoreTerm::Missing(term) => self.externalize_encoded_term(term),
         }
     }
-
-    fn all_named_graph_terms(&self) -> Vec<std::result::Result<StoreTerm, StoreDatasetError>> {
-        match self.store.graphs() {
-            Ok(graphs) => graphs
-                .into_iter()
-                .map(|graph| {
-                    let encoded = EncodedTerm::from_named_node(&graph.0);
-                    match self.store.lookup_term(&encoded)? {
-                        Some(id) => Ok(StoreTerm::Existing(id)),
-                        None => Err(StoreDatasetError::InvalidTerm(graph.as_str().to_string())),
-                    }
-                })
-                .filter(|result| match result {
-                    Ok(StoreTerm::Existing(id)) => self.graph_is_visible(*id),
-                    Ok(StoreTerm::Missing(_)) => false,
-                    Err(_) => true,
-                })
-                .collect(),
-            Err(error) => vec![Err(error.into())],
-        }
-    }
-
-    fn graph_is_visible(&self, graph: TermId) -> bool {
-        self.visible_graphs
-            .as_ref()
-            .is_none_or(|visible| visible.contains(&graph))
-    }
-
-    fn orphaned_subjects_for_graph(
-        &self,
-        graph: TermId,
-    ) -> std::result::Result<HashSet<TermId>, StoreDatasetError> {
-        if let Some(cached) = self.orphan_cache.borrow().get(&graph) {
-            return Ok(cached.clone());
-        }
-
-        let graph_term = self.decode_term(graph)?;
-        let Some(graph_name) = graph_term.to_named_node() else {
-            return Err(StoreDatasetError::InvalidTerm(graph_term.0));
-        };
-
-        let diagnostics = self.store.graph_diagnostics(&GraphId(graph_name))?;
-        let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
-        for entity_id in diagnostics.orphaned_entities {
-            let term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
-            if let Some(term_id) = self.store.lookup_term(&term)? {
-                orphaned.insert(term_id);
-            }
-        }
-
-        self.orphan_cache
-            .borrow_mut()
-            .insert(graph, orphaned.clone());
-        Ok(orphaned)
-    }
-
-    fn quad_is_visible(
-        &self,
-        quad: &crate::store::EncodedQuad,
-    ) -> std::result::Result<bool, StoreDatasetError> {
-        if !self.graph_is_visible(quad.graph) {
-            return Ok(false);
-        }
-        let orphaned = self.orphaned_subjects_for_graph(quad.graph)?;
-        Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
-    }
 }
 
 impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
@@ -773,8 +905,10 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
         predicate: Option<&Self::InternalTerm>,
         object: Option<&Self::InternalTerm>,
         graph_name: Option<Option<&Self::InternalTerm>>,
-    ) -> std::vec::IntoIter<std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>
-    {
+    ) -> Box<
+        dyn Iterator<Item = std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>
+            + 'a,
+    > {
         let subject = self.resolve_pattern_term(subject);
         let predicate = self.resolve_pattern_term(predicate);
         let object = self.resolve_pattern_term(object);
@@ -783,9 +917,7 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             || matches!(predicate, ResolvedPatternTerm::Missing)
             || matches!(object, ResolvedPatternTerm::Missing)
         {
-            return Vec::<std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>::new(
-            )
-            .into_iter();
+            return Box::new(std::iter::empty());
         }
 
         let subject = match subject {
@@ -804,47 +936,48 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             ResolvedPatternTerm::Missing => unreachable!(),
         };
 
-        let rows = match graph_name {
-            Some(None) => match self
-                .store
-                .quads_for_pattern(None, subject, predicate, object)
-            {
-                Ok(quads) => {
-                    let mut seen = HashSet::new();
-                    quads
-                        .into_iter()
-                        .filter_map(move |quad| match self.quad_is_visible(&quad) {
-                            Ok(true) => {
-                                let key = (quad.subject, quad.predicate, quad.object);
-                                if seen.insert(key) {
-                                    Some(Ok(InternalQuad {
-                                        subject: StoreTerm::Existing(quad.subject),
-                                        predicate: StoreTerm::Existing(quad.predicate),
-                                        object: StoreTerm::Existing(quad.object),
-                                        graph_name: None,
-                                    }))
-                                } else {
-                                    None
-                                }
+        let visibility = self.visibility.clone();
+        match graph_name {
+            Some(None) => {
+                let quads =
+                    union_quads_for_pattern(self.store, &visibility, subject, predicate, object);
+                let mut seen = HashSet::new();
+                Box::new(quads.filter_map(move |quad| {
+                    let quad = match quad {
+                        Ok(quad) => quad,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    match visibility.quad_is_visible(&quad) {
+                        Ok(true) => {
+                            let key = (quad.subject, quad.predicate, quad.object);
+                            if seen.insert(key) {
+                                Some(Ok(InternalQuad {
+                                    subject: StoreTerm::Existing(quad.subject),
+                                    predicate: StoreTerm::Existing(quad.predicate),
+                                    object: StoreTerm::Existing(quad.object),
+                                    graph_name: None,
+                                }))
+                            } else {
+                                None
                             }
-                            Ok(false) => None,
-                            Err(error) => Some(Err(error)),
-                        })
-                        .collect()
-                }
-                Err(error) => vec![Err(error.into())],
-            },
+                        }
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                }))
+            }
             Some(Some(StoreTerm::Existing(graph))) => {
-                if !self.graph_is_visible(*graph) {
-                    return Vec::new().into_iter();
+                match visibility.graph_is_visible(*graph) {
+                    Ok(true) => {}
+                    Ok(false) => return Box::new(std::iter::empty()),
+                    Err(error) => return Box::new(std::iter::once(Err(error))),
                 }
                 match self
                     .store
                     .quads_for_pattern(Some(*graph), subject, predicate, object)
                 {
-                    Ok(quads) => quads
-                        .into_iter()
-                        .filter_map(|quad| match self.quad_is_visible(&quad) {
+                    Ok(quads) => Box::new(quads.into_iter().filter_map(move |quad| {
+                        match visibility.quad_is_visible(&quad) {
                             Ok(true) => Some(Ok(InternalQuad {
                                 subject: StoreTerm::Existing(quad.subject),
                                 predicate: StoreTerm::Existing(quad.predicate),
@@ -853,19 +986,21 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
                             })),
                             Ok(false) => None,
                             Err(error) => Some(Err(error)),
-                        })
-                        .collect(),
-                    Err(error) => vec![Err(error.into())],
+                        }
+                    })),
+                    Err(error) => Box::new(std::iter::once(Err(error.into()))),
                 }
             }
-            Some(Some(StoreTerm::Missing(_))) => Vec::new(),
-            None => match self
-                .store
-                .quads_for_pattern(None, subject, predicate, object)
-            {
-                Ok(quads) => quads
-                    .into_iter()
-                    .filter_map(|quad| match self.quad_is_visible(&quad) {
+            Some(Some(StoreTerm::Missing(_))) => Box::new(std::iter::empty()),
+            None => {
+                let quads =
+                    union_quads_for_pattern(self.store, &visibility, subject, predicate, object);
+                Box::new(quads.filter_map(move |quad| {
+                    let quad = match quad {
+                        Ok(quad) => quad,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    match visibility.quad_is_visible(&quad) {
                         Ok(true) => Some(Ok(InternalQuad {
                             subject: StoreTerm::Existing(quad.subject),
                             predicate: StoreTerm::Existing(quad.predicate),
@@ -874,20 +1009,29 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
                         })),
                         Ok(false) => None,
                         Err(error) => Some(Err(error)),
-                    })
-                    .collect(),
-                Err(error) => vec![Err(error.into())],
-            },
-        };
-
-        rows.into_iter()
+                    }
+                }))
+            }
+        }
     }
 
     #[allow(refining_impl_trait)]
     fn internal_named_graphs(
         &self,
-    ) -> std::vec::IntoIter<std::result::Result<Self::InternalTerm, Self::Error>> {
-        self.all_named_graph_terms().into_iter()
+    ) -> Box<dyn Iterator<Item = std::result::Result<Self::InternalTerm, Self::Error>> + 'a> {
+        let visibility = self.visibility.clone();
+        Box::new(
+            self.store
+                .graph_term_id_iter()
+                .filter_map(move |graph_id| match graph_id {
+                    Ok(graph_id) => match visibility.graph_is_visible(graph_id) {
+                        Ok(true) => Some(Ok(StoreTerm::Existing(graph_id))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                    Err(error) => Some(Err(error.into())),
+                }),
+        )
     }
 
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
@@ -1139,6 +1283,475 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn query_with_graphs_limits_default_and_named_graphs_to_visible_set() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph1 = GraphId::new("urn:test:g1");
+        let graph2 = GraphId::new("urn:test:g2");
+        insert_quad(
+            &store,
+            &graph1,
+            "urn:test:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+        );
+        insert_quad(
+            &store,
+            &graph2,
+            "urn:test:e2",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset Two"))),
+        );
+
+        let rows = solution_rows(
+            engine
+                .query_with_graphs(
+                    "SELECT ?s ?name WHERE { ?s schema:name ?name }",
+                    std::slice::from_ref(&graph1),
+                )
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("name").unwrap().0, "\"Dataset One\"");
+
+        let named_rows = solution_rows(
+            engine
+                .query_with_graphs(
+                    "SELECT ?g ?name WHERE { GRAPH ?g { ?s schema:name ?name } }",
+                    std::slice::from_ref(&graph1),
+                )
+                .unwrap(),
+        );
+        assert_eq!(named_rows.len(), 1);
+        assert_eq!(named_rows[0].get("g").unwrap().0, "<urn:test:g1>");
+
+        let missing = GraphId::new("urn:test:missing");
+        let empty_rows = solution_rows(
+            engine
+                .query_with_graphs(
+                    "SELECT ?s WHERE { ?s schema:name ?name }",
+                    std::slice::from_ref(&missing),
+                )
+                .unwrap(),
+        );
+        assert!(empty_rows.is_empty());
+    }
+
+    #[test]
+    fn large_visible_graph_sets_filter_through_union_view() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let total = EXPLICIT_DATASET_GRAPH_LIMIT + 8;
+        let mut graphs = Vec::with_capacity(total);
+        let shared_subject = "urn:test:large:shared";
+        for idx in 0..total {
+            let graph = GraphId::new(&format!("urn:test:large:{idx:03}"));
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:large:{idx:03}:e"),
+                "http://schema.org/name",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "Dataset {idx:03}"
+                )))),
+            );
+            insert_quad(
+                &store,
+                &graph,
+                shared_subject,
+                "http://schema.org/position",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                    idx.to_string(),
+                ))),
+            );
+            graphs.push(graph);
+        }
+        let hidden = GraphId::new("urn:test:large:hidden");
+        insert_quad(
+            &store,
+            &hidden,
+            "urn:test:hidden:e",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Hidden Dataset",
+            ))),
+        );
+        insert_quad(
+            &store,
+            &hidden,
+            shared_subject,
+            "http://schema.org/position",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("hidden"))),
+        );
+
+        let rows = solution_rows(
+            engine
+                .query_with_graphs("SELECT ?s ?name WHERE { ?s schema:name ?name }", &graphs)
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), total);
+        assert!(
+            rows.iter()
+                .all(|row| row.get("name").unwrap().0 != "\"Hidden Dataset\"")
+        );
+
+        let named_rows = solution_rows(
+            engine
+                .query_with_graphs(
+                    "SELECT ?g WHERE { GRAPH ?g { ?s schema:name ?name } }",
+                    &graphs,
+                )
+                .unwrap(),
+        );
+        assert_eq!(named_rows.len(), total);
+        assert!(
+            named_rows
+                .iter()
+                .all(|row| row.get("g").unwrap().0 != "<urn:test:large:hidden>")
+        );
+
+        let enumerated = solution_rows(
+            engine
+                .query_with_graphs("SELECT ?g WHERE { GRAPH ?g {} }", &graphs)
+                .unwrap(),
+        );
+        assert_eq!(enumerated.len(), total);
+        assert!(
+            enumerated
+                .iter()
+                .all(|row| row.get("g").unwrap().0 != "<urn:test:large:hidden>")
+        );
+
+        let fixed_hidden = solution_rows(
+            engine
+                .query_with_graphs(
+                    "SELECT ?name WHERE { GRAPH <urn:test:large:hidden> { ?s schema:name ?name } }",
+                    &graphs,
+                )
+                .unwrap(),
+        );
+        assert!(fixed_hidden.is_empty());
+
+        let subject_rows = solution_rows(
+            engine
+                .query_with_graphs(
+                    "SELECT ?pos WHERE { <urn:test:large:shared> <http://schema.org/position> ?pos }",
+                    &graphs,
+                )
+                .unwrap(),
+        );
+        assert_eq!(subject_rows.len(), total);
+        assert!(
+            subject_rows
+                .iter()
+                .all(|row| row.get("pos").unwrap().0 != "\"hidden\"")
+        );
+
+        assert_eq!(
+            engine
+                .query_with_graphs("ASK { ?s ?p ?o }", &graphs)
+                .unwrap(),
+            QueryResults::Boolean(true)
+        );
+        assert_eq!(
+            engine
+                .query_with_graphs("ASK { ?s ?p ?o }", &[GraphId::new("urn:test:absent")])
+                .unwrap(),
+            QueryResults::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn large_visible_graph_sets_hide_orphaned_entities() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let total = EXPLICIT_DATASET_GRAPH_LIMIT + 4;
+        let mut graphs = Vec::with_capacity(total);
+        for idx in 0..total {
+            let graph = GraphId::new(&format!("urn:test:orphan:{idx:03}"));
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:orphan:{idx:03}:e"),
+                "http://schema.org/name",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "Visible {idx:03}"
+                )))),
+            );
+            graphs.push(graph);
+        }
+        insert_quad(
+            &store,
+            &graphs[0],
+            "./data/orphan.txt",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Orphaned File"))),
+        );
+        store
+            .set_graph_diagnostics(
+                &graphs[0],
+                &GraphDiagnostics::from_orphaned_entities(vec!["./data/orphan.txt".to_string()]),
+            )
+            .unwrap();
+
+        let rows = solution_rows(
+            engine
+                .query_with_graphs("SELECT ?name WHERE { ?s schema:name ?name }", &graphs)
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), total);
+        assert!(
+            rows.iter()
+                .all(|row| row.get("name").unwrap().0 != "\"Orphaned File\"")
+        );
+    }
+
+    #[test]
+    fn predicate_visibility_filters_union_view() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let total = EXPLICIT_DATASET_GRAPH_LIMIT + 8;
+        let shared_subject = "urn:test:pred:shared";
+        for idx in 0..total {
+            let graph = GraphId::new(&format!("urn:test:pred:{idx:03}"));
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:pred:{idx:03}:e"),
+                "http://schema.org/name",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "Dataset {idx:03}"
+                )))),
+            );
+            insert_quad(
+                &store,
+                &graph,
+                shared_subject,
+                "http://schema.org/position",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                    idx.to_string(),
+                ))),
+            );
+        }
+        let hidden = GraphId::new("urn:test:pred:hidden");
+        insert_quad(
+            &store,
+            &hidden,
+            "urn:test:hidden:e",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Hidden Dataset",
+            ))),
+        );
+        insert_quad(
+            &store,
+            &hidden,
+            shared_subject,
+            "http://schema.org/position",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("hidden"))),
+        );
+
+        let visible = |graph: &GraphId| graph.as_str() != "urn:test:pred:hidden";
+
+        let rows = solution_rows(
+            engine
+                .query_with_visibility("SELECT ?s ?name WHERE { ?s schema:name ?name }", &visible)
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), total);
+        assert!(
+            rows.iter()
+                .all(|row| row.get("name").unwrap().0 != "\"Hidden Dataset\"")
+        );
+
+        let named_rows = solution_rows(
+            engine
+                .query_with_visibility(
+                    "SELECT ?g WHERE { GRAPH ?g { ?s schema:name ?name } }",
+                    &visible,
+                )
+                .unwrap(),
+        );
+        assert_eq!(named_rows.len(), total);
+        assert!(
+            named_rows
+                .iter()
+                .all(|row| row.get("g").unwrap().0 != "<urn:test:pred:hidden>")
+        );
+
+        let enumerated = solution_rows(
+            engine
+                .query_with_visibility("SELECT ?g WHERE { GRAPH ?g {} }", &visible)
+                .unwrap(),
+        );
+        assert_eq!(enumerated.len(), total);
+        assert!(
+            enumerated
+                .iter()
+                .all(|row| row.get("g").unwrap().0 != "<urn:test:pred:hidden>")
+        );
+
+        let fixed_hidden = solution_rows(
+            engine
+                .query_with_visibility(
+                    "SELECT ?name WHERE { GRAPH <urn:test:pred:hidden> { ?s schema:name ?name } }",
+                    &visible,
+                )
+                .unwrap(),
+        );
+        assert!(fixed_hidden.is_empty());
+
+        let subject_rows = solution_rows(
+            engine
+                .query_with_visibility(
+                    "SELECT ?pos WHERE { <urn:test:pred:shared> <http://schema.org/position> ?pos }",
+                    &visible,
+                )
+                .unwrap(),
+        );
+        assert_eq!(subject_rows.len(), total);
+        assert!(
+            subject_rows
+                .iter()
+                .all(|row| row.get("pos").unwrap().0 != "\"hidden\"")
+        );
+
+        assert_eq!(
+            engine
+                .query_with_visibility("ASK { ?s ?p ?o }", &visible)
+                .unwrap(),
+            QueryResults::Boolean(true)
+        );
+        assert_eq!(
+            engine
+                .query_with_visibility("ASK { ?s ?p ?o }", &|_: &GraphId| false)
+                .unwrap(),
+            QueryResults::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn predicate_visibility_hides_orphaned_entities() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let total = EXPLICIT_DATASET_GRAPH_LIMIT + 4;
+        let mut graphs = Vec::with_capacity(total);
+        for idx in 0..total {
+            let graph = GraphId::new(&format!("urn:test:predorphan:{idx:03}"));
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:predorphan:{idx:03}:e"),
+                "http://schema.org/name",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "Visible {idx:03}"
+                )))),
+            );
+            graphs.push(graph);
+        }
+        insert_quad(
+            &store,
+            &graphs[0],
+            "./data/orphan.txt",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Orphaned File"))),
+        );
+        store
+            .set_graph_diagnostics(
+                &graphs[0],
+                &GraphDiagnostics::from_orphaned_entities(vec!["./data/orphan.txt".to_string()]),
+            )
+            .unwrap();
+
+        let rows = solution_rows(
+            engine
+                .query_with_visibility(
+                    "SELECT ?name WHERE { ?s schema:name ?name }",
+                    &|_: &GraphId| true,
+                )
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), total);
+        assert!(
+            rows.iter()
+                .all(|row| row.get("name").unwrap().0 != "\"Orphaned File\"")
+        );
+    }
+
+    #[test]
+    fn predicate_visibility_is_memoized_per_graph() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let total = EXPLICIT_DATASET_GRAPH_LIMIT + 8;
+        for idx in 0..total {
+            let graph = GraphId::new(&format!("urn:test:memo:{idx:03}"));
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:memo:{idx:03}:e"),
+                "http://schema.org/name",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "Dataset {idx:03}"
+                )))),
+            );
+        }
+
+        let calls: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+        let visible = |graph: &GraphId| {
+            *calls
+                .borrow_mut()
+                .entry(graph.as_str().to_string())
+                .or_insert(0) += 1;
+            true
+        };
+
+        let rows = solution_rows(
+            engine
+                .query_with_visibility("SELECT ?s ?name WHERE { ?s schema:name ?name }", &visible)
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), total);
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), total);
+        assert!(calls.values().all(|&count| count == 1), "{calls:?}");
+    }
+
+    #[test]
+    fn predicate_visibility_blocks_cross_graph_influence() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let visible_graph = GraphId::new("urn:test:join:visible");
+        let hidden_graph = GraphId::new("urn:test:join:hidden");
+        insert_quad(
+            &store,
+            &visible_graph,
+            "urn:test:join:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+        );
+        insert_quad(
+            &store,
+            &hidden_graph,
+            "urn:test:join:e1",
+            "http://schema.org/hidden",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("true"))),
+        );
+
+        let query = "SELECT ?name WHERE { ?s schema:name ?name . \
+                     FILTER NOT EXISTS { ?s <http://schema.org/hidden> ?h } }";
+
+        let rows = solution_rows(
+            engine
+                .query_with_visibility(query, &|graph: &GraphId| {
+                    graph.as_str() != "urn:test:join:hidden"
+                })
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1, "invisible graph must not feed NOT EXISTS");
+
+        let rows = solution_rows(
+            engine
+                .query_with_visibility(query, &|_: &GraphId| true)
+                .unwrap(),
+        );
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -1459,5 +2072,78 @@ mod tests {
                 .0
                 .contains("http://www.w3.org/2001/XMLSchema#double")
         );
+    }
+
+    #[test]
+    fn service_fts_respects_visibility_predicate() {
+        let (_dir, store, search, engine) = setup_engine();
+        let graph1 = GraphId::new("urn:test:fts:g1");
+        let graph2 = GraphId::new("urn:test:fts:g2");
+        insert_quad(
+            &store,
+            &graph1,
+            "urn:test:fts:e1",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Proteomics Atlas",
+            ))),
+        );
+        insert_quad(
+            &store,
+            &graph2,
+            "urn:test:fts:e2",
+            "http://schema.org/name",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                "Proteomics Archive",
+            ))),
+        );
+        while search.process_queued_updates(&store, 50_000).unwrap() != 0 {}
+
+        let query = r#"
+            SELECT ?s ?g
+            WHERE {
+                SERVICE <urn:craqle:fts> {
+                    ?s fts:query "proteomics" .
+                    ?s fts:graph ?g .
+                    ?s fts:limit 5 .
+                }
+            }
+        "#;
+
+        let rows = solution_rows(
+            engine
+                .query_with_visibility(query, &|graph: &GraphId| {
+                    graph.as_str() != "urn:test:fts:g2"
+                })
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("g").unwrap().0, "<urn:test:fts:g1>");
+
+        let all_rows = solution_rows(
+            engine
+                .query_with_visibility(query, &|_: &GraphId| true)
+                .unwrap(),
+        );
+        assert_eq!(all_rows.len(), 2);
+
+        let fixed_hidden = r#"
+            SELECT ?s
+            WHERE {
+                SERVICE <urn:craqle:fts> {
+                    ?s fts:query "proteomics" .
+                    ?s fts:graph <urn:test:fts:g2> .
+                    ?s fts:limit 5 .
+                }
+            }
+        "#;
+        let hidden_rows = solution_rows(
+            engine
+                .query_with_visibility(fixed_hidden, &|graph: &GraphId| {
+                    graph.as_str() != "urn:test:fts:g2"
+                })
+                .unwrap(),
+        );
+        assert!(hidden_rows.is_empty());
     }
 }

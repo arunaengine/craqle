@@ -1184,6 +1184,46 @@ impl CraqleNode {
         Ok(self.sparql.query_with_graphs(sparql, graphs)?)
     }
 
+    /// Execute a SPARQL query where graph visibility is decided by `visible`.
+    ///
+    /// The predicate is evaluated lazily over the union view: it runs at most
+    /// once per graph the evaluation actually touches (memoized for the
+    /// duration of the query), so the cost scales with the graphs a query
+    /// reaches instead of the total corpus. A quad participates in evaluation
+    /// iff its graph satisfies the predicate; the predicate must be cheap and
+    /// side-effect free.
+    pub fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
+    where
+        F: Fn(&GraphId) -> bool,
+    {
+        Ok(self.sparql.query_with_visibility(sparql, &visible)?)
+    }
+
+    /// [`CraqleNode::query_graphs_with`] with explicit control over the
+    /// craqle query-plan optimizer. `optimize = false` evaluates the raw
+    /// sparopt plan; used for plan debugging and result-equivalence tests.
+    /// The `CRAQLE_QUERY_OPT=off` environment variable disables the
+    /// optimizer globally for the default query entry points.
+    pub fn query_graphs_with_planner<F>(
+        &self,
+        visible: F,
+        sparql: &str,
+        optimize: bool,
+    ) -> Result<QueryResults>
+    where
+        F: Fn(&GraphId) -> bool,
+    {
+        Ok(self
+            .sparql
+            .query_with_visibility_planned(sparql, &visible, optimize)?)
+    }
+
+    /// Block until the cross-graph derived indexes are built; they are kept
+    /// up to date incrementally afterwards.
+    pub fn ensure_query_indexes(&self) {
+        self.store.ensure_derived_indexes();
+    }
+
     /// Search visible resources in the local search index.
     pub fn search(
         &self,
@@ -1191,9 +1231,32 @@ impl CraqleNode {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let mut hits = Vec::new();
-        for graph in self.visible_graphs(auth)? {
-            hits.extend(self.search.search_in_graph(graph.as_str(), query, limit)?);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let fetch = limit.saturating_mul(4).max(64);
+        let raw_hits = self.search.search(query, fetch)?;
+
+        let mut graph_readable: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
+        for hit in raw_hits {
+            let readable = match graph_readable.get(&hit.graph_id) {
+                Some(readable) => *readable,
+                None => {
+                    let graph = GraphId::new(&hit.graph_id);
+                    let readable = self.store.contains_graph(&graph)?
+                        && auth
+                            .authorize(&graph, &self.store.graph_policy(&graph)?, Action::Read)
+                            .is_ok();
+                    graph_readable.insert(hit.graph_id.clone(), readable);
+                    readable
+                }
+            };
+            if readable {
+                hits.push(hit);
+            }
         }
 
         hits.sort_by_key(|hit| {
