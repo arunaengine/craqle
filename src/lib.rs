@@ -336,16 +336,11 @@ pub struct CraqleOptions {
 }
 
 /// Storage backend used for the full-text search index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum SearchStorage {
+    #[default]
     Disk,
     Memory,
-}
-
-impl Default for SearchStorage {
-    fn default() -> Self {
-        Self::Disk
-    }
 }
 
 impl Default for CraqleOptions {

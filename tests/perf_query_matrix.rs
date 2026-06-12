@@ -438,7 +438,11 @@ mod tests {
                 shape.label
             );
             if let Some(expected) = shape.expect_rows {
-                assert_eq!(rows_after, expected, "{}: unexpected row count", shape.label);
+                assert_eq!(
+                    rows_after, expected,
+                    "{}: unexpected row count",
+                    shape.label
+                );
             }
             let before_p50 = percentile(&mut before, 0.5);
             let after_p50 = percentile(&mut after, 0.5);
@@ -483,10 +487,7 @@ mod tests {
                 qps,
             );
             if p50 > Duration::from_millis(10) {
-                violations.push(format!(
-                    "{}: concurrent p50 too slow: {p50:?}",
-                    shape.label
-                ));
+                violations.push(format!("{}: concurrent p50 too slow: {p50:?}", shape.label));
             }
         }
 
@@ -508,6 +509,10 @@ mod tests {
             ));
         }
 
-        assert!(violations.is_empty(), "matrix violations:\n{}", violations.join("\n"));
+        assert!(
+            violations.is_empty(),
+            "matrix violations:\n{}",
+            violations.join("\n")
+        );
     }
 }

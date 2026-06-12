@@ -36,8 +36,8 @@ mod tests {
             rest /= 32;
         }
         let mut seed = idx.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        for slot in 0..10 {
-            out[slot] = CROCKFORD[(seed % 32) as usize];
+        for slot in out.iter_mut().take(10) {
+            *slot = CROCKFORD[seed % 32];
             seed /= 32;
         }
         // Keep lexicographic order aligned with idx for binary search.
@@ -138,10 +138,16 @@ mod tests {
         let Some(tail) = iri.rsplit('/').next() else {
             return false;
         };
-        if tail.len() != 26 || !tail.bytes().all(|b| CROCKFORD.contains(&b.to_ascii_uppercase())) {
+        if tail.len() != 26
+            || !tail
+                .bytes()
+                .all(|b| CROCKFORD.contains(&b.to_ascii_uppercase()))
+        {
             return false;
         }
-        registry.binary_search_by(|entry| entry.as_str().cmp(iri)).is_ok()
+        registry
+            .binary_search_by(|entry| entry.as_str().cmp(iri))
+            .is_ok()
     }
 
     fn measure(label: &str, samples: usize, mut run: impl FnMut() -> usize) -> Vec<Duration> {
@@ -183,7 +189,12 @@ mod tests {
         });
         let wall = wall_start.elapsed();
         let qps = latencies.len() as f64 / wall.as_secs_f64();
-        println!("{} [wall {:?}, {:.1} qps]", format_stats(label, &latencies), wall, qps);
+        println!(
+            "{} [wall {:?}, {:.1} qps]",
+            format_stats(label, &latencies),
+            wall,
+            qps
+        );
         latencies
     }
 
@@ -217,9 +228,8 @@ mod tests {
         let filter_scan = || {
             let rows = solution_rows(node.query_graphs_with(visible, &filter_contains).unwrap());
             assert!(
-                rows.iter().any(|row| row
-                    .get("name")
-                    .is_some_and(|name| name.0.contains(&needle))),
+                rows.iter()
+                    .any(|row| row.get("name").is_some_and(|name| name.0.contains(&needle))),
                 "needle row missing",
             );
             rows.len()
@@ -235,8 +245,18 @@ mod tests {
         measure("warm SELECT files LIMIT 100", samples, select_files);
         measure("warm FILTER CONTAINS scan", samples, filter_scan);
 
-        measure_concurrent("conc SELECT datasets LIMIT 25", threads, samples, select_datasets);
-        measure_concurrent("conc SELECT files LIMIT 100", threads, samples, select_files);
+        measure_concurrent(
+            "conc SELECT datasets LIMIT 25",
+            threads,
+            samples,
+            select_datasets,
+        );
+        measure_concurrent(
+            "conc SELECT files LIMIT 100",
+            threads,
+            samples,
+            select_files,
+        );
     }
 
     #[test]
@@ -257,8 +277,7 @@ mod tests {
         let count_q = "SELECT (COUNT(*) AS ?c) WHERE { ?d <http://schema.org/name> ?name }";
         let contains_q = "SELECT ?d ?name WHERE { ?d <http://schema.org/name> ?name . \
                           FILTER(CONTAINS(?name, \"doc-0\")) }";
-        let count_type_q =
-            "SELECT (COUNT(*) AS ?c) WHERE { ?d a <http://schema.org/Dataset> }";
+        let count_type_q = "SELECT (COUNT(*) AS ?c) WHERE { ?d a <http://schema.org/Dataset> }";
 
         measure("COUNT names (predicate registry)", samples, || {
             solution_rows(node.query_graphs_with(visible, count_q).unwrap()).len()
@@ -304,7 +323,10 @@ mod tests {
         )
         .unwrap();
         node.ensure_query_indexes();
-        println!("--- post-reopen (cold caches), reopen took {:?} ---", reopen_started.elapsed());
+        println!(
+            "--- post-reopen (cold caches), reopen took {:?} ---",
+            reopen_started.elapsed()
+        );
         run_query_suite(&node, &registry, samples, threads);
     }
 }

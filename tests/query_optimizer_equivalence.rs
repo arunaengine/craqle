@@ -83,7 +83,11 @@ mod tests {
             }
             // Typed integer literal written with a non-canonical lexical form
             // on some graphs: value-equality folds must never fire on these.
-            let version = if idx % 5 == 0 { "\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>" } else { "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>" };
+            let version = if idx % 5 == 0 {
+                "\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+            } else {
+                "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+            };
             changes.push(insert(
                 &root,
                 "http://schema.org/version",
@@ -247,12 +251,10 @@ mod tests {
             ),
             (
                 "join_chain_anchored_worst_order",
-                format!(
-                    "SELECT ?fn WHERE {{ ?f <http://schema.org/name> ?fn . \
+                "SELECT ?fn WHERE { ?f <http://schema.org/name> ?fn . \
                      ?f a <http://schema.org/File> . ?d <http://schema.org/hasPart> ?f . \
                      ?d a <http://schema.org/Dataset> . \
-                     ?d <http://schema.org/name> \"Equivalence Dataset 0123\" }}"
-                ),
+                     ?d <http://schema.org/name> \"Equivalence Dataset 0123\" }".to_string(),
             ),
             (
                 "distinct_limit",
@@ -355,7 +357,7 @@ mod tests {
                     .trim_end_matches('"')
                     .parse()
                     .unwrap();
-                assert!(idx % 7 != 0, "hidden graph leaked: {name}");
+                assert!(!idx.is_multiple_of(7), "hidden graph leaked: {name}");
             }
         }
 
@@ -377,8 +379,7 @@ mod tests {
 
         // `?v = 1` is value equality: it must match both "1"^^xsd:integer and
         // the non-canonical "01"^^xsd:integer spellings.
-        let sparql =
-            "SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }";
+        let sparql = "SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }";
         let optimized = solution_rows(
             node.query_graphs_with_planner(visible, sparql, true)
                 .unwrap(),

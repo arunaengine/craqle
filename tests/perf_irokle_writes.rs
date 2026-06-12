@@ -227,6 +227,7 @@ mod tests {
         builder.build().unwrap()
     }
 
+    #[allow(dead_code)]
     fn probe_node_with_peers(
         label: &str,
         node: &CraqleNode,
