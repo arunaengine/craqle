@@ -22,10 +22,14 @@ mod tests {
         EncodedTerm(format!("\"{value}\""))
     }
 
-    fn crate_changes(graph: &GraphId, graph_idx: usize, files_per_graph: usize) -> Vec<MaterializedQuadChange> {
+    fn crate_changes(
+        graph: &GraphId,
+        graph_idx: usize,
+        files_per_graph: usize,
+    ) -> Vec<MaterializedQuadChange> {
         let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
         let root = term_iri(graph.as_str());
-        let name = if graph_idx % NEEDLE_EVERY == 0 {
+        let name = if graph_idx.is_multiple_of(NEEDLE_EVERY) {
             format!("Bench Dataset {graph_idx:05} {NEEDLE}")
         } else {
             format!("Bench Dataset {graph_idx:05}")
@@ -46,9 +50,15 @@ mod tests {
             insert(
                 &root,
                 "http://schema.org/description",
-                term_str(&format!("Synthetic RO-Crate {graph_idx:05} for query profiling")),
+                term_str(&format!(
+                    "Synthetic RO-Crate {graph_idx:05} for query profiling"
+                )),
             ),
-            insert(&root, "http://schema.org/datePublished", term_str("2026-01-01")),
+            insert(
+                &root,
+                "http://schema.org/datePublished",
+                term_str("2026-01-01"),
+            ),
             insert(
                 &root,
                 "http://schema.org/license",
@@ -58,13 +68,21 @@ mod tests {
 
         for file_idx in 0..files_per_graph {
             let file = term_iri(&format!("{}/data/file-{file_idx}.dat", graph.as_str()));
-            changes.push(insert(&file, rdf_type, term_iri("http://schema.org/MediaObject")));
+            changes.push(insert(
+                &file,
+                rdf_type,
+                term_iri("http://schema.org/MediaObject"),
+            ));
             changes.push(insert(
                 &file,
                 "http://schema.org/name",
                 term_str(&format!("file-{graph_idx:05}-{file_idx}.dat")),
             ));
-            changes.push(insert(&file, "http://schema.org/contentSize", term_str("1024")));
+            changes.push(insert(
+                &file,
+                "http://schema.org/contentSize",
+                term_str("1024"),
+            ));
             changes.push(insert(
                 &file,
                 "http://schema.org/encodingFormat",
@@ -76,11 +94,7 @@ mod tests {
         changes
     }
 
-    fn measure(
-        label: &str,
-        samples: usize,
-        mut run: impl FnMut() -> usize,
-    ) -> Vec<Duration> {
+    fn measure(label: &str, samples: usize, mut run: impl FnMut() -> usize) -> Vec<Duration> {
         let _ = run();
         let mut latencies = Vec::with_capacity(samples);
         for _ in 0..samples {
@@ -198,8 +212,10 @@ mod tests {
             rows.len()
         });
         measure("SELECT name LIMIT 25 (predicate all)", samples, || {
-            let rows =
-                solution_rows(node.query_graphs_with(|_: &GraphId| true, select_limited).unwrap());
+            let rows = solution_rows(
+                node.query_graphs_with(|_: &GraphId| true, select_limited)
+                    .unwrap(),
+            );
             assert_eq!(rows.len(), 25);
             rows.len()
         });
@@ -222,8 +238,10 @@ mod tests {
             rows.len()
         });
         measure("FILTER CONTAINS scan (predicate all)", samples, || {
-            let rows =
-                solution_rows(node.query_graphs_with(|_: &GraphId| true, &filter_scan).unwrap());
+            let rows = solution_rows(
+                node.query_graphs_with(|_: &GraphId| true, &filter_scan)
+                    .unwrap(),
+            );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
         });
@@ -237,17 +255,27 @@ mod tests {
         });
 
         let graph_bound = "SELECT ?g ?name WHERE { GRAPH ?g { ?s rdf:type schema:Dataset . ?s schema:name ?name } } LIMIT 25";
-        measure("GRAPH-bound type+name LIMIT 25 (graph list)", samples, || {
-            let rows = solution_rows(node.query_graphs(&graphs, graph_bound).unwrap());
-            assert_eq!(rows.len(), 25);
-            rows.len()
-        });
-        measure("GRAPH-bound type+name LIMIT 25 (predicate all)", samples, || {
-            let rows =
-                solution_rows(node.query_graphs_with(|_: &GraphId| true, graph_bound).unwrap());
-            assert_eq!(rows.len(), 25);
-            rows.len()
-        });
+        measure(
+            "GRAPH-bound type+name LIMIT 25 (graph list)",
+            samples,
+            || {
+                let rows = solution_rows(node.query_graphs(&graphs, graph_bound).unwrap());
+                assert_eq!(rows.len(), 25);
+                rows.len()
+            },
+        );
+        measure(
+            "GRAPH-bound type+name LIMIT 25 (predicate all)",
+            samples,
+            || {
+                let rows = solution_rows(
+                    node.query_graphs_with(|_: &GraphId| true, graph_bound)
+                        .unwrap(),
+                );
+                assert_eq!(rows.len(), 25);
+                rows.len()
+            },
+        );
     }
 
     #[test]
@@ -323,9 +351,18 @@ mod tests {
         measure("seq trivial ASK (graph list)", samples, ask_list);
         measure_concurrent("conc trivial ASK (graph list)", threads, samples, ask_list);
         measure("seq trivial ASK (predicate 90%)", samples, ask_pred);
-        measure_concurrent("conc trivial ASK (predicate 90%)", threads, samples, ask_pred);
+        measure_concurrent(
+            "conc trivial ASK (predicate 90%)",
+            threads,
+            samples,
+            ask_pred,
+        );
 
-        measure("seq SELECT name LIMIT 25 (graph list)", samples, select_limited);
+        measure(
+            "seq SELECT name LIMIT 25 (graph list)",
+            samples,
+            select_limited,
+        );
         measure_concurrent(
             "conc SELECT name LIMIT 25 (graph list)",
             threads,
@@ -344,7 +381,11 @@ mod tests {
             select_limited_pred,
         );
 
-        measure("seq FILTER CONTAINS scan (graph list)", samples, filter_scan);
+        measure(
+            "seq FILTER CONTAINS scan (graph list)",
+            samples,
+            filter_scan,
+        );
         measure_concurrent(
             "conc FILTER CONTAINS scan (graph list)",
             threads,
@@ -363,7 +404,11 @@ mod tests {
             filter_scan_pred,
         );
 
-        measure("seq GRAPH-bound LIMIT 25 (graph list)", samples, graph_bound);
+        measure(
+            "seq GRAPH-bound LIMIT 25 (graph list)",
+            samples,
+            graph_bound,
+        );
         measure_concurrent(
             "conc GRAPH-bound LIMIT 25 (graph list)",
             threads,

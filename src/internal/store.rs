@@ -936,7 +936,11 @@ impl GraphStore {
 
     pub(crate) fn stat_predicate_count(&self, predicate: TermId) -> usize {
         self.with_derived_indexes(|indexes| {
-            indexes.predicate_counts.get(&predicate).copied().unwrap_or(0)
+            indexes
+                .predicate_counts
+                .get(&predicate)
+                .copied()
+                .unwrap_or(0)
         })
     }
 

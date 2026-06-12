@@ -51,7 +51,12 @@ pub(crate) fn optimize_query(query: &mut Query, store: &GraphStore) {
         | Query::Ask { pattern, .. }
         | Query::Describe { pattern, .. }
         | Query::Construct { pattern, .. } => {
-            let current = std::mem::replace(pattern, GraphPattern::Bgp { patterns: Vec::new() });
+            let current = std::mem::replace(
+                pattern,
+                GraphPattern::Bgp {
+                    patterns: Vec::new(),
+                },
+            );
             *pattern = optimize_pattern(current, &HashSet::new(), store);
         }
     }
@@ -435,10 +440,10 @@ fn fold_variable_into_patterns(
     constant: &FoldableConstant,
 ) -> bool {
     let key = variable.as_str();
-    let occurs_as = |slot: &TermPattern| matches!(slot, TermPattern::Variable(v) if v.as_str() == key);
-    let occurs_as_predicate = |p: &NamedNodePattern| {
-        matches!(p, NamedNodePattern::Variable(v) if v.as_str() == key)
-    };
+    let occurs_as =
+        |slot: &TermPattern| matches!(slot, TermPattern::Variable(v) if v.as_str() == key);
+    let occurs_as_predicate =
+        |p: &NamedNodePattern| matches!(p, NamedNodePattern::Variable(v) if v.as_str() == key);
 
     let literal_constant = !matches!(constant, FoldableConstant::Iri(_));
     let mut occurs_anywhere = false;
@@ -469,10 +474,10 @@ fn fold_variable_into_patterns(
         if occurs_as(&pattern.subject) {
             pattern.subject = term_pattern.clone();
         }
-        if occurs_as_predicate(&pattern.predicate) {
-            if let FoldableConstant::Iri(node) = constant {
-                pattern.predicate = NamedNodePattern::NamedNode(node.clone());
-            }
+        if occurs_as_predicate(&pattern.predicate)
+            && let FoldableConstant::Iri(node) = constant
+        {
+            pattern.predicate = NamedNodePattern::NamedNode(node.clone());
         }
         if occurs_as(&pattern.object) {
             pattern.object = term_pattern.clone();
@@ -515,8 +520,9 @@ fn rewrite_filter_over_bgp(
     for (variable, constant) in bindings {
         let expression = match constant {
             FoldableConstant::Iri(node) => Expression::NamedNode(node),
-            FoldableConstant::StringLiteral(literal)
-            | FoldableConstant::TypedLiteral(literal) => Expression::Literal(literal),
+            FoldableConstant::StringLiteral(literal) | FoldableConstant::TypedLiteral(literal) => {
+                Expression::Literal(literal)
+            }
         };
         node = GraphPattern::Extend {
             inner: Box::new(node),
@@ -714,9 +720,7 @@ fn reorder_bgp(
         while let Some(idx) = stack.pop() {
             members.push(idx);
             for other in 0..patterns.len() {
-                if component_of[other].is_none()
-                    && !free_vars[idx].is_disjoint(&free_vars[other])
-                {
+                if component_of[other].is_none() && !free_vars[idx].is_disjoint(&free_vars[other]) {
                     component_of[other] = Some(component_id);
                     stack.push(other);
                 }
@@ -736,11 +740,7 @@ fn reorder_bgp(
         let mut chain_cost = u64::MAX;
         let mut first_index = usize::MAX;
         while !remaining.is_empty() {
-            let connected = |idx: usize| {
-                free_vars[idx]
-                    .iter()
-                    .any(|key| local_bound.contains(key))
-            };
+            let connected = |idx: usize| free_vars[idx].iter().any(|key| local_bound.contains(key));
             let candidate = remaining
                 .iter()
                 .copied()
@@ -857,11 +857,15 @@ mod tests {
         let graph_id = store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))
             .unwrap();
-        let subject_id = store.resolve_term(&EncodedTerm(subject.to_string())).unwrap();
+        let subject_id = store
+            .resolve_term(&EncodedTerm(subject.to_string()))
+            .unwrap();
         let predicate_id = store
             .resolve_term(&EncodedTerm(predicate.to_string()))
             .unwrap();
-        let object_id = store.resolve_term(&EncodedTerm(object.to_string())).unwrap();
+        let object_id = store
+            .resolve_term(&EncodedTerm(object.to_string()))
+            .unwrap();
         store
             .insert_quad(
                 &mut batch,
@@ -975,9 +979,8 @@ mod tests {
     #[test]
     fn filter_numeric_equality_is_not_folded() {
         let (_dir, store) = seeded_store();
-        let mut query = parse(
-            "SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }",
-        );
+        let mut query =
+            parse("SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }");
         optimize_query(&mut query, &store);
         fn has_filter(pattern: &GraphPattern) -> bool {
             match pattern {
