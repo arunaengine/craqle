@@ -1306,18 +1306,42 @@ impl CraqleNode {
             }
         }
 
-        hits.sort_by_key(|hit| {
-            (
-                Reverse(score_key(hit.score)),
-                hit.graph_id.clone(),
-                hit.subject_iri.clone(),
-            )
-        });
-        hits.dedup_by(|left, right| {
-            left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
-        });
-        hits.truncate(limit);
-        Ok(hits)
+        Ok(limit_search_hits(hits, limit))
+    }
+
+    /// Search visible resources in an explicit set of graph IRIs.
+    ///
+    /// Graph selection and authorization are applied before Tantivy top-k
+    /// collection by searching each readable selected graph separately. Missing
+    /// or non-readable graphs are ignored, matching [`CraqleNode::search`].
+    pub fn search_graphs(
+        &self,
+        auth: &dyn Authorizer,
+        graphs: &[GraphId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut hits = Vec::new();
+        for graph in graphs {
+            if !seen.insert(graph.as_str().to_string()) {
+                continue;
+            }
+            if !self.store.contains_graph(graph)?
+                || auth
+                    .authorize(graph, &self.store.graph_policy(graph)?, Action::Read)
+                    .is_err()
+            {
+                continue;
+            }
+            hits.extend(self.search.search_in_graph(graph.as_str(), query, limit)?);
+        }
+
+        Ok(limit_search_hits(hits, limit))
     }
 
     /// Resolve one visible subject into `(predicate, object)` pairs.
@@ -1682,4 +1706,19 @@ fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<Gr
 
 fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
+}
+
+fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    hits.sort_by_key(|hit| {
+        (
+            Reverse(score_key(hit.score)),
+            hit.graph_id.clone(),
+            hit.subject_iri.clone(),
+        )
+    });
+    hits.dedup_by(|left, right| {
+        left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
+    });
+    hits.truncate(limit);
+    hits
 }
