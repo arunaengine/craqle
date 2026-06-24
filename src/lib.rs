@@ -111,6 +111,38 @@ impl CraqleRequestDurability {
     }
 }
 
+/// Fjall persistence mode used when Craqle explicitly persists its graph store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CraqleFjallPersistMode {
+    /// Flush to Fjall's configured buffer without forcing an OS sync.
+    #[default]
+    Buffer,
+    /// Sync file data but not necessarily metadata.
+    SyncData,
+    /// Sync file data and metadata before returning.
+    SyncAll,
+}
+
+impl From<CraqleFjallPersistMode> for fjall::PersistMode {
+    fn from(mode: CraqleFjallPersistMode) -> Self {
+        match mode {
+            CraqleFjallPersistMode::Buffer => Self::Buffer,
+            CraqleFjallPersistMode::SyncData => Self::SyncData,
+            CraqleFjallPersistMode::SyncAll => Self::SyncAll,
+        }
+    }
+}
+
+impl From<fjall::PersistMode> for CraqleFjallPersistMode {
+    fn from(mode: fjall::PersistMode) -> Self {
+        match mode {
+            fjall::PersistMode::Buffer => Self::Buffer,
+            fjall::PersistMode::SyncData => Self::SyncData,
+            fjall::PersistMode::SyncAll => Self::SyncAll,
+        }
+    }
+}
+
 /// Input for creating a new RO-Crate graph.
 #[derive(Debug, Clone)]
 pub struct CreateCrateRequest {
@@ -333,6 +365,7 @@ pub struct CraqleOptions {
     actor: ActorId,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
     search_storage: SearchStorage,
+    graph_store_persist_mode: CraqleFjallPersistMode,
 }
 
 /// Storage backend used for the full-text search index.
@@ -349,6 +382,7 @@ impl Default for CraqleOptions {
             actor: ActorId::random(),
             sync: None,
             search_storage: SearchStorage::default(),
+            graph_store_persist_mode: CraqleFjallPersistMode::default(),
         }
     }
 }
@@ -366,6 +400,15 @@ impl CraqleOptions {
     pub fn with_search_storage(mut self, search_storage: SearchStorage) -> Self {
         self.search_storage = search_storage;
         self
+    }
+
+    pub fn with_graph_store_persist_mode(mut self, mode: CraqleFjallPersistMode) -> Self {
+        self.graph_store_persist_mode = mode;
+        self
+    }
+
+    pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
+        self.graph_store_persist_mode
     }
 
     pub fn with_irokle<S: irokle::Storage>(
@@ -398,8 +441,12 @@ impl CraqleNode {
         let root = path.as_ref();
         std::fs::create_dir_all(root)?;
         let search_storage = options.search_storage;
+        let graph_store_persist_mode = options.graph_store_persist_mode;
 
-        let store = Arc::new(GraphStore::open(root.join("store"))?);
+        let store = Arc::new(GraphStore::open_with_persist_mode(
+            root.join("store"),
+            graph_store_persist_mode.into(),
+        )?);
         let search = Arc::new(match search_storage {
             SearchStorage::Disk => SearchIndex::open(root.join("search"))?,
             SearchStorage::Memory => SearchIndex::open_in_memory()?,
@@ -449,6 +496,11 @@ impl CraqleNode {
     /// Return the local actor id used for authored replication batches.
     pub fn actor(&self) -> ActorId {
         self.actor
+    }
+
+    /// Return the Fjall persistence mode used for explicit graph-store persists.
+    pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
+        self.store.persist_mode().into()
     }
 
     pub fn irokle_topic_id(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {
