@@ -61,6 +61,59 @@ fn public_graphs_are_visible_without_grants() {
 }
 
 #[test]
+fn graph_store_persist_mode_defaults_to_buffer_and_can_use_sync_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = GraphId::new("urn:test:graph-store-sync-all");
+    let options =
+        CraqleOptions::new().with_graph_store_persist_mode(CraqleFjallPersistMode::SyncAll);
+
+    assert_eq!(
+        CraqleFjallPersistMode::Buffer,
+        CraqleOptions::new().graph_store_persist_mode()
+    );
+    assert_eq!(
+        CraqleFjallPersistMode::SyncAll,
+        options.graph_store_persist_mode()
+    );
+
+    {
+        let node = CraqleNode::open_with_options(dir.path(), options).unwrap();
+        assert_eq!(
+            CraqleFjallPersistMode::SyncAll,
+            node.graph_store_persist_mode()
+        );
+        node.create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "SyncAll Dataset",
+                "Graph-store SyncAll persistence test",
+                "2026-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/sync-all".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    let reopened = CraqleNode::open(dir.path()).unwrap();
+    assert_eq!(
+        CraqleFjallPersistMode::Buffer,
+        reopened.graph_store_persist_mode()
+    );
+    assert!(reopened.contains_graph(&graph).unwrap());
+    assert!(
+        reopened
+            .export_rocrate(&GrantAuthorizer::default(), &graph)
+            .unwrap()
+            .contains("SyncAll Dataset")
+    );
+}
+
+#[test]
 fn query_graphs_with_filters_by_lazy_predicate() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();

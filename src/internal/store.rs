@@ -297,6 +297,7 @@ impl DerivedIndexState {
 
 pub struct GraphStore {
     db: Database,
+    persist_mode: PersistMode,
     terms: Keyspace,
     quads: Keyspace,
     graphs: Keyspace,
@@ -1098,6 +1099,13 @@ impl GraphStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_persist_mode(path, PersistMode::Buffer)
+    }
+
+    pub fn open_with_persist_mode(
+        path: impl AsRef<Path>,
+        persist_mode: PersistMode,
+    ) -> Result<Self> {
         let worker_threads = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
@@ -1111,10 +1119,17 @@ impl GraphStore {
             .max_write_buffer_size(Some(24 * 1_024 * 1_024 * 1_024))
             .worker_threads(worker_threads)
             .open()?;
-        Self::from_database(db)
+        Self::from_database_with_persist_mode(db, persist_mode)
     }
 
     pub fn from_database(db: Database) -> Result<Self> {
+        Self::from_database_with_persist_mode(db, PersistMode::Buffer)
+    }
+
+    pub fn from_database_with_persist_mode(
+        db: Database,
+        persist_mode: PersistMode,
+    ) -> Result<Self> {
         let point_read_heavy = || {
             KeyspaceCreateOptions::default()
                 .expect_point_read_hits(true)
@@ -1139,6 +1154,7 @@ impl GraphStore {
             graphs: db.keyspace("graphs", point_read_heavy)?,
             log: db.keyspace("log", write_heavy)?,
             db,
+            persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             indexes: RwLock::new(IndexState::default()),
             derived_indexes: RwLock::new(None),
@@ -1157,12 +1173,16 @@ impl GraphStore {
         &self.db
     }
 
+    pub fn persist_mode(&self) -> PersistMode {
+        self.persist_mode
+    }
+
     pub fn manual_compact(&self) -> Result<()> {
-        self.db.persist(PersistMode::Buffer)?;
+        self.db.persist(self.persist_mode)?;
         for keyspace in [&self.terms, &self.quads, &self.graphs, &self.log] {
             keyspace.major_compact()?;
         }
-        self.db.persist(PersistMode::Buffer)?;
+        self.db.persist(self.persist_mode)?;
         Ok(())
     }
 
@@ -2216,7 +2236,7 @@ impl GraphStore {
     }
 
     pub fn persist(&self) -> Result<()> {
-        self.db.persist(PersistMode::Buffer)?;
+        self.db.persist(self.persist_mode)?;
         Ok(())
     }
 
@@ -2388,6 +2408,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn open_with_persist_mode_tracks_configured_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:persist-mode:sync-all");
+
+        {
+            let store =
+                GraphStore::open_with_persist_mode(dir.path(), PersistMode::SyncAll).unwrap();
+            assert_eq!(PersistMode::SyncAll, store.persist_mode());
+            store.create_graph(&graph).unwrap();
+            store.persist().unwrap();
+        }
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(PersistMode::Buffer, reopened.persist_mode());
+        assert!(reopened.contains_graph(&graph).unwrap());
     }
 
     fn insert_quad(
