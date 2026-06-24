@@ -493,6 +493,84 @@ fn search_filters_private_graphs_by_policy() {
 }
 
 #[test]
+fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    let selected_a = GraphId::new("urn:test:search-graphs:selected-a");
+    let selected_b = GraphId::new("urn:test:search-graphs:selected-b");
+    let hidden_selected = GraphId::new("urn:test:search-graphs:hidden-selected");
+
+    for idx in 0..70 {
+        let graph_iri = format!("urn:test:search-graphs:unselected-{idx:03}");
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new(&graph_iri),
+                format!("Dominant Unselected {idx}"),
+                "needle ".repeat(40),
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/search-graphs".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            hidden_selected.clone(),
+            "Hidden Selected",
+            "needle ".repeat(40),
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/private/search-graphs".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    for graph in [&selected_a, &selected_b] {
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                format!("Selected {}", graph.as_str()),
+                "needle",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/search-graphs".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+    node.flush_search_updates().unwrap();
+
+    let hits = node
+        .search_graphs(
+            &GrantAuthorizer::default(),
+            &[hidden_selected, selected_a.clone(), selected_b.clone()],
+            "needle",
+            2,
+        )
+        .unwrap();
+
+    assert_eq!(hits.len(), 2);
+    let mut subjects: Vec<_> = hits.iter().map(|hit| hit.subject_iri.as_str()).collect();
+    subjects.sort_unstable();
+    assert_eq!(subjects, vec![selected_a.as_str(), selected_b.as_str()]);
+}
+
+#[test]
 fn search_hits_can_be_hydrated_from_rdf() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
