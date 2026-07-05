@@ -146,15 +146,8 @@ impl RoCrateManager {
         date_published: &str,
         license: &str,
     ) -> Result<Batch, RoCrateError> {
-        let changes = if self.graph_is_empty(&graph_id)? {
-            create_crate_scaffold_changes_with_license(
-                &graph_id,
-                name,
-                description,
-                date_published,
-                encoded_license_value(license)?,
-            )
-        } else {
+        let is_replacement = !self.graph_is_empty(&graph_id)?;
+        let changes = if is_replacement {
             let mut rocrate = create_crate_rocrate_with_license(
                 &graph_id,
                 name,
@@ -163,6 +156,14 @@ impl RoCrateManager {
                 license_from_str(license)?,
             );
             self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+        } else {
+            create_crate_scaffold_changes_with_license(
+                &graph_id,
+                name,
+                description,
+                date_published,
+                encoded_license_value(license)?,
+            )
         };
         let batch = self
             .engine
@@ -170,6 +171,11 @@ impl RoCrateManager {
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        if is_replacement {
+            // Same stale-context revert as `replace_graph_with_rocrate`, so the
+            // checked and prevalidated create paths stay in lockstep.
+            self.reset_context_after_replacement(&graph_id)?;
+        }
         Ok(batch)
     }
 
@@ -318,16 +324,13 @@ impl RoCrateManager {
 
     /// Export a graph to RO-Crate JSON-LD.
     pub fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
-        Ok(serde_json::to_string_pretty(
-            &self.current_rocrate(graph_id)?,
-        )?)
+        let page = self.visible_root_linked_data_entities(graph_id)?;
+        self.render_export_view(graph_id, &page, true)
     }
 
     /// Export a lightweight partial RO-Crate view without data entities.
     pub fn export_jsonld_summary(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
-        Ok(serde_json::to_string(
-            &self.build_partial_export_view(graph_id, &[])?,
-        )?)
+        self.render_export_view(graph_id, &[], false)
     }
 
     /// Export an offset-based partial RO-Crate page of root-linked data entities.
@@ -338,7 +341,7 @@ impl RoCrateManager {
         limit: usize,
     ) -> Result<RoCratePage, RoCrateError> {
         let (total, page) = self.root_linked_data_entity_page(graph_id, offset, limit)?;
-        let jsonld = serde_json::to_string(&self.build_partial_export_view(graph_id, &page)?)?;
+        let jsonld = self.render_export_view(graph_id, &page, false)?;
         let returned = page.len();
         let has_more = offset + returned < total;
         let next_cursor = has_more
@@ -375,7 +378,7 @@ impl RoCrateManager {
         let next_cursor = has_more
             .then(|| page.last().and_then(encoded_named_node_value))
             .flatten();
-        let jsonld = serde_json::to_string(&self.build_partial_export_view(graph_id, &page)?)?;
+        let jsonld = self.render_export_view(graph_id, &page, false)?;
 
         Ok(RoCratePage {
             jsonld,
@@ -393,11 +396,14 @@ impl RoCrateManager {
     /// current graph state.
     pub fn import_jsonld(&self, graph_id: GraphId, jsonld: &str) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        if self.graph_is_missing_or_empty(&graph_id)? {
-            return self.import_jsonld_into_empty_graph_trusted(graph_id, value);
-        }
-
-        self.replace_jsonld_in_existing_graph(graph_id, value)
+        let context = extract_raw_context(&value);
+        let batch = if self.graph_is_missing_or_empty(&graph_id)? {
+            self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?
+        } else {
+            self.replace_jsonld_in_existing_graph(graph_id.clone(), value)?
+        };
+        self.store_import_context(&graph_id, context)?;
+        Ok(batch)
     }
 
     /// Strict import path that validates complete RO-Crate semantics even for
@@ -407,13 +413,16 @@ impl RoCrateManager {
         graph_id: GraphId,
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
-        let changes = self.plan_import_jsonld_checked(&graph_id, jsonld)?;
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        let context = extract_raw_context(&value);
+        let changes = self.plan_import_value_checked(&graph_id, value)?;
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.store_import_context(&graph_id, context)?;
         Ok(batch)
     }
 
@@ -429,6 +438,7 @@ impl RoCrateManager {
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        let context = extract_raw_context(&value);
         let target = jsonld_triples(&graph_id, &value)?;
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
             insert_changes(&graph_id, target)
@@ -444,6 +454,7 @@ impl RoCrateManager {
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.store_import_context(&graph_id, context)?;
         Ok(batch)
     }
 
@@ -464,7 +475,10 @@ impl RoCrateManager {
         }
 
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        self.import_jsonld_into_empty_graph_trusted(graph_id, value)
+        let context = extract_raw_context(&value);
+        let batch = self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?;
+        self.store_import_context(&graph_id, context)?;
+        Ok(batch)
     }
 
     /// Compute the canonical change set for replacing a graph with a JSON-LD RO-Crate.
@@ -709,9 +723,13 @@ impl RoCrateManager {
         &self,
         graph_id: &GraphId,
         page_entities: &[EncodedTerm],
+        ctx: &ContextTermMap,
     ) -> Result<RoCrate, RoCrateError> {
-        let metadata =
-            export_metadata_descriptor(graph_id, self.subject_triples(graph_id, METADATA_ID)?)?;
+        let metadata = export_metadata_descriptor(
+            graph_id,
+            self.subject_triples(graph_id, METADATA_ID)?,
+            ctx,
+        )?;
         let root = export_root_entity(
             graph_id,
             self.subject_triples_excluding_predicate(
@@ -720,6 +738,7 @@ impl RoCrateManager {
                 &vocab::schema_has_part(),
             )?,
             page_entities,
+            ctx,
         )?;
 
         let mut graph = vec![
@@ -732,7 +751,7 @@ impl RoCrateManager {
             if triples.is_empty() {
                 continue;
             }
-            graph.push(export_graph_entity(&subject_id, triples)?);
+            graph.push(export_graph_entity(&subject_id, triples, ctx)?);
         }
 
         for entity in page_entities {
@@ -747,7 +766,7 @@ impl RoCrateManager {
             if triples.is_empty() {
                 continue;
             }
-            graph.push(export_graph_entity(&subject_id, triples)?);
+            graph.push(export_graph_entity(&subject_id, triples, ctx)?);
         }
 
         Ok(RoCrate {
@@ -756,8 +775,23 @@ impl RoCrateManager {
         })
     }
 
-    fn current_rocrate(&self, graph_id: &GraphId) -> Result<RoCrate, RoCrateError> {
-        self.build_partial_export_view(graph_id, &self.visible_root_linked_data_entities(graph_id)?)
+    /// Render an export view to a JSON-LD string, splicing the graph's stored
+    /// raw `@context` back in when one exists. When no custom context is stored,
+    /// output matches the bare default RO-Crate context byte-for-byte.
+    fn render_export_view(
+        &self,
+        graph_id: &GraphId,
+        page_entities: &[EncodedTerm],
+        pretty: bool,
+    ) -> Result<String, RoCrateError> {
+        let raw_context = self.engine.store().graph_context(graph_id)?;
+        let ctx = ContextTermMap::from_raw(raw_context.as_deref());
+        let rocrate = self.build_partial_export_view(graph_id, page_entities, &ctx)?;
+        match raw_context {
+            None if pretty => Ok(serde_json::to_string_pretty(&rocrate)?),
+            None => Ok(serde_json::to_string(&rocrate)?),
+            Some(raw) => splice_context_json(&rocrate, &raw, pretty),
+        }
     }
 
     fn replace_graph_with_rocrate(
@@ -766,7 +800,19 @@ impl RoCrateManager {
         mut rocrate: RoCrate,
     ) -> Result<Batch, RoCrateError> {
         let changes = self.plan_rocrate_replacement(graph_id, &mut rocrate)?;
-        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+        let batch = self.engine.local_apply_changes(graph_id, changes)?;
+        self.reset_context_after_replacement(graph_id)?;
+        Ok(batch)
+    }
+
+    /// A full crate replacement declares only the default RO-Crate context, so
+    /// any custom context left over from a prior import is now stale. Revert it
+    /// through the same store+publish path as an import (last write wins),
+    /// which no-ops when there is nothing custom to clear. Every full
+    /// replacement path (checked and prevalidated create alike) must call this
+    /// after a successful apply.
+    fn reset_context_after_replacement(&self, graph_id: &GraphId) -> Result<(), RoCrateError> {
+        self.store_import_context(graph_id, None)
     }
 
     fn plan_import_value(
@@ -838,6 +884,38 @@ impl RoCrateManager {
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
         Ok(batch)
+    }
+
+    /// Persist (and, when sync is configured, replicate) the raw `@context`
+    /// captured from an import. Last-write-wins: only updates when the context
+    /// actually changed, warning when it replaces an existing custom context.
+    ///
+    /// Two-phase contract. Import is not a single atomic transaction: the quad
+    /// changes are committed and published (phase 1, by the caller) *before* the
+    /// context register is updated here (phase 2). If phase 2 fails, the import
+    /// returns an error with the quads already applied and the stored context
+    /// unchanged. This is self-healing: re-importing the same document produces
+    /// an empty quad diff (a no-op batch, so phase 1 does nothing), and because
+    /// the stored context still differs from the freshly captured one, the
+    /// `current == context` guard below does not trip — so the context
+    /// store/publish is retried and the two phases converge.
+    fn store_import_context(
+        &self,
+        graph_id: &GraphId,
+        context: Option<String>,
+    ) -> Result<(), RoCrateError> {
+        let current = self.engine.store().graph_context(graph_id)?;
+        if current == context {
+            return Ok(());
+        }
+        if current.is_some() {
+            tracing::warn!(
+                graph = %graph_id.as_str(),
+                "replacing stored RO-Crate @context for graph (last write wins)"
+            );
+        }
+        self.engine.set_graph_context(graph_id, context)?;
+        Ok(())
     }
 
     fn plan_rocrate_replacement(
@@ -1547,6 +1625,10 @@ fn jsonld_triples(
         })?;
 
     let import_root = document_root_id(graph);
+    let term_map = object
+        .get("@context")
+        .map(context_term_map)
+        .unwrap_or_default();
     let mut triples = BTreeSet::new();
     for (index, entry) in graph.iter().enumerate() {
         let entity = entry.as_object().ok_or_else(|| {
@@ -1573,7 +1655,7 @@ fn jsonld_triples(
             }
             let normalized_property = normalize_property(property);
             let predicate =
-                EncodedTerm::from_named_node(&property_named_node(&normalized_property)?);
+                EncodedTerm::from_named_node(&resolve_import_predicate(property, &term_map)?);
             for object in property_value_terms(
                 graph_id,
                 import_root.as_deref(),
@@ -1911,6 +1993,7 @@ fn expand_known_compact_iri(value: &str) -> Result<NamedNode, RoCrateError> {
 fn export_metadata_descriptor(
     graph_id: &GraphId,
     triples: Vec<(EncodedTerm, EncodedTerm)>,
+    ctx: &ContextTermMap,
 ) -> Result<MetadataDescriptor, RoCrateError> {
     let mut type_terms = Vec::new();
     let mut conforms_to = None;
@@ -1918,7 +2001,7 @@ fn export_metadata_descriptor(
     let mut dynamic = HashMap::new();
 
     for (predicate, object) in triples {
-        let key = predicate_key(&predicate);
+        let key = predicate_key(&predicate, ctx);
         match key.as_str() {
             "type" | "@type" => {
                 if let Some(value) = object_named_node_value(&object) {
@@ -1944,6 +2027,7 @@ fn export_root_entity(
     graph_id: &GraphId,
     triples: Vec<(EncodedTerm, EncodedTerm)>,
     page_entities: &[EncodedTerm],
+    ctx: &ContextTermMap,
 ) -> Result<RootDataEntity, RoCrateError> {
     let mut type_terms = Vec::new();
     let mut name = None;
@@ -1953,7 +2037,7 @@ fn export_root_entity(
     let mut dynamic = HashMap::new();
 
     for (predicate, object) in triples {
-        let key = predicate_key(&predicate);
+        let key = predicate_key(&predicate, ctx);
         match key.as_str() {
             "type" | "@type" => {
                 if let Some(value) = object_named_node_value(&object) {
@@ -2003,12 +2087,13 @@ fn export_root_entity(
 fn export_graph_entity(
     subject_id: &str,
     triples: Vec<(EncodedTerm, EncodedTerm)>,
+    ctx: &ContextTermMap,
 ) -> Result<GraphVector, RoCrateError> {
     let mut type_terms = Vec::new();
     let mut dynamic = HashMap::new();
 
     for (predicate, object) in triples {
-        let key = predicate_key(&predicate);
+        let key = predicate_key(&predicate, ctx);
         match key.as_str() {
             "type" | "@type" => {
                 if let Some(value) = object_named_node_value(&object) {
@@ -2039,10 +2124,10 @@ fn export_graph_entity(
     }
 }
 
-fn predicate_key(predicate: &EncodedTerm) -> String {
+fn predicate_key(predicate: &EncodedTerm, ctx: &ContextTermMap) -> String {
     predicate
         .to_named_node()
-        .map(|node| normalize_compact_term(node.as_str()))
+        .map(|node| ctx.compact_predicate(node.as_str()))
         .unwrap_or_else(|| predicate.0.clone())
 }
 
@@ -2237,6 +2322,240 @@ fn default_context() -> RoCrateContext {
     RoCrateContext::ReferenceContext(ROCRATE_CONTEXT_URL.to_string())
 }
 
+/// Serialize an export view and replace its `@context` with the stored raw
+/// context JSON. Used when a graph has a custom context that `RoCrateContext`
+/// cannot represent (e.g. complex term definitions).
+fn splice_context_json(
+    rocrate: &RoCrate,
+    raw_context: &str,
+    pretty: bool,
+) -> Result<String, RoCrateError> {
+    let mut document = serde_json::to_value(rocrate)?;
+    let context: serde_json::Value = serde_json::from_str(raw_context)?;
+    if let Some(object) = document.as_object_mut() {
+        object.insert("@context".to_string(), context);
+    }
+    if pretty {
+        Ok(serde_json::to_string_pretty(&document)?)
+    } else {
+        Ok(serde_json::to_string(&document)?)
+    }
+}
+
+/// Simple `term -> IRI` mappings and their reverse, derived from a stored
+/// RO-Crate `@context`. String mappings from inline embedded context objects
+/// are captured, and object definitions carrying a string `@id` are expanded to
+/// that IRI; other complex shapes are skipped. Duplicate terms resolve
+/// last-write-wins (a later entry overrides an earlier one), with a warning on
+/// the import path (see [`collect_context_terms`]).
+#[derive(Debug, Default)]
+struct ContextTermMap {
+    forward: HashMap<String, String>,
+    reverse: HashMap<String, String>,
+}
+
+impl ContextTermMap {
+    fn from_raw(raw: Option<&str>) -> Self {
+        let mut forward = HashMap::new();
+        if let Some(raw) = raw {
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                // Export path: the context was already validated and warned about
+                // at import time, so collect quietly (see `collect_context_terms`).
+                Ok(value) => collect_context_terms(&value, &mut forward, false),
+                Err(error) => tracing::debug!(
+                    %error,
+                    "stored RO-Crate @context is not valid JSON; skipping term compaction"
+                ),
+            }
+        }
+        Self::from_forward(forward)
+    }
+
+    fn from_forward(forward: HashMap<String, String>) -> Self {
+        let mut reverse: HashMap<String, String> = HashMap::new();
+        for (term, iri) in &forward {
+            match reverse.get(iri) {
+                // Deterministic reverse mapping: keep the lexicographically
+                // smallest term when several terms alias the same IRI.
+                Some(existing) if existing.as_str() <= term.as_str() => {}
+                _ => {
+                    reverse.insert(iri.clone(), term.clone());
+                }
+            }
+        }
+        Self { forward, reverse }
+    }
+
+    /// Compact a predicate IRI back to a context term.
+    ///
+    /// A custom mapping wins over the built-in schema.org/rdf/rdfs compaction.
+    /// The built-in compaction is suppressed when the stored context redefines
+    /// the resulting term to a different IRI, so an emitted compact key always
+    /// resolves back to exactly the stored predicate IRI.
+    fn compact_predicate(&self, iri: &str) -> String {
+        if let Some(term) = self.reverse.get(iri) {
+            return term.clone();
+        }
+        let builtin = normalize_compact_term(iri);
+        if builtin != iri
+            && let Some(mapped) = self.forward.get(&builtin)
+            && mapped != iri
+        {
+            return iri.to_string();
+        }
+        builtin
+    }
+}
+
+/// Whether a submitted `@context` is equivalent to the bare default RO-Crate
+/// context (a plain reference string, or a single-element array of it).
+fn is_bare_default_context(context: &serde_json::Value) -> bool {
+    match context {
+        serde_json::Value::String(url) => url == ROCRATE_CONTEXT_URL,
+        serde_json::Value::Array(items) => {
+            items.len() == 1
+                && items
+                    .first()
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| url == ROCRATE_CONTEXT_URL)
+        }
+        _ => false,
+    }
+}
+
+/// Serialize the submitted `@context` verbatim for storage, or `None` when it is
+/// absent, degenerate, or equivalent to the bare default RO-Crate context.
+///
+/// Only strings, arrays, and objects can carry a usable JSON-LD context.
+/// Degenerate values (`null`, numbers, booleans) carry no mappings and are
+/// treated as "no custom context" so export falls back to the bare default URL
+/// rather than round-tripping a nonsensical `@context`.
+fn extract_raw_context(value: &serde_json::Value) -> Option<String> {
+    let context = value.as_object()?.get("@context")?;
+    if !matches!(
+        context,
+        serde_json::Value::String(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) {
+        return None;
+    }
+    if is_bare_default_context(context) {
+        return None;
+    }
+    match serde_json::to_string(context) {
+        Ok(raw) => Some(raw),
+        Err(error) => {
+            tracing::warn!(%error, "failed to serialize submitted @context; treating as default");
+            None
+        }
+    }
+}
+
+/// Build a `term -> IRI` map from a submitted `@context` value. Called on the
+/// import path, so unresolvable entries are surfaced with a warning once.
+fn context_term_map(context: &serde_json::Value) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    collect_context_terms(context, &mut map, true);
+    map
+}
+
+/// Insert a term mapping, warning (import path only) when it remaps an
+/// already-collected term to a different IRI. Last definition wins.
+fn insert_context_term(map: &mut HashMap<String, String>, term: &str, iri: String, warn: bool) {
+    if warn
+        && let Some(previous) = map.get(term)
+        && *previous != iri
+    {
+        tracing::warn!(
+            term = %term,
+            previous = %previous,
+            replacement = %iri,
+            "duplicate @context term remapped to a different IRI (last definition wins)"
+        );
+    }
+    map.insert(term.to_string(), iri);
+}
+
+/// Collect `term -> IRI` mappings from a `@context`.
+///
+/// Array entries are processed in order so later definitions override earlier
+/// ones (last-write-wins). String term definitions map directly, and object
+/// term definitions carrying a string `@id` are expanded to that IRI. Reference
+/// URLs other than the RO-Crate base, `@`-keywords, and object definitions
+/// without a string `@id` cannot be expanded here and are skipped. When `warn`
+/// is set (import path) each skip — and each duplicate term that remaps to a
+/// different IRI — is logged at `warn` level; the export path passes `false` so
+/// it does not re-log on every export.
+fn collect_context_terms(
+    context: &serde_json::Value,
+    map: &mut HashMap<String, String>,
+    warn: bool,
+) {
+    match context {
+        serde_json::Value::String(url) => {
+            if url != ROCRATE_CONTEXT_URL && warn {
+                tracing::warn!(
+                    context = %url,
+                    "ignoring non-RO-Crate reference @context for term expansion"
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_context_terms(item, map, warn);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for (term, definition) in entries {
+                if term.starts_with('@') {
+                    if warn {
+                        tracing::warn!(
+                            key = %term,
+                            "ignoring @context keyword entry for term expansion"
+                        );
+                    }
+                    continue;
+                }
+                match definition {
+                    serde_json::Value::String(iri) => {
+                        insert_context_term(map, term, iri.clone(), warn);
+                    }
+                    serde_json::Value::Object(definition_object) => {
+                        match definition_object
+                            .get("@id")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            Some(iri) => insert_context_term(map, term, iri.to_string(), warn),
+                            None if warn => tracing::warn!(
+                                term = %term,
+                                "ignoring complex @context term definition without a string @id for term expansion"
+                            ),
+                            None => {}
+                        }
+                    }
+                    _ if warn => tracing::warn!(
+                        term = %term,
+                        "ignoring complex @context term definition for term expansion"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve an import property key to its predicate IRI, preferring an explicit
+/// custom context mapping before the built-in schema.org fallback.
+fn resolve_import_predicate(
+    property: &str,
+    term_map: &HashMap<String, String>,
+) -> Result<NamedNode, RoCrateError> {
+    if let Some(iri) = term_map.get(property) {
+        return Ok(NamedNode::new_unchecked(iri));
+    }
+    property_named_node(&normalize_property(property))
+}
+
 fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateError> {
     let rdf_graph = rocrate_to_rdf_with_options(
         rocrate,
@@ -2350,4 +2669,239 @@ fn looks_like_identifier(value: &str) -> bool {
         || value.starts_with("_:")
         || value.contains("://")
         || (value.contains(':') && !value.contains(' '))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::sync::{
+        CraqleGraphEvent, CraqleGraphSync, CraqleSyncError, SyncResult, TopicCatchup,
+    };
+    use irokle::reducer::EventRecord;
+
+    /// A [`CraqleGraphSync`] decorator that delegates every call to `inner`,
+    /// except `publish_context`, which fails while `fail_context` is set. Used to
+    /// simulate a phase-2 (context) publish failure after phase-1 (quads) has
+    /// already committed and published.
+    struct FlakyContextSync {
+        inner: Arc<dyn CraqleGraphSync>,
+        fail_context: AtomicBool,
+    }
+
+    impl CraqleGraphSync for FlakyContextSync {
+        fn publish_changes(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            changes: Vec<MaterializedQuadChange>,
+        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            self.inner.publish_changes(store, graph, changes)
+        }
+
+        fn publish_policy(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            policy: crate::core::GraphPolicy,
+        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            self.inner.publish_policy(store, graph, policy)
+        }
+
+        fn publish_delete(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            self.inner.publish_delete(store, graph)
+        }
+
+        fn publish_context(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            context: Option<String>,
+            tag: crate::core::ContextTag,
+        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            if self.fail_context.load(Ordering::SeqCst) {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "injected context publish failure".to_string(),
+                ));
+            }
+            self.inner.publish_context(store, graph, context, tag)
+        }
+
+        fn graph_topic_id(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+        ) -> SyncResult<Option<irokle::TopicId>> {
+            self.inner.graph_topic_id(store, graph)
+        }
+
+        fn ensure_graph_topic(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+        ) -> SyncResult<irokle::TopicId> {
+            self.inner.ensure_graph_topic(store, graph)
+        }
+
+        fn bind_graph_topic(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            topic_id: irokle::TopicId,
+        ) -> SyncResult<()> {
+            self.inner.bind_graph_topic(store, graph, topic_id)
+        }
+
+        fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>> {
+            self.inner.craqle_topic_ids()
+        }
+
+        fn topic_records_since(
+            &self,
+            topic_id: irokle::TopicId,
+            cursor: Option<&[u8]>,
+        ) -> SyncResult<TopicCatchup> {
+            self.inner.topic_records_since(topic_id, cursor)
+        }
+
+        fn add_peer(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            peer: irokle::PeerId,
+        ) -> SyncResult<()> {
+            self.inner.add_peer(store, graph, peer)
+        }
+
+        fn remove_peer(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            peer: irokle::PeerId,
+        ) -> SyncResult<()> {
+            self.inner.remove_peer(store, graph, peer)
+        }
+
+        fn sync_status(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+        ) -> SyncResult<Vec<irokle::SyncPeerStatus>> {
+            self.inner.sync_status(store, graph)
+        }
+    }
+
+    /// A failed context publish (phase 2) leaves the already-applied quads
+    /// (phase 1) in place with the stored context unchanged, and re-importing the
+    /// same document heals it: the empty quad diff is a no-op while the context
+    /// store/publish is retried.
+    #[test]
+    fn context_publish_failure_leaves_quads_and_heals_on_reimport() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::GraphStore::open(dir.path()).unwrap());
+        let search = Arc::new(crate::search::SearchIndex::open_in_memory().unwrap());
+        let sparql = Arc::new(crate::sparql::SparqlEngine::new(
+            store.clone(),
+            search.clone(),
+        ));
+        let actor = crate::core::ActorId::random();
+
+        let node = irokle::Irokle::builder().build().unwrap();
+        let inner: Arc<dyn CraqleGraphSync> = Arc::new(crate::sync::IrokleGraphSync::new(
+            node,
+            crate::sync::CraqleIrokleOptions::new(),
+        ));
+        let flaky = Arc::new(FlakyContextSync {
+            inner,
+            fail_context: AtomicBool::new(true),
+        });
+        let sync: Arc<dyn CraqleGraphSync> = flaky.clone();
+
+        let engine = Arc::new(ReplicationEngine::new_with_sync(
+            store.clone(),
+            sparql.clone(),
+            actor,
+            Some(sync),
+        ));
+        let manager = RoCrateManager::new(engine);
+
+        let graph = GraphId::new("urn:test:context-publish-failure");
+        let organism_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
+        let document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                { "organism": organism_iri }
+            ],
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Failure Mode Crate",
+                    "description": "Context publish fails then heals",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "organism": "Homo sapiens"
+                }
+            ]
+        });
+
+        // Phase 1 (quads) succeeds; phase 2 (context publish) is forced to fail.
+        let first = manager.import_jsonld(graph.clone(), &document.to_string());
+        assert!(
+            first.is_err(),
+            "import should surface the injected context publish failure"
+        );
+
+        // The quads were applied (phase 1 committed and published) ...
+        assert!(
+            !store.graph_is_empty(&graph).unwrap(),
+            "quads should remain after the context publish failure"
+        );
+        assert!(
+            manager
+                .current_triples(&graph)
+                .unwrap()
+                .iter()
+                .any(|(_, predicate, _)| predicate
+                    .to_named_node()
+                    .is_some_and(|node| node.as_str() == organism_iri)),
+            "the custom-profile organism predicate should be present"
+        );
+        // ... but the stored context register is unchanged (publish-first).
+        assert_eq!(store.graph_context(&graph).unwrap(), None);
+        assert_eq!(
+            store.graph_context_tag(&graph).unwrap(),
+            crate::core::ContextTag::GENESIS
+        );
+
+        // Clear the fault and re-import the SAME document. The quad diff is empty
+        // (a no-op batch), and because the stored context still differs, the
+        // `current == context` guard does not trip, so the context is retried.
+        flaky.fail_context.store(false, Ordering::SeqCst);
+        let second = manager.import_jsonld(graph.clone(), &document.to_string());
+        assert!(second.is_ok(), "re-import should heal: {second:?}");
+
+        let stored = store.graph_context(&graph).unwrap();
+        assert!(
+            stored
+                .as_deref()
+                .is_some_and(|context| context.contains(organism_iri)),
+            "healed context should carry the profile IRI: {stored:?}"
+        );
+        assert!(
+            store.graph_context_tag(&graph).unwrap().counter >= 1,
+            "healed context tag should have advanced past genesis"
+        );
+    }
 }
