@@ -93,6 +93,16 @@ struct StoredGraphMeta {
     clock: VectorClock,
     #[serde(default)]
     irokle_topic: Option<[u8; 32]>,
+    /// Raw RO-Crate `@context` JSON submitted on import, stored verbatim so it
+    /// can be spliced back into exported documents. `None` means the graph uses
+    /// the bare default RO-Crate context.
+    #[serde(default)]
+    rocrate_context: Option<String>,
+    /// Last-write-wins ordering tag for `rocrate_context`. Determines the
+    /// winner when concurrent context writes race across peers; see
+    /// [`ContextTag`].
+    #[serde(default)]
+    context_tag: ContextTag,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1519,51 @@ impl GraphStore {
         self.commit(batch)
     }
 
+    /// Read the stored raw RO-Crate `@context` JSON for a graph, if any.
+    pub fn graph_context(&self, graph: &GraphId) -> Result<Option<String>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_graph_meta_by_id(graph_id)?
+            .unwrap_or_default()
+            .rocrate_context)
+    }
+
+    /// Read the last-write-wins ordering tag for a graph's stored `@context`.
+    /// Returns [`ContextTag::GENESIS`] when the graph has no explicit context.
+    pub fn graph_context_tag(&self, graph: &GraphId) -> Result<ContextTag> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(ContextTag::GENESIS);
+        };
+        Ok(self
+            .read_graph_meta_by_id(graph_id)?
+            .unwrap_or_default()
+            .context_tag)
+    }
+
+    /// Persist (or clear, with `None`) the raw RO-Crate `@context` JSON for a
+    /// graph, together with its last-write-wins ordering tag.
+    pub fn set_graph_context(
+        &self,
+        graph: &GraphId,
+        context: Option<&str>,
+        tag: ContextTag,
+    ) -> Result<()> {
+        let mut batch = self.new_batch();
+        let graph_id =
+            self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
+        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        meta.rocrate_context = context.map(str::to_string);
+        meta.context_tag = tag;
+        batch.insert(
+            &self.graphs,
+            graph_meta_key(graph_id),
+            postcard::to_allocvec(&meta)?,
+        );
+        self.commit(batch)
+    }
+
     pub fn topic_graph_binding(&self, topic_id: &[u8; 32]) -> Result<Option<String>> {
         self.graphs
             .get(topic_binding_key(topic_id))?
@@ -2426,6 +2481,29 @@ mod tests {
         let reopened = GraphStore::open(dir.path()).unwrap();
         assert_eq!(PersistMode::Buffer, reopened.persist_mode());
         assert!(reopened.contains_graph(&graph).unwrap());
+    }
+
+    #[test]
+    fn graph_context_defaults_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:context-defaults-reopen");
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            // Never set any context: the persisted metadata carries the default
+            // (no context, genesis tag) for the current on-disk shape.
+            store.persist().unwrap();
+        }
+
+        // Genuinely reopen from disk rather than reusing the in-memory instance.
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert!(reopened.contains_graph(&graph).unwrap());
+        assert_eq!(reopened.graph_context(&graph).unwrap(), None);
+        assert_eq!(
+            reopened.graph_context_tag(&graph).unwrap(),
+            ContextTag::GENESIS
+        );
     }
 
     fn insert_quad(
