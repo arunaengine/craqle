@@ -714,4 +714,169 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_custom_context_replicates_across_peers() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:ctx-replicate");
+        let organism_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
+        let document = format!(
+            r#"{{
+                "@context": [
+                    "https://w3id.org/ro/crate/1.2/context",
+                    {{"organism": "{organism_iri}"}}
+                ],
+                "@graph": [
+                    {{
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                        "about": {{"@id": "{graph}"}}
+                    }},
+                    {{
+                        "@id": "{graph}",
+                        "@type": "Dataset",
+                        "name": "Replicated Context Crate",
+                        "description": "Custom context should replicate",
+                        "datePublished": "2025-01-01",
+                        "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}},
+                        "organism": "Homo sapiens"
+                    }}
+                ]
+            }}"#,
+            graph = graph.as_str()
+        );
+
+        manager(net.peer(0))
+            .import_jsonld(graph.clone(), &document)
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        let exported_a: serde_json::Value =
+            serde_json::from_str(&manager(net.peer(0)).export_jsonld(&graph).unwrap()).unwrap();
+        let exported_b: serde_json::Value =
+            serde_json::from_str(&manager(net.peer(1)).export_jsonld(&graph).unwrap()).unwrap();
+
+        // The receiving peer reproduces the exact custom context, not the default.
+        assert!(
+            exported_b["@context"].is_array(),
+            "peer B should export the custom array context, got {}",
+            exported_b["@context"]
+        );
+        assert_eq!(exported_a["@context"], exported_b["@context"]);
+
+        // And peer B compacts the custom predicate using the replicated context.
+        let root_b = exported_b["@graph"]
+            .as_array()
+            .expect("@graph array")
+            .iter()
+            .find(|entry| entry["@id"] == serde_json::json!(graph.as_str()))
+            .expect("root entity present");
+        assert_eq!(root_b["organism"], serde_json::json!("Homo sapiens"));
+    }
+
+    /// A valid RO-Crate document whose `@graph` uses only standard terms, so the
+    /// resulting quads are identical no matter which custom `@context` is
+    /// attached (the custom terms are never referenced by the graph). This
+    /// isolates *context* convergence from *quad* convergence.
+    fn valid_crate_with_context(graph: &GraphId, context: &serde_json::Value) -> String {
+        serde_json::json!({
+            "@context": context,
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Concurrent Context Crate",
+                    "description": "Same content, different context",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "hasPart": [{"@id": "./data/file1.txt"}]
+                },
+                {
+                    "@id": "./data/file1.txt",
+                    "@type": "File",
+                    "name": "Measurement File"
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_concurrent_context_imports_converge_to_lww_winner() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:ctx-concurrent");
+        let default_context = serde_json::json!("https://w3id.org/ro/crate/1.2/context");
+
+        // Two distinct custom contexts. Their custom terms are not used by the
+        // `@graph`, so both imports produce byte-identical quads and the graph
+        // converges cleanly, leaving only the context register in conflict.
+        let context_a = serde_json::json!([
+            "https://w3id.org/ro/crate/1.2/context",
+            {"organism": "https://example.org/profiles/a#organism"}
+        ]);
+        let context_b = serde_json::json!([
+            "https://w3id.org/ro/crate/1.2/context",
+            {"assayType": "https://example.org/profiles/b#assayType"}
+        ]);
+
+        // Establish the graph and its shared irokle topic genesis on both peers
+        // first (bare default context, so no context event yet). This lets the
+        // later cross-peer sync succeed instead of forking the genesis.
+        manager(net.peer(0))
+            .import_jsonld(
+                graph.clone(),
+                &valid_crate_with_context(&graph, &default_context),
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        // Concurrent context writes over identical content, BEFORE the next sync:
+        // peer 0 gets A, peer 1 gets B. Both start from the genesis context tag,
+        // so both mint counter=1 tags and only the actor id breaks the tie.
+        manager(net.peer(0))
+            .import_jsonld(graph.clone(), &valid_crate_with_context(&graph, &context_a))
+            .unwrap();
+        manager(net.peer(1))
+            .import_jsonld(graph.clone(), &valid_crate_with_context(&graph, &context_b))
+            .unwrap();
+
+        net.sync_until_converged(10).unwrap();
+
+        let exported_a: serde_json::Value =
+            serde_json::from_str(&manager(net.peer(0)).export_jsonld(&graph).unwrap()).unwrap();
+        let exported_b: serde_json::Value =
+            serde_json::from_str(&manager(net.peer(1)).export_jsonld(&graph).unwrap()).unwrap();
+
+        // Convergence: both peers export the SAME context (not swapped, not each
+        // keeping their own).
+        assert_eq!(
+            exported_a["@context"], exported_b["@context"],
+            "peers must converge on one context, got A={} B={}",
+            exported_a["@context"], exported_b["@context"]
+        );
+
+        // The winner is deterministic and independent of arrival order: both tags
+        // have counter 1 (first write on each peer), so the larger actor id wins.
+        let winner_context = if net.peer(0).actor() >= net.peer(1).actor() {
+            &context_a
+        } else {
+            &context_b
+        };
+        assert_eq!(
+            exported_a["@context"], *winner_context,
+            "converged context must be the deterministic last-write-wins winner"
+        );
+        // And it is exactly one of the two imported contexts, never a merge.
+        assert!(
+            exported_a["@context"] == context_a || exported_a["@context"] == context_b,
+            "converged context must be one of the two imported contexts"
+        );
+    }
 }
