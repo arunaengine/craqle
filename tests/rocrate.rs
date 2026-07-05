@@ -695,4 +695,622 @@ mod tests {
         assert!(second_page.jsonld.contains("cursor-3.dat"));
         assert!(!second_page.jsonld.contains("cursor-0.dat"));
     }
+
+    const PROTEOMICS_ASSAY_IRI: &str = "https://w3id.org/aruna/profiles/proteomics#assayType";
+
+    fn custom_context_document(graph: &str, organism_iri: &str) -> String {
+        format!(
+            r#"{{
+                "@context": [
+                    "https://w3id.org/ro/crate/1.2/context",
+                    {{
+                        "organism": "{organism_iri}",
+                        "assayType": "{PROTEOMICS_ASSAY_IRI}"
+                    }}
+                ],
+                "@graph": [
+                    {{
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                        "about": {{"@id": "{graph}"}}
+                    }},
+                    {{
+                        "@id": "{graph}",
+                        "@type": "Dataset",
+                        "name": "Custom Context Crate",
+                        "description": "Dataset using profile terms",
+                        "datePublished": "2025-01-01",
+                        "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}},
+                        "organism": "Homo sapiens",
+                        "assayType": "proteomics",
+                        "hasPart": [{{"@id": "./data/file1.txt"}}]
+                    }},
+                    {{
+                        "@id": "./data/file1.txt",
+                        "@type": "File",
+                        "name": "Measurement File"
+                    }}
+                ]
+            }}"#
+        )
+    }
+
+    fn context_mappings(context: &serde_json::Value) -> std::collections::HashMap<String, String> {
+        let objects: Vec<&serde_json::Map<String, serde_json::Value>> = match context {
+            serde_json::Value::Array(items) => {
+                items.iter().filter_map(|item| item.as_object()).collect()
+            }
+            serde_json::Value::Object(object) => vec![object],
+            _ => Vec::new(),
+        };
+        let mut mappings = std::collections::HashMap::new();
+        for object in objects {
+            for (term, definition) in object {
+                if let Some(iri) = definition.as_str() {
+                    mappings.insert(term.clone(), iri.to_string());
+                }
+            }
+        }
+        mappings
+    }
+
+    fn graph_entry<'a>(document: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        document["@graph"]
+            .as_array()
+            .expect("@graph array")
+            .iter()
+            .find(|entry| entry["@id"] == serde_json::json!(id))
+            .expect("graph entry present")
+    }
+
+    #[test]
+    fn test_custom_array_context_import_stores_profile_iris_and_exports_compact() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-custom");
+        let mgr = manager(net.peer(0));
+        let organism_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
+        mgr.import_jsonld(
+            graph.clone(),
+            &custom_context_document(graph.as_str(), organism_iri),
+        )
+        .unwrap();
+
+        // Stored predicates use the custom profile IRIs, not schema.org fallbacks.
+        let state = graph_state(&net, 0, &graph);
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, object)| predicate.contains(organism_iri)
+                    && object.contains("Homo sapiens")),
+            "organism triple should use the custom profile IRI: {state:?}"
+        );
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains(PROTEOMICS_ASSAY_IRI))
+        );
+        assert!(
+            !state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains("schema.org/organism")),
+            "custom organism term must not fall back to schema.org"
+        );
+
+        // Full export retains the mappings and compacts the custom predicates.
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        let mappings = context_mappings(&exported["@context"]);
+        assert_eq!(
+            mappings.get("organism").map(String::as_str),
+            Some(organism_iri)
+        );
+        assert_eq!(
+            mappings.get("assayType").map(String::as_str),
+            Some(PROTEOMICS_ASSAY_IRI)
+        );
+
+        let root = graph_entry(&exported, graph.as_str());
+        assert_eq!(root["organism"], serde_json::json!("Homo sapiens"));
+        assert_eq!(root["assayType"], serde_json::json!("proteomics"));
+    }
+
+    #[test]
+    fn test_duplicate_context_term_last_definition_wins() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-duplicate");
+        let mgr = manager(net.peer(0));
+
+        let proteomics_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
+        let genomics_iri = "https://w3id.org/aruna/profiles/genomics#organism";
+        let submitted_context = serde_json::json!([
+            "https://w3id.org/ro/crate/1.2/context",
+            { "organism": proteomics_iri },
+            { "organism": genomics_iri }
+        ]);
+        let document = serde_json::json!({
+            "@context": submitted_context,
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Duplicate Term Crate",
+                    "description": "Later organism mapping wins",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "organism": "Homo sapiens"
+                }
+            ]
+        });
+
+        mgr.import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        let state = graph_state(&net, 0, &graph);
+        // (i) The later (genomics) IRI wins in the stored triple.
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, object)| predicate.contains(genomics_iri)
+                    && object.contains("Homo sapiens")),
+            "organism triple should use the later (genomics) profile IRI: {state:?}"
+        );
+        // (ii) The superseded (proteomics) IRI must not appear at all.
+        assert!(
+            !state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains(proteomics_iri)),
+            "superseded proteomics organism IRI must not appear: {state:?}"
+        );
+
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        // (iii) The exported entity still uses the compact key.
+        let root = graph_entry(&exported, graph.as_str());
+        assert_eq!(root["organism"], serde_json::json!("Homo sapiens"));
+        // (iv) The submitted @context round-trips verbatim (both entries present).
+        assert_eq!(exported["@context"], submitted_context);
+    }
+
+    #[test]
+    fn test_object_context_term_definition_with_id_expands() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-object-id");
+        let mgr = manager(net.peer(0));
+
+        let measurement_iri = "https://w3id.org/aruna/profiles/proteomics#measurement";
+        let document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "measurement": {
+                        "@id": measurement_iri,
+                        "@type": "@id"
+                    }
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Object Term Crate",
+                    "description": "Object term with a string @id",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "measurement": "spectrometry"
+                }
+            ]
+        });
+
+        mgr.import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        let state = graph_state(&net, 0, &graph);
+        // The object term definition is expanded to its `@id` IRI.
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, object)| predicate.contains(measurement_iri)
+                    && object.contains("spectrometry")),
+            "measurement triple should use the expanded profile IRI: {state:?}"
+        );
+        assert!(
+            !state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains("schema.org/measurement")),
+            "expanded measurement term must not fall back to schema.org"
+        );
+
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        let root = graph_entry(&exported, graph.as_str());
+        assert_eq!(root["measurement"], serde_json::json!("spectrometry"));
+    }
+
+    #[test]
+    fn test_object_context_term_definition_without_id_falls_back_to_schema_org() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-object-no-id");
+        let mgr = manager(net.peer(0));
+
+        let document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "measurement": { "@type": "@id" },
+                    "assay": { "@id": 5 }
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Fallback Term Crate",
+                    "description": "Object terms without a string @id",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "measurement": "spectrometry",
+                    "assay": "proteomics"
+                }
+            ]
+        });
+
+        // Import succeeds even though the object definitions cannot be expanded.
+        mgr.import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        let state = graph_state(&net, 0, &graph);
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains("http://schema.org/measurement")),
+            "measurement without a string @id should fall back to schema.org: {state:?}"
+        );
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains("http://schema.org/assay")),
+            "assay with a non-string @id should fall back to schema.org: {state:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial_exports_retain_custom_context() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-partial");
+        let mgr = manager(net.peer(0));
+        mgr.import_jsonld(
+            graph.clone(),
+            &custom_context_document(
+                graph.as_str(),
+                "https://w3id.org/aruna/profiles/proteomics#organism",
+            ),
+        )
+        .unwrap();
+
+        let summary: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld_summary(&graph).unwrap()).unwrap();
+        assert!(context_mappings(&summary["@context"]).contains_key("organism"));
+        let summary_root = graph_entry(&summary, graph.as_str());
+        assert_eq!(summary_root["organism"], serde_json::json!("Homo sapiens"));
+
+        let page = mgr.export_jsonld_page(&graph, 0, 10).unwrap();
+        let page_value: serde_json::Value = serde_json::from_str(&page.jsonld).unwrap();
+        assert!(context_mappings(&page_value["@context"]).contains_key("assayType"));
+
+        let page_after = mgr.export_jsonld_page_after(&graph, None, 10).unwrap();
+        let after_value: serde_json::Value = serde_json::from_str(&page_after.jsonld).unwrap();
+        assert!(context_mappings(&after_value["@context"]).contains_key("organism"));
+    }
+
+    #[test]
+    fn test_bare_context_exports_default_url_string() {
+        let (_tmp, net) = setup_network(1);
+        let mgr = manager(net.peer(0));
+
+        // Creation path keeps the default reference context.
+        let created = GraphId::new("urn:test:ctx-created");
+        mgr.create_crate(
+            created.clone(),
+            "Bare Context Crate",
+            "Uses the default context",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        let created_export: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&created).unwrap()).unwrap();
+        assert_eq!(
+            created_export["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.2/context")
+        );
+
+        // Importing a bare-context document also exports the plain URL string.
+        let imported = GraphId::new("urn:test:ctx-bare-import");
+        let doc = format!(
+            r#"{{
+                "@context": "https://w3id.org/ro/crate/1.2/context",
+                "@graph": [
+                    {{
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                        "about": {{"@id": "{graph}"}}
+                    }},
+                    {{
+                        "@id": "{graph}",
+                        "@type": "Dataset",
+                        "name": "Bare Crate",
+                        "description": "No custom context",
+                        "datePublished": "2025-01-01",
+                        "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+                    }}
+                ]
+            }}"#,
+            graph = imported.as_str()
+        );
+        mgr.import_jsonld(imported.clone(), &doc).unwrap();
+        let bare_export: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&imported).unwrap()).unwrap();
+        assert_eq!(
+            bare_export["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.2/context")
+        );
+    }
+
+    #[test]
+    fn test_complex_context_entries_round_trip_verbatim() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-complex");
+        let mgr = manager(net.peer(0));
+
+        let submitted_context = serde_json::json!([
+            "https://w3id.org/ro/crate/1.2/context",
+            {
+                "organism": "https://w3id.org/aruna/profiles/proteomics#organism",
+                "measurement": {
+                    "@id": "https://w3id.org/aruna/profiles/proteomics#measurement",
+                    "@type": "@id"
+                },
+                "@vocab": "https://schema.org/"
+            }
+        ]);
+        let document = serde_json::json!({
+            "@context": submitted_context,
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Complex Context Crate",
+                    "description": "Round-trips a complex context",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "organism": "Homo sapiens",
+                    "measurement": "spectrometry"
+                }
+            ]
+        });
+
+        // The complex term definition must not break import.
+        mgr.import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        // The stored context round-trips verbatim (including the complex entry).
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        assert_eq!(exported["@context"], submitted_context);
+
+        // The object term definition with a string `@id` is now expanded, so the
+        // stored `measurement` predicate is the profile IRI (not schema.org).
+        let state = graph_state(&net, 0, &graph);
+        assert!(
+            state.iter().any(|(_, predicate, object)| predicate
+                .contains("https://w3id.org/aruna/profiles/proteomics#measurement")
+                && object.contains("spectrometry")),
+            "measurement triple should use the expanded profile IRI: {state:?}"
+        );
+        assert!(
+            !state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains("schema.org/measurement")),
+            "expanded measurement term must not fall back to schema.org"
+        );
+    }
+
+    #[test]
+    fn test_replacement_import_updates_stored_context() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-replace");
+        let mgr = manager(net.peer(0));
+
+        mgr.import_jsonld(
+            graph.clone(),
+            &custom_context_document(
+                graph.as_str(),
+                "https://w3id.org/aruna/profiles/proteomics#organism",
+            ),
+        )
+        .unwrap();
+
+        let replacement_iri = "https://example.org/profiles/v2#organism";
+        mgr.import_jsonld(
+            graph.clone(),
+            &custom_context_document(graph.as_str(), replacement_iri),
+        )
+        .unwrap();
+
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        let mappings = context_mappings(&exported["@context"]);
+        assert_eq!(
+            mappings.get("organism").map(String::as_str),
+            Some(replacement_iri),
+            "replacement import should overwrite the stored context (last write wins)"
+        );
+
+        // The replaced predicate IRI is stored, and still compacts to `organism`.
+        let state = graph_state(&net, 0, &graph);
+        assert!(
+            state
+                .iter()
+                .any(|(_, predicate, _)| predicate.contains(replacement_iri))
+        );
+        let root = graph_entry(&exported, graph.as_str());
+        assert_eq!(root["organism"], serde_json::json!("Homo sapiens"));
+    }
+
+    #[test]
+    fn test_create_crate_over_custom_context_resets_to_default() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-create-reset");
+        let mgr = manager(net.peer(0));
+
+        // Import a crate that stores a custom array context.
+        mgr.import_jsonld(
+            graph.clone(),
+            &custom_context_document(
+                graph.as_str(),
+                "https://w3id.org/aruna/profiles/proteomics#organism",
+            ),
+        )
+        .unwrap();
+        let imported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        assert!(
+            imported["@context"].is_array(),
+            "custom context should be stored after import"
+        );
+
+        // A full create_crate replacement over the non-empty graph declares only
+        // the default context, so the stale custom context must be reverted.
+        mgr.create_crate(
+            graph.clone(),
+            "Replacement Crate",
+            "Replaces the custom-context crate",
+            "2025-02-02",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        assert_eq!(
+            exported["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.2/context"),
+            "create_crate replacement must revert to the bare default context"
+        );
+    }
+
+    #[test]
+    fn test_create_crate_prevalidated_over_custom_context_resets_to_default() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-create-prevalidated-reset");
+        let mgr = manager(net.peer(0));
+
+        // Import a crate that stores a custom array context.
+        mgr.import_jsonld(
+            graph.clone(),
+            &custom_context_document(
+                graph.as_str(),
+                "https://w3id.org/aruna/profiles/proteomics#organism",
+            ),
+        )
+        .unwrap();
+        let imported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        assert!(
+            imported["@context"].is_array(),
+            "custom context should be stored after import"
+        );
+
+        // The prevalidated create path must revert the stale custom context on a
+        // full replacement exactly like the checked create path.
+        net.peer(0)
+            .create_crate_prevalidated_with_durability_as(
+                &writer_auth(),
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "Replacement Crate",
+                    "Replaces the custom-context crate (prevalidated)",
+                    "2025-02-02",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    public_policy(),
+                ),
+                CraqleRequestDurability::Durable,
+                None,
+            )
+            .unwrap();
+
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        assert_eq!(
+            exported["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.2/context"),
+            "prevalidated create replacement must revert to the bare default context"
+        );
+    }
+
+    #[test]
+    fn test_null_context_exports_default() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:ctx-null");
+        let mgr = manager(net.peer(0));
+
+        let document = serde_json::json!({
+            "@context": serde_json::Value::Null,
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Null Context Crate",
+                    "description": "Degenerate context value",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                }
+            ]
+        });
+
+        mgr.import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        // A degenerate `@context: null` carries no mappings; export must fall back
+        // to the bare default rather than round-tripping `null`.
+        let exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
+        assert_eq!(
+            exported["@context"],
+            serde_json::json!("https://w3id.org/ro/crate/1.2/context"),
+            "a null @context must export as the bare default, not null"
+        );
+    }
 }
