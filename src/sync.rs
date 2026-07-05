@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::core::{
-    ActorId, Batch, Dot, GraphId, GraphPolicy, MaterializedQuadChange, QuadOp, VectorClock,
+    ActorId, Batch, ContextTag, Dot, GraphId, GraphPolicy, MaterializedQuadChange, QuadOp,
+    VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
@@ -25,6 +26,17 @@ pub enum CraqleGraphEvent {
     GraphDeleted {
         graph: GraphId,
     },
+    /// Last-write-wins update of a graph's raw RO-Crate `@context` JSON.
+    ///
+    /// `context` is `None` when the graph reverts to the bare default context.
+    /// `tag` is the last-write-wins ordering tag: a receiving peer overwrites its
+    /// stored context only when this tag strictly dominates its own, so all peers
+    /// converge on the same context regardless of event arrival order.
+    ContextUpdated {
+        graph: GraphId,
+        context: Option<String>,
+        tag: ContextTag,
+    },
 }
 
 impl CraqleGraphEvent {
@@ -32,7 +44,8 @@ impl CraqleGraphEvent {
         match self {
             Self::QuadChanges { graph, .. }
             | Self::Policy { graph, .. }
-            | Self::GraphDeleted { graph } => graph,
+            | Self::GraphDeleted { graph }
+            | Self::ContextUpdated { graph, .. } => graph,
         }
     }
 }
@@ -114,6 +127,14 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         &self,
         store: &GraphStore,
         graph: &GraphId,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
+
+    fn publish_context(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        context: Option<String>,
+        tag: ContextTag,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
     fn graph_topic_id(
@@ -229,6 +250,25 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         Ok(topic.publish_with(
             CraqleGraphEvent::GraphDeleted {
                 graph: graph.clone(),
+            },
+            self.publish_options(),
+        )?)
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str()))]
+    fn publish_context(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        context: Option<String>,
+        tag: ContextTag,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        let topic = self.open_graph_topic(store, graph)?;
+        Ok(topic.publish_with(
+            CraqleGraphEvent::ContextUpdated {
+                graph: graph.clone(),
+                context,
+                tag,
             },
             self.publish_options(),
         )?)

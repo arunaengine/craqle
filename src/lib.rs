@@ -1640,6 +1640,23 @@ impl CraqleNode {
                 }
                 Ok(result.applied)
             }
+            CraqleGraphEvent::ContextUpdated {
+                graph,
+                context,
+                tag,
+            } => {
+                // Deterministic last-write-wins: overwrite only when the incoming
+                // tag strictly dominates the stored one. This converges to the
+                // same context on every peer regardless of arrival order, since
+                // the `(counter, actor)` order is total and the winning tag is
+                // unique per distinct context value.
+                if *tag <= self.store.graph_context_tag(graph)? {
+                    return Ok(false);
+                }
+                self.store
+                    .set_graph_context(graph, context.as_deref(), *tag)?;
+                Ok(true)
+            }
         }
     }
 
