@@ -67,6 +67,20 @@ impl SearchIndex {
     }
 
     pub fn process_queued_updates(&self, store: &GraphStore, limit: usize) -> Result<usize> {
+        let queued_deletes = store.drain_fts_delete_queue(limit)?;
+        if !queued_deletes.is_empty() {
+            store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
+            store.acknowledge_fts_delete_queue(&queued_deletes)?;
+            return Ok(queued_deletes.len());
+        }
+
+        let queued_reindexes = store.drain_fts_reindex_queue(limit)?;
+        if !queued_reindexes.is_empty() {
+            store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_reindexes)?;
+            store.acknowledge_fts_reindex_queue(&queued_reindexes)?;
+            return Ok(queued_reindexes.len());
+        }
+
         let queued = store.drain_fts_queue(limit)?;
         store.acknowledge_fts_queue(&queued)?;
         Ok(queued.len())

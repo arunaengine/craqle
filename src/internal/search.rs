@@ -369,17 +369,37 @@ impl SearchIndex {
         store: &crate::store::GraphStore,
         limit: usize,
     ) -> Result<usize> {
-        let queued_graphs = store.drain_fts_reindex_queue(limit)?;
-        if !queued_graphs.is_empty() {
+        let queued_deletes = store.drain_fts_delete_queue(limit)?;
+        if !queued_deletes.is_empty() {
             let mut processed = 0usize;
-            for (graph, _) in &queued_graphs {
-                self.reindex_from_store(store, graph)?;
-                store.clear_fts_queue_for_graph(graph)?;
+            for (graph, _) in &queued_deletes {
+                if store.contains_graph(graph)? {
+                    self.reindex_from_store(store, graph)?;
+                } else {
+                    self.delete_graph_documents_uncommitted(graph.as_str());
+                }
                 processed += 1;
             }
 
             if processed > 0 {
                 self.commit()?;
+                store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
+                store.acknowledge_fts_delete_queue(&queued_deletes)?;
+            }
+            return Ok(processed);
+        }
+
+        let queued_graphs = store.drain_fts_reindex_queue(limit)?;
+        if !queued_graphs.is_empty() {
+            let mut processed = 0usize;
+            for (graph, _) in &queued_graphs {
+                self.reindex_from_store(store, graph)?;
+                processed += 1;
+            }
+
+            if processed > 0 {
+                self.commit()?;
+                store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_graphs)?;
                 store.acknowledge_fts_reindex_queue(&queued_graphs)?;
             }
             return Ok(processed);
@@ -620,6 +640,12 @@ impl SearchIndex {
             self.f_doc_key,
             &doc_key(graph_id, subject_iri),
         ));
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    fn delete_graph_documents_uncommitted(&self, graph_id: &str) {
+        let writer = self.writer.lock().unwrap();
+        writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
         self.dirty.store(true, Ordering::SeqCst);
     }
 }

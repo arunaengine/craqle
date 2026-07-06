@@ -24,6 +24,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        net.flush_search_updates().unwrap();
 
         let hits = net
             .peer(0)
@@ -220,6 +221,7 @@ mod tests {
                 )],
             )
             .unwrap();
+            node.flush_search_updates().unwrap();
 
             let hits = node
                 .search(&GrantAuthorizer::default(), "proteomics", 10)
@@ -231,6 +233,7 @@ mod tests {
         }
 
         let reopened = CraqleNode::open(tmp.path().join("peer0")).unwrap();
+        reopened.flush_search_updates().unwrap();
         let hits = reopened
             .search(&GrantAuthorizer::default(), "proteomics", 10)
             .unwrap();
@@ -288,52 +291,44 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_sync_updates_search_without_reindex() {
-        let tmp = tempfile::tempdir().unwrap();
-        let graph = GraphId::new("urn:test:remote-snapshot-search");
+    fn test_graph_delete_removes_search_results_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:delete-search");
         let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
 
-        let sender = CraqleNode::open(tmp.path().join("sender")).unwrap();
-        let receiver = CraqleNode::open(tmp.path().join("receiver")).unwrap();
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Deleted Search Dataset",
+                "This should disappear from search",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+        assert!(!node.search(&reader, "deleted", 10).unwrap().is_empty());
 
-        sender
-            .create_crate(
-                &writer,
-                CreateCrateRequest::new(
-                    graph.clone(),
-                    "Snapshot Dataset",
-                    "Snapshot receiver should update search directly",
-                    "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
-                    public_policy(),
-                ),
-            )
-            .unwrap();
-        sender
-            .append_new_root_data_entities(
-                &writer,
-                &graph,
-                benchmark_media_object_entities(
-                    0,
-                    25,
-                    "snapshot-keyword",
-                    "Snapshot Entity",
-                    "snapshot record",
-                    "SNAP",
-                ),
-            )
-            .unwrap();
+        node.delete_graph(&writer, &graph).unwrap();
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Replacement Search Dataset",
+                "Only replacement text should be searchable",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
 
-        let policy = sender.graph_policy(&graph).unwrap();
-        let snapshot = sender.graph_snapshot(&graph).unwrap();
-        receiver.import_graph_snapshot(&snapshot, policy).unwrap();
-
-        let hits = receiver
-            .search(&GrantAuthorizer::default(), "SNAP-000024", 10)
-            .unwrap();
-        assert!(
-            hits.iter()
-                .any(|hit| hit.subject_iri.contains("entity-000024.dat"))
-        );
+        assert!(node.search(&reader, "deleted", 10).unwrap().is_empty());
+        assert!(!node.search(&reader, "replacement", 10).unwrap().is_empty());
     }
 }

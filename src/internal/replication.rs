@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::*;
@@ -18,6 +18,8 @@ pub enum UpdateError {
     InvalidChangeSet(String),
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
+    #[error("sync: {0}")]
+    Sync(#[from] crate::sync::CraqleSyncError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,13 +35,14 @@ pub struct MergeResult {
     pub applied: bool,
 }
 
-/// The replication engine: local writes, CRDT merge, catch-up.
+/// The replication engine: local writes and CRDT merge of Irokle records.
 pub struct ReplicationEngine {
     store: Arc<GraphStore>,
     sparql: Arc<SparqlEngine>,
     rules: Vec<Box<dyn Rule>>,
     actor: ActorId,
-    gap_buffer: std::sync::Mutex<HashMap<GraphId, Vec<Batch>>>,
+    sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+    local_commit_lock: std::sync::Mutex<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,21 +51,60 @@ enum DiagnosticsRefresh {
     Deferred,
 }
 
-const MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH: usize = 10_000;
-
 impl ReplicationEngine {
     pub fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
+        Self::new_with_sync(store, sparql, actor, None)
+    }
+
+    pub fn new_with_sync(
+        store: Arc<GraphStore>,
+        sparql: Arc<SparqlEngine>,
+        actor: ActorId,
+        sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+    ) -> Self {
         Self {
             store,
             sparql,
             rules: crate::rules::default_rules(),
             actor,
-            gap_buffer: std::sync::Mutex::new(HashMap::new()),
+            sync,
+            local_commit_lock: std::sync::Mutex::new(()),
         }
     }
 
     pub fn store(&self) -> &Arc<GraphStore> {
         &self.store
+    }
+
+    /// Persist a graph's raw RO-Crate `@context` (last-write-wins) and, when sync
+    /// is configured, replicate the change to peers so their exports match.
+    ///
+    /// A fresh ordering tag is minted here (`stored_counter + 1`, actor =
+    /// this engine's actor) and used for both the local store and the published
+    /// event, so peers apply the same deterministic last-write-wins resolution.
+    ///
+    /// Publish-first invariant (load-bearing). The `ContextUpdated` event is
+    /// published to peers *before* the local store is updated. This ordering
+    /// makes the operation self-healing: if the publish fails, the local stored
+    /// context is left unchanged and a retry re-mints the same-or-higher tag and
+    /// re-publishes. Reversing the order (store locally, then publish) would, on
+    /// a publish failure, leave the local context updated so that a retry trips
+    /// the `current == context` short-circuit in `store_import_context` and
+    /// never re-publishes — leaving peers permanently without the update.
+    ///
+    /// `context` is `None` when the graph reverts to the bare default context.
+    pub fn set_graph_context(
+        &self,
+        graph: &GraphId,
+        context: Option<String>,
+    ) -> Result<(), UpdateError> {
+        let tag = ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor);
+        if let Some(sync) = &self.sync {
+            sync.publish_context(&self.store, graph, context.clone(), tag)?;
+        }
+        self.store
+            .set_graph_context(graph, context.as_deref(), tag)?;
+        Ok(())
     }
 
     /// Execute a SPARQL Update locally with full validation.
@@ -113,6 +155,7 @@ impl ReplicationEngine {
     }
 
     /// Apply a pre-materialized change set locally with full validation.
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
     pub fn local_apply_changes(
         &self,
         graph: &GraphId,
@@ -228,6 +271,7 @@ impl ReplicationEngine {
         self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Immediate, true)
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len(), sync_enabled = self.sync.is_some()))]
     fn commit_changes_with_mode(
         &self,
         graph: &GraphId,
@@ -235,6 +279,24 @@ impl ReplicationEngine {
         diagnostics_refresh: DiagnosticsRefresh,
         validated_orphan_free: bool,
     ) -> Result<Batch, UpdateError> {
+        if let Some(sync) = &self.sync {
+            let can_preserve_clean_diagnostics = diagnostics_refresh
+                == DiagnosticsRefresh::Immediate
+                && validated_orphan_free
+                && !self.store.graph_diagnostics(graph)?.has_orphans();
+            return self.publish_and_apply_changes(
+                sync,
+                graph,
+                changes,
+                diagnostics_refresh,
+                can_preserve_clean_diagnostics,
+            );
+        }
+
+        let _commit_guard = self
+            .local_commit_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut batch = self.store.new_batch();
         let can_preserve_clean_diagnostics = diagnostics_refresh == DiagnosticsRefresh::Immediate
             && validated_orphan_free
@@ -256,7 +318,6 @@ impl ReplicationEngine {
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
 
         let mut ops = Vec::with_capacity(changes.len());
-        let mut stored_ops = Vec::with_capacity(changes.len());
         let mut affected_subjects = std::collections::HashSet::new();
         let mut term_cache = HashMap::new();
 
@@ -307,12 +368,6 @@ impl ReplicationEngine {
                         object,
                         dot,
                     });
-                    stored_ops.push(crate::store::StoredQuadOp::Add {
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        dot,
-                    });
                 }
                 MaterializedQuadChange::Delete {
                     subject,
@@ -341,12 +396,6 @@ impl ReplicationEngine {
                         object,
                         witnessed: vector_clock.clone(),
                     });
-                    stored_ops.push(crate::store::StoredQuadOp::Remove {
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        witnessed: vector_clock.clone(),
-                    });
                 }
             }
         }
@@ -364,27 +413,8 @@ impl ReplicationEngine {
             timestamp: Utc::now(),
         };
 
-        self.store.append_compact_batch_log(
-            &mut batch,
-            graph,
-            &crate::store::StoredBatch {
-                actor: repl_batch.actor,
-                counter: repl_batch.counter,
-                base_clock: repl_batch.base_clock.clone(),
-                ops: stored_ops,
-                timestamp: repl_batch.timestamp,
-            },
-        )?;
-
-        match diagnostics_refresh {
-            DiagnosticsRefresh::Immediate => {
-                self.store
-                    .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
-            }
-            DiagnosticsRefresh::Deferred => {
-                self.store.enqueue_fts_reindex(&mut batch, graph)?;
-            }
-        }
+        self.store
+            .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
 
         self.store.commit(batch)?;
         if diagnostics_refresh == DiagnosticsRefresh::Immediate {
@@ -403,34 +433,47 @@ impl ReplicationEngine {
         Ok(repl_batch)
     }
 
-    /// Apply a remote batch using OR-Set CRDT semantics.
-    pub fn apply_remote_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
-        let mut touched_graphs = HashSet::new();
-        self.apply_remote_batch_internal(incoming, true, &mut touched_graphs)
-    }
-
-    pub fn apply_remote_batches(
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
+    fn publish_and_apply_changes(
         &self,
-        incoming: Vec<Batch>,
-    ) -> Result<Vec<MergeResult>, MergeError> {
-        let mut touched_graphs = HashSet::new();
-        let mut results = Vec::with_capacity(incoming.len());
-        for batch in incoming {
-            results.push(self.apply_remote_batch_internal(batch, false, &mut touched_graphs)?);
-        }
+        sync: &Arc<dyn crate::sync::CraqleGraphSync>,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        diagnostics_refresh: DiagnosticsRefresh,
+        can_preserve_clean_diagnostics: bool,
+    ) -> Result<Batch, UpdateError> {
+        let record = sync.publish_changes(&self.store, graph, changes)?;
+        let Some(batch) = crate::sync::batch_from_irokle_record(&record)? else {
+            return Err(UpdateError::InvalidChangeSet(
+                "irokle changes publish did not return a quad-change record".to_string(),
+            ));
+        };
 
-        for graph in touched_graphs {
-            self.finalize_remote_graph(&graph)?;
-        }
-
-        Ok(results)
+        self.apply_irokle_batch_with_mode(
+            batch.clone(),
+            diagnostics_refresh,
+            can_preserve_clean_diagnostics,
+        )
+        .map_err(update_error_from_merge)?;
+        Ok(batch)
     }
 
-    fn apply_remote_batch_internal(
+    /// Apply a causally ordered batch produced from an Irokle graph event.
+    ///
+    /// Irokle actor sequences include genesis and topic-control operations, so
+    /// they are not contiguous over Craqle domain events. The Irokle DAG already
+    /// enforces causal delivery; this path intentionally bypasses Craqle's old
+    /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
+    pub fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
+        self.apply_irokle_batch_with_mode(incoming, DiagnosticsRefresh::Immediate, false)
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
+    fn apply_irokle_batch_with_mode(
         &self,
         incoming: Batch,
-        finalize_graph: bool,
-        touched_graphs: &mut HashSet<GraphId>,
+        diagnostics_refresh: DiagnosticsRefresh,
+        can_preserve_clean_diagnostics: bool,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
@@ -439,7 +482,6 @@ impl ReplicationEngine {
         }
 
         let mut vector_clock = self.store.get_vector_clock(graph)?;
-
         if vector_clock.contains(&Dot {
             actor: incoming.actor,
             counter: incoming.counter,
@@ -447,20 +489,30 @@ impl ReplicationEngine {
             return Ok(MergeResult { applied: false });
         }
 
-        if !self.batch_is_ready(&vector_clock, &incoming) {
-            self.buffer_remote_batch(incoming)?;
-            return Ok(MergeResult { applied: false });
-        }
-
         self.apply_single_batch(&incoming, &mut vector_clock)?;
-        touched_graphs.insert(graph.clone());
-        self.apply_ready_buffered_batches(graph, &mut vector_clock, touched_graphs)?;
-
-        if finalize_graph {
-            self.finalize_remote_graph(graph)?;
+        match diagnostics_refresh {
+            DiagnosticsRefresh::Immediate => {
+                if can_preserve_clean_diagnostics {
+                    self.store
+                        .set_graph_diagnostics(graph, &crate::core::GraphDiagnostics::default())?;
+                } else {
+                    self.finalize_remote_graph(graph)?;
+                }
+            }
+            DiagnosticsRefresh::Deferred => {}
         }
-
         Ok(MergeResult { applied: true })
+    }
+
+    pub fn apply_irokle_record(
+        &self,
+        record: &irokle::reducer::EventRecord<crate::sync::CraqleGraphEvent>,
+    ) -> Result<Option<MergeResult>, MergeError> {
+        let batch = crate::sync::batch_from_irokle_record(record)
+            .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        batch
+            .map(|batch| self.apply_irokle_batch(batch))
+            .transpose()
     }
 
     fn finalize_remote_graph(&self, graph: &GraphId) -> Result<(), MergeError> {
@@ -469,6 +521,7 @@ impl ReplicationEngine {
             .map_err(MergeError::Store)
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
     fn apply_single_batch(
         &self,
         incoming: &Batch,
@@ -478,7 +531,6 @@ impl ReplicationEngine {
         let mut batch = self.store.new_batch();
         let mut affected_subjects = std::collections::HashSet::new();
         let mut term_cache = HashMap::new();
-        let mut stored_ops = Vec::with_capacity(incoming.ops.len());
 
         self.store.seed_term_cache(
             &mut batch,
@@ -522,12 +574,6 @@ impl ReplicationEngine {
                         .resolve_term_cached(&mut batch, &mut term_cache, object)?;
                     self.store.insert_quad(&mut batch, g, s, p, o, dot)?;
                     affected_subjects.insert(s);
-                    stored_ops.push(crate::store::StoredQuadOp::Add {
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        dot: *dot,
-                    });
                 }
                 QuadOp::Remove {
                     subject,
@@ -546,12 +592,6 @@ impl ReplicationEngine {
                         .resolve_term_cached(&mut batch, &mut term_cache, object)?;
                     self.store.remove_quad(&mut batch, g, s, p, o, witnessed)?;
                     affected_subjects.insert(s);
-                    stored_ops.push(crate::store::StoredQuadOp::Remove {
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        witnessed: witnessed.clone(),
-                    });
                 }
             }
         }
@@ -559,90 +599,10 @@ impl ReplicationEngine {
         vector_clock.advance(incoming.actor, incoming.counter);
         self.store
             .set_vector_clock(&mut batch, graph, vector_clock)?;
-
-        self.store.append_compact_batch_log(
-            &mut batch,
-            graph,
-            &crate::store::StoredBatch {
-                actor: incoming.actor,
-                counter: incoming.counter,
-                base_clock: incoming.base_clock.clone(),
-                ops: stored_ops,
-                timestamp: incoming.timestamp,
-            },
-        )?;
-
         self.store
             .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
-
         self.store.commit(batch)?;
         Ok(())
-    }
-
-    fn batch_is_ready(&self, vector_clock: &VectorClock, incoming: &Batch) -> bool {
-        let expected = vector_clock
-            .0
-            .get(&incoming.actor)
-            .map(|counter| counter + 1)
-            .unwrap_or(1);
-        incoming.counter == expected
-            && incoming
-                .base_clock
-                .0
-                .iter()
-                .all(|(actor, counter)| vector_clock.0.get(actor).copied().unwrap_or(0) >= *counter)
-    }
-
-    fn buffer_remote_batch(&self, incoming: Batch) -> Result<(), MergeError> {
-        let mut buffer = self.gap_buffer.lock().unwrap();
-        let graph_buffer = buffer.entry(incoming.graph.clone()).or_default();
-        if graph_buffer
-            .iter()
-            .any(|batch| batch.actor == incoming.actor && batch.counter == incoming.counter)
-        {
-            return Ok(());
-        }
-        if graph_buffer.len() >= MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH {
-            return Err(MergeError::InputRejected(format!(
-                "gap buffer on graph `{}` exceeded {} pending batches",
-                incoming.graph.as_str(),
-                MAX_BUFFERED_REMOTE_BATCHES_PER_GRAPH
-            )));
-        }
-        graph_buffer.push(incoming);
-        Ok(())
-    }
-
-    fn apply_ready_buffered_batches(
-        &self,
-        graph: &GraphId,
-        vector_clock: &mut VectorClock,
-        touched_graphs: &mut HashSet<GraphId>,
-    ) -> Result<(), MergeError> {
-        loop {
-            let next = {
-                let mut buffer = self.gap_buffer.lock().unwrap();
-                let Some(graph_buffer) = buffer.get_mut(graph) else {
-                    return Ok(());
-                };
-                let Some((index, _)) = graph_buffer
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, batch)| self.batch_is_ready(vector_clock, batch))
-                    .min_by_key(|(_, batch)| (batch.actor, batch.counter))
-                else {
-                    return Ok(());
-                };
-                let batch = graph_buffer.swap_remove(index);
-                if graph_buffer.is_empty() {
-                    buffer.remove(graph);
-                }
-                batch
-            };
-
-            self.apply_single_batch(&next, vector_clock)?;
-            touched_graphs.insert(graph.clone());
-        }
     }
 
     fn refresh_graph_diagnostics(
@@ -695,21 +655,17 @@ impl ReplicationEngine {
 
         Ok(())
     }
-
-    /// Get batches that a remote peer needs beyond their current vector clock.
-    pub fn batches_for_catchup(
-        &self,
-        graph: &GraphId,
-        remote_clock: &VectorClock,
-    ) -> Result<Vec<Batch>, MergeError> {
-        Ok(self
-            .store
-            .batches_beyond_vector_clock(graph, remote_clock)?)
-    }
 }
 
 fn encoded_identifier_value(term: &EncodedTerm) -> String {
     term.to_named_node()
         .map(|node| node.as_str().to_string())
         .unwrap_or_else(|| term.0.clone())
+}
+
+fn update_error_from_merge(error: MergeError) -> UpdateError {
+    match error {
+        MergeError::Store(error) => UpdateError::Store(error),
+        MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
+    }
 }

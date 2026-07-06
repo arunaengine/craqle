@@ -1,8 +1,15 @@
 mod support;
 
 use craqle::*;
+use serde::{Deserialize, Serialize};
 
 use support::{CraqleCluster, QueryOptions};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
+#[irokle(type_id = "craqle.test.other-app.v1")]
+struct OtherAppEvent {
+    value: String,
+}
 
 fn writer_auth() -> GrantAuthorizer {
     GrantAuthorizer::new(vec![PermissionGrant::new(
@@ -51,6 +58,108 @@ fn public_graphs_are_visible_without_grants() {
 
     assert!(!rows.is_empty());
     assert!(node.export_rocrate(&anonymous, &graph).is_ok());
+}
+
+#[test]
+fn graph_store_persist_mode_defaults_to_buffer_and_can_use_sync_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = GraphId::new("urn:test:graph-store-sync-all");
+    let options =
+        CraqleOptions::new().with_graph_store_persist_mode(CraqleFjallPersistMode::SyncAll);
+
+    assert_eq!(
+        CraqleFjallPersistMode::Buffer,
+        CraqleOptions::new().graph_store_persist_mode()
+    );
+    assert_eq!(
+        CraqleFjallPersistMode::SyncAll,
+        options.graph_store_persist_mode()
+    );
+
+    {
+        let node = CraqleNode::open_with_options(dir.path(), options).unwrap();
+        assert_eq!(
+            CraqleFjallPersistMode::SyncAll,
+            node.graph_store_persist_mode()
+        );
+        node.create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "SyncAll Dataset",
+                "Graph-store SyncAll persistence test",
+                "2026-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/sync-all".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    let reopened = CraqleNode::open(dir.path()).unwrap();
+    assert_eq!(
+        CraqleFjallPersistMode::Buffer,
+        reopened.graph_store_persist_mode()
+    );
+    assert!(reopened.contains_graph(&graph).unwrap());
+    assert!(
+        reopened
+            .export_rocrate(&GrantAuthorizer::default(), &graph)
+            .unwrap()
+            .contains("SyncAll Dataset")
+    );
+}
+
+#[test]
+fn query_graphs_with_filters_by_lazy_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    for (graph, name) in [
+        ("urn:test:lazy:one", "Lazy One"),
+        ("urn:test:lazy:two", "Lazy Two"),
+    ] {
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new(graph),
+                name,
+                "Predicate visibility test",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/demo".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    let rows = match node
+        .query_graphs_with(
+            |graph: &GraphId| graph.as_str() == "urn:test:lazy:one",
+            "SELECT ?name WHERE { ?s schema:name ?name }",
+        )
+        .unwrap()
+    {
+        QueryResults::Solutions(rows) => rows,
+        other => panic!("expected solutions, got {other:?}"),
+    };
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|row| row.values().all(|value| !value.0.contains("Lazy Two")))
+    );
+
+    assert_eq!(
+        node.query_graphs_with(|_: &GraphId| false, "ASK { ?s ?p ?o }")
+            .unwrap(),
+        QueryResults::Boolean(false)
+    );
 }
 
 #[test]
@@ -143,71 +252,195 @@ fn write_access_is_required_for_updates() {
 }
 
 #[test]
-fn explicit_batch_and_snapshot_sync_replicate_graphs_and_policy() {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    let node_a = CraqleNode::open(dir_a.path()).unwrap();
-    let node_b = CraqleNode::open(dir_b.path()).unwrap();
-    let graph = GraphId::new("urn:test:sync");
-    let auth = writer_auth();
-
-    node_a
-        .create_crate(
-            &auth,
-            CreateCrateRequest::new(
-                graph.clone(),
-                "Synced Dataset",
-                "Replicated through sync messages",
-                "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
-                GraphPolicy {
-                    public: false,
-                    permission_paths: vec!["/datasets/private/project-a".to_string()],
-                },
-            ),
-        )
+fn external_irokle_instance_can_be_shared_with_other_topics() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let other_topic = irokle
+        .create_topic::<OtherAppEvent>(irokle::TopicConfig::default())
+        .unwrap();
+    other_topic
+        .publish(OtherAppEvent {
+            value: "owned by another app".to_string(),
+        })
         .unwrap();
 
-    let policy = node_a.graph_policy(&graph).unwrap();
-    let snapshot = node_a.graph_snapshot(&graph).unwrap();
-    node_b.import_graph_snapshot(&snapshot, policy).unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:shared-irokle");
 
-    node_a
-        .add_data_entity(
-            &auth,
-            &graph,
-            "data/synced.txt",
-            "http://schema.org/MediaObject",
-            "Synced File",
-        )
-        .unwrap();
-    let batches = node_a
-        .catchup_batches(&graph, &node_b.vector_clock(&graph).unwrap())
-        .unwrap();
-    node_b.apply_remote_batches(batches).unwrap();
-    node_b
-        .import_graph_policy(&graph, node_a.graph_policy(&graph).unwrap())
-        .unwrap();
+    node.create_crate(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Shared Irokle Dataset",
+            "Craqle uses one graph topic beside other app topics",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/shared".to_string()],
+            },
+        ),
+    )
+    .unwrap();
 
+    let craqle_topic = node.irokle_topic_id(&graph).unwrap().unwrap();
+    assert_ne!(craqle_topic, other_topic.id());
+    assert_eq!(irokle.list_topics().unwrap().len(), 2);
     assert_eq!(
-        node_b.graph_policy(&graph).unwrap().permission_paths,
-        vec!["/datasets/private/project-a".to_string()]
+        other_topic
+            .history(irokle::history::HistoryOrder::OldestFirst)
+            .unwrap()[0]
+            .event
+            .value,
+        "owned by another app"
     );
-    let rows = match node_b
-        .query(
-            &auth,
-            "SELECT ?name WHERE { GRAPH <urn:test:sync> { ?s schema:name ?name } }",
+}
+
+#[test]
+fn wal_already_durable_create_crate_does_not_publish_irokle_graph_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:wal-local-create");
+
+    node.create_crate_with_durability(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            graph.clone(),
+            "WAL Local Dataset",
+            "Materialized from an external WAL",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/wal-local-create".to_string()],
+            },
+        ),
+        CraqleRequestDurability::WalAlreadyDurable,
+    )
+    .unwrap();
+
+    assert!(node.contains_graph(&graph).unwrap());
+    assert!(node.export_rocrate(&reader_auth(), &graph).is_ok());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+}
+
+#[test]
+fn wal_already_durable_apply_rocrate_does_not_publish_irokle_graph_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:wal-local-rocrate");
+    let jsonld = r#"{
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "urn:test:wal-local-rocrate"}
+            },
+            {
+                "@id": "urn:test:wal-local-rocrate",
+                "@type": "Dataset",
+                "name": "WAL Local RO-Crate",
+                "description": "Materialized from an external WAL",
+                "datePublished": "2025-01-01",
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+            }
+        ]
+    }"#;
+
+    node.apply_rocrate_document_checked_with_policy_and_durability(
+        &writer_auth(),
+        graph.clone(),
+        jsonld,
+        GraphPolicy {
+            public: true,
+            permission_paths: vec!["/datasets/public/wal-local-rocrate".to_string()],
+        },
+        CraqleRequestDurability::WalAlreadyDurable,
+    )
+    .unwrap();
+
+    assert!(node.contains_graph(&graph).unwrap());
+    assert!(node.export_rocrate(&reader_auth(), &graph).is_ok());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+}
+
+#[test]
+fn opening_with_irokle_replays_durable_graph_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let craqle_dir = dir.path().join("craqle");
+    let irokle_dir = dir.path().join("irokle");
+    let graph = GraphId::new("urn:test:irokle-replay");
+    let signer;
+
+    {
+        let irokle = irokle::Irokle::builder()
+            .with_fjall_path_and_persist_mode(&irokle_dir, fjall::PersistMode::Buffer)
+            .unwrap()
+            .build()
+            .unwrap();
+        signer = irokle.signer().clone();
+        let topic = irokle
+            .create_topic::<CraqleGraphEvent>(irokle::TopicConfig::default())
+            .unwrap();
+        topic
+            .publish(CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes: vec![MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: EncodedTerm::from_named_node(&graph.0),
+                    predicate: EncodedTerm::from_named_node(&vocab::schema_name()),
+                    object: EncodedTerm("\"Recovered From Irokle\"".to_string()),
+                }],
+            })
+            .unwrap();
+    }
+
+    let irokle = irokle::Irokle::builder()
+        .with_signer(signer)
+        .with_fjall_path_and_persist_mode(&irokle_dir, fjall::PersistMode::Buffer)
+        .unwrap()
+        .build()
+        .unwrap();
+    let node = CraqleNode::open_with_options(
+        &craqle_dir,
+        CraqleOptions::new().with_irokle(irokle, CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+
+    assert!(node.contains_graph(&graph).unwrap());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_some());
+    let rows = match node
+        .query_graphs(
+            std::slice::from_ref(&graph),
+            "SELECT ?name WHERE { GRAPH <urn:test:irokle-replay> { ?s <http://schema.org/name> ?name } }",
         )
         .unwrap()
     {
         QueryResults::Solutions(rows) => rows,
         other => panic!("expected solutions, got {other:?}"),
     };
-    assert!(!rows.is_empty());
-    assert!(
-        rows.iter()
-            .any(|row| row.values().any(|value| value.0.contains("Synced File")))
-    );
+    assert!(rows.iter().any(|row| {
+        row.values()
+            .any(|value| value.0.contains("Recovered From Irokle"))
+    }));
 }
 
 #[test]
@@ -247,6 +480,7 @@ fn search_filters_private_graphs_by_policy() {
         ),
     )
     .unwrap();
+    node.flush_search_updates().unwrap();
 
     let anonymous_hits = node
         .search(&GrantAuthorizer::default(), "proteomics", 10)
@@ -256,6 +490,84 @@ fn search_filters_private_graphs_by_policy() {
 
     let writer_hits = node.search(&writer, "proteomics", 10).unwrap();
     assert_eq!(writer_hits.len(), 2);
+}
+
+#[test]
+fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    let selected_a = GraphId::new("urn:test:search-graphs:selected-a");
+    let selected_b = GraphId::new("urn:test:search-graphs:selected-b");
+    let hidden_selected = GraphId::new("urn:test:search-graphs:hidden-selected");
+
+    for idx in 0..70 {
+        let graph_iri = format!("urn:test:search-graphs:unselected-{idx:03}");
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                GraphId::new(&graph_iri),
+                format!("Dominant Unselected {idx}"),
+                "needle ".repeat(40),
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/search-graphs".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            hidden_selected.clone(),
+            "Hidden Selected",
+            "needle ".repeat(40),
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/private/search-graphs".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+
+    for graph in [&selected_a, &selected_b] {
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                format!("Selected {}", graph.as_str()),
+                "needle",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/search-graphs".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+    node.flush_search_updates().unwrap();
+
+    let hits = node
+        .search_graphs(
+            &GrantAuthorizer::default(),
+            &[hidden_selected, selected_a.clone(), selected_b.clone()],
+            "needle",
+            2,
+        )
+        .unwrap();
+
+    assert_eq!(hits.len(), 2);
+    let mut subjects: Vec<_> = hits.iter().map(|hit| hit.subject_iri.as_str()).collect();
+    subjects.sort_unstable();
+    assert_eq!(subjects, vec![selected_a.as_str(), selected_b.as_str()]);
 }
 
 #[test]
@@ -281,6 +593,7 @@ fn search_hits_can_be_hydrated_from_rdf() {
         ),
     )
     .unwrap();
+    node.flush_search_updates().unwrap();
 
     let hits = node.search(&reader, "hydrated", 10).unwrap();
     assert_eq!(hits.len(), 1);
@@ -419,6 +732,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
     };
     assert!(federated_rows.len() > local_rows.len());
 
+    cluster.flush_search_updates().unwrap();
     let hits = cluster
         .search_from_peer(
             0,
@@ -501,6 +815,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
             .any(|name| name.contains("Private Federated Dataset"))
     );
 
+    cluster.flush_search_updates().unwrap();
     let hits = cluster
         .search_from_peer(
             0,
@@ -713,4 +1028,139 @@ fn preview_rocrate_update_returns_canonical_changes() {
             MaterializedQuadChange::Insert { object, .. } if object.0.contains("Updated description")
         )
     }));
+}
+
+#[test]
+fn validate_create_crate_does_not_create_graph_or_publish_irokle_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:validate-create");
+
+    let changes = node
+        .validate_create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Validated Dataset",
+                "Validated without committing",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/validate-create".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+
+    assert!(!changes.is_empty());
+    assert!(!node.contains_graph(&graph).unwrap());
+    assert!(node.graphs().unwrap().is_empty());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+}
+
+#[test]
+fn validate_rocrate_document_checked_with_policy_is_non_mutating_and_rejects_invalid_rocrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:validate-rocrate");
+    let policy = GraphPolicy {
+        public: true,
+        permission_paths: vec!["/datasets/public/validate-rocrate".to_string()],
+    };
+    let valid = format!(
+        r#"{{
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {{
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                "about": {{"@id": "{}"}}
+            }},
+            {{
+                "@id": "{}",
+                "@type": "Dataset",
+                "name": "Validated RO-Crate",
+                "description": "Validated without committing",
+                "datePublished": "2025-01-01",
+                "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+            }}
+        ]
+    }}"#,
+        graph.as_str(),
+        graph.as_str()
+    );
+
+    let changes = node
+        .validate_rocrate_document_checked_with_policy(
+            &writer_auth(),
+            graph.clone(),
+            &valid,
+            policy.clone(),
+        )
+        .unwrap();
+
+    assert!(!changes.is_empty());
+    assert!(!node.contains_graph(&graph).unwrap());
+    assert!(node.graphs().unwrap().is_empty());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+
+    let invalid = format!(
+        r#"{{
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {{
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+                "about": {{"@id": "{}"}}
+            }},
+            {{
+                "@id": "{}",
+                "@type": "Dataset",
+                "description": "Missing required name",
+                "datePublished": "2025-01-01",
+                "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+            }}
+        ]
+    }}"#,
+        graph.as_str(),
+        graph.as_str()
+    );
+
+    let err = node
+        .validate_rocrate_document_checked_with_policy(
+            &writer_auth(),
+            graph.clone(),
+            &invalid,
+            policy,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CraqleError::RoCrate(RoCrateError::Update(UpdateError::ValidationFailed(violations)))
+            if violations.iter().any(|violation| matches!(
+                violation,
+                CrateViolation::MissingRequiredProperty { property, .. }
+                    if property == "schema:name"
+            ))
+    ));
+    assert!(!node.contains_graph(&graph).unwrap());
+    assert!(node.graphs().unwrap().is_empty());
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
 }
