@@ -59,6 +59,46 @@ impl std::fmt::Display for ActorId {
     }
 }
 
+/// Last-write-wins ordering tag for a graph's RO-Crate `@context` register.
+///
+/// Ordered lexicographically by `(counter, actor)` so every peer converges on
+/// the same winning context regardless of the order in which `ContextUpdated`
+/// events arrive. A local context write sets `counter = stored_counter + 1`
+/// (Lamport-style max-seen + 1) with the writer's [`ActorId`] as the tiebreaker,
+/// and an incoming tag only overwrites the stored one when it is strictly
+/// greater. Because the derived field order is `(counter, actor)`, a strictly
+/// higher counter always wins and equal counters break ties on the actor id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ContextTag {
+    pub counter: u64,
+    pub actor: ActorId,
+}
+
+impl ContextTag {
+    /// The tag of a graph that has never had an explicit context write. Any
+    /// real write (counter >= 1) strictly dominates it.
+    pub const GENESIS: Self = Self {
+        counter: 0,
+        actor: ActorId([0u8; 32]),
+    };
+
+    /// The tag for a fresh local context write by `actor`, given the currently
+    /// stored tag. Bumps the counter past everything observed so far so the new
+    /// write wins locally, while remaining deterministic across peers.
+    pub fn next_local(previous: ContextTag, actor: ActorId) -> Self {
+        Self {
+            counter: previous.counter.saturating_add(1),
+            actor,
+        }
+    }
+}
+
+impl Default for ContextTag {
+    fn default() -> Self {
+        Self::GENESIS
+    }
+}
+
 // ── Causality ───────────────────────────────────────────────────────────────
 
 /// A single event identifier: (actor, monotonic counter).
@@ -270,7 +310,7 @@ pub struct Batch {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Snapshot of a live quad and its OR-Set dot set.
+/// Read-only state of a live quad and its OR-Set dot set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotQuadState {
     pub subject: EncodedTerm,
@@ -279,28 +319,12 @@ pub struct SnapshotQuadState {
     pub dots: Vec<Dot>,
 }
 
-/// Full graph snapshot used for bootstrap/catch-up.
+/// Read-only dump of one graph's quad state for diagnostics and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphReplicaSnapshot {
     pub graph: GraphId,
     pub clock: VectorClock,
     pub quads: Vec<SnapshotQuadState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactSnapshotQuadState {
-    pub subject: u32,
-    pub predicate: u32,
-    pub object: u32,
-    pub dots: Vec<Dot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphReplicaCompactSnapshot {
-    pub graph: GraphId,
-    pub clock: VectorClock,
-    pub terms: Vec<EncodedTerm>,
-    pub quads: Vec<CompactSnapshotQuadState>,
 }
 
 // ── Violations ──────────────────────────────────────────────────────────────
@@ -364,7 +388,7 @@ impl GraphPolicy {
 // ── Materialized Changes (SPARQL evaluator output) ──────────────────────────
 
 /// A concrete quad change produced by SPARQL Update evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaterializedQuadChange {
     Insert {
         graph: GraphId,

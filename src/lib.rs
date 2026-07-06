@@ -8,6 +8,8 @@
 
 #[path = "internal/core.rs"]
 mod core;
+#[path = "internal/planner.rs"]
+mod planner;
 #[path = "internal/replication.rs"]
 mod replication;
 #[path = "internal/rocrate.rs"]
@@ -26,12 +28,12 @@ mod sparql;
 mod store;
 
 mod auth;
-mod transport;
+mod sync;
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
@@ -47,19 +49,17 @@ pub use crate::core::{
     ActorId, Batch, CrateViolation, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy,
     MaterializedQuadChange, PredicateFilter, VectorClock, vocab,
 };
-pub use crate::core::{
-    CompactSnapshotQuadState, Dot, GraphReplicaCompactSnapshot, GraphReplicaSnapshot, QuadOp,
-    SnapshotQuadState,
-};
+pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
 pub use crate::search::SearchHit;
 pub use crate::sparql::QueryResults;
-pub use crate::transport::SyncMessage;
+pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
 };
+pub use irokle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CraqleError {
@@ -81,11 +81,67 @@ pub enum CraqleError {
     RoCrate(#[from] rocrate::RoCrateError),
     #[error("sync input rejected: {0}")]
     SyncInputRejected(String),
+    #[error("sync: {0}")]
+    Sync(#[from] sync::CraqleSyncError),
+    #[error("search worker: {0}")]
+    SearchWorker(String),
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, CraqleError>;
+
+/// Request-path durability policy for callers with an external durable WAL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CraqleRequestDurability {
+    /// Persist Craqle's Fjall graph store before returning.
+    #[default]
+    Durable,
+    /// Apply locally but let the caller's already-durable WAL drive recovery.
+    WalAlreadyDurable,
+}
+
+impl CraqleRequestDurability {
+    fn persists_fjall(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+
+    fn publishes_irokle(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+}
+
+/// Fjall persistence mode used when Craqle explicitly persists its graph store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CraqleFjallPersistMode {
+    /// Flush to Fjall's configured buffer without forcing an OS sync.
+    #[default]
+    Buffer,
+    /// Sync file data but not necessarily metadata.
+    SyncData,
+    /// Sync file data and metadata before returning.
+    SyncAll,
+}
+
+impl From<CraqleFjallPersistMode> for fjall::PersistMode {
+    fn from(mode: CraqleFjallPersistMode) -> Self {
+        match mode {
+            CraqleFjallPersistMode::Buffer => Self::Buffer,
+            CraqleFjallPersistMode::SyncData => Self::SyncData,
+            CraqleFjallPersistMode::SyncAll => Self::SyncAll,
+        }
+    }
+}
+
+impl From<fjall::PersistMode> for CraqleFjallPersistMode {
+    fn from(mode: fjall::PersistMode) -> Self {
+        match mode {
+            fjall::PersistMode::Buffer => Self::Buffer,
+            fjall::PersistMode::SyncData => Self::SyncData,
+            fjall::PersistMode::SyncAll => Self::SyncAll,
+        }
+    }
+}
 
 /// Input for creating a new RO-Crate graph.
 #[derive(Debug, Clone)]
@@ -145,11 +201,120 @@ pub struct HydratedSearchHit {
     pub properties: Vec<(EncodedTerm, EncodedTerm)>,
 }
 
-const MAX_SYNC_BATCH_OPS: usize = 50_000;
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
-const MAX_SYNC_SNAPSHOT_QUADS: usize = 250_000;
-const MAX_SYNC_SNAPSHOT_TERMS: usize = 500_000;
-const MAX_REMOTE_BATCHES: usize = 10_000;
+const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
+
+enum SearchWorkerMessage {
+    Wake,
+    Flush(mpsc::Sender<std::result::Result<(), String>>),
+    Stop,
+}
+
+struct SearchUpdateWorker {
+    sender: mpsc::Sender<SearchWorkerMessage>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SearchUpdateWorker {
+    fn start(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            run_search_update_worker(receiver, store, search);
+        });
+
+        Self {
+            sender,
+            handle: Some(handle),
+        }
+    }
+
+    fn wake(&self) {
+        let _ = self.sender.send(SearchWorkerMessage::Wake);
+    }
+
+    fn flush(&self) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.sender
+            .send(SearchWorkerMessage::Flush(sender))
+            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?;
+        receiver
+            .recv()
+            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?
+            .map_err(CraqleError::SearchWorker)
+    }
+}
+
+impl Drop for SearchUpdateWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.send(SearchWorkerMessage::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_search_update_worker(
+    receiver: mpsc::Receiver<SearchWorkerMessage>,
+    store: Arc<GraphStore>,
+    search: Arc<SearchIndex>,
+) {
+    loop {
+        let mut flush_replies = Vec::new();
+        if collect_search_worker_messages(&receiver, &mut flush_replies) {
+            for reply in flush_replies {
+                let _ = reply.send(Err("stopped".to_string()));
+            }
+            break;
+        }
+
+        let result = match flush_search_queue(&store, &search) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        let failed = result.is_err();
+        for reply in flush_replies {
+            let _ = reply.send(result.clone());
+        }
+        if failed {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+fn collect_search_worker_messages(
+    receiver: &mpsc::Receiver<SearchWorkerMessage>,
+    flush_replies: &mut Vec<mpsc::Sender<std::result::Result<(), String>>>,
+) -> bool {
+    match receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(SearchWorkerMessage::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(SearchWorkerMessage::Flush(reply)) => flush_replies.push(reply),
+        Ok(SearchWorkerMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+    }
+
+    while let Ok(message) = receiver.try_recv() {
+        match message {
+            SearchWorkerMessage::Wake => {}
+            SearchWorkerMessage::Flush(reply) => flush_replies.push(reply),
+            SearchWorkerMessage::Stop => return true,
+        }
+    }
+
+    false
+}
+
+fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
+    let mut processed_any = false;
+    loop {
+        let processed = search.process_queued_updates(store, SEARCH_QUEUE_FLUSH_CHUNK)?;
+        if processed == 0 {
+            if processed_any {
+                store.persist()?;
+            }
+            return Ok(());
+        }
+        processed_any = true;
+    }
+}
 
 /// Main application handle for local RO-Crate operations.
 ///
@@ -161,19 +326,63 @@ pub struct CraqleNode {
     actor: ActorId,
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
+    search_worker: SearchUpdateWorker,
+    _index_warmer: DerivedIndexWarmer,
     sparql: Arc<SparqlEngine>,
     replication: Arc<ReplicationEngine>,
+    local_replication: Arc<ReplicationEngine>,
+    sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+}
+
+// Joined on drop so the store (and its fjall lock) cannot outlive the node.
+struct DerivedIndexWarmer {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DerivedIndexWarmer {
+    fn start(store: &Arc<GraphStore>) -> Self {
+        let store = Arc::downgrade(store);
+        Self {
+            handle: Some(std::thread::spawn(move || {
+                if let Some(store) = store.upgrade() {
+                    store.ensure_derived_indexes();
+                }
+            })),
+        }
+    }
+}
+
+impl Drop for DerivedIndexWarmer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Configuration used when constructing a [`CraqleNode`].
 pub struct CraqleOptions {
     actor: ActorId,
+    sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+    search_storage: SearchStorage,
+    graph_store_persist_mode: CraqleFjallPersistMode,
+}
+
+/// Storage backend used for the full-text search index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum SearchStorage {
+    #[default]
+    Disk,
+    Memory,
 }
 
 impl Default for CraqleOptions {
     fn default() -> Self {
         Self {
             actor: ActorId::random(),
+            sync: None,
+            search_storage: SearchStorage::default(),
+            graph_store_persist_mode: CraqleFjallPersistMode::default(),
         }
     }
 }
@@ -188,8 +397,31 @@ impl CraqleOptions {
         self
     }
 
-    fn into_actor(self) -> ActorId {
-        self.actor
+    pub fn with_search_storage(mut self, search_storage: SearchStorage) -> Self {
+        self.search_storage = search_storage;
+        self
+    }
+
+    pub fn with_graph_store_persist_mode(mut self, mode: CraqleFjallPersistMode) -> Self {
+        self.graph_store_persist_mode = mode;
+        self
+    }
+
+    pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
+        self.graph_store_persist_mode
+    }
+
+    pub fn with_irokle<S: irokle::Storage>(
+        mut self,
+        node: irokle::Irokle<S>,
+        options: CraqleIrokleOptions,
+    ) -> Self {
+        self.sync = Some(Arc::new(IrokleGraphSync::new(node, options)));
+        self
+    }
+
+    fn into_parts(self) -> (ActorId, Option<Arc<dyn sync::CraqleGraphSync>>) {
+        (self.actor, self.sync)
     }
 }
 
@@ -208,12 +440,23 @@ impl CraqleNode {
     pub fn open_with_options(path: impl AsRef<Path>, options: CraqleOptions) -> Result<Self> {
         let root = path.as_ref();
         std::fs::create_dir_all(root)?;
+        let search_storage = options.search_storage;
+        let graph_store_persist_mode = options.graph_store_persist_mode;
 
-        let store = Arc::new(GraphStore::open(root.join("store"))?);
-        let search = Arc::new(SearchIndex::open(root.join("search"))?);
+        let store = Arc::new(GraphStore::open_with_persist_mode(
+            root.join("store"),
+            graph_store_persist_mode.into(),
+        )?);
+        let search = Arc::new(match search_storage {
+            SearchStorage::Disk => SearchIndex::open(root.join("search"))?,
+            SearchStorage::Memory => SearchIndex::open_in_memory()?,
+        });
+        let search_needs_rebuild =
+            search.needs_rebuild() || search_storage == SearchStorage::Memory;
         let node = Self::from_store_and_search(store, search.clone(), options);
-        if search.needs_rebuild() {
-            node.reindex_search()?;
+        node.reconcile_irokle()?;
+        if search_needs_rebuild {
+            node.schedule_full_search_reindex()?;
         }
         Ok(node)
     }
@@ -223,22 +466,151 @@ impl CraqleNode {
         search: Arc<SearchIndex>,
         options: CraqleOptions,
     ) -> Self {
-        let actor = options.into_actor();
+        let (actor, sync) = options.into_parts();
+        // Cross-graph derived indexes are built off the boot path so the
+        // first multi-graph query does not pay the build under a write lock.
+        let index_warmer = DerivedIndexWarmer::start(&store);
+        let search_worker = SearchUpdateWorker::start(store.clone(), search.clone());
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
-        let replication = Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
+        let local_replication =
+            Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
+        let replication = Arc::new(if sync.is_some() {
+            ReplicationEngine::new_with_sync(store.clone(), sparql.clone(), actor, sync.clone())
+        } else {
+            ReplicationEngine::new(store.clone(), sparql.clone(), actor)
+        });
 
         Self {
             actor,
             store,
             search,
+            search_worker,
+            _index_warmer: index_warmer,
             sparql,
             replication,
+            local_replication,
+            sync,
         }
     }
 
     /// Return the local actor id used for authored replication batches.
     pub fn actor(&self) -> ActorId {
         self.actor
+    }
+
+    /// Return the Fjall persistence mode used for explicit graph-store persists.
+    pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
+        self.store.persist_mode().into()
+    }
+
+    pub fn irokle_topic_id(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {
+        let Some(sync) = &self.sync else {
+            return Ok(None);
+        };
+        Ok(sync.graph_topic_id(&self.store, graph)?)
+    }
+
+    pub fn ensure_irokle_topic(&self, graph: &GraphId) -> Result<irokle::TopicId> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let topic_id = sync.ensure_graph_topic(&self.store, graph)?;
+        self.persist_fjall()?;
+        Ok(topic_id)
+    }
+
+    pub fn add_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        sync.add_peer(&self.store, graph, peer)?;
+        self.persist_fjall()
+    }
+
+    pub fn remove_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        sync.remove_peer(&self.store, graph, peer)?;
+        self.persist_fjall()
+    }
+
+    pub fn irokle_sync_status(&self, graph: &GraphId) -> Result<Vec<irokle::SyncPeerStatus>> {
+        let Some(sync) = &self.sync else {
+            return Ok(Vec::new());
+        };
+        Ok(sync.sync_status(&self.store, graph)?)
+    }
+
+    pub fn reconcile_irokle(&self) -> Result<usize> {
+        let Some(sync) = &self.sync else {
+            return Ok(0);
+        };
+
+        let mut applied = 0;
+        for topic_id in sync.craqle_topic_ids()? {
+            applied += self.reconcile_irokle_topic(sync, topic_id)?;
+        }
+        if applied > 0 {
+            self.persist_fjall()?;
+        }
+        Ok(applied)
+    }
+
+    fn reconcile_irokle_topic(
+        &self,
+        sync: &Arc<dyn sync::CraqleGraphSync>,
+        topic_id: irokle::TopicId,
+    ) -> Result<usize> {
+        let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
+        let catchup = match sync.topic_records_since(topic_id, stored_cursor.as_deref()) {
+            Ok(catchup) => catchup,
+            Err(error) => {
+                tracing::warn!(
+                    topic = %topic_id,
+                    %error,
+                    "skipping unreadable craqle topic during reconcile",
+                );
+                return Ok(0);
+            }
+        };
+
+        let mut applied = 0;
+        for record in &catchup.records {
+            match self.apply_reconciled_record(sync, topic_id, record) {
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        topic = %topic_id,
+                        %error,
+                        "quarantined craqle record during reconcile",
+                    );
+                }
+            }
+        }
+        if let Some(cursor) = catchup.cursor {
+            self.store
+                .set_applied_topic_clock(topic_id.as_bytes(), &cursor)?;
+        }
+        Ok(applied)
+    }
+
+    fn apply_reconciled_record(
+        &self,
+        sync: &Arc<dyn sync::CraqleGraphSync>,
+        topic_id: irokle::TopicId,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<bool> {
+        let graph = record.event.graph();
+        match self.store.topic_graph_binding(topic_id.as_bytes())? {
+            Some(bound) if bound != graph.as_str() => {
+                tracing::warn!(
+                    topic = %topic_id,
+                    bound = %bound,
+                    claimed = %graph.as_str(),
+                    "rejected craqle record targeting a graph outside its topic binding",
+                );
+                return Ok(false);
+            }
+            Some(_) => {}
+            None => sync.bind_graph_topic(&self.store, graph, topic_id)?,
+        }
+        self.apply_irokle_record(record)
     }
 
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
@@ -262,6 +634,30 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         request: CreateCrateRequest,
     ) -> Result<Batch> {
+        self.create_crate_with_durability(auth, request, CraqleRequestDurability::Durable)
+    }
+
+    /// Create a new RO-Crate graph with an explicit request durability policy.
+    pub fn create_crate_with_durability(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
+        self.create_crate_with_durability_as(auth, request, durability, None)
+    }
+
+    /// Like [`CraqleNode::create_crate_with_durability`], but non-publishing
+    /// writes are authored under `actor`, so replicas materializing the same
+    /// logical event emit identical CRDT ops.
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
+    pub fn create_crate_with_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
         let CreateCrateRequest {
             graph,
             name,
@@ -272,15 +668,79 @@ impl CraqleNode {
         } = request;
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self.manager().create_crate(
+        let batch = self.manager_with(durability, actor).create_crate(
             graph.clone(),
             &name,
             &description,
             &date_published,
             &license,
         )?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
+    /// Create a crate from a scaffold request that was already validated at
+    /// its origin, skipping post-state rule re-validation.
+    ///
+    /// The request fields must be identical to ones that passed
+    /// `validate_create_crate` (or the checked create) at the origin. Use the
+    /// checked variant for any untrusted input.
+    pub fn create_crate_prevalidated_with_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let CreateCrateRequest {
+            graph,
+            name,
+            description,
+            date_published,
+            license,
+            policy,
+        } = request;
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager_with(durability, actor)
+            .create_crate_prevalidated(
+                graph.clone(),
+                &name,
+                &description,
+                &date_published,
+                &license,
+            )?;
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
+    /// Validate and materialize a create-crate request without applying it.
+    ///
+    /// Returns the changes that would be applied, but does not mutate the graph
+    /// store, persist policy, enqueue search, or publish Irokle records.
+    pub fn validate_create_crate(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+        let CreateCrateRequest {
+            graph,
+            name,
+            description,
+            date_published,
+            license,
+            policy,
+        } = request;
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        Ok(self.manager().validate_create_crate(
+            &graph,
+            &name,
+            &description,
+            &date_published,
+            &license,
+        )?)
     }
 
     /// Create or replace a root-linked data entity using a typed request.
@@ -427,7 +887,7 @@ impl CraqleNode {
         let policy = policy.normalized();
         self.ensure_policy_action(graph, &policy, auth, Action::Write)?;
         self.persist_graph_policy(graph, policy)?;
-        Ok(())
+        self.persist_fjall()
     }
 
     /// Export the full visible RO-Crate as JSON-LD.
@@ -491,11 +951,31 @@ impl CraqleNode {
         jsonld: &str,
         policy: GraphPolicy,
     ) -> Result<Batch> {
+        self.apply_rocrate_document_with_policy_and_durability(
+            auth,
+            graph,
+            jsonld,
+            policy,
+            CraqleRequestDurability::Durable,
+        )
+    }
+
+    /// Create or replace a visible RO-Crate state with explicit durability.
+    pub fn apply_rocrate_document_with_policy_and_durability(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
+        let batch = self
+            .manager_for_durability(durability)
+            .import_jsonld(graph.clone(), jsonld)?;
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
     }
 
     /// Strict variant of `apply_rocrate_document_with_policy` that validates
@@ -507,13 +987,89 @@ impl CraqleNode {
         jsonld: &str,
         policy: GraphPolicy,
     ) -> Result<Batch> {
+        self.apply_rocrate_document_checked_with_policy_and_durability(
+            auth,
+            graph,
+            jsonld,
+            policy,
+            CraqleRequestDurability::Durable,
+        )
+    }
+
+    /// Strict RO-Crate replacement with explicit request durability.
+    pub fn apply_rocrate_document_checked_with_policy_and_durability(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
+        self.apply_rocrate_document_checked_with_policy_and_durability_as(
+            auth, graph, jsonld, policy, durability, None,
+        )
+    }
+
+    /// Strict RO-Crate replacement authored under an explicit CRDT actor for
+    /// non-publishing writes.
+    pub fn apply_rocrate_document_checked_with_policy_and_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
         let batch = self
-            .manager()
+            .manager_with(durability, actor)
             .import_jsonld_checked(graph.clone(), jsonld)?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
+    /// Apply a RO-Crate document that was already strictly validated at its
+    /// origin, skipping semantic re-validation.
+    ///
+    /// The event-log payload replicated to this node must be byte-identical to
+    /// a document that passed `validate_rocrate_document_checked_with_policy`
+    /// (or the checked apply) at the origin. Structural JSON-LD errors are
+    /// still rejected; RO-Crate semantic rules are not re-checked. Use the
+    /// checked variant for any untrusted input.
+    pub fn apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager_with(durability, actor)
+            .import_jsonld_prevalidated(graph.clone(), jsonld)?;
+        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
+    /// Strictly validate and materialize a RO-Crate document without applying it.
+    ///
+    /// Returns the changes that would be applied, but does not mutate the graph
+    /// store, persist policy, enqueue search, or publish Irokle records.
+    pub fn validate_rocrate_document_checked_with_policy(
+        &self,
+        auth: &dyn Authorizer,
+        graph: GraphId,
+        jsonld: &str,
+        policy: GraphPolicy,
+    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+        let policy = policy.normalized();
+        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
+        Ok(self.manager().plan_import_jsonld_checked(&graph, jsonld)?)
     }
 
     /// Fast path for trusted RO-Crate bootstrap into a new or empty graph.
@@ -675,6 +1231,46 @@ impl CraqleNode {
         Ok(self.sparql.query_with_graphs(sparql, graphs)?)
     }
 
+    /// Execute a SPARQL query where graph visibility is decided by `visible`.
+    ///
+    /// The predicate is evaluated lazily over the union view: it runs at most
+    /// once per graph the evaluation actually touches (memoized for the
+    /// duration of the query), so the cost scales with the graphs a query
+    /// reaches instead of the total corpus. A quad participates in evaluation
+    /// iff its graph satisfies the predicate; the predicate must be cheap and
+    /// side-effect free.
+    pub fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
+    where
+        F: Fn(&GraphId) -> bool,
+    {
+        Ok(self.sparql.query_with_visibility(sparql, &visible)?)
+    }
+
+    /// [`CraqleNode::query_graphs_with`] with explicit control over the
+    /// craqle query-plan optimizer. `optimize = false` evaluates the raw
+    /// sparopt plan; used for plan debugging and result-equivalence tests.
+    /// The `CRAQLE_QUERY_OPT=off` environment variable disables the
+    /// optimizer globally for the default query entry points.
+    pub fn query_graphs_with_planner<F>(
+        &self,
+        visible: F,
+        sparql: &str,
+        optimize: bool,
+    ) -> Result<QueryResults>
+    where
+        F: Fn(&GraphId) -> bool,
+    {
+        Ok(self
+            .sparql
+            .query_with_visibility_planned(sparql, &visible, optimize)?)
+    }
+
+    /// Block until the cross-graph derived indexes are built; they are kept
+    /// up to date incrementally afterwards.
+    pub fn ensure_query_indexes(&self) {
+        self.store.ensure_derived_indexes();
+    }
+
     /// Search visible resources in the local search index.
     pub fn search(
         &self,
@@ -682,23 +1278,70 @@ impl CraqleNode {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let fetch = limit.saturating_mul(4).max(64);
+        let raw_hits = self.search.search(query, fetch)?;
+
+        let mut graph_readable: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
+        for hit in raw_hits {
+            let readable = match graph_readable.get(&hit.graph_id) {
+                Some(readable) => *readable,
+                None => {
+                    let graph = GraphId::new(&hit.graph_id);
+                    let readable = self.store.contains_graph(&graph)?
+                        && auth
+                            .authorize(&graph, &self.store.graph_policy(&graph)?, Action::Read)
+                            .is_ok();
+                    graph_readable.insert(hit.graph_id.clone(), readable);
+                    readable
+                }
+            };
+            if readable {
+                hits.push(hit);
+            }
+        }
+
+        Ok(limit_search_hits(hits, limit))
+    }
+
+    /// Search visible resources in an explicit set of graph IRIs.
+    ///
+    /// Graph selection and authorization are applied before Tantivy top-k
+    /// collection by searching each readable selected graph separately. Missing
+    /// or non-readable graphs are ignored, matching [`CraqleNode::search`].
+    pub fn search_graphs(
+        &self,
+        auth: &dyn Authorizer,
+        graphs: &[GraphId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = std::collections::HashSet::new();
         let mut hits = Vec::new();
-        for graph in self.visible_graphs(auth)? {
+        for graph in graphs {
+            if !seen.insert(graph.as_str().to_string()) {
+                continue;
+            }
+            if !self.store.contains_graph(graph)?
+                || auth
+                    .authorize(graph, &self.store.graph_policy(graph)?, Action::Read)
+                    .is_err()
+            {
+                continue;
+            }
             hits.extend(self.search.search_in_graph(graph.as_str(), query, limit)?);
         }
 
-        hits.sort_by_key(|hit| {
-            (
-                Reverse(score_key(hit.score)),
-                hit.graph_id.clone(),
-                hit.subject_iri.clone(),
-            )
-        });
-        hits.dedup_by(|left, right| {
-            left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
-        });
-        hits.truncate(limit);
-        Ok(hits)
+        Ok(limit_search_hits(hits, limit))
     }
 
     /// Resolve one visible subject into `(predicate, object)` pairs.
@@ -760,6 +1403,11 @@ impl CraqleNode {
         self.hydrate_search_hits(auth, &hits)
     }
 
+    /// Block until the background full-text indexer has processed queued work.
+    pub fn flush_search_updates(&self) -> Result<()> {
+        self.search_worker.flush()
+    }
+
     /// Rebuild the full-text index from store state.
     pub fn reindex_search(&self) -> Result<()> {
         for graph in self.store.graphs()? {
@@ -776,50 +1424,8 @@ impl CraqleNode {
 
     pub fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
-        self.persist_graph_policy(graph, policy.normalized())
-    }
-
-    pub fn apply_remote_batch(&self, batch: Batch) -> Result<()> {
-        self.validate_remote_batch(&batch)?;
-        let graph = batch.graph.clone();
-        let result = self.replication.apply_remote_batch(batch)?;
-        if result.applied {
-            self.refresh_search_for_graph(&graph)?;
-        }
-        Ok(())
-    }
-
-    pub fn apply_remote_batches(&self, batches: Vec<Batch>) -> Result<()> {
-        if batches.len() > MAX_REMOTE_BATCHES {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "remote sync payload exceeded {} batches",
-                MAX_REMOTE_BATCHES
-            )));
-        }
-
-        let mut graphs = HashSet::new();
-        for batch in &batches {
-            self.validate_remote_batch(batch)?;
-            graphs.insert(batch.graph.clone());
-        }
-
-        self.replication.apply_remote_batches(batches)?;
-        for graph in graphs {
-            self.refresh_search_for_graph(&graph)?;
-        }
-        Ok(())
-    }
-
-    pub fn catchup_batches(
-        &self,
-        graph: &GraphId,
-        remote_clock: &VectorClock,
-    ) -> Result<Vec<Batch>> {
-        Ok(self.replication.batches_for_catchup(graph, remote_clock)?)
-    }
-
-    pub fn compact_graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaCompactSnapshot> {
-        Ok(self.store.compact_graph_snapshot(graph)?)
+        self.set_local_graph_policy(graph, policy.normalized())?;
+        self.persist_fjall()
     }
 
     pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
@@ -847,17 +1453,18 @@ impl CraqleNode {
     }
 
     pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
-        self.store.delete_graph(graph)?;
-        cfg_select! {
-            feature = "search" => {
-                self.search.replace_graph_documents(
-                    graph.as_str(),
-                    std::iter::empty::<(String, Option<String>)>(),
-                )?;
-            }
-            _ => ()
+        if let Some(sync) = &self.sync
+            && sync.graph_topic_id(&self.store, graph)?.is_some()
+            && !self.store.graph_tombstoned(graph)?
+        {
+            let record = sync.publish_delete(&self.store, graph)?;
+            self.apply_irokle_record(&record)?;
+            return self.persist_fjall();
         }
-        Ok(())
+        self.store.set_graph_tombstone(graph)?;
+        self.store.delete_graph(graph)?;
+        self.schedule_search_update();
+        self.persist_fjall()
     }
 
     pub fn vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
@@ -868,51 +1475,10 @@ impl CraqleNode {
         Ok(self.store.graph_fingerprint(graph)?)
     }
 
+    /// Read-only dump of one graph's quad and dot state, for diagnostics and
+    /// test assertions. Not a sync mechanism.
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
         Ok(self.store.graph_snapshot(graph)?)
-    }
-
-    pub fn import_graph_snapshot(
-        &self,
-        snapshot: &GraphReplicaSnapshot,
-        policy: GraphPolicy,
-    ) -> Result<()> {
-        self.validate_sync_policy(&snapshot.graph, &policy)?;
-        if snapshot.quads.len() > MAX_SYNC_SNAPSHOT_QUADS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "snapshot for graph `{}` exceeded {} quads",
-                snapshot.graph.as_str(),
-                MAX_SYNC_SNAPSHOT_QUADS
-            )));
-        }
-        self.store.import_graph_snapshot(snapshot)?;
-        self.persist_graph_policy(&snapshot.graph, policy.normalized())?;
-        self.refresh_search_for_graph(&snapshot.graph)
-    }
-
-    pub fn import_compact_graph_snapshot(
-        &self,
-        snapshot: &GraphReplicaCompactSnapshot,
-        policy: GraphPolicy,
-    ) -> Result<()> {
-        self.validate_sync_policy(&snapshot.graph, &policy)?;
-        if snapshot.quads.len() > MAX_SYNC_SNAPSHOT_QUADS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "compact snapshot for graph `{}` exceeded {} quads",
-                snapshot.graph.as_str(),
-                MAX_SYNC_SNAPSHOT_QUADS
-            )));
-        }
-        if snapshot.terms.len() > MAX_SYNC_SNAPSHOT_TERMS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "compact snapshot for graph `{}` exceeded {} interned terms",
-                snapshot.graph.as_str(),
-                MAX_SYNC_SNAPSHOT_TERMS
-            )));
-        }
-        self.store.import_compact_graph_snapshot(snapshot)?;
-        self.persist_graph_policy(&snapshot.graph, policy.normalized())?;
-        self.refresh_search_for_graph(&snapshot.graph)
     }
 
     fn ensure_graph_action(
@@ -938,12 +1504,37 @@ impl CraqleNode {
         } else {
             next_policy.clone()
         };
-
         auth.authorize(graph, &policy, action)?;
         Ok(())
     }
 
     fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+        self.persist_graph_policy_with_durability(graph, policy, CraqleRequestDurability::Durable)
+    }
+
+    fn persist_graph_policy_with_durability(
+        &self,
+        graph: &GraphId,
+        policy: GraphPolicy,
+        durability: CraqleRequestDurability,
+    ) -> Result<()> {
+        if !durability.publishes_irokle() {
+            return self.set_local_graph_policy(graph, policy);
+        }
+
+        if let Some(sync) = &self.sync {
+            if self.store.contains_graph(graph)? && self.store.graph_policy(graph)? == policy {
+                return Ok(());
+            }
+            let record = sync.publish_policy(&self.store, graph, policy.clone())?;
+            self.apply_irokle_record(&record)?;
+            return Ok(());
+        }
+
+        self.set_local_graph_policy(graph, policy)
+    }
+
+    fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.store.set_graph_policy(graph, &policy)?;
         Ok(())
     }
@@ -959,7 +1550,19 @@ impl CraqleNode {
     }
 
     fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
-        self.refresh_search_for_graph(graph)?;
+        self.finish_batch_with_durability(graph, batch, CraqleRequestDurability::Durable)
+    }
+
+    fn finish_batch_with_durability(
+        &self,
+        graph: &GraphId,
+        batch: Batch,
+        durability: CraqleRequestDurability,
+    ) -> Result<Batch> {
+        self.schedule_search_update_for_graph(graph)?;
+        if durability.persists_fjall() {
+            self.persist_fjall()?;
+        }
         Ok(batch)
     }
 
@@ -968,26 +1571,93 @@ impl CraqleNode {
         graph: &GraphId,
         report: AppendDataEntitiesReport,
     ) -> Result<AppendDataEntitiesReport> {
-        self.refresh_search_for_graph(graph)?;
+        self.schedule_search_update_for_graph(graph)?;
+        self.persist_fjall()?;
         Ok(report)
+    }
+
+    fn schedule_full_search_reindex(&self) -> Result<()> {
+        let mut batch = self.store.new_batch();
+        for graph in self.store.graphs()? {
+            self.store.enqueue_fts_reindex(&mut batch, &graph)?;
+        }
+        self.store.commit(batch)?;
+        self.persist_fjall()?;
+        self.schedule_search_update();
+        Ok(())
+    }
+
+    fn schedule_search_update_for_graph(&self, graph: &GraphId) -> Result<()> {
+        if self.store.contains_graph(graph)? {
+            self.schedule_search_update();
+        }
+        Ok(())
+    }
+
+    fn schedule_search_update(&self) {
+        self.search_worker.wake();
     }
 
     fn refresh_search_for_graph(&self, graph: &GraphId) -> Result<()> {
         self.search.reindex_from_store(&self.store, graph)?;
         self.search.commit()?;
         self.store.clear_fts_queue_for_graph(graph)?;
-        Ok(())
+        self.persist_fjall()
     }
 
-    fn validate_remote_batch(&self, batch: &Batch) -> Result<()> {
-        if batch.ops.len() > MAX_SYNC_BATCH_OPS {
-            return Err(CraqleError::SyncInputRejected(format!(
-                "remote batch for graph `{}` exceeded {} operations",
-                batch.graph.as_str(),
-                MAX_SYNC_BATCH_OPS
-            )));
+    pub fn persist_fjall(&self) -> Result<()> {
+        Ok(self.store.persist()?)
+    }
+
+    fn apply_irokle_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<bool> {
+        if self.store.graph_tombstoned(record.event.graph())? {
+            return Ok(false);
         }
-        Ok(())
+        match &record.event {
+            CraqleGraphEvent::GraphDeleted { graph } => {
+                self.store.set_graph_tombstone(graph)?;
+                self.store.delete_graph(graph)?;
+                self.schedule_search_update();
+                Ok(true)
+            }
+            CraqleGraphEvent::Policy { graph, policy } => {
+                let policy = policy.clone().normalized();
+                if self.store.graph_policy(graph)? == policy {
+                    return Ok(false);
+                }
+                self.set_local_graph_policy(graph, policy)?;
+                Ok(true)
+            }
+            CraqleGraphEvent::QuadChanges { graph, .. } => {
+                let Some(result) = self.replication.apply_irokle_record(record)? else {
+                    return Ok(false);
+                };
+                if result.applied {
+                    self.schedule_search_update_for_graph(graph)?;
+                }
+                Ok(result.applied)
+            }
+            CraqleGraphEvent::ContextUpdated {
+                graph,
+                context,
+                tag,
+            } => {
+                // Deterministic last-write-wins: overwrite only when the incoming
+                // tag strictly dominates the stored one. This converges to the
+                // same context on every peer regardless of arrival order, since
+                // the `(counter, actor)` order is total and the winning tag is
+                // unique per distinct context value.
+                if *tag <= self.store.graph_context_tag(graph)? {
+                    return Ok(false);
+                }
+                self.store
+                    .set_graph_context(graph, context.as_deref(), *tag)?;
+                Ok(true)
+            }
+        }
     }
 
     fn validate_sync_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
@@ -1003,6 +1673,26 @@ impl CraqleNode {
 
     fn manager(&self) -> RoCrateManager {
         RoCrateManager::new(self.replication.clone())
+    }
+
+    fn manager_with(
+        &self,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> RoCrateManager {
+        match (durability.publishes_irokle(), actor) {
+            (true, _) => self.manager(),
+            (false, None) => RoCrateManager::new(self.local_replication.clone()),
+            (false, Some(actor)) => RoCrateManager::new(Arc::new(ReplicationEngine::new(
+                self.store.clone(),
+                self.sparql.clone(),
+                actor,
+            ))),
+        }
+    }
+
+    fn manager_for_durability(&self, durability: CraqleRequestDurability) -> RoCrateManager {
+        self.manager_with(durability, None)
     }
 }
 
@@ -1033,4 +1723,19 @@ fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<Gr
 
 fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
+}
+
+fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    hits.sort_by_key(|hit| {
+        (
+            Reverse(score_key(hit.score)),
+            hit.graph_id.clone(),
+            hit.subject_iri.clone(),
+        )
+    });
+    hits.dedup_by(|left, right| {
+        left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
+    });
+    hits.truncate(limit);
+    hits
 }
