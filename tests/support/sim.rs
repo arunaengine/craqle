@@ -241,7 +241,7 @@ impl CraqleCluster {
         let moved = data.ops.len();
         let ack =
             self.irokles[receiver].receive_sync_data_from(self.irokles[sender].peer_id(), data)?;
-        let _ = self.irokles[sender].apply_sync_ack(&ack);
+        let _ = self.irokles[sender].apply_sync_ack(&ack.0);
         self.peers[receiver].reconcile_irokle()?;
         Ok(moved)
     }
