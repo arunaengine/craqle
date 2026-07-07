@@ -158,7 +158,7 @@ mod tests {
             .irokle(1)
             .receive_sync_data_from(net.irokle(0).peer_id(), data)
             .unwrap();
-        let _ = net.irokle(0).apply_sync_ack(&ack);
+        let _ = net.irokle(0).apply_sync_ack(&ack.0);
         assert!(net.peer(1).irokle_topic_id(&graph).unwrap().is_none());
 
         create_test_crate(&net, 1, &graph);
@@ -590,7 +590,7 @@ mod tests {
             .irokle(1)
             .receive_sync_data_from(net.irokle(0).peer_id(), data)
             .unwrap();
-        let _ = net.irokle(0).apply_sync_ack(&ack);
+        let _ = net.irokle(0).apply_sync_ack(&ack.0);
         net.peer(1).reconcile_irokle().unwrap();
 
         assert_eq!(graph_state(&net, 0, &graph), graph_state(&net, 1, &graph));
