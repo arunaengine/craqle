@@ -2757,6 +2757,23 @@ mod tests {
             self.inner.bind_graph_topic(store, graph, topic_id)
         }
 
+        fn bind_graph_topic_if_present(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+        ) -> SyncResult<Option<irokle::TopicId>> {
+            self.inner.bind_graph_topic_if_present(store, graph)
+        }
+
+        fn mint_graph_topic(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            initial_peers: std::collections::BTreeSet<irokle::PeerId>,
+        ) -> SyncResult<irokle::TopicId> {
+            self.inner.mint_graph_topic(store, graph, initial_peers)
+        }
+
         fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>> {
             self.inner.craqle_topic_ids()
         }

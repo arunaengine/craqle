@@ -517,6 +517,42 @@ impl CraqleNode {
         Ok(topic_id)
     }
 
+    /// Deterministic graph topic id, binding it locally only if its genesis is
+    /// already present. Never mints, so concurrent callers on different nodes
+    /// cannot fork rival geneses for the same graph.
+    pub fn bind_or_derive_irokle_topic(&self, graph: &GraphId) -> Result<irokle::TopicId> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        if let Some(topic_id) = sync.bind_graph_topic_if_present(&self.store, graph)? {
+            self.persist_fjall()?;
+            return Ok(topic_id);
+        }
+        Ok(crate::sync::graph_topic_id(graph))
+    }
+
+    /// Binds the graph's topic id if its genesis is present locally, else `None`.
+    pub fn bind_irokle_topic(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let bound = sync.bind_graph_topic_if_present(&self.store, graph)?;
+        if bound.is_some() {
+            self.persist_fjall()?;
+        }
+        Ok(bound)
+    }
+
+    /// Mints the graph's topic genesis with an explicit member set (or binds an
+    /// existing one). The only path that creates a graph genesis; callers own
+    /// the single-minter discipline.
+    pub fn mint_irokle_topic(
+        &self,
+        graph: &GraphId,
+        initial_peers: std::collections::BTreeSet<irokle::PeerId>,
+    ) -> Result<irokle::TopicId> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let topic_id = sync.mint_graph_topic(&self.store, graph, initial_peers)?;
+        self.persist_fjall()?;
+        Ok(topic_id)
+    }
+
     pub fn add_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
         sync.add_peer(&self.store, graph, peer)?;
