@@ -28,6 +28,79 @@ mod tests {
         assert!(!net.peer(1).contains_graph(&graph).unwrap());
     }
 
+    // A graph topic is derived deterministically and minted by exactly one
+    // node; every other node adopts that single genesis over sync instead of
+    // forking a rival one, so the topic converges with no genesis collision.
+    #[test]
+    fn graph_genesis_converges() {
+        use irokle::Storage as _;
+        let (_tmp, net) = setup_network(3);
+        let graph = GraphId::new("urn:test:graph-genesis-single-minter");
+
+        let topic_id = net.peer(0).bind_or_derive_irokle_topic(&graph).unwrap();
+        for idx in 0..net.peer_count() {
+            assert_eq!(
+                net.peer(idx).bind_or_derive_irokle_topic(&graph).unwrap(),
+                topic_id
+            );
+            assert!(net.peer(idx).irokle_topic_id(&graph).unwrap().is_none());
+            assert!(
+                net.irokle(idx)
+                    .storage()
+                    .topic_state(&topic_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let members = (1..net.peer_count())
+            .map(|idx| net.irokle(idx).peer_id())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            net.peer(0).mint_irokle_topic(&graph, members).unwrap(),
+            topic_id
+        );
+
+        for idx in 1..net.peer_count() {
+            assert_eq!(
+                net.peer(idx).bind_or_derive_irokle_topic(&graph).unwrap(),
+                topic_id
+            );
+            assert!(
+                net.irokle(idx)
+                    .storage()
+                    .topic_state(&topic_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        for _ in 0..5 {
+            net.sync_round().unwrap();
+        }
+
+        let genesis = net
+            .irokle(0)
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis;
+        for idx in 0..net.peer_count() {
+            let state = net
+                .irokle(idx)
+                .storage()
+                .topic_state(&topic_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.genesis, genesis);
+            assert_eq!(
+                net.peer(idx).bind_irokle_topic(&graph).unwrap(),
+                Some(topic_id)
+            );
+        }
+    }
+
     #[test]
     fn test_graph_delete_survives_reopen_without_resurrection() {
         let dir = tempfile::tempdir().unwrap();
