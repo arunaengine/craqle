@@ -156,6 +156,27 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         topic_id: irokle::TopicId,
     ) -> SyncResult<()>;
 
+    /// Bind the graph's deterministic topic id only if its genesis is already
+    /// present locally (self-minted or adopted from a peer). Never mints, so a
+    /// concurrent caller cannot fork a rival genesis. Returns `None` when no
+    /// genesis exists yet.
+    fn bind_graph_topic_if_present(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> SyncResult<Option<irokle::TopicId>>;
+
+    /// Mint the graph's deterministic topic genesis with an explicit member set,
+    /// or bind an existing one if a concurrent admission already created it. The
+    /// single-minter discipline lives in the embedder; this is the only path
+    /// that creates a graph genesis.
+    fn mint_graph_topic(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        initial_peers: BTreeSet<irokle::PeerId>,
+    ) -> SyncResult<irokle::TopicId>;
+
     fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>>;
 
     fn topic_records_since(
@@ -350,6 +371,61 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         }
         store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
         Ok(())
+    }
+
+    fn bind_graph_topic_if_present(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> SyncResult<Option<irokle::TopicId>> {
+        if let Some(topic_id) = self.graph_topic_id(store, graph)? {
+            return Ok(Some(topic_id));
+        }
+        let topic_id = graph_topic_id(graph);
+        let Some(state) = self.node.storage().topic_state(&topic_id)? else {
+            return Ok(None);
+        };
+        if state.event_type_id != CraqleGraphEvent::TYPE_ID {
+            return Err(CraqleSyncError::Irokle(irokle::Error::EventTypeMismatch {
+                expected: CraqleGraphEvent::TYPE_ID.to_owned(),
+                actual: state.event_type_id,
+            }));
+        }
+        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        Ok(Some(topic_id))
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), member_count = initial_peers.len()))]
+    fn mint_graph_topic(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        initial_peers: BTreeSet<irokle::PeerId>,
+    ) -> SyncResult<irokle::TopicId> {
+        let topic_id = graph_topic_id(graph);
+        let mut genesis_error = None;
+        for _ in 0..2 {
+            if let Some(topic_id) = self.bind_graph_topic_if_present(store, graph)? {
+                return Ok(topic_id);
+            }
+            let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
+            let genesis = TopicGenesis {
+                event_type_id: CraqleGraphEvent::TYPE_ID.to_owned(),
+                initial_peers: initial_peers.clone(),
+                replication_policy: self.options.replication_policy.clone(),
+            };
+            let oplog = Oplog::with_storage(self.node.storage().clone());
+            match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
+                Ok(_) => {
+                    store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+                    return Ok(topic_id);
+                }
+                Err(error) => genesis_error = Some(error),
+            }
+        }
+        Err(CraqleSyncError::Irokle(genesis_error.unwrap_or_else(
+            || irokle::Error::Storage(format!("failed to mint craqle topic {topic_id}")),
+        )))
     }
 
     fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>> {
