@@ -7,13 +7,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, Value,
+    Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing, Value,
+};
+use tantivy::tokenizer::{
+    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
 };
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
 const MEMORY_INDEX_WRITER_HEAP_BYTES: usize = 64_000_000;
 const REINDEX_FLUSH_CHUNK: usize = 2_048;
+const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
+const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
@@ -63,17 +68,37 @@ fn build_schema() -> Schema {
     builder.add_text_field("doc_key", STRING | STORED);
     builder.add_text_field("graph_id", STRING | STORED);
     builder.add_text_field("subject_iri", STRING | STORED);
-    builder.add_text_field("all_text", TEXT);
+    builder.add_text_field(
+        "all_text",
+        TEXT.set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(ALL_TEXT_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        ),
+    );
+    builder.add_text_field(INDEX_VERSION_FIELD, STRING);
     builder.build()
 }
 
 fn schema_fields(schema: &Schema) -> tantivy::Result<(Field, Field, Field, Field)> {
+    schema.get_field(INDEX_VERSION_FIELD)?;
     Ok((
         schema.get_field("doc_key")?,
         schema.get_field("graph_id")?,
         schema.get_field("subject_iri")?,
         schema.get_field("all_text")?,
     ))
+}
+
+fn register_text_analyzer(index: &Index) {
+    index.tokenizers().register(
+        ALL_TEXT_TOKENIZER,
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(40))
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build(),
+    );
 }
 
 fn create_index_dir(dir: &Path, schema: &Schema) -> tantivy::Result<Index> {
@@ -109,6 +134,7 @@ impl SearchIndex {
             (create_index_dir(dir, &schema)?, true)
         };
 
+        register_text_analyzer(&index);
         let (f_doc_key, f_graph_id, f_subject_iri, f_all_text) = schema_fields(&index.schema())?;
         let reader = index.reader()?;
         let writer = index.writer(DISK_INDEX_WRITER_HEAP_BYTES)?;
@@ -133,6 +159,7 @@ impl SearchIndex {
 
         let (f_doc_key, f_graph_id, f_subject_iri, f_all_text) = schema_fields(&schema)?;
         let index = Index::create_in_ram(schema);
+        register_text_analyzer(&index);
         let reader = index.reader()?;
         let writer = index.writer(MEMORY_INDEX_WRITER_HEAP_BYTES)?;
 
@@ -310,7 +337,7 @@ impl SearchIndex {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = query_parser.parse_query(query)?;
+        let parsed = query_parser.parse_query(&sanitize_query(query))?;
 
         let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top_docs.len());
@@ -330,7 +357,7 @@ impl SearchIndex {
     ) -> Result<Vec<SearchHit>> {
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = query_parser.parse_query(query)?;
+        let parsed = query_parser.parse_query(&sanitize_query(query))?;
         let graph_filter = TermQuery::new(
             Term::from_field_text(self.f_graph_id, graph_id),
             IndexRecordOption::Basic,
@@ -666,6 +693,26 @@ fn split_doc_key(doc_key: &str) -> Option<(String, String)> {
     Some((graph_id.to_string(), subject_iri.to_string()))
 }
 
+fn sanitize_query(query: &str) -> String {
+    let cleaned: String = query
+        .chars()
+        .map(|c| {
+            if "+-&|!(){}[]^\"~*?:\\/".contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    cleaned
+        .split_whitespace()
+        .filter(|token| !matches!(*token, "AND" | "OR" | "NOT"))
+        .map(|token| token.to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn orphaned_subjects(
     store: &crate::store::GraphStore,
     graph: &crate::core::GraphId,
@@ -710,9 +757,13 @@ fn is_searchable_predicate(
     predicate: &crate::core::EncodedTerm,
     searchable_predicates: &[crate::core::EncodedTerm],
 ) -> bool {
+    let normalized = predicate
+        .0
+        .strip_prefix("<https://schema.org/")
+        .map(|suffix| format!("<http://schema.org/{suffix}"));
     searchable_predicates
         .iter()
-        .any(|candidate| candidate == predicate)
+        .any(|candidate| candidate == predicate || normalized.as_ref() == Some(&candidate.0))
 }
 
 fn searchable_term_text(term: &crate::core::EncodedTerm) -> Option<Cow<'_, str>> {
@@ -746,6 +797,15 @@ fn load_orphaned_subjects<'a>(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn build_legacy_schema() -> Schema {
+        let mut builder = SchemaBuilder::default();
+        builder.add_text_field("doc_key", STRING | STORED);
+        builder.add_text_field("graph_id", STRING | STORED);
+        builder.add_text_field("subject_iri", STRING | STORED);
+        builder.add_text_field("all_text", TEXT);
+        builder.build()
+    }
 
     #[test]
     fn test_index_and_search() -> Result<()> {
@@ -799,6 +859,102 @@ mod tests {
         assert_eq!(all_hits.len(), 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_raw_query_operators_are_neutralized() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("COVID-19 RNA-seq foo dataset"),
+        )?;
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity2",
+            Some("bar"),
+        )?;
+        idx.commit()?;
+
+        for query in ["COVID-19", "covid", "RNA-seq", "type:dataset"] {
+            let hits = idx.search(query, 10)?;
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
+        }
+
+        let hits = idx.search("foo AND bar", 10)?;
+        let subjects: HashSet<_> = hits.iter().map(|hit| hit.subject_iri.as_str()).collect();
+        assert_eq!(subjects.len(), 2);
+        assert!(subjects.contains("http://example.org/entity1"));
+        assert!(subjects.contains("http://example.org/entity2"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ascii_folding_matches_diacritics() -> Result<()> {
+        let idx = SearchIndex::open_in_memory()?;
+
+        idx.index_resource(
+            "http://example.org/graph1",
+            "http://example.org/entity1",
+            Some("Forschung an der Universität"),
+        )?;
+        idx.commit()?;
+
+        for query in ["universität", "universitat"] {
+            let hits = idx.search(query, 10)?;
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_https_schema_description_is_indexed() {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let graph = crate::core::GraphId::new("urn:test:https-schema-search");
+        let auth = crate::AllowAllAuthorizer;
+        let document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {"description": "https://schema.org/description"}
+            ],
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "HTTPS Context Crate",
+                    "description": "Contains contextneedle in its description",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                }
+            ]
+        });
+
+        node.apply_rocrate_document_with_policy(
+            &auth,
+            graph.clone(),
+            &document.to_string(),
+            crate::core::GraphPolicy::default(),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        let hits = node.search(&auth, "contextneedle", 10).unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.graph_id == graph.as_str() && hit.subject_iri == graph.as_str())
+        );
     }
 
     #[test]
@@ -888,5 +1044,62 @@ mod tests {
         assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_old_analyzer_index_is_rebuilt_on_node_open() {
+        let dir = tempdir().unwrap();
+        let graph = crate::core::GraphId::new("urn:test:search-analyzer-reindex");
+        let auth = crate::AllowAllAuthorizer;
+
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(
+                &auth,
+                crate::CreateCrateRequest::new(
+                    graph.clone(),
+                    "Analyzer Reindex Crate",
+                    "Forschung an der Universität",
+                    "2025-01-01",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    crate::core::GraphPolicy::default(),
+                ),
+            )
+            .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+
+        let search_dir = dir.path().join("search");
+        std::fs::remove_dir_all(&search_dir).unwrap();
+        std::fs::create_dir_all(&search_dir).unwrap();
+        let legacy_schema = build_legacy_schema();
+        let legacy_index = Index::create_in_dir(&search_dir, legacy_schema.clone()).unwrap();
+        let mut writer = legacy_index.writer(MEMORY_INDEX_WRITER_HEAP_BYTES).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_text(
+            legacy_schema.get_field("doc_key").unwrap(),
+            doc_key(graph.as_str(), graph.as_str()),
+        );
+        doc.add_text(legacy_schema.get_field("graph_id").unwrap(), graph.as_str());
+        doc.add_text(
+            legacy_schema.get_field("subject_iri").unwrap(),
+            graph.as_str(),
+        );
+        doc.add_text(
+            legacy_schema.get_field("all_text").unwrap(),
+            "Forschung an der Universität",
+        );
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(legacy_index);
+
+        let reopened = crate::CraqleNode::open(dir.path()).unwrap();
+        reopened.flush_search_updates().unwrap();
+        let hits = reopened.search(&auth, "universitat", 10).unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.graph_id == graph.as_str() && hit.subject_iri == graph.as_str())
+        );
     }
 }
