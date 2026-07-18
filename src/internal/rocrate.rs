@@ -22,6 +22,8 @@ const XSD_BOOLEAN_IRI: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const XSD_DOUBLE_IRI: &str = "http://www.w3.org/2001/XMLSchema#double";
 const XSD_INTEGER_IRI: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_STRING_IRI: &str = "http://www.w3.org/2001/XMLSchema#string";
+const PROF_HAS_ARTIFACT_IRI: &str = "http://www.w3.org/ns/dx/prof#hasArtifact";
+const PROF_RESOURCE_DESCRIPTOR_IRI: &str = "http://www.w3.org/ns/dx/prof#ResourceDescriptor";
 const METADATA_ID: &str = "ro-crate-metadata.json";
 type TripleKey = (EncodedTerm, EncodedTerm, EncodedTerm);
 
@@ -1113,6 +1115,8 @@ impl RoCrateManager {
 
         let mut expanded = HashSet::new();
         let mut contextuals = BTreeSet::new();
+        let has_artifact =
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked(PROF_HAS_ARTIFACT_IRI));
 
         while let Some(subject_id) = queue.pop_front() {
             if !expanded.insert(subject_id.clone()) {
@@ -1128,8 +1132,10 @@ impl RoCrateManager {
             } else {
                 self.subject_triples(graph_id, &subject_id)?
             };
+            let is_resource_descriptor =
+                triples_have_type(&references, PROF_RESOURCE_DESCRIPTOR_IRI);
 
-            for (_, object) in references {
+            for (predicate, object) in references {
                 let Some(candidate_id) = encoded_named_node_value(&object) else {
                     continue;
                 };
@@ -1141,7 +1147,12 @@ impl RoCrateManager {
                 }
 
                 let triples = self.subject_triples(graph_id, &candidate_id)?;
-                if triples.is_empty() || !triples_describe_contextual_entity(&triples) {
+                let is_profile_artifact = is_resource_descriptor
+                    && predicate == has_artifact
+                    && triples_have_type(&triples, "File");
+                if triples.is_empty()
+                    || (!triples_describe_contextual_entity(&triples) && !is_profile_artifact)
+                {
                     continue;
                 }
 
@@ -2174,6 +2185,13 @@ fn triples_describe_contextual_entity(triples: &[(EncodedTerm, EncodedTerm)]) ->
     })
 }
 
+fn triples_have_type(triples: &[(EncodedTerm, EncodedTerm)], expected: &str) -> bool {
+    triples.iter().any(|(predicate, object)| {
+        predicate == &EncodedTerm::from_named_node(&vocab::rdf_type())
+            && object_named_node_value(object).as_deref() == Some(expected)
+    })
+}
+
 fn literal_string(term: &EncodedTerm) -> Result<String, RoCrateError> {
     match term.to_term() {
         Some(Term::Literal(literal)) => Ok(literal.value().to_string()),
@@ -2920,5 +2938,130 @@ mod tests {
             store.graph_context_tag(&graph).unwrap().counter >= 1,
             "healed context tag should have advanced past genesis"
         );
+    }
+
+    #[test]
+    fn profile_summary_includes_only_resource_descriptor_artifact_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::GraphStore::open(dir.path()).unwrap());
+        let search = Arc::new(crate::search::SearchIndex::open_in_memory().unwrap());
+        let sparql = Arc::new(crate::sparql::SparqlEngine::new(store.clone(), search));
+        let engine = Arc::new(ReplicationEngine::new(
+            store,
+            sparql,
+            crate::core::ActorId::random(),
+        ));
+        let manager = RoCrateManager::new(engine);
+        let graph = GraphId::new("urn:test:profile-summary-artifacts");
+        let document = serde_json::json!({
+            "@context": [
+                ROCRATE_CONTEXT_URL,
+                {
+                    "hasResource": "http://www.w3.org/ns/dx/prof#hasResource",
+                    "hasArtifact": PROF_HAS_ARTIFACT_IRI,
+                    "text": "http://schema.org/text"
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": METADATA_ID,
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": ROCRATE_SPEC_URL},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Profile Crate",
+                    "description": "Profile rules and an ordinary data file",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "conformsTo": {"@id": "#profile"},
+                    "hasPart": {"@id": "./data/plain.txt"}
+                },
+                {
+                    "@id": "#profile",
+                    "@type": "http://www.w3.org/ns/dx/prof#Profile",
+                    "name": "Test Profile",
+                    "hasResource": [
+                        {"@id": "#mode-descriptor"},
+                        {"@id": "#schema-descriptor"}
+                    ]
+                },
+                {
+                    "@id": "#mode-descriptor",
+                    "@type": PROF_RESOURCE_DESCRIPTOR_IRI,
+                    "name": "Mode Rules",
+                    "hasArtifact": {"@id": "./mode.json"}
+                },
+                {
+                    "@id": "#schema-descriptor",
+                    "@type": PROF_RESOURCE_DESCRIPTOR_IRI,
+                    "name": "Schema Rules",
+                    "hasArtifact": {"@id": "./schema.json"}
+                },
+                {
+                    "@id": "./mode.json",
+                    "@type": "File",
+                    "name": "Mode Rules",
+                    "text": "{\"mode\":\"strict\"}"
+                },
+                {
+                    "@id": "./schema.json",
+                    "@type": "File",
+                    "name": "Schema Rules",
+                    "text": "{\"required\":[\"name\"]}"
+                },
+                {
+                    "@id": "./data/plain.txt",
+                    "@type": "File",
+                    "name": "Plain Data",
+                    "text": "ordinary data content"
+                }
+            ]
+        });
+
+        manager
+            .import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+        let summary_json = manager.export_jsonld_summary(&graph).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
+        let entries = summary["@graph"].as_array().unwrap();
+        let mode = entries
+            .iter()
+            .find(|entity| entity["@id"].as_str() == Some("./mode.json"))
+            .unwrap();
+        let schema = entries
+            .iter()
+            .find(|entity| entity["@id"].as_str() == Some("./schema.json"))
+            .unwrap();
+        assert_eq!(mode["text"], serde_json::json!("{\"mode\":\"strict\"}"));
+        assert_eq!(
+            schema["text"],
+            serde_json::json!("{\"required\":[\"name\"]}")
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entity| entity["@id"].as_str() != Some("./data/plain.txt")),
+            "ordinary root hasPart files must stay out of summary exports"
+        );
+
+        let roundtrip_graph = GraphId::new("urn:test:profile-summary-artifacts-roundtrip");
+        manager
+            .import_jsonld(roundtrip_graph.clone(), &summary_json)
+            .unwrap();
+        let roundtrip: serde_json::Value =
+            serde_json::from_str(&manager.export_jsonld_summary(&roundtrip_graph).unwrap())
+                .unwrap();
+        let roundtrip_entries = roundtrip["@graph"].as_array().unwrap();
+        assert!(roundtrip_entries.iter().any(|entity| {
+            entity["@id"].as_str() == Some("./mode.json")
+                && entity["text"] == serde_json::json!("{\"mode\":\"strict\"}")
+        }));
+        assert!(roundtrip_entries.iter().any(|entity| {
+            entity["@id"].as_str() == Some("./schema.json")
+                && entity["text"] == serde_json::json!("{\"required\":[\"name\"]}")
+        }));
     }
 }
