@@ -130,7 +130,7 @@ mod tests {
                 "Workflow Append Dataset",
                 "Workflow append comparison",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )

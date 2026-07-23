@@ -331,27 +331,102 @@ pub struct GraphReplicaSnapshot {
 
 /// Structural violations detectable by SHACL guards or post-merge checks.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CrateViolation {
-    #[error("missing root data entity (<./> rdf:type schema:Dataset)")]
-    MissingRootDataEntity,
+#[error("{message}")]
+pub struct CrateViolation {
+    pub code: &'static str,
+    pub message: String,
+    pub pointer: String,
+    pub entity_id: Option<String>,
+}
 
-    #[error("missing metadata descriptor (ro-crate-metadata.json)")]
-    MissingMetadataDescriptor,
+impl CrateViolation {
+    pub(crate) fn missing_root(pointer: impl Into<String>) -> Self {
+        Self {
+            code: "missing_root_data_entity",
+            message: "missing root data entity (<./> rdf:type schema:Dataset)".to_string(),
+            pointer: pointer.into(),
+            entity_id: None,
+        }
+    }
 
-    #[error("missing required property `{property}` on entity `{entity}`")]
-    MissingRequiredProperty { entity: String, property: String },
+    pub(crate) fn missing_descriptor(pointer: impl Into<String>) -> Self {
+        Self {
+            code: "missing_metadata_descriptor",
+            message: "missing metadata descriptor (ro-crate-metadata.json)".to_string(),
+            pointer: pointer.into(),
+            entity_id: Some("ro-crate-metadata.json".to_string()),
+        }
+    }
 
-    #[error("orphaned data entity `{entity_id}` not reachable from root")]
-    OrphanedDataEntity { entity_id: String },
+    pub(crate) fn missing_property(
+        entity: impl Into<String>,
+        property: &str,
+        pointer: impl Into<String>,
+    ) -> Self {
+        let entity = entity.into();
+        Self {
+            code: "missing_required_property",
+            message: format!("missing required property `{property}` on entity `{entity}`"),
+            pointer: pointer.into(),
+            entity_id: Some(entity),
+        }
+    }
 
-    #[error("datePublished must have exactly one value, found {count}")]
-    InvalidDatePublishedCardinality { count: usize },
+    pub(crate) fn orphaned(entity_id: impl Into<String>, pointer: impl Into<String>) -> Self {
+        let entity_id = entity_id.into();
+        let entity_id = violation_entity_id(&entity_id);
+        Self {
+            code: "orphaned_data_entity",
+            message: format!("orphaned data entity `{entity_id}` not reachable from root"),
+            pointer: pointer.into(),
+            entity_id: Some(entity_id),
+        }
+    }
 
-    #[error("entity `{entity_id}` is missing rdf:type")]
-    EntityMissingType { entity_id: String },
+    pub(crate) fn invalid_date(count: usize, pointer: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_date_published_cardinality",
+            message: format!("datePublished must have exactly one value, found {count}"),
+            pointer: pointer.into(),
+            entity_id: None,
+        }
+    }
 
-    #[error("custom rule `{rule}` failed: {message}")]
-    Custom { rule: String, message: String },
+    pub(crate) fn missing_type(entity_id: impl Into<String>, pointer: impl Into<String>) -> Self {
+        let entity_id = entity_id.into();
+        let entity_id = violation_entity_id(&entity_id);
+        Self {
+            code: "entity_missing_type",
+            message: format!("entity `{entity_id}` is missing rdf:type"),
+            pointer: pointer.into(),
+            entity_id: Some(entity_id),
+        }
+    }
+
+    pub(crate) fn unsupported_version(
+        version: Option<&str>,
+        pointer: impl Into<String>,
+        entity_id: Option<String>,
+    ) -> Self {
+        let message = match version {
+            Some(version) => format!("unsupported RO-Crate version `{version}`"),
+            None => "missing RO-Crate 1.1 or 1.2 version declaration".to_string(),
+        };
+        Self {
+            code: "unsupported_crate_version",
+            message,
+            pointer: pointer.into(),
+            entity_id,
+        }
+    }
+}
+
+fn violation_entity_id(entity_id: &str) -> String {
+    entity_id
+        .strip_prefix('<')
+        .and_then(|entity_id| entity_id.strip_suffix('>'))
+        .unwrap_or(entity_id)
+        .to_string()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

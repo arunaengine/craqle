@@ -591,6 +591,7 @@ dependencies = [
  "globset",
  "iroh",
  "irokle",
+ "oxjsonld",
  "oxrdf",
  "postcard",
  "proptest",

@@ -19,7 +19,7 @@ mod tests {
                     "Microbial Genomics Study",
                     "Analysis of microbial communities",
                     "2025-03-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -46,7 +46,7 @@ mod tests {
                     "Proteomics Dataset",
                     "Search helper should commit indexed documents",
                     "2025-03-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -73,7 +73,7 @@ mod tests {
                     "Microbial Genomics Study",
                     "Microbial sequencing",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -135,7 +135,7 @@ mod tests {
                     "Integrated FTS Crate",
                     "SPARQL should see Tantivy hits",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -202,7 +202,7 @@ mod tests {
                     "Persisted Search Crate",
                     "Committed Tantivy index should survive restart",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -257,7 +257,7 @@ mod tests {
                     "Remote Batch Dataset",
                     "Receiver should update search directly",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -305,7 +305,7 @@ mod tests {
                 "Deleted Search Dataset",
                 "This should disappear from search",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -321,7 +321,7 @@ mod tests {
                 "Replacement Search Dataset",
                 "Only replacement text should be searchable",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )

@@ -100,7 +100,7 @@ mod tests {
                         format!("Bench {path}"),
                         "k8s benchmark document",
                         "2026-06-11",
-                        "https://creativecommons.org/licenses/by/4.0/",
+                        Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                         policy.clone(),
                     ),
                 )

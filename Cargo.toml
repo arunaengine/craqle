@@ -4,6 +4,7 @@ resolver = "3"
 [workspace.dependencies]
 # RDF ecosystem
 oxrdf = { version = "0.3.3", features = ["serde"] }
+oxjsonld = "0.2.5"
 spargebra = "0.4.6"
 spareval = { version = "0.2.6", features = ["sep-0006"] }
 
@@ -62,6 +63,7 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", f
     "fjall",
 ] }
 oxrdf = { workspace = true }
+oxjsonld = { workspace = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
 serde_json = { workspace = true }
