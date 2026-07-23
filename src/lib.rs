@@ -53,7 +53,7 @@ pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{
     AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
-    canonicalize_jsonld,
+    canonicalize_jsonld, validate_rocrate_jsonld,
 };
 pub use crate::search::SearchHit;
 pub use crate::sparql::QueryResults;
