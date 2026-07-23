@@ -1894,7 +1894,11 @@ fn jsonld_quads(value: &serde_json::Value) -> Result<Vec<Quad>, RoCrateError> {
             serde_json::Value::String(ROCRATE_CONTEXT_URL.to_string()),
         );
     }
-    label_blank_nodes(&mut prepared, "", true);
+    let mut terms = HashMap::new();
+    if let Some(context) = prepared.get("@context") {
+        collect_context_terms(context, &mut terms, false);
+    }
+    label_blank_nodes(&mut prepared, "", true, &terms);
     let jsonld = serde_json::to_vec(&prepared)?;
     let parser = JsonLdParser::new()
         .with_base_iri(JSONLD_BASE_IRI)
@@ -1927,22 +1931,30 @@ fn load_context(
     })
 }
 
-fn label_blank_nodes(value: &mut serde_json::Value, pointer: &str, document: bool) {
+fn label_blank_nodes(
+    value: &mut serde_json::Value,
+    pointer: &str,
+    document: bool,
+    terms: &HashMap<String, String>,
+) {
     match value {
         serde_json::Value::Array(values) => {
             for (index, value) in values.iter_mut().enumerate() {
-                label_blank_nodes(value, &format!("{pointer}/{index}"), false);
+                label_blank_nodes(value, &format!("{pointer}/{index}"), false, terms);
             }
         }
         serde_json::Value::Object(object) => {
             if !document
-                && !object.contains_key("@id")
-                && !object.contains_key("id")
+                && submitted_id(object, terms).is_none()
                 && !object.contains_key("@value")
                 && !object.contains_key("value")
                 && !object.contains_key("@list")
                 && !object.contains_key("@set")
-                && (object.contains_key("@type") || object.contains_key("type"))
+                && object.keys().any(|key| {
+                    key == "@type"
+                        || key == "type"
+                        || terms.get(key).is_some_and(|iri| iri == "@type")
+                })
             {
                 let suffix = blake3::hash(pointer.as_bytes()).to_hex();
                 object.insert(
@@ -1955,7 +1967,12 @@ fn label_blank_nodes(value: &mut serde_json::Value, pointer: &str, document: boo
                 if key == "@context" {
                     continue;
                 }
-                label_blank_nodes(value, &format!("{pointer}/{}", escape_pointer(key)), false);
+                label_blank_nodes(
+                    value,
+                    &format!("{pointer}/{}", escape_pointer(key)),
+                    false,
+                    terms,
+                );
             }
         }
         _ => {}
