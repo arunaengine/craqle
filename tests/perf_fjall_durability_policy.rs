@@ -66,7 +66,7 @@ mod tests {
                     format!("Fjall Durability Probe {sample}"),
                     "Craqle metadata durability policy probe",
                     "2026-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )

@@ -73,7 +73,7 @@ mod tests {
                     format!("Cross Graph Dataset {graph_idx}"),
                     "Graph-unbound SPARQL performance profile",
                     "2026-03-30",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )

@@ -51,7 +51,10 @@ pub use crate::core::{
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::replication::{MergeError, UpdateError};
-pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
+pub use crate::rocrate::{
+    AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
+    canonicalize_jsonld,
+};
 pub use crate::search::SearchHit;
 pub use crate::sparql::QueryResults;
 pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
@@ -150,7 +153,7 @@ pub struct CreateCrateRequest {
     pub name: String,
     pub description: String,
     pub date_published: String,
-    pub license: String,
+    pub license: Option<String>,
     pub policy: GraphPolicy,
 }
 
@@ -160,7 +163,7 @@ impl CreateCrateRequest {
         name: impl Into<String>,
         description: impl Into<String>,
         date_published: impl Into<String>,
-        license: impl Into<String>,
+        license: Option<String>,
         policy: GraphPolicy,
     ) -> Self {
         Self {
@@ -168,7 +171,7 @@ impl CreateCrateRequest {
             name: name.into(),
             description: description.into(),
             date_published: date_published.into(),
-            license: license.into(),
+            license,
             policy,
         }
     }
@@ -709,7 +712,7 @@ impl CraqleNode {
             &name,
             &description,
             &date_published,
-            &license,
+            license.as_deref(),
         )?;
         self.persist_graph_policy_with_durability(&graph, policy, durability)?;
         self.finish_batch_with_durability(&graph, batch, durability)
@@ -745,7 +748,7 @@ impl CraqleNode {
                 &name,
                 &description,
                 &date_published,
-                &license,
+                license.as_deref(),
             )?;
         self.persist_graph_policy_with_durability(&graph, policy, durability)?;
         self.finish_batch_with_durability(&graph, batch, durability)
@@ -775,7 +778,7 @@ impl CraqleNode {
             &name,
             &description,
             &date_published,
-            &license,
+            license.as_deref(),
         )?)
     }
 

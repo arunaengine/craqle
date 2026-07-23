@@ -160,7 +160,7 @@ mod tests {
                 "Existing Dataset",
                 "Existing graph",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -193,7 +193,7 @@ mod tests {
                 "Append Search Dataset",
                 "Batched append search refresh",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -239,7 +239,7 @@ mod tests {
                 "Graph Reindex Dataset",
                 "Graph-level reindex marker test",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn test_object_context_term_definition_without_id_falls_back_to_schema_org() {
+    fn rejects_invalid_context() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-object-no-id");
         let mgr = manager(net.peer(0));
@@ -973,23 +973,10 @@ mod tests {
             ]
         });
 
-        // Import succeeds even though the object definitions cannot be expanded.
-        mgr.import_jsonld(graph.clone(), &document.to_string())
-            .unwrap();
-
-        let state = graph_state(&net, 0, &graph);
-        assert!(
-            state
-                .iter()
-                .any(|(_, predicate, _)| predicate.contains("http://schema.org/measurement")),
-            "measurement without a string @id should fall back to schema.org: {state:?}"
-        );
-        assert!(
-            state
-                .iter()
-                .any(|(_, predicate, _)| predicate.contains("http://schema.org/assay")),
-            "assay with a non-string @id should fall back to schema.org: {state:?}"
-        );
+        assert!(matches!(
+            mgr.import_jsonld(graph, &document.to_string()),
+            Err(RoCrateError::JsonLd(_))
+        ));
     }
 
     #[test]
@@ -1257,7 +1244,7 @@ mod tests {
                     "Replacement Crate",
                     "Replaces the custom-context crate (prevalidated)",
                     "2025-02-02",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
                 CraqleRequestDurability::Durable,

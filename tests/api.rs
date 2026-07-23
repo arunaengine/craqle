@@ -38,7 +38,7 @@ fn public_graphs_are_visible_without_grants() {
             "Public Dataset",
             "Visible to everyone",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/demo".to_string()],
@@ -89,7 +89,7 @@ fn graph_store_persist_mode_defaults_to_buffer_and_can_use_sync_all() {
                 "SyncAll Dataset",
                 "Graph-store SyncAll persistence test",
                 "2026-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/sync-all".to_string()],
@@ -129,7 +129,7 @@ fn query_graphs_with_filters_by_lazy_predicate() {
                 name,
                 "Predicate visibility test",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/demo".to_string()],
@@ -176,7 +176,7 @@ fn read_requires_matching_path_while_write_implies_read() {
             "Private Dataset",
             "Only path-matched users can see this",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: false,
                 permission_paths: vec!["/datasets/private/project-a".to_string()],
@@ -227,7 +227,7 @@ fn write_access_is_required_for_updates() {
             "Protected Dataset",
             "Only writers may mutate this crate",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: false,
                 permission_paths: vec!["/datasets/public/demo".to_string()],
@@ -278,7 +278,7 @@ fn external_irokle_instance_can_be_shared_with_other_topics() {
             "Shared Irokle Dataset",
             "Craqle uses one graph topic beside other app topics",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/shared".to_string()],
@@ -318,7 +318,7 @@ fn wal_already_durable_create_crate_does_not_publish_irokle_graph_topic() {
             "WAL Local Dataset",
             "Materialized from an external WAL",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/wal-local-create".to_string()],
@@ -457,7 +457,7 @@ fn search_filters_private_graphs_by_policy() {
             "Public Proteomics",
             "Visible search document",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/demo".to_string()],
@@ -472,7 +472,7 @@ fn search_filters_private_graphs_by_policy() {
             "Private Proteomics",
             "Hidden search document",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: false,
                 permission_paths: vec!["/datasets/private/project-a".to_string()],
@@ -510,7 +510,7 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
                 format!("Dominant Unselected {idx}"),
                 "needle ".repeat(40),
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/search-graphs".to_string()],
@@ -527,7 +527,7 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
             "Hidden Selected",
             "needle ".repeat(40),
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: false,
                 permission_paths: vec!["/datasets/private/search-graphs".to_string()],
@@ -544,7 +544,7 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
                 format!("Selected {}", graph.as_str()),
                 "needle",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/search-graphs".to_string()],
@@ -585,7 +585,7 @@ fn search_hits_can_be_hydrated_from_rdf() {
             "Hydrated Search Dataset",
             "Search results can be hydrated from RDF",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/hydrate-search".to_string()],
@@ -630,7 +630,7 @@ fn cluster_sync_converges_through_public_api() {
                 "Cluster Dataset",
                 "Synced via simulation helper",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/cluster".to_string()],
@@ -678,7 +678,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
                 "Peer Zero Dataset",
                 "Lives only on peer zero",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/peer0".to_string()],
@@ -695,7 +695,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
                 "Peer One Dataset",
                 "Lives only on peer one",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/peer1".to_string()],
@@ -761,7 +761,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
                 "Public Federated Dataset",
                 "Visible everywhere",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/federated".to_string()],
@@ -778,7 +778,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
                 "Private Federated Dataset",
                 "Must not leak through remote fanout",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: false,
                     permission_paths: vec!["/datasets/private/federated".to_string()],
@@ -837,7 +837,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
 }
 
 #[test]
-fn import_jsonld_rejects_inline_nested_objects() {
+fn imports_nested_objects() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let graph = GraphId::new("urn:test:inline-object");
@@ -850,7 +850,7 @@ fn import_jsonld_rejects_inline_nested_objects() {
             "Inline Object Test",
             "Used to validate RO-Crate import semantics",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/inline-object".to_string()],
@@ -859,7 +859,7 @@ fn import_jsonld_rejects_inline_nested_objects() {
     )
     .unwrap();
 
-    let invalid = format!(
+    let document = format!(
         r#"
     {{
       "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -874,7 +874,7 @@ fn import_jsonld_rejects_inline_nested_objects() {
           "@id": "{}",
           "@type": "Dataset",
           "name": "Inline Object Test",
-          "description": "Should be rejected",
+          "description": "Nested entities are supported",
           "datePublished": "2025-01-01",
           "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}},
           "creator": {{
@@ -889,13 +889,11 @@ fn import_jsonld_rejects_inline_nested_objects() {
         graph.as_str()
     );
 
-    let err = node
-        .apply_rocrate_document(&writer, graph, &invalid)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(_))
-    ));
+    node.apply_rocrate_document(&writer, graph.clone(), &document)
+        .unwrap();
+    let exported = node.export_rocrate(&writer, &graph).unwrap();
+    assert!(exported.contains("Nested Person"));
+    assert!(exported.contains("creator"));
 }
 
 #[test]
@@ -912,7 +910,7 @@ fn update_property_rejects_unknown_compact_property_names() {
             "Unknown Property Test",
             "Reject unsupported compact properties",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/unknown-property".to_string()],
@@ -945,7 +943,7 @@ fn add_data_entity_rejects_unknown_compact_types() {
             "Unknown Type Test",
             "Reject unsupported compact type names",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/unknown-type".to_string()],
@@ -978,7 +976,7 @@ fn preview_rocrate_update_returns_canonical_changes() {
             "Preview Dataset",
             "Original description",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/datasets/public/preview-rocrate".to_string()],
@@ -1049,7 +1047,7 @@ fn validate_create_crate_does_not_create_graph_or_publish_irokle_topic() {
                 "Validated Dataset",
                 "Validated without committing",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/validate-create".to_string()],
@@ -1153,11 +1151,10 @@ fn validate_rocrate_document_checked_with_policy_is_non_mutating_and_rejects_inv
     assert!(matches!(
         err,
         CraqleError::RoCrate(RoCrateError::Update(UpdateError::ValidationFailed(violations)))
-            if violations.iter().any(|violation| matches!(
-                violation,
-                CrateViolation::MissingRequiredProperty { property, .. }
-                    if property == "schema:name"
-            ))
+            if violations.iter().any(|violation|
+                violation.code == "missing_required_property"
+                    && violation.message.contains("schema:name")
+            )
     ));
     assert!(!node.contains_graph(&graph).unwrap());
     assert!(node.graphs().unwrap().is_empty());

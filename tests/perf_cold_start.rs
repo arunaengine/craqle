@@ -73,7 +73,7 @@ mod tests {
                         format!("Cold Start Graph {graph_idx}"),
                         "Cold-start reopen and search rebuild profile",
                         "2026-03-30",
-                        "https://creativecommons.org/licenses/by/4.0/",
+                        Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                         public_policy(),
                     ),
                 )

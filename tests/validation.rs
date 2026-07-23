@@ -21,7 +21,7 @@ mod tests {
                     "Test",
                     "Test",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -45,9 +45,11 @@ mod tests {
 
         match net.peer(0).insert_quads(&graph, orphan_quads) {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
-                assert!(violations.iter().any(|violation| {
-                    matches!(violation, CrateViolation::OrphanedDataEntity { .. })
-                }));
+                assert!(
+                    violations
+                        .iter()
+                        .any(|violation| violation.code == "orphaned_data_entity")
+                );
             }
             other => panic!("expected orphan validation failure, got {other:?}"),
         }
@@ -79,7 +81,7 @@ mod tests {
                     "Orphan Test",
                     "Concurrent structure changes",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -169,10 +171,9 @@ mod tests {
         match net.peer_mut(0).update(&delete_root) {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
-                    violations.iter().any(|violation| matches!(
-                        violation,
-                        CrateViolation::MissingRootDataEntity
-                    ))
+                    violations
+                        .iter()
+                        .any(|violation| violation.code == "missing_root_data_entity")
                 );
             }
             other => panic!("expected root-destruction validation failure, got {other:?}"),
@@ -193,7 +194,7 @@ mod tests {
                     "Multi Parent",
                     "Alternate path reachability",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )

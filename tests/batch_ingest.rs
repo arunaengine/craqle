@@ -69,7 +69,7 @@ mod tests {
                 "Batch Ingest Demo",
                 "RO-Crate batch ingest workflow",
                 "2026-03-27",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy_for("/demo/batch-ingest"),
             ),
         )?;

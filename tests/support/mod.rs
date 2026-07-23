@@ -21,7 +21,7 @@ pub fn create_test_crate(net: &sim::CraqleCluster, peer: usize, graph: &GraphId)
                 "Test Dataset",
                 "A test dataset",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -56,7 +56,7 @@ impl<'a> TestRoCrateApi<'a> {
                 name,
                 description,
                 date_published,
-                license,
+                Some(license.to_string()),
                 public_policy(),
             ),
         )

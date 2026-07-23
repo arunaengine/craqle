@@ -123,7 +123,7 @@ mod tests {
             format!("Scaffold Dataset {nonce:x}-{idx}"),
             "Materialized scaffold record",
             "2026-06-10",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             doc_policy(),
         );
         let started = Instant::now();
@@ -144,7 +144,7 @@ mod tests {
             format!("Scaffold Dataset {nonce:x}-{idx}"),
             "Materialized scaffold record",
             "2026-06-10",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             doc_policy(),
         );
         let started = Instant::now();
