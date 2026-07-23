@@ -105,6 +105,17 @@ pub fn canonicalize_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError
     canonicalize_value(&value)
 }
 
+pub fn validate_rocrate_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError> {
+    let value: serde_json::Value = serde_json::from_str(jsonld)?;
+    validate_jsonld_import(&value)?;
+    let graph_id = GraphId::new(JSONLD_BASE_IRI);
+    let target = jsonld_triples(&graph_id, &value)?;
+    let pointers = SubmittedPointers::new(&value, &graph_id);
+    validate_crate_version(&graph_id, &target, &pointers)?;
+    validate_complete_import_triples(&graph_id, &target, Some(&pointers))?;
+    canonicalize_value(&value)
+}
+
 /// Description of one new entity to append during batch ingest.
 #[derive(Debug, Clone)]
 pub struct NewDataEntity {
