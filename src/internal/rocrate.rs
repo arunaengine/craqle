@@ -234,8 +234,7 @@ impl RoCrateManager {
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
         if is_replacement {
-            // Same stale-context revert as `replace_graph_with_rocrate`, so the
-            // checked and prevalidated create paths stay in lockstep.
+            // Keep checked and prevalidated replacement paths in lockstep.
             self.reset_context_after_replacement(&graph_id)?;
         }
         Ok(batch)
@@ -501,10 +500,9 @@ impl RoCrateManager {
 
     /// Import path for documents already validated at their origin.
     ///
-    /// Skips semantic RO-Crate validation (`validate_jsonld_import` and
-    /// `validate_complete_import_triples`) but keeps replace/diff semantics,
-    /// CRDT authoring, and structural JSON-LD error handling. Only callers
-    /// replaying an event log of origin-validated documents may use this.
+    /// Skips complete RO-Crate semantic validation but keeps replace/diff
+    /// semantics, CRDT authoring, and structural JSON-LD error handling. Only
+    /// callers replaying origin-validated documents may use this.
     pub fn import_jsonld_prevalidated(
         &self,
         graph_id: GraphId,
@@ -512,6 +510,7 @@ impl RoCrateManager {
     ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        validate_jsonld_import(&value)?;
         let target = jsonld_triples(&graph_id, &value)?;
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
             insert_changes(&graph_id, target)
@@ -901,17 +900,6 @@ impl RoCrateManager {
         }
     }
 
-    fn replace_graph_with_rocrate(
-        &self,
-        graph_id: &GraphId,
-        mut rocrate: RoCrate,
-    ) -> Result<Batch, RoCrateError> {
-        let changes = self.plan_rocrate_replacement(graph_id, &mut rocrate)?;
-        let batch = self.engine.local_apply_changes(graph_id, changes)?;
-        self.reset_context_after_replacement(graph_id)?;
-        Ok(batch)
-    }
-
     /// A full crate replacement declares only the default RO-Crate context, so
     /// any custom context left over from a prior import is now stale. Revert it
     /// through the same store+publish path as an import (last write wins),
@@ -1256,7 +1244,8 @@ impl RoCrateManager {
                 let triples = self.subject_triples(graph_id, &candidate_id)?;
                 let is_profile_artifact = is_resource_descriptor
                     && predicate == has_artifact
-                    && triples_have_type(&triples, "File");
+                    && (triples_have_type(&triples, "File")
+                        || triples_have_type(&triples, "MediaObject"));
                 if triples.is_empty()
                     || (!triples_describe_contextual_entity(&triples) && !is_profile_artifact)
                 {
@@ -1850,6 +1839,16 @@ fn canonicalize_value(value: &serde_json::Value) -> Result<CanonicalJsonLd, RoCr
 
 fn jsonld_quads(value: &serde_json::Value) -> Result<Vec<Quad>, RoCrateError> {
     let mut prepared = value.clone();
+    if let Some(object) = prepared.as_object_mut()
+        && object
+            .get("@context")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        object.insert(
+            "@context".to_string(),
+            serde_json::Value::String(ROCRATE_CONTEXT_URL.to_string()),
+        );
+    }
     label_blank_nodes(&mut prepared, "", true);
     let jsonld = serde_json::to_vec(&prepared)?;
     let parser = JsonLdParser::new()
@@ -1961,7 +1960,7 @@ fn remap_subject(
 ) -> EncodedTerm {
     match subject {
         NamedOrBlankNode::NamedNode(node) => remap_node(node, import_root, graph_id),
-        NamedOrBlankNode::BlankNode(node) => EncodedTerm(format!("_:{node}")),
+        NamedOrBlankNode::BlankNode(node) => EncodedTerm(format!("_:{}", node.as_str())),
     }
 }
 
@@ -2143,7 +2142,10 @@ fn export_metadata_descriptor(
             }
             "conformsTo" => conforms_to = Some(id_from_encoded_term(&object)),
             "about" => about = Some(id_from_encoded_term(&object)),
-            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+            _ => {
+                let value = context_value(ctx, &key, &object);
+                insert_entity_value(&mut dynamic, key, value);
+            }
         }
     }
 
@@ -2182,7 +2184,10 @@ fn export_root_entity(
             "datePublished" => date_published = Some(literal_string(&object)?),
             "license" => license = Some(license_from_encoded_term(&object)),
             "hasPart" => {}
-            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+            _ => {
+                let value = context_value(ctx, &key, &object);
+                insert_entity_value(&mut dynamic, key, value);
+            }
         }
     }
 
@@ -2233,7 +2238,10 @@ fn export_graph_entity(
                     type_terms.push(value);
                 }
             }
-            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+            _ => {
+                let value = context_value(ctx, &key, &object);
+                insert_entity_value(&mut dynamic, key, value);
+            }
         }
     }
 
@@ -2386,6 +2394,24 @@ fn entity_value_from_encoded_term(term: &EncodedTerm) -> EntityValue {
     }
 }
 
+fn context_value(ctx: &ContextTermMap, key: &str, term: &EncodedTerm) -> EntityValue {
+    if ctx.identifier_terms.contains(key) {
+        return match term.to_term() {
+            Some(Term::NamedNode(node)) => EntityValue::EntityString(
+                node.as_str()
+                    .strip_prefix("./")
+                    .unwrap_or(node.as_str())
+                    .to_string(),
+            ),
+            Some(Term::BlankNode(node)) => {
+                EntityValue::EntityString(format!("_:{}", node.as_str()))
+            }
+            _ => entity_value_from_encoded_term(term),
+        };
+    }
+    entity_value_from_encoded_term(term)
+}
+
 fn literal_entity_value(term: &EncodedTerm, literal: &oxrdf::Literal) -> EntityValue {
     let value = literal.value().to_string();
     let annotation = literal_annotation(&term.0).unwrap_or(LiteralAnnotation::Simple);
@@ -2502,26 +2528,31 @@ fn splice_context_json(
 struct ContextTermMap {
     forward: HashMap<String, String>,
     reverse: HashMap<String, String>,
+    identifier_terms: HashSet<String>,
 }
 
 impl ContextTermMap {
     fn from_raw(raw: Option<&str>) -> Self {
         let mut forward = HashMap::new();
+        let mut identifier_terms = HashSet::new();
         if let Some(raw) = raw {
             match serde_json::from_str::<serde_json::Value>(raw) {
                 // Export path: the context was already validated and warned about
                 // at import time, so collect quietly (see `collect_context_terms`).
-                Ok(value) => collect_context_terms(&value, &mut forward, false),
+                Ok(value) => {
+                    collect_context_terms(&value, &mut forward, false);
+                    collect_identifier_terms(&value, &mut identifier_terms);
+                }
                 Err(error) => tracing::debug!(
                     %error,
                     "stored RO-Crate @context is not valid JSON; skipping term compaction"
                 ),
             }
         }
-        Self::from_forward(forward)
+        Self::from_forward(forward, identifier_terms)
     }
 
-    fn from_forward(forward: HashMap<String, String>) -> Self {
+    fn from_forward(forward: HashMap<String, String>, identifier_terms: HashSet<String>) -> Self {
         let mut reverse: HashMap<String, String> = HashMap::new();
         for (term, iri) in &forward {
             match reverse.get(iri) {
@@ -2533,7 +2564,11 @@ impl ContextTermMap {
                 }
             }
         }
-        Self { forward, reverse }
+        Self {
+            forward,
+            reverse,
+            identifier_terms,
+        }
     }
 
     /// Compact a predicate IRI back to a context term.
@@ -2554,6 +2589,29 @@ impl ContextTermMap {
             return iri.to_string();
         }
         builtin
+    }
+}
+
+fn collect_identifier_terms(context: &serde_json::Value, terms: &mut HashSet<String>) {
+    match context {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_identifier_terms(item, terms);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for (term, definition) in entries {
+                if definition
+                    .as_object()
+                    .and_then(|definition| definition.get("@type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("@id")
+                {
+                    terms.insert(term.clone());
+                }
+            }
+        }
+        _ => {}
     }
 }
 

@@ -73,7 +73,7 @@ fn build_fixture(config: BenchConfig) -> Fixture {
                 format!("Large Bench Crate {crate_idx}"),
                 "Multi-crate large RO-Crate benchmark",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 bench_policy(),
             ),
         )
