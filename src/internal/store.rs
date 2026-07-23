@@ -356,7 +356,7 @@ fn decode_dots(bytes: &[u8]) -> Result<Vec<Dot>> {
     }
 
     let mut dots = Vec::with_capacity((bytes.len() - 1) / 40);
-    for chunk in bytes[1..].chunks_exact(40) {
+    for chunk in bytes[1..].as_chunks::<40>().0 {
         dots.push(Dot {
             actor: ActorId::from_bytes(chunk[..32].try_into().unwrap()),
             counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
