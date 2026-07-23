@@ -20,6 +20,7 @@ use rocraters::ro_crate::root::RootDataEntity;
 
 const ROCRATE_1_1_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.1/context";
 const ROCRATE_1_2_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.2/context";
+const WORKFLOW_RUN_CONTEXT_URL: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const ROCRATE_1_1_SPEC_URL: &str = "https://w3id.org/ro/crate/1.1";
 const ROCRATE_1_2_SPEC_URL: &str = "https://w3id.org/ro/crate/1.2";
 const ROCRATE_CONTEXT_URL: &str = ROCRATE_1_2_CONTEXT_URL;
@@ -27,6 +28,7 @@ const ROCRATE_SPEC_URL: &str = ROCRATE_1_2_SPEC_URL;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const ROCRATE_1_1_CONTEXT: &[u8] = include_bytes!("../resources/ro_crate_1_1.jsonld");
 const ROCRATE_1_2_CONTEXT: &[u8] = include_bytes!("../resources/ro_crate_1_2.jsonld");
+const WORKFLOW_RUN_CONTEXT: &[u8] = include_bytes!("../resources/workflow_run.jsonld");
 const XSD_BOOLEAN_IRI: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const XSD_DOUBLE_IRI: &str = "http://www.w3.org/2001/XMLSchema#double";
 const XSD_INTEGER_IRI: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -1917,6 +1919,7 @@ fn load_context(
     let document = match url {
         ROCRATE_1_1_CONTEXT_URL => ROCRATE_1_1_CONTEXT,
         ROCRATE_1_2_CONTEXT_URL => ROCRATE_1_2_CONTEXT,
+        WORKFLOW_RUN_CONTEXT_URL => WORKFLOW_RUN_CONTEXT,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,

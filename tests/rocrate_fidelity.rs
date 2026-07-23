@@ -104,6 +104,18 @@ fn accepts_both_contexts() {
 }
 
 #[test]
+fn accepts_workflow_context() {
+    checked_document(&crate_document(
+        json!([
+            "https://w3id.org/ro/crate/1.2/context",
+            "https://w3id.org/ro/terms/workflow-run/context"
+        ]),
+        Some("https://w3id.org/ro/crate/1.2"),
+        None,
+    ));
+}
+
+#[test]
 fn accepts_keyword_aliases() {
     let document = json!({
         "@context": [
