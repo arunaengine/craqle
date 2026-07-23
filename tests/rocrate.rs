@@ -332,7 +332,10 @@ mod tests {
         let mgr = manager(net.peer(0));
 
         let jsonld = serde_json::json!({
-            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                { "measurement": "http://schema.org/measurement" }
+            ],
             "@graph": [
                 {
                     "@id": "ro-crate-metadata.json",
@@ -975,7 +978,7 @@ mod tests {
 
         assert!(matches!(
             mgr.import_jsonld(graph, &document.to_string()),
-            Err(RoCrateError::JsonLd(_))
+            Err(CraqleError::RoCrate(RoCrateError::JsonLd(_)))
         ));
     }
 

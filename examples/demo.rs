@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "Genomic Analysis of E. coli",
             "Whole-genome sequencing data and analysis pipeline",
             "2025-01-15",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: true,
                 permission_paths: vec!["/demo/public/experiment-1".to_string()],
