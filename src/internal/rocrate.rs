@@ -469,12 +469,13 @@ impl RoCrateManager {
     pub fn import_jsonld(&self, graph_id: GraphId, jsonld: &str) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         let batch = if self.graph_is_missing_or_empty(&graph_id)? {
             self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?
         } else {
             self.replace_jsonld_in_existing_graph(graph_id.clone(), value)?
         };
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -487,6 +488,7 @@ impl RoCrateManager {
     ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         let changes = self.plan_import_value_checked(&graph_id, value)?;
         let batch = self
             .engine
@@ -494,7 +496,7 @@ impl RoCrateManager {
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -510,6 +512,7 @@ impl RoCrateManager {
     ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         validate_jsonld_import(&value)?;
         let target = jsonld_triples(&graph_id, &value)?;
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
@@ -526,7 +529,7 @@ impl RoCrateManager {
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -548,8 +551,9 @@ impl RoCrateManager {
 
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         let batch = self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?;
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -857,6 +861,12 @@ impl RoCrateManager {
         pretty: bool,
     ) -> Result<String, RoCrateError> {
         let raw_context = self.engine.store().graph_context(graph_id)?;
+        let raw_license = match self.engine.store().graph_license(graph_id)? {
+            Some((raw, digest)) if digest == self.graph_digest(graph_id)? => {
+                Some(serde_json::from_str(&raw)?)
+            }
+            _ => None,
+        };
         let ctx = ContextTermMap::from_raw(raw_context.as_deref());
         let rocrate = self.build_partial_export_view(graph_id, page_entities, &ctx)?;
         let mut document = serde_json::to_value(&rocrate)?;
@@ -878,18 +888,22 @@ impl RoCrateManager {
             })
             .and_then(serde_json::Value::as_object_mut)
         {
-            match license_values.len() {
-                0 => {
-                    root.remove("license");
-                }
-                1 => {
-                    root.insert("license".to_string(), license_values[0].clone());
-                }
-                _ => {
-                    root.insert(
-                        "license".to_string(),
-                        serde_json::Value::Array(license_values),
-                    );
+            if let Some(raw_license) = raw_license {
+                root.insert("license".to_string(), raw_license);
+            } else {
+                match license_values.len() {
+                    0 => {
+                        root.remove("license");
+                    }
+                    1 => {
+                        root.insert("license".to_string(), license_values[0].clone());
+                    }
+                    _ => {
+                        root.insert(
+                            "license".to_string(),
+                            serde_json::Value::Array(license_values),
+                        );
+                    }
                 }
             }
         }
@@ -907,7 +921,7 @@ impl RoCrateManager {
     /// replacement path (checked and prevalidated create alike) must call this
     /// after a successful apply.
     fn reset_context_after_replacement(&self, graph_id: &GraphId) -> Result<(), RoCrateError> {
-        self.store_import_context(graph_id, None)
+        self.store_import_context(graph_id, None, None)
     }
 
     fn plan_import_value(
@@ -983,26 +997,31 @@ impl RoCrateManager {
         Ok(batch)
     }
 
-    /// Persist (and, when sync is configured, replicate) the raw `@context`
-    /// captured from an import. Last-write-wins: only updates when the context
-    /// actually changed, warning when it replaces an existing custom context.
+    /// Persist (and, when sync is configured, replicate) the raw context and
+    /// license render hints captured from an import. Last-write-wins: only
+    /// updates when a hint actually changed.
     ///
     /// Two-phase contract. Import is not a single atomic transaction: the quad
     /// changes are committed and published (phase 1, by the caller) *before* the
-    /// context register is updated here (phase 2). If phase 2 fails, the import
-    /// returns an error with the quads already applied and the stored context
+    /// render hints are updated here (phase 2). If phase 2 fails, the import
+    /// returns an error with the quads already applied and the stored hints
     /// unchanged. This is self-healing: re-importing the same document produces
     /// an empty quad diff (a no-op batch, so phase 1 does nothing), and because
-    /// the stored context still differs from the freshly captured one, the
-    /// `current == context` guard below does not trip — so the context
+    /// the stored hints still differ from the freshly captured ones, their
     /// store/publish is retried and the two phases converge.
     fn store_import_context(
         &self,
         graph_id: &GraphId,
         context: Option<String>,
+        license: Option<String>,
     ) -> Result<(), RoCrateError> {
         let current = self.engine.store().graph_context(graph_id)?;
-        if current == context {
+        let license_digest = license
+            .as_ref()
+            .map(|_| self.graph_digest(graph_id))
+            .transpose()?;
+        let current_license = self.engine.store().graph_license(graph_id)?;
+        if current == context && current_license == license.clone().zip(license_digest) {
             return Ok(());
         }
         if current.is_some() {
@@ -1011,7 +1030,8 @@ impl RoCrateManager {
                 "replacing stored RO-Crate @context for graph (last write wins)"
             );
         }
-        self.engine.set_graph_context(graph_id, context)?;
+        self.engine
+            .set_graph_context(graph_id, context, license, license_digest)?;
         Ok(())
     }
 
@@ -1048,6 +1068,18 @@ impl RoCrateManager {
             Ok(())
         })?;
         Ok(triples)
+    }
+
+    fn graph_digest(&self, graph_id: &GraphId) -> Result<[u8; 32], RoCrateError> {
+        let mut hasher = blake3::Hasher::new();
+        for (subject, predicate, object) in self.current_triples(graph_id)? {
+            for term in [subject, predicate, object] {
+                let bytes = term.0.as_bytes();
+                hasher.update(&(bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+        }
+        Ok(*hasher.finalize().as_bytes())
     }
 
     fn append_like_replace_changes(
@@ -1838,6 +1870,8 @@ fn canonicalize_value(value: &serde_json::Value) -> Result<CanonicalJsonLd, RoCr
 }
 
 fn jsonld_quads(value: &serde_json::Value) -> Result<Vec<Quad>, RoCrateError> {
+    // rocraters requires a root scalar license and string-only context maps, so
+    // caller JSON-LD uses oxjsonld; typed internal crates still use rocraters.
     let mut prepared = value.clone();
     if let Some(object) = prepared.as_object_mut()
         && object
@@ -2658,6 +2692,41 @@ fn extract_raw_context(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn extract_raw_license(value: &serde_json::Value) -> Option<String> {
+    let document = value.as_object()?;
+    let mut terms = HashMap::new();
+    if let Some(context) = document.get("@context") {
+        collect_context_terms(context, &mut terms, false);
+    }
+    let entries = document.iter().find_map(|(key, value)| {
+        (key == "@graph" || key == "graph" || terms.get(key).is_some_and(|iri| iri == "@graph"))
+            .then(|| value.as_array())
+            .flatten()
+    })?;
+    let root_id = entries.iter().find_map(|entry| {
+        let entity = entry.as_object()?;
+        (normalize_entity_id(submitted_id(entity, &terms)?) == METADATA_ID)
+            .then(|| {
+                entity.iter().find_map(|(key, value)| {
+                    (submitted_predicate(key, &terms).as_deref()
+                        == Some(vocab::schema_about().as_str()))
+                    .then(|| reference_id(value))
+                    .flatten()
+                })
+            })
+            .flatten()
+    })?;
+    let root = entries.iter().find_map(|entry| {
+        let entity = entry.as_object()?;
+        (normalize_entity_id(submitted_id(entity, &terms)?) == root_id).then_some(entity)
+    })?;
+    let license = root.iter().find_map(|(key, value)| {
+        (submitted_predicate(key, &terms).as_deref() == Some(vocab::schema_license().as_str()))
+            .then_some(value)
+    })?;
+    serde_json::to_string(license).ok()
+}
+
 /// Insert a term mapping, warning (import path only) when it remaps an
 /// already-collected term to a different IRI. Last definition wins.
 fn insert_context_term(map: &mut HashMap<String, String>, term: &str, iri: String, warn: bool) {
@@ -2911,6 +2980,8 @@ mod tests {
             store: &crate::store::GraphStore,
             graph: &GraphId,
             context: Option<String>,
+            license: Option<String>,
+            license_digest: Option<[u8; 32]>,
             tag: crate::core::ContextTag,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
             if self.fail_context.load(Ordering::SeqCst) {
@@ -2918,7 +2989,8 @@ mod tests {
                     "injected context publish failure".to_string(),
                 ));
             }
-            self.inner.publish_context(store, graph, context, tag)
+            self.inner
+                .publish_context(store, graph, context, license, license_digest, tag)
         }
 
         fn graph_topic_id(

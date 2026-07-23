@@ -1682,6 +1682,8 @@ impl CraqleNode {
             CraqleGraphEvent::ContextUpdated {
                 graph,
                 context,
+                license,
+                license_digest,
                 tag,
             } => {
                 // Deterministic last-write-wins: overwrite only when the incoming
@@ -1692,8 +1694,13 @@ impl CraqleNode {
                 if *tag <= self.store.graph_context_tag(graph)? {
                     return Ok(false);
                 }
-                self.store
-                    .set_graph_context(graph, context.as_deref(), *tag)?;
+                self.store.set_graph_context(
+                    graph,
+                    context.as_deref(),
+                    license.as_deref(),
+                    *license_digest,
+                    *tag,
+                )?;
                 Ok(true)
             }
         }

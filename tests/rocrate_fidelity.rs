@@ -48,7 +48,7 @@ fn checked_document(jsonld: &str) {
     .unwrap();
 }
 
-fn roundtrip_document(jsonld: &str) -> String {
+fn roundtrip_document(jsonld: &str) -> (String, Option<Value>) {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fidelity-roundtrip");
@@ -60,7 +60,15 @@ fn roundtrip_document(jsonld: &str) -> String {
     )
     .unwrap();
     let exported = node.export_rocrate(&writer_auth(), &graph).unwrap();
-    canonicalize_jsonld(&exported).unwrap().nquads
+    let exported_value: Value = serde_json::from_str(&exported).unwrap();
+    let license = exported_value["@graph"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entity| entity["@id"] == graph.as_str())
+        .and_then(|root| root.get("license"))
+        .cloned();
+    (canonicalize_jsonld(&exported).unwrap().nquads, license)
 }
 
 #[test]
@@ -96,7 +104,7 @@ fn accepts_both_contexts() {
 }
 
 #[test]
-fn license_shapes_project() {
+fn license_shapes_roundtrip() {
     let context = json!([
         "https://w3id.org/ro/crate/1.2/context",
         {
@@ -117,6 +125,10 @@ fn license_shapes_project() {
         (
             Some(json!({"@id": "cc:by"})),
             vec!["<http://schema.org/license> <https://creativecommons.org/licenses/by>"],
+        ),
+        (
+            Some(json!([{"@id": "https://example.org/licenses/single"}])),
+            vec!["<http://schema.org/license> <https://example.org/licenses/single>"],
         ),
         (
             Some(json!({
@@ -149,6 +161,7 @@ fn license_shapes_project() {
     ];
 
     for (license, expected) in fixtures {
+        let expected_shape = license.clone();
         let document = crate_document(
             context.clone(),
             Some("https://w3id.org/ro/crate/1.2"),
@@ -156,7 +169,8 @@ fn license_shapes_project() {
         );
         checked_document(&document);
         let CanonicalJsonLd { nquads, .. } = canonicalize_jsonld(&document).unwrap();
-        let projected = roundtrip_document(&document);
+        let (projected, exported_shape) = roundtrip_document(&document);
+        assert_eq!(exported_shape, expected_shape);
         if expected.is_empty() {
             assert!(!projected.contains("<http://schema.org/license>"));
         }

@@ -76,8 +76,8 @@ impl ReplicationEngine {
         &self.store
     }
 
-    /// Persist a graph's raw RO-Crate `@context` (last-write-wins) and, when sync
-    /// is configured, replicate the change to peers so their exports match.
+    /// Persist a graph's raw RO-Crate render hints (last-write-wins) and, when
+    /// sync is configured, replicate the change to peers so their exports match.
     ///
     /// A fresh ordering tag is minted here (`stored_counter + 1`, actor =
     /// this engine's actor) and used for both the local store and the published
@@ -86,24 +86,36 @@ impl ReplicationEngine {
     /// Publish-first invariant (load-bearing). The `ContextUpdated` event is
     /// published to peers *before* the local store is updated. This ordering
     /// makes the operation self-healing: if the publish fails, the local stored
-    /// context is left unchanged and a retry re-mints the same-or-higher tag and
+    /// hints are left unchanged and a retry re-mints the same-or-higher tag and
     /// re-publishes. Reversing the order (store locally, then publish) would, on
-    /// a publish failure, leave the local context updated so that a retry trips
-    /// the `current == context` short-circuit in `store_import_context` and
-    /// never re-publishes — leaving peers permanently without the update.
-    ///
-    /// `context` is `None` when the graph reverts to the bare default context.
+    /// a publish failure, leave the local hints updated so that a retry trips
+    /// the unchanged-state short-circuit in `store_import_context` and never
+    /// re-publishes — leaving peers permanently without the update.
     pub fn set_graph_context(
         &self,
         graph: &GraphId,
         context: Option<String>,
+        license: Option<String>,
+        license_digest: Option<[u8; 32]>,
     ) -> Result<(), UpdateError> {
         let tag = ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor);
         if let Some(sync) = &self.sync {
-            sync.publish_context(&self.store, graph, context.clone(), tag)?;
+            sync.publish_context(
+                &self.store,
+                graph,
+                context.clone(),
+                license.clone(),
+                license_digest,
+                tag,
+            )?;
         }
-        self.store
-            .set_graph_context(graph, context.as_deref(), tag)?;
+        self.store.set_graph_context(
+            graph,
+            context.as_deref(),
+            license.as_deref(),
+            license_digest,
+            tag,
+        )?;
         Ok(())
     }
 
