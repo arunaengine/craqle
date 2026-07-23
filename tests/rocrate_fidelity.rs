@@ -104,6 +104,37 @@ fn accepts_both_contexts() {
 }
 
 #[test]
+fn accepts_keyword_aliases() {
+    let document = json!({
+        "@context": [
+            "https://w3id.org/ro/crate/1.2/context",
+            {
+                "graphItems": "@graph",
+                "idAlias": "@id",
+                "typeAlias": "@type"
+            }
+        ],
+        "graphItems": [
+            {
+                "idAlias": "ro-crate-metadata.json",
+                "typeAlias": "CreativeWork",
+                "about": {"idAlias": "./"},
+                "conformsTo": {"idAlias": "https://w3id.org/ro/crate/1.2"}
+            },
+            {
+                "idAlias": "./",
+                "typeAlias": "Dataset",
+                "name": "Aliased crate",
+                "description": "Keyword aliases remain singular",
+                "datePublished": "2026-07-23"
+            }
+        ]
+    });
+
+    checked_document(&document.to_string());
+}
+
+#[test]
 fn license_shapes_roundtrip() {
     let context = json!([
         "https://w3id.org/ro/crate/1.2/context",
