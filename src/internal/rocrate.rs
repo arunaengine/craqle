@@ -1511,7 +1511,7 @@ impl SubmittedPointers {
             entity.iter().find_map(|(key, value)| {
                 (submitted_predicate(key, &terms).as_deref()
                     == Some(vocab::schema_about().as_str()))
-                .then(|| reference_id(value))
+                .then(|| reference_id(value, &terms))
                 .flatten()
             })
         });
@@ -1577,15 +1577,13 @@ fn submitted_id<'a>(
     })
 }
 
-fn reference_id(value: &serde_json::Value) -> Option<String> {
+fn reference_id(value: &serde_json::Value, terms: &HashMap<String, String>) -> Option<String> {
     match value {
         serde_json::Value::String(id) => Some(normalize_entity_id(id)),
-        serde_json::Value::Array(values) => values.iter().find_map(reference_id),
-        serde_json::Value::Object(object) => object
-            .get("@id")
-            .or_else(|| object.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map(normalize_entity_id),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| reference_id(value, terms))
+        }
+        serde_json::Value::Object(object) => submitted_id(object, terms).map(normalize_entity_id),
         _ => None,
     }
 }
@@ -1832,10 +1830,16 @@ fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError>
         RoCrateError::UnsupportedJsonLd("top-level JSON-LD document must be an object".to_string())
     })?;
 
+    let context = object
+        .get("@context")
+        .filter(|context| !context.is_null())
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(
+                "RO-Crate import requires a non-null top-level `@context`".to_string(),
+            )
+        })?;
     let mut terms = HashMap::new();
-    if let Some(context) = object.get("@context") {
-        collect_context_terms(context, &mut terms, false);
-    }
+    collect_context_terms(context, &mut terms, false);
     let graph = object
         .iter()
         .find_map(|(key, value)| {
@@ -2741,7 +2745,7 @@ fn extract_raw_license(value: &serde_json::Value) -> Option<String> {
                 entity.iter().find_map(|(key, value)| {
                     (submitted_predicate(key, &terms).as_deref()
                         == Some(vocab::schema_about().as_str()))
-                    .then(|| reference_id(value))
+                    .then(|| reference_id(value, &terms))
                     .flatten()
                 })
             })
