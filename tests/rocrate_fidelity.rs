@@ -2,7 +2,7 @@ mod support;
 
 use craqle::{
     CanonicalJsonLd, CraqleError, CraqleNode, CreateCrateRequest, GraphId, RoCrateError,
-    UpdateError, canonicalize_jsonld,
+    UpdateError, canonicalize_jsonld, validate_rocrate_jsonld,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -117,6 +117,10 @@ fn accepts_workflow_context() {
 
 #[test]
 fn accepts_keyword_aliases() {
+    let license = json!([
+        {"idAlias": "https://spdx.org/licenses/Apache-2.0"},
+        {"@value": "frei", "@language": "de"}
+    ]);
     let document = json!({
         "@context": [
             "https://w3id.org/ro/crate/1.2/context",
@@ -138,12 +142,47 @@ fn accepts_keyword_aliases() {
                 "typeAlias": "Dataset",
                 "name": "Aliased crate",
                 "description": "Keyword aliases remain singular",
-                "datePublished": "2026-07-23"
+                "datePublished": "2026-07-23",
+                "license": license
             }
         ]
     });
 
-    checked_document(&document.to_string());
+    let (_, exported_license) = roundtrip_document(&document.to_string());
+    assert_eq!(exported_license, Some(license));
+}
+
+#[test]
+fn rejects_missing_context() {
+    let document: Value = serde_json::from_str(&crate_document(
+        json!("https://w3id.org/ro/crate/1.2/context"),
+        Some("https://w3id.org/ro/crate/1.2"),
+        None,
+    ))
+    .unwrap();
+    let mut missing = document.clone();
+    missing.as_object_mut().unwrap().remove("@context");
+    let mut null = document;
+    null["@context"] = Value::Null;
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+
+    for invalid in [missing, null] {
+        assert!(matches!(
+            validate_rocrate_jsonld(&invalid.to_string()),
+            Err(RoCrateError::UnsupportedJsonLd(message)) if message.contains("@context")
+        ));
+        assert!(matches!(
+            node.validate_rocrate_document_checked_with_policy(
+                &writer_auth(),
+                GraphId::new("urn:test:context"),
+                &invalid.to_string(),
+                public_policy(),
+            ),
+            Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(message)))
+                if message.contains("@context")
+        ));
+    }
 }
 
 #[test]
