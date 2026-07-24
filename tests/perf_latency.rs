@@ -67,7 +67,7 @@ mod tests {
                         format!("Large Latency Crate {crate_idx}"),
                         "Release latency profile for very large RO-Crates",
                         "2025-01-01",
-                        "https://creativecommons.org/licenses/by/4.0/",
+                        Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                         public_policy(),
                     ),
                 )

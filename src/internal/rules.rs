@@ -93,7 +93,6 @@ pub struct DeltaSummary {
     touches_root_name: bool,
     touches_root_description: bool,
     touches_root_date_published: bool,
-    touches_root_license: bool,
     touches_reachability: bool,
 }
 
@@ -127,19 +126,15 @@ struct ReachabilityCaches {
 }
 
 impl DeltaSummary {
-    fn touches_required_root_properties(&self) -> bool {
-        self.touches_root_name
-            || self.touches_root_description
-            || self.touches_root_date_published
-            || self.touches_root_license
+    fn touches_root_properties(&self) -> bool {
+        self.touches_root_name || self.touches_root_description || self.touches_root_date_published
     }
 
-    fn touched_required_root_properties(&self) -> [bool; 4] {
+    fn touched_root_properties(&self) -> [bool; 3] {
         [
             self.touches_root_name,
             self.touches_root_description,
             self.touches_root_date_published,
-            self.touches_root_license,
         ]
     }
 }
@@ -287,7 +282,7 @@ impl Rule for RootEntityRule {
             if triple_exists_after(store, graph, &root, &rdf_type, &dataset, delta)? {
                 CandidateCheck::Pass
             } else {
-                CandidateCheck::Violation(CrateViolation::MissingRootDataEntity)
+                CandidateCheck::Violation(CrateViolation::missing_root(""))
             },
         )
     }
@@ -298,7 +293,7 @@ impl Rule for RootEntityRule {
         let dataset = encoded_nn(&vocab::schema_dataset());
 
         if !has_triple(post, &root, &rdf_type, &dataset) {
-            return Err(CrateViolation::MissingRootDataEntity);
+            return Err(CrateViolation::missing_root(""));
         }
         Ok(())
     }
@@ -339,7 +334,7 @@ impl Rule for MetadataDescriptorRule {
         Ok(if has_type && has_about {
             CandidateCheck::Pass
         } else {
-            CandidateCheck::Violation(CrateViolation::MissingMetadataDescriptor)
+            CandidateCheck::Violation(CrateViolation::missing_descriptor(""))
         })
     }
 
@@ -354,7 +349,7 @@ impl Rule for MetadataDescriptorRule {
         let has_about = has_triple(post, &descriptor, &about, &root);
 
         if !has_type || !has_about {
-            return Err(CrateViolation::MissingMetadataDescriptor);
+            return Err(CrateViolation::missing_descriptor(""));
         }
         Ok(())
     }
@@ -370,7 +365,7 @@ impl Rule for RequiredRootPropertiesRule {
         delta: &[MaterializedQuadChange],
         summary: &DeltaSummary,
     ) -> crate::store::Result<CandidateCheck> {
-        if !delta.is_empty() && !summary.touches_required_root_properties() {
+        if !delta.is_empty() && !summary.touches_root_properties() {
             return Ok(CandidateCheck::Pass);
         }
 
@@ -379,24 +374,19 @@ impl Rule for RequiredRootPropertiesRule {
             (vocab::schema_name(), "schema:name"),
             (vocab::schema_description(), "schema:description"),
             (vocab::schema_date_published(), "schema:datePublished"),
-            (vocab::schema_license(), "schema:license"),
         ];
 
-        for ((nn, label), touched) in required
-            .iter()
-            .zip(summary.touched_required_root_properties())
-        {
+        for ((nn, label), touched) in required.iter().zip(summary.touched_root_properties()) {
             if !delta.is_empty() && !touched {
                 continue;
             }
             let pred = encoded_nn(nn);
             if count_sp_after(store, graph, &root, &pred, delta)? < 1 {
-                return Ok(CandidateCheck::Violation(
-                    CrateViolation::MissingRequiredProperty {
-                        entity: graph.as_str().to_string(),
-                        property: label.to_string(),
-                    },
-                ));
+                return Ok(CandidateCheck::Violation(CrateViolation::missing_property(
+                    graph.as_str(),
+                    label,
+                    "",
+                )));
             }
         }
 
@@ -414,18 +404,16 @@ impl Rule for RequiredRootPropertiesRule {
             (vocab::schema_name(), "schema:name"),
             (vocab::schema_description(), "schema:description"),
             (vocab::schema_date_published(), "schema:datePublished"),
-            (vocab::schema_license(), "schema:license"),
         ];
 
         for (nn, label) in required {
             let pred = encoded_nn(nn);
             if count_sp_after(store, graph, &root, &pred, delta)? < 1 {
-                return Ok(CandidateCheck::Violation(
-                    CrateViolation::MissingRequiredProperty {
-                        entity: graph.as_str().to_string(),
-                        property: label.to_string(),
-                    },
-                ));
+                return Ok(CandidateCheck::Violation(CrateViolation::missing_property(
+                    graph.as_str(),
+                    label,
+                    "",
+                )));
             }
         }
 
@@ -439,16 +427,16 @@ impl Rule for RequiredRootPropertiesRule {
             (vocab::schema_name(), "schema:name"),
             (vocab::schema_description(), "schema:description"),
             (vocab::schema_date_published(), "schema:datePublished"),
-            (vocab::schema_license(), "schema:license"),
         ];
 
         for (nn, label) in required {
             let pred = encoded_nn(nn);
             if count_sp(post, &root, &pred) < 1 {
-                return Err(CrateViolation::MissingRequiredProperty {
-                    entity: post.graph.as_str().to_string(),
-                    property: label.to_string(),
-                });
+                return Err(CrateViolation::missing_property(
+                    post.graph.as_str(),
+                    label,
+                    "",
+                ));
             }
         }
         Ok(())
@@ -484,7 +472,7 @@ impl Rule for DatePublishedCardinalityRule {
         Ok(if count == 1 {
             CandidateCheck::Pass
         } else {
-            CandidateCheck::Violation(CrateViolation::InvalidDatePublishedCardinality { count })
+            CandidateCheck::Violation(CrateViolation::invalid_date(count, ""))
         })
     }
 
@@ -494,7 +482,7 @@ impl Rule for DatePublishedCardinalityRule {
         let count = count_sp(post, &root, &date_pub);
 
         if count != 1 {
-            return Err(CrateViolation::InvalidDatePublishedCardinality { count });
+            return Err(CrateViolation::invalid_date(count, ""));
         }
         Ok(())
     }
@@ -532,11 +520,9 @@ impl Rule for EntityTypeRule {
                 continue;
             }
             if count_sp_after(store, graph, &subject, &rdf_type, delta)? == 0 {
-                return Ok(CandidateCheck::Violation(
-                    CrateViolation::EntityMissingType {
-                        entity_id: subject.0,
-                    },
-                ));
+                return Ok(CandidateCheck::Violation(CrateViolation::missing_type(
+                    subject.0, "",
+                )));
             }
         }
 
@@ -554,11 +540,9 @@ impl Rule for EntityTypeRule {
         }
 
         if let Some(subject) = first_subject_missing_type_after(store, graph, delta)? {
-            return Ok(CandidateCheck::Violation(
-                CrateViolation::EntityMissingType {
-                    entity_id: subject.0,
-                },
-            ));
+            return Ok(CandidateCheck::Violation(CrateViolation::missing_type(
+                subject.0, "",
+            )));
         }
 
         Ok(CandidateCheck::Pass)
@@ -576,7 +560,7 @@ impl Rule for EntityTypeRule {
                 .any(|(s, p, _)| s == *subject && p == &rdf_type);
             if !has_type {
                 let id = subject.0.clone();
-                return Err(CrateViolation::EntityMissingType { entity_id: id });
+                return Err(CrateViolation::missing_type(id, ""));
             }
         }
         Ok(())
@@ -602,9 +586,7 @@ impl Rule for ReachabilityRule {
 
         Ok(
             match first_orphan_after_localized(store, graph, delta, summary)? {
-                Some(entity) => CandidateCheck::Violation(CrateViolation::OrphanedDataEntity {
-                    entity_id: entity.0,
-                }),
+                Some(entity) => CandidateCheck::Violation(CrateViolation::orphaned(entity.0, "")),
                 None => CandidateCheck::Pass,
             },
         )
@@ -621,18 +603,14 @@ impl Rule for ReachabilityRule {
         }
 
         Ok(match first_orphan_after(store, graph, delta)? {
-            Some(entity) => CandidateCheck::Violation(CrateViolation::OrphanedDataEntity {
-                entity_id: entity.0,
-            }),
+            Some(entity) => CandidateCheck::Violation(CrateViolation::orphaned(entity.0, "")),
             None => CandidateCheck::Pass,
         })
     }
 
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation> {
         if let Some(entity) = orphaned_data_entities(post).into_iter().next() {
-            return Err(CrateViolation::OrphanedDataEntity {
-                entity_id: entity.0,
-            });
+            return Err(CrateViolation::orphaned(entity.0, ""));
         }
 
         Ok(())
@@ -802,7 +780,6 @@ fn summarize_delta(graph: &GraphId, delta: &[MaterializedQuadChange]) -> DeltaSu
     let root_name = encoded_nn(&vocab::schema_name());
     let root_description = encoded_nn(&vocab::schema_description());
     let root_date_published = encoded_nn(&vocab::schema_date_published());
-    let root_license = encoded_nn(&vocab::schema_license());
 
     let mut summary = DeltaSummary::default();
 
@@ -840,9 +817,6 @@ fn summarize_delta(graph: &GraphId, delta: &[MaterializedQuadChange]) -> DeltaSu
             }
             if predicate == &root_date_published {
                 summary.touches_root_date_published = true;
-            }
-            if predicate == &root_license {
-                summary.touches_root_license = true;
             }
             if predicate == &rdf_type && object == &dataset {
                 summary.touches_root_dataset = true;

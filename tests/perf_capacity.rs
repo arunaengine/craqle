@@ -245,7 +245,7 @@ mod tests {
                     format!("Capacity Graph {graph_idx}"),
                     "Summary and storage footprint capacity profile",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -336,7 +336,7 @@ mod tests {
                 format!("Capacity Graph {graph_idx}"),
                 "Summary and storage footprint capacity profile",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )

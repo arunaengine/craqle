@@ -98,9 +98,14 @@ struct StoredGraphMeta {
     /// the bare default RO-Crate context.
     #[serde(default)]
     rocrate_context: Option<String>,
-    /// Last-write-wins ordering tag for `rocrate_context`. Determines the
-    /// winner when concurrent context writes race across peers; see
-    /// [`ContextTag`].
+    /// Raw root `license` JSON submitted on import, retained so exports can
+    /// preserve its JSON-LD surface shape while the graph remains unchanged.
+    #[serde(default)]
+    rocrate_license: Option<String>,
+    #[serde(default)]
+    rocrate_license_digest: Option<[u8; 32]>,
+    /// Last-write-wins ordering tag for the stored RO-Crate render hints.
+    /// See [`ContextTag`].
     #[serde(default)]
     context_tag: ContextTag,
 }
@@ -351,7 +356,7 @@ fn decode_dots(bytes: &[u8]) -> Result<Vec<Dot>> {
     }
 
     let mut dots = Vec::with_capacity((bytes.len() - 1) / 40);
-    for chunk in bytes[1..].chunks_exact(40) {
+    for chunk in bytes[1..].as_chunks::<40>().0 {
         dots.push(Dot {
             actor: ActorId::from_bytes(chunk[..32].try_into().unwrap()),
             counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
@@ -1530,6 +1535,15 @@ impl GraphStore {
             .rocrate_context)
     }
 
+    /// Read the raw root `license` JSON and the graph digest it describes.
+    pub fn graph_license(&self, graph: &GraphId) -> Result<Option<(String, [u8; 32])>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(None);
+        };
+        let meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        Ok(meta.rocrate_license.zip(meta.rocrate_license_digest))
+    }
+
     /// Read the last-write-wins ordering tag for a graph's stored `@context`.
     /// Returns [`ContextTag::GENESIS`] when the graph has no explicit context.
     pub fn graph_context_tag(&self, graph: &GraphId) -> Result<ContextTag> {
@@ -1542,12 +1556,13 @@ impl GraphStore {
             .context_tag)
     }
 
-    /// Persist (or clear, with `None`) the raw RO-Crate `@context` JSON for a
-    /// graph, together with its last-write-wins ordering tag.
+    /// Persist the raw RO-Crate render hints and their ordering tag.
     pub fn set_graph_context(
         &self,
         graph: &GraphId,
         context: Option<&str>,
+        license: Option<&str>,
+        license_digest: Option<[u8; 32]>,
         tag: ContextTag,
     ) -> Result<()> {
         let mut batch = self.new_batch();
@@ -1555,6 +1570,8 @@ impl GraphStore {
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
         let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
         meta.rocrate_context = context.map(str::to_string);
+        meta.rocrate_license = license.map(str::to_string);
+        meta.rocrate_license_digest = license_digest;
         meta.context_tag = tag;
         batch.insert(
             &self.graphs,

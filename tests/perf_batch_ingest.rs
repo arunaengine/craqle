@@ -42,7 +42,7 @@ mod tests {
                         format!("Batch Profile {batch_size}"),
                         "Batched RO-Crate ingest workflow",
                         "2026-03-27",
-                        "https://creativecommons.org/licenses/by/4.0/",
+                        Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                         public_policy(),
                     ),
                 )

@@ -122,7 +122,7 @@ mod tests {
                 "Doomed",
                 "To be deleted",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -152,7 +152,7 @@ mod tests {
                 "Poisoned",
                 "Has a bad record",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -187,7 +187,7 @@ mod tests {
                 "Bound",
                 "Legit graph",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )
@@ -279,7 +279,7 @@ mod tests {
                 "Det",
                 "Deterministic materialization",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             )
         };

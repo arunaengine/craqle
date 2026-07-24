@@ -194,7 +194,7 @@ fn prevalidated_create_matches_checked_create() {
             "Scaffold Dataset",
             "Scaffold description",
             "2026-06-10",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             policy(),
         )
     };
