@@ -321,6 +321,38 @@ impl RoCrateManager {
         )
     }
 
+    pub fn patch_data_entity(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Batch, RoCrateError> {
+        let entity_id = normalize_entity_id(entity_id);
+        self.require_rocrate_initialized(graph_id)?;
+        let parent_id = root_id(graph_id);
+        if self.subject_triples(graph_id, parent_id)?.is_empty() {
+            return Err(RoCrateError::EntityNotFound(parent_id.to_string()));
+        }
+        let mut changes = self.patch_subject_changes(
+            graph_id,
+            &entity_id,
+            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
+            replaced_predicates,
+        )?;
+        if !self.has_part_link(graph_id, parent_id, &entity_id)? {
+            changes.push(insert_change(
+                graph_id,
+                parent_id,
+                &vocab::schema_has_part(),
+                encoded_identifier(&entity_id),
+            ));
+        }
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
     pub fn append_new_root_data_entities(
         &self,
         graph_id: &GraphId,
@@ -405,6 +437,26 @@ impl RoCrateManager {
         Ok(self
             .engine
             .local_apply_changes(graph_id, std::mem::take(&mut changes))?)
+    }
+
+    pub fn patch_contextual_entity(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Batch, RoCrateError> {
+        self.require_rocrate_initialized(graph_id)?;
+        let entity_id = normalize_entity_id(entity_id);
+        let changes = self.patch_subject_changes(
+            graph_id,
+            &entity_id,
+            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
+            replaced_predicates,
+        )?;
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
     /// Export a graph to RO-Crate JSON-LD.
@@ -723,6 +775,47 @@ impl RoCrateManager {
                 predicate: predicate.clone(),
                 object: object.clone(),
             });
+        }
+        for (predicate, object) in desired.difference(&current) {
+            changes.push(MaterializedQuadChange::Insert {
+                graph: graph_id.clone(),
+                subject: subject.clone(),
+                predicate: predicate.clone(),
+                object: object.clone(),
+            });
+        }
+        Ok(changes)
+    }
+
+    fn patch_subject_changes(
+        &self,
+        graph_id: &GraphId,
+        subject_id: &str,
+        desired_triples: Vec<(EncodedTerm, EncodedTerm)>,
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
+            .subject_triples(graph_id, subject_id)?
+            .into_iter()
+            .collect();
+        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = desired_triples.into_iter().collect();
+        let mut replaced: BTreeSet<EncodedTerm> = desired
+            .iter()
+            .map(|(predicate, _)| predicate.clone())
+            .collect();
+        replaced.extend(replaced_predicates.iter().map(EncodedTerm::from_named_node));
+
+        let mut changes = Vec::new();
+        for (predicate, object) in current.difference(&desired) {
+            if replaced.contains(predicate) {
+                changes.push(MaterializedQuadChange::Delete {
+                    graph: graph_id.clone(),
+                    subject: subject.clone(),
+                    predicate: predicate.clone(),
+                    object: object.clone(),
+                });
+            }
         }
         for (predicate, object) in desired.difference(&current) {
             changes.push(MaterializedQuadChange::Insert {
