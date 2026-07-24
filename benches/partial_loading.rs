@@ -39,7 +39,7 @@ fn build_fixture(entity_count: usize) -> Fixture {
                 "Criterion Partial Loading",
                 "Large crate partial loading benchmark",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 bench_policy(),
             ),
         )

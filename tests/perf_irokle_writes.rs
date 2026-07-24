@@ -124,7 +124,7 @@ mod tests {
                     "Small Write Probe",
                     "Small RO-Crate write latency probe",
                     "2026-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -250,7 +250,7 @@ mod tests {
                     "Aruna-like Net Write Probe",
                     "Network-backed Irokle write latency probe",
                     "2026-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -394,7 +394,7 @@ mod tests {
                     "Aruna Service Style Probe",
                     "Aruna-style Irokle service write latency probe",
                     "2026-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )

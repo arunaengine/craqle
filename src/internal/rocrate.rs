@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::io;
 use std::sync::Arc;
 
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::replication::ReplicationEngine;
-use oxrdf::{NamedNode, Term, Triple};
+use oxjsonld::{JsonLdParser, JsonLdRemoteDocument};
+use oxrdf::{NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use rocraters::ro_crate::constraints::{DataType, EntityValue, Id, License};
 use rocraters::ro_crate::context::RoCrateContext;
 use rocraters::ro_crate::contextual_entity::ContextualEntity;
@@ -16,12 +18,22 @@ use rocraters::ro_crate::rdf::{
 use rocraters::ro_crate::rocrate::RoCrate;
 use rocraters::ro_crate::root::RootDataEntity;
 
-const ROCRATE_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.2/context";
-const ROCRATE_SPEC_URL: &str = "https://w3id.org/ro/crate/1.2";
+const ROCRATE_1_1_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.1/context";
+const ROCRATE_1_2_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.2/context";
+const WORKFLOW_RUN_CONTEXT_URL: &str = "https://w3id.org/ro/terms/workflow-run/context";
+const ROCRATE_1_1_SPEC_URL: &str = "https://w3id.org/ro/crate/1.1";
+const ROCRATE_1_2_SPEC_URL: &str = "https://w3id.org/ro/crate/1.2";
+const ROCRATE_CONTEXT_URL: &str = ROCRATE_1_2_CONTEXT_URL;
+const ROCRATE_SPEC_URL: &str = ROCRATE_1_2_SPEC_URL;
+const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
+const ROCRATE_1_1_CONTEXT: &[u8] = include_bytes!("../resources/ro_crate_1_1.jsonld");
+const ROCRATE_1_2_CONTEXT: &[u8] = include_bytes!("../resources/ro_crate_1_2.jsonld");
+const WORKFLOW_RUN_CONTEXT: &[u8] = include_bytes!("../resources/workflow_run.jsonld");
 const XSD_BOOLEAN_IRI: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const XSD_DOUBLE_IRI: &str = "http://www.w3.org/2001/XMLSchema#double";
 const XSD_INTEGER_IRI: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_STRING_IRI: &str = "http://www.w3.org/2001/XMLSchema#string";
+const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 const PROF_HAS_ARTIFACT_IRI: &str = "http://www.w3.org/ns/dx/prof#hasArtifact";
 const PROF_RESOURCE_DESCRIPTOR_IRI: &str = "http://www.w3.org/ns/dx/prof#ResourceDescriptor";
 const METADATA_ID: &str = "ro-crate-metadata.json";
@@ -33,6 +45,10 @@ fn root_id(graph_id: &GraphId) -> &str {
 
 fn root_term(graph_id: &GraphId) -> EncodedTerm {
     EncodedTerm::from_named_node(&graph_id.0)
+}
+
+fn crate_conforms_to() -> NamedNode {
+    NamedNode::new_unchecked(DCTERMS_CONFORMS_TO_IRI)
 }
 
 enum AppendLikeCheckError {
@@ -56,6 +72,8 @@ pub enum RoCrateError {
     Store(#[from] crate::store::StoreError),
     #[error("rdf: {0}")]
     Rdf(#[from] RdfError),
+    #[error("json-ld: {0}")]
+    JsonLd(String),
     #[error("invalid graph: {0}")]
     InvalidGraph(String),
     #[error("entity not found: {0}")]
@@ -76,6 +94,28 @@ pub struct RoCratePage {
     pub returned_data_entities: usize,
     pub next_offset: Option<usize>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalJsonLd {
+    pub nquads: String,
+    pub digest: [u8; 32],
+}
+
+pub fn canonicalize_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError> {
+    let value: serde_json::Value = serde_json::from_str(jsonld)?;
+    canonicalize_value(&value)
+}
+
+pub fn validate_rocrate_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError> {
+    let value: serde_json::Value = serde_json::from_str(jsonld)?;
+    validate_jsonld_import(&value)?;
+    let graph_id = GraphId::new(JSONLD_BASE_IRI);
+    let target = jsonld_triples(&graph_id, &value)?;
+    let pointers = SubmittedPointers::new(&value, &graph_id);
+    validate_crate_version(&graph_id, &target, &pointers)?;
+    validate_complete_import_triples(&graph_id, &target, Some(&pointers))?;
+    canonicalize_value(&value)
 }
 
 /// Description of one new entity to append during batch ingest.
@@ -105,17 +145,17 @@ impl RoCrateManager {
         Self { engine }
     }
 
-    /// Create a new RO-Crate with all required base entities.
+    /// Create a new RO-Crate with its base entities.
     pub fn create_crate(
         &self,
         graph_id: GraphId,
         name: &str,
         description: &str,
         date_published: &str,
-        license: &str,
+        license: Option<&str>,
     ) -> Result<Batch, RoCrateError> {
+        let license_value = license.map(encoded_license_value).transpose()?;
         if self.graph_is_empty(&graph_id)? {
-            let license_value = encoded_license_value(license)?;
             let changes = create_crate_scaffold_changes_with_license(
                 &graph_id,
                 name,
@@ -126,15 +166,33 @@ impl RoCrateManager {
             return Ok(self.engine.local_apply_changes(&graph_id, changes)?);
         }
 
-        let license = license_from_str(license)?;
-        let rocrate = create_crate_rocrate_with_license(
-            &graph_id,
-            name,
-            description,
-            date_published,
-            license,
-        );
-        self.replace_graph_with_rocrate(&graph_id, rocrate)
+        let changes = match license {
+            Some(license) => {
+                let mut rocrate = create_crate_rocrate_with_license(
+                    &graph_id,
+                    name,
+                    description,
+                    date_published,
+                    license_from_str(license)?,
+                );
+                self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+            }
+            None => {
+                let target =
+                    triples_from_insert_changes(&create_crate_scaffold_changes_with_license(
+                        &graph_id,
+                        name,
+                        description,
+                        date_published,
+                        None,
+                    ));
+                validate_complete_import_triples(&graph_id, &target, None)?;
+                diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?
+            }
+        };
+        let batch = self.engine.local_apply_changes(&graph_id, changes)?;
+        self.reset_context_after_replacement(&graph_id)?;
+        Ok(batch)
     }
 
     /// Create-crate path for scaffold requests already validated at their
@@ -146,25 +204,40 @@ impl RoCrateManager {
         name: &str,
         description: &str,
         date_published: &str,
-        license: &str,
+        license: Option<&str>,
     ) -> Result<Batch, RoCrateError> {
         let is_replacement = !self.graph_is_empty(&graph_id)?;
         let changes = if is_replacement {
-            let mut rocrate = create_crate_rocrate_with_license(
-                &graph_id,
-                name,
-                description,
-                date_published,
-                license_from_str(license)?,
-            );
-            self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+            match license {
+                Some(license) => {
+                    let mut rocrate = create_crate_rocrate_with_license(
+                        &graph_id,
+                        name,
+                        description,
+                        date_published,
+                        license_from_str(license)?,
+                    );
+                    self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+                }
+                None => {
+                    let target =
+                        triples_from_insert_changes(&create_crate_scaffold_changes_with_license(
+                            &graph_id,
+                            name,
+                            description,
+                            date_published,
+                            None,
+                        ));
+                    diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?
+                }
+            }
         } else {
             create_crate_scaffold_changes_with_license(
                 &graph_id,
                 name,
                 description,
                 date_published,
-                encoded_license_value(license)?,
+                license.map(encoded_license_value).transpose()?,
             )
         };
         let batch = self
@@ -174,8 +247,7 @@ impl RoCrateManager {
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
         if is_replacement {
-            // Same stale-context revert as `replace_graph_with_rocrate`, so the
-            // checked and prevalidated create paths stay in lockstep.
+            // Keep checked and prevalidated replacement paths in lockstep.
             self.reset_context_after_replacement(&graph_id)?;
         }
         Ok(batch)
@@ -188,7 +260,7 @@ impl RoCrateManager {
         name: &str,
         description: &str,
         date_published: &str,
-        license: &str,
+        license: Option<&str>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let current = self.current_triples(graph_id)?;
         if current.is_empty() {
@@ -197,23 +269,34 @@ impl RoCrateManager {
                 name,
                 description,
                 date_published,
-                encoded_license_value(license)?,
+                license.map(encoded_license_value).transpose()?,
             );
             let target = triples_from_insert_changes(&changes);
-            validate_complete_import_triples(graph_id, &target)?;
+            validate_complete_import_triples(graph_id, &target, None)?;
             return Ok(changes);
         }
 
-        let mut rocrate = create_crate_rocrate_with_license(
-            graph_id,
-            name,
-            description,
-            date_published,
-            license_from_str(license)?,
-        );
-        normalize_rocrate(&mut rocrate);
-        let target = rocrate_triples(&rocrate)?;
-        validate_complete_import_triples(graph_id, &target)?;
+        let target = match license {
+            Some(license) => {
+                let mut rocrate = create_crate_rocrate_with_license(
+                    graph_id,
+                    name,
+                    description,
+                    date_published,
+                    license_from_str(license)?,
+                );
+                normalize_rocrate(&mut rocrate);
+                rocrate_triples(&rocrate)?
+            }
+            None => triples_from_insert_changes(&create_crate_scaffold_changes_with_license(
+                graph_id,
+                name,
+                description,
+                date_published,
+                None,
+            )),
+        };
+        validate_complete_import_triples(graph_id, &target, None)?;
         diff_triples(graph_id, &current, &target)
     }
 
@@ -236,6 +319,38 @@ impl RoCrateManager {
             name,
             additional_triples,
         )
+    }
+
+    pub fn patch_data_entity(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Batch, RoCrateError> {
+        let entity_id = normalize_entity_id(entity_id);
+        self.require_rocrate_initialized(graph_id)?;
+        let parent_id = root_id(graph_id);
+        if self.subject_triples(graph_id, parent_id)?.is_empty() {
+            return Err(RoCrateError::EntityNotFound(parent_id.to_string()));
+        }
+        let mut changes = self.patch_subject_changes(
+            graph_id,
+            &entity_id,
+            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
+            replaced_predicates,
+        )?;
+        if !self.has_part_link(graph_id, parent_id, &entity_id)? {
+            changes.push(insert_change(
+                graph_id,
+                parent_id,
+                &vocab::schema_has_part(),
+                encoded_identifier(&entity_id),
+            ));
+        }
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
     pub fn append_new_root_data_entities(
@@ -324,6 +439,26 @@ impl RoCrateManager {
             .local_apply_changes(graph_id, std::mem::take(&mut changes))?)
     }
 
+    pub fn patch_contextual_entity(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Batch, RoCrateError> {
+        self.require_rocrate_initialized(graph_id)?;
+        let entity_id = normalize_entity_id(entity_id);
+        let changes = self.patch_subject_changes(
+            graph_id,
+            &entity_id,
+            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
+            replaced_predicates,
+        )?;
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
     /// Export a graph to RO-Crate JSON-LD.
     pub fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
         let page = self.visible_root_linked_data_entities(graph_id)?;
@@ -399,12 +534,13 @@ impl RoCrateManager {
     pub fn import_jsonld(&self, graph_id: GraphId, jsonld: &str) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         let batch = if self.graph_is_missing_or_empty(&graph_id)? {
             self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?
         } else {
             self.replace_jsonld_in_existing_graph(graph_id.clone(), value)?
         };
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -417,6 +553,7 @@ impl RoCrateManager {
     ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         let changes = self.plan_import_value_checked(&graph_id, value)?;
         let batch = self
             .engine
@@ -424,16 +561,15 @@ impl RoCrateManager {
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
     /// Import path for documents already validated at their origin.
     ///
-    /// Skips semantic RO-Crate validation (`validate_jsonld_import` and
-    /// `validate_complete_import_triples`) but keeps replace/diff semantics,
-    /// CRDT authoring, and structural JSON-LD error handling. Only callers
-    /// replaying an event log of origin-validated documents may use this.
+    /// Skips complete RO-Crate semantic validation but keeps replace/diff
+    /// semantics, CRDT authoring, and structural JSON-LD error handling. Only
+    /// callers replaying origin-validated documents may use this.
     pub fn import_jsonld_prevalidated(
         &self,
         graph_id: GraphId,
@@ -441,6 +577,8 @@ impl RoCrateManager {
     ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
+        validate_jsonld_import(&value)?;
         let target = jsonld_triples(&graph_id, &value)?;
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
             insert_changes(&graph_id, target)
@@ -456,7 +594,7 @@ impl RoCrateManager {
         self.engine
             .store()
             .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -478,8 +616,9 @@ impl RoCrateManager {
 
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
         let batch = self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?;
-        self.store_import_context(&graph_id, context)?;
+        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -648,6 +787,47 @@ impl RoCrateManager {
         Ok(changes)
     }
 
+    fn patch_subject_changes(
+        &self,
+        graph_id: &GraphId,
+        subject_id: &str,
+        desired_triples: Vec<(EncodedTerm, EncodedTerm)>,
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
+            .subject_triples(graph_id, subject_id)?
+            .into_iter()
+            .collect();
+        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = desired_triples.into_iter().collect();
+        let mut replaced: BTreeSet<EncodedTerm> = desired
+            .iter()
+            .map(|(predicate, _)| predicate.clone())
+            .collect();
+        replaced.extend(replaced_predicates.iter().map(EncodedTerm::from_named_node));
+
+        let mut changes = Vec::new();
+        for (predicate, object) in current.difference(&desired) {
+            if replaced.contains(predicate) {
+                changes.push(MaterializedQuadChange::Delete {
+                    graph: graph_id.clone(),
+                    subject: subject.clone(),
+                    predicate: predicate.clone(),
+                    object: object.clone(),
+                });
+            }
+        }
+        for (predicate, object) in desired.difference(&current) {
+            changes.push(MaterializedQuadChange::Insert {
+                graph: graph_id.clone(),
+                subject: subject.clone(),
+                predicate: predicate.clone(),
+                object: object.clone(),
+            });
+        }
+        Ok(changes)
+    }
+
     fn subject_triples(
         &self,
         graph_id: &GraphId,
@@ -659,7 +839,7 @@ impl RoCrateManager {
         let Some(graph_tid) = store.lookup_term(&graph_term)? else {
             return Ok(Vec::new());
         };
-        let subject_term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let subject_term = encoded_subject(subject_id);
         if orphaned.contains(&subject_term) {
             return Ok(Vec::new());
         }
@@ -685,7 +865,7 @@ impl RoCrateManager {
         let Some(graph_tid) = store.lookup_term(&graph_term)? else {
             return Ok(Vec::new());
         };
-        let subject_term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let subject_term = encoded_subject(subject_id);
         if orphaned.contains(&subject_term) {
             return Ok(Vec::new());
         }
@@ -787,24 +967,57 @@ impl RoCrateManager {
         pretty: bool,
     ) -> Result<String, RoCrateError> {
         let raw_context = self.engine.store().graph_context(graph_id)?;
+        let raw_license = match self.engine.store().graph_license(graph_id)? {
+            Some((raw, digest)) if digest == self.graph_digest(graph_id)? => {
+                Some(serde_json::from_str(&raw)?)
+            }
+            _ => None,
+        };
         let ctx = ContextTermMap::from_raw(raw_context.as_deref());
         let rocrate = self.build_partial_export_view(graph_id, page_entities, &ctx)?;
-        match raw_context {
-            None if pretty => Ok(serde_json::to_string_pretty(&rocrate)?),
-            None => Ok(serde_json::to_string(&rocrate)?),
-            Some(raw) => splice_context_json(&rocrate, &raw, pretty),
+        let mut document = serde_json::to_value(&rocrate)?;
+        let license_values = self
+            .subject_triples(graph_id, root_id(graph_id))?
+            .into_iter()
+            .filter(|(predicate, _)| {
+                predicate == &EncodedTerm::from_named_node(&vocab::schema_license())
+            })
+            .map(|(_, object)| serde_json::to_value(entity_value_from_encoded_term(&object)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(root) = document
+            .get_mut("@graph")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|entries| {
+                entries.iter_mut().find(|entry| {
+                    entry.get("@id").and_then(serde_json::Value::as_str) == Some(root_id(graph_id))
+                })
+            })
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(raw_license) = raw_license {
+                root.insert("license".to_string(), raw_license);
+            } else {
+                match license_values.len() {
+                    0 => {
+                        root.remove("license");
+                    }
+                    1 => {
+                        root.insert("license".to_string(), license_values[0].clone());
+                    }
+                    _ => {
+                        root.insert(
+                            "license".to_string(),
+                            serde_json::Value::Array(license_values),
+                        );
+                    }
+                }
+            }
         }
-    }
-
-    fn replace_graph_with_rocrate(
-        &self,
-        graph_id: &GraphId,
-        mut rocrate: RoCrate,
-    ) -> Result<Batch, RoCrateError> {
-        let changes = self.plan_rocrate_replacement(graph_id, &mut rocrate)?;
-        let batch = self.engine.local_apply_changes(graph_id, changes)?;
-        self.reset_context_after_replacement(graph_id)?;
-        Ok(batch)
+        match raw_context {
+            None if pretty => Ok(serde_json::to_string_pretty(&document)?),
+            None => Ok(serde_json::to_string(&document)?),
+            Some(raw) => splice_context_json(document, &raw, pretty),
+        }
     }
 
     /// A full crate replacement declares only the default RO-Crate context, so
@@ -814,7 +1027,7 @@ impl RoCrateManager {
     /// replacement path (checked and prevalidated create alike) must call this
     /// after a successful apply.
     fn reset_context_after_replacement(&self, graph_id: &GraphId) -> Result<(), RoCrateError> {
-        self.store_import_context(graph_id, None)
+        self.store_import_context(graph_id, None, None)
     }
 
     fn plan_import_value(
@@ -843,7 +1056,9 @@ impl RoCrateManager {
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         validate_jsonld_import(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
-        validate_complete_import_triples(graph_id, &target)?;
+        let pointers = SubmittedPointers::new(&value, graph_id);
+        validate_crate_version(graph_id, &target, &pointers)?;
+        validate_complete_import_triples(graph_id, &target, Some(&pointers))?;
         if self.graph_is_missing_or_empty(graph_id)? {
             return Ok(insert_changes(graph_id, target));
         }
@@ -888,26 +1103,31 @@ impl RoCrateManager {
         Ok(batch)
     }
 
-    /// Persist (and, when sync is configured, replicate) the raw `@context`
-    /// captured from an import. Last-write-wins: only updates when the context
-    /// actually changed, warning when it replaces an existing custom context.
+    /// Persist (and, when sync is configured, replicate) the raw context and
+    /// license render hints captured from an import. Last-write-wins: only
+    /// updates when a hint actually changed.
     ///
     /// Two-phase contract. Import is not a single atomic transaction: the quad
     /// changes are committed and published (phase 1, by the caller) *before* the
-    /// context register is updated here (phase 2). If phase 2 fails, the import
-    /// returns an error with the quads already applied and the stored context
+    /// render hints are updated here (phase 2). If phase 2 fails, the import
+    /// returns an error with the quads already applied and the stored hints
     /// unchanged. This is self-healing: re-importing the same document produces
     /// an empty quad diff (a no-op batch, so phase 1 does nothing), and because
-    /// the stored context still differs from the freshly captured one, the
-    /// `current == context` guard below does not trip — so the context
+    /// the stored hints still differ from the freshly captured ones, their
     /// store/publish is retried and the two phases converge.
     fn store_import_context(
         &self,
         graph_id: &GraphId,
         context: Option<String>,
+        license: Option<String>,
     ) -> Result<(), RoCrateError> {
         let current = self.engine.store().graph_context(graph_id)?;
-        if current == context {
+        let license_digest = license
+            .as_ref()
+            .map(|_| self.graph_digest(graph_id))
+            .transpose()?;
+        let current_license = self.engine.store().graph_license(graph_id)?;
+        if current == context && current_license == license.clone().zip(license_digest) {
             return Ok(());
         }
         if current.is_some() {
@@ -916,7 +1136,8 @@ impl RoCrateManager {
                 "replacing stored RO-Crate @context for graph (last write wins)"
             );
         }
-        self.engine.set_graph_context(graph_id, context)?;
+        self.engine
+            .set_graph_context(graph_id, context, license, license_digest)?;
         Ok(())
     }
 
@@ -953,6 +1174,18 @@ impl RoCrateManager {
             Ok(())
         })?;
         Ok(triples)
+    }
+
+    fn graph_digest(&self, graph_id: &GraphId) -> Result<[u8; 32], RoCrateError> {
+        let mut hasher = blake3::Hasher::new();
+        for (subject, predicate, object) in self.current_triples(graph_id)? {
+            for term in [subject, predicate, object] {
+                let bytes = term.0.as_bytes();
+                hasher.update(&(bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+        }
+        Ok(*hasher.finalize().as_bytes())
     }
 
     fn append_like_replace_changes(
@@ -1136,7 +1369,7 @@ impl RoCrateManager {
                 triples_have_type(&references, PROF_RESOURCE_DESCRIPTOR_IRI);
 
             for (predicate, object) in references {
-                let Some(candidate_id) = encoded_named_node_value(&object) else {
+                let Some(candidate_id) = encoded_reference_value(&object) else {
                     continue;
                 };
                 if candidate_id == root_id(graph_id)
@@ -1149,7 +1382,8 @@ impl RoCrateManager {
                 let triples = self.subject_triples(graph_id, &candidate_id)?;
                 let is_profile_artifact = is_resource_descriptor
                     && predicate == has_artifact
-                    && triples_have_type(&triples, "File");
+                    && (triples_have_type(&triples, "File")
+                        || triples_have_type(&triples, "MediaObject"));
                 if triples.is_empty()
                     || (!triples_describe_contextual_entity(&triples) && !is_profile_artifact)
                 {
@@ -1185,10 +1419,10 @@ fn create_crate_scaffold_changes_with_license(
     name: &str,
     description: &str,
     date_published: &str,
-    license_value: EncodedTerm,
+    license_value: Option<EncodedTerm>,
 ) -> Vec<MaterializedQuadChange> {
     let root_id = root_id(graph_id);
-    vec![
+    let mut changes = vec![
         insert_change(
             graph_id,
             METADATA_ID,
@@ -1198,7 +1432,7 @@ fn create_crate_scaffold_changes_with_license(
         insert_change(
             graph_id,
             METADATA_ID,
-            &vocab::schema_conforms_to(),
+            &crate_conforms_to(),
             encoded_identifier(ROCRATE_SPEC_URL),
         ),
         insert_change(
@@ -1231,8 +1465,16 @@ fn create_crate_scaffold_changes_with_license(
             &vocab::schema_date_published(),
             encoded_literal(date_published),
         ),
-        insert_change(graph_id, root_id, &vocab::schema_license(), license_value),
-    ]
+    ];
+    if let Some(license_value) = license_value {
+        changes.push(insert_change(
+            graph_id,
+            root_id,
+            &vocab::schema_license(),
+            license_value,
+        ));
+    }
+    changes
 }
 
 fn create_crate_rocrate_with_license(
@@ -1328,9 +1570,211 @@ fn insert_changes(graph_id: &GraphId, triples: BTreeSet<TripleKey>) -> Vec<Mater
         .collect()
 }
 
+#[derive(Default)]
+struct SubmittedPointers {
+    graph: String,
+    entities: HashMap<String, String>,
+    properties: HashMap<(String, String), String>,
+}
+
+impl SubmittedPointers {
+    fn new(value: &serde_json::Value, graph_id: &GraphId) -> Self {
+        let Some(document) = value.as_object() else {
+            return Self::default();
+        };
+        let mut terms = HashMap::new();
+        if let Some(context) = document.get("@context") {
+            collect_context_terms(context, &mut terms, false);
+        }
+        let Some((graph_key, entries)) = document.iter().find_map(|(key, value)| {
+            (key == "@graph" || key == "graph" || terms.get(key).is_some_and(|iri| iri == "@graph"))
+                .then(|| value.as_array().map(|entries| (key, entries)))
+                .flatten()
+        }) else {
+            return Self::default();
+        };
+
+        let graph = format!("/{}", escape_pointer(graph_key));
+        let import_root = entries.iter().find_map(|entry| {
+            let entity = entry.as_object()?;
+            let id = submitted_id(entity, &terms)?;
+            if normalize_entity_id(id) != METADATA_ID {
+                return None;
+            }
+            entity.iter().find_map(|(key, value)| {
+                (submitted_predicate(key, &terms).as_deref()
+                    == Some(vocab::schema_about().as_str()))
+                .then(|| reference_id(value, &terms))
+                .flatten()
+            })
+        });
+
+        let mut pointers = Self {
+            graph,
+            ..Self::default()
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(entity) = entry.as_object() else {
+                continue;
+            };
+            let Some(id) = submitted_id(entity, &terms) else {
+                continue;
+            };
+            let normalized = normalize_entity_id(id);
+            let entity_term = if import_root.as_deref() == Some(normalized.as_str()) {
+                root_term(graph_id)
+            } else {
+                encoded_identifier(&normalized)
+            };
+            let entity_pointer = format!("{}/{index}", pointers.graph);
+            pointers
+                .entities
+                .insert(entity_term.0.clone(), entity_pointer.clone());
+
+            for key in entity.keys() {
+                let Some(predicate) = submitted_predicate(key, &terms) else {
+                    continue;
+                };
+                pointers.properties.insert(
+                    (entity_term.0.clone(), predicate),
+                    format!("{entity_pointer}/{}", escape_pointer(key)),
+                );
+            }
+        }
+        pointers
+    }
+
+    fn entity(&self, entity: &EncodedTerm) -> String {
+        self.entities
+            .get(&entity.0)
+            .cloned()
+            .unwrap_or_else(|| self.graph.clone())
+    }
+
+    fn property(&self, entity: &EncodedTerm, predicate: &EncodedTerm) -> String {
+        self.properties
+            .get(&(entity.0.clone(), predicate_iri(predicate)))
+            .cloned()
+            .unwrap_or_else(|| self.entity(entity))
+    }
+}
+
+fn submitted_id<'a>(
+    entity: &'a serde_json::Map<String, serde_json::Value>,
+    terms: &HashMap<String, String>,
+) -> Option<&'a str> {
+    entity.iter().find_map(|(key, value)| {
+        (key == "@id" || key == "id" || terms.get(key).is_some_and(|iri| iri == "@id"))
+            .then(|| value.as_str())
+            .flatten()
+    })
+}
+
+fn reference_id(value: &serde_json::Value, terms: &HashMap<String, String>) -> Option<String> {
+    match value {
+        serde_json::Value::String(id) => Some(normalize_entity_id(id)),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| reference_id(value, terms))
+        }
+        serde_json::Value::Object(object) => submitted_id(object, terms).map(normalize_entity_id),
+        _ => None,
+    }
+}
+
+fn submitted_predicate(key: &str, terms: &HashMap<String, String>) -> Option<String> {
+    if key == "@type" || key == "type" || terms.get(key).is_some_and(|iri| iri == "@type") {
+        return Some(vocab::rdf_type().as_str().to_string());
+    }
+    if key.starts_with('@') || terms.get(key).is_some_and(|iri| iri.starts_with('@')) {
+        return None;
+    }
+    let term = terms.get(key).map_or(key, String::as_str);
+    if term == "conformsTo" {
+        return Some(DCTERMS_CONFORMS_TO_IRI.to_string());
+    }
+    property_named_node(&normalize_property(term))
+        .ok()
+        .map(|predicate| predicate.as_str().to_string())
+}
+
+fn predicate_iri(predicate: &EncodedTerm) -> String {
+    predicate
+        .to_named_node()
+        .map(|predicate| predicate.as_str().to_string())
+        .unwrap_or_default()
+}
+
+fn violation_pointer(
+    pointers: Option<&SubmittedPointers>,
+    entity: &EncodedTerm,
+    predicate: &EncodedTerm,
+) -> String {
+    pointers.map_or_else(String::new, |pointers| pointers.property(entity, predicate))
+}
+
+fn validate_crate_version(
+    graph_id: &GraphId,
+    triples: &BTreeSet<TripleKey>,
+    pointers: &SubmittedPointers,
+) -> Result<(), RoCrateError> {
+    let metadata = EncodedTerm::from_named_node(&vocab::metadata_descriptor());
+    let root = root_term(graph_id);
+    let conforms_to = EncodedTerm::from_named_node(&crate_conforms_to());
+    let candidates = triples
+        .iter()
+        .filter(|(subject, predicate, _)| {
+            (subject == &metadata || subject == &root) && predicate == &conforms_to
+        })
+        .collect::<Vec<_>>();
+    if candidates.iter().any(|(_, _, object)| {
+        object.to_named_node().is_some_and(|version| {
+            matches!(
+                version.as_str(),
+                ROCRATE_1_1_SPEC_URL | ROCRATE_1_2_SPEC_URL
+            )
+        })
+    }) {
+        return Ok(());
+    }
+
+    let (version, entity, pointer) = candidates.first().map_or_else(
+        || {
+            let entity = if pointers.entities.contains_key(&metadata.0) {
+                metadata.clone()
+            } else {
+                root.clone()
+            };
+            (None, entity.clone(), pointers.entity(&entity))
+        },
+        |(subject, _, object)| {
+            (
+                object
+                    .to_named_node()
+                    .map(|version| version.as_str().to_string())
+                    .or_else(|| Some(object.0.clone())),
+                (*subject).clone(),
+                pointers.property(subject, &conforms_to),
+            )
+        },
+    );
+    let entity_id = entity
+        .to_named_node()
+        .map(|entity| entity.as_str().to_string());
+    Err(RoCrateError::Update(
+        crate::replication::UpdateError::ValidationFailed(vec![
+            crate::core::CrateViolation::unsupported_version(
+                version.as_deref(),
+                pointer,
+                entity_id,
+            ),
+        ]),
+    ))
+}
+
 fn validate_complete_import_triples(
     graph_id: &GraphId,
     triples: &BTreeSet<TripleKey>,
+    pointers: Option<&SubmittedPointers>,
 ) -> Result<(), RoCrateError> {
     let root = root_term(graph_id);
     let metadata = EncodedTerm::from_named_node(&vocab::metadata_descriptor());
@@ -1343,7 +1787,6 @@ fn validate_complete_import_triples(
     let root_name = EncodedTerm::from_named_node(&vocab::schema_name());
     let root_description = EncodedTerm::from_named_node(&vocab::schema_description());
     let root_date_published = EncodedTerm::from_named_node(&vocab::schema_date_published());
-    let root_license = EncodedTerm::from_named_node(&vocab::schema_license());
 
     let mut subjects = BTreeSet::new();
     let mut typed_subjects = HashSet::new();
@@ -1354,7 +1797,6 @@ fn validate_complete_import_triples(
     let mut root_name_count = 0usize;
     let mut root_description_count = 0usize;
     let mut root_date_published_count = 0usize;
-    let mut root_license_count = 0usize;
 
     for (subject, predicate, object) in triples {
         subjects.insert(subject.clone());
@@ -1368,10 +1810,6 @@ fn validate_complete_import_triples(
         if subject == &root && predicate == &root_date_published {
             root_date_published_count += 1;
         }
-        if subject == &root && predicate == &root_license {
-            root_license_count += 1;
-        }
-
         if predicate == &rdf_type {
             typed_subjects.insert(subject.clone());
             if subject == &root && object == &dataset {
@@ -1403,50 +1841,51 @@ fn validate_complete_import_triples(
     let metadata_about_root = triples.contains(&(metadata.clone(), about.clone(), root.clone()));
 
     if !has_root_dataset {
-        violations.push(crate::core::CrateViolation::MissingRootDataEntity);
+        violations.push(crate::core::CrateViolation::missing_root(
+            pointers.map_or("/@graph", |pointers| pointers.graph.as_str()),
+        ));
     }
     if !(has_metadata_type && metadata_about_root) {
-        violations.push(crate::core::CrateViolation::MissingMetadataDescriptor);
+        violations.push(crate::core::CrateViolation::missing_descriptor(
+            pointers.map_or("/@graph", |pointers| pointers.graph.as_str()),
+        ));
     }
     if root_name_count < 1 {
-        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
-            entity: root_id(graph_id).to_string(),
-            property: "schema:name".to_string(),
-        });
+        violations.push(crate::core::CrateViolation::missing_property(
+            root_id(graph_id),
+            "schema:name",
+            violation_pointer(pointers, &root, &root_name),
+        ));
     }
     if root_description_count < 1 {
-        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
-            entity: root_id(graph_id).to_string(),
-            property: "schema:description".to_string(),
-        });
+        violations.push(crate::core::CrateViolation::missing_property(
+            root_id(graph_id),
+            "schema:description",
+            violation_pointer(pointers, &root, &root_description),
+        ));
     }
     if root_date_published_count < 1 {
-        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
-            entity: root_id(graph_id).to_string(),
-            property: "schema:datePublished".to_string(),
-        });
-    }
-    if root_license_count < 1 {
-        violations.push(crate::core::CrateViolation::MissingRequiredProperty {
-            entity: root_id(graph_id).to_string(),
-            property: "schema:license".to_string(),
-        });
+        violations.push(crate::core::CrateViolation::missing_property(
+            root_id(graph_id),
+            "schema:datePublished",
+            violation_pointer(pointers, &root, &root_date_published),
+        ));
     }
     if root_date_published_count != 1 {
-        violations.push(
-            crate::core::CrateViolation::InvalidDatePublishedCardinality {
-                count: root_date_published_count,
-            },
-        );
+        violations.push(crate::core::CrateViolation::invalid_date(
+            root_date_published_count,
+            violation_pointer(pointers, &root, &root_date_published),
+        ));
     }
 
     if let Some(subject) = subjects
         .iter()
         .find(|subject| !typed_subjects.contains(*subject))
     {
-        violations.push(crate::core::CrateViolation::EntityMissingType {
-            entity_id: subject.0.clone(),
-        });
+        violations.push(crate::core::CrateViolation::missing_type(
+            subject.0.clone(),
+            violation_pointer(pointers, subject, &rdf_type),
+        ));
     }
 
     let mut reachable = HashSet::new();
@@ -1466,9 +1905,8 @@ fn validate_complete_import_triples(
         .into_iter()
         .find(|entity| !reachable.contains(entity))
     {
-        violations.push(crate::core::CrateViolation::OrphanedDataEntity {
-            entity_id: orphan.0,
-        });
+        let pointer = violation_pointer(pointers, &orphan, &has_part);
+        violations.push(crate::core::CrateViolation::orphaned(orphan.0, pointer));
     }
 
     if violations.is_empty() {
@@ -1485,9 +1923,22 @@ fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError>
         RoCrateError::UnsupportedJsonLd("top-level JSON-LD document must be an object".to_string())
     })?;
 
+    let context = object
+        .get("@context")
+        .filter(|context| !context.is_null())
+        .ok_or_else(|| {
+            RoCrateError::UnsupportedJsonLd(
+                "RO-Crate import requires a non-null top-level `@context`".to_string(),
+            )
+        })?;
+    let mut terms = HashMap::new();
+    collect_context_terms(context, &mut terms, false);
     let graph = object
-        .get("@graph")
-        .or_else(|| object.get("graph"))
+        .iter()
+        .find_map(|(key, value)| {
+            (key == "@graph" || key == "graph" || terms.get(key).is_some_and(|iri| iri == "@graph"))
+                .then_some(value)
+        })
         .ok_or_else(|| {
             RoCrateError::UnsupportedJsonLd(
                 "RO-Crate import requires a top-level `@graph` array".to_string(),
@@ -1502,365 +1953,202 @@ fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError>
         let entity = entry.as_object().ok_or_else(|| {
             RoCrateError::UnsupportedJsonLd(format!("@graph entry {index} must be an object"))
         })?;
-
-        for (property, property_value) in entity {
-            if matches!(
-                property.as_str(),
-                "@id" | "id" | "@type" | "type" | "@context"
-            ) {
-                continue;
-            }
-            validate_property_value(property, property_value)?;
+        if submitted_id(entity, &terms).is_none() {
+            return Err(RoCrateError::UnsupportedJsonLd(format!(
+                "@graph entry {index} must define string `@id`"
+            )));
         }
     }
 
     Ok(())
 }
 
-fn validate_property_value(property: &str, value: &serde_json::Value) -> Result<(), RoCrateError> {
-    match value {
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => Ok(()),
-        serde_json::Value::Array(values) => {
-            for entry in values {
-                validate_property_value(property, entry)?;
-            }
-            Ok(())
-        }
-        serde_json::Value::Object(object) if is_reference_object(object) => Ok(()),
-        serde_json::Value::Object(object) if is_value_object(object) => {
-            validate_value_object(property, object)
-        }
-        serde_json::Value::Object(_) => Err(RoCrateError::UnsupportedJsonLd(format!(
-            "property `{property}` contains an inline nested object; nested entities must be top-level `@graph` entries referenced by `@id`"
-        ))),
+fn canonicalize_value(value: &serde_json::Value) -> Result<CanonicalJsonLd, RoCrateError> {
+    let mut lines = BTreeSet::new();
+    for quad in jsonld_quads(value)? {
+        lines.insert(format!("{quad} ."));
     }
+    let nquads = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.into_iter().collect::<Vec<_>>().join("\n"))
+    };
+    Ok(CanonicalJsonLd {
+        digest: *blake3::hash(nquads.as_bytes()).as_bytes(),
+        nquads,
+    })
 }
 
-fn is_reference_object(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    let has_identifier = object.contains_key("@id") || object.contains_key("id");
-    has_identifier
+fn jsonld_quads(value: &serde_json::Value) -> Result<Vec<Quad>, RoCrateError> {
+    // rocraters requires a root scalar license and string-only context maps, so
+    // caller JSON-LD uses oxjsonld; typed internal crates still use rocraters.
+    let mut prepared = value.clone();
+    if let Some(object) = prepared.as_object_mut()
         && object
-            .keys()
-            .all(|key| matches!(key.as_str(), "@id" | "id" | "@type" | "type"))
+            .get("@context")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        object.insert(
+            "@context".to_string(),
+            serde_json::Value::String(ROCRATE_CONTEXT_URL.to_string()),
+        );
+    }
+    let mut terms = HashMap::new();
+    if let Some(context) = prepared.get("@context") {
+        collect_context_terms(context, &mut terms, false);
+    }
+    label_blank_nodes(&mut prepared, "", true, &terms);
+    let jsonld = serde_json::to_vec(&prepared)?;
+    let parser = JsonLdParser::new()
+        .with_base_iri(JSONLD_BASE_IRI)
+        .map_err(|error| RoCrateError::JsonLd(error.to_string()))?
+        .for_slice(&jsonld)
+        .with_load_document_callback(|url, _| load_context(url));
+
+    parser
+        .map(|quad| quad.map_err(|error| RoCrateError::JsonLd(error.to_string())))
+        .collect()
 }
 
-fn is_value_object(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    let has_value = object.contains_key("@value") || object.contains_key("value");
-    has_value
-        && object.keys().all(|key| {
-            matches!(
-                key.as_str(),
-                "@value" | "value" | "@type" | "type" | "@language" | "language"
+fn load_context(
+    url: &str,
+) -> Result<JsonLdRemoteDocument, Box<dyn std::error::Error + Send + Sync>> {
+    let document = match url {
+        ROCRATE_1_1_CONTEXT_URL => ROCRATE_1_1_CONTEXT,
+        ROCRATE_1_2_CONTEXT_URL => ROCRATE_1_2_CONTEXT,
+        WORKFLOW_RUN_CONTEXT_URL => WORKFLOW_RUN_CONTEXT,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unresolved offline JSON-LD context `{url}`"),
             )
-        })
+            .into());
+        }
+    };
+    Ok(JsonLdRemoteDocument {
+        document: document.to_vec(),
+        document_url: url.to_string(),
+    })
 }
 
-fn validate_value_object(
-    property: &str,
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), RoCrateError> {
-    let value = object
-        .get("@value")
-        .or_else(|| object.get("value"))
-        .ok_or_else(|| {
-            RoCrateError::UnsupportedJsonLd(format!(
-                "property `{property}` value object is missing `@value`"
-            ))
-        })?;
-
-    if matches!(
-        value,
-        serde_json::Value::Array(_) | serde_json::Value::Object(_)
-    ) {
-        return Err(RoCrateError::UnsupportedJsonLd(format!(
-            "property `{property}` value object must contain a scalar `@value`"
-        )));
-    }
-
-    let language = object.get("@language").or_else(|| object.get("language"));
-    let datatype = object.get("@type").or_else(|| object.get("type"));
-
-    if language.is_some() && datatype.is_some() {
-        return Err(RoCrateError::UnsupportedJsonLd(format!(
-            "property `{property}` value object must not combine `@language` and `@type`"
-        )));
-    }
-
-    if let Some(language) = language {
-        if !matches!(value, serde_json::Value::String(_)) {
-            return Err(RoCrateError::UnsupportedJsonLd(format!(
-                "property `{property}` language-tagged values must use string `@value`"
-            )));
+fn label_blank_nodes(
+    value: &mut serde_json::Value,
+    pointer: &str,
+    document: bool,
+    terms: &HashMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter_mut().enumerate() {
+                label_blank_nodes(value, &format!("{pointer}/{index}"), false, terms);
+            }
         }
-        if !language.is_string() {
-            return Err(RoCrateError::UnsupportedJsonLd(format!(
-                "property `{property}` language tag must be a string"
-            )));
+        serde_json::Value::Object(object) => {
+            if !document
+                && submitted_id(object, terms).is_none()
+                && !object.contains_key("@value")
+                && !object.contains_key("value")
+                && !object.contains_key("@list")
+                && !object.contains_key("@set")
+                && object.keys().any(|key| {
+                    key == "@type"
+                        || key == "type"
+                        || terms.get(key).is_some_and(|iri| iri == "@type")
+                })
+            {
+                let suffix = blake3::hash(pointer.as_bytes()).to_hex();
+                object.insert(
+                    "@id".to_string(),
+                    serde_json::Value::String(format!("_:b{}", &suffix[..32])),
+                );
+            }
+
+            for (key, value) in object {
+                if key == "@context" {
+                    continue;
+                }
+                label_blank_nodes(
+                    value,
+                    &format!("{pointer}/{}", escape_pointer(key)),
+                    false,
+                    terms,
+                );
+            }
         }
+        _ => {}
     }
+}
 
-    if let Some(datatype) = datatype {
-        let Some(datatype) = datatype.as_str() else {
-            return Err(RoCrateError::UnsupportedJsonLd(format!(
-                "property `{property}` datatype must be a string"
-            )));
-        };
-        let _ = if datatype.starts_with("http://") || datatype.starts_with("https://") {
-            NamedNode::new_unchecked(datatype)
-        } else {
-            expand_known_compact_iri(datatype)?
-        };
-    }
-
-    Ok(())
+fn escape_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 fn jsonld_triples(
     graph_id: &GraphId,
     value: &serde_json::Value,
 ) -> Result<BTreeSet<TripleKey>, RoCrateError> {
-    let object = value.as_object().ok_or_else(|| {
-        RoCrateError::UnsupportedJsonLd("top-level JSON-LD document must be an object".to_string())
-    })?;
-    let graph = object
-        .get("@graph")
-        .or_else(|| object.get("graph"))
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            RoCrateError::UnsupportedJsonLd(
-                "RO-Crate import requires a top-level `@graph` array".to_string(),
-            )
-        })?;
-
-    let import_root = document_root_id(graph);
-    let term_map = object
-        .get("@context")
-        .map(context_term_map)
-        .unwrap_or_default();
-    let mut triples = BTreeSet::new();
-    for (index, entry) in graph.iter().enumerate() {
-        let entity = entry.as_object().ok_or_else(|| {
-            RoCrateError::UnsupportedJsonLd(format!("@graph entry {index} must be an object"))
-        })?;
-        let subject_id = entity_identifier(graph_id, import_root.as_deref(), entity, index)?;
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&subject_id));
-
-        if let Some(type_value) = entity.get("@type").or_else(|| entity.get("type")) {
-            let predicate = EncodedTerm::from_named_node(&vocab::rdf_type());
-            for object in
-                property_value_terms(graph_id, import_root.as_deref(), "type", type_value)?
-            {
-                triples.insert((subject.clone(), predicate.clone(), object));
-            }
-        }
-
-        for (property, property_value) in entity {
-            if matches!(
-                property.as_str(),
-                "@context" | "@graph" | "graph" | "@id" | "id" | "@type" | "type"
-            ) {
-                continue;
-            }
-            let normalized_property = normalize_property(property);
-            let predicate =
-                EncodedTerm::from_named_node(&resolve_import_predicate(property, &term_map)?);
-            for object in property_value_terms(
-                graph_id,
-                import_root.as_deref(),
-                &normalized_property,
-                property_value,
-            )? {
-                triples.insert((subject.clone(), predicate.clone(), object));
-            }
-        }
-    }
-
-    Ok(triples)
-}
-
-fn entity_identifier(
-    graph_id: &GraphId,
-    import_root: Option<&str>,
-    entity: &serde_json::Map<String, serde_json::Value>,
-    index: usize,
-) -> Result<String, RoCrateError> {
-    let raw = entity
-        .get("@id")
-        .or_else(|| entity.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            RoCrateError::UnsupportedJsonLd(format!(
-                "@graph entry {index} must define string `@id`"
-            ))
-        })?;
-    Ok(remap_import_identifier(
-        graph_id,
-        import_root,
-        &normalize_entity_id(raw),
-    ))
-}
-
-fn document_root_id(graph: &[serde_json::Value]) -> Option<String> {
-    graph.iter().find_map(|entry| {
-        let entity = entry.as_object()?;
-        let id = entity
-            .get("@id")
-            .or_else(|| entity.get("id"))
-            .and_then(serde_json::Value::as_str)?;
-        if id != METADATA_ID {
+    let quads = jsonld_quads(value)?;
+    let metadata = format!("{JSONLD_BASE_IRI}{METADATA_ID}");
+    let about = vocab::schema_about();
+    let import_root = quads.iter().find_map(|quad| {
+        let NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+            return None;
+        };
+        if subject.as_str() != metadata || quad.predicate != about {
             return None;
         }
+        let Term::NamedNode(root) = &quad.object else {
+            return None;
+        };
+        Some(root.as_str().to_string())
+    });
 
-        let about = entity.get("about")?;
-        match about {
-            serde_json::Value::String(value) => Some(normalize_entity_id(value)),
-            serde_json::Value::Object(object) => object
-                .get("@id")
-                .or_else(|| object.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .map(normalize_entity_id),
-            _ => None,
-        }
-    })
+    Ok(quads
+        .into_iter()
+        .map(|quad| {
+            (
+                remap_subject(quad.subject, import_root.as_deref(), graph_id),
+                EncodedTerm::from_named_node(&quad.predicate),
+                remap_object(quad.object, import_root.as_deref(), graph_id),
+            )
+        })
+        .collect())
 }
 
-fn remap_import_identifier(graph_id: &GraphId, import_root: Option<&str>, id: &str) -> String {
-    if import_root == Some(id) {
-        root_id(graph_id).to_string()
-    } else {
-        id.to_string()
-    }
-}
-
-fn property_expects_identifier(property: &str) -> bool {
-    matches!(property, "license" | "about" | "conformsTo")
-}
-
-fn property_value_terms(
-    graph_id: &GraphId,
+fn remap_subject(
+    subject: NamedOrBlankNode,
     import_root: Option<&str>,
-    property: &str,
-    value: &serde_json::Value,
-) -> Result<Vec<EncodedTerm>, RoCrateError> {
-    match value {
-        serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::Bool(boolean) => Ok(vec![encoded_typed_literal(
-            boolean.to_string(),
-            XSD_BOOLEAN_IRI,
-        )]),
-        serde_json::Value::Number(number) => Ok(vec![encoded_number_literal(number)]),
-        serde_json::Value::String(text) => {
-            let mapped = remap_import_identifier(graph_id, import_root, &normalize_entity_id(text));
-            let value = if property_expects_identifier(property) {
-                mapped.as_str()
-            } else {
-                text
-            };
-            Ok(vec![property_value_encoded(property, value)?])
-        }
-        serde_json::Value::Array(values) => {
-            let mut objects = Vec::new();
-            for entry in values {
-                objects.extend(property_value_terms(
-                    graph_id,
-                    import_root,
-                    property,
-                    entry,
-                )?);
-            }
-            Ok(objects)
-        }
-        serde_json::Value::Object(object) if is_reference_object(object) => {
-            let id = object
-                .get("@id")
-                .or_else(|| object.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    RoCrateError::UnsupportedJsonLd(format!(
-                        "property `{property}` reference object is missing string `@id`"
-                    ))
-                })?;
-            let mapped = remap_import_identifier(graph_id, import_root, &normalize_entity_id(id));
-            Ok(vec![encoded_reference_term(&mapped)?])
-        }
-        serde_json::Value::Object(object) if is_value_object(object) => {
-            Ok(vec![encoded_value_object(object)?])
-        }
-        serde_json::Value::Object(_) => Err(RoCrateError::UnsupportedJsonLd(format!(
-            "property `{property}` contains an inline nested object; nested entities must be top-level `@graph` entries referenced by `@id`"
-        ))),
+    graph_id: &GraphId,
+) -> EncodedTerm {
+    match subject {
+        NamedOrBlankNode::NamedNode(node) => remap_node(node, import_root, graph_id),
+        NamedOrBlankNode::BlankNode(node) => EncodedTerm(format!("_:{}", node.as_str())),
     }
 }
 
-fn encoded_number_literal(number: &serde_json::Number) -> EncodedTerm {
-    if number.as_i64().is_some() || number.as_u64().is_some() {
-        encoded_typed_literal(number.to_string(), XSD_INTEGER_IRI)
+fn remap_object(object: Term, import_root: Option<&str>, graph_id: &GraphId) -> EncodedTerm {
+    match object {
+        Term::NamedNode(node) => remap_node(node, import_root, graph_id),
+        object => EncodedTerm::from_term(&object),
+    }
+}
+
+fn remap_node(node: NamedNode, import_root: Option<&str>, graph_id: &GraphId) -> EncodedTerm {
+    let iri = node.as_str();
+    let mapped = if import_root == Some(iri) {
+        graph_id.as_str().to_string()
+    } else if let Some(relative) = iri.strip_prefix(JSONLD_BASE_IRI) {
+        if relative == METADATA_ID {
+            METADATA_ID.to_string()
+        } else if relative.starts_with('#') {
+            relative.to_string()
+        } else {
+            format!("./{relative}")
+        }
     } else {
-        encoded_typed_literal(number.to_string(), XSD_DOUBLE_IRI)
-    }
-}
-
-fn encoded_value_object(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> Result<EncodedTerm, RoCrateError> {
-    let value = object
-        .get("@value")
-        .or_else(|| object.get("value"))
-        .ok_or_else(|| {
-            RoCrateError::UnsupportedJsonLd("value object missing `@value`".to_string())
-        })?;
-    let language = object
-        .get("@language")
-        .or_else(|| object.get("language"))
-        .and_then(serde_json::Value::as_str);
-    let datatype = object
-        .get("@type")
-        .or_else(|| object.get("type"))
-        .and_then(serde_json::Value::as_str);
-
-    match value {
-        serde_json::Value::String(text) => {
-            if let Some(language) = language {
-                Ok(encoded_language_literal(text, language))
-            } else if let Some(datatype) = datatype {
-                Ok(encoded_typed_literal(text.clone(), datatype_iri(datatype)?))
-            } else {
-                Ok(encoded_literal(text))
-            }
-        }
-        serde_json::Value::Bool(boolean) => Ok(encoded_typed_literal(
-            boolean.to_string(),
-            datatype
-                .map(datatype_iri)
-                .transpose()?
-                .unwrap_or_else(|| XSD_BOOLEAN_IRI.to_string()),
-        )),
-        serde_json::Value::Number(number) => Ok(encoded_typed_literal(
-            number.to_string(),
-            datatype.map(datatype_iri).transpose()?.unwrap_or_else(|| {
-                if number.as_i64().is_some() || number.as_u64().is_some() {
-                    XSD_INTEGER_IRI.to_string()
-                } else {
-                    XSD_DOUBLE_IRI.to_string()
-                }
-            }),
-        )),
-        serde_json::Value::Null => Ok(encoded_literal("")),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(
-            RoCrateError::UnsupportedJsonLd("value object `@value` must be scalar".to_string()),
-        ),
-    }
-}
-
-fn datatype_iri(datatype: &str) -> Result<String, RoCrateError> {
-    if datatype.starts_with("http://") || datatype.starts_with("https://") {
-        Ok(datatype.to_string())
-    } else {
-        Ok(expand_known_compact_iri(datatype)?.as_str().to_string())
-    }
+        iri.to_string()
+    };
+    EncodedTerm::from_named_node(&NamedNode::new_unchecked(mapped))
 }
 
 fn entity_subject_triples(
@@ -1899,7 +2187,7 @@ fn property_named_node(property: &str) -> Result<NamedNode, RoCrateError> {
         "datePublished" => Ok(vocab::schema_date_published()),
         "license" => Ok(vocab::schema_license()),
         "about" => Ok(vocab::schema_about()),
-        "conformsTo" => Ok(vocab::schema_conforms_to()),
+        "conformsTo" => Ok(crate_conforms_to()),
         other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
         other if other.contains(':') => expand_known_compact_iri(other),
         other => Ok(NamedNode::new_unchecked(format!(
@@ -1940,21 +2228,16 @@ fn encoded_identifier(value: &str) -> EncodedTerm {
     EncodedTerm::from_named_node(&NamedNode::new_unchecked(value))
 }
 
+fn encoded_subject(value: &str) -> EncodedTerm {
+    if value.starts_with("_:") {
+        EncodedTerm(value.to_string())
+    } else {
+        encoded_identifier(value)
+    }
+}
+
 fn encoded_literal(value: &str) -> EncodedTerm {
     EncodedTerm::from_term(&Term::Literal(oxrdf::Literal::new_simple_literal(value)))
-}
-
-fn encoded_typed_literal(value: impl Into<String>, datatype: impl AsRef<str>) -> EncodedTerm {
-    EncodedTerm::from_term(&Term::Literal(oxrdf::Literal::new_typed_literal(
-        value.into(),
-        NamedNode::new_unchecked(datatype.as_ref()),
-    )))
-}
-
-fn encoded_language_literal(value: &str, language: &str) -> EncodedTerm {
-    EncodedTerm::from_term(&Term::Literal(
-        oxrdf::Literal::new_language_tagged_literal_unchecked(value, language),
-    ))
 }
 
 fn encoded_reference_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
@@ -1965,7 +2248,7 @@ fn encoded_reference_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
         || NamedNode::new(value).is_ok();
 
     if is_identifier {
-        Ok(encoded_identifier(value))
+        Ok(encoded_subject(value))
     } else if value.contains(':') {
         Ok(EncodedTerm::from_named_node(&expand_known_compact_iri(
             value,
@@ -2021,7 +2304,10 @@ fn export_metadata_descriptor(
             }
             "conformsTo" => conforms_to = Some(id_from_encoded_term(&object)),
             "about" => about = Some(id_from_encoded_term(&object)),
-            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+            _ => {
+                let value = context_value(ctx, &key, &object);
+                insert_entity_value(&mut dynamic, key, value);
+            }
         }
     }
 
@@ -2060,7 +2346,10 @@ fn export_root_entity(
             "datePublished" => date_published = Some(literal_string(&object)?),
             "license" => license = Some(license_from_encoded_term(&object)),
             "hasPart" => {}
-            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+            _ => {
+                let value = context_value(ctx, &key, &object);
+                insert_entity_value(&mut dynamic, key, value);
+            }
         }
     }
 
@@ -2111,7 +2400,10 @@ fn export_graph_entity(
                     type_terms.push(value);
                 }
             }
-            _ => insert_entity_value(&mut dynamic, key, entity_value_from_encoded_term(&object)),
+            _ => {
+                let value = context_value(ctx, &key, &object);
+                insert_entity_value(&mut dynamic, key, value);
+            }
         }
     }
 
@@ -2152,7 +2444,18 @@ fn encoded_named_node_value(object: &EncodedTerm) -> Option<String> {
     object.to_named_node().map(|node| node.as_str().to_string())
 }
 
+fn encoded_reference_value(object: &EncodedTerm) -> Option<String> {
+    match object.to_term() {
+        Some(Term::NamedNode(node)) => Some(node.as_str().to_string()),
+        Some(Term::BlankNode(node)) => Some(format!("_:{}", node.as_str())),
+        _ => None,
+    }
+}
+
 fn normalize_compact_term(value: &str) -> String {
+    if value == DCTERMS_CONFORMS_TO_IRI {
+        return "conformsTo".to_string();
+    }
     value
         .strip_prefix("http://schema.org/")
         .or_else(|| value.strip_prefix("https://schema.org/"))
@@ -2253,6 +2556,24 @@ fn entity_value_from_encoded_term(term: &EncodedTerm) -> EntityValue {
     }
 }
 
+fn context_value(ctx: &ContextTermMap, key: &str, term: &EncodedTerm) -> EntityValue {
+    if ctx.identifier_terms.contains(key) {
+        return match term.to_term() {
+            Some(Term::NamedNode(node)) => EntityValue::EntityString(
+                node.as_str()
+                    .strip_prefix("./")
+                    .unwrap_or(node.as_str())
+                    .to_string(),
+            ),
+            Some(Term::BlankNode(node)) => {
+                EntityValue::EntityString(format!("_:{}", node.as_str()))
+            }
+            _ => entity_value_from_encoded_term(term),
+        };
+    }
+    entity_value_from_encoded_term(term)
+}
+
 fn literal_entity_value(term: &EncodedTerm, literal: &oxrdf::Literal) -> EntityValue {
     let value = literal.value().to_string();
     let annotation = literal_annotation(&term.0).unwrap_or(LiteralAnnotation::Simple);
@@ -2344,11 +2665,10 @@ fn default_context() -> RoCrateContext {
 /// context JSON. Used when a graph has a custom context that `RoCrateContext`
 /// cannot represent (e.g. complex term definitions).
 fn splice_context_json(
-    rocrate: &RoCrate,
+    mut document: serde_json::Value,
     raw_context: &str,
     pretty: bool,
 ) -> Result<String, RoCrateError> {
-    let mut document = serde_json::to_value(rocrate)?;
     let context: serde_json::Value = serde_json::from_str(raw_context)?;
     if let Some(object) = document.as_object_mut() {
         object.insert("@context".to_string(), context);
@@ -2370,26 +2690,31 @@ fn splice_context_json(
 struct ContextTermMap {
     forward: HashMap<String, String>,
     reverse: HashMap<String, String>,
+    identifier_terms: HashSet<String>,
 }
 
 impl ContextTermMap {
     fn from_raw(raw: Option<&str>) -> Self {
         let mut forward = HashMap::new();
+        let mut identifier_terms = HashSet::new();
         if let Some(raw) = raw {
             match serde_json::from_str::<serde_json::Value>(raw) {
                 // Export path: the context was already validated and warned about
                 // at import time, so collect quietly (see `collect_context_terms`).
-                Ok(value) => collect_context_terms(&value, &mut forward, false),
+                Ok(value) => {
+                    collect_context_terms(&value, &mut forward, false);
+                    collect_identifier_terms(&value, &mut identifier_terms);
+                }
                 Err(error) => tracing::debug!(
                     %error,
                     "stored RO-Crate @context is not valid JSON; skipping term compaction"
                 ),
             }
         }
-        Self::from_forward(forward)
+        Self::from_forward(forward, identifier_terms)
     }
 
-    fn from_forward(forward: HashMap<String, String>) -> Self {
+    fn from_forward(forward: HashMap<String, String>, identifier_terms: HashSet<String>) -> Self {
         let mut reverse: HashMap<String, String> = HashMap::new();
         for (term, iri) in &forward {
             match reverse.get(iri) {
@@ -2401,7 +2726,11 @@ impl ContextTermMap {
                 }
             }
         }
-        Self { forward, reverse }
+        Self {
+            forward,
+            reverse,
+            identifier_terms,
+        }
     }
 
     /// Compact a predicate IRI back to a context term.
@@ -2422,6 +2751,29 @@ impl ContextTermMap {
             return iri.to_string();
         }
         builtin
+    }
+}
+
+fn collect_identifier_terms(context: &serde_json::Value, terms: &mut HashSet<String>) {
+    match context {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_identifier_terms(item, terms);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for (term, definition) in entries {
+                if definition
+                    .as_object()
+                    .and_then(|definition| definition.get("@type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("@id")
+                {
+                    terms.insert(term.clone());
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2468,12 +2820,39 @@ fn extract_raw_context(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Build a `term -> IRI` map from a submitted `@context` value. Called on the
-/// import path, so unresolvable entries are surfaced with a warning once.
-fn context_term_map(context: &serde_json::Value) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    collect_context_terms(context, &mut map, true);
-    map
+fn extract_raw_license(value: &serde_json::Value) -> Option<String> {
+    let document = value.as_object()?;
+    let mut terms = HashMap::new();
+    if let Some(context) = document.get("@context") {
+        collect_context_terms(context, &mut terms, false);
+    }
+    let entries = document.iter().find_map(|(key, value)| {
+        (key == "@graph" || key == "graph" || terms.get(key).is_some_and(|iri| iri == "@graph"))
+            .then(|| value.as_array())
+            .flatten()
+    })?;
+    let root_id = entries.iter().find_map(|entry| {
+        let entity = entry.as_object()?;
+        (normalize_entity_id(submitted_id(entity, &terms)?) == METADATA_ID)
+            .then(|| {
+                entity.iter().find_map(|(key, value)| {
+                    (submitted_predicate(key, &terms).as_deref()
+                        == Some(vocab::schema_about().as_str()))
+                    .then(|| reference_id(value, &terms))
+                    .flatten()
+                })
+            })
+            .flatten()
+    })?;
+    let root = entries.iter().find_map(|entry| {
+        let entity = entry.as_object()?;
+        (normalize_entity_id(submitted_id(entity, &terms)?) == root_id).then_some(entity)
+    })?;
+    let license = root.iter().find_map(|(key, value)| {
+        (submitted_predicate(key, &terms).as_deref() == Some(vocab::schema_license().as_str()))
+            .then_some(value)
+    })?;
+    serde_json::to_string(license).ok()
 }
 
 /// Insert a term mapping, warning (import path only) when it remaps an
@@ -2562,18 +2941,6 @@ fn collect_context_terms(
     }
 }
 
-/// Resolve an import property key to its predicate IRI, preferring an explicit
-/// custom context mapping before the built-in schema.org fallback.
-fn resolve_import_predicate(
-    property: &str,
-    term_map: &HashMap<String, String>,
-) -> Result<NamedNode, RoCrateError> {
-    if let Some(iri) = term_map.get(property) {
-        return Ok(NamedNode::new_unchecked(iri));
-    }
-    property_named_node(&normalize_property(property))
-}
-
 fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateError> {
     let rdf_graph = rocrate_to_rdf_with_options(
         rocrate,
@@ -2611,6 +2978,7 @@ fn normalize_metadata_descriptor(metadata: &mut MetadataDescriptor) {
             .or_else(|| dynamic.remove("schema:conformsTo"))
             .or_else(|| dynamic.remove("http://schema.org/conformsTo"))
             .or_else(|| dynamic.remove("https://schema.org/conformsTo"))
+            .or_else(|| dynamic.remove(DCTERMS_CONFORMS_TO_IRI))
         && let Some(id) = first_identifier(&value)
     {
         metadata.conforms_to = Id::Id(id);
@@ -2740,6 +3108,8 @@ mod tests {
             store: &crate::store::GraphStore,
             graph: &GraphId,
             context: Option<String>,
+            license: Option<String>,
+            license_digest: Option<[u8; 32]>,
             tag: crate::core::ContextTag,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
             if self.fail_context.load(Ordering::SeqCst) {
@@ -2747,7 +3117,8 @@ mod tests {
                     "injected context publish failure".to_string(),
                 ));
             }
-            self.inner.publish_context(store, graph, context, tag)
+            self.inner
+                .publish_context(store, graph, context, license, license_digest, tag)
         }
 
         fn graph_topic_id(

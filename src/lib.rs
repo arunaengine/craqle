@@ -51,7 +51,10 @@ pub use crate::core::{
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::replication::{MergeError, UpdateError};
-pub use crate::rocrate::{AppendDataEntitiesReport, NewDataEntity, RoCrateError, RoCratePage};
+pub use crate::rocrate::{
+    AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
+    canonicalize_jsonld, validate_rocrate_jsonld,
+};
 pub use crate::search::SearchHit;
 pub use crate::sparql::QueryResults;
 pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
@@ -150,7 +153,7 @@ pub struct CreateCrateRequest {
     pub name: String,
     pub description: String,
     pub date_published: String,
-    pub license: String,
+    pub license: Option<String>,
     pub policy: GraphPolicy,
 }
 
@@ -160,7 +163,7 @@ impl CreateCrateRequest {
         name: impl Into<String>,
         description: impl Into<String>,
         date_published: impl Into<String>,
-        license: impl Into<String>,
+        license: Option<String>,
         policy: GraphPolicy,
     ) -> Self {
         Self {
@@ -168,7 +171,7 @@ impl CreateCrateRequest {
             name: name.into(),
             description: description.into(),
             date_published: date_published.into(),
-            license: license.into(),
+            license,
             policy,
         }
     }
@@ -182,6 +185,14 @@ pub struct CreateEntityRequest {
     pub entity_type: String,
     pub name: String,
     pub additional_triples: Vec<(NamedNode, Term)>,
+}
+
+/// Input for patching the properties present on a single RO-Crate entity.
+#[derive(Debug, Clone)]
+pub struct PatchEntityRequest {
+    pub entity: CreateEntityRequest,
+    /// Predicates explicitly present in the patch, including empty values.
+    pub replaced_predicates: Vec<NamedNode>,
 }
 
 /// Input for updating one property value on an existing entity.
@@ -709,7 +720,7 @@ impl CraqleNode {
             &name,
             &description,
             &date_published,
-            &license,
+            license.as_deref(),
         )?;
         self.persist_graph_policy_with_durability(&graph, policy, durability)?;
         self.finish_batch_with_durability(&graph, batch, durability)
@@ -745,7 +756,7 @@ impl CraqleNode {
                 &name,
                 &description,
                 &date_published,
-                &license,
+                license.as_deref(),
             )?;
         self.persist_graph_policy_with_durability(&graph, policy, durability)?;
         self.finish_batch_with_durability(&graph, batch, durability)
@@ -775,7 +786,7 @@ impl CraqleNode {
             &name,
             &description,
             &date_published,
-            &license,
+            license.as_deref(),
         )?)
     }
 
@@ -793,6 +804,31 @@ impl CraqleNode {
             &request.name,
             request.additional_triples,
         )
+    }
+
+    /// Patch one root-linked data entity with explicit durability and actor.
+    pub fn patch_data_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: PatchEntityRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let PatchEntityRequest {
+            entity,
+            replaced_predicates,
+        } = request;
+        let graph = entity.graph;
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let batch = self.manager_with(durability, actor).patch_data_entity(
+            &graph,
+            &entity.entity_id,
+            &entity.entity_type,
+            &entity.name,
+            entity.additional_triples,
+            &replaced_predicates,
+        )?;
+        self.finish_batch_with_durability(&graph, batch, durability)
     }
 
     /// Create or replace a root-linked data entity.
@@ -871,6 +907,33 @@ impl CraqleNode {
             &request.name,
             request.additional_triples,
         )
+    }
+
+    /// Patch one contextual entity with explicit durability and actor.
+    pub fn patch_contextual_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: PatchEntityRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let PatchEntityRequest {
+            entity,
+            replaced_predicates,
+        } = request;
+        let graph = entity.graph;
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let batch = self
+            .manager_with(durability, actor)
+            .patch_contextual_entity(
+                &graph,
+                &entity.entity_id,
+                &entity.entity_type,
+                &entity.name,
+                entity.additional_triples,
+                &replaced_predicates,
+            )?;
+        self.finish_batch_with_durability(&graph, batch, durability)
     }
 
     /// Create or replace a contextual entity.
@@ -1679,6 +1742,8 @@ impl CraqleNode {
             CraqleGraphEvent::ContextUpdated {
                 graph,
                 context,
+                license,
+                license_digest,
                 tag,
             } => {
                 // Deterministic last-write-wins: overwrite only when the incoming
@@ -1689,8 +1754,13 @@ impl CraqleNode {
                 if *tag <= self.store.graph_context_tag(graph)? {
                     return Ok(false);
                 }
-                self.store
-                    .set_graph_context(graph, context.as_deref(), *tag)?;
+                self.store.set_graph_context(
+                    graph,
+                    context.as_deref(),
+                    license.as_deref(),
+                    *license_digest,
+                    *tag,
+                )?;
                 Ok(true)
             }
         }

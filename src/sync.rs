@@ -26,15 +26,17 @@ pub enum CraqleGraphEvent {
     GraphDeleted {
         graph: GraphId,
     },
-    /// Last-write-wins update of a graph's raw RO-Crate `@context` JSON.
+    /// Last-write-wins update of a graph's raw RO-Crate render hints.
     ///
-    /// `context` is `None` when the graph reverts to the bare default context.
-    /// `tag` is the last-write-wins ordering tag: a receiving peer overwrites its
-    /// stored context only when this tag strictly dominates its own, so all peers
-    /// converge on the same context regardless of event arrival order.
+    /// `context` and `license` hold the raw submitted JSON shapes. `tag` is the
+    /// last-write-wins ordering tag: a receiving peer overwrites its stored hints
+    /// only when this tag strictly dominates its own, so all peers converge on
+    /// the same rendering regardless of event arrival order.
     ContextUpdated {
         graph: GraphId,
         context: Option<String>,
+        license: Option<String>,
+        license_digest: Option<[u8; 32]>,
         tag: ContextTag,
     },
 }
@@ -134,6 +136,8 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         store: &GraphStore,
         graph: &GraphId,
         context: Option<String>,
+        license: Option<String>,
+        license_digest: Option<[u8; 32]>,
         tag: ContextTag,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
@@ -282,6 +286,8 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
         context: Option<String>,
+        license: Option<String>,
+        license_digest: Option<[u8; 32]>,
         tag: ContextTag,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, graph)?;
@@ -289,6 +295,8 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             CraqleGraphEvent::ContextUpdated {
                 graph: graph.clone(),
                 context,
+                license,
+                license_digest,
                 tag,
             },
             self.publish_options(),
