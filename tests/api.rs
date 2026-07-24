@@ -383,6 +383,115 @@ fn wal_already_durable_apply_rocrate_does_not_publish_irokle_graph_topic() {
 }
 
 #[test]
+fn patch_preserves_properties() {
+    let dir = tempfile::tempdir().unwrap();
+    let irokle = irokle::Irokle::builder().build().unwrap();
+    let node = CraqleNode::open_with_options(
+        dir.path(),
+        CraqleOptions::new().with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let graph = GraphId::new("urn:test:wal-local-patch");
+    let durability = CraqleRequestDurability::WalAlreadyDurable;
+
+    node.create_crate_with_durability_as(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Patch Dataset",
+            "Materialized from an external WAL",
+            "2026-01-01",
+            None,
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/datasets/public/wal-local-patch".to_string()],
+            },
+        ),
+        durability,
+        Some(ActorId::from_bytes([1u8; 32])),
+    )
+    .unwrap();
+
+    let description = oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal("preserved"));
+    node.patch_data_with(
+        &writer_auth(),
+        PatchEntityRequest {
+            entity: CreateEntityRequest {
+                graph: graph.clone(),
+                entity_id: "./file.txt".to_string(),
+                entity_type: "File".to_string(),
+                name: "before".to_string(),
+                additional_triples: vec![(vocab::schema_description(), description.clone())],
+            },
+            replaced_predicates: vec![vocab::schema_description()],
+        },
+        durability,
+        Some(ActorId::from_bytes([2u8; 32])),
+    )
+    .unwrap();
+
+    let batch = node
+        .patch_data_with(
+            &writer_auth(),
+            PatchEntityRequest {
+                entity: CreateEntityRequest {
+                    graph: graph.clone(),
+                    entity_id: "./file.txt".to_string(),
+                    entity_type: "File".to_string(),
+                    name: "after".to_string(),
+                    additional_triples: Vec::new(),
+                },
+                replaced_predicates: Vec::new(),
+            },
+            durability,
+            Some(ActorId::from_bytes([3u8; 32])),
+        )
+        .unwrap();
+    assert_eq!(batch.actor, ActorId::from_bytes([3u8; 32]));
+
+    let properties = node
+        .describe_subject(&reader_auth(), &graph, "./file.txt")
+        .unwrap();
+    assert!(properties.contains(&(
+        EncodedTerm::from_named_node(&vocab::schema_description()),
+        EncodedTerm::from_term(&description),
+    )));
+    assert!(properties.contains(&(
+        EncodedTerm::from_named_node(&vocab::schema_name()),
+        EncodedTerm::from_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+            "after"
+        ),)),
+    )));
+
+    node.patch_data_with(
+        &writer_auth(),
+        PatchEntityRequest {
+            entity: CreateEntityRequest {
+                graph: graph.clone(),
+                entity_id: "./file.txt".to_string(),
+                entity_type: "File".to_string(),
+                name: "after".to_string(),
+                additional_triples: Vec::new(),
+            },
+            replaced_predicates: vec![vocab::schema_description()],
+        },
+        durability,
+        Some(ActorId::from_bytes([4u8; 32])),
+    )
+    .unwrap();
+    assert!(
+        node.describe_subject(&reader_auth(), &graph, "./file.txt")
+            .unwrap()
+            .iter()
+            .all(|(predicate, _)| {
+                predicate != &EncodedTerm::from_named_node(&vocab::schema_description())
+            })
+    );
+    assert!(node.irokle_topic_id(&graph).unwrap().is_none());
+    assert!(irokle.list_topics().unwrap().is_empty());
+}
+
+#[test]
 fn opening_with_irokle_replays_durable_graph_events() {
     let dir = tempfile::tempdir().unwrap();
     let craqle_dir = dir.path().join("craqle");

@@ -187,6 +187,14 @@ pub struct CreateEntityRequest {
     pub additional_triples: Vec<(NamedNode, Term)>,
 }
 
+/// Input for patching the properties present on a single RO-Crate entity.
+#[derive(Debug, Clone)]
+pub struct PatchEntityRequest {
+    pub entity: CreateEntityRequest,
+    /// Predicates explicitly present in the patch, including empty values.
+    pub replaced_predicates: Vec<NamedNode>,
+}
+
 /// Input for updating one property value on an existing entity.
 #[derive(Debug, Clone)]
 pub struct UpdatePropertyRequest {
@@ -798,6 +806,31 @@ impl CraqleNode {
         )
     }
 
+    /// Patch one root-linked data entity with explicit durability and actor.
+    pub fn patch_data_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: PatchEntityRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let PatchEntityRequest {
+            entity,
+            replaced_predicates,
+        } = request;
+        let graph = entity.graph;
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let batch = self.manager_with(durability, actor).patch_data_entity(
+            &graph,
+            &entity.entity_id,
+            &entity.entity_type,
+            &entity.name,
+            entity.additional_triples,
+            &replaced_predicates,
+        )?;
+        self.finish_batch_with_durability(&graph, batch, durability)
+    }
+
     /// Create or replace a root-linked data entity.
     pub fn add_data_entity(
         &self,
@@ -874,6 +907,33 @@ impl CraqleNode {
             &request.name,
             request.additional_triples,
         )
+    }
+
+    /// Patch one contextual entity with explicit durability and actor.
+    pub fn patch_contextual_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: PatchEntityRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+    ) -> Result<Batch> {
+        let PatchEntityRequest {
+            entity,
+            replaced_predicates,
+        } = request;
+        let graph = entity.graph;
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let batch = self
+            .manager_with(durability, actor)
+            .patch_contextual_entity(
+                &graph,
+                &entity.entity_id,
+                &entity.entity_type,
+                &entity.name,
+                entity.additional_triples,
+                &replaced_predicates,
+            )?;
+        self.finish_batch_with_durability(&graph, batch, durability)
     }
 
     /// Create or replace a contextual entity.
