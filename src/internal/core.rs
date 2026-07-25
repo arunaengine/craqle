@@ -154,20 +154,11 @@ impl EncodedTerm {
         Self(t.to_string())
     }
 
-    /// Encode a subject identifier that may name either an IRI or a blank node.
+    /// Encode a subject id that may name an IRI or a blank node.
     ///
-    /// Identifiers that travel as plain strings — [`GraphDiagnostics::orphaned_entities`]
-    /// above all — carry a blank node in its bare label form (`_:b0`), never as
-    /// an IRI. Encoding such an id with [`EncodedTerm::from_named_node`] yields
-    /// `<_:b0>`, which matches no interned term: membership tests silently miss
-    /// and an orphaned blank node stays visible to export, SPARQL and search
-    /// (G6). Every string → [`EncodedTerm`] round trip for a *subject* must go
-    /// through here.
-    ///
-    /// This binds writes as tightly as reads. Blank nodes are addressable
-    /// entities: an entity id supplied to the RO-Crate write API may name one,
-    /// and encoding it as an IRI would target a term no reader resolves — the
-    /// write would appear to succeed and then be invisible.
+    /// Every string → `EncodedTerm` round trip for a subject must come through
+    /// here: `from_named_node` would turn `_:b0` into `<_:b0>`, which matches no
+    /// interned term, so lookups silently miss on both reads and writes.
     pub fn from_subject_id(id: &str) -> Self {
         if id.starts_with("_:") {
             Self(id.to_string())
