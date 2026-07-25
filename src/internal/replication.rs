@@ -377,7 +377,7 @@ impl ReplicationEngine {
 
             // Publish-first (G4): the event goes out before any local state
             // changes, and outside the commit guard, because the publish may bind
-            // an irokle topic and that takes the guard itself (addendum A1).
+            // an irokle topic and that takes the guard itself.
             let record = sync.publish_changes(&self.store, graph, changes)?;
             let Some(batch) = crate::sync::batch_from_irokle_event_record(record)? else {
                 return Err(UpdateError::InvalidChangeSet(

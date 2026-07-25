@@ -272,7 +272,7 @@ struct SearchUpdateWorker {
     sender: mpsc::Sender<SearchWorkerMessage>,
     /// `true` once a wake has been sent and not yet consumed by the worker.
     /// Collapses a burst of writes into a single channel message instead of
-    /// one unbounded-channel send per write (finding W15c).
+    /// one unbounded-channel send per write.
     wake_pending: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1595,7 +1595,7 @@ impl CraqleNode {
     ///
     /// Search results usually cluster into a handful of graphs, so the policy
     /// read and the orphan-set rebuild are memoized per graph rather than
-    /// repeated per hit (finding R8). Hits in a graph the caller may not read
+    /// repeated per hit. Hits in a graph the caller may not read
     /// are skipped rather than failing the whole call, matching how
     /// [`CraqleNode::search`] drops them.
     pub fn hydrate_search_hits(
@@ -1652,7 +1652,7 @@ impl CraqleNode {
     /// Commits Tantivy and persists Fjall once per batch of graphs rather than
     /// once per graph: every commit replays the queued deletes against every
     /// segment, which made a per-graph commit super-linear in corpus size
-    /// (finding W8).
+    ///.
     pub fn reindex_search(&self) -> Result<()> {
         let mut covered = Vec::with_capacity(REINDEX_COMMIT_BATCH_GRAPHS);
         for graph in self.store.graphs()? {
@@ -2133,7 +2133,7 @@ fn score_key(score: f32) -> i64 {
 /// Only needed where hits arrive from more than one collection; a single
 /// Tantivy search already returns score-descending order. The comparator
 /// borrows the key fields instead of cloning two `String`s per hit and
-/// rebuilding the key for both sides of every comparison (finding R8). Callers
+/// rebuilding the key for both sides of every comparison. Callers
 /// never pass duplicate `(graph, subject)` pairs, so an unstable sort is a
 /// total order here and no dedup pass is required.
 fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {

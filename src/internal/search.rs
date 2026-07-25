@@ -27,7 +27,7 @@ const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v2";
 ///
 /// Built once instead of per synced subject: the previous per-call constructor
 /// allocated four `NamedNode`s plus four `EncodedTerm`s for every subject the
-/// worker touched (finding W13).
+/// worker touched.
 static SEARCHABLE_PREDICATES: LazyLock<[EncodedTerm; 4]> = LazyLock::new(|| {
     [
         EncodedTerm::from_named_node(&crate::vocab::schema_name()),
@@ -64,7 +64,7 @@ pub struct SearchIndex {
     index: Index,
     reader: IndexReader,
     /// Guards the single Tantivy writer. Held only around `add`/`delete`
-    /// calls — never across store reads (finding W15). One writer, rather
+    /// calls — never across store reads. One writer, rather
     /// than concurrent writers behind an `RwLock`, keeps delete/add
     /// interleaving deterministic instead of timing-dependent (G7).
     ///
@@ -112,7 +112,7 @@ pub struct QueueBound {
     ///
     /// A bounded flush pins this to the token observed when the flush started,
     /// so a writer that keeps enqueueing cannot keep the drain alive forever
-    /// (finding W15b).
+    ///.
     pub max_token: Option<u64>,
 }
 
@@ -533,7 +533,7 @@ impl SearchIndex {
         // Phase 1: read every update from the store with NO writer lock held.
         // This walks up to `bound.chunk` subjects and used to run under the
         // Tantivy writer mutex, blocking every other indexer for the whole
-        // scan (finding W15a).
+        // scan.
         let mut seen = HashSet::with_capacity(queued.len());
         let mut caches = StoreSyncCaches::default();
         let mut prepared = Vec::with_capacity(queued.len());

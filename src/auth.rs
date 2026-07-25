@@ -174,7 +174,7 @@ impl Authorizer for GrantAuthorizer {
         // Test for the existence of a usable grant without materializing them:
         // `visible_graphs` and the search filters call this once per candidate
         // graph, and the collected `Vec` was allocated only to be measured
-        // (finding W13).
+        //.
         let has_usable_grant = self.grants.iter().any(|grant| grant.level.allows(action));
 
         if !has_usable_grant || policy.permission_paths.is_empty() {

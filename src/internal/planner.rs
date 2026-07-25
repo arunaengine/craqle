@@ -43,7 +43,7 @@ use crate::store::GraphStore;
 /// 150 term-table point reads for a five-pattern BGP, all loop-invariant.
 /// `term_ids` memoizes them for the duration of the pass.
 ///
-/// Derived-state note (register row 11): the memo lives and dies with a single
+/// Derived-state note: the memo lives and dies with a single
 /// optimization pass, so it needs no invalidation path. Store errors are
 /// deliberately *not* memoized, so a transient failure cannot pin a wrong
 /// verdict for the rest of the pass.
