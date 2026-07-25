@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::core::*;
 use fjall::{
@@ -63,7 +63,17 @@ const LOG_BATCH_PREFIX: u8 = b'B';
 const TOPIC_CLOCK_PREFIX: u8 = b'C';
 const TOPIC_BINDING_PREFIX: u8 = b'T';
 const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
+/// Per-graph vector clock, split out of the graph meta record (WS0-T3) so a
+/// commit writes only the clock and never rewrites policy/context/topic bytes.
+const GRAPH_CLOCK_PREFIX: u8 = b'K';
+/// Persisted, clock-tagged graph diagnostics (WS0-T5, finding K6).
+const GRAPH_DIAGNOSTICS_PREFIX: u8 = b'O';
 const TERM_LOCK_SHARDS: usize = 64;
+const COMMIT_LOCK_SHARDS: usize = 64;
+/// Upper bound on the global term-decode cache. Term ids are content hashes so
+/// entries are never invalidated; the cache is simply cleared when it hits the
+/// cap (WS0-T4).
+const TERM_DECODE_CACHE_CAP: usize = 1_000_000;
 const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
 const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const MAX_DB_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
@@ -90,6 +100,11 @@ fn recommended_db_cache_bytes() -> u64 {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct StoredGraphMeta {
     policy: GraphPolicy,
+    /// Legacy home of the per-graph vector clock. Since WS0-T3 the clock lives
+    /// under its own `'K' || graph_id` key and this field is only read as a
+    /// one-time migration fallback for stores written before the split; it is
+    /// ignored as soon as the `'K'` key exists. Never written by
+    /// [`GraphStore::set_vector_clock`] any more.
     clock: VectorClock,
     #[serde(default)]
     irokle_topic: Option<[u8; 32]>,
@@ -116,12 +131,18 @@ enum QuadMutation {
     Remove(EncodedQuad),
 }
 
+/// Quad key bytes: `graph || subject || predicate || object`, 4 × 16 bytes.
+type QuadKey = [u8; 64];
+
 pub struct WriteBatch {
     inner: fjall::OwnedWriteBatch,
-    pending_quad_states: HashMap<Vec<u8>, Option<Vec<Dot>>>,
+    /// Uncommitted dot sets, so later operations in the same batch read the
+    /// batch-local state instead of the (still stale) durable one. `None` means
+    /// "written empty", i.e. the quad is dead. Keyed by the fixed-size quad key
+    /// so no per-quad `Vec` is allocated (WS0-T8).
+    pending_quad_states: HashMap<QuadKey, Option<Vec<Dot>>>,
     pending_terms: HashMap<TermId, String>,
     quad_mutations: Vec<QuadMutation>,
-    touched_graphs: HashSet<TermId>,
 }
 
 impl WriteBatch {
@@ -131,7 +152,6 @@ impl WriteBatch {
             pending_quad_states: HashMap::new(),
             pending_terms: HashMap::new(),
             quad_mutations: Vec::new(),
-            touched_graphs: HashSet::new(),
         }
     }
 
@@ -151,10 +171,24 @@ impl WriteBatch {
     }
 }
 
+/// Outcome of applying one quad mutation to a derived index.
+///
+/// `Anomaly` means the index disagreed with the durable `quads` keyspace, which
+/// is the source of truth: an insert found the `(predicate, object)` pair
+/// already present, or a remove found nothing to remove. Both are impossible
+/// while every read→write cycle of a graph is serialized by its commit guard,
+/// so seeing one means the index has drifted and must be rebuilt (WS0-T2,
+/// derived-state register row 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexApply {
+    Ok,
+    Anomaly,
+}
+
 #[derive(Default)]
 struct IndexState {
-    graph_subjects: HashMap<TermId, Vec<TermId>>,
-    by_graph_subject: HashMap<(TermId, TermId), Vec<(TermId, TermId)>>,
+    graph_subjects: HashMap<TermId, HashSet<TermId>>,
+    by_graph_subject: HashMap<(TermId, TermId), HashSet<(TermId, TermId)>>,
 }
 
 type ObjectOrderKey = (TermId, TermId, TermId);
@@ -162,43 +196,42 @@ type ObjectOrderValues = Arc<Vec<TermId>>;
 type ObjectOrderCache = HashMap<ObjectOrderKey, ObjectOrderValues>;
 
 impl IndexState {
-    fn insert_quad(&mut self, quad: EncodedQuad) {
-        match self.by_graph_subject.entry((quad.graph, quad.subject)) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().push((quad.predicate, quad.object));
-            }
-            Entry::Vacant(entry) => {
-                self.graph_subjects
-                    .entry(quad.graph)
-                    .or_default()
-                    .push(quad.subject);
-                entry.insert(vec![(quad.predicate, quad.object)]);
-            }
+    fn insert_quad(&mut self, quad: EncodedQuad) -> IndexApply {
+        let entries = self
+            .by_graph_subject
+            .entry((quad.graph, quad.subject))
+            .or_default();
+        if !entries.insert((quad.predicate, quad.object)) {
+            return IndexApply::Anomaly;
         }
+        if entries.len() == 1 {
+            self.graph_subjects
+                .entry(quad.graph)
+                .or_default()
+                .insert(quad.subject);
+        }
+        IndexApply::Ok
     }
 
-    fn remove_quad(&mut self, quad: EncodedQuad) {
+    fn remove_quad(&mut self, quad: EncodedQuad) -> IndexApply {
         let Entry::Occupied(mut entry) = self.by_graph_subject.entry((quad.graph, quad.subject))
         else {
-            return;
+            return IndexApply::Anomaly;
         };
-        if let Some(index) = entry
-            .get()
-            .iter()
-            .position(|e| *e == (quad.predicate, quad.object))
-        {
-            entry.get_mut().swap_remove(index);
-        }
+        let removed = entry.get_mut().remove(&(quad.predicate, quad.object));
         if entry.get().is_empty() {
             entry.remove();
             if let Entry::Occupied(mut subjects) = self.graph_subjects.entry(quad.graph) {
-                if let Some(index) = subjects.get().iter().position(|s| *s == quad.subject) {
-                    subjects.get_mut().swap_remove(index);
-                }
+                subjects.get_mut().remove(&quad.subject);
                 if subjects.get().is_empty() {
                     subjects.remove();
                 }
             }
+        }
+        if removed {
+            IndexApply::Ok
+        } else {
+            IndexApply::Anomaly
         }
     }
 }
@@ -208,6 +241,11 @@ struct DerivedIndexState {
     by_subject: HashMap<TermId, HashSet<(TermId, TermId, TermId)>>,
     by_predicate_object: HashMap<(TermId, TermId), HashMap<TermId, HashSet<TermId>>>,
     by_object: HashMap<TermId, HashMap<TermId, HashSet<(TermId, TermId)>>>,
+    /// predicate → graph → live quad count, so a predicate-only pattern can be
+    /// answered by scanning just the graphs that actually contain it instead of
+    /// every subject in the corpus (WS0-T11). Counts are needed so a graph is
+    /// dropped only when its last quad for that predicate goes away.
+    predicate_graph_counts: HashMap<TermId, HashMap<TermId, usize>>,
     // Approximate corpus-wide cardinalities for the query planner; quad
     // instances are counted per graph (no cross-graph triple dedup).
     predicate_object_counts: HashMap<(TermId, TermId), usize>,
@@ -242,6 +280,12 @@ impl DerivedIndexState {
                 .or_default() += 1;
             *self.predicate_counts.entry(quad.predicate).or_default() += 1;
             *self.object_counts.entry(quad.object).or_default() += 1;
+            *self
+                .predicate_graph_counts
+                .entry(quad.predicate)
+                .or_default()
+                .entry(quad.graph)
+                .or_default() += 1;
             self.total_quads += 1;
         }
     }
@@ -278,6 +322,17 @@ impl DerivedIndexState {
                     count.remove();
                 }
             }
+            if let Entry::Occupied(mut graphs) = self.predicate_graph_counts.entry(quad.predicate) {
+                if let Entry::Occupied(mut count) = graphs.get_mut().entry(quad.graph) {
+                    *count.get_mut() = count.get().saturating_sub(1);
+                    if *count.get() == 0 {
+                        count.remove();
+                    }
+                }
+                if graphs.get().is_empty() {
+                    graphs.remove();
+                }
+            }
             self.total_quads = self.total_quads.saturating_sub(1);
         }
 
@@ -310,6 +365,31 @@ impl DerivedIndexState {
     }
 }
 
+/// Diagnostics as persisted under `'O' || graph_id`, tagged with the graph's
+/// vector clock at the moment they were computed.
+///
+/// The tag is what makes the cache self-checking: every quad-mutating commit
+/// advances the graph clock (`set_vector_clock` is part of the same batch), so
+/// `at_clock != current clock` proves the record describes an older state and
+/// must be recomputed. See derived-state register row 4 / finding K6.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StoredDiagnostics {
+    diagnostics: GraphDiagnostics,
+    at_clock: VectorClock,
+}
+
+/// Number of times [`GraphStore::compute_graph_diagnostics`] has run in this
+/// process. Tests use it to prove that a reopen served diagnostics from the
+/// persisted record rather than recomputing them.
+static DIAGNOSTICS_COMPUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Consumed by WS0 tests and by WS1's diagnostics work; not called by the
+// library itself.
+#[allow(dead_code)]
+pub(crate) fn diagnostics_compute_count() -> u64 {
+    DIAGNOSTICS_COMPUTE_COUNT.load(Ordering::Relaxed)
+}
+
 pub struct GraphStore {
     db: Database,
     persist_mode: PersistMode,
@@ -317,13 +397,112 @@ pub struct GraphStore {
     quads: Keyspace,
     graphs: Keyspace,
     log: Keyspace,
+    /// Guards first-write-wins term interning, sharded by term id.
     term_locks: Vec<Mutex<()>>,
+    /// Guards whole read→write→commit cycles of one graph's CRDT state; see
+    /// [`GraphStore::graph_commit_guard`].
+    commit_locks: Vec<Mutex<()>>,
     indexes: RwLock<IndexState>,
     derived_indexes: RwLock<Option<DerivedIndexState>>,
     object_order_cache: RwLock<ObjectOrderCache>,
-    diagnostics_cache: RwLock<HashMap<TermId, GraphDiagnostics>>,
-    graph_term_cache: RwLock<HashMap<TermId, EncodedTerm>>,
+    /// Memory mirror of the persisted `'O'` records; always carries the clock
+    /// tag so a reader can tell a fresh entry from a stale one.
+    diagnostics_cache: RwLock<HashMap<TermId, StoredDiagnostics>>,
+    /// Global term-id → term cache. Term ids are content hashes, so an entry
+    /// can never become wrong; the map is bounded by clearing at
+    /// [`TERM_DECODE_CACHE_CAP`] (WS0-T4).
+    term_decode_cache: RwLock<HashMap<TermId, Arc<EncodedTerm>>>,
     dirty_counter: AtomicU64,
+    #[cfg(test)]
+    corrupt_index_hook: AtomicU64,
+}
+
+// ── Frozen WS0 parameter structs ────────────────────────────────────────────
+
+/// RAII guard serializing all read→write cycles of one graph's CRDT state
+/// (dot sets, log heads, vector clock, meta, diagnostics tag).
+///
+/// Sharded: [`COMMIT_LOCK_SHARDS`] shards keyed by the hash of the graph term;
+/// collisions merely serialize unrelated graphs (accepted simplicity trade).
+///
+/// **Lock order: graph commit guard ▸ term shard locks.** NEVER acquire a
+/// second commit guard while holding one — `std::sync::Mutex` is not reentrant
+/// and doing so self-deadlocks.
+///
+/// These `GraphStore` methods are **self-guarding**: they take the guard
+/// themselves and therefore MUST NOT be called while a guard is held:
+///
+/// * [`GraphStore::create_graph`]
+/// * [`GraphStore::delete_graph`]
+/// * [`GraphStore::set_graph_policy`]
+/// * [`GraphStore::set_irokle_topic_id`]
+/// * [`GraphStore::set_graph_context`]
+/// * [`GraphStore::set_graph_tombstone`]
+///
+/// The batch-parameterized functions (`insert_quad`, `remove_quad`,
+/// `set_vector_clock`, `next_counter`, `enqueue_fts*`) do **not** lock; their
+/// contract is "the caller holds the guard".
+///
+/// Poisoned mutexes are recovered with
+/// `unwrap_or_else(PoisonError::into_inner)`: the state the guard protects
+/// lives in fjall, not behind the mutex, so a panicking writer cannot leave
+/// torn data reachable only through the lock.
+pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+/// An OR-Set add: contributes exactly one unique dot to the quad's dot set (G1).
+pub struct QuadAdd {
+    pub quad: EncodedQuad,
+    pub dot: Dot,
+}
+
+/// An OR-Set remove: deletes exactly the dots contained in the witnessed clock
+/// and can never kill a dot it did not witness (G1).
+pub struct QuadRemove<'a> {
+    pub quad: EncodedQuad,
+    pub witnessed: &'a VectorClock,
+}
+
+pub struct ClockUpdate<'a> {
+    pub graph_id: TermId,
+    pub clock: &'a VectorClock,
+}
+
+pub struct CounterKey {
+    pub graph_id: TermId,
+    pub actor: ActorId,
+}
+
+/// Batch-scoped term interning context: the write batch the terms are staged
+/// into plus the caller's term → id memo.
+pub struct BatchTermCtx<'a> {
+    pub batch: &'a mut WriteBatch,
+    pub cache: &'a mut HashMap<String, TermId>,
+}
+
+pub struct FtsSubject {
+    pub graph_id: TermId,
+    pub subject: TermId,
+}
+
+pub struct FtsEnqueue<'a> {
+    pub graph_id: TermId,
+    pub subjects: &'a HashSet<TermId>,
+}
+
+pub struct SubjectPredicate<'a> {
+    pub graph: &'a GraphId,
+    pub subject: &'a EncodedTerm,
+    pub predicate: &'a EncodedTerm,
+}
+
+pub enum PageCursor<'a> {
+    Offset(usize),
+    After(Option<&'a EncodedTerm>),
+}
+
+pub struct PageRequest<'a> {
+    pub cursor: PageCursor<'a>,
+    pub limit: usize,
 }
 
 fn decode_u64_bytes(bytes: &[u8], context: &'static str) -> Result<u64> {
@@ -365,8 +544,19 @@ fn decode_dots(bytes: &[u8]) -> Result<Vec<Dot>> {
     Ok(dots)
 }
 
+/// Is a stored dot payload the empty set?
+///
+/// Both encodings start with one header byte — the `DOT_ENCODING_TAG` for the
+/// packed form, a postcard length prefix of `0` for the legacy form — so any
+/// payload of one byte or less carries no dots and the quad is dead.
+fn dot_payload_is_empty(bytes: &[u8]) -> bool {
+    bytes.len() <= 1
+}
+
 fn normalize_dots(dots: &mut Vec<Dot>) {
-    dots.sort_by_key(|dot| (dot.actor, dot.counter));
+    dots.sort_unstable_by(|left, right| {
+        (left.actor, left.counter).cmp(&(right.actor, right.counter))
+    });
     dots.dedup();
 }
 
@@ -432,6 +622,20 @@ fn graph_meta_prefix() -> [u8; 1] {
     [GRAPH_META_PREFIX]
 }
 
+fn graph_clock_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_CLOCK_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn graph_diagnostics_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = GRAPH_DIAGNOSTICS_PREFIX;
+    key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
 fn topic_clock_key(topic_id: &[u8; 32]) -> [u8; 33] {
     let mut key = [0u8; 33];
     key[0] = TOPIC_CLOCK_PREFIX;
@@ -476,6 +680,27 @@ fn log_head_prefix(graph: TermId) -> [u8; 17] {
     key
 }
 
+/// Confirm that the bytes already stored under a term id really are `term`.
+///
+/// Compares raw bytes and only decodes on mismatch, i.e. on the
+/// (astronomically unlikely) hash-collision path that needs a message.
+fn confirm_stored_term(stored: &[u8], term: &EncodedTerm) -> Result<()> {
+    if stored == term.0.as_bytes() {
+        return Ok(());
+    }
+    Err(StoreError::TermCollision {
+        attempted: term.0.clone(),
+        existing: decode_term_utf8(stored)?,
+    })
+}
+
+fn decode_term_utf8(bytes: &[u8]) -> Result<String> {
+    String::from_utf8(bytes.to_vec()).map_err(|error| StoreError::InvalidEncoding {
+        context: "terms",
+        message: error.to_string(),
+    })
+}
+
 fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<TermId> {
     let raw: [u8; 16] = bytes.try_into().map_err(|_| StoreError::InvalidEncoding {
         context,
@@ -487,6 +712,35 @@ fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<TermId> {
 impl GraphStore {
     fn term_lock_index(&self, id: TermId) -> usize {
         (id.0 as usize) % self.term_locks.len()
+    }
+
+    // ── Locking (WS0-T1) ────────────────────────────────────────────────────
+
+    /// Serialize the whole read→write→commit cycle for `graph`.
+    ///
+    /// See [`GraphCommitGuard`] for the lock order and the list of
+    /// self-guarding functions that must not be called while this is held.
+    pub(crate) fn graph_commit_guard(&self, graph: &GraphId) -> GraphCommitGuard<'_> {
+        self.graph_commit_guard_by_id(hash_term(&EncodedTerm::from_named_node(&graph.0)))
+    }
+
+    /// Id-keyed twin of [`GraphStore::graph_commit_guard`]. The shard is chosen
+    /// from the graph term id, so both entry points map to the same lock.
+    pub(crate) fn graph_commit_guard_by_id(&self, graph_id: TermId) -> GraphCommitGuard<'_> {
+        let shard = (graph_id.0 as usize) % self.commit_locks.len();
+        GraphCommitGuard(
+            self.commit_locks[shard]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    fn indexes_read(&self) -> RwLockReadGuard<'_, IndexState> {
+        self.indexes.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn indexes_write(&self) -> RwLockWriteGuard<'_, IndexState> {
+        self.indexes.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn pending_term_in_batch<'a>(
@@ -518,22 +772,14 @@ impl GraphStore {
         }
 
         if let Some(existing) = self.terms.get(key)? {
-            let existing = String::from_utf8(existing.to_vec()).map_err(|error| {
-                StoreError::InvalidEncoding {
-                    context: "terms",
-                    message: error.to_string(),
-                }
-            })?;
-            if existing == term.0 {
-                return Ok(id);
-            }
-            return Err(StoreError::TermCollision {
-                attempted: term.0.clone(),
-                existing,
-            });
+            confirm_stored_term(existing.as_ref(), term)?;
+            return Ok(id);
         }
 
-        let _guard = self.term_locks[self.term_lock_index(id)].lock().unwrap();
+        // Guards first-write-wins interning for this term id's shard.
+        let _term_shard = self.term_locks[self.term_lock_index(id)]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(existing) = self.pending_term_in_batch(batch.as_deref(), id) {
             if existing == term.0 {
                 return Ok(id);
@@ -545,19 +791,8 @@ impl GraphStore {
         }
 
         if let Some(existing) = self.terms.get(key)? {
-            let existing = String::from_utf8(existing.to_vec()).map_err(|error| {
-                StoreError::InvalidEncoding {
-                    context: "terms",
-                    message: error.to_string(),
-                }
-            })?;
-            if existing == term.0 {
-                return Ok(id);
-            }
-            return Err(StoreError::TermCollision {
-                attempted: term.0.clone(),
-                existing,
-            });
+            confirm_stored_term(existing.as_ref(), term)?;
+            return Ok(id);
         }
 
         if let Some(batch) = batch {
@@ -586,7 +821,7 @@ impl GraphStore {
         }
     }
 
-    fn current_quad_dots(&self, batch: &WriteBatch, key: &[u8]) -> Result<Vec<Dot>> {
+    fn current_quad_dots(&self, batch: &WriteBatch, key: &QuadKey) -> Result<Vec<Dot>> {
         if let Some(state) = batch.pending_quad_states.get(key) {
             return Ok(state.clone().unwrap_or_default());
         }
@@ -605,16 +840,14 @@ impl GraphStore {
         let was_live = !previous.is_empty();
         let is_live = !dots.is_empty();
 
-        batch.touched_graphs.insert(quad.graph);
-        batch.pending_quad_states.insert(
-            key.to_vec(),
-            if is_live { Some(dots.clone()) } else { None },
-        );
-
         if is_live {
+            // Encode first so the dot vector can be moved into the pending map
+            // instead of cloned (WS0-T8).
             batch.insert(&self.quads, key, encode_dots(&dots));
+            batch.pending_quad_states.insert(key, Some(dots));
         } else {
             batch.remove(&self.quads, key);
+            batch.pending_quad_states.insert(key, None);
         }
 
         match (was_live, is_live) {
@@ -637,7 +870,7 @@ impl GraphStore {
             if key.len() != 64 {
                 continue;
             }
-            if decode_dots(value.as_ref())?.is_empty() {
+            if dot_payload_is_empty(value.as_ref()) {
                 continue;
             }
             indexes.insert_quad(Self::decode_quad_key(key.as_ref())?);
@@ -645,31 +878,70 @@ impl GraphStore {
         Ok(indexes)
     }
 
+    /// Rebuild every derived structure from the durable `quads` keyspace, the
+    /// source of truth. This is the repair action for derived-state register
+    /// rows 1–3 and 6.
     fn rebuild_indexes(&self) -> Result<()> {
         let indexes = self.build_indexes()?;
-        *self.indexes.write().unwrap() = indexes;
-        *self.derived_indexes.write().unwrap() = None;
-        self.object_order_cache.write().unwrap().clear();
-        self.diagnostics_cache.write().unwrap().clear();
-        self.graph_term_cache.write().unwrap().clear();
+        // Order matters only in that all derived state is dropped before the
+        // fresh index becomes visible; every consumer rebuilds lazily.
+        *self.indexes_write() = indexes;
+        *self
+            .derived_indexes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.object_order_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.term_decode_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 
-    fn apply_quad_mutations(&self, mutations: Vec<QuadMutation>, _touched_graphs: HashSet<TermId>) {
+    /// Apply a committed batch's quad mutations to the in-memory indexes.
+    ///
+    /// Runs after the durable commit, so the store already holds the new truth.
+    /// If any mutation reports an [`IndexApply::Anomaly`] the index has drifted
+    /// from the store and is rebuilt **synchronously, before this call
+    /// returns** — the derived state is never left inconsistent past the commit
+    /// that detected the drift (WS0-T2, plan constraint #3).
+    fn apply_quad_mutations(&self, mutations: Vec<QuadMutation>) -> Result<()> {
         if mutations.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let mut indexes = self.indexes.write().unwrap();
-        for mutation in &mutations {
-            match mutation {
-                QuadMutation::Insert(quad) => indexes.insert_quad(*quad),
-                QuadMutation::Remove(quad) => indexes.remove_quad(*quad),
+        let mut anomaly = false;
+        {
+            // Guards IndexState: the (graph, subject) → (predicate, object) map.
+            let mut indexes = self.indexes_write();
+            for mutation in &mutations {
+                let outcome = match mutation {
+                    QuadMutation::Insert(quad) => indexes.insert_quad(*quad),
+                    QuadMutation::Remove(quad) => indexes.remove_quad(*quad),
+                };
+                anomaly |= outcome == IndexApply::Anomaly;
             }
         }
-        drop(indexes);
 
-        if let Some(derived) = self.derived_indexes.write().unwrap().as_mut() {
+        if anomaly {
+            // Drop the mirror and the order cache with it; rebuild_indexes
+            // resets both from the store.
+            tracing::warn!(
+                "index anomaly detected while applying a commit; rebuilding indexes from the store"
+            );
+            return self.rebuild_indexes();
+        }
+
+        // Guards the lazily built planner/cross-graph mirror of IndexState.
+        if let Some(derived) = self
+            .derived_indexes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
             for mutation in &mutations {
                 match mutation {
                     QuadMutation::Insert(quad) => derived.insert_quad(*quad),
@@ -678,17 +950,22 @@ impl GraphStore {
             }
         }
 
-        let mut cache = self.object_order_cache.write().unwrap();
+        // Guards the (graph, subject, predicate) → sorted objects cache.
+        let mut cache = self
+            .object_order_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         for mutation in &mutations {
             let quad = match mutation {
                 QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
             };
             cache.remove(&(quad.graph, quad.subject, quad.predicate));
         }
+        Ok(())
     }
 
     fn build_derived_indexes(&self) -> DerivedIndexState {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes_read();
         let mut derived = DerivedIndexState::default();
         for (&(graph, subject), entries) in &indexes.by_graph_subject {
             for &(predicate, object) in entries {
@@ -709,13 +986,19 @@ impl GraphStore {
 
     fn with_derived_indexes<R>(&self, f: impl FnOnce(&DerivedIndexState) -> R) -> R {
         {
-            let guard = self.derived_indexes.read().unwrap();
+            let guard = self
+                .derived_indexes
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(derived) = guard.as_ref() {
                 return f(derived);
             }
         }
 
-        let mut guard = self.derived_indexes.write().unwrap();
+        let mut guard = self
+            .derived_indexes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if guard.is_none() {
             *guard = Some(self.build_derived_indexes());
         }
@@ -723,6 +1006,7 @@ impl GraphStore {
     }
 
     fn compute_graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
+        DIAGNOSTICS_COMPUTE_COUNT.fetch_add(1, Ordering::Relaxed);
         let snapshot = crate::rules::GraphSnapshot::from_store(self, graph)?;
         Ok(GraphDiagnostics::from_orphaned_entities(
             crate::rules::orphaned_data_entities(&snapshot)
@@ -736,12 +1020,31 @@ impl GraphStore {
         ))
     }
 
-    fn prime_graph_diagnostics(&self) -> Result<()> {
-        let mut cache = self.diagnostics_cache.write().unwrap();
-        cache.clear();
-        for graph in self.graphs()? {
-            if let Some(graph_id) = self.graph_id_for(&graph)? {
-                cache.insert(graph_id, self.compute_graph_diagnostics(&graph)?);
+    /// Open-time repair pass for the persisted diagnostics (register row 4).
+    ///
+    /// A record whose clock tag still matches the graph's clock describes the
+    /// current state and is simply loaded into the memory cache; anything else
+    /// (missing record, or a tag left behind by a crash between the quad commit
+    /// and the diagnostics write) is recomputed and re-persisted right here,
+    /// not lazily.
+    fn repair_graph_diagnostics_at_open(&self) -> Result<()> {
+        self.diagnostics_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+
+        for graph_id in self.graph_term_ids()? {
+            let clock = self.get_vector_clock_by_id(graph_id)?;
+            match self.read_stored_diagnostics(graph_id)? {
+                Some(record) if record.at_clock == clock => {
+                    self.diagnostics_cache
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(graph_id, record);
+                }
+                _ => {
+                    self.recompute_graph_diagnostics(graph_id)?;
+                }
             }
         }
         Ok(())
@@ -758,7 +1061,7 @@ impl GraphStore {
         predicate: Option<TermId>,
         object: Option<TermId>,
     ) -> Vec<EncodedQuad> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes_read();
         let Some(entries) = indexes.by_graph_subject.get(&(graph, subject)) else {
             return Vec::new();
         };
@@ -787,7 +1090,7 @@ impl GraphStore {
         predicate: Option<TermId>,
         object: Option<TermId>,
     ) -> Vec<EncodedQuad> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes_read();
         let Some(subjects) = indexes.graph_subjects.get(&graph) else {
             return Vec::new();
         };
@@ -1125,13 +1428,17 @@ impl GraphStore {
             .map(usize::from)
             .unwrap_or(4)
             .min(32);
-        #[allow(deprecated)]
+        // `max_write_buffer_size` is `#[deprecated = "todo"]` and `#[doc(hidden)]`
+        // upstream (fjall 3.1.6) — a knob whose behaviour is not settled. We
+        // stop setting it (WS0-T7, plan SECTION 6 item 3) rather than pin
+        // durability behaviour to an unstable option; per-keyspace
+        // `max_memtable_size` below still bounds memtable growth, so the
+        // durability contract (G10) is unchanged.
         let db = Database::builder(path.as_ref())
             .manual_journal_persist(true)
             .cache_size(recommended_db_cache_bytes())
             .journal_compression(CompressionType::None)
             .max_journaling_size(16 * 1_024 * 1_024 * 1_024)
-            .max_write_buffer_size(Some(24 * 1_024 * 1_024 * 1_024))
             .worker_threads(worker_threads)
             .open()?;
         Self::from_database_with_persist_mode(db, persist_mode)
@@ -1171,17 +1478,46 @@ impl GraphStore {
             db,
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             indexes: RwLock::new(IndexState::default()),
             derived_indexes: RwLock::new(None),
             object_order_cache: RwLock::new(HashMap::new()),
             diagnostics_cache: RwLock::new(HashMap::new()),
-            graph_term_cache: RwLock::new(HashMap::new()),
+            term_decode_cache: RwLock::new(HashMap::new()),
             dirty_counter: AtomicU64::new(1),
+            #[cfg(test)]
+            corrupt_index_hook: AtomicU64::new(0),
         };
 
         store.rebuild_indexes()?;
-        store.prime_graph_diagnostics()?;
+        store.restore_dirty_counter()?;
+        store.repair_graph_diagnostics_at_open()?;
         Ok(store)
+    }
+
+    /// Restore the FTS queue token counter across restarts (WS0-T6, **K4**).
+    ///
+    /// Acknowledgement is token-comparison based: a reindex/delete entry clears
+    /// every subject entry whose token is `<=` its own. If the counter restarted
+    /// at 1, a subject enqueued *after* a restart would get a token below a
+    /// reindex token issued *before* it and be silently dropped without tantivy
+    /// ever having processed it — a silent search-index data loss (G7). Seeding
+    /// the counter past every live token makes tokens strictly increasing across
+    /// restarts, which is exactly what the acknowledgement rule assumes.
+    fn restore_dirty_counter(&self) -> Result<()> {
+        let mut highest = 0u64;
+        for prefix in [
+            graph_dirty_prefix(),
+            graph_reindex_prefix(),
+            graph_search_delete_prefix(),
+        ] {
+            for guard in self.graphs.prefix(prefix) {
+                let (_, value) = guard.into_inner()?;
+                highest = highest.max(decode_u64_bytes(value.as_ref(), "fts queue token")?);
+            }
+        }
+        self.dirty_counter.store(highest + 1, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn database(&self) -> &Database {
@@ -1205,20 +1541,47 @@ impl GraphStore {
         self.encode_term_internal(None, term)
     }
 
+    /// Intern `term` into `cx.batch`, memoized in `cx.cache`.
+    pub fn resolve_term_in_ctx(
+        &self,
+        cx: &mut BatchTermCtx<'_>,
+        term: &EncodedTerm,
+    ) -> Result<TermId> {
+        if let Some(&id) = cx.cache.get(term.0.as_str()) {
+            return Ok(id);
+        }
+        let id = self.encode_term_internal(Some(cx.batch), term)?;
+        cx.cache.insert(term.0.clone(), id);
+        Ok(id)
+    }
+
+    /// Intern every term that is not memoized yet, in one pass.
+    pub fn seed_term_cache_in_ctx<'t>(
+        &self,
+        cx: &mut BatchTermCtx<'_>,
+        terms: impl IntoIterator<Item = &'t EncodedTerm>,
+    ) -> Result<()> {
+        for term in terms {
+            self.resolve_term_in_ctx(cx, term)?;
+        }
+        Ok(())
+    }
+
+    #[deprecated(
+        note = "use GraphStore::resolve_term_in_ctx with a BatchTermCtx; removed in W-CLEAN"
+    )]
     pub fn resolve_term_cached(
         &self,
         batch: &mut WriteBatch,
         cache: &mut HashMap<String, TermId>,
         term: &EncodedTerm,
     ) -> Result<TermId> {
-        if let Some(&id) = cache.get(term.0.as_str()) {
-            return Ok(id);
-        }
-        let id = self.encode_term_internal(Some(batch), term)?;
-        cache.insert(term.0.clone(), id);
-        Ok(id)
+        self.resolve_term_in_ctx(&mut BatchTermCtx { batch, cache }, term)
     }
 
+    #[deprecated(
+        note = "use GraphStore::seed_term_cache_in_ctx with a BatchTermCtx; removed in W-CLEAN"
+    )]
     pub fn seed_term_cache<'a, I>(
         &self,
         batch: &mut WriteBatch,
@@ -1228,43 +1591,54 @@ impl GraphStore {
     where
         I: IntoIterator<Item = &'a EncodedTerm>,
     {
-        for term in terms {
-            if cache.contains_key(term.0.as_str()) {
-                continue;
-            }
-            let id = self.encode_term_internal(Some(batch), term)?;
-            cache.insert(term.0.clone(), id);
-        }
-        Ok(())
+        self.seed_term_cache_in_ctx(&mut BatchTermCtx { batch, cache }, terms)
     }
 
-    pub fn decode_term(&self, id: TermId) -> Result<EncodedTerm> {
+    fn read_term(&self, id: TermId) -> Result<EncodedTerm> {
         match self.terms.get(id.to_be_bytes())? {
-            Some(bytes) => Ok(EncodedTerm(String::from_utf8(bytes.to_vec()).map_err(
-                |error| StoreError::InvalidEncoding {
-                    context: "terms",
-                    message: error.to_string(),
-                },
-            )?)),
+            Some(bytes) => Ok(EncodedTerm(decode_term_utf8(bytes.as_ref())?)),
             None => Err(StoreError::TermNotFound(id.0)),
         }
     }
 
-    /// Decode a graph name term through a store-level cache. Term ids are
-    /// content hashes so the mapping is immutable; entries are evicted on
-    /// graph deletion only to bound the cache by the live graph count. Query
-    /// visibility checks decode each touched graph IRI, so caching here turns
-    /// a per-query store read per graph into a map hit.
-    pub fn decode_graph_term(&self, id: TermId) -> Result<EncodedTerm> {
-        if let Some(term) = self.graph_term_cache.read().unwrap().get(&id) {
+    /// Decode a term id through the global term cache (WS0-T4).
+    ///
+    /// Term ids are content hashes of immutable term bytes, so a cached entry
+    /// can never become stale and needs no invalidation path — the only bound
+    /// is the cap, at which the whole map is cleared. Returns an `Arc` so hot
+    /// paths (visibility checks, snapshot/fingerprint scans) share one
+    /// allocation instead of cloning the string per lookup.
+    pub(crate) fn decode_term_arc(&self, id: TermId) -> Result<Arc<EncodedTerm>> {
+        if let Some(term) = self
+            .term_decode_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+        {
             return Ok(term.clone());
         }
-        let term = self.decode_term(id)?;
-        self.graph_term_cache
+
+        let term = Arc::new(self.read_term(id)?);
+        // Guards the term-id → term cache.
+        let mut cache = self
+            .term_decode_cache
             .write()
-            .unwrap()
-            .insert(id, term.clone());
-        Ok(term)
+            .unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= TERM_DECODE_CACHE_CAP {
+            cache.clear();
+        }
+        Ok(cache.entry(id).or_insert(term).clone())
+    }
+
+    pub fn decode_term(&self, id: TermId) -> Result<EncodedTerm> {
+        Ok(self.decode_term_arc(id)?.as_ref().clone())
+    }
+
+    /// Decode a graph name term. Graph IRIs are decoded on every visibility
+    /// check, so this goes through the same global cache as any other term
+    /// (derived-state register row 5, folded into row 6).
+    pub fn decode_graph_term(&self, id: TermId) -> Result<EncodedTerm> {
+        self.decode_term(id)
     }
 
     pub fn lookup_term(&self, term: &EncodedTerm) -> Result<Option<TermId>> {
@@ -1272,17 +1646,14 @@ impl GraphStore {
         let Some(existing) = self.terms.get(id.to_be_bytes())? else {
             return Ok(None);
         };
-        let existing =
-            String::from_utf8(existing.to_vec()).map_err(|error| StoreError::InvalidEncoding {
-                context: "terms",
-                message: error.to_string(),
-            })?;
-        if existing == term.0 {
+        // Compare the raw bytes; only decode when they differ, i.e. on the
+        // (astronomically unlikely) hash collision path that needs the message.
+        if existing.as_ref() == term.0.as_bytes() {
             return Ok(Some(id));
         }
         Err(StoreError::TermCollision {
             attempted: term.0.clone(),
-            existing,
+            existing: decode_term_utf8(existing.as_ref())?,
         })
     }
 
@@ -1290,7 +1661,10 @@ impl GraphStore {
         self.encode_term(term)
     }
 
+    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
+    /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn create_graph(&self, graph: &GraphId) -> Result<()> {
+        let _commit_guard = self.graph_commit_guard(graph);
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
@@ -1309,10 +1683,18 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(false);
         };
-        Ok(self.read_graph_meta_by_id(graph_id)?.is_some())
+        self.contains_graph_by_id(graph_id)
     }
 
+    /// O(1) existence probe that never decodes the metadata record (WS0-T9).
+    pub(crate) fn contains_graph_by_id(&self, graph_id: TermId) -> Result<bool> {
+        Ok(self.graphs.contains_key(graph_meta_key(graph_id))?)
+    }
+
+    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
+    /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn delete_graph(&self, graph: &GraphId) -> Result<()> {
+        let _commit_guard = self.graph_commit_guard(graph);
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(());
         };
@@ -1324,6 +1706,11 @@ impl GraphStore {
         })?;
 
         batch.remove(&self.graphs, graph_meta_key(graph_id));
+        // The clock and the diagnostics record live under their own keys since
+        // WS0-T3/T5; a recreated graph must start from a fresh clock, not
+        // inherit the deleted one (register row 13).
+        batch.remove(&self.graphs, graph_clock_key(graph_id));
+        batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
             batch.remove(&self.graphs, key);
@@ -1351,11 +1738,13 @@ impl GraphStore {
         }
 
         self.commit(batch)?;
-        self.diagnostics_cache.write().unwrap().remove(&graph_id);
-        self.graph_term_cache.write().unwrap().remove(&graph_id);
+        self.diagnostics_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&graph_id);
         self.object_order_cache
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|(graph_term, _, _), _| *graph_term != graph_id);
         Ok(())
     }
@@ -1364,11 +1753,16 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(true);
         };
-        let indexes = self.indexes.read().unwrap();
-        Ok(indexes
+        Ok(self.graph_subject_count(graph_id) == 0)
+    }
+
+    /// Live subject count for a graph, straight off the in-memory index (WS0-T9).
+    pub(crate) fn graph_subject_count(&self, graph_id: TermId) -> usize {
+        self.indexes_read()
             .graph_subjects
             .get(&graph_id)
-            .is_none_or(Vec::is_empty))
+            .map(HashSet::len)
+            .unwrap_or(0)
     }
 
     pub fn contains_subject(&self, graph: &GraphId, subject: &EncodedTerm) -> Result<bool> {
@@ -1379,7 +1773,7 @@ impl GraphStore {
             return Ok(false);
         };
 
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes_read();
         Ok(indexes
             .by_graph_subject
             .contains_key(&(graph_id, subject_id)))
@@ -1419,16 +1813,84 @@ impl GraphStore {
             })
     }
 
+    // ── Persisted, clock-tagged diagnostics (WS0-T5, finding K6) ────────────
+
+    fn read_stored_diagnostics(&self, graph_id: TermId) -> Result<Option<StoredDiagnostics>> {
+        self.graphs
+            .get(graph_diagnostics_key(graph_id))?
+            .map(|bytes| postcard::from_bytes(bytes.as_ref()))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn store_diagnostics_record(
+        &self,
+        graph_id: TermId,
+        record: StoredDiagnostics,
+    ) -> Result<GraphDiagnostics> {
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.graphs,
+            graph_diagnostics_key(graph_id),
+            postcard::to_allocvec(&record)?,
+        );
+        batch.commit()?;
+        let diagnostics = record.diagnostics.clone();
+        // Guards the in-memory mirror of the persisted 'O' records.
+        self.diagnostics_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(graph_id, record);
+        Ok(diagnostics)
+    }
+
+    /// Recompute a graph's diagnostics from the store and persist them.
+    ///
+    /// The clock is read *before* computing so a concurrent commit can only
+    /// make the tag look older than it is. That direction is safe: it triggers
+    /// one more recomputation, never a stale record wrongly accepted as fresh
+    /// (G6).
+    fn recompute_graph_diagnostics(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
+        let at_clock = self.get_vector_clock_by_id(graph_id)?;
+        let graph = self.graph_name_by_id(graph_id)?;
+        let diagnostics = self.compute_graph_diagnostics(&graph)?;
+        self.store_diagnostics_record(
+            graph_id,
+            StoredDiagnostics {
+                diagnostics,
+                at_clock,
+            },
+        )
+    }
+
+    fn graph_name_by_id(&self, graph_id: TermId) -> Result<GraphId> {
+        let term = self.decode_term_arc(graph_id)?;
+        term.to_named_node()
+            .map(GraphId)
+            .ok_or_else(|| StoreError::InvalidEncoding {
+                context: "graph term",
+                message: term.0.clone(),
+            })
+    }
+
+    /// Persist `diagnostics` for `graph`, tagged with the graph's current
+    /// vector clock, and refresh the memory cache.
+    ///
+    /// **Call while holding the graph commit guard** so no commit can slip
+    /// between the state the caller measured and the clock recorded here;
+    /// otherwise the record can be tagged with a clock newer than the state it
+    /// describes and readers would accept it as fresh.
     pub fn set_graph_diagnostics(
         &self,
         graph: &GraphId,
         diagnostics: &GraphDiagnostics,
     ) -> Result<()> {
         let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
-        self.diagnostics_cache
-            .write()
-            .unwrap()
-            .insert(graph_id, diagnostics.clone());
+        let record = StoredDiagnostics {
+            diagnostics: diagnostics.clone(),
+            at_clock: self.get_vector_clock_by_id(graph_id)?,
+        };
+        self.store_diagnostics_record(graph_id, record)?;
         Ok(())
     }
 
@@ -1436,42 +1898,51 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(GraphDiagnostics::default());
         };
-
-        if let Some(cached) = self.diagnostics_cache.read().unwrap().get(&graph_id) {
-            return Ok(cached.clone());
-        }
-
-        let diagnostics = self.compute_graph_diagnostics(graph)?;
-        self.diagnostics_cache
-            .write()
-            .unwrap()
-            .insert(graph_id, diagnostics.clone());
-        Ok(diagnostics)
+        self.graph_diagnostics_by_id(graph_id)
     }
 
     /// Like [`GraphStore::graph_diagnostics`], but keyed by the graph term id
     /// so cache hits avoid decode/lookup round trips through the term table.
+    ///
+    /// Every read verifies the clock tag, so a reader can never be served
+    /// diagnostics that describe an older state: a mismatch is repaired inline,
+    /// on this call (derived-state register row 4, max staleness zero).
     pub fn graph_diagnostics_by_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
-        if let Some(cached) = self.diagnostics_cache.read().unwrap().get(&graph_id) {
-            return Ok(cached.clone());
+        let clock = self.get_vector_clock_by_id(graph_id)?;
+
+        if let Some(record) = self
+            .diagnostics_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&graph_id)
+            && record.at_clock == clock
+        {
+            return Ok(record.diagnostics.clone());
         }
 
-        let graph_term = self.decode_graph_term(graph_id)?;
-        let Some(graph_name) = graph_term.to_named_node() else {
-            return Err(StoreError::InvalidEncoding {
-                context: "graph term",
-                message: graph_term.0,
-            });
-        };
-        let diagnostics = self.compute_graph_diagnostics(&GraphId(graph_name))?;
-        self.diagnostics_cache
-            .write()
-            .unwrap()
-            .insert(graph_id, diagnostics.clone());
-        Ok(diagnostics)
+        if let Some(record) = self.read_stored_diagnostics(graph_id)?
+            && record.at_clock == clock
+        {
+            let diagnostics = record.diagnostics.clone();
+            self.diagnostics_cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(graph_id, record);
+            return Ok(diagnostics);
+        }
+
+        // A graph with no metadata record has no diagnostics to persist; do not
+        // create an orphan 'O' key for it.
+        if !self.contains_graph_by_id(graph_id)? {
+            return Ok(GraphDiagnostics::default());
+        }
+        self.recompute_graph_diagnostics(graph_id)
     }
 
+    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
+    /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
+        let _commit_guard = self.graph_commit_guard(graph);
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
@@ -1505,7 +1976,12 @@ impl GraphStore {
             .irokle_topic)
     }
 
+    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
+    /// while a commit guard is held (see [`GraphCommitGuard`]). In particular
+    /// `IrokleGraphSync::ensure_graph_topic` reaches this, so any publish that
+    /// may bind a topic must run *before* the caller takes its guard (addendum A1).
     pub fn set_irokle_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
+        let _commit_guard = self.graph_commit_guard(graph);
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
@@ -1557,6 +2033,9 @@ impl GraphStore {
     }
 
     /// Persist the raw RO-Crate render hints and their ordering tag.
+    ///
+    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
+    /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn set_graph_context(
         &self,
         graph: &GraphId,
@@ -1565,6 +2044,7 @@ impl GraphStore {
         license_digest: Option<[u8; 32]>,
         tag: ContextTag,
     ) -> Result<()> {
+        let _commit_guard = self.graph_commit_guard(graph);
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
@@ -1614,7 +2094,10 @@ impl GraphStore {
         Ok(self.graphs.get(graph_tombstone_key(graph_id))?.is_some())
     }
 
+    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
+    /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn set_graph_tombstone(&self, graph: &GraphId) -> Result<()> {
+        let _commit_guard = self.graph_commit_guard(graph);
         let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
         let mut batch = self.buffered_batch();
         batch.insert(&self.graphs, graph_tombstone_key(graph_id), []);
@@ -1632,19 +2115,15 @@ impl GraphStore {
             });
         };
 
+        // One prefix scan yields both the quads and their dot sets, instead of
+        // an index scan plus a point read per quad (WS0-T9).
         let mut quads = Vec::new();
-        let mut term_cache = HashMap::new();
-        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+        self.for_each_stored_quad(graph_id, |quad, dots| {
             quads.push(SnapshotQuadState {
-                subject: self.decode_term_cached(&mut term_cache, quad.subject)?,
-                predicate: self.decode_term_cached(&mut term_cache, quad.predicate)?,
-                object: self.decode_term_cached(&mut term_cache, quad.object)?,
-                dots: self.read_quad_dots(&Self::quad_key(
-                    graph_id,
-                    quad.subject,
-                    quad.predicate,
-                    quad.object,
-                ))?,
+                subject: self.decode_term_arc(quad.subject)?.as_ref().clone(),
+                predicate: self.decode_term_arc(quad.predicate)?.as_ref().clone(),
+                object: self.decode_term_arc(quad.object)?.as_ref().clone(),
+                dots: decode_dots(dots)?,
             });
             Ok(())
         })?;
@@ -1665,26 +2144,13 @@ impl GraphStore {
         let mut count = 0u64;
         let mut xor = [0u8; 32];
         let mut sum = [0u8; 32];
-        let mut term_cache = HashMap::new();
-        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+        self.for_each_stored_quad(graph_id, |quad, _dots| {
             let mut hasher = blake3::Hasher::new();
-            hasher.update(
-                self.decode_term_cached(&mut term_cache, quad.subject)?
-                    .0
-                    .as_bytes(),
-            );
+            hasher.update(self.decode_term_arc(quad.subject)?.0.as_bytes());
             hasher.update(&[0]);
-            hasher.update(
-                self.decode_term_cached(&mut term_cache, quad.predicate)?
-                    .0
-                    .as_bytes(),
-            );
+            hasher.update(self.decode_term_arc(quad.predicate)?.0.as_bytes());
             hasher.update(&[0]);
-            hasher.update(
-                self.decode_term_cached(&mut term_cache, quad.object)?
-                    .0
-                    .as_bytes(),
-            );
+            hasher.update(self.decode_term_arc(quad.object)?.0.as_bytes());
             let quad_hash = hasher.finalize();
             for (index, byte) in quad_hash.as_bytes().iter().enumerate() {
                 xor[index] ^= byte;
@@ -1703,7 +2169,7 @@ impl GraphStore {
             .unwrap()
             .by_graph_subject
             .get(&(graph, subject))
-            .map(Vec::len)
+            .map(HashSet::len)
             .unwrap_or(0))
     }
 
@@ -1731,6 +2197,38 @@ impl GraphStore {
         Ok(())
     }
 
+    /// OR-Set add: stage `add.dot` into the quad's dot set (G1).
+    ///
+    /// Does not lock — the caller must hold the graph commit guard, otherwise
+    /// two concurrent adds can read the same dot set and one add is lost.
+    pub fn add_quad(&self, batch: &mut WriteBatch, add: QuadAdd) -> Result<bool> {
+        let QuadAdd { quad, dot } = add;
+        let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
+        let mut dots = self.current_quad_dots(batch, &key)?;
+        if dots.contains(&dot) {
+            return Ok(false);
+        }
+        dots.push(dot);
+        self.write_quad_state(batch, quad, dots)
+    }
+
+    /// OR-Set remove: drop exactly the dots contained in the witnessed clock,
+    /// never a dot the remover did not witness (G1).
+    ///
+    /// Does not lock — the caller must hold the graph commit guard.
+    pub fn retract_quad(&self, batch: &mut WriteBatch, removal: QuadRemove<'_>) -> Result<bool> {
+        let QuadRemove { quad, witnessed } = removal;
+        let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
+        let mut dots = self.current_quad_dots(batch, &key)?;
+        let before = dots.len();
+        dots.retain(|dot| !witnessed.contains(dot));
+        if before == dots.len() {
+            return Ok(false);
+        }
+        self.write_quad_state(batch, quad, dots)
+    }
+
+    #[deprecated(note = "use GraphStore::add_quad with a QuadAdd; removed in W-CLEAN")]
     pub fn insert_quad(
         &self,
         batch: &mut WriteBatch,
@@ -1740,24 +2238,21 @@ impl GraphStore {
         object: TermId,
         dot: &Dot,
     ) -> Result<bool> {
-        let key = Self::quad_key(graph, subject, predicate, object);
-        let mut dots = self.current_quad_dots(batch, &key)?;
-        if dots.contains(dot) {
-            return Ok(false);
-        }
-        dots.push(*dot);
-        self.write_quad_state(
+        self.add_quad(
             batch,
-            EncodedQuad {
-                graph,
-                subject,
-                predicate,
-                object,
+            QuadAdd {
+                quad: EncodedQuad {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                },
+                dot: *dot,
             },
-            dots,
         )
     }
 
+    #[deprecated(note = "use GraphStore::retract_quad with a QuadRemove; removed in W-CLEAN")]
     pub fn remove_quad(
         &self,
         batch: &mut WriteBatch,
@@ -1767,23 +2262,51 @@ impl GraphStore {
         object: TermId,
         witnessed: &VectorClock,
     ) -> Result<bool> {
-        let key = Self::quad_key(graph, subject, predicate, object);
-        let mut dots = self.current_quad_dots(batch, &key)?;
-        let before = dots.len();
-        dots.retain(|dot| !witnessed.contains(dot));
-        if before == dots.len() {
-            return Ok(false);
-        }
-        self.write_quad_state(
+        self.retract_quad(
             batch,
-            EncodedQuad {
-                graph,
-                subject,
-                predicate,
-                object,
+            QuadRemove {
+                quad: EncodedQuad {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                },
+                witnessed,
             },
-            dots,
         )
+    }
+
+    /// Is this exact quad live? O(1) against the derived indexes, committed
+    /// state only — uncommitted batch state is invisible here (WS0-T9).
+    pub fn contains_quad(&self, quad: EncodedQuad) -> bool {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .by_subject
+                .get(&quad.subject)
+                .is_some_and(|entries| {
+                    entries.contains(&(quad.predicate, quad.object, quad.graph))
+                })
+        })
+    }
+
+    /// Graphs holding at least one quad with `predicate`, so a predicate-only
+    /// pattern scans those graphs instead of every subject in the corpus
+    /// (WS0-T11).
+    pub(crate) fn predicate_graphs(&self, predicate: TermId) -> Vec<TermId> {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .predicate_graph_counts
+                .get(&predicate)
+                .map(|graphs| graphs.keys().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The token the next FTS queue entry will receive. Used by tests and by
+    /// the reindex-threshold policy to reason about queue ordering (WS0-T9).
+    #[allow(dead_code)] // consumed by WS4's reindex-threshold policy and by WS0 tests
+    pub(crate) fn current_dirty_token(&self) -> u64 {
+        self.dirty_counter.load(Ordering::SeqCst)
     }
 
     pub fn quads_for_pattern(
@@ -1812,28 +2335,16 @@ impl GraphStore {
                 self.predicate_object_scan(None, predicate, object)
             }
             (None, None, None, Some(object)) => self.object_scan(None, object),
-            (None, None, Some(predicate), None) => self.with_derived_indexes(|indexes| {
+            (None, None, Some(predicate), None) => {
                 let mut quads = Vec::new();
-                for (&subject, entries) in &indexes.by_subject {
-                    for &(candidate_predicate, candidate_object, graph) in entries {
-                        if candidate_predicate != predicate {
-                            continue;
-                        }
-                        quads.push(EncodedQuad {
-                            graph,
-                            subject,
-                            predicate: candidate_predicate,
-                            object: candidate_object,
-                        });
-                    }
+                for graph in self.predicate_graphs(predicate) {
+                    quads.extend(self.graph_scan(graph, Some(predicate), None));
                 }
                 quads
-            }),
+            }
             (None, None, None, None) => {
                 let graph_ids = self
-                    .indexes
-                    .read()
-                    .unwrap()
+                    .indexes_read()
                     .graph_subjects
                     .keys()
                     .copied()
@@ -1862,16 +2373,73 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Stream a graph's quads straight off the durable `quads` keyspace,
+    /// handing each one to `visit` together with its raw dot-set bytes.
+    ///
+    /// One sequential prefix scan replaces "in-memory scan + one point read per
+    /// quad to fetch its dots" (WS0-T9). Reads committed state only.
+    pub(crate) fn for_each_stored_quad<F>(&self, graph: TermId, mut visit: F) -> Result<()>
+    where
+        F: FnMut(EncodedQuad, &[u8]) -> Result<()>,
+    {
+        for guard in self.quads.prefix(graph.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 64 {
+                continue;
+            }
+            let dots = value.as_ref();
+            if dot_payload_is_empty(dots) {
+                continue;
+            }
+            visit(Self::decode_quad_key(key.as_ref())?, dots)?;
+        }
+        Ok(())
+    }
+
     pub fn get_vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(VectorClock::new());
         };
+        self.get_vector_clock_by_id(graph_id)
+    }
+
+    /// Read a graph's vector clock from its own `'K'` key.
+    ///
+    /// Falls back to the clock embedded in the legacy metadata record when no
+    /// `'K'` key exists yet, which is the one-time migration path for stores
+    /// written before the split; the first [`GraphStore::set_vector_clock`]
+    /// writes `'K'` and the legacy copy is ignored from then on
+    /// (derived-state register row 13).
+    pub(crate) fn get_vector_clock_by_id(&self, graph_id: TermId) -> Result<VectorClock> {
+        if let Some(bytes) = self.graphs.get(graph_clock_key(graph_id))? {
+            return Ok(postcard::from_bytes(bytes.as_ref())?);
+        }
         Ok(self
             .read_graph_meta_by_id(graph_id)?
             .unwrap_or_default()
             .clock)
     }
 
+    /// Write **only** the graph's clock key; the metadata record (policy,
+    /// context, topic binding) is never rewritten, so a commit cannot clobber a
+    /// concurrent policy or context write (WS0-T3).
+    ///
+    /// Does not lock — the caller must hold the graph commit guard, which is
+    /// what makes the read-clock → advance → write-clock cycle atomic (G2).
+    pub fn set_vector_clock_by_id(
+        &self,
+        batch: &mut WriteBatch,
+        update: ClockUpdate<'_>,
+    ) -> Result<()> {
+        batch.insert(
+            &self.graphs,
+            graph_clock_key(update.graph_id),
+            postcard::to_allocvec(update.clock)?,
+        );
+        Ok(())
+    }
+
+    #[deprecated(note = "use GraphStore::set_vector_clock_by_id with a ClockUpdate; removed in W-CLEAN")]
     pub fn set_vector_clock(
         &self,
         batch: &mut WriteBatch,
@@ -1880,16 +2448,25 @@ impl GraphStore {
     ) -> Result<()> {
         let graph_id =
             self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
-        meta.clock = clock.clone();
-        batch.insert(
-            &self.graphs,
-            graph_meta_key(graph_id),
-            postcard::to_allocvec(&meta)?,
-        );
-        Ok(())
+        self.set_vector_clock_by_id(batch, ClockUpdate { graph_id, clock })
     }
 
+    /// Next per-(graph, actor) event counter, staged into `batch`.
+    ///
+    /// The caller MUST hold the graph commit guard: the read-then-write of the
+    /// log head is what guarantees two concurrent local writes never mint the
+    /// same dot (G1).
+    pub fn next_counter_by_id(&self, batch: &mut WriteBatch, key: CounterKey) -> Result<u64> {
+        let head = log_head_key(key.graph_id, &key.actor);
+        let counter = match self.log.get(head)? {
+            Some(value) => decode_u64_bytes(value.as_ref(), "log head")? + 1,
+            None => 1,
+        };
+        batch.insert(&self.log, head, counter.to_be_bytes());
+        Ok(counter)
+    }
+
+    #[deprecated(note = "use GraphStore::next_counter_by_id with a CounterKey; removed in W-CLEAN")]
     pub fn next_counter(
         &self,
         batch: &mut WriteBatch,
@@ -1898,13 +2475,13 @@ impl GraphStore {
     ) -> Result<u64> {
         let graph_id =
             self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        let key = log_head_key(graph_id, actor);
-        let counter = match self.log.get(key)? {
-            Some(value) => decode_u64_bytes(value.as_ref(), "log head")? + 1,
-            None => 1,
-        };
-        batch.insert(&self.log, key, counter.to_be_bytes());
-        Ok(counter)
+        self.next_counter_by_id(
+            batch,
+            CounterKey {
+                graph_id,
+                actor: *actor,
+            },
+        )
     }
 
     pub(crate) fn decode_term_cached(
@@ -1920,6 +2497,57 @@ impl GraphStore {
         Ok(term)
     }
 
+    /// Queue one subject for search reindexing, in the same durable batch as
+    /// the store mutation that dirtied it (G7).
+    ///
+    /// Does not lock; the token comes from a process-wide counter that is
+    /// seeded past every live queue token at open (WS0-T6).
+    pub fn enqueue_fts_by_id(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
+        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        batch.insert(
+            &self.graphs,
+            graph_dirty_key(key.graph_id, key.subject),
+            token.to_be_bytes(),
+        );
+        Ok(())
+    }
+
+    /// Queue a set of subjects, collapsing to a whole-graph reindex once the
+    /// set is large enough that per-subject entries cost more than a rescan.
+    pub fn enqueue_fts_subjects_by_id(
+        &self,
+        batch: &mut WriteBatch,
+        req: FtsEnqueue<'_>,
+    ) -> Result<()> {
+        if req.subjects.is_empty() {
+            return Ok(());
+        }
+        if req.subjects.len() >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD {
+            return self.enqueue_fts_reindex_by_id(batch, req.graph_id);
+        }
+        for subject in req.subjects {
+            self.enqueue_fts_by_id(
+                batch,
+                FtsSubject {
+                    graph_id: req.graph_id,
+                    subject: *subject,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn enqueue_fts_reindex_by_id(&self, batch: &mut WriteBatch, graph_id: TermId) -> Result<()> {
+        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        batch.insert(
+            &self.graphs,
+            graph_reindex_key(graph_id),
+            token.to_be_bytes(),
+        );
+        Ok(())
+    }
+
+    #[deprecated(note = "use GraphStore::enqueue_fts_by_id with an FtsSubject; removed in W-CLEAN")]
     pub fn enqueue_fts(
         &self,
         batch: &mut WriteBatch,
@@ -1928,24 +2556,12 @@ impl GraphStore {
     ) -> Result<()> {
         let graph_id =
             self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.enqueue_fts_by_graph_id(batch, graph_id, subject)
+        self.enqueue_fts_by_id(batch, FtsSubject { graph_id, subject })
     }
 
-    fn enqueue_fts_by_graph_id(
-        &self,
-        batch: &mut WriteBatch,
-        graph_id: TermId,
-        subject: TermId,
-    ) -> Result<()> {
-        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
-        batch.insert(
-            &self.graphs,
-            graph_dirty_key(graph_id, subject),
-            token.to_be_bytes(),
-        );
-        Ok(())
-    }
-
+    #[deprecated(
+        note = "use GraphStore::enqueue_fts_subjects_by_id with an FtsEnqueue; removed in W-CLEAN"
+    )]
     pub fn enqueue_fts_subjects(
         &self,
         batch: &mut WriteBatch,
@@ -1955,37 +2571,16 @@ impl GraphStore {
         if subjects.is_empty() {
             return Ok(());
         }
-
         let graph_id =
             self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        if subjects.len() >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD {
-            return self.enqueue_fts_reindex_by_graph_id(batch, graph_id);
-        }
-
-        for subject in subjects {
-            self.enqueue_fts_by_graph_id(batch, graph_id, *subject)?;
-        }
-        Ok(())
+        self.enqueue_fts_subjects_by_id(batch, FtsEnqueue { graph_id, subjects })
     }
 
+    #[deprecated(note = "use GraphStore::enqueue_fts_reindex_by_id; removed in W-CLEAN")]
     pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph: &GraphId) -> Result<()> {
         let graph_id =
             self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.enqueue_fts_reindex_by_graph_id(batch, graph_id)
-    }
-
-    fn enqueue_fts_reindex_by_graph_id(
-        &self,
-        batch: &mut WriteBatch,
-        graph_id: TermId,
-    ) -> Result<()> {
-        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
-        batch.insert(
-            &self.graphs,
-            graph_reindex_key(graph_id),
-            token.to_be_bytes(),
-        );
-        Ok(())
+        self.enqueue_fts_reindex_by_id(batch, graph_id)
     }
 
     pub fn drain_fts_queue(&self, limit: usize) -> Result<Vec<(GraphId, TermId, u64)>> {
@@ -2323,11 +2918,47 @@ impl GraphStore {
             pending_quad_states: _,
             pending_terms: _,
             quad_mutations,
-            touched_graphs,
         } = batch;
         inner.commit()?;
-        self.apply_quad_mutations(quad_mutations, touched_graphs);
-        Ok(())
+        self.apply_quad_mutations(quad_mutations)
+    }
+
+    /// Copy a subject's `(predicate, object)` id pairs out of the index,
+    /// dropping `excluded` **while the read lock is held** (addendum A3).
+    ///
+    /// Filtering by term id before anything is decoded means excluding a
+    /// high-cardinality predicate (`hasPart` on a crate root) never copies or
+    /// decodes those entries at all.
+    fn subject_entries(
+        &self,
+        key: (TermId, TermId),
+        excluded: Option<TermId>,
+    ) -> Vec<(TermId, TermId)> {
+        // Guards IndexState for the duration of the filtered copy.
+        let indexes = self.indexes_read();
+        let Some(entries) = indexes.by_graph_subject.get(&key) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .copied()
+            .filter(|(predicate, _)| Some(*predicate) != excluded)
+            .collect()
+    }
+
+    fn decode_entries(
+        &self,
+        entries: Vec<(TermId, TermId)>,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
+        entries
+            .into_iter()
+            .map(|(predicate, object)| {
+                Ok((
+                    self.decode_term_arc(predicate)?.as_ref().clone(),
+                    self.decode_term_arc(object)?.as_ref().clone(),
+                ))
+            })
+            .collect()
     }
 
     pub fn triples_for_subject(
@@ -2335,20 +2966,7 @@ impl GraphStore {
         graph: TermId,
         subject: TermId,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        let predicates = self
-            .indexes
-            .read()
-            .unwrap()
-            .by_graph_subject
-            .get(&(graph, subject))
-            .cloned()
-            .unwrap_or_default();
-        let mut triples = Vec::new();
-        for (predicate, object) in predicates {
-            let predicate_term = self.decode_term(predicate)?;
-            triples.push((predicate_term, self.decode_term(object)?));
-        }
-        Ok(triples)
+        self.decode_entries(self.subject_entries((graph, subject), None))
     }
 
     pub fn triples_for_subject_excluding_predicate(
@@ -2357,23 +2975,7 @@ impl GraphStore {
         subject: TermId,
         excluded_predicate: TermId,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        let predicates = self
-            .indexes
-            .read()
-            .unwrap()
-            .by_graph_subject
-            .get(&(graph, subject))
-            .cloned()
-            .unwrap_or_default();
-        let mut triples = Vec::new();
-        for (predicate, object) in predicates {
-            if predicate == excluded_predicate {
-                continue;
-            }
-            let predicate_term = self.decode_term(predicate)?;
-            triples.push((predicate_term, self.decode_term(object)?));
-        }
-        Ok(triples)
+        self.decode_entries(self.subject_entries((graph, subject), Some(excluded_predicate)))
     }
 
     pub fn count_objects_for_subject_predicate(
@@ -2394,6 +2996,59 @@ impl GraphStore {
         Ok(self.count_objects_for_ids(graph_id, subject_id, predicate_id))
     }
 
+    /// One page of the objects of `(graph, subject, predicate)`, in the stable
+    /// order defined by the decoded object terms.
+    ///
+    /// Returns `(total, page)`; `total` is the full object count for both
+    /// cursor kinds, so an `After` caller can still report progress.
+    pub fn objects_page(
+        &self,
+        key: SubjectPredicate<'_>,
+        page: PageRequest<'_>,
+    ) -> Result<(usize, Vec<EncodedTerm>)> {
+        if page.limit == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let Some(graph_id) = self.graph_id_for(key.graph)? else {
+            return Ok((0, Vec::new()));
+        };
+        let Some(subject_id) = self.lookup_term(key.subject)? else {
+            return Ok((0, Vec::new()));
+        };
+        let Some(predicate_id) = self.lookup_term(key.predicate)? else {
+            return Ok((0, Vec::new()));
+        };
+
+        let object_ids =
+            self.ordered_objects_for_subject_predicate(graph_id, subject_id, predicate_id)?;
+        let total = object_ids.len();
+
+        let start = match page.cursor {
+            PageCursor::Offset(offset) => offset,
+            // An unknown or dropped cursor term restarts from the beginning,
+            // which is what the previous `_after` entry point did.
+            PageCursor::After(None) => 0,
+            PageCursor::After(Some(after)) => match self.lookup_term(after)? {
+                Some(after_id) => object_ids
+                    .iter()
+                    .position(|object| *object == after_id)
+                    .map(|index| index + 1)
+                    .unwrap_or(0),
+                None => 0,
+            },
+        };
+
+        let objects = object_ids
+            .iter()
+            .skip(start)
+            .take(page.limit)
+            .map(|object| Ok(self.decode_term_arc(*object)?.as_ref().clone()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((total, objects))
+    }
+
+    #[deprecated(note = "use GraphStore::objects_page with a PageRequest; removed in W-CLEAN")]
     pub fn objects_for_subject_predicate_page(
         &self,
         graph: &GraphId,
@@ -2402,32 +3057,20 @@ impl GraphStore {
         offset: usize,
         limit: usize,
     ) -> Result<(usize, Vec<EncodedTerm>)> {
-        if limit == 0 {
-            return Ok((0, Vec::new()));
-        }
-
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok((0, Vec::new()));
-        };
-        let Some(subject_id) = self.lookup_term(subject)? else {
-            return Ok((0, Vec::new()));
-        };
-        let Some(predicate_id) = self.lookup_term(predicate)? else {
-            return Ok((0, Vec::new()));
-        };
-
-        let object_ids =
-            self.ordered_objects_for_subject_predicate(graph_id, subject_id, predicate_id)?;
-        let total = object_ids.len();
-        let page = object_ids
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|object| self.decode_term(*object))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((total, page))
+        self.objects_page(
+            SubjectPredicate {
+                graph,
+                subject,
+                predicate,
+            },
+            PageRequest {
+                cursor: PageCursor::Offset(offset),
+                limit,
+            },
+        )
     }
 
+    #[deprecated(note = "use GraphStore::objects_page with a PageRequest; removed in W-CLEAN")]
     pub fn objects_for_subject_predicate_page_after(
         &self,
         graph: &GraphId,
@@ -2436,39 +3079,36 @@ impl GraphStore {
         after: Option<&EncodedTerm>,
         limit: usize,
     ) -> Result<Vec<EncodedTerm>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(Vec::new());
-        };
-        let Some(subject_id) = self.lookup_term(subject)? else {
-            return Ok(Vec::new());
-        };
-        let Some(predicate_id) = self.lookup_term(predicate)? else {
-            return Ok(Vec::new());
-        };
-        let object_ids =
-            self.ordered_objects_for_subject_predicate(graph_id, subject_id, predicate_id)?;
-        let start = match after {
-            Some(after) => match self.lookup_term(after)? {
-                Some(after_id) => object_ids
-                    .iter()
-                    .position(|object| *object == after_id)
-                    .map(|index| index + 1)
-                    .unwrap_or(0),
-                None => 0,
+        self.objects_page(
+            SubjectPredicate {
+                graph,
+                subject,
+                predicate,
             },
-            None => 0,
-        };
+            PageRequest {
+                cursor: PageCursor::After(after),
+                limit,
+            },
+        )
+        .map(|(_, objects)| objects)
+    }
 
-        object_ids
-            .iter()
-            .skip(start)
-            .take(limit)
-            .map(|object| self.decode_term(*object))
-            .collect()
+    /// Test-only hook: drop a live quad from the in-memory index without
+    /// touching the store, simulating index drift so tests can prove the next
+    /// commit repairs it (WS0-T2).
+    #[cfg(test)]
+    fn corrupt_index_for_test(&self, quad: EncodedQuad) {
+        self.corrupt_index_hook.fetch_add(1, Ordering::SeqCst);
+        let mut indexes = self.indexes_write();
+        indexes.remove_quad(quad);
+    }
+
+    #[cfg(test)]
+    fn index_contains(&self, quad: EncodedQuad) -> bool {
+        self.indexes_read()
+            .by_graph_subject
+            .get(&(quad.graph, quad.subject))
+            .is_some_and(|entries| entries.contains(&(quad.predicate, quad.object)))
     }
 }
 
