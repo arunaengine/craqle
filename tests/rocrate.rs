@@ -59,6 +59,8 @@ mod tests {
         assert!(net.peer(0).contains_graph(&imported).unwrap());
     }
 
+    /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+    #[cfg(feature = "search")]
     #[test]
     fn test_import_jsonld_updates_search_without_manual_reindex() {
         let dir = tempfile::tempdir().unwrap();
@@ -99,6 +101,8 @@ mod tests {
         assert!(!keyword_hits.is_empty());
     }
 
+    /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+    #[cfg(feature = "search")]
     #[test]
     fn test_trusted_bootstrap_import_updates_search_without_manual_reindex() {
         let dir = tempfile::tempdir().unwrap();
@@ -210,6 +214,8 @@ mod tests {
         ));
     }
 
+    /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+    #[cfg(feature = "search")]
     #[test]
     fn test_batched_append_updates_search_without_manual_reindex() {
         let dir = tempfile::tempdir().unwrap();
@@ -272,6 +278,8 @@ mod tests {
         assert!(!keyword_hits.is_empty());
     }
 
+    /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+    #[cfg(feature = "search")]
     #[test]
     fn test_graph_reindex_marker_refreshes_search_results() {
         let dir = tempfile::tempdir().unwrap();
@@ -598,18 +606,22 @@ mod tests {
         assert!(exported.contains("results/report.pdf"));
         assert!(exported.contains("results/figures/fig1.png"));
 
-        let experiment_hits = reindex_and_search(&net, 0, "experiment");
-        let report_hits = reindex_and_search(&net, 1, "report");
-        assert!(
-            experiment_hits
-                .iter()
-                .any(|subject| subject == graph.as_str())
-        );
-        assert!(
-            report_hits
-                .iter()
-                .any(|subject| subject.contains("report.pdf"))
-        );
+        // Search needs a real tantivy index; the lifecycle above does not.
+        #[cfg(feature = "search")]
+        {
+            let experiment_hits = reindex_and_search(&net, 0, "experiment");
+            let report_hits = reindex_and_search(&net, 1, "report");
+            assert!(
+                experiment_hits
+                    .iter()
+                    .any(|subject| subject == graph.as_str())
+            );
+            assert!(
+                report_hits
+                    .iter()
+                    .any(|subject| subject.contains("report.pdf"))
+            );
+        }
     }
 
     #[test]
@@ -1903,6 +1915,7 @@ mod tests {
     /// Every subject `search` returns for `query`, plus every object
     /// `search_resources` hydrates those hits with, once the index has caught
     /// up with the store.
+    #[cfg(feature = "search")]
     fn searched_terms(node: &CraqleNode, query: &str) -> Vec<String> {
         node.flush_search_updates().unwrap();
         let request = || SearchRequest { query, limit: 10 };
@@ -1952,16 +1965,21 @@ mod tests {
             "the reachable nested entity must stay queryable: {bound:?}"
         );
 
-        let found = searched_terms(node, "Nested Person");
-        assert!(
-            !found.contains(&entities.orphan.id) && !found.contains(&entities.orphan.term.0),
-            "search must return neither the orphan nor a hydrated reference to \
-             it (G6): {found:?}"
-        );
-        assert!(
-            found.contains(&entities.linked.id),
-            "the reachable nested entity must stay searchable: {found:?}"
-        );
+        // Only this block needs a real index: the `search`-off stub returns an
+        // empty set, which would satisfy the orphan half of the pair for free.
+        #[cfg(feature = "search")]
+        {
+            let found = searched_terms(node, "Nested Person");
+            assert!(
+                !found.contains(&entities.orphan.id) && !found.contains(&entities.orphan.term.0),
+                "search must return neither the orphan nor a hydrated reference to \
+                 it (G6): {found:?}"
+            );
+            assert!(
+                found.contains(&entities.linked.id),
+                "the reachable nested entity must stay searchable: {found:?}"
+            );
+        }
 
         assert!(
             described(node, graph, &entities.orphan.id).is_empty(),
