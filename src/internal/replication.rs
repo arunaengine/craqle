@@ -1,10 +1,13 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use crate::core::*;
-use crate::rules::{GraphSnapshot, Rule};
+use crate::rules::{ChangeSet, DeltaSummary, GraphSnapshot, Rule};
 use crate::sparql::SparqlEngine;
-use crate::store::GraphStore;
+use crate::store::{
+    BatchTermCtx, ClockUpdate, CounterKey, EncodedQuad, FtsEnqueue, FtsSubject, GraphStore,
+    QuadAdd, QuadRemove, TermId,
+};
 use chrono::Utc;
 use oxrdf::NamedNode;
 
@@ -35,6 +38,54 @@ pub struct MergeResult {
     pub applied: bool,
 }
 
+/// Number of shards backing [`GRAPH_WRITE_LOCKS`].
+const GRAPH_WRITE_LOCK_SHARDS: usize = 32;
+
+/// Orders one graph's *engine-level* write pipeline — the part that happens
+/// before and around the store's own commit guard. Two things need it:
+///
+/// **1. The sync publish must be applied in publish order (G1, G2, G3).**
+/// `IrokleGraphSync::publish_changes` stamps the batch with the publishing
+/// actor's next irokle sequence number, and the local apply gates on
+/// `VectorClock::contains`, which is monotonic per actor. Two threads publishing
+/// to the same graph get sequence numbers `n` and `n+1`, but nothing stops the
+/// thread holding `n+1` from reaching the apply first: the clock then advances
+/// to `n+1` and the `n` batch is discarded as "already applied", silently losing
+/// every add in it. Holding this lock across publish *and* apply makes publish
+/// order the apply order.
+///
+/// **2. The `@context` tag mint must be atomic (G5).** Without it two concurrent
+/// local context writes both read the same stored tag and
+/// `ContextTag::next_local` mints the *identical* `(counter, actor)` for two
+/// different context values — a tie the last-write-wins register cannot resolve,
+/// so peers need not converge.
+///
+/// This deliberately is **not** `GraphStore::graph_commit_guard`. Both uses have
+/// to span a call that takes that guard internally — `GraphStore::set_graph_context`
+/// and, on a first publish, `ensure_graph_topic` → `set_irokle_topic_id` — and
+/// `std::sync::Mutex` is not reentrant, so reusing the store guard would
+/// self-deadlock (addendum A1). Releasing it in between would reopen both races.
+///
+/// Process-wide (a `static`) rather than per-engine: one store is shared by
+/// several `ReplicationEngine`s — the sync engine, the local-only engine, and the
+/// per-request engines built for explicit actors — so an engine-local mutex would
+/// not serialize them. Sharded by graph IRI; a collision only serializes two
+/// unrelated graphs.
+///
+/// Lock order: **graph write lock ▸ graph commit guard**. Nothing acquires them
+/// the other way round, and neither is ever taken twice on one path.
+static GRAPH_WRITE_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
+    (0..GRAPH_WRITE_LOCK_SHARDS)
+        .map(|_| Mutex::new(()))
+        .collect()
+});
+
+fn graph_write_lock(graph: &GraphId) -> &'static Mutex<()> {
+    let hash = blake3::hash(graph.as_str().as_bytes());
+    let shard = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap()) as usize;
+    &GRAPH_WRITE_LOCKS[shard % GRAPH_WRITE_LOCK_SHARDS]
+}
+
 /// The replication engine: local writes and CRDT merge of Irokle records.
 pub struct ReplicationEngine {
     store: Arc<GraphStore>,
@@ -42,13 +93,60 @@ pub struct ReplicationEngine {
     rules: Vec<Box<dyn Rule>>,
     actor: ActorId,
     sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
-    local_commit_lock: std::sync::Mutex<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiagnosticsRefresh {
     Immediate,
     Deferred,
+}
+
+/// How a write should leave the graph's persisted diagnostics record.
+#[derive(Debug, Clone, Copy)]
+struct DiagnosticsPlan {
+    refresh: DiagnosticsRefresh,
+    /// The change set was run through the full rule set, which — given a graph
+    /// that was already orphan-free — proves the post state is orphan-free too.
+    validated_orphan_free: bool,
+}
+
+impl DiagnosticsPlan {
+    /// Trusted writes that maintain structure incrementally: still refreshed
+    /// immediately, but nothing proves the post state orphan-free, so only the
+    /// "reachability untouched" fast path applies.
+    const UNVALIDATED: Self = Self {
+        refresh: DiagnosticsRefresh::Immediate,
+        validated_orphan_free: false,
+    };
+
+    const VALIDATED: Self = Self {
+        refresh: DiagnosticsRefresh::Immediate,
+        validated_orphan_free: true,
+    };
+
+    /// Bulk import: the caller rebuilds diagnostics once at the end.
+    const DEFERRED: Self = Self {
+        refresh: DiagnosticsRefresh::Deferred,
+        validated_orphan_free: false,
+    };
+
+    /// Run `capture` only when this write refreshes diagnostics immediately.
+    fn pending_diagnostics<F>(&self, capture: F) -> crate::store::Result<Option<PendingDiagnostics>>
+    where
+        F: FnOnce() -> crate::store::Result<PendingDiagnostics>,
+    {
+        match self.refresh {
+            DiagnosticsRefresh::Immediate => capture().map(Some),
+            DiagnosticsRefresh::Deferred => Ok(None),
+        }
+    }
+}
+
+/// A local write, ready to be committed to one graph.
+struct LocalCommit<'a> {
+    graph: &'a GraphId,
+    changes: Vec<MaterializedQuadChange>,
+    plan: DiagnosticsPlan,
 }
 
 impl ReplicationEngine {
@@ -68,7 +166,6 @@ impl ReplicationEngine {
             rules: crate::rules::default_rules(),
             actor,
             sync,
-            local_commit_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -98,6 +195,20 @@ impl ReplicationEngine {
         license: Option<String>,
         license_digest: Option<[u8; 32]>,
     ) -> Result<(), UpdateError> {
+        // Bind the topic before taking any lock. `ensure_graph_topic` reaches
+        // `GraphStore::set_irokle_topic_id`, which takes the graph commit guard
+        // itself; doing it under a lock we also hold would deadlock (addendum
+        // A1). It is idempotent and, after the first call, a memo hit.
+        if let Some(sync) = &self.sync {
+            sync.ensure_graph_topic(&self.store, graph)?;
+        }
+
+        // Guards the context-tag mint through to the store write; see
+        // GRAPH_WRITE_LOCKS.
+        let _write_guard = graph_write_lock(graph)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         let tag = ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor);
         if let Some(sync) = &self.sync {
             sync.publish_context(
@@ -133,16 +244,7 @@ impl ReplicationEngine {
             | MaterializedQuadChange::Delete { graph, .. } => graph.clone(),
         };
         self.ensure_change_set_targets(&graph, &changes)?;
-
-        match crate::rules::validate_change_set(&self.rules, &self.store, &graph, &changes) {
-            Ok(()) => {}
-            Err(crate::rules::RuleEvaluationError::Store(error)) => {
-                return Err(UpdateError::Store(error));
-            }
-            Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
-                return Err(UpdateError::ValidationFailed(violations));
-            }
-        }
+        self.validate(&graph, &changes)?;
 
         self.commit_changes(&graph, changes).map(Some)
     }
@@ -176,26 +278,10 @@ impl ReplicationEngine {
         self.ensure_change_set_targets(graph, &changes)?;
 
         if changes.is_empty() {
-            return Ok(Batch {
-                graph: graph.clone(),
-                actor: self.actor,
-                counter: 0,
-                base_clock: self.store.get_vector_clock(graph)?,
-                ops: vec![],
-                timestamp: Utc::now(),
-            });
+            return self.empty_batch(graph);
         }
 
-        match crate::rules::validate_change_set(&self.rules, &self.store, graph, &changes) {
-            Ok(()) => {}
-            Err(crate::rules::RuleEvaluationError::Store(error)) => {
-                return Err(UpdateError::Store(error));
-            }
-            Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
-                return Err(UpdateError::ValidationFailed(violations));
-            }
-        }
-
+        self.validate(graph, &changes)?;
         self.commit_changes(graph, changes)
     }
 
@@ -211,17 +297,14 @@ impl ReplicationEngine {
         self.ensure_change_set_targets(graph, &changes)?;
 
         if changes.is_empty() {
-            return Ok(Batch {
-                graph: graph.clone(),
-                actor: self.actor,
-                counter: 0,
-                base_clock: self.store.get_vector_clock(graph)?,
-                ops: vec![],
-                timestamp: Utc::now(),
-            });
+            return self.empty_batch(graph);
         }
 
-        self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Immediate, false)
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            plan: DiagnosticsPlan::UNVALIDATED,
+        })
     }
 
     /// Apply a trusted bulk change set locally and defer graph-diagnostics
@@ -234,23 +317,52 @@ impl ReplicationEngine {
         self.ensure_change_set_targets(graph, &changes)?;
 
         if changes.is_empty() {
-            return Ok(Batch {
-                graph: graph.clone(),
-                actor: self.actor,
-                counter: 0,
-                base_clock: self.store.get_vector_clock(graph)?,
-                ops: vec![],
-                timestamp: Utc::now(),
-            });
+            return self.empty_batch(graph);
         }
 
-        self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Deferred, false)
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            plan: DiagnosticsPlan::DEFERRED,
+        })
     }
 
     pub fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<(), UpdateError> {
-        let snapshot = GraphSnapshot::from_store(&self.store, graph).map_err(UpdateError::Store)?;
-        self.refresh_graph_diagnostics(graph, &snapshot)
+        // Guards the recompute→persist cycle so the record cannot be tagged with
+        // a clock newer than the state it describes.
+        let _commit_guard = self.store.graph_commit_guard(graph);
+        self.recompute_graph_diagnostics(graph)
             .map_err(UpdateError::Store)
+    }
+
+    fn empty_batch(&self, graph: &GraphId) -> Result<Batch, UpdateError> {
+        Ok(Batch {
+            graph: graph.clone(),
+            actor: self.actor,
+            counter: 0,
+            base_clock: self.store.get_vector_clock(graph)?,
+            ops: vec![],
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn validate(
+        &self,
+        graph: &GraphId,
+        changes: &[MaterializedQuadChange],
+    ) -> Result<(), UpdateError> {
+        let change_set = ChangeSet {
+            store: &self.store,
+            graph,
+            delta: changes,
+        };
+        match crate::rules::validate_change_set(&self.rules, change_set) {
+            Ok(()) => Ok(()),
+            Err(crate::rules::RuleEvaluationError::Store(error)) => Err(UpdateError::Store(error)),
+            Err(crate::rules::RuleEvaluationError::Violations(violations)) => {
+                Err(UpdateError::ValidationFailed(violations))
+            }
+        }
     }
 
     fn ensure_change_set_targets(
@@ -280,62 +392,93 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.commit_changes_with_mode(graph, changes, DiagnosticsRefresh::Immediate, true)
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            plan: DiagnosticsPlan::VALIDATED,
+        })
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len(), sync_enabled = self.sync.is_some()))]
-    fn commit_changes_with_mode(
-        &self,
-        graph: &GraphId,
-        changes: Vec<MaterializedQuadChange>,
-        diagnostics_refresh: DiagnosticsRefresh,
-        validated_orphan_free: bool,
-    ) -> Result<Batch, UpdateError> {
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %commit.graph.as_str(), change_count = commit.changes.len(), sync_enabled = self.sync.is_some()))]
+    fn commit_changes_with_plan(&self, commit: LocalCommit<'_>) -> Result<Batch, UpdateError> {
+        let LocalCommit {
+            graph,
+            changes,
+            plan,
+        } = commit;
+
         if let Some(sync) = &self.sync {
-            let can_preserve_clean_diagnostics = diagnostics_refresh
-                == DiagnosticsRefresh::Immediate
-                && validated_orphan_free
-                && !self.store.graph_diagnostics(graph)?.has_orphans();
-            return self.publish_and_apply_changes(
-                sync,
-                graph,
-                changes,
-                diagnostics_refresh,
-                can_preserve_clean_diagnostics,
-            );
+            // Orders this graph's publish against its own apply; see
+            // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
+            let _write_guard = graph_write_lock(graph)
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+
+            // Publish-first (G4): the event goes out before any local state
+            // changes, and outside the commit guard, because the publish may bind
+            // an irokle topic and that takes the guard itself (addendum A1).
+            let record = sync.publish_changes(&self.store, graph, changes)?;
+            let Some(batch) = crate::sync::batch_from_irokle_event_record(record)? else {
+                return Err(UpdateError::InvalidChangeSet(
+                    "irokle changes publish did not return a quad-change record".to_string(),
+                ));
+            };
+            self.apply_irokle_batch_with_plan(&batch, plan)
+                .map_err(update_error_from_merge)?;
+            return Ok(batch);
         }
 
-        let _commit_guard = self
-            .local_commit_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut batch = self.store.new_batch();
-        let can_preserve_clean_diagnostics = diagnostics_refresh == DiagnosticsRefresh::Immediate
-            && validated_orphan_free
-            && !self.store.graph_diagnostics(graph)?.has_orphans();
-
+        // `create_graph` is self-guarding, so the graph must exist *before* the
+        // commit guard is taken; the guard is not reentrant. (The sync branch
+        // leaves this to the apply, which does the same thing before its guard.)
         if !self.store.contains_graph(graph)? {
             self.store.create_graph(graph)?;
         }
 
+        // Guards the whole read→write cycle of this graph's CRDT state: the
+        // diagnostics read, the clock read, the counter mint, every quad op, the
+        // clock write, the FTS enqueue, the commit and the diagnostics refresh
+        // (G1, G2, G5, G6).
+        let _commit_guard = self.store.graph_commit_guard(graph);
+
+        // Captured before the write, under the guard, so it describes exactly
+        // the state this commit starts from. Skipped entirely when the caller
+        // defers the refresh — reading it can itself force a recompute.
+        let pending = plan.pending_diagnostics(|| {
+            Ok(PendingDiagnostics {
+                previous: self.store.graph_diagnostics(graph)?,
+                summary: crate::rules::summarize_delta(graph, &changes),
+            })
+        })?;
+
+        let mut batch = self.store.new_batch();
         let mut vector_clock = self.store.get_vector_clock(graph)?;
-        let counter = self.store.next_counter(&mut batch, graph, &self.actor)?;
+        let graph_id = self
+            .store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let counter = self.store.next_counter_by_id(
+            &mut batch,
+            CounterKey {
+                graph_id,
+                actor: self.actor,
+            },
+        )?;
         let dot = Dot {
             actor: self.actor,
             counter,
         };
         let base_clock = vector_clock.clone();
-        let g = self
-            .store
-            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
 
         let mut ops = Vec::with_capacity(changes.len());
-        let mut affected_subjects = std::collections::HashSet::new();
+        let mut affected_subjects = HashSet::new();
         let mut term_cache = HashMap::new();
+        let mut cx = BatchTermCtx {
+            batch: &mut batch,
+            cache: &mut term_cache,
+        };
 
-        self.store.seed_term_cache(
-            &mut batch,
-            &mut term_cache,
+        self.store.seed_term_cache_in_ctx(
+            &mut cx,
             changes.iter().flat_map(|change| match change {
                 MaterializedQuadChange::Insert {
                     subject,
@@ -360,20 +503,17 @@ impl ReplicationEngine {
                     object,
                     ..
                 } => {
-                    let s =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, &subject)?;
-                    let p =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, &predicate)?;
-                    let o = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, &object)?;
-
-                    self.store.insert_quad(&mut batch, g, s, p, o, &dot)?;
-
-                    affected_subjects.insert(s);
-
+                    let quad = self.resolve_quad(
+                        &mut cx,
+                        QuadTerms {
+                            graph_id,
+                            subject: &subject,
+                            predicate: &predicate,
+                            object: &object,
+                        },
+                    )?;
+                    self.store.add_quad(cx.batch, QuadAdd { quad, dot })?;
+                    affected_subjects.insert(quad.subject);
                     ops.push(QuadOp::Add {
                         subject,
                         predicate,
@@ -387,21 +527,23 @@ impl ReplicationEngine {
                     object,
                     ..
                 } => {
-                    let s =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, &subject)?;
-                    let p =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, &predicate)?;
-                    let o = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, &object)?;
-
-                    self.store
-                        .remove_quad(&mut batch, g, s, p, o, &vector_clock)?;
-
-                    affected_subjects.insert(s);
-
+                    let quad = self.resolve_quad(
+                        &mut cx,
+                        QuadTerms {
+                            graph_id,
+                            subject: &subject,
+                            predicate: &predicate,
+                            object: &object,
+                        },
+                    )?;
+                    self.store.retract_quad(
+                        cx.batch,
+                        QuadRemove {
+                            quad,
+                            witnessed: &vector_clock,
+                        },
+                    )?;
+                    affected_subjects.insert(quad.subject);
                     ops.push(QuadOp::Remove {
                         subject,
                         predicate,
@@ -413,61 +555,48 @@ impl ReplicationEngine {
         }
 
         vector_clock.advance(self.actor, counter);
-        self.store
-            .set_vector_clock(&mut batch, graph, &vector_clock)?;
+        self.store.set_vector_clock_by_id(
+            &mut batch,
+            ClockUpdate {
+                graph_id,
+                clock: &vector_clock,
+            },
+        )?;
+        self.store.enqueue_fts_subjects_by_id(
+            &mut batch,
+            FtsEnqueue {
+                graph_id,
+                subjects: &affected_subjects,
+            },
+        )?;
+        self.store.commit(batch)?;
 
-        let repl_batch = Batch {
+        if let Some(pending) = &pending {
+            self.settle_diagnostics(graph, DiagnosticsOutcome { pending, plan })
+                .map_err(UpdateError::Store)?;
+        }
+
+        Ok(Batch {
             graph: graph.clone(),
             actor: self.actor,
             counter,
             base_clock,
             ops,
             timestamp: Utc::now(),
-        };
-
-        self.store
-            .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
-
-        self.store.commit(batch)?;
-        if diagnostics_refresh == DiagnosticsRefresh::Immediate {
-            if can_preserve_clean_diagnostics {
-                self.store
-                    .set_graph_diagnostics(graph, &crate::core::GraphDiagnostics::default())
-                    .map_err(UpdateError::Store)?;
-            } else {
-                let snapshot =
-                    GraphSnapshot::from_store(&self.store, graph).map_err(UpdateError::Store)?;
-                self.refresh_graph_diagnostics(graph, &snapshot)
-                    .map_err(UpdateError::Store)?;
-            }
-        }
-
-        Ok(repl_batch)
+        })
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
-    fn publish_and_apply_changes(
+    fn resolve_quad(
         &self,
-        sync: &Arc<dyn crate::sync::CraqleGraphSync>,
-        graph: &GraphId,
-        changes: Vec<MaterializedQuadChange>,
-        diagnostics_refresh: DiagnosticsRefresh,
-        can_preserve_clean_diagnostics: bool,
-    ) -> Result<Batch, UpdateError> {
-        let record = sync.publish_changes(&self.store, graph, changes)?;
-        let Some(batch) = crate::sync::batch_from_irokle_record(&record)? else {
-            return Err(UpdateError::InvalidChangeSet(
-                "irokle changes publish did not return a quad-change record".to_string(),
-            ));
-        };
-
-        self.apply_irokle_batch_with_mode(
-            batch.clone(),
-            diagnostics_refresh,
-            can_preserve_clean_diagnostics,
-        )
-        .map_err(update_error_from_merge)?;
-        Ok(batch)
+        cx: &mut BatchTermCtx<'_>,
+        terms: QuadTerms<'_>,
+    ) -> crate::store::Result<EncodedQuad> {
+        Ok(EncodedQuad {
+            graph: terms.graph_id,
+            subject: self.store.resolve_term_in_ctx(cx, terms.subject)?,
+            predicate: self.store.resolve_term_in_ctx(cx, terms.predicate)?,
+            object: self.store.resolve_term_in_ctx(cx, terms.object)?,
+        })
     }
 
     /// Apply a causally ordered batch produced from an Irokle graph event.
@@ -477,21 +606,27 @@ impl ReplicationEngine {
     /// enforces causal delivery; this path intentionally bypasses Craqle's old
     /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
     pub fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
-        self.apply_irokle_batch_with_mode(incoming, DiagnosticsRefresh::Immediate, false)
+        self.apply_irokle_batch_with_plan(&incoming, DiagnosticsPlan::UNVALIDATED)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
-    fn apply_irokle_batch_with_mode(
+    fn apply_irokle_batch_with_plan(
         &self,
-        incoming: Batch,
-        diagnostics_refresh: DiagnosticsRefresh,
-        can_preserve_clean_diagnostics: bool,
+        incoming: &Batch,
+        plan: DiagnosticsPlan,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
+        // Self-guarding, so it must run before the commit guard is taken.
         if !self.store.contains_graph(graph)? {
             self.store.create_graph(graph)?;
         }
+
+        // Guards the dedup gate through to the diagnostics refresh: the clock
+        // read that decides "already applied" must be the same clock the apply
+        // then advances, or a concurrent commit can make one batch apply twice
+        // or the clock lose an entry (G1, G2).
+        let _commit_guard = self.store.graph_commit_guard(graph);
 
         let mut vector_clock = self.store.get_vector_clock(graph)?;
         if vector_clock.contains(&Dot {
@@ -501,17 +636,17 @@ impl ReplicationEngine {
             return Ok(MergeResult { applied: false });
         }
 
-        self.apply_single_batch(&incoming, &mut vector_clock)?;
-        match diagnostics_refresh {
-            DiagnosticsRefresh::Immediate => {
-                if can_preserve_clean_diagnostics {
-                    self.store
-                        .set_graph_diagnostics(graph, &crate::core::GraphDiagnostics::default())?;
-                } else {
-                    self.finalize_remote_graph(graph)?;
-                }
-            }
-            DiagnosticsRefresh::Deferred => {}
+        let pending = plan.pending_diagnostics(|| {
+            Ok(PendingDiagnostics {
+                previous: self.store.graph_diagnostics(graph)?,
+                summary: crate::rules::summarize_ops(graph, &incoming.ops),
+            })
+        })?;
+
+        self.apply_single_batch(incoming, &mut vector_clock)?;
+
+        if let Some(pending) = &pending {
+            self.settle_diagnostics(graph, DiagnosticsOutcome { pending, plan })?;
         }
         Ok(MergeResult { applied: true })
     }
@@ -527,12 +662,6 @@ impl ReplicationEngine {
             .transpose()
     }
 
-    fn finalize_remote_graph(&self, graph: &GraphId) -> Result<(), MergeError> {
-        let snapshot = GraphSnapshot::from_store(&self.store, graph).map_err(MergeError::Store)?;
-        self.refresh_graph_diagnostics(graph, &snapshot)
-            .map_err(MergeError::Store)
-    }
-
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
     fn apply_single_batch(
         &self,
@@ -541,12 +670,15 @@ impl ReplicationEngine {
     ) -> Result<(), MergeError> {
         let graph = &incoming.graph;
         let mut batch = self.store.new_batch();
-        let mut affected_subjects = std::collections::HashSet::new();
+        let mut affected_subjects = HashSet::new();
         let mut term_cache = HashMap::new();
+        let mut cx = BatchTermCtx {
+            batch: &mut batch,
+            cache: &mut term_cache,
+        };
 
-        self.store.seed_term_cache(
-            &mut batch,
-            &mut term_cache,
+        self.store.seed_term_cache_in_ctx(
+            &mut cx,
             incoming.ops.iter().flat_map(|op| match op {
                 QuadOp::Add {
                     subject,
@@ -563,7 +695,7 @@ impl ReplicationEngine {
             }),
         )?;
 
-        let g = self
+        let graph_id = self
             .store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
 
@@ -575,17 +707,17 @@ impl ReplicationEngine {
                     object,
                     dot,
                 } => {
-                    let s = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, subject)?;
-                    let p =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, predicate)?;
-                    let o = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, object)?;
-                    self.store.insert_quad(&mut batch, g, s, p, o, dot)?;
-                    affected_subjects.insert(s);
+                    let quad = self.resolve_quad(
+                        &mut cx,
+                        QuadTerms {
+                            graph_id,
+                            subject,
+                            predicate,
+                            object,
+                        },
+                    )?;
+                    self.store.add_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+                    affected_subjects.insert(quad.subject);
                 }
                 QuadOp::Remove {
                     subject,
@@ -593,61 +725,117 @@ impl ReplicationEngine {
                     object,
                     witnessed,
                 } => {
-                    let s = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, subject)?;
-                    let p =
-                        self.store
-                            .resolve_term_cached(&mut batch, &mut term_cache, predicate)?;
-                    let o = self
-                        .store
-                        .resolve_term_cached(&mut batch, &mut term_cache, object)?;
-                    self.store.remove_quad(&mut batch, g, s, p, o, witnessed)?;
-                    affected_subjects.insert(s);
+                    let quad = self.resolve_quad(
+                        &mut cx,
+                        QuadTerms {
+                            graph_id,
+                            subject,
+                            predicate,
+                            object,
+                        },
+                    )?;
+                    self.store
+                        .retract_quad(cx.batch, QuadRemove { quad, witnessed })?;
+                    affected_subjects.insert(quad.subject);
                 }
             }
         }
 
         vector_clock.advance(incoming.actor, incoming.counter);
-        self.store
-            .set_vector_clock(&mut batch, graph, vector_clock)?;
-        self.store
-            .enqueue_fts_subjects(&mut batch, graph, &affected_subjects)?;
+        self.store.set_vector_clock_by_id(
+            &mut batch,
+            ClockUpdate {
+                graph_id,
+                clock: vector_clock,
+            },
+        )?;
+        self.store.enqueue_fts_subjects_by_id(
+            &mut batch,
+            FtsEnqueue {
+                graph_id,
+                subjects: &affected_subjects,
+            },
+        )?;
         self.store.commit(batch)?;
         Ok(())
     }
 
-    fn refresh_graph_diagnostics(
+    /// Bring the persisted diagnostics record back in step with the state the
+    /// commit just produced. **Call with the graph commit guard held.**
+    ///
+    /// Three cases, cheapest first:
+    ///
+    /// 1. The write cannot have moved the orphan set, so the previous verdict is
+    ///    re-stamped against the new clock.
+    /// 2. The graph was orphan-free and the write was validated, so it is still
+    ///    orphan-free.
+    /// 3. Anything else: recompute from the store.
+    fn settle_diagnostics(
         &self,
         graph: &GraphId,
-        snapshot: &GraphSnapshot,
+        outcome: DiagnosticsOutcome<'_>,
     ) -> crate::store::Result<()> {
+        let DiagnosticsOutcome { pending, plan } = outcome;
+
+        // Case 1. `orphaned_data_entities` reads exactly two triple shapes:
+        // `?s rdf:type schema:Dataset|schema:MediaObject` (which entities count
+        // as data entities) and `?s schema:hasPart ?o` (which adds to that set
+        // and forms every edge of the reachability graph). Nothing else in the
+        // graph can affect it. `touches_reachability` is set by exactly those
+        // two shapes, so a write that leaves it clear provably leaves the orphan
+        // set identical — the previous verdict is still exact and only needs
+        // re-stamping so its clock tag matches the new state (G6).
+        if !pending.summary.touches_reachability() {
+            return self.store.set_graph_diagnostics(graph, &pending.previous);
+        }
+
+        // Case 2. A validated write leaves no orphan reachable from anything it
+        // touched, and a graph that was already orphan-free has no others.
+        if plan.validated_orphan_free && !pending.previous.has_orphans() {
+            return self
+                .store
+                .set_graph_diagnostics(graph, &GraphDiagnostics::default());
+        }
+
+        // Case 3.
+        self.recompute_graph_diagnostics(graph)
+    }
+
+    /// Recompute the orphan set from the store and persist it, re-queueing the
+    /// entities whose visibility changed for search (G6, G7).
+    fn recompute_graph_diagnostics(&self, graph: &GraphId) -> crate::store::Result<()> {
+        let snapshot = GraphSnapshot::from_store(&self.store, graph)?;
         let previous = self.store.graph_diagnostics(graph)?;
         let current = GraphDiagnostics::from_orphaned_entities(
-            crate::rules::orphaned_data_entities(snapshot)
+            crate::rules::orphaned_data_entities(&snapshot)
                 .into_iter()
                 .map(|term| encoded_identifier_value(&term))
                 .collect(),
         );
 
         if previous == current {
-            return Ok(());
+            // Still re-stamp: the record is tagged with the clock it was
+            // computed at, and the caller has just advanced it.
+            return self.store.set_graph_diagnostics(graph, &current);
         }
 
         self.store.set_graph_diagnostics(graph, &current)?;
-        self.enqueue_orphan_fts_updates(graph, &previous, &current)
+        self.enqueue_orphan_fts_updates(graph, OrphanChange { previous, current })
     }
 
     fn enqueue_orphan_fts_updates(
         &self,
         graph: &GraphId,
-        previous: &GraphDiagnostics,
-        current: &GraphDiagnostics,
+        change: OrphanChange,
     ) -> crate::store::Result<()> {
-        let previous: std::collections::HashSet<&String> =
-            previous.orphaned_entities.iter().collect();
-        let current: std::collections::HashSet<&String> =
-            current.orphaned_entities.iter().collect();
+        let previous: HashSet<&String> = change.previous.orphaned_entities.iter().collect();
+        let current: HashSet<&String> = change.current.orphaned_entities.iter().collect();
+        let Some(graph_id) = self
+            .store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))?
+        else {
+            return Ok(());
+        };
         let mut batch = self.store.new_batch();
         let mut dirty = false;
 
@@ -657,7 +845,13 @@ impl ReplicationEngine {
             let Some(subject_tid) = self.store.lookup_term(&subject)? else {
                 continue;
             };
-            self.store.enqueue_fts(&mut batch, graph, subject_tid)?;
+            self.store.enqueue_fts_by_id(
+                &mut batch,
+                FtsSubject {
+                    graph_id,
+                    subject: subject_tid,
+                },
+            )?;
             dirty = true;
         }
 
@@ -667,6 +861,34 @@ impl ReplicationEngine {
 
         Ok(())
     }
+}
+
+/// The four term ids of one quad, before interning.
+struct QuadTerms<'a> {
+    graph_id: TermId,
+    subject: &'a EncodedTerm,
+    predicate: &'a EncodedTerm,
+    object: &'a EncodedTerm,
+}
+
+/// Diagnostics inputs captured before a write, under the commit guard.
+struct PendingDiagnostics {
+    /// The record as it stood before the commit.
+    previous: GraphDiagnostics,
+    /// What the write touches, in the terms the orphan set depends on.
+    summary: DeltaSummary,
+}
+
+/// Inputs to the post-commit diagnostics decision.
+struct DiagnosticsOutcome<'a> {
+    pending: &'a PendingDiagnostics,
+    plan: DiagnosticsPlan,
+}
+
+/// The orphan set before and after a recompute.
+struct OrphanChange {
+    previous: GraphDiagnostics,
+    current: GraphDiagnostics,
 }
 
 fn encoded_identifier_value(term: &EncodedTerm) -> String {
