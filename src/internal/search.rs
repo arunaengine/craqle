@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing, Value,
 };
@@ -14,11 +14,28 @@ use tantivy::tokenizer::{
 };
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
+use crate::core::{EncodedTerm, GraphId};
+use crate::store::{GraphStore, TermId};
+
 const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
 const MEMORY_INDEX_WRITER_HEAP_BYTES: usize = 64_000_000;
 const REINDEX_FLUSH_CHUNK: usize = 2_048;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v2";
+
+/// Predicates whose objects contribute to a document's searchable text.
+///
+/// Built once instead of per synced subject: the previous per-call constructor
+/// allocated four `NamedNode`s plus four `EncodedTerm`s for every subject the
+/// worker touched (finding W13).
+static SEARCHABLE_PREDICATES: LazyLock<[EncodedTerm; 4]> = LazyLock::new(|| {
+    [
+        EncodedTerm::from_named_node(&crate::vocab::schema_name()),
+        EncodedTerm::from_named_node(&crate::vocab::schema_description()),
+        EncodedTerm::from_named_node(&crate::vocab::schema_keywords()),
+        EncodedTerm::from_named_node(&crate::vocab::schema_identifier()),
+    ]
+});
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
@@ -46,9 +63,12 @@ pub struct SearchHit {
 pub struct SearchIndex {
     index: Index,
     reader: IndexReader,
+    /// Guards the single Tantivy writer. Held only around `add`/`delete`
+    /// calls — never across store reads (finding W15). One writer, rather
+    /// than concurrent writers behind an `RwLock`, keeps delete/add
+    /// interleaving deterministic instead of timing-dependent (G7).
     writer: Mutex<IndexWriter>,
     dirty: AtomicBool,
-    empty: AtomicBool,
     needs_rebuild: bool,
     f_doc_key: Field,
     f_graph_id: Field,
@@ -56,11 +76,65 @@ pub struct SearchIndex {
     f_all_text: Field,
 }
 
+/// One document to add or replace.
+struct ResourceDoc<'a> {
+    graph_id: &'a str,
+    subject_iri: &'a str,
+    all_text: Option<&'a str>,
+    /// Delete any existing document with the same key first. Skipped by bulk
+    /// reindex, which already dropped every document of the graph.
+    delete_existing: bool,
+}
+
+/// Full-text query restricted to an explicit set of graph IRIs.
+pub struct GraphSetQuery<'a> {
+    pub graphs: &'a [GraphId],
+    pub query: &'a str,
+    pub limit: usize,
+}
+
+/// Bounds one drain pass over the durable FTS queues.
+pub struct QueueBound {
+    /// Maximum entries to read from the store per drain.
+    pub chunk: usize,
+    /// Highest dirty token to process, or `None` to process everything queued.
+    ///
+    /// A bounded flush pins this to the token observed when the flush started,
+    /// so a writer that keeps enqueueing cannot keep the drain alive forever
+    /// (finding W15b).
+    pub max_token: Option<u64>,
+}
+
+/// A subject update read from the store, ready to apply to the index.
+///
+/// Produced with no writer lock held so the (potentially very large) store
+/// read phase does not block searches or other index writers.
+enum PreparedDocOp {
+    /// The subject is gone, orphaned, or its graph is unknown: drop it.
+    Delete { doc: DocIdentity },
+    /// Replace the subject's document with freshly read text.
+    Upsert {
+        doc: DocIdentity,
+        all_text: Option<String>,
+    },
+}
+
+struct DocIdentity {
+    graph_iri: String,
+    subject_iri: String,
+}
+
+/// Store reads needed to prepare one subject's index update.
+struct PrepareSubject<'a> {
+    store: &'a GraphStore,
+    graph: &'a GraphId,
+    subject: TermId,
+}
+
 #[derive(Default)]
 struct StoreSyncCaches {
-    orphaned_subjects: HashMap<crate::core::GraphId, HashSet<String>>,
-    graph_terms: HashMap<crate::core::GraphId, Option<crate::store::TermId>>,
-    terms: HashMap<crate::store::TermId, crate::core::EncodedTerm>,
+    orphaned_subjects: HashMap<GraphId, HashSet<String>>,
+    graph_terms: HashMap<GraphId, Option<TermId>>,
 }
 
 fn build_schema() -> Schema {
@@ -144,7 +218,6 @@ impl SearchIndex {
             reader,
             writer: Mutex::new(writer),
             dirty: AtomicBool::new(false),
-            empty: AtomicBool::new(needs_rebuild),
             needs_rebuild,
             f_doc_key,
             f_graph_id,
@@ -168,7 +241,6 @@ impl SearchIndex {
             reader,
             writer: Mutex::new(writer),
             dirty: AtomicBool::new(false),
-            empty: AtomicBool::new(true),
             needs_rebuild: false,
             f_doc_key,
             f_graph_id,
@@ -193,132 +265,39 @@ impl SearchIndex {
         all_text: Option<&str>,
     ) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
-        self.add_resource_document(&mut writer, graph_id, subject_iri, all_text)
+        self.add_document(
+            &mut writer,
+            ResourceDoc {
+                graph_id,
+                subject_iri,
+                all_text,
+                delete_existing: true,
+            },
+        )
     }
 
-    pub fn replace_graph_documents<I>(&self, graph_id: &str, documents: I) -> Result<()>
-    where
-        I: IntoIterator<Item = (String, Option<String>)>,
-    {
-        {
-            let mut writer = self.writer.lock().unwrap();
-            writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
-            self.dirty.store(true, Ordering::SeqCst);
-            for (subject_iri, all_text) in documents {
-                self.add_resource_document_with_delete(
-                    &mut writer,
-                    graph_id,
-                    &subject_iri,
-                    all_text.as_deref(),
-                    false,
-                )?;
-            }
-        }
-        self.commit()
-    }
-
-    pub fn upsert_resource_documents<I>(&self, graph_id: &str, documents: I) -> Result<()>
-    where
-        I: IntoIterator<Item = (String, Option<String>)>,
-    {
-        {
-            let mut writer = self.writer.lock().unwrap();
-            for (subject_iri, all_text) in documents {
-                self.add_resource_document_with_delete(
-                    &mut writer,
-                    graph_id,
-                    &subject_iri,
-                    all_text.as_deref(),
-                    true,
-                )?;
-            }
-        }
-        self.commit()
-    }
-
-    pub fn sync_subjects_from_store(
-        &self,
-        store: &crate::store::GraphStore,
-        graph: &crate::core::GraphId,
-        subjects: &[crate::core::EncodedTerm],
-    ) -> Result<()> {
-        let mut seen = HashSet::new();
-        let mut caches = StoreSyncCaches::default();
-        {
-            let mut writer = self.writer.lock().unwrap();
-            for subject in subjects {
-                let subject_iri = term_to_string(subject);
-                if !seen.insert(subject_iri.clone()) {
-                    continue;
-                }
-
-                let Some(subject_tid) = store.lookup_term(subject)? else {
-                    self.delete_resource_with_writer(&mut writer, graph.as_str(), &subject_iri);
-                    continue;
-                };
-
-                self.sync_subject_from_store_cached(
-                    &mut writer,
-                    store,
-                    graph,
-                    subject_tid,
-                    &mut caches,
-                )?;
-            }
-        }
-        self.commit()
-    }
-
-    fn add_resource_document(
-        &self,
-        writer: &mut IndexWriter,
-        graph_id: &str,
-        subject_iri: &str,
-        all_text: Option<&str>,
-    ) -> Result<()> {
-        self.add_resource_document_with_delete(writer, graph_id, subject_iri, all_text, true)
-    }
-
-    fn add_resource_document_with_delete(
-        &self,
-        writer: &mut IndexWriter,
-        graph_id: &str,
-        subject_iri: &str,
-        all_text: Option<&str>,
-        delete_existing: bool,
-    ) -> Result<()> {
-        if delete_existing {
-            writer.delete_term(Term::from_field_text(
-                self.f_doc_key,
-                &doc_key(graph_id, subject_iri),
-            ));
+    /// Add `doc` to the index, optionally replacing the document with the same
+    /// `(graph, subject)` key first.
+    fn add_document(&self, writer: &mut IndexWriter, doc: ResourceDoc<'_>) -> Result<()> {
+        let key = doc_key(doc.graph_id, doc.subject_iri);
+        if doc.delete_existing {
+            writer.delete_term(Term::from_field_text(self.f_doc_key, &key));
         }
 
-        self.add_resource_document_without_delete(writer, graph_id, subject_iri, all_text)
-    }
-
-    fn add_resource_document_without_delete(
-        &self,
-        writer: &mut IndexWriter,
-        graph_id: &str,
-        subject_iri: &str,
-        all_text: Option<&str>,
-    ) -> Result<()> {
-        let mut all_text_parts: Vec<&str> = vec![graph_id, subject_iri];
-        if let Some(extra) = all_text {
+        let mut all_text_parts: Vec<&str> = vec![doc.graph_id, doc.subject_iri];
+        if let Some(extra) = doc.all_text {
             all_text_parts.push(extra);
         }
         let all_text = all_text_parts.join(" ");
 
-        let mut doc = TantivyDocument::default();
-        doc.add_text(self.f_doc_key, doc_key(graph_id, subject_iri));
-        doc.add_text(self.f_graph_id, graph_id);
-        doc.add_text(self.f_subject_iri, subject_iri);
-        doc.add_text(self.f_all_text, &all_text);
+        let mut document = TantivyDocument::default();
+        document.add_text(self.f_doc_key, key);
+        document.add_text(self.f_graph_id, doc.graph_id);
+        document.add_text(self.f_subject_iri, doc.subject_iri);
+        document.add_text(self.f_all_text, &all_text);
 
-        writer.add_document(doc)?;
+        writer.add_document(document)?;
         self.dirty.store(true, Ordering::SeqCst);
-        self.empty.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -335,17 +314,10 @@ impl SearchIndex {
 
     /// Full-text search across all graphs.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
         let parsed = query_parser.parse_query(&sanitize_query(query))?;
 
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
-        let mut hits = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
-            hits.push(self.doc_to_hit(doc, score));
-        }
-        Ok(hits)
+        self.collect_top_docs(&parsed, limit)
     }
 
     /// Full-text search restricted to a single graph.
@@ -355,7 +327,6 @@ impl SearchIndex {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
         let parsed = query_parser.parse_query(&sanitize_query(query))?;
         let graph_filter = TermQuery::new(
@@ -367,7 +338,46 @@ impl SearchIndex {
             (Occur::Must, Box::new(graph_filter)),
         ]);
 
-        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit).order_by_score())?;
+        self.collect_top_docs(&combined, limit)
+    }
+
+    /// Full-text search restricted to an explicit set of graphs.
+    ///
+    /// One top-k collection over a graph-set filter, instead of one full
+    /// search per graph. Callers must have authorized every graph in the set
+    /// against the *stored* policy first: this filter only narrows the
+    /// candidate set, it is not an authorization check (G8).
+    pub fn search_in_graphs(&self, req: GraphSetQuery<'_>) -> Result<Vec<SearchHit>> {
+        if req.graphs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
+        let parsed = query_parser.parse_query(req.query)?;
+
+        let graph_clauses: Vec<(Occur, Box<dyn Query>)> = req
+            .graphs
+            .iter()
+            .map(|graph| {
+                let term = TermQuery::new(
+                    Term::from_field_text(self.f_graph_id, graph.as_str()),
+                    IndexRecordOption::Basic,
+                );
+                (Occur::Should, Box::new(term) as Box<dyn Query>)
+            })
+            .collect();
+
+        let combined = BooleanQuery::new(vec![
+            (Occur::Must, parsed),
+            (Occur::Must, Box::new(BooleanQuery::new(graph_clauses))),
+        ]);
+
+        self.collect_top_docs(&combined, req.limit)
+    }
+
+    fn collect_top_docs(&self, query: &dyn Query, limit: usize) -> Result<Vec<SearchHit>> {
+        let searcher = self.reader.searcher();
+        let top_docs = searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -391,92 +401,114 @@ impl SearchIndex {
     }
 
     /// Sync queued subject updates from the RDF store into Tantivy.
-    pub fn process_queued_updates(
+    ///
+    /// The three durable queues are drained in priority order: graph deletes,
+    /// whole-graph reindexes, then individual subjects. Each branch commits the
+    /// index *before* acknowledging the queue entries it covered — a crash in
+    /// between only re-does work, whereas acknowledging first would silently
+    /// drop updates Tantivy never committed (G7).
+    pub fn process_queued_updates_bounded(
         &self,
-        store: &crate::store::GraphStore,
-        limit: usize,
+        store: &GraphStore,
+        bound: QueueBound,
     ) -> Result<usize> {
-        let queued_deletes = store.drain_fts_delete_queue(limit)?;
+        let queued_deletes = drain_upto(&bound, |chunk| Ok(store.drain_fts_delete_queue(chunk)?))?;
         if !queued_deletes.is_empty() {
-            let mut processed = 0usize;
             for (graph, _) in &queued_deletes {
                 if store.contains_graph(graph)? {
                     self.reindex_from_store(store, graph)?;
                 } else {
                     self.delete_graph_documents_uncommitted(graph.as_str());
                 }
-                processed += 1;
             }
 
-            if processed > 0 {
-                self.commit()?;
-                store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
-                store.acknowledge_fts_delete_queue(&queued_deletes)?;
-            }
-            return Ok(processed);
+            self.commit()?;
+            store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
+            store.acknowledge_fts_delete_queue(&queued_deletes)?;
+            return Ok(queued_deletes.len());
         }
 
-        let queued_graphs = store.drain_fts_reindex_queue(limit)?;
+        let queued_graphs = drain_upto(&bound, |chunk| Ok(store.drain_fts_reindex_queue(chunk)?))?;
         if !queued_graphs.is_empty() {
-            let mut processed = 0usize;
             for (graph, _) in &queued_graphs {
                 self.reindex_from_store(store, graph)?;
-                processed += 1;
             }
 
-            if processed > 0 {
-                self.commit()?;
-                store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_graphs)?;
-                store.acknowledge_fts_reindex_queue(&queued_graphs)?;
-            }
-            return Ok(processed);
+            self.commit()?;
+            store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_graphs)?;
+            store.acknowledge_fts_reindex_queue(&queued_graphs)?;
+            return Ok(queued_graphs.len());
         }
 
-        let queued = store.drain_fts_queue(limit)?;
+        let queued = drain_upto(&bound, |chunk| Ok(store.drain_fts_queue(chunk)?))?;
         if queued.is_empty() {
             return Ok(0);
         }
 
+        // Phase 1: read every update from the store with NO writer lock held.
+        // This walks up to `bound.chunk` subjects and used to run under the
+        // Tantivy writer mutex, blocking every other indexer for the whole
+        // scan (finding W15a).
         let mut seen = HashSet::with_capacity(queued.len());
         let mut caches = StoreSyncCaches::default();
-        let mut writer = self.writer.lock().unwrap();
-        let mut processed = 0usize;
-
-        for (graph, subject_tid, _) in &queued {
-            if !seen.insert((graph.clone(), *subject_tid)) {
+        let mut prepared = Vec::with_capacity(queued.len());
+        for (graph, subject, _) in &queued {
+            if !seen.insert((graph.clone(), *subject)) {
                 continue;
             }
-            self.sync_subject_from_store_cached(
-                &mut writer,
-                store,
-                graph,
-                *subject_tid,
+            prepared.push(prepare_subject_op(
+                PrepareSubject {
+                    store,
+                    graph,
+                    subject: *subject,
+                },
                 &mut caches,
-            )?;
-            processed += 1;
+            )?);
         }
 
-        drop(writer);
-
-        if processed > 0 {
-            self.commit()?;
-            store.acknowledge_fts_queue(&queued)?;
+        // Phase 2: apply the prepared ops in queue order under the writer lock.
+        {
+            // Guards the Tantivy writer; no store reads happen inside.
+            let mut writer = self.writer.lock().unwrap();
+            for op in &prepared {
+                self.apply_prepared_op(&mut writer, op)?;
+            }
         }
-        Ok(processed)
+
+        self.commit()?;
+        store.acknowledge_fts_queue(&queued)?;
+        Ok(prepared.len())
     }
 
-    pub fn sync_subject_from_store(
-        &self,
-        store: &crate::store::GraphStore,
-        graph: &crate::core::GraphId,
-        subject: &crate::core::EncodedTerm,
-    ) -> Result<()> {
-        let Some(subject_tid) = store.lookup_term(subject)? else {
-            return self.delete_resource(graph.as_str(), &term_to_string(subject));
-        };
-        let mut writer = self.writer.lock().unwrap();
-        let mut caches = StoreSyncCaches::default();
-        self.sync_subject_from_store_cached(&mut writer, store, graph, subject_tid, &mut caches)
+    #[deprecated(
+        note = "use SearchIndex::process_queued_updates_bounded with a QueueBound; removed in W-CLEAN"
+    )]
+    pub fn process_queued_updates(&self, store: &GraphStore, limit: usize) -> Result<usize> {
+        self.process_queued_updates_bounded(
+            store,
+            QueueBound {
+                chunk: limit,
+                max_token: None,
+            },
+        )
+    }
+
+    fn apply_prepared_op(&self, writer: &mut IndexWriter, op: &PreparedDocOp) -> Result<()> {
+        match op {
+            PreparedDocOp::Delete { doc } => {
+                self.delete_resource_with_writer(writer, &doc.graph_iri, &doc.subject_iri);
+                Ok(())
+            }
+            PreparedDocOp::Upsert { doc, all_text } => self.add_document(
+                writer,
+                ResourceDoc {
+                    graph_id: &doc.graph_iri,
+                    subject_iri: &doc.subject_iri,
+                    all_text: all_text.as_deref(),
+                    delete_existing: true,
+                },
+            ),
+        }
     }
 
     /// Reindex all entities in a graph from the RDF store.
@@ -485,29 +517,23 @@ impl SearchIndex {
     /// subject, and indexes each subject as a document.
     ///
     /// Returns the number of entities indexed.
-    pub fn reindex_from_store(
-        &self,
-        store: &crate::store::GraphStore,
-        graph: &crate::core::GraphId,
-    ) -> Result<usize> {
+    pub fn reindex_from_store(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
         let graph_iri = graph.as_str();
-        let graph_term = crate::core::EncodedTerm::from_named_node(&graph.0);
+        let graph_term = EncodedTerm::from_named_node(&graph.0);
         let graph_tid = match store.lookup_term(&graph_term)? {
             Some(tid) => tid,
             None => return Ok(0),
         };
 
         let orphaned = orphaned_subjects(store, graph)?;
-        let searchable_predicates = searchable_predicates();
         let mut count = 0usize;
-        let mut current_subject: Option<crate::store::TermId> = None;
+        let mut current_subject: Option<TermId> = None;
         let mut current_subject_iri = String::new();
         let mut current_subject_visible = false;
         let mut current_text = String::new();
         let mut pending_documents = Vec::new();
-        let mut term_cache = HashMap::new();
-        let delete_existing = false;
         {
+            // Guards the Tantivy writer for the whole-graph clear only.
             let writer = self.writer.lock().unwrap();
             writer.delete_term(Term::from_field_text(self.f_graph_id, graph_iri));
             self.dirty.store(true, Ordering::SeqCst);
@@ -522,15 +548,11 @@ impl SearchIndex {
                     ));
                     count += 1;
                     if pending_documents.len() >= REINDEX_FLUSH_CHUNK {
-                        self.flush_pending_documents(
-                            graph_iri,
-                            delete_existing,
-                            &mut pending_documents,
-                        )?;
+                        self.flush_pending_documents(graph_iri, &mut pending_documents)?;
                     }
                 }
 
-                let subject_term = store.decode_term_cached(&mut term_cache, quad.subject)?;
+                let subject_term = store.decode_term_arc(quad.subject)?;
                 current_subject_iri = term_to_string(&subject_term);
                 current_subject_visible = !orphaned.contains(&current_subject_iri);
                 current_text.clear();
@@ -538,11 +560,11 @@ impl SearchIndex {
             }
 
             if current_subject_visible {
-                let predicate_term = store.decode_term_cached(&mut term_cache, quad.predicate)?;
-                if !is_searchable_predicate(&predicate_term, &searchable_predicates) {
+                let predicate_term = store.decode_term_arc(quad.predicate)?;
+                if !is_searchable_predicate(&predicate_term) {
                     return Ok(());
                 }
-                let object_term = store.decode_term_cached(&mut term_cache, quad.object)?;
+                let object_term = store.decode_term_arc(quad.object)?;
                 append_searchable_text(&mut current_text, &object_term);
             }
             Ok(())
@@ -556,7 +578,7 @@ impl SearchIndex {
             count += 1;
         }
 
-        self.flush_pending_documents(graph_iri, delete_existing, &mut pending_documents)?;
+        self.flush_pending_documents(graph_iri, &mut pending_documents)?;
 
         Ok(count)
     }
@@ -582,79 +604,27 @@ impl SearchIndex {
     fn flush_pending_documents(
         &self,
         graph_iri: &str,
-        delete_existing: bool,
         pending_documents: &mut Vec<(String, Option<String>)>,
     ) -> Result<()> {
         if pending_documents.is_empty() {
             return Ok(());
         }
 
+        // Guards the Tantivy writer. Reindex already dropped every document of
+        // this graph, so the per-document delete is unnecessary here.
         let mut writer = self.writer.lock().unwrap();
         for (subject_iri, extra_text) in pending_documents.drain(..) {
-            self.add_resource_document_with_delete(
+            self.add_document(
                 &mut writer,
-                graph_iri,
-                &subject_iri,
-                extra_text.as_deref(),
-                delete_existing,
+                ResourceDoc {
+                    graph_id: graph_iri,
+                    subject_iri: &subject_iri,
+                    all_text: extra_text.as_deref(),
+                    delete_existing: false,
+                },
             )?;
         }
         Ok(())
-    }
-
-    fn sync_subject_from_store_cached(
-        &self,
-        writer: &mut IndexWriter,
-        store: &crate::store::GraphStore,
-        graph: &crate::core::GraphId,
-        subject_tid: crate::store::TermId,
-        caches: &mut StoreSyncCaches,
-    ) -> Result<()> {
-        let graph_iri = graph.as_str();
-        let subject = store.decode_term_cached(&mut caches.terms, subject_tid)?;
-        let subject_iri = term_to_string(&subject);
-        let orphaned = load_orphaned_subjects(&mut caches.orphaned_subjects, store, graph)?;
-        if orphaned.contains(subject_iri.as_str()) {
-            self.delete_resource_with_writer(writer, graph_iri, &subject_iri);
-            return Ok(());
-        }
-
-        let graph_tid = match caches.graph_terms.get(graph) {
-            Some(cached) => *cached,
-            None => {
-                let graph_term = crate::core::EncodedTerm::from_named_node(&graph.0);
-                let resolved = store.lookup_term(&graph_term)?;
-                caches.graph_terms.insert(graph.clone(), resolved);
-                resolved
-            }
-        };
-        let Some(graph_tid) = graph_tid else {
-            self.delete_resource_with_writer(writer, graph_iri, &subject_iri);
-            return Ok(());
-        };
-
-        let triples = store.triples_for_subject(graph_tid, subject_tid)?;
-        if triples.is_empty() {
-            self.delete_resource_with_writer(writer, graph_iri, &subject_iri);
-            return Ok(());
-        }
-
-        let searchable_predicates = searchable_predicates();
-        let mut extra_text = String::new();
-        for (predicate, object) in triples {
-            if !is_searchable_predicate(&predicate, &searchable_predicates) {
-                continue;
-            }
-            append_searchable_text(&mut extra_text, &object);
-        }
-
-        self.add_resource_document_with_delete(
-            writer,
-            graph_iri,
-            &subject_iri,
-            (!extra_text.is_empty()).then_some(extra_text).as_deref(),
-            true,
-        )
     }
 
     fn delete_resource_with_writer(
@@ -675,6 +645,108 @@ impl SearchIndex {
         writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
         self.dirty.store(true, Ordering::SeqCst);
     }
+}
+
+/// A durable FTS queue entry, tagged with the dirty token it was enqueued at.
+trait QueueEntry {
+    fn token(&self) -> u64;
+}
+
+impl QueueEntry for (GraphId, u64) {
+    fn token(&self) -> u64 {
+        self.1
+    }
+}
+
+impl QueueEntry for (GraphId, TermId, u64) {
+    fn token(&self) -> u64 {
+        self.2
+    }
+}
+
+/// Drain one durable queue, keeping only entries at or below `bound.max_token`.
+///
+/// Queue keys are ordered by graph/subject hash rather than by token, so a
+/// bounded drain can come back holding nothing but entries enqueued after the
+/// bound was taken while eligible ones sit further along the scan. Widen the
+/// chunk until eligible entries appear or the whole queue has been seen:
+/// returning early would leave pre-flush work unindexed and break the bounded
+/// flush contract ("everything enqueued before the call is indexed").
+///
+/// Terminates because `chunk` grows until the drain returns fewer entries than
+/// requested, which means the whole queue was scanned.
+fn drain_upto<T, D>(bound: &QueueBound, drain: D) -> Result<Vec<T>>
+where
+    T: QueueEntry,
+    D: Fn(usize) -> Result<Vec<T>>,
+{
+    let Some(max_token) = bound.max_token else {
+        return drain(bound.chunk);
+    };
+
+    let mut chunk = bound.chunk;
+    loop {
+        let drained = drain(chunk)?;
+        let whole_queue_seen = drained.len() < chunk;
+        let eligible: Vec<T> = drained
+            .into_iter()
+            .filter(|entry| entry.token() <= max_token)
+            .collect();
+        if !eligible.is_empty() || whole_queue_seen {
+            return Ok(eligible);
+        }
+        chunk = chunk.saturating_mul(4);
+    }
+}
+
+/// Read everything one queued subject needs from the store and decide whether
+/// its document should be replaced or dropped.
+///
+/// Pure store reads: no Tantivy writer lock is held while this runs.
+fn prepare_subject_op(
+    req: PrepareSubject<'_>,
+    caches: &mut StoreSyncCaches,
+) -> Result<PreparedDocOp> {
+    let subject_term = req.store.decode_term_arc(req.subject)?;
+    let doc = DocIdentity {
+        graph_iri: req.graph.as_str().to_string(),
+        subject_iri: term_to_string(&subject_term),
+    };
+
+    // Orphaned entities are invisible to search, exactly as they are to export
+    // and SPARQL (G6).
+    let orphaned = load_orphaned_subjects(&mut caches.orphaned_subjects, req.store, req.graph)?;
+    if orphaned.contains(doc.subject_iri.as_str()) {
+        return Ok(PreparedDocOp::Delete { doc });
+    }
+
+    let graph_tid = match caches.graph_terms.entry(req.graph.clone()) {
+        std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let graph_term = EncodedTerm::from_named_node(&req.graph.0);
+            *entry.insert(req.store.lookup_term(&graph_term)?)
+        }
+    };
+    let Some(graph_tid) = graph_tid else {
+        return Ok(PreparedDocOp::Delete { doc });
+    };
+
+    let triples = req.store.triples_for_subject(graph_tid, req.subject)?;
+    if triples.is_empty() {
+        return Ok(PreparedDocOp::Delete { doc });
+    }
+
+    let mut all_text = String::new();
+    for (predicate, object) in triples {
+        if is_searchable_predicate(&predicate) {
+            append_searchable_text(&mut all_text, &object);
+        }
+    }
+
+    Ok(PreparedDocOp::Upsert {
+        doc,
+        all_text: (!all_text.is_empty()).then_some(all_text),
+    })
 }
 
 /// Extract the first text value for a field from a TantivyDocument.
@@ -713,10 +785,7 @@ fn sanitize_query(query: &str) -> String {
         .join(" ")
 }
 
-fn orphaned_subjects(
-    store: &crate::store::GraphStore,
-    graph: &crate::core::GraphId,
-) -> Result<std::collections::HashSet<String>> {
+fn orphaned_subjects(store: &GraphStore, graph: &GraphId) -> Result<HashSet<String>> {
     Ok(store
         .graph_diagnostics(graph)?
         .orphaned_entities
@@ -726,7 +795,7 @@ fn orphaned_subjects(
 
 /// Convert an EncodedTerm to a plain string (IRI without angle brackets,
 /// or the raw string representation for other term types).
-fn term_to_string(term: &crate::core::EncodedTerm) -> String {
+fn term_to_string(term: &EncodedTerm) -> String {
     if term.0.starts_with('<') && term.0.ends_with('>') {
         term.0[1..term.0.len() - 1].to_string()
     } else {
@@ -734,7 +803,7 @@ fn term_to_string(term: &crate::core::EncodedTerm) -> String {
     }
 }
 
-fn append_searchable_text(buffer: &mut String, term: &crate::core::EncodedTerm) {
+fn append_searchable_text(buffer: &mut String, term: &EncodedTerm) {
     let Some(value) = searchable_term_text(term) else {
         return;
     };
@@ -744,29 +813,20 @@ fn append_searchable_text(buffer: &mut String, term: &crate::core::EncodedTerm) 
     buffer.push_str(&value);
 }
 
-fn searchable_predicates() -> [crate::core::EncodedTerm; 4] {
-    [
-        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_name()),
-        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_description()),
-        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_keywords()),
-        crate::core::EncodedTerm::from_named_node(&crate::vocab::schema_identifier()),
-    ]
-}
-
-fn is_searchable_predicate(
-    predicate: &crate::core::EncodedTerm,
-    searchable_predicates: &[crate::core::EncodedTerm],
-) -> bool {
+/// `https://schema.org/` and `http://schema.org/` name the same predicate; the
+/// table is interned in the `http` form, so an `https` term is normalized
+/// before comparison rather than being silently dropped from the index.
+fn is_searchable_predicate(predicate: &EncodedTerm) -> bool {
     let normalized = predicate
         .0
         .strip_prefix("<https://schema.org/")
         .map(|suffix| format!("<http://schema.org/{suffix}"));
-    searchable_predicates
+    SEARCHABLE_PREDICATES
         .iter()
         .any(|candidate| candidate == predicate || normalized.as_ref() == Some(&candidate.0))
 }
 
-fn searchable_term_text(term: &crate::core::EncodedTerm) -> Option<Cow<'_, str>> {
+fn searchable_term_text(term: &EncodedTerm) -> Option<Cow<'_, str>> {
     if term.0.starts_with('<') && term.0.ends_with('>') {
         return Some(Cow::Borrowed(&term.0[1..term.0.len() - 1]));
     }
@@ -783,9 +843,9 @@ fn searchable_term_text(term: &crate::core::EncodedTerm) -> Option<Cow<'_, str>>
 }
 
 fn load_orphaned_subjects<'a>(
-    cache: &'a mut HashMap<crate::core::GraphId, HashSet<String>>,
-    store: &crate::store::GraphStore,
-    graph: &crate::core::GraphId,
+    cache: &'a mut HashMap<GraphId, HashSet<String>>,
+    store: &GraphStore,
+    graph: &GraphId,
 ) -> Result<&'a HashSet<String>> {
     if !cache.contains_key(graph) {
         cache.insert(graph.clone(), orphaned_subjects(store, graph)?);

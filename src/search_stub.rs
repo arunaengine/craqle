@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::core::{EncodedTerm, GraphId};
+use crate::core::GraphId;
 use crate::store::GraphStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +18,19 @@ pub struct SearchHit {
     pub graph_id: String,
     pub subject_iri: String,
     pub score: f32,
+}
+
+/// Mirrors `search::GraphSetQuery`.
+pub struct GraphSetQuery<'a> {
+    pub graphs: &'a [GraphId],
+    pub query: &'a str,
+    pub limit: usize,
+}
+
+/// Mirrors `search::QueueBound`.
+pub struct QueueBound {
+    pub chunk: usize,
+    pub max_token: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -62,40 +75,66 @@ impl SearchIndex {
         Ok(Vec::new())
     }
 
+    pub fn search_in_graphs(&self, _req: GraphSetQuery<'_>) -> Result<Vec<SearchHit>> {
+        Ok(Vec::new())
+    }
+
     pub fn commit(&self) -> Result<()> {
         Ok(())
     }
 
-    pub fn process_queued_updates(&self, store: &GraphStore, limit: usize) -> Result<usize> {
-        let queued_deletes = store.drain_fts_delete_queue(limit)?;
+    /// Drain and acknowledge without indexing. The token bound is honoured so
+    /// the caller's flush contract behaves the same with the feature off.
+    pub fn process_queued_updates_bounded(
+        &self,
+        store: &GraphStore,
+        bound: QueueBound,
+    ) -> Result<usize> {
+        let queued_deletes =
+            retain_upto(store.drain_fts_delete_queue(bound.chunk)?, &bound, |e| e.1);
         if !queued_deletes.is_empty() {
             store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
             store.acknowledge_fts_delete_queue(&queued_deletes)?;
             return Ok(queued_deletes.len());
         }
 
-        let queued_reindexes = store.drain_fts_reindex_queue(limit)?;
+        let queued_reindexes =
+            retain_upto(store.drain_fts_reindex_queue(bound.chunk)?, &bound, |e| e.1);
         if !queued_reindexes.is_empty() {
             store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_reindexes)?;
             store.acknowledge_fts_reindex_queue(&queued_reindexes)?;
             return Ok(queued_reindexes.len());
         }
 
-        let queued = store.drain_fts_queue(limit)?;
+        let queued = retain_upto(store.drain_fts_queue(bound.chunk)?, &bound, |e| e.2);
         store.acknowledge_fts_queue(&queued)?;
         Ok(queued.len())
     }
 
-    pub fn sync_subject_from_store(
-        &self,
-        _store: &GraphStore,
-        _graph: &GraphId,
-        _subject: &EncodedTerm,
-    ) -> Result<()> {
-        Ok(())
+    #[deprecated(
+        note = "use SearchIndex::process_queued_updates_bounded with a QueueBound; removed in W-CLEAN"
+    )]
+    pub fn process_queued_updates(&self, store: &GraphStore, limit: usize) -> Result<usize> {
+        self.process_queued_updates_bounded(
+            store,
+            QueueBound {
+                chunk: limit,
+                max_token: None,
+            },
+        )
     }
 
     pub fn reindex_from_store(&self, _store: &GraphStore, _graph: &GraphId) -> Result<usize> {
         Ok(0)
     }
+}
+
+fn retain_upto<T>(entries: Vec<T>, bound: &QueueBound, token: impl Fn(&T) -> u64) -> Vec<T> {
+    let Some(max_token) = bound.max_token else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .filter(|entry| token(entry) <= max_token)
+        .collect()
 }
