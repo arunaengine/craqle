@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -67,8 +67,14 @@ pub struct SearchIndex {
     /// calls — never across store reads (finding W15). One writer, rather
     /// than concurrent writers behind an `RwLock`, keeps delete/add
     /// interleaving deterministic instead of timing-dependent (G7).
+    ///
+    /// Never locked directly: go through [`SearchIndex::writer`], which turns
+    /// a poisoned lock into a recovery instead of a panic.
     writer: Mutex<IndexWriter>,
     dirty: AtomicBool,
+    /// Set when a poisoned writer was rolled back and the index therefore owes
+    /// the store a full re-derivation. Cleared once that reindex is queued.
+    rebuild_owed: AtomicBool,
     needs_rebuild: bool,
     f_doc_key: Field,
     f_graph_id: Field,
@@ -218,6 +224,7 @@ impl SearchIndex {
             reader,
             writer: Mutex::new(writer),
             dirty: AtomicBool::new(false),
+            rebuild_owed: AtomicBool::new(false),
             needs_rebuild,
             f_doc_key,
             f_graph_id,
@@ -241,6 +248,7 @@ impl SearchIndex {
             reader,
             writer: Mutex::new(writer),
             dirty: AtomicBool::new(false),
+            rebuild_owed: AtomicBool::new(false),
             needs_rebuild: false,
             f_doc_key,
             f_graph_id,
@@ -254,6 +262,98 @@ impl SearchIndex {
         self.needs_rebuild
     }
 
+    /// Lock the Tantivy writer, repairing it if a panicking thread poisoned
+    /// the mutex.
+    ///
+    /// `lock().unwrap()` made a single panic anywhere in the process fatal to
+    /// the search index for the lifetime of that process: every later lock
+    /// panicked in turn, the background indexer died with the first of them,
+    /// and the index stopped converging with the store until a restart. The
+    /// index is derived state, and derived state gets a prompt automatic
+    /// repair — "fixed at next restart" is not a repair.
+    fn writer(&self) -> Result<MutexGuard<'_, IndexWriter>> {
+        match self.writer.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => self.recover_writer(poisoned.into_inner()),
+        }
+    }
+
+    /// Roll a poisoned writer back to its last commit and take on the debt of
+    /// re-deriving the index from the store.
+    ///
+    /// The panic unwound out of the writer at an unknown point, so its
+    /// uncommitted state cannot be trusted; carrying on with it would risk a
+    /// silently incomplete index, which is worse than the failure being
+    /// repaired. `IndexWriter::rollback` is Tantivy's own answer to exactly
+    /// this: it discards everything since the last commit and replaces the
+    /// writer with a fresh one built from the same `Index`, handing the
+    /// directory lock across so no second writer can be constructed behind it.
+    ///
+    /// That leaves the index at a consistent — but stale — commit, so the
+    /// recovery is only half done here. The other half, re-deriving from the
+    /// store, needs a store handle and is completed by
+    /// [`SearchIndex::settle_poisoned_writer`] on the indexer's next pass.
+    /// The debt is recorded before the rollback so a rollback that itself
+    /// fails still leaves the mutex poisoned and the debt outstanding, and the
+    /// next lock attempt retries the whole repair.
+    fn recover_writer<'a>(
+        &'a self,
+        mut guard: MutexGuard<'a, IndexWriter>,
+    ) -> Result<MutexGuard<'a, IndexWriter>> {
+        self.rebuild_owed.store(true, Ordering::SeqCst);
+        guard.rollback()?;
+        self.writer.clear_poison();
+        Ok(guard)
+    }
+
+    /// Repair a poisoned writer and durably queue the reindex it owes.
+    ///
+    /// Called at the top of every drain, so the indexer's own one-second tick
+    /// is the detection point: recovery does not wait for the next write, let
+    /// alone the next restart.
+    ///
+    /// The repair is queued rather than run inline so that it is durable —
+    /// a crash part-way through leaves the reindex entries in fjall and the
+    /// next open picks them up — and so that it obeys the same rule as every
+    /// other index update: acknowledged only after the Tantivy commit that
+    /// covers it (G7). Re-deriving whole graphs re-does work the index may
+    /// already hold, which is the safe direction for a dirty set.
+    ///
+    /// The returned bound is widened past the entries just queued so this same
+    /// pass drains them. Without that, a caller blocked in
+    /// `flush_search_updates` would be told the index is current while the
+    /// rebuild its own flush triggered was still pending. The widening happens
+    /// once, on the recovery pass only, so it cannot revive the unbounded-drain
+    /// livelock the bound exists to prevent (finding W15b).
+    fn settle_poisoned_writer(&self, store: &GraphStore, bound: QueueBound) -> Result<QueueBound> {
+        if self.writer.is_poisoned() {
+            drop(self.writer()?);
+        }
+        if !self.rebuild_owed.swap(false, Ordering::SeqCst) {
+            return Ok(bound);
+        }
+
+        if let Err(error) = self.enqueue_full_rebuild(store) {
+            // Put the debt back: the next pass, one tick later, retries it.
+            self.rebuild_owed.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+
+        Ok(QueueBound {
+            chunk: bound.chunk,
+            max_token: bound.max_token.map(|_| store.current_dirty_token()),
+        })
+    }
+
+    fn enqueue_full_rebuild(&self, store: &GraphStore) -> Result<()> {
+        let mut batch = store.new_batch();
+        for graph_id in store.graph_term_ids()? {
+            store.enqueue_fts_reindex_by_id(&mut batch, graph_id)?;
+        }
+        store.commit(batch)?;
+        Ok(store.persist()?)
+    }
+
     /// Add or update a document for the given resource.
     ///
     /// Deletes any existing document with the same `subject_iri` in the same
@@ -264,7 +364,7 @@ impl SearchIndex {
         subject_iri: &str,
         all_text: Option<&str>,
     ) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = self.writer()?;
         self.add_document(
             &mut writer,
             ResourceDoc {
@@ -303,7 +403,7 @@ impl SearchIndex {
 
     /// Delete a document for the given graph/resource pair.
     pub fn delete_resource(&self, graph_id: &str, subject_iri: &str) -> Result<()> {
-        let writer = self.writer.lock().unwrap();
+        let writer = self.writer()?;
         writer.delete_term(Term::from_field_text(
             self.f_doc_key,
             &doc_key(graph_id, subject_iri),
@@ -393,7 +493,7 @@ impl SearchIndex {
             return Ok(());
         }
         {
-            let mut writer = self.writer.lock().unwrap();
+            let mut writer = self.writer()?;
             writer.commit()?;
         }
         self.reader.reload()?;
@@ -412,13 +512,15 @@ impl SearchIndex {
         store: &GraphStore,
         bound: QueueBound,
     ) -> Result<usize> {
+        let bound = self.settle_poisoned_writer(store, bound)?;
+
         let queued_deletes = drain_upto(&bound, |chunk| Ok(store.drain_fts_delete_queue(chunk)?))?;
         if !queued_deletes.is_empty() {
             for (graph, _) in &queued_deletes {
                 if store.contains_graph(graph)? {
                     self.reindex_from_store(store, graph)?;
                 } else {
-                    self.delete_graph_documents_uncommitted(graph.as_str());
+                    self.delete_graph_documents_uncommitted(graph.as_str())?;
                 }
             }
 
@@ -469,7 +571,7 @@ impl SearchIndex {
         // Phase 2: apply the prepared ops in queue order under the writer lock.
         {
             // Guards the Tantivy writer; no store reads happen inside.
-            let mut writer = self.writer.lock().unwrap();
+            let mut writer = self.writer()?;
             for op in &prepared {
                 self.apply_prepared_op(&mut writer, op)?;
             }
@@ -534,7 +636,7 @@ impl SearchIndex {
         let mut pending_documents = Vec::new();
         {
             // Guards the Tantivy writer for the whole-graph clear only.
-            let writer = self.writer.lock().unwrap();
+            let writer = self.writer()?;
             writer.delete_term(Term::from_field_text(self.f_graph_id, graph_iri));
             self.dirty.store(true, Ordering::SeqCst);
         }
@@ -612,7 +714,7 @@ impl SearchIndex {
 
         // Guards the Tantivy writer. Reindex already dropped every document of
         // this graph, so the per-document delete is unnecessary here.
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = self.writer()?;
         for (subject_iri, extra_text) in pending_documents.drain(..) {
             self.add_document(
                 &mut writer,
@@ -640,10 +742,11 @@ impl SearchIndex {
         self.dirty.store(true, Ordering::SeqCst);
     }
 
-    fn delete_graph_documents_uncommitted(&self, graph_id: &str) {
-        let writer = self.writer.lock().unwrap();
+    fn delete_graph_documents_uncommitted(&self, graph_id: &str) -> Result<()> {
+        let writer = self.writer()?;
         writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
         self.dirty.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -855,6 +958,8 @@ fn load_orphaned_subjects<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -1160,6 +1265,115 @@ mod tests {
         assert!(
             hits.iter()
                 .any(|hit| hit.graph_id == graph.as_str() && hit.subject_iri == graph.as_str())
+        );
+    }
+
+    // ── G7: a poisoned Tantivy writer is derived state, so it self-heals ──
+
+    /// Panic while holding the writer lock, from a thread that is then joined.
+    fn poison_writer(index: Arc<SearchIndex>) {
+        let panicked = std::thread::spawn(move || {
+            let _guard = index.writer.lock().unwrap();
+            panic!("panic while holding the Tantivy writer");
+        })
+        .join();
+
+        assert!(panicked.is_err(), "the poisoning thread must have panicked");
+    }
+
+    /// A poisoned writer must not turn every later index write into a panic.
+    #[test]
+    fn poisoned_writer_recovers_without_a_restart() -> Result<()> {
+        let index = Arc::new(SearchIndex::open_in_memory()?);
+        index.index_resource("urn:g", "urn:before", Some("beforepoison"))?;
+        index.commit()?;
+
+        poison_writer(index.clone());
+        assert!(index.writer.is_poisoned());
+
+        // The very next write repairs the lock instead of panicking on it.
+        index.index_resource("urn:g", "urn:after", Some("afterpoison"))?;
+        index.commit()?;
+
+        assert!(
+            !index.writer.is_poisoned(),
+            "the repair must clear the poison, not paper over it"
+        );
+        assert_eq!(1, index.search("afterpoison", 10)?.len());
+        assert!(
+            index.rebuild_owed.load(Ordering::SeqCst),
+            "the rollback discarded uncommitted work, so a rebuild is owed"
+        );
+
+        Ok(())
+    }
+
+    /// The repair is not just "stop panicking": the rollback drops the writer
+    /// back to its last commit, so the index has to re-derive from the store,
+    /// which is the source of truth. One indexer pass must be enough.
+    #[test]
+    fn poisoned_writer_reconverges_with_the_store() {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let graph = crate::core::GraphId::new("urn:test:poison-reconverge");
+        let auth = crate::AllowAllAuthorizer;
+        let document = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Crate holding poisonneedle",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                }
+            ]
+        });
+
+        node.apply_rocrate_document_with_policy(
+            &auth,
+            graph.clone(),
+            &document.to_string(),
+            crate::core::GraphPolicy::default(),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+        let found = |node: &crate::CraqleNode| {
+            node.search_with(
+                &auth,
+                crate::SearchRequest {
+                    query: "poisonneedle",
+                    limit: 10,
+                },
+            )
+            .unwrap()
+            .len()
+        };
+        assert_eq!(1, found(&node));
+
+        // Drop the graph's documents behind the store's back, so the index is
+        // stale in exactly the way an interrupted writer leaves it. Nothing is
+        // queued for it: only a re-derivation from the store can bring it back.
+        node.search
+            .delete_graph_documents_uncommitted(graph.as_str())
+            .unwrap();
+        node.search.commit().unwrap();
+        assert_eq!(0, found(&node));
+
+        poison_writer(node.search.clone());
+
+        node.flush_search_updates().unwrap();
+        assert!(!node.search.writer.is_poisoned());
+        assert_eq!(
+            1,
+            found(&node),
+            "the recovery must re-derive the index from the store, in one pass"
         );
     }
 }
