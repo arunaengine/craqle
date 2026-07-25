@@ -499,6 +499,107 @@ mod tests {
         );
     }
 
+    // ── F3: a read that writes destroys the search re-queue baseline ────────
+
+    /// F3 — the search worker reads a graph's diagnostics to know which
+    /// subjects to hide. If that read also persisted what it recomputed, it
+    /// would move the baseline `rebuild_graph_diagnostics` diffs against
+    /// *without* indexing anything, and an entity a bulk write re-linked —
+    /// never named by the write, so never enqueued by it — would stay out of
+    /// the index forever (G6, G7).
+    #[test]
+    fn a_worker_read_between_a_bulk_relink_and_its_rebuild_keeps_search_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = standalone_node(&dir);
+        let graph = GraphId::new("urn:test:f3-requeue-baseline");
+        node.create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "requeue crate",
+                "description",
+                "2025-01-01",
+                None,
+                public_policy(),
+            ),
+        )
+        .unwrap();
+
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let root = EncodedTerm::from_named_node(&graph.0);
+        let child = entity(&graph, "salamander.dat");
+        let link = Change::Insert {
+            graph: graph.clone(),
+            subject: root.clone(),
+            predicate: has_part.clone(),
+            object: child.clone(),
+        };
+        node.apply_changes_unchecked(
+            &graph,
+            vec![
+                insert(
+                    &graph,
+                    (
+                        child.clone(),
+                        EncodedTerm::from_named_node(&vocab::rdf_type()),
+                        EncodedTerm::from_named_node(&vocab::schema_media_object()),
+                    ),
+                ),
+                insert(
+                    &graph,
+                    (
+                        child.clone(),
+                        EncodedTerm::from_named_node(&vocab::schema_name()),
+                        literal_term("salamander"),
+                    ),
+                ),
+                link.clone(),
+            ],
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+        assert_eq!(1, search_hits(&node, "salamander"), "seeded and searchable");
+
+        // Orphan it, so it is correctly absent from the index.
+        node.apply_changes_unchecked(
+            &graph,
+            vec![Change::Delete {
+                graph: graph.clone(),
+                subject: root,
+                predicate: has_part,
+                object: child,
+            }],
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+        assert_eq!(0, search_hits(&node, "salamander"), "orphans are hidden");
+
+        // Re-link it through the bulk path, which defers diagnostics and
+        // enqueues only the subjects it names — the root, never the child.
+        node.apply_changes_bulk_unchecked(&graph, vec![link])
+            .unwrap();
+        // The worker wins the race to the diagnostics read.
+        node.flush_search_updates().unwrap();
+        node.rebuild_graph_diagnostics(&graph).unwrap();
+        node.flush_search_updates().unwrap();
+
+        assert!(
+            !node.graph_diagnostics(&graph).unwrap().has_orphans(),
+            "the re-linked entity is reachable again"
+        );
+        assert_eq!(
+            1,
+            search_hits(&node, "salamander"),
+            "the re-linked entity must be searchable again"
+        );
+    }
+
+    fn search_hits(node: &CraqleNode, query: &str) -> usize {
+        node.search(&writer_auth(), SearchRequest { query, limit: 10 })
+            .unwrap()
+            .len()
+    }
+
     fn graph_has_keyword(
         net: &sim::CraqleCluster,
         peer: usize,

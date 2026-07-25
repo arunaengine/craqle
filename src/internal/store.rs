@@ -2018,23 +2018,26 @@ impl GraphStore {
         Ok(diagnostics)
     }
 
-    /// Recompute a graph's diagnostics from the store and persist them.
+    /// Recompute a graph's diagnostics from the store, tagged with the clock.
     ///
     /// The clock is read *before* computing so a concurrent commit can only
     /// make the tag look older than it is. That direction is safe: it triggers
     /// one more recomputation, never a stale record wrongly accepted as fresh
     /// (G6).
-    fn recompute_graph_diagnostics(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
+    fn compute_tagged_diagnostics(&self, graph_id: TermId) -> Result<StoredDiagnostics> {
         let at_clock = self.get_vector_clock_by_id(graph_id)?;
         let graph = self.graph_name_by_id(graph_id)?;
-        let diagnostics = self.compute_graph_diagnostics(&graph)?;
-        self.store_diagnostics_record(
-            graph_id,
-            StoredDiagnostics {
-                diagnostics,
-                at_clock,
-            },
-        )
+        Ok(StoredDiagnostics {
+            diagnostics: self.compute_graph_diagnostics(&graph)?,
+            at_clock,
+        })
+    }
+
+    /// Recompute a graph's diagnostics and persist them. Only writers that own
+    /// the search re-queue may call this; see [`GraphStore::graph_diagnostics_by_id`].
+    fn recompute_graph_diagnostics(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
+        let record = self.compute_tagged_diagnostics(graph_id)?;
+        self.store_diagnostics_record(graph_id, record)
     }
 
     fn graph_name_by_id(&self, graph_id: TermId) -> Result<GraphId> {
@@ -2079,8 +2082,16 @@ impl GraphStore {
     /// so cache hits avoid decode/lookup round trips through the term table.
     ///
     /// Every read verifies the clock tag, so a reader can never be served
-    /// diagnostics that describe an older state: a mismatch is repaired inline,
-    /// on this call (derived-state register row 4, max staleness zero).
+    /// diagnostics that describe an older state: a mismatch is recomputed
+    /// inline, on this call (derived-state register row 4, max staleness zero).
+    ///
+    /// **A read never persists.** The persisted record is the baseline the
+    /// search re-queue diffs against — it names the orphan set the index was
+    /// last brought in step with — so a reader that stored its recomputation
+    /// would erase the difference a later rebuild has to act on, leaving an
+    /// entity that changed visibility permanently un-indexed (G7). Readers
+    /// therefore only refresh the memory cache, which is clock-tagged and so
+    /// can never serve a set that describes an older state either.
     pub fn graph_diagnostics_by_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
         let clock = self.get_vector_clock_by_id(graph_id)?;
 
@@ -2105,12 +2116,18 @@ impl GraphStore {
             return Ok(diagnostics);
         }
 
-        // A graph with no metadata record has no diagnostics to persist; do not
-        // create an orphan 'O' key for it.
         if !self.contains_graph_by_id(graph_id)? {
             return Ok(GraphDiagnostics::default());
         }
-        self.recompute_graph_diagnostics(graph_id)
+
+        let record = self.compute_tagged_diagnostics(graph_id)?;
+        let diagnostics = record.diagnostics.clone();
+        // Guards the in-memory mirror of the persisted 'O' records.
+        self.diagnostics_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(graph_id, record);
+        Ok(diagnostics)
     }
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
@@ -3897,6 +3914,17 @@ mod tests {
 
     /// Attach `entity` to the graph as a data entity that is *not* reachable
     /// from the root, i.e. an orphan.
+    /// Persist a graph's diagnostics the way a committing writer does.
+    ///
+    /// Reads deliberately do not persist what they recompute (see
+    /// [`GraphStore::graph_diagnostics_by_id`]), so a fixture that needs a
+    /// stored record has to settle it here, holding the guard the writer holds.
+    fn settle_diagnostics(store: &GraphStore, graph: &GraphId) {
+        let _commit_guard = store.graph_commit_guard(graph);
+        let diagnostics = store.compute_graph_diagnostics(graph).unwrap();
+        store.set_graph_diagnostics(graph, &diagnostics).unwrap();
+    }
+
     fn commit_orphan(store: &GraphStore, graph: &GraphId, entity: &str) {
         let quad = encode_quad(
             store,
@@ -4022,6 +4050,7 @@ mod tests {
             let store = GraphStore::open(dir.path()).unwrap();
             store.create_graph(&graph).unwrap();
             commit_orphan(&store, &graph, "urn:orphan:a");
+            settle_diagnostics(&store, &graph);
             assert_eq!(
                 vec!["urn:orphan:a".to_string()],
                 store.graph_diagnostics(&graph).unwrap().orphaned_entities
@@ -4145,15 +4174,57 @@ mod tests {
                 store.graph_diagnostics(&graph).unwrap().orphaned_entities
             );
             assert_eq!(2, store.diagnostics_compute_count());
+
+            // The read repaired what it served, not what is stored: the record
+            // is the search re-queue's baseline, so only a committing writer
+            // moves it.
+            settle_diagnostics(&store, &graph);
             store.persist().unwrap();
         }
 
-        // And the repair is durable: the next open has nothing to fix.
+        // And the writer's repair is durable: the next open has nothing to fix.
         let reopened = GraphStore::open(dir.path()).unwrap();
         assert_eq!(
             0,
             reopened.diagnostics_compute_count(),
             "the previous run must have persisted a correctly tagged record"
+        );
+    }
+
+    /// A read may not touch the persisted diagnostics record.
+    ///
+    /// The record names the orphan set the search index was last brought in
+    /// step with, and `rebuild_graph_diagnostics` re-queues exactly the
+    /// difference against it. A reader that persisted its own recomputation —
+    /// the search worker is such a reader — would erase that difference without
+    /// indexing anything, and the entity whose visibility changed would never
+    /// be re-queued (G7).
+    #[test]
+    fn a_read_never_moves_the_search_requeue_baseline() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:diagnostics-read-only");
+        store.create_graph(&graph).unwrap();
+        commit_orphan(&store, &graph, "urn:orphan:baseline");
+        settle_diagnostics(&store, &graph);
+
+        // A commit the writer never settled, so the stored record is stale.
+        commit_orphan(&store, &graph, "urn:orphan:unsettled");
+
+        assert_eq!(
+            vec![
+                "urn:orphan:baseline".to_string(),
+                "urn:orphan:unsettled".to_string(),
+            ],
+            store.graph_diagnostics(&graph).unwrap().orphaned_entities,
+            "a read must serve the set the current state implies"
+        );
+        assert_eq!(
+            vec!["urn:orphan:baseline".to_string()],
+            store
+                .last_persisted_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities,
+            "the read must leave the baseline for the writer that owns it"
         );
     }
 
@@ -4169,6 +4240,7 @@ mod tests {
             let store = GraphStore::open(dir.path()).unwrap();
             store.create_graph(&graph).unwrap();
             commit_orphan(&store, &graph, "urn:orphan:known");
+            settle_diagnostics(&store, &graph);
             assert_eq!(
                 vec!["urn:orphan:known".to_string()],
                 store.graph_diagnostics(&graph).unwrap().orphaned_entities

@@ -789,25 +789,30 @@ impl ReplicationEngine {
     /// post-write state — which would make `previous` equal `current` every
     /// time, and silently skip the search re-queue for any entity whose
     /// visibility the write flipped without touching it directly.
+    ///
+    /// The re-queue comes first and the record second, in that order: the two
+    /// are separate commits, and a crash between them must leave the older
+    /// baseline behind so the next rebuild re-queues, never the newer one with
+    /// nothing enqueued (G7).
     fn recompute_graph_diagnostics(
         &self,
         graph: &GraphId,
         previous: &GraphDiagnostics,
     ) -> crate::store::Result<()> {
-        // Reading through the store both recomputes against post-write state
-        // (the tag is stale) and re-stamps the record with the current clock.
+        // Recomputes against post-write state, because the commit already made
+        // the stored record's clock tag stale. It does not persist: this is the
+        // writer that owns the record.
         let current = self.store.graph_diagnostics(graph)?;
-        if *previous == current {
-            return Ok(());
+        if *previous != current {
+            self.enqueue_orphan_fts_updates(
+                graph,
+                OrphanChange {
+                    previous: previous.clone(),
+                    current: current.clone(),
+                },
+            )?;
         }
-
-        self.enqueue_orphan_fts_updates(
-            graph,
-            OrphanChange {
-                previous: previous.clone(),
-                current,
-            },
-        )
+        self.store.set_graph_diagnostics(graph, &current)
     }
 
     fn enqueue_orphan_fts_updates(
