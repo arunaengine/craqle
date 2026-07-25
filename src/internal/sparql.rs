@@ -8,7 +8,8 @@ use crate::search::SearchIndex;
 use crate::store::{GraphStore, StoreError, TermId};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use spareval::{
-    DeleteInsertQuad, InternalQuad, QueryEvaluationError, QueryEvaluator, QueryableDataset,
+    DeleteInsertQuad, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
+    QueryableDataset,
 };
 use spargebra::algebra::{GraphPattern, GraphTarget};
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern};
@@ -891,76 +892,137 @@ type QuadResultIter<'a> = Box<
     dyn Iterator<Item = std::result::Result<crate::store::EncodedQuad, StoreDatasetError>> + 'a,
 >;
 
+/// A triple pattern resolved to term ids; `None` in a slot means "any".
+#[derive(Clone, Copy)]
+struct PatternIds {
+    subject: Option<TermId>,
+    predicate: Option<TermId>,
+    object: Option<TermId>,
+}
+
+/// Graphs a union scan will visit for one pattern.
+enum GraphCandidates {
+    /// A candidate list produced by an index probe.
+    Indexed(Vec<TermId>),
+    /// The query's visible-graph list, shared by `Rc` instead of deep-copied
+    /// on every pattern evaluation.
+    Visible(Rc<Vec<TermId>>),
+    /// Nothing narrows the pattern down; fall back to one cross-graph scan.
+    Unbounded,
+}
+
+/// Walks a shared visible-graph list by cloning the `Rc`, never the `Vec`.
+struct VisibleGraphIter {
+    graphs: Rc<Vec<TermId>>,
+    next: usize,
+}
+
+impl Iterator for VisibleGraphIter {
+    type Item = TermId;
+
+    fn next(&mut self) -> Option<TermId> {
+        let graph = *self.graphs.get(self.next)?;
+        self.next += 1;
+        Some(graph)
+    }
+}
+
+/// Which graphs can hold a match for `pattern`.
+///
+/// A bound object narrows the corpus through the object indexes; a small
+/// visible set narrows it through the caller's authorization. Both are valid
+/// starting points — every visited graph is still probed through the same
+/// index, so the quads produced are identical — so we walk whichever side is
+/// shorter instead of always enumerating every corpus graph holding `(p, o)`.
+/// Visibility semantics are untouched: `graph_is_visible` still runs per graph
+/// and `quad_is_visible` still runs per quad.
+fn candidate_graphs(visibility: &QuadVisibility<'_>, pattern: PatternIds) -> GraphCandidates {
+    let store = visibility.store;
+    let indexed = match (pattern.predicate, pattern.object) {
+        (Some(predicate), Some(object)) => Some(store.predicate_object_graphs(predicate, object)),
+        (None, Some(object)) => Some(store.object_graphs(object)),
+        (_, None) => None,
+    };
+
+    match (&visibility.filter, indexed) {
+        (GraphFilter::Set { ordered, .. }, Some(graphs)) if ordered.len() <= graphs.len() => {
+            GraphCandidates::Visible(ordered.clone())
+        }
+        (_, Some(graphs)) => GraphCandidates::Indexed(graphs),
+        (GraphFilter::Set { ordered, .. }, None) => GraphCandidates::Visible(ordered.clone()),
+        (GraphFilter::Predicate { .. }, None) => {
+            GraphCandidates::Indexed(store.populated_graph_ids())
+        }
+        (GraphFilter::All, None) => GraphCandidates::Unbounded,
+    }
+}
+
 /// Quads of all visible graphs matching the pattern, evaluated lazily so that
 /// short-circuiting consumers (ASK, LIMIT) stop after a few graphs instead of
 /// materializing the whole union. Streams graph-at-a-time wherever an index
 /// can enumerate candidate graphs, checking visibility per graph before any
 /// per-quad work so the cost tracks the graphs evaluation actually consumes.
 fn union_quads_for_pattern<'a>(
-    store: &'a GraphStore,
     visibility: &QuadVisibility<'a>,
-    subject: Option<TermId>,
-    predicate: Option<TermId>,
-    object: Option<TermId>,
+    pattern: PatternIds,
 ) -> QuadResultIter<'a> {
-    if subject.is_none() {
-        let candidate_graphs = match (&visibility.filter, object) {
-            // Bound object: only graphs containing a matching quad.
-            (_, Some(object_id)) => Some(match predicate {
-                Some(predicate_id) => store.predicate_object_graphs(predicate_id, object_id),
-                None => store.object_graphs(object_id),
-            }),
-            // Unbound object: every populated graph is a candidate.
-            (GraphFilter::Set { ordered, .. }, None) => Some(ordered.as_ref().clone()),
-            (GraphFilter::Predicate { .. }, None) => Some(store.populated_graph_ids()),
-            (GraphFilter::All, None) => None,
-        };
-        if let Some(graphs) = candidate_graphs {
-            let visibility = visibility.clone();
-            return Box::new(graphs.into_iter().flat_map(move |graph| {
-                let visible = match visibility.graph_is_visible(graph) {
-                    Ok(visible) => visible,
-                    Err(error) => return EitherIter::Right(std::iter::once(Err(error))),
-                };
-                if !visible {
-                    return EitherIter::Left(Vec::new().into_iter().map(Ok));
-                }
-                let quads = match (predicate, object) {
-                    (Some(predicate_id), Some(object_id)) => store
-                        .predicate_object_subjects_in_graph(graph, predicate_id, object_id)
-                        .into_iter()
-                        .map(|subject| crate::store::EncodedQuad {
-                            graph,
-                            subject,
-                            predicate: predicate_id,
-                            object: object_id,
-                        })
-                        .collect::<Vec<_>>(),
-                    (None, Some(object_id)) => store
-                        .object_entries_in_graph(graph, object_id)
-                        .into_iter()
-                        .map(|(subject, predicate)| crate::store::EncodedQuad {
-                            graph,
-                            subject,
-                            predicate,
-                            object: object_id,
-                        })
-                        .collect::<Vec<_>>(),
-                    (_, None) => {
-                        match store.quads_for_pattern(Some(graph), None, predicate, None) {
-                            Ok(quads) => quads,
-                            Err(error) => {
-                                return EitherIter::Right(std::iter::once(Err(error.into())));
-                            }
+    let store = visibility.store;
+    let graphs = match pattern.subject {
+        Some(_) => None,
+        None => match candidate_graphs(visibility, pattern) {
+            GraphCandidates::Indexed(graphs) => Some(EitherIter::Left(graphs.into_iter())),
+            GraphCandidates::Visible(graphs) => {
+                Some(EitherIter::Right(VisibleGraphIter { graphs, next: 0 }))
+            }
+            GraphCandidates::Unbounded => None,
+        },
+    };
+
+    if let Some(graphs) = graphs {
+        let visibility = visibility.clone();
+        return Box::new(graphs.flat_map(move |graph| {
+            let visible = match visibility.graph_is_visible(graph) {
+                Ok(visible) => visible,
+                Err(error) => return EitherIter::Right(std::iter::once(Err(error))),
+            };
+            if !visible {
+                return EitherIter::Left(Vec::new().into_iter().map(Ok));
+            }
+            let quads = match (pattern.predicate, pattern.object) {
+                (Some(predicate), Some(object)) => store
+                    .predicate_object_subjects_in_graph(graph, predicate, object)
+                    .into_iter()
+                    .map(|subject| crate::store::EncodedQuad {
+                        graph,
+                        subject,
+                        predicate,
+                        object,
+                    })
+                    .collect::<Vec<_>>(),
+                (None, Some(object)) => store
+                    .object_entries_in_graph(graph, object)
+                    .into_iter()
+                    .map(|(subject, predicate)| crate::store::EncodedQuad {
+                        graph,
+                        subject,
+                        predicate,
+                        object,
+                    })
+                    .collect::<Vec<_>>(),
+                (_, None) => {
+                    match store.quads_for_pattern(Some(graph), None, pattern.predicate, None) {
+                        Ok(quads) => quads,
+                        Err(error) => {
+                            return EitherIter::Right(std::iter::once(Err(error.into())));
                         }
                     }
-                };
-                EitherIter::Left(quads.into_iter().map(Ok))
-            }));
-        }
+                }
+            };
+            EitherIter::Left(quads.into_iter().map(Ok))
+        }));
     }
 
-    match store.quads_for_pattern(None, subject, predicate, object) {
+    match store.quads_for_pattern(None, pattern.subject, pattern.predicate, pattern.object) {
         Ok(quads) => Box::new(quads.into_iter().map(Ok)),
         Err(error) => Box::new(std::iter::once(Err(error.into()))),
     }
@@ -1011,15 +1073,20 @@ impl<'a> StoreDataset<'a> {
         }
     }
 
-    fn decode_term(&self, id: TermId) -> std::result::Result<EncodedTerm, StoreDatasetError> {
-        self.store.decode_term(id).map_err(Into::into)
+    /// Decode through the store's global term cache: term ids are content
+    /// hashes of immutable bytes, so a decoded term never goes stale. Row
+    /// decoding is the hottest read in evaluation — one point read plus one
+    /// `String` allocation per variable reference per row without the cache.
+    fn decode_term(&self, id: TermId) -> std::result::Result<Arc<EncodedTerm>, StoreDatasetError> {
+        self.store.decode_term_arc(id).map_err(Into::into)
     }
 
     fn externalize_encoded_term(
         &self,
-        term: EncodedTerm,
+        term: &EncodedTerm,
     ) -> std::result::Result<Term, StoreDatasetError> {
-        term.to_term().ok_or(StoreDatasetError::InvalidTerm(term.0))
+        term.to_term()
+            .ok_or_else(|| StoreDatasetError::InvalidTerm(term.0.clone()))
     }
 
     fn externalize_store_term(
@@ -1027,8 +1094,11 @@ impl<'a> StoreDataset<'a> {
         term: StoreTerm,
     ) -> std::result::Result<Term, StoreDatasetError> {
         match term {
-            StoreTerm::Existing(id) => self.externalize_encoded_term(self.decode_term(id)?),
-            StoreTerm::Missing(term) => self.externalize_encoded_term(term),
+            StoreTerm::Existing(id) => {
+                let decoded = self.decode_term(id)?;
+                self.externalize_encoded_term(&decoded)
+            }
+            StoreTerm::Missing(term) => self.externalize_encoded_term(&term),
         }
     }
 }
@@ -1059,27 +1129,21 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             return Box::new(std::iter::empty());
         }
 
-        let subject = match subject {
+        let bound = |term: ResolvedPatternTerm| match term {
             ResolvedPatternTerm::Any => None,
             ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!(),
+            ResolvedPatternTerm::Missing => unreachable!("missing terms short-circuit above"),
         };
-        let predicate = match predicate {
-            ResolvedPatternTerm::Any => None,
-            ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!(),
-        };
-        let object = match object {
-            ResolvedPatternTerm::Any => None,
-            ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!(),
+        let pattern = PatternIds {
+            subject: bound(subject),
+            predicate: bound(predicate),
+            object: bound(object),
         };
 
         let visibility = self.visibility.clone();
         match graph_name {
             Some(None) => {
-                let quads =
-                    union_quads_for_pattern(self.store, &visibility, subject, predicate, object);
+                let quads = union_quads_for_pattern(&visibility, pattern);
                 let mut seen = HashSet::new();
                 Box::new(quads.filter_map(move |quad| {
                     let quad = match quad {
@@ -1111,10 +1175,12 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
                     Ok(false) => return Box::new(std::iter::empty()),
                     Err(error) => return Box::new(std::iter::once(Err(error))),
                 }
-                match self
-                    .store
-                    .quads_for_pattern(Some(*graph), subject, predicate, object)
-                {
+                match self.store.quads_for_pattern(
+                    Some(*graph),
+                    pattern.subject,
+                    pattern.predicate,
+                    pattern.object,
+                ) {
                     Ok(quads) => Box::new(quads.into_iter().filter_map(move |quad| {
                         match visibility.quad_is_visible(&quad) {
                             Ok(true) => Some(Ok(InternalQuad {
@@ -1132,8 +1198,7 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             }
             Some(Some(StoreTerm::Missing(_))) => Box::new(std::iter::empty()),
             None => {
-                let quads =
-                    union_quads_for_pattern(self.store, &visibility, subject, predicate, object);
+                let quads = union_quads_for_pattern(&visibility, pattern);
                 Box::new(quads.filter_map(move |quad| {
                     let quad = match quad {
                         Ok(quad) => quad,
@@ -1202,25 +1267,47 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
     fn externalize_term(&self, term: Self::InternalTerm) -> std::result::Result<Term, Self::Error> {
         self.externalize_store_term(term)
     }
+
+    /// Expression-term hooks: pinned to our cached decode/lookup path rather
+    /// than left to spareval's defaults, which are defined in terms of
+    /// `externalize_term`/`internalize_term` and would silently change shape
+    /// if the trait's defaults ever do.
+    ///
+    /// `internal_term_effective_boolean_value` is deliberately *not*
+    /// overridden: spareval defines it as
+    /// `externalize_expression_term(term)?.effective_boolean_value()`, and
+    /// `ExpressionTerm::effective_boolean_value` is crate-private. Any override
+    /// would have to restate spareval's EBV table by hand and could drift from
+    /// it — silently changing FILTER results. Inheriting the default keeps EBV
+    /// exact and still routes through the cached externalization below.
+    fn internalize_expression_term(
+        &self,
+        term: ExpressionTerm,
+    ) -> std::result::Result<Self::InternalTerm, Self::Error> {
+        self.internalize_term(term.into())
+    }
+
+    fn externalize_expression_term(
+        &self,
+        term: Self::InternalTerm,
+    ) -> std::result::Result<ExpressionTerm, Self::Error> {
+        Ok(self.externalize_store_term(term)?.into())
+    }
 }
 
 fn collect_query_results(results: spareval::QueryResults<'_>) -> Result<QueryResults> {
     match results {
         spareval::QueryResults::Solutions(solutions) => {
-            let variables: Vec<String> = solutions
-                .variables()
-                .iter()
-                .map(|variable| variable.as_str().to_string())
-                .collect();
-
+            // Each solution carries its own (variable, term) pairs and yields
+            // only the bound ones, so building the row from them is exactly
+            // the old "for every projected variable, look it up" loop without
+            // the per-cell linear scan and per-cell name clone.
             let mut rows = Vec::new();
             for solution in solutions {
                 let solution = solution.map_err(map_eval_error)?;
-                let mut row = HashMap::new();
-                for variable in &variables {
-                    if let Some(term) = solution.get(variable.as_str()) {
-                        row.insert(variable.clone(), EncodedTerm::from_term(term));
-                    }
+                let mut row = HashMap::with_capacity(solution.len());
+                for (variable, term) in solution.iter() {
+                    row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term));
                 }
                 rows.push(row);
             }
