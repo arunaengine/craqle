@@ -687,6 +687,199 @@ mod tests {
     /// direction still passes and this one does not: the child is un-orphaned
     /// everywhere except in search, where it stays invisible until some
     /// unrelated write happens to dirty it.
+    /// Re-attaching through the public append API, with no manual rebuild.
+    /// The append path defers diagnostics, so nothing else settles the record
+    /// and the entity has to come back to search on the write alone (G7).
+    #[test]
+    fn append_restores_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth =
+            GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
+        let graph = GraphId::new("urn:test:append-requeue");
+        let entity = || NewDataEntity {
+            entity_id: "data/nautilus.dat".to_string(),
+            entity_type: "http://schema.org/MediaObject".to_string(),
+            name: "nautilus".to_string(),
+            additional_triples: Vec::new(),
+        };
+
+        node.create_crate(
+            &auth,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "append crate",
+                "description",
+                "2025-01-01",
+                None,
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/t/x".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+        node.append_new_root_data_entities(&auth, &graph, vec![entity()])
+            .unwrap();
+
+        let searchable = || {
+            node.flush_search_updates().unwrap();
+            node.search(
+                &auth,
+                SearchRequest {
+                    query: "nautilus",
+                    limit: 10,
+                },
+            )
+            .unwrap()
+            .len()
+        };
+
+        assert_eq!(1, searchable(), "the appended entity starts out searchable");
+
+        let edge = node
+            .graph_snapshot(&graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
+            .expect("root must link the child");
+        node.apply_changes_bulk_unchecked(
+            &graph,
+            vec![MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: edge.subject.clone(),
+                predicate: edge.predicate.clone(),
+                object: edge.object.clone(),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(&graph).unwrap();
+        assert_eq!(0, searchable(), "the orphan must leave the index");
+
+        // Re-append the same id. This is the only write, and it must settle
+        // the orphan record it invalidates.
+        node.append_new_root_data_entities(&auth, &graph, vec![entity()])
+            .unwrap();
+
+        assert!(
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "re-appending must clear the orphan record"
+        );
+        assert_eq!(1, searchable(), "the re-appended entity must be findable");
+    }
+
+    /// An append can adopt an entity it never touches: `additional_triples`
+    /// carries a `hasPart` edge to an existing orphan. Nothing enqueues that
+    /// entity, so only a settled orphan record can return it to search (G7).
+    #[test]
+    fn append_adopts_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth =
+            GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
+        let graph = GraphId::new("urn:test:append-adopt");
+
+        node.create_crate(
+            &auth,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "adopt crate",
+                "description",
+                "2025-01-01",
+                None,
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/t/x".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+        node.append_new_root_data_entities(
+            &auth,
+            &graph,
+            vec![NewDataEntity {
+                entity_id: "data/pangolin.dat".to_string(),
+                entity_type: "http://schema.org/MediaObject".to_string(),
+                name: "pangolin".to_string(),
+                additional_triples: Vec::new(),
+            }],
+        )
+        .unwrap();
+
+        let searchable = || {
+            node.flush_search_updates().unwrap();
+            node.search(
+                &auth,
+                SearchRequest {
+                    query: "pangolin",
+                    limit: 10,
+                },
+            )
+            .unwrap()
+            .len()
+        };
+
+        assert_eq!(1, searchable(), "the entity starts out searchable");
+
+        let edge = node
+            .graph_snapshot(&graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
+            .expect("root must link the child");
+        node.apply_changes_bulk_unchecked(
+            &graph,
+            vec![MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: edge.subject.clone(),
+                predicate: edge.predicate.clone(),
+                object: edge.object.clone(),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(&graph).unwrap();
+        assert_eq!(0, searchable(), "the orphan must leave the index");
+
+        // Adopt the orphan from a brand-new sibling. The orphan itself is
+        // never written, so the write cannot enqueue it.
+        node.append_new_root_data_entities(
+            &auth,
+            &graph,
+            vec![NewDataEntity {
+                entity_id: "data/folder".to_string(),
+                entity_type: "http://schema.org/Dataset".to_string(),
+                name: "folder".to_string(),
+                additional_triples: vec![(
+                    oxrdf::NamedNode::new_unchecked("http://schema.org/hasPart"),
+                    oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked("./data/pangolin.dat")),
+                )],
+            }],
+        )
+        .unwrap();
+
+        assert!(
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "adoption must clear the orphan record"
+        );
+        assert_eq!(1, searchable(), "the adopted entity must be findable");
+    }
+
     #[test]
     fn reattach_restores_index() {
         let dir = tempfile::tempdir().unwrap();

@@ -1383,6 +1383,11 @@ impl CraqleNode {
     }
 
     /// Advanced: apply a large change set using the bulk write path.
+    ///
+    /// Diagnostics are deferred so a run of these can share one recompute. The
+    /// caller must finish with [`CraqleNode::rebuild_graph_diagnostics`]: until
+    /// it runs, an entity whose orphan status this changed without being
+    /// written stays missing from search (G7).
     pub fn apply_changes_bulk_unchecked(
         &self,
         graph: &GraphId,
