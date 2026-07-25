@@ -2558,12 +2558,11 @@ fn encoded_identifier(value: &str) -> EncodedTerm {
     EncodedTerm::from_named_node(&NamedNode::new_unchecked(value))
 }
 
+/// A subject identifier, which import may have minted as a blank node. Shares
+/// [`EncodedTerm::from_subject_id`] with the SPARQL and describe readers so all
+/// three agree on how an orphan id encodes (G6).
 fn encoded_subject(value: &str) -> EncodedTerm {
-    if value.starts_with("_:") {
-        EncodedTerm(value.to_string())
-    } else {
-        encoded_identifier(value)
-    }
+    EncodedTerm::from_subject_id(value)
 }
 
 fn encoded_literal(value: &str) -> EncodedTerm {
