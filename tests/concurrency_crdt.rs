@@ -77,8 +77,8 @@ mod tests {
     /// Each parallel insert is its own batch and therefore carries exactly one
     /// dot; a duplicated counter would show up as two quads sharing a dot.
     #[test]
-    fn dots_unique_under_parallel_same_graph_writes() {
-        with_watchdog("dots_unique_under_parallel_same_graph_writes", || {
+    fn dots_stay_unique() {
+        with_watchdog("dots_stay_unique", || {
             let (_tmp, net) = setup_network(1);
             let graph = GraphId::new("urn:test:crdt-dots");
             create_test_crate(&net, 0, &graph);
@@ -102,8 +102,8 @@ mod tests {
 
     /// K1b — no add may be lost when writers race on the same graph.
     #[test]
-    fn no_lost_adds_under_parallel_insert() {
-        with_watchdog("no_lost_adds_under_parallel_insert", || {
+    fn adds_never_lost() {
+        with_watchdog("adds_never_lost", || {
             let (_tmp, net) = setup_network(1);
             let graph = GraphId::new("urn:test:crdt-adds");
             create_test_crate(&net, 0, &graph);
@@ -128,8 +128,8 @@ mod tests {
     /// A read-modify-write race on the clock silently drops the losing writer's
     /// counter, leaving the clock behind the log head.
     #[test]
-    fn vector_clock_not_lost_under_concurrent_commits() {
-        with_watchdog("vector_clock_not_lost_under_concurrent_commits", || {
+    fn clock_never_lost() {
+        with_watchdog("clock_never_lost", || {
             let (_tmp, net) = setup_network(1);
             let graph = GraphId::new("urn:test:crdt-clock");
             create_test_crate(&net, 0, &graph);
@@ -169,8 +169,8 @@ mod tests {
     /// Peer 0 then deletes it *before* healing, witnessing only its own dot, so
     /// peer 1's concurrent add must survive the merge on both replicas.
     #[test]
-    fn remove_kills_only_witnessed_dots() {
-        with_watchdog("remove_kills_only_witnessed_dots", || {
+    fn remove_kills_witnessed() {
+        with_watchdog("remove_kills_witnessed", || {
             let (_tmp, mut net) = setup_network(2);
             let graph = GraphId::new("urn:test:crdt-witness");
             create_test_crate(&net, 0, &graph);
@@ -206,8 +206,8 @@ mod tests {
     /// add agree perfectly. The quad count is asserted against the state before
     /// the writes plus one quad per write, so completeness is pinned as well.
     #[test]
-    fn sync_mode_concurrent_writes_converge() {
-        with_watchdog("sync_mode_concurrent_writes_converge", || {
+    fn sync_writes_converge() {
+        with_watchdog("sync_writes_converge", || {
             let (_tmp, net) = setup_network(2);
             let graph = GraphId::new("urn:test:crdt-converge");
             create_test_crate(&net, 0, &graph);
@@ -241,8 +241,8 @@ mod tests {
     /// a concurrent mix of inserts and deletes, **without** a restart to repair
     /// them.
     #[test]
-    fn index_matches_store_after_concurrent_churn() {
-        with_watchdog("index_matches_store_after_concurrent_churn", || {
+    fn index_matches_store() {
+        with_watchdog("index_matches_store", || {
             let (_tmp, net) = setup_network(1);
             let graph = GraphId::new("urn:test:crdt-churn");
             create_test_crate(&net, 0, &graph);
@@ -419,7 +419,7 @@ mod tests {
     /// the orphan they left behind rather than the clean graph each writer was
     /// promised (G6).
     #[test]
-    fn racing_validated_deletes_record_the_orphan_they_create() {
+    fn deletes_record_orphans() {
         let dir = tempfile::tempdir().unwrap();
         let node = standalone_node(&dir);
         let graph = GraphId::new("urn:test:f2-orphan-race");
@@ -509,7 +509,7 @@ mod tests {
     /// the index forever (G6, G7).
     #[test]
     #[cfg(feature = "search")]
-    fn a_worker_read_between_a_bulk_relink_and_its_rebuild_keeps_search_correct() {
+    fn relink_keeps_search() {
         let dir = tempfile::tempdir().unwrap();
         let node = standalone_node(&dir);
         let graph = GraphId::new("urn:test:f3-requeue-baseline");

@@ -31,7 +31,7 @@ pub enum SparqlError {
     Search(#[from] crate::search::SearchError),
 }
 
-pub type Result<T> = std::result::Result<T, SparqlError>;
+pub(crate) type Result<T> = std::result::Result<T, SparqlError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryResults {
@@ -40,7 +40,7 @@ pub enum QueryResults {
     Graph(Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>),
 }
 
-pub struct SparqlEngine {
+pub(crate) struct SparqlEngine {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
     evaluator: QueryEvaluator,
@@ -48,7 +48,7 @@ pub struct SparqlEngine {
 
 type VisibleGraphSet = Option<HashSet<TermId>>;
 
-pub type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
+pub(crate) type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
 
 /// Which graphs a query may see. `Predicate` defers the decision to a
 /// callback evaluated lazily per touched graph (memoized per query).
@@ -98,7 +98,7 @@ const FTS_OVERFETCH_FACTOR: usize = 4;
 const FTS_MIN_FETCH: usize = 64;
 
 impl SparqlEngine {
-    pub fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
+    pub(crate) fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
         Self {
             store,
             search,
@@ -107,15 +107,19 @@ impl SparqlEngine {
     }
 
     #[cfg(test)]
-    pub fn query(&self, sparql: &str) -> Result<QueryResults> {
+    pub(crate) fn query(&self, sparql: &str) -> Result<QueryResults> {
         self.run_query(sparql, GraphScope::All, planner_enabled())
     }
 
-    pub fn query_with_graphs(&self, sparql: &str, graphs: &[GraphId]) -> Result<QueryResults> {
+    pub(crate) fn query_with_graphs(
+        &self,
+        sparql: &str,
+        graphs: &[GraphId],
+    ) -> Result<QueryResults> {
         self.run_query(sparql, GraphScope::List(graphs), planner_enabled())
     }
 
-    pub fn query_with_visibility(
+    pub(crate) fn query_with_visibility(
         &self,
         sparql: &str,
         visible: &VisibleFn<'_>,
@@ -125,7 +129,7 @@ impl SparqlEngine {
 
     /// Like [`SparqlEngine::query_with_visibility`] with explicit control over
     /// the craqle plan optimizer (used by tests and as a debugging hatch).
-    pub fn query_with_visibility_planned(
+    pub(crate) fn query_with_visibility_planned(
         &self,
         sparql: &str,
         visible: &VisibleFn<'_>,
@@ -210,7 +214,7 @@ impl SparqlEngine {
         collect_query_results(results)
     }
 
-    pub fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
+    pub(crate) fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let update = SparqlParser::new()
             .parse_update(&full)
@@ -813,7 +817,7 @@ impl<'a> QuadVisibility<'a> {
                 if let Some(&allowed) = memo.borrow().get(&graph) {
                     return Ok(allowed);
                 }
-                let term = self.store.decode_graph_term(graph)?;
+                let term = self.store.decode_term(graph)?;
                 // Non-IRI graph terms fail closed.
                 let allowed = if term.0.starts_with('<') && term.0.ends_with('>') {
                     let mut iri = term.0;

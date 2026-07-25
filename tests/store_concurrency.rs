@@ -61,8 +61,8 @@ fn write_unchecked(
 /// that swap: if the guard is not adopted at every read→write site, the counter
 /// mint and the dot-set read-modify-write interleave and adds are lost.
 #[test]
-fn parallel_inserts_on_one_graph_lose_nothing() {
-    with_watchdog("parallel_inserts_on_one_graph_lose_nothing", || {
+fn parallel_inserts_persist() {
+    with_watchdog("parallel_inserts_persist", || {
         const WRITERS: usize = 6;
         const INSERTS_PER_WRITER: usize = 20;
 
@@ -131,8 +131,8 @@ fn parallel_inserts_on_one_graph_lose_nothing() {
 /// contend even though they are logically independent. That contention must
 /// only serialize them, never lose writes.
 #[test]
-fn parallel_inserts_across_graphs_lose_nothing() {
-    with_watchdog("parallel_inserts_across_graphs_lose_nothing", || {
+fn multigraph_inserts_persist() {
+    with_watchdog("multigraph_inserts_persist", || {
         const GRAPHS: usize = 8;
         const INSERTS_PER_GRAPH: usize = 15;
 
@@ -182,8 +182,8 @@ fn parallel_inserts_across_graphs_lose_nothing() {
 /// Calling them concurrently — including on graphs that collide on a lock
 /// shard — must make progress rather than deadlock on the non-reentrant mutex.
 #[test]
-fn concurrent_graph_lifecycle_calls_do_not_deadlock() {
-    with_watchdog("concurrent_graph_lifecycle_calls_do_not_deadlock", || {
+fn lifecycle_never_deadlocks() {
+    with_watchdog("lifecycle_never_deadlocks", || {
         const THREADS: usize = 8;
         const ROUNDS: usize = 10;
 
@@ -235,8 +235,8 @@ fn concurrent_graph_lifecycle_calls_do_not_deadlock() {
 /// never observes a set that disagrees with the graph it is reading, and never
 /// blocks writers indefinitely.
 #[test]
-fn concurrent_reads_and_writes_stay_consistent() {
-    with_watchdog("concurrent_reads_and_writes_stay_consistent", || {
+fn reads_stay_consistent() {
+    with_watchdog("reads_stay_consistent", || {
         const WRITES: usize = 60;
 
         let dir = tempfile::tempdir().unwrap();

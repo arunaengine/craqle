@@ -9,7 +9,7 @@ mod tests {
     use crate::support::*;
 
     #[test]
-    fn a_created_crate_is_searchable() {
+    fn created_crate_searchable() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -42,7 +42,7 @@ mod tests {
     }
 
     #[test]
-    fn reindex_search_keeps_results_available() {
+    fn reindex_keeps_results() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn the_search_index_persists_across_restart() {
+    fn index_persists_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:crate-fts-persist");
 
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_batch_sync_updates_search_without_reindex() {
+    fn sync_updates_search() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:remote-batch-search");
         let writer = writer_auth();
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_delete_removes_search_results_after_flush() {
+    fn delete_removes_results() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:delete-search");
@@ -404,7 +404,7 @@ mod tests {
     /// fixed `limit * 4` over-fetch this returned 21 hits for `limit = 25` and
     /// 41 for `limit = 50` (finding K2).
     #[test]
-    fn search_returns_limit_with_enough_authorized() {
+    fn search_returns_limit() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let writer = writer_auth();
@@ -481,7 +481,7 @@ mod tests {
     /// The unbounded drain re-read work enqueued between drain and
     /// acknowledgement, so the flush could spin forever (finding W15b).
     #[test]
-    fn flush_returns_under_sustained_ingest() {
+    fn flush_survives_ingest() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let dir = tempfile::tempdir().unwrap();
@@ -580,7 +580,7 @@ mod tests {
     /// an entity that export and SPARQL now hide, and nothing repairs it until some
     /// unrelated write happens to dirty that subject.
     #[test]
-    fn entity_orphaned_by_an_untouched_write_leaves_the_search_index() {
+    fn orphan_leaves_index() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),
@@ -688,7 +688,7 @@ mod tests {
     /// everywhere except in search, where it stays invisible until some
     /// unrelated write happens to dirty it.
     #[test]
-    fn re_attaching_an_orphan_returns_it_to_the_search_index() {
+    fn reattach_restores_index() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),

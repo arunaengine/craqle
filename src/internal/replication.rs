@@ -33,7 +33,7 @@ pub enum MergeError {
 }
 
 #[derive(Debug)]
-pub struct MergeResult {
+pub(crate) struct MergeResult {
     pub applied: bool,
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn graph_write_guard(graph: &GraphId) -> MutexGuard<'static, ()> {
 }
 
 /// The replication engine: local writes and CRDT merge of Irokle records.
-pub struct ReplicationEngine {
+pub(crate) struct ReplicationEngine {
     store: Arc<GraphStore>,
     sparql: Arc<SparqlEngine>,
     rules: Vec<Box<dyn Rule>>,
@@ -108,11 +108,11 @@ struct LocalCommit<'a> {
 }
 
 impl ReplicationEngine {
-    pub fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
+    pub(crate) fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
         Self::new_with_sync(store, sparql, actor, None)
     }
 
-    pub fn new_with_sync(
+    pub(crate) fn new_with_sync(
         store: Arc<GraphStore>,
         sparql: Arc<SparqlEngine>,
         actor: ActorId,
@@ -127,7 +127,7 @@ impl ReplicationEngine {
         }
     }
 
-    pub fn store(&self) -> &Arc<GraphStore> {
+    pub(crate) fn store(&self) -> &Arc<GraphStore> {
         &self.store
     }
 
@@ -138,7 +138,7 @@ impl ReplicationEngine {
     /// failed publish looking like success, so the retry would trip
     /// `store_import_context`'s unchanged-state short-circuit and peers would
     /// never receive the update.
-    pub fn set_graph_context(
+    pub(crate) fn set_graph_context(
         &self,
         graph: &GraphId,
         context: Option<String>,
@@ -180,7 +180,7 @@ impl ReplicationEngine {
 
     /// Execute a SPARQL Update locally with full validation.
     /// Returns `None` if the update produced no changes.
-    pub fn local_update(&self, sparql_update: &str) -> Result<Option<Batch>, UpdateError> {
+    pub(crate) fn local_update(&self, sparql_update: &str) -> Result<Option<Batch>, UpdateError> {
         let changes = self.sparql.evaluate_update(sparql_update)?;
 
         if changes.is_empty() {
@@ -198,7 +198,7 @@ impl ReplicationEngine {
     }
 
     /// Insert raw quads (bypasses SPARQL, still validates).
-    pub fn local_insert_quads(
+    pub(crate) fn local_insert_quads(
         &self,
         graph: &GraphId,
         quads: Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>,
@@ -218,7 +218,7 @@ impl ReplicationEngine {
 
     /// Apply a pre-materialized change set locally with full validation.
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
-    pub fn local_apply_changes(
+    pub(crate) fn local_apply_changes(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -237,7 +237,7 @@ impl ReplicationEngine {
     ///
     /// Intended for trusted higher-level RO-Crate operations that maintain
     /// structural invariants incrementally.
-    pub fn local_apply_changes_unchecked(
+    pub(crate) fn local_apply_changes_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -257,7 +257,7 @@ impl ReplicationEngine {
 
     /// Apply a trusted bulk change set locally and defer graph-diagnostics
     /// recomputation until the caller explicitly rebuilds diagnostics.
-    pub fn local_apply_changes_bulk_unchecked(
+    pub(crate) fn local_apply_changes_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -275,7 +275,7 @@ impl ReplicationEngine {
         })
     }
 
-    pub fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<(), UpdateError> {
+    pub(crate) fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<(), UpdateError> {
         // Guards the recompute→persist cycle so the record cannot be tagged with
         // a clock newer than the state it describes.
         let _commit_guard = self.store.graph_commit_guard(graph);
@@ -567,7 +567,7 @@ impl ReplicationEngine {
     /// they are not contiguous over Craqle domain events. The Irokle DAG already
     /// enforces causal delivery; this path intentionally bypasses Craqle's old
     /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
-    pub fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
+    pub(crate) fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
         self.apply_irokle_batch_with_plan(&incoming, DiagnosticsPlan::Immediate)
     }
 
@@ -626,7 +626,7 @@ impl ReplicationEngine {
         Ok(MergeResult { applied: true })
     }
 
-    pub fn apply_irokle_record(
+    pub(crate) fn apply_irokle_record(
         &self,
         record: &irokle::reducer::EventRecord<crate::sync::CraqleGraphEvent>,
     ) -> Result<Option<MergeResult>, MergeError> {

@@ -109,7 +109,7 @@ pub enum CraqleSyncError {
     InvalidEvent(String),
 }
 
-pub type SyncResult<T> = std::result::Result<T, CraqleSyncError>;
+pub(crate) type SyncResult<T> = std::result::Result<T, CraqleSyncError>;
 
 pub(crate) trait CraqleGraphSync: Send + Sync {
     fn publish_changes(

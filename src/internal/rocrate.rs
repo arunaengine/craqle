@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::replication::ReplicationEngine;
-use crate::store::{EncodedQuad, PageCursor, PageRequest, SubjectPredicate, TermId};
+use crate::store::{EncodedQuad, GraphSubjectPredicate, PageCursor, PageRequest, TermId};
 use oxjsonld::{JsonLdParser, JsonLdRemoteDocument};
 use oxrdf::{NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use rocraters::ro_crate::constraints::{DataType, EntityValue, Id, License};
@@ -174,7 +174,7 @@ struct HasPartLink<'a> {
 
 /// The triples one entity should carry after a write: its type, its name, and
 /// any caller-supplied extras. `entity_id` is already normalized.
-pub struct EntitySpec<'a> {
+pub(crate) struct EntitySpec<'a> {
     pub entity_id: &'a str,
     pub entity_type: &'a str,
     pub name: &'a str,
@@ -199,7 +199,7 @@ struct SubjectPatch<'a> {
 ///
 /// `old_value: Some(v)` replaces only the triple matching `v`; `None` removes
 /// **all** existing values for the predicate first (replace-all semantics).
-pub struct PropertyUpdate<'a> {
+pub(crate) struct PropertyUpdate<'a> {
     pub entity_id: &'a str,
     pub predicate: &'a str,
     pub old_value: Option<&'a str>,
@@ -266,17 +266,17 @@ pub struct AppendDataEntitiesReport {
 }
 
 /// RO-Crate lifecycle management built on the replication engine.
-pub struct RoCrateManager {
+pub(crate) struct RoCrateManager {
     engine: Arc<ReplicationEngine>,
 }
 
 impl RoCrateManager {
-    pub fn new(engine: Arc<ReplicationEngine>) -> Self {
+    pub(crate) fn new(engine: Arc<ReplicationEngine>) -> Self {
         Self { engine }
     }
 
     /// Create a new RO-Crate with its base entities.
-    pub fn create_crate(
+    pub(crate) fn create_crate(
         &self,
         graph_id: GraphId,
         name: &str,
@@ -329,7 +329,7 @@ impl RoCrateManager {
     /// Create-crate path for scaffold requests already validated at their
     /// origin. Skips post-state rule validation; scaffold output is
     /// structurally valid by construction.
-    pub fn create_crate_prevalidated(
+    pub(crate) fn create_crate_prevalidated(
         &self,
         graph_id: GraphId,
         name: &str,
@@ -384,7 +384,7 @@ impl RoCrateManager {
     }
 
     /// Validate and materialize the changes for creating a crate without applying them.
-    pub fn validate_create_crate(
+    pub(crate) fn validate_create_crate(
         &self,
         graph_id: &GraphId,
         name: &str,
@@ -432,7 +432,7 @@ impl RoCrateManager {
     }
 
     /// Add a data entity with automatic hasPart linkage from root.
-    pub fn add_data_entity(
+    pub(crate) fn add_data_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -457,7 +457,7 @@ impl RoCrateManager {
         )
     }
 
-    pub fn patch_data_entity(
+    pub(crate) fn patch_data_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -503,7 +503,7 @@ impl RoCrateManager {
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
-    pub fn append_new_root_data_entities(
+    pub(crate) fn append_new_root_data_entities(
         &self,
         graph_id: &GraphId,
         entities: Vec<NewDataEntity>,
@@ -511,7 +511,7 @@ impl RoCrateManager {
         self.append_new_data_entities_under(graph_id, root_id(graph_id), entities)
     }
 
-    pub fn append_new_data_entities_under(
+    pub(crate) fn append_new_data_entities_under(
         &self,
         graph_id: &GraphId,
         parent_id: &str,
@@ -570,7 +570,7 @@ impl RoCrateManager {
     }
 
     /// Add a contextual entity (no hasPart linkage needed).
-    pub fn add_contextual_entity(
+    pub(crate) fn add_contextual_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -593,7 +593,7 @@ impl RoCrateManager {
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
-    pub fn patch_contextual_entity(
+    pub(crate) fn patch_contextual_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -622,7 +622,7 @@ impl RoCrateManager {
     }
 
     /// Export a graph to RO-Crate JSON-LD.
-    pub fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
+    pub(crate) fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
         let cx = self.crate_ctx(graph_id)?;
         // The full export is the same visible sequence as an unbounded page, so
         // both go through one implementation and cannot drift apart.
@@ -643,7 +643,7 @@ impl RoCrateManager {
     }
 
     /// Export a lightweight partial RO-Crate view without data entities.
-    pub fn export_jsonld_summary(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
+    pub(crate) fn export_jsonld_summary(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
         let cx = self.crate_ctx(graph_id)?;
         self.render_export_view(
             &cx,
@@ -655,7 +655,7 @@ impl RoCrateManager {
     }
 
     /// Export an offset-based partial RO-Crate page of root-linked data entities.
-    pub fn export_jsonld_page(
+    pub(crate) fn export_jsonld_page(
         &self,
         graph_id: &GraphId,
         offset: usize,
@@ -692,7 +692,7 @@ impl RoCrateManager {
     }
 
     /// Export a cursor-based partial RO-Crate page of root-linked data entities.
-    pub fn export_jsonld_page_after(
+    pub(crate) fn export_jsonld_page_after(
         &self,
         graph_id: &GraphId,
         after_entity_id: Option<&str>,
@@ -745,7 +745,11 @@ impl RoCrateManager {
     /// New or empty graphs use the trusted bootstrap fast path. Existing graphs
     /// use a validated full-document replacement path that diffs against the
     /// current graph state.
-    pub fn import_jsonld(&self, graph_id: GraphId, jsonld: &str) -> Result<Batch, RoCrateError> {
+    pub(crate) fn import_jsonld(
+        &self,
+        graph_id: GraphId,
+        jsonld: &str,
+    ) -> Result<Batch, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
         let license = extract_raw_license(&value);
@@ -761,7 +765,7 @@ impl RoCrateManager {
 
     /// Strict import path that validates complete RO-Crate semantics even for
     /// new-graph bootstrap imports.
-    pub fn import_jsonld_checked(
+    pub(crate) fn import_jsonld_checked(
         &self,
         graph_id: GraphId,
         jsonld: &str,
@@ -784,7 +788,7 @@ impl RoCrateManager {
     /// Skips complete RO-Crate semantic validation but keeps replace/diff
     /// semantics, CRDT authoring, and structural JSON-LD error handling. Only
     /// callers replaying origin-validated documents may use this.
-    pub fn import_jsonld_prevalidated(
+    pub(crate) fn import_jsonld_prevalidated(
         &self,
         graph_id: GraphId,
         jsonld: &str,
@@ -815,7 +819,7 @@ impl RoCrateManager {
     ///
     /// This skips semantic RO-Crate validation and current-state diffing, and
     /// is intended for callers that already trust the input document.
-    pub fn bootstrap_jsonld_trusted(
+    pub(crate) fn bootstrap_jsonld_trusted(
         &self,
         graph_id: GraphId,
         jsonld: &str,
@@ -836,7 +840,7 @@ impl RoCrateManager {
     }
 
     /// Compute the canonical change set for replacing a graph with a JSON-LD RO-Crate.
-    pub fn plan_import_jsonld(
+    pub(crate) fn plan_import_jsonld(
         &self,
         graph_id: &GraphId,
         jsonld: &str,
@@ -846,7 +850,7 @@ impl RoCrateManager {
     }
 
     /// Compute and validate the strict import change set without applying it.
-    pub fn plan_import_jsonld_checked(
+    pub(crate) fn plan_import_jsonld_checked(
         &self,
         graph_id: &GraphId,
         jsonld: &str,
@@ -857,7 +861,7 @@ impl RoCrateManager {
 
     /// Apply one property mutation to an entity. See [`PropertyUpdate`] for the
     /// `old_value` semantics.
-    pub fn update_property(
+    pub(crate) fn update_property(
         &self,
         graph_id: &GraphId,
         update: PropertyUpdate<'_>,
@@ -1568,7 +1572,7 @@ impl RoCrateManager {
 
         if cx.orphaned.is_empty() {
             return Ok(store.objects_page(
-                SubjectPredicate {
+                GraphSubjectPredicate {
                     graph: &cx.graph,
                     subject: &root,
                     predicate: &has_part,
@@ -1621,7 +1625,7 @@ impl RoCrateManager {
                 None => PageCursor::After(start_after),
             };
             let (_, window) = store.objects_page(
-                SubjectPredicate {
+                GraphSubjectPredicate {
                     graph: &cx.graph,
                     subject: &root,
                     predicate: &has_part,
@@ -3595,7 +3599,7 @@ mod tests {
     /// divergence nothing later reconciles. Every field a write can touch is
     /// compared, not just the quad count.
     #[test]
-    fn quad_publish_failure_moves_no_local_state() {
+    fn publish_persists_nothing() {
         let (_dir, store, flaky, manager) = flaky_manager();
         let graph = GraphId::new("urn:test:quad-publish-failure");
         let document = |extra: &str| {
@@ -3654,7 +3658,7 @@ mod tests {
     /// The same guarantee on a graph that does not exist yet: a failed quad
     /// publish must not leave a half-created graph behind.
     #[test]
-    fn quad_publish_failure_creates_no_graph() {
+    fn publish_creates_nothing() {
         let (_dir, store, flaky, manager) = flaky_manager();
         let graph = GraphId::new("urn:test:quad-publish-failure-fresh");
         flaky.fail_changes.store(true, Ordering::SeqCst);

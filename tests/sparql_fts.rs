@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_service_returns_limit_when_authorized_matches_exist() {
+    fn service_returns_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let node = seeded_node(&tmp);
 
@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_service_still_stops_at_the_requested_limit() {
+    fn service_caps_results() {
         let tmp = tempfile::tempdir().unwrap();
         let node = seeded_node(&tmp);
 
@@ -185,11 +185,11 @@ mod tests {
     /// past `fts:limit` — one authorized document among 250 equal-scoring ones
     /// is not in the top `limit` for all but one of them.
     #[test]
-    fn fts_service_terminates_when_nothing_is_authorized() {
+    fn service_terminates_unauthorized() {
         // The watchdog is the termination assertion: an escalation loop that
         // never notices an exhausted index hangs the harness rather than
         // failing, and `rows.is_empty()` below would never be reached.
-        with_watchdog("fts_service_terminates_when_nothing_is_authorized", || {
+        with_watchdog("service_terminates_unauthorized", || {
             let tmp = tempfile::tempdir().unwrap();
             let node = seeded_node(&tmp);
             let sparql = |limit: usize| {
@@ -229,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_service_scoped_to_a_fixed_graph_still_honours_visibility() {
+    fn service_honours_visibility() {
         let tmp = tempfile::tempdir().unwrap();
         let node = seeded_node(&tmp);
 

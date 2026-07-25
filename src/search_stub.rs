@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use crate::core::GraphId;
+pub(crate) use crate::search_queue::QueueBound;
+use crate::search_queue::drain_upto;
 use crate::store::GraphStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,7 +13,7 @@ pub enum SearchError {
     Store(#[from] crate::store::StoreError),
 }
 
-pub type Result<T> = std::result::Result<T, SearchError>;
+pub(crate) type Result<T> = std::result::Result<T, SearchError>;
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -25,12 +27,6 @@ pub struct GraphSetQuery<'a> {
     pub graphs: &'a [GraphId],
     pub query: &'a str,
     pub limit: usize,
-}
-
-/// Mirrors `search::QueueBound`.
-pub struct QueueBound {
-    pub chunk: usize,
-    pub max_token: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -94,23 +90,21 @@ impl SearchIndex {
     /// Drain and acknowledge without indexing. The token bound is honoured so
     /// the caller's flush contract behaves the same with the feature off.
     pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
-        let queued_deletes =
-            retain_upto(store.drain_fts_delete_queue(bound.chunk)?, &bound, |e| e.1);
+        let queued_deletes = drain_upto(&bound, |chunk| store.drain_fts_delete_queue(chunk))?;
         if !queued_deletes.is_empty() {
             store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
             store.acknowledge_fts_delete_queue(&queued_deletes)?;
             return Ok(queued_deletes.len());
         }
 
-        let queued_reindexes =
-            retain_upto(store.drain_fts_reindex_queue(bound.chunk)?, &bound, |e| e.1);
+        let queued_reindexes = drain_upto(&bound, |chunk| store.drain_fts_reindex_queue(chunk))?;
         if !queued_reindexes.is_empty() {
             store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_reindexes)?;
             store.acknowledge_fts_reindex_queue(&queued_reindexes)?;
             return Ok(queued_reindexes.len());
         }
 
-        let queued = retain_upto(store.drain_fts_queue(bound.chunk)?, &bound, |e| e.2);
+        let queued = drain_upto(&bound, |chunk| store.drain_fts_queue(chunk))?;
         store.acknowledge_fts_queue(&queued)?;
         Ok(queued.len())
     }
@@ -118,14 +112,4 @@ impl SearchIndex {
     pub fn reindex_from_store(&self, _store: &GraphStore, _graph: &GraphId) -> Result<usize> {
         Ok(0)
     }
-}
-
-fn retain_upto<T>(entries: Vec<T>, bound: &QueueBound, token: impl Fn(&T) -> u64) -> Vec<T> {
-    let Some(max_token) = bound.max_token else {
-        return entries;
-    };
-    entries
-        .into_iter()
-        .filter(|entry| token(entry) <= max_token)
-        .collect()
 }

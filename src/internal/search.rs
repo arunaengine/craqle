@@ -15,6 +15,8 @@ use tantivy::tokenizer::{
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::core::{EncodedTerm, GraphId};
+pub(crate) use crate::search_queue::QueueBound;
+use crate::search_queue::drain_upto;
 use crate::store::{GraphStore, TermId};
 
 const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
@@ -47,7 +49,7 @@ pub enum SearchError {
     Store(#[from] crate::store::StoreError),
 }
 
-pub type Result<T> = std::result::Result<T, SearchError>;
+pub(crate) type Result<T> = std::result::Result<T, SearchError>;
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -102,18 +104,6 @@ pub struct GraphSetQuery<'a> {
     pub graphs: &'a [GraphId],
     pub query: &'a str,
     pub limit: usize,
-}
-
-/// Bounds one drain pass over the durable FTS queues.
-pub struct QueueBound {
-    /// Maximum entries to read from the store per drain.
-    pub chunk: usize,
-    /// Highest dirty token to process, or `None` to process everything queued.
-    ///
-    /// A bounded flush pins this to the token observed when the flush started,
-    /// so a writer that keeps enqueueing cannot keep the drain alive forever
-    ///.
-    pub max_token: Option<u64>,
 }
 
 /// A subject update read from the store, ready to apply to the index.
@@ -497,7 +487,7 @@ impl SearchIndex {
     pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
         let bound = self.settle_poisoned_writer(store, bound)?;
 
-        let queued_deletes = drain_upto(&bound, |chunk| Ok(store.drain_fts_delete_queue(chunk)?))?;
+        let queued_deletes = drain_upto(&bound, |chunk| store.drain_fts_delete_queue(chunk))?;
         if !queued_deletes.is_empty() {
             for (graph, _) in &queued_deletes {
                 if store.contains_graph(graph)? {
@@ -513,7 +503,7 @@ impl SearchIndex {
             return Ok(queued_deletes.len());
         }
 
-        let queued_graphs = drain_upto(&bound, |chunk| Ok(store.drain_fts_reindex_queue(chunk)?))?;
+        let queued_graphs = drain_upto(&bound, |chunk| store.drain_fts_reindex_queue(chunk))?;
         if !queued_graphs.is_empty() {
             for (graph, _) in &queued_graphs {
                 self.reindex_from_store(store, graph)?;
@@ -525,7 +515,7 @@ impl SearchIndex {
             return Ok(queued_graphs.len());
         }
 
-        let queued = drain_upto(&bound, |chunk| Ok(store.drain_fts_queue(chunk)?))?;
+        let queued = drain_upto(&bound, |chunk| store.drain_fts_queue(chunk))?;
         if queued.is_empty() {
             return Ok(0);
         }
@@ -717,58 +707,6 @@ impl SearchIndex {
         writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
         self.dirty.store(true, Ordering::SeqCst);
         Ok(())
-    }
-}
-
-/// A durable FTS queue entry, tagged with the dirty token it was enqueued at.
-trait QueueEntry {
-    fn token(&self) -> u64;
-}
-
-impl QueueEntry for (GraphId, u64) {
-    fn token(&self) -> u64 {
-        self.1
-    }
-}
-
-impl QueueEntry for (GraphId, TermId, u64) {
-    fn token(&self) -> u64 {
-        self.2
-    }
-}
-
-/// Drain one durable queue, keeping only entries at or below `bound.max_token`.
-///
-/// Queue keys are ordered by graph/subject hash rather than by token, so a
-/// bounded drain can come back holding nothing but entries enqueued after the
-/// bound was taken while eligible ones sit further along the scan. Widen the
-/// chunk until eligible entries appear or the whole queue has been seen:
-/// returning early would leave pre-flush work unindexed and break the bounded
-/// flush contract ("everything enqueued before the call is indexed").
-///
-/// Terminates because `chunk` grows until the drain returns fewer entries than
-/// requested, which means the whole queue was scanned.
-fn drain_upto<T, D>(bound: &QueueBound, drain: D) -> Result<Vec<T>>
-where
-    T: QueueEntry,
-    D: Fn(usize) -> Result<Vec<T>>,
-{
-    let Some(max_token) = bound.max_token else {
-        return drain(bound.chunk);
-    };
-
-    let mut chunk = bound.chunk;
-    loop {
-        let drained = drain(chunk)?;
-        let whole_queue_seen = drained.len() < chunk;
-        let eligible: Vec<T> = drained
-            .into_iter()
-            .filter(|entry| entry.token() <= max_token)
-            .collect();
-        if !eligible.is_empty() || whole_queue_seen {
-            return Ok(eligible);
-        }
-        chunk = chunk.saturating_mul(4);
     }
 }
 
@@ -1048,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn https_schema_description_is_indexed() {
+    fn https_schema_indexed() {
         let dir = tempdir().unwrap();
         let node = crate::CraqleNode::open(dir.path()).unwrap();
         let graph = crate::core::GraphId::new("urn:test:https-schema-search");
@@ -1190,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn old_analyzer_index_is_rebuilt_on_node_open() {
+    fn old_analyzer_rebuilt() {
         let dir = tempdir().unwrap();
         let graph = crate::core::GraphId::new("urn:test:search-analyzer-reindex");
         let auth = crate::AllowAllAuthorizer;
@@ -1269,7 +1207,7 @@ mod tests {
 
     /// A poisoned writer must not turn every later index write into a panic.
     #[test]
-    fn poisoned_writer_recovers_without_a_restart() -> Result<()> {
+    fn poisoned_writer_recovers() -> Result<()> {
         let index = Arc::new(SearchIndex::open_in_memory()?);
         index.index_resource("urn:g", "urn:before", Some("beforepoison"))?;
         index.commit()?;
@@ -1298,7 +1236,7 @@ mod tests {
     /// back to its last commit, so the index has to re-derive from the store,
     /// which is the source of truth. One indexer pass must be enough.
     #[test]
-    fn poisoned_writer_reconverges_with_the_store() {
+    fn poisoned_writer_reconverges() {
         let dir = tempdir().unwrap();
         let node = crate::CraqleNode::open(dir.path()).unwrap();
         let graph = crate::core::GraphId::new("urn:test:poison-reconverge");

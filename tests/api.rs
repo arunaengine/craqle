@@ -168,7 +168,7 @@ fn query_graphs_with_filters_by_lazy_predicate() {
 /// 32-graph limit where `query_graphs` switches from an explicit dataset to the
 /// union view.
 #[test]
-fn query_matches_explicit_visible_set_with_mixed_policies() {
+fn query_matches_visible() {
     // Small visible set: explicit-dataset regime.
     assert_query_regimes_agree(6, 2);
     // 40 visible graphs: crosses the explicit-dataset threshold.
@@ -826,7 +826,7 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
 /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
 #[cfg(feature = "search")]
 #[test]
-fn search_graphs_agrees_across_the_per_graph_threshold() {
+fn search_crosses_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();

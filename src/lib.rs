@@ -1,10 +1,10 @@
 //! Craqle stores, validates, queries, searches, and replicates RO-Crates.
 //!
-//! For application integration, prefer the root `craqle` API centered around
-//! [`CraqleNode`], typed request structs, and RO-Crate JSON-LD import/export.
-//! The lower-level modules exposed from `src/internal/` remain available for
-//! advanced use cases and tests, but they are not the primary integration
-//! surface.
+//! The integration surface is the root API: [`CraqleNode`], the typed request
+//! structs, and RO-Crate JSON-LD import/export. Everything under
+//! `src/internal/` is private to the crate.
+
+#![warn(unreachable_pub)]
 
 #[path = "internal/core.rs"]
 mod core;
@@ -22,6 +22,8 @@ mod search;
 #[cfg(not(feature = "search"))]
 #[path = "search_stub.rs"]
 mod search;
+#[path = "internal/search_queue.rs"]
+mod search_queue;
 #[path = "internal/sparql.rs"]
 mod sparql;
 #[path = "internal/store.rs"]
@@ -1651,8 +1653,7 @@ impl CraqleNode {
     ///
     /// Commits Tantivy and persists Fjall once per batch of graphs rather than
     /// once per graph: every commit replays the queued deletes against every
-    /// segment, which made a per-graph commit super-linear in corpus size
-    ///.
+    /// segment, which made a per-graph commit super-linear in corpus size.
     pub fn reindex_search(&self) -> Result<()> {
         let mut covered = Vec::with_capacity(REINDEX_COMMIT_BATCH_GRAPHS);
         for graph in self.store.graphs()? {
@@ -1706,7 +1707,7 @@ impl CraqleNode {
     pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
         let mut visible = Vec::new();
         for graph_id in self.store.graph_term_id_iter() {
-            let term = self.store.decode_graph_term(graph_id?)?;
+            let term = self.store.decode_term(graph_id?)?;
             let Some(graph) = term.to_named_node().map(GraphId) else {
                 continue;
             };
@@ -2207,7 +2208,7 @@ mod tests {
     /// inconsistency the recovery rules forbid.
     #[test]
     #[cfg(feature = "search")]
-    fn search_worker_survives_a_panicking_drain() {
+    fn worker_survives_panic() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),
@@ -2259,7 +2260,7 @@ mod tests {
     /// identical `(counter, actor)` to two different context values: a tie the
     /// register cannot break, which leaves peers free to disagree forever.
     #[test]
-    fn concurrent_context_writes_mint_distinct_tags() {
+    fn context_tags_distinct() {
         const WRITERS: usize = 8;
         const WRITES: usize = 8;
 
@@ -2305,7 +2306,7 @@ mod tests {
     /// can settle on a value every peer has already superseded, with no later
     /// event to correct it.
     #[test]
-    fn racing_context_applies_converge_on_the_highest_tag() {
+    fn context_applies_converge() {
         const ROUNDS: usize = 32;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2379,7 +2380,7 @@ mod tests {
     /// node on a policy its peers have already replaced — the permissive one,
     /// if that is the one that lost.
     #[test]
-    fn concurrent_policy_writes_settle_on_the_last_published() {
+    fn policy_writes_settle() {
         const ROUNDS: usize = 10;
         const WRITERS: usize = 4;
         const STALL_MICROS: u64 = 2_000;
@@ -2444,7 +2445,7 @@ mod tests {
     /// clears a tombstone, so every later replicated record for that graph is
     /// dropped and the divergence can never be repaired.
     #[test]
-    fn a_write_racing_a_delete_never_resurrects_the_graph() {
+    fn write_never_resurrects() {
         const ROUNDS: usize = 16;
 
         let dir = tempfile::tempdir().unwrap();
