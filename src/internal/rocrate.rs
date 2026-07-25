@@ -856,7 +856,7 @@ impl RoCrateManager {
 
     /// Apply one property mutation to an entity. See [`PropertyUpdate`] for the
     /// `old_value` semantics.
-    pub fn apply_property_update(
+    pub fn update_property(
         &self,
         graph_id: &GraphId,
         update: PropertyUpdate<'_>,
@@ -915,33 +915,6 @@ impl RoCrateManager {
         });
 
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
-    }
-
-    /// Update a property on an entity.
-    ///
-    /// When `old_value` is `Some(v)`, only the triple matching `v` is replaced.
-    /// When `old_value` is `None`, **all** existing values for the given predicate
-    /// are removed before inserting `new_value` (replace-all semantics).
-    #[deprecated(
-        note = "use RoCrateManager::apply_property_update with a PropertyUpdate; removed in W-CLEAN"
-    )]
-    pub fn update_property(
-        &self,
-        graph_id: &GraphId,
-        entity_id: &str,
-        predicate: &str,
-        old_value: Option<&str>,
-        new_value: &str,
-    ) -> Result<Batch, RoCrateError> {
-        self.apply_property_update(
-            graph_id,
-            PropertyUpdate {
-                entity_id,
-                predicate,
-                old_value,
-                new_value,
-            },
-        )
     }
 
     /// Build the per-operation context: the graph's interned term id plus a

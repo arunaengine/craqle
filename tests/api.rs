@@ -559,7 +559,13 @@ fn patch_preserves_properties() {
     assert_eq!(batch.actor, ActorId::from_bytes([3u8; 32]));
 
     let properties = node
-        .describe_subject(&reader_auth(), &graph, "./file.txt")
+        .describe_subject(
+            &reader_auth(),
+            DescribeRequest {
+                graph: &graph,
+                subject_id: "./file.txt",
+            },
+        )
         .unwrap();
     assert!(properties.contains(&(
         EncodedTerm::from_named_node(&vocab::schema_description()),
@@ -589,12 +595,18 @@ fn patch_preserves_properties() {
     )
     .unwrap();
     assert!(
-        node.describe_subject(&reader_auth(), &graph, "./file.txt")
-            .unwrap()
-            .iter()
-            .all(|(predicate, _)| {
-                predicate != &EncodedTerm::from_named_node(&vocab::schema_description())
-            })
+        node.describe_subject(
+            &reader_auth(),
+            DescribeRequest {
+                graph: &graph,
+                subject_id: "./file.txt",
+            },
+        )
+        .unwrap()
+        .iter()
+        .all(|(predicate, _)| {
+            predicate != &EncodedTerm::from_named_node(&vocab::schema_description())
+        })
     );
     assert!(node.irokle_topic_id(&graph).unwrap().is_none());
     assert!(irokle.list_topics().unwrap().is_empty());
@@ -701,7 +713,7 @@ fn search_filters_private_graphs_by_policy() {
     node.flush_search_updates().unwrap();
 
     let anonymous_hits = node
-        .search_with(
+        .search(
             &GrantAuthorizer::default(),
             SearchRequest {
                 query: "proteomics",
@@ -713,7 +725,7 @@ fn search_filters_private_graphs_by_policy() {
     assert_eq!(anonymous_hits[0].subject_iri, public_graph.as_str());
 
     let writer_hits = node
-        .search_with(
+        .search(
             &writer,
             SearchRequest {
                 query: "proteomics",
@@ -788,7 +800,7 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
     node.flush_search_updates().unwrap();
 
     let hits = node
-        .search_graphs_with(
+        .search_graphs(
             &GrantAuthorizer::default(),
             GraphSearchRequest {
                 graphs: &[hidden_selected, selected_a.clone(), selected_b.clone()],
@@ -804,7 +816,7 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
     assert_eq!(subjects, vec![selected_a.as_str(), selected_b.as_str()]);
 }
 
-/// The large-set path of `search_graphs_with` swaps one search-per-graph for a
+/// The large-set path of `search_graphs` swaps one search-per-graph for a
 /// single search with an index-side graph filter (finding R8). Both paths must
 /// return the same graph-restricted, policy-respecting page.
 #[test]
@@ -856,7 +868,7 @@ fn search_graphs_agrees_across_the_per_graph_threshold() {
     let anonymous = GrantAuthorizer::default();
     let search = |graphs: &[GraphId], limit: usize| {
         let mut subjects: Vec<String> = node
-            .search_graphs_with(
+            .search_graphs(
                 &anonymous,
                 GraphSearchRequest {
                     graphs,
@@ -919,7 +931,7 @@ fn search_hits_can_be_hydrated_from_rdf() {
     node.flush_search_updates().unwrap();
 
     let hits = node
-        .search_with(
+        .search(
             &reader,
             SearchRequest {
                 query: "hydrated",
@@ -941,7 +953,7 @@ fn search_hits_can_be_hydrated_from_rdf() {
     );
 
     let hydrated_search = node
-        .search_resources_with(
+        .search_resources(
             &reader,
             SearchRequest {
                 query: "hydrated",
@@ -996,7 +1008,7 @@ fn cluster_sync_converges_through_public_api() {
     cluster.reindex_search().unwrap();
     let hits = cluster
         .peer(1)
-        .search_with(
+        .search(
             &anonymous,
             SearchRequest {
                 query: "cluster",

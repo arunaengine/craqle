@@ -868,6 +868,7 @@ fn push_slice_cap(pattern: GraphPattern, cap: usize) -> GraphPattern {
 mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphId};
+    use crate::store::{EncodedQuad, QuadAdd};
     use spargebra::SparqlParser;
     use std::sync::Arc;
 
@@ -898,13 +899,17 @@ mod tests {
         store
             .insert_quad(
                 &mut batch,
-                graph_id,
-                subject_id,
-                predicate_id,
-                object_id,
-                &Dot {
-                    actor: ActorId::random(),
-                    counter: 1,
+                QuadAdd {
+                    quad: EncodedQuad {
+                        graph: graph_id,
+                        subject: subject_id,
+                        predicate: predicate_id,
+                        object: object_id,
+                    },
+                    dot: Dot {
+                        actor: ActorId::random(),
+                        counter: 1,
+                    },
                 },
             )
             .unwrap();

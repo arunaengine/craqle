@@ -95,11 +95,7 @@ impl SearchIndex {
 
     /// Drain and acknowledge without indexing. The token bound is honoured so
     /// the caller's flush contract behaves the same with the feature off.
-    pub fn process_queued_updates_bounded(
-        &self,
-        store: &GraphStore,
-        bound: QueueBound,
-    ) -> Result<usize> {
+    pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
         let queued_deletes =
             retain_upto(store.drain_fts_delete_queue(bound.chunk)?, &bound, |e| e.1);
         if !queued_deletes.is_empty() {
@@ -119,19 +115,6 @@ impl SearchIndex {
         let queued = retain_upto(store.drain_fts_queue(bound.chunk)?, &bound, |e| e.2);
         store.acknowledge_fts_queue(&queued)?;
         Ok(queued.len())
-    }
-
-    #[deprecated(
-        note = "use SearchIndex::process_queued_updates_bounded with a QueueBound; removed in W-CLEAN"
-    )]
-    pub fn process_queued_updates(&self, store: &GraphStore, limit: usize) -> Result<usize> {
-        self.process_queued_updates_bounded(
-            store,
-            QueueBound {
-                chunk: limit,
-                max_token: None,
-            },
-        )
     }
 
     pub fn reindex_from_store(&self, _store: &GraphStore, _graph: &GraphId) -> Result<usize> {

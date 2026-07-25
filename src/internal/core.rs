@@ -560,10 +560,6 @@ pub mod vocab {
     pub fn schema_media_object() -> NamedNode {
         NamedNode::new_unchecked("http://schema.org/MediaObject")
     }
-    #[deprecated(note = "renamed to schema_media_object")]
-    pub fn schema_file() -> NamedNode {
-        schema_media_object()
-    }
     pub fn schema_keywords() -> NamedNode {
         NamedNode::new_unchecked("http://schema.org/keywords")
     }

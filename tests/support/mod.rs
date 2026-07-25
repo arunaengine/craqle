@@ -272,7 +272,10 @@ pub fn keyword_delete(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
 pub fn reindex_and_search(net: &sim::CraqleCluster, peer: usize, query: &str) -> Vec<String> {
     net.reindex_search().unwrap();
     net.peer(peer)
-        .search(&GrantAuthorizer::default(), query, 10)
+        .search(
+            &GrantAuthorizer::default(),
+            SearchRequest { query, limit: 10 },
+        )
         .unwrap()
         .into_iter()
         .map(|hit| hit.subject_iri)
