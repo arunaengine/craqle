@@ -1031,19 +1031,67 @@ impl GraphStore {
 
         for graph_id in self.graph_term_ids()? {
             let clock = self.get_vector_clock_by_id(graph_id)?;
-            match self.read_stored_diagnostics(graph_id)? {
-                Some(record) if record.at_clock == clock => {
-                    self.diagnostics_cache
-                        .write()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(graph_id, record);
-                }
-                _ => {
-                    self.recompute_graph_diagnostics(graph_id)?;
-                }
+            let stored = self.read_stored_diagnostics(graph_id)?;
+            if let Some(record) = stored.filter(|record| record.at_clock == clock) {
+                self.diagnostics_cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(graph_id, record);
+                continue;
             }
+
+            let previous = self
+                .read_stored_diagnostics(graph_id)?
+                .map(|record| record.diagnostics)
+                .unwrap_or_default();
+            let repaired = self.recompute_graph_diagnostics(graph_id)?;
+            self.requeue_orphan_changes(graph_id, (&previous, &repaired))?;
         }
         Ok(())
+    }
+
+    /// Re-queue for search every entity whose orphan status changed during a
+    /// repair.
+    ///
+    /// Orphaned entities are invisible to search (G6), so a repair that flips
+    /// an entity in or out of the orphan set leaves the search index disagreeing
+    /// with the store until that subject is re-indexed. Without this, a crash
+    /// between a quad commit and its diagnostics write would keep an entity
+    /// searchable — or wrongly hidden — until something unrelated happened to
+    /// dirty it (G7).
+    fn requeue_orphan_changes(
+        &self,
+        graph_id: TermId,
+        change: (&GraphDiagnostics, &GraphDiagnostics),
+    ) -> Result<()> {
+        let (previous, current) = change;
+        if previous == current {
+            return Ok(());
+        }
+
+        let before: HashSet<&String> = previous.orphaned_entities.iter().collect();
+        let after: HashSet<&String> = current.orphaned_entities.iter().collect();
+        let mut subjects = HashSet::new();
+        for entity in before.symmetric_difference(&after) {
+            let term =
+                EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(entity.as_str()));
+            if let Some(subject) = self.lookup_term(&term)? {
+                subjects.insert(subject);
+            }
+        }
+        if subjects.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.new_batch();
+        self.enqueue_fts_subjects_by_id(
+            &mut batch,
+            FtsEnqueue {
+                graph_id,
+                subjects: &subjects,
+            },
+        )?;
+        self.commit(batch)
     }
 
     fn graph_id_for(&self, graph: &GraphId) -> Result<Option<TermId>> {
@@ -3855,6 +3903,53 @@ mod tests {
             0,
             reopened.diagnostics_compute_count(),
             "the previous run must have persisted a correctly tagged record"
+        );
+    }
+
+    /// A repair that changes the orphan set must re-queue the affected
+    /// subjects, because orphans are invisible to search: otherwise the index
+    /// keeps showing an entity the store now hides (G6/G7).
+    #[test]
+    fn open_repair_requeues_entities_whose_orphan_status_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:diagnostics-requeue");
+
+        let subject_id = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            commit_orphan(&store, &graph, "urn:orphan:known");
+            assert_eq!(
+                vec!["urn:orphan:known".to_string()],
+                store.graph_diagnostics(&graph).unwrap().orphaned_entities
+            );
+            store.clear_fts_queue().unwrap();
+
+            // A commit that never refreshed diagnostics.
+            let quad = encode_quad(
+                &store,
+                &graph,
+                (
+                    "urn:orphan:appeared",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://schema.org/MediaObject",
+                ),
+            );
+            commit_add(&store, &graph, quad);
+            store.persist().unwrap();
+            quad.subject
+        };
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        let queued: Vec<TermId> = store
+            .drain_fts_queue(10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, subject, _)| subject)
+            .collect();
+        assert_eq!(
+            vec![subject_id],
+            queued,
+            "the newly orphaned entity must be re-queued for search at open"
         );
     }
 
