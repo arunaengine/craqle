@@ -446,34 +446,15 @@ pub struct GraphStore {
 
 // ── Frozen WS0 parameter structs ────────────────────────────────────────────
 
-/// RAII guard serializing all read→write cycles of one graph's CRDT state
-/// (dot sets, log heads, vector clock, meta, diagnostics tag).
+/// RAII guard serializing one graph's read→write cycles (dot sets, log heads,
+/// vector clock, meta, diagnostics tag). Sharded by graph term hash.
 ///
-/// Sharded: [`COMMIT_LOCK_SHARDS`] shards keyed by the hash of the graph term;
-/// collisions merely serialize unrelated graphs (accepted simplicity trade).
+/// **Lock order: graph commit guard ▸ term shard locks.** Never take a second
+/// commit guard while holding one — `std::sync::Mutex` is not reentrant. Any
+/// method that calls `graph_commit_guard` itself is therefore off limits while
+/// one is held; batch-taking methods do not lock and require the caller to hold it.
 ///
-/// **Lock order: graph commit guard ▸ term shard locks.** NEVER acquire a
-/// second commit guard while holding one — `std::sync::Mutex` is not reentrant
-/// and doing so self-deadlocks.
-///
-/// These `GraphStore` methods are **self-guarding**: they take the guard
-/// themselves and therefore MUST NOT be called while a guard is held:
-///
-/// * [`GraphStore::create_graph`]
-/// * [`GraphStore::delete_graph`]
-/// * [`GraphStore::set_graph_policy`]
-/// * [`GraphStore::set_irokle_topic_id`]
-/// * [`GraphStore::set_graph_context`]
-/// * [`GraphStore::set_graph_tombstone`]
-///
-/// The batch-parameterized functions (`insert_quad`, `remove_quad`,
-/// `set_vector_clock`, `next_counter`, `enqueue_fts*`) do **not** lock; their
-/// contract is "the caller holds the guard".
-///
-/// Poisoned mutexes are recovered with
-/// `unwrap_or_else(PoisonError::into_inner)`: the state the guard protects
-/// lives in fjall, not behind the mutex, so a panicking writer cannot leave
-/// torn data reachable only through the lock.
+/// Poison is recovered: the protected state lives in fjall, not behind the mutex.
 pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
 
 /// An OR-Set add: contributes exactly one unique dot to the quad's dot set (G1).
@@ -2078,20 +2059,13 @@ impl GraphStore {
         self.graph_diagnostics_by_id(graph_id)
     }
 
-    /// Like [`GraphStore::graph_diagnostics`], but keyed by the graph term id
-    /// so cache hits avoid decode/lookup round trips through the term table.
+    /// Like [`GraphStore::graph_diagnostics`] but keyed by term id. Verifies the
+    /// clock tag on every read and recomputes inline on a mismatch, so a stale
+    /// set is never served.
     ///
-    /// Every read verifies the clock tag, so a reader can never be served
-    /// diagnostics that describe an older state: a mismatch is recomputed
-    /// inline, on this call (derived-state register row 4, max staleness zero).
-    ///
-    /// **A read never persists.** The persisted record is the baseline the
-    /// search re-queue diffs against — it names the orphan set the index was
-    /// last brought in step with — so a reader that stored its recomputation
-    /// would erase the difference a later rebuild has to act on, leaving an
-    /// entity that changed visibility permanently un-indexed (G7). Readers
-    /// therefore only refresh the memory cache, which is clock-tagged and so
-    /// can never serve a set that describes an older state either.
+    /// **A read never persists.** The stored record is the baseline the search
+    /// re-queue diffs against, so a reader that saved its recomputation would
+    /// erase the difference a later rebuild must act on (G7).
     pub fn graph_diagnostics_by_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
         let clock = self.get_vector_clock_by_id(graph_id)?;
 
@@ -2604,19 +2578,12 @@ impl GraphStore {
         Ok(term)
     }
 
-    /// Queue one subject for search reindexing, in the same durable batch as
-    /// the store mutation that dirtied it (G7).
+    /// Queue one subject for search reindexing, in the same durable batch as the
+    /// store mutation that dirtied it (G7). The token comes from a counter seeded
+    /// past every live queue token at open.
     ///
-    /// Does not lock; the token comes from a process-wide counter that is
-    /// seeded past every live queue token at open (WS0-T6).
-    ///
-    /// `Relaxed` is enough for the mint. The counter orders nothing but itself:
-    /// the queue entry's visibility comes from the fjall batch, not from this
-    /// atomic. What [`GraphStore::current_dirty_token`] needs is that a mint
-    /// which happened-before its load is reflected in the value it reads, and
-    /// that is single-location read-read coherence, which every ordering
-    /// guarantees. `SeqCst` bought a fence on the hottest write path for
-    /// nothing.
+    /// `Relaxed` suffices: the entry's visibility comes from the fjall batch, and
+    /// `current_dirty_token` only needs single-location read-read coherence.
     pub fn enqueue_fts(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
         let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
@@ -2651,32 +2618,12 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Whether rescanning the whole graph is cheaper than queueing `subjects`
-    /// individual dirty entries.
+    /// Whether rescanning the whole graph beats queueing `subjects` dirty
+    /// entries: the batch must be large *and* cover much of the graph.
     ///
-    /// The batch has to be large in absolute terms *and* cover a substantial
-    /// fraction of the graph. The absolute bound on its own was measuring the
-    /// wrong thing (finding W14): a 10k-subject write against a 100k-entity
-    /// graph escalated into a 100k-subject rescan, ten times the work the write
-    /// actually dirtied, and a large ingest split into batches re-scanned
-    /// everything it had already written once per batch.
-    ///
-    /// [`GraphStore::graph_subject_count`] is an O(1) read off the in-memory
-    /// index, so the extra test costs nothing. It observes the graph as it
-    /// stood before `batch`, which is the conservative direction: a batch that
-    /// is adding subjects is compared against the smaller, pre-write graph and
-    /// so escalates more readily, never less.
-    ///
-    /// **Why the per-subject branch is safe (G7).** The queue is a dirty-set:
-    /// over-queueing only costs work, under-queueing silently loses search
-    /// freshness, so moving work out of the rescan branch is only legitimate if
-    /// the per-subject entries still cover everything the write changed. They
-    /// do: every caller passes exactly the subjects its own write changed, and
-    /// the one effect a write can have on a subject it never touched — flipping
-    /// that subject in or out of the orphan set, which hides it from search
-    /// (G6) — is queued separately and per-subject by the diagnostics
-    /// settlement that follows every commit. Neither branch of this function
-    /// ever covered that case, so neither branch depends on it.
+    /// Safe to take the per-subject branch (G7) because callers pass exactly the
+    /// subjects their write changed, and orphan-status flips on untouched
+    /// subjects are queued separately by the diagnostics settle.
     fn fts_reindex_is_cheaper(&self, graph_id: TermId, subjects: usize) -> bool {
         subjects >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD
             && subjects * 2 >= self.graph_subject_count(graph_id)

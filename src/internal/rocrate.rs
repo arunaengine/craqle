@@ -120,19 +120,12 @@ pub fn validate_rocrate_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateE
 }
 
 /// Per-operation view of one crate: the graph, its interned term id, and the
-/// set of orphaned entities that are hidden from every read (G6).
+/// orphaned entities hidden from every read (G6).
 ///
-/// Built exactly once at the top of each public manager operation and threaded
-/// through every read underneath it. Previously each `subject_triples` call
-/// re-read the graph diagnostics and re-interned the graph term, so exporting
-/// N entities rebuilt the orphan set roughly 3N times.
-///
-/// Consistency note: the context snapshots the orphan set at operation start.
-/// That is exactly the semantics the code already had — the set the *first*
-/// read observed governed that read, and export was never transactional across
-/// its internal reads — so a single snapshot introduces no new inconsistency.
-/// It removes one, in fact: every read inside one operation now agrees on the
-/// same visible set instead of straddling a concurrent commit.
+/// Built once per public operation and threaded through every read beneath it.
+/// The orphan set is snapshotted at operation start, which strengthens the old
+/// behaviour rather than weakening it: every read within one operation now
+/// agrees on the same visible set instead of straddling a concurrent commit.
 struct CrateCtx {
     graph: GraphId,
     /// `None` when the graph term was never interned, i.e. the graph holds no
@@ -1423,29 +1416,14 @@ impl RoCrateManager {
         Ok(batch)
     }
 
-    /// Persist (and, when sync is configured, replicate) the raw context and
-    /// license render hints captured from an import. Last-write-wins: only
-    /// updates when a hint actually changed.
+    /// Persist, and replicate when sync is configured, the render hints captured
+    /// from an import. Last-write-wins; only writes when a hint changed.
     ///
-    /// Two-phase contract. Import is not a single atomic transaction: the quad
-    /// changes are committed and published (phase 1, by the caller) *before* the
-    /// render hints are updated here (phase 2). If phase 2 fails, the import
-    /// returns an error with the quads already applied and the stored hints
-    /// unchanged. This is self-healing: re-importing the same document produces
-    /// an empty quad diff (a no-op batch, so phase 1 does nothing), and because
-    /// the stored hints still differ from the freshly captured ones, their
-    /// store/publish is retried and the two phases converge.
-    ///
-    /// Phase 2 is itself publish-first (G4): `ReplicationEngine::set_graph_context`
-    /// publishes the new `(context, tag)` before writing it locally, so a failed
-    /// publish leaves the local register untouched and the retry above republishes
-    /// rather than stranding peers on a value only this node holds. The tag is a
-    /// LWW register (G5) minted strictly above the stored one, so the retry's
-    /// republish also wins over the value it is healing, whatever order peers see.
-    ///
-    /// Pinned by `context_publish_failure_leaves_quads_and_heals_on_reimport`
-    /// below and by `context_retry_is_idempotent_and_advances_only_on_change`
-    /// in `tests/rocrate.rs`.
+    /// Phase 2 of a two-phase import: the quads are already committed. A failure
+    /// here leaves the hints unchanged and self-heals, because re-importing the
+    /// same document produces an empty quad diff while the hints still differ, so
+    /// the store/publish is retried. Publish-first (G4), with a tag minted strictly
+    /// above the stored one (G5), so the retry also wins over what it is healing.
     fn store_import_context(
         &self,
         graph_id: &GraphId,

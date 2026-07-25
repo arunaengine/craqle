@@ -299,24 +299,13 @@ impl SearchIndex {
         }
     }
 
-    /// Roll a poisoned writer back to its last commit and take on the debt of
-    /// re-deriving the index from the store.
+    /// Roll a poisoned writer back to its last commit and record that the index
+    /// owes the store a re-derivation.
     ///
-    /// The panic unwound out of the writer at an unknown point, so its
-    /// uncommitted state cannot be trusted; carrying on with it would risk a
-    /// silently incomplete index, which is worse than the failure being
-    /// repaired. `IndexWriter::rollback` is Tantivy's own answer to exactly
-    /// this: it discards everything since the last commit and replaces the
-    /// writer with a fresh one built from the same `Index`, handing the
-    /// directory lock across so no second writer can be constructed behind it.
-    ///
-    /// That leaves the index at a consistent — but stale — commit, so the
-    /// recovery is only half done here. The other half, re-deriving from the
-    /// store, needs a store handle and is completed by
-    /// [`SearchIndex::settle_poisoned_writer`] on the indexer's next pass.
-    /// The debt is recorded before the rollback so a rollback that itself
-    /// fails still leaves the mutex poisoned and the debt outstanding, and the
-    /// next lock attempt retries the whole repair.
+    /// The panic unwound at an unknown point, so uncommitted writer state cannot
+    /// be trusted. `rollback` discards it and builds a fresh writer from the same
+    /// `Index`, moving the directory lock across. The debt is recorded first, so a
+    /// failing rollback leaves the mutex poisoned and the repair is retried.
     fn recover_writer<'a>(
         &'a self,
         mut guard: MutexGuard<'a, IndexWriter>,
@@ -329,23 +318,11 @@ impl SearchIndex {
 
     /// Repair a poisoned writer and durably queue the reindex it owes.
     ///
-    /// Called at the top of every drain, so the indexer's own one-second tick
-    /// is the detection point: recovery does not wait for the next write, let
-    /// alone the next restart.
-    ///
-    /// The repair is queued rather than run inline so that it is durable —
-    /// a crash part-way through leaves the reindex entries in fjall and the
-    /// next open picks them up — and so that it obeys the same rule as every
-    /// other index update: acknowledged only after the Tantivy commit that
-    /// covers it (G7). Re-deriving whole graphs re-does work the index may
-    /// already hold, which is the safe direction for a dirty set.
-    ///
-    /// The returned bound is widened past the entries just queued so this same
-    /// pass drains them. Without that, a caller blocked in
-    /// `flush_search_updates` would be told the index is current while the
-    /// rebuild its own flush triggered was still pending. The widening happens
-    /// once, on the recovery pass only, so it cannot revive the unbounded-drain
-    /// livelock the bound exists to prevent (finding W15b).
+    /// Runs at the top of every drain, so the indexer's one-second tick is the
+    /// detection point. The reindex is queued rather than run inline so it stays
+    /// crash-safe and keeps G7's acknowledge-after-commit rule. The returned
+    /// bound is widened once, on this pass only, so a caller's own flush cannot
+    /// return while the rebuild it triggered is still pending.
     fn settle_poisoned_writer(&self, store: &GraphStore, bound: QueueBound) -> Result<QueueBound> {
         if self.writer.is_poisoned() {
             drop(self.writer()?);
