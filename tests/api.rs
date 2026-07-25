@@ -162,6 +162,115 @@ fn query_graphs_with_filters_by_lazy_predicate() {
     );
 }
 
+/// `CraqleNode::query` now decides visibility with a lazy per-graph predicate
+/// instead of materializing the visible set and handing it to
+/// `query_graphs` (finding R1). Results must be unchanged, including above the
+/// 32-graph limit where `query_graphs` switches from an explicit dataset to the
+/// union view.
+#[test]
+fn query_matches_explicit_visible_set_with_mixed_policies() {
+    // Small visible set: explicit-dataset regime.
+    assert_query_regimes_agree(6, 2);
+    // 40 visible graphs: crosses the explicit-dataset threshold.
+    assert_query_regimes_agree(40, 8);
+}
+
+fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let reader = reader_auth();
+
+    for idx in 0..readable {
+        create_policy_crate(
+            &node,
+            &format!("urn:test:regime:readable-{idx:03}"),
+            &format!("Readable Regime {idx}"),
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/public/regime".to_string()],
+            },
+        );
+    }
+    for idx in 0..unreadable {
+        create_policy_crate(
+            &node,
+            &format!("urn:test:regime:hidden-{idx:03}"),
+            &format!("Hidden Regime {idx}"),
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/private/regime".to_string()],
+            },
+        );
+    }
+
+    let visible = node.visible_graphs(&reader).unwrap();
+    assert_eq!(visible.len(), readable, "visible set size");
+
+    for sparql in [
+        "SELECT ?s ?name WHERE { ?s schema:name ?name }",
+        "SELECT ?g ?name WHERE { GRAPH ?g { ?s schema:name ?name } }",
+        "SELECT ?name WHERE { ?s schema:name ?name } ORDER BY ?name LIMIT 5",
+    ] {
+        assert_eq!(
+            canonical_rows(node.query(&reader, sparql).unwrap()),
+            canonical_rows(node.query_graphs(&visible, sparql).unwrap()),
+            "query and query_graphs(visible_graphs) disagree on `{sparql}` \
+             with {readable} readable / {unreadable} unreadable graphs"
+        );
+    }
+
+    assert_eq!(
+        node.query(&reader, "ASK { ?s ?p ?o }").unwrap(),
+        node.query_graphs(&visible, "ASK { ?s ?p ?o }").unwrap()
+    );
+
+    // G8 soundness: no hidden graph's data may appear either way.
+    let rows = canonical_rows(
+        node.query(&reader, "SELECT ?name WHERE { ?s schema:name ?name }")
+            .unwrap(),
+    );
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter().all(|row| row
+            .iter()
+            .all(|(_, value)| !value.contains("Hidden Regime"))),
+        "unreadable graph leaked into query results"
+    );
+}
+
+fn create_policy_crate(node: &CraqleNode, graph: &str, name: &str, policy: GraphPolicy) {
+    node.create_crate(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            GraphId::new(graph),
+            name,
+            "Regime equivalence fixture",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            policy,
+        ),
+    )
+    .unwrap();
+}
+
+/// Order-independent, comparable form of a solution sequence.
+fn canonical_rows(results: QueryResults) -> Vec<Vec<(String, String)>> {
+    let QueryResults::Solutions(rows) = results else {
+        panic!("expected solutions, got {results:?}");
+    };
+    let mut canonical: Vec<Vec<(String, String)>> = rows
+        .into_iter()
+        .map(|row| {
+            let mut row: Vec<(String, String)> =
+                row.into_iter().map(|(name, term)| (name, term.0)).collect();
+            row.sort_unstable();
+            row
+        })
+        .collect();
+    canonical.sort_unstable();
+    canonical
+}
+
 #[test]
 fn read_requires_matching_path_while_write_implies_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -592,12 +701,26 @@ fn search_filters_private_graphs_by_policy() {
     node.flush_search_updates().unwrap();
 
     let anonymous_hits = node
-        .search(&GrantAuthorizer::default(), "proteomics", 10)
+        .search_with(
+            &GrantAuthorizer::default(),
+            SearchRequest {
+                query: "proteomics",
+                limit: 10,
+            },
+        )
         .unwrap();
     assert_eq!(anonymous_hits.len(), 1);
     assert_eq!(anonymous_hits[0].subject_iri, public_graph.as_str());
 
-    let writer_hits = node.search(&writer, "proteomics", 10).unwrap();
+    let writer_hits = node
+        .search_with(
+            &writer,
+            SearchRequest {
+                query: "proteomics",
+                limit: 10,
+            },
+        )
+        .unwrap();
     assert_eq!(writer_hits.len(), 2);
 }
 
@@ -665,11 +788,13 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
     node.flush_search_updates().unwrap();
 
     let hits = node
-        .search_graphs(
+        .search_graphs_with(
             &GrantAuthorizer::default(),
-            &[hidden_selected, selected_a.clone(), selected_b.clone()],
-            "needle",
-            2,
+            GraphSearchRequest {
+                graphs: &[hidden_selected, selected_a.clone(), selected_b.clone()],
+                query: "needle",
+                limit: 2,
+            },
         )
         .unwrap();
 
@@ -677,6 +802,95 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
     let mut subjects: Vec<_> = hits.iter().map(|hit| hit.subject_iri.as_str()).collect();
     subjects.sort_unstable();
     assert_eq!(subjects, vec![selected_a.as_str(), selected_b.as_str()]);
+}
+
+/// The large-set path of `search_graphs_with` swaps one search-per-graph for a
+/// single search with an index-side graph filter (finding R8). Both paths must
+/// return the same graph-restricted, policy-respecting page.
+#[test]
+fn search_graphs_agrees_across_the_per_graph_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    let mut selected = Vec::new();
+
+    for idx in 0..24 {
+        let graph = GraphId::new(&format!("urn:test:graphset:visible-{idx:03}"));
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                format!("Graph Set {idx}"),
+                "graphsetneedle",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/datasets/public/graphset".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+        selected.push(graph);
+    }
+
+    // Selected but unreadable: must never appear from either path.
+    let hidden = GraphId::new("urn:test:graphset:hidden");
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            hidden.clone(),
+            "Graph Set Hidden",
+            "graphsetneedle ".repeat(40),
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/private/graphset".to_string()],
+            },
+        ),
+    )
+    .unwrap();
+    node.flush_search_updates().unwrap();
+
+    let anonymous = GrantAuthorizer::default();
+    let search = |graphs: &[GraphId], limit: usize| {
+        let mut subjects: Vec<String> = node
+            .search_graphs_with(
+                &anonymous,
+                GraphSearchRequest {
+                    graphs,
+                    query: "graphsetneedle",
+                    limit,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.subject_iri)
+            .collect();
+        subjects.sort_unstable();
+        subjects
+    };
+
+    // Small selection stays on the per-graph path; the large one crosses to the
+    // single filtered search. Their overlap must agree.
+    let mut small_selection: Vec<GraphId> = selected[..4].to_vec();
+    small_selection.push(hidden.clone());
+    let small = search(&small_selection, 10);
+    assert_eq!(small.len(), 4);
+
+    let mut large_selection = selected.clone();
+    large_selection.push(hidden);
+    let large = search(&large_selection, 100);
+    assert_eq!(large.len(), 24);
+    assert!(
+        small.iter().all(|subject| large.contains(subject)),
+        "per-graph and filtered paths disagree"
+    );
+    assert!(
+        large.iter().all(|subject| !subject.contains("hidden")),
+        "unreadable selected graph leaked into results"
+    );
 }
 
 #[test]
@@ -704,7 +918,15 @@ fn search_hits_can_be_hydrated_from_rdf() {
     .unwrap();
     node.flush_search_updates().unwrap();
 
-    let hits = node.search(&reader, "hydrated", 10).unwrap();
+    let hits = node
+        .search_with(
+            &reader,
+            SearchRequest {
+                query: "hydrated",
+                limit: 10,
+            },
+        )
+        .unwrap();
     assert_eq!(hits.len(), 1);
 
     let hydrated = node.hydrate_search_hits(&reader, &hits).unwrap();
@@ -718,7 +940,15 @@ fn search_hits_can_be_hydrated_from_rdf() {
                 && object.0.contains("Hydrated Search Dataset"))
     );
 
-    let hydrated_search = node.search_resources(&reader, "hydrated", 10).unwrap();
+    let hydrated_search = node
+        .search_resources_with(
+            &reader,
+            SearchRequest {
+                query: "hydrated",
+                limit: 10,
+            },
+        )
+        .unwrap();
     assert_eq!(hydrated_search.len(), 1);
 }
 
@@ -764,7 +994,16 @@ fn cluster_sync_converges_through_public_api() {
     assert!(exported.contains("Cluster File"));
 
     cluster.reindex_search().unwrap();
-    let hits = cluster.peer(1).search(&anonymous, "cluster", 10).unwrap();
+    let hits = cluster
+        .peer(1)
+        .search_with(
+            &anonymous,
+            SearchRequest {
+                query: "cluster",
+                limit: 10,
+            },
+        )
+        .unwrap();
     assert!(!hits.is_empty());
 
     cluster.partition(0, 1);

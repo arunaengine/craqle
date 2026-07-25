@@ -28,7 +28,13 @@ mod tests {
 
         let hits = net
             .peer(0)
-            .search(&GrantAuthorizer::default(), "genomics", 10)
+            .search_with(
+                &GrantAuthorizer::default(),
+                SearchRequest {
+                    query: "genomics",
+                    limit: 10,
+                },
+            )
             .unwrap();
         assert!(!hits.is_empty(), "should find 'genomics' in crate name");
     }
@@ -55,7 +61,13 @@ mod tests {
         net.reindex_search().unwrap();
         let hits = net
             .peer(0)
-            .search(&GrantAuthorizer::default(), "proteomics", 10)
+            .search_with(
+                &GrantAuthorizer::default(),
+                SearchRequest {
+                    query: "proteomics",
+                    limit: 10,
+                },
+            )
             .unwrap();
         assert_eq!(hits.len(), 1);
     }
@@ -224,7 +236,13 @@ mod tests {
             node.flush_search_updates().unwrap();
 
             let hits = node
-                .search(&GrantAuthorizer::default(), "proteomics", 10)
+                .search_with(
+                    &GrantAuthorizer::default(),
+                    SearchRequest {
+                        query: "proteomics",
+                        limit: 10,
+                    },
+                )
                 .unwrap();
             assert!(
                 hits.iter()
@@ -235,7 +253,13 @@ mod tests {
         let reopened = CraqleNode::open(tmp.path().join("peer0")).unwrap();
         reopened.flush_search_updates().unwrap();
         let hits = reopened
-            .search(&GrantAuthorizer::default(), "proteomics", 10)
+            .search_with(
+                &GrantAuthorizer::default(),
+                SearchRequest {
+                    query: "proteomics",
+                    limit: 10,
+                },
+            )
             .unwrap();
         assert!(
             hits.iter()
@@ -282,7 +306,13 @@ mod tests {
 
         let hits = net
             .peer(1)
-            .search(&GrantAuthorizer::default(), "RBATCH-000049", 10)
+            .search_with(
+                &GrantAuthorizer::default(),
+                SearchRequest {
+                    query: "RBATCH-000049",
+                    limit: 10,
+                },
+            )
             .unwrap();
         assert!(
             hits.iter()
@@ -311,7 +341,18 @@ mod tests {
         )
         .unwrap();
         node.flush_search_updates().unwrap();
-        assert!(!node.search(&reader, "deleted", 10).unwrap().is_empty());
+        assert!(
+            !node
+                .search_with(
+                    &reader,
+                    SearchRequest {
+                        query: "deleted",
+                        limit: 10
+                    }
+                )
+                .unwrap()
+                .is_empty()
+        );
 
         node.delete_graph(&writer, &graph).unwrap();
         node.create_crate(
@@ -328,7 +369,185 @@ mod tests {
         .unwrap();
         node.flush_search_updates().unwrap();
 
-        assert!(node.search(&reader, "deleted", 10).unwrap().is_empty());
-        assert!(!node.search(&reader, "replacement", 10).unwrap().is_empty());
+        assert!(
+            node.search_with(
+                &reader,
+                SearchRequest {
+                    query: "deleted",
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            !node
+                .search_with(
+                    &reader,
+                    SearchRequest {
+                        query: "replacement",
+                        limit: 10
+                    }
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// G8 completeness: an authorized caller must never be shown a short page
+    /// while matching, readable documents exist.
+    ///
+    /// Tantivy collects a global top-k by score, so unreadable graphs can fill
+    /// the whole over-fetch window and starve the authorization filter. With a
+    /// fixed `limit * 4` over-fetch this returned 21 hits for `limit = 25` and
+    /// 41 for `limit = 50` (finding K2).
+    #[test]
+    fn search_returns_limit_with_enough_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+
+        // Unreadable graphs, each scoring far above the readable ones so they
+        // dominate the top of the ranking.
+        for idx in 0..200 {
+            node.create_crate(
+                &writer,
+                CreateCrateRequest::new(
+                    GraphId::new(&format!("urn:test:escalation:private-{idx:03}")),
+                    format!("Private Escalation {idx}"),
+                    "escalationneedle ".repeat(40),
+                    "2025-01-01",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    GraphPolicy {
+                        public: false,
+                        permission_paths: vec!["/tests/private/escalation".to_string()],
+                    },
+                ),
+            )
+            .unwrap();
+        }
+
+        for idx in 0..50 {
+            node.create_crate(
+                &writer,
+                CreateCrateRequest::new(
+                    GraphId::new(&format!("urn:test:escalation:public-{idx:03}")),
+                    format!("Public Escalation {idx}"),
+                    "escalationneedle",
+                    "2025-01-01",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    GraphPolicy {
+                        public: true,
+                        permission_paths: vec!["/tests/public/escalation".to_string()],
+                    },
+                ),
+            )
+            .unwrap();
+        }
+        node.flush_search_updates().unwrap();
+
+        for limit in [25, 50] {
+            let hits = node
+                .search_with(
+                    &reader,
+                    SearchRequest {
+                        query: "escalationneedle",
+                        limit,
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(
+                hits.len(),
+                limit,
+                "limit {limit} must be filled from the 50 readable graphs"
+            );
+            // Soundness: nothing from an unreadable graph may leak through.
+            assert!(
+                hits.iter()
+                    .all(|hit| hit.graph_id.contains("escalation:public-")),
+                "unreadable graph leaked into results"
+            );
+        }
+    }
+
+    /// G7: `flush_search_updates()` must terminate even while a writer keeps
+    /// enqueueing, and everything enqueued *before* the call must be indexed
+    /// when it returns.
+    ///
+    /// The unbounded drain re-read work enqueued between drain and
+    /// acknowledgement, so the flush could spin forever (finding W15b).
+    #[test]
+    fn flush_returns_under_sustained_ingest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+        let reader = GrantAuthorizer::default();
+        let graph = GraphId::new("urn:test:sustained-ingest");
+
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Sustained Ingest Dataset",
+                "Contains sustainedmarker before the flush",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+                public_policy(),
+            ),
+        )
+        .unwrap();
+
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let writer = writer_auth();
+                let mut idx = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    node.add_data_entity_with_triples(
+                        &writer,
+                        &graph,
+                        &format!("data/background-{idx:05}.dat"),
+                        "http://schema.org/MediaObject",
+                        &format!("Background Entity {idx}"),
+                        vec![(
+                            oxrdf::NamedNode::new_unchecked("http://schema.org/description"),
+                            oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                                "background ingest record",
+                            )),
+                        )],
+                    )
+                    .unwrap();
+                    idx += 1;
+                }
+                idx
+            });
+
+            // Give the writer a head start so the queue is genuinely busy.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+
+            // The assertion is that this returns at all.
+            node.flush_search_updates().unwrap();
+
+            // Everything enqueued before the flush is indexed once it returns.
+            let hits = node
+                .search_with(
+                    &reader,
+                    SearchRequest {
+                        query: "sustainedmarker",
+                        limit: 10,
+                    },
+                )
+                .unwrap();
+            assert!(
+                hits.iter().any(|hit| hit.graph_id == graph.as_str()),
+                "work enqueued before the flush must be searchable after it"
+            );
+
+            stop.store(true, Ordering::SeqCst);
+        });
     }
 }
