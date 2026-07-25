@@ -31,7 +31,10 @@ mod auth;
 mod sync;
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -212,8 +215,34 @@ pub struct HydratedSearchHit {
     pub properties: Vec<(EncodedTerm, EncodedTerm)>,
 }
 
+/// Full-text search over every graph the caller may read.
+pub struct SearchRequest<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+}
+
+/// Full-text search restricted to an explicit set of graphs.
+pub struct GraphSearchRequest<'a> {
+    pub graphs: &'a [GraphId],
+    pub query: &'a str,
+    pub limit: usize,
+}
+
+/// One subject to resolve into its visible `(predicate, object)` pairs.
+pub struct DescribeRequest<'a> {
+    pub graph: &'a GraphId,
+    pub subject_id: &'a str,
+}
+
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
+/// Smallest Tantivy over-fetch before authorization filtering.
+const SEARCH_MIN_FETCH: usize = 64;
+/// Above this many selected graphs, `search_graphs` runs one filtered search
+/// instead of one full top-k collection per graph.
+const SEARCH_GRAPHS_PER_GRAPH_LIMIT: usize = 8;
+/// Graphs reindexed between Tantivy commits in `reindex_search`.
+const REINDEX_COMMIT_BATCH_GRAPHS: usize = 64;
 
 enum SearchWorkerMessage {
     Wake,
@@ -223,24 +252,46 @@ enum SearchWorkerMessage {
 
 struct SearchUpdateWorker {
     sender: mpsc::Sender<SearchWorkerMessage>,
+    /// `true` once a wake has been sent and not yet consumed by the worker.
+    /// Collapses a burst of writes into a single channel message instead of
+    /// one unbounded-channel send per write (finding W15c).
+    wake_pending: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SearchUpdateWorker {
     fn start(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let ctx = SearchWorkerCtx {
+            store,
+            search,
+            wake_pending: wake_pending.clone(),
+        };
         let handle = std::thread::spawn(move || {
-            run_search_update_worker(receiver, store, search);
+            run_search_update_worker(receiver, ctx);
         });
 
         Self {
             sender,
+            wake_pending,
             handle: Some(handle),
         }
     }
 
+    /// Ask the worker to drain the FTS queues.
+    ///
+    /// Skipping the send while a wake is already outstanding is safe: the
+    /// worker clears the flag *before* it starts draining, so any enqueue that
+    /// observed the flag set is guaranteed to be visible to that drain. A
+    /// one-second receive timeout backstops the flag either way.
     fn wake(&self) {
-        let _ = self.sender.send(SearchWorkerMessage::Wake);
+        if self.wake_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.sender.send(SearchWorkerMessage::Wake).is_err() {
+            self.wake_pending.store(false, Ordering::SeqCst);
+        }
     }
 
     fn flush(&self) -> Result<()> {
@@ -264,11 +315,14 @@ impl Drop for SearchUpdateWorker {
     }
 }
 
-fn run_search_update_worker(
-    receiver: mpsc::Receiver<SearchWorkerMessage>,
+/// Everything the background indexer thread owns.
+struct SearchWorkerCtx {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
-) {
+    wake_pending: Arc<AtomicBool>,
+}
+
+fn run_search_update_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
     loop {
         let mut flush_replies = Vec::new();
         if collect_search_worker_messages(&receiver, &mut flush_replies) {
@@ -278,7 +332,11 @@ fn run_search_update_worker(
             break;
         }
 
-        let result = match flush_search_queue(&store, &search) {
+        // Cleared before the drain, so a writer that enqueues after this point
+        // always gets a fresh wake through.
+        ctx.wake_pending.store(false, Ordering::SeqCst);
+
+        let result = match flush_search_queue(&ctx.store, &ctx.search) {
             Ok(()) => Ok(()),
             Err(error) => Err(error.to_string()),
         };
@@ -313,10 +371,23 @@ fn collect_search_worker_messages(
     false
 }
 
+/// Drain the FTS queues until everything enqueued *before this call* is indexed.
+///
+/// The bound matters: without it, a writer that keeps enqueueing between the
+/// drain and the acknowledgement keeps the loop alive forever and
+/// `flush_search_updates()` never returns (finding W15b). Pinning the dirty
+/// token up front turns the contract into "everything enqueued before the call
+/// is indexed", which is what callers actually need, and lets sustained ingest
+/// carry on in the background.
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
+    let max_token = store.current_dirty_token();
     let mut processed_any = false;
     loop {
-        let processed = search.process_queued_updates(store, SEARCH_QUEUE_FLUSH_CHUNK)?;
+        let bound = search::QueueBound {
+            chunk: SEARCH_QUEUE_FLUSH_CHUNK,
+            max_token: Some(max_token),
+        };
+        let processed = search.process_queued_updates_bounded(store, bound)?;
         if processed == 0 {
             if processed_any {
                 store.persist()?;
@@ -1320,9 +1391,23 @@ impl CraqleNode {
     }
 
     /// Execute a SPARQL query against the local node.
+    ///
+    /// Visibility is decided lazily, once per graph the evaluation actually
+    /// touches, instead of by materializing the whole visible set up front:
+    /// enumerating every graph cost a term decode, a full metadata decode and
+    /// an authorization call per graph in the corpus, even for a query that
+    /// reads one graph (finding R1).
+    ///
+    /// The predicate cannot report failure, so a store read error must deny.
+    /// `ensure_graph_action` already folds both "read failed" and "policy says
+    /// no" into `Err`, and `is_ok()` maps that to *not visible* — never to
+    /// visible (G8 soundness).
     pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
-        let visible = self.visible_graphs(auth)?;
-        Ok(self.sparql.query_with_graphs(sparql, &visible)?)
+        Ok(self
+            .sparql
+            .query_with_visibility(sparql, &|graph: &GraphId| {
+                self.ensure_graph_action(graph, auth, Action::Read).is_ok()
+            })?)
     }
 
     /// Execute a SPARQL query against an explicit set of local graphs.
@@ -1371,63 +1456,83 @@ impl CraqleNode {
     }
 
     /// Search visible resources in the local search index.
+    ///
+    /// Tantivy collects a global top-k by score with no idea of who is asking,
+    /// so authorization runs afterwards against the *stored* policy — never as
+    /// an index-side filter, because the index can lag the store and a policy
+    /// may have changed since a document was written (G8 soundness).
+    ///
+    /// Filtering afterwards used to silently truncate the result: a single
+    /// over-fetch of `limit * 4` returned fewer than `limit` readable hits
+    /// whenever unreadable graphs dominated the top of the ranking (finding
+    /// K2 — a completeness bug, not just a slow path). The loop below widens
+    /// the over-fetch until either enough readable hits are found or the index
+    /// is exhausted, so an authorized caller is never shown a short page while
+    /// matching, readable documents exist (G8 completeness).
+    pub fn search_with(
+        &self,
+        auth: &dyn Authorizer,
+        req: SearchRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        if req.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut readable = ReadableGraphs::new(self, auth);
+        let mut fetch = req.limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
+        loop {
+            let raw_hits = self.search.search(req.query, fetch)?;
+            // Fewer hits than asked for means the index has nothing more to
+            // give; widening again cannot produce another readable hit.
+            let index_exhausted = raw_hits.len() < fetch;
+
+            let mut hits = Vec::with_capacity(raw_hits.len().min(req.limit));
+            for hit in raw_hits {
+                if readable.allows(&hit.graph_id)? {
+                    hits.push(hit);
+                }
+            }
+
+            if hits.len() >= req.limit || index_exhausted {
+                // Tantivy already returned score-descending order and the
+                // filter preserves it, so no re-sort is needed here.
+                hits.truncate(req.limit);
+                return Ok(hits);
+            }
+            fetch = fetch.saturating_mul(4);
+        }
+    }
+
+    #[deprecated(note = "use CraqleNode::search_with with a SearchRequest; removed in W-CLEAN")]
     pub fn search(
         &self,
         auth: &dyn Authorizer,
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let fetch = limit.saturating_mul(4).max(64);
-        let raw_hits = self.search.search(query, fetch)?;
-
-        let mut graph_readable: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
-        let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
-        for hit in raw_hits {
-            let readable = match graph_readable.get(&hit.graph_id) {
-                Some(readable) => *readable,
-                None => {
-                    let graph = GraphId::new(&hit.graph_id);
-                    let readable = self.store.contains_graph(&graph)?
-                        && auth
-                            .authorize(&graph, &self.store.graph_policy(&graph)?, Action::Read)
-                            .is_ok();
-                    graph_readable.insert(hit.graph_id.clone(), readable);
-                    readable
-                }
-            };
-            if readable {
-                hits.push(hit);
-            }
-        }
-
-        Ok(limit_search_hits(hits, limit))
+        self.search_with(auth, SearchRequest { query, limit })
     }
 
     /// Search visible resources in an explicit set of graph IRIs.
     ///
-    /// Graph selection and authorization are applied before Tantivy top-k
-    /// collection by searching each readable selected graph separately. Missing
-    /// or non-readable graphs are ignored, matching [`CraqleNode::search`].
-    pub fn search_graphs(
+    /// Every selected graph is authorized against its stored policy *before*
+    /// the index is consulted, so no post-filtering — and therefore no
+    /// escalation loop — is needed: every hit the index can return already
+    /// belongs to a graph the caller may read. Missing or non-readable graphs
+    /// are ignored, matching [`CraqleNode::search_with`].
+    pub fn search_graphs_with(
         &self,
         auth: &dyn Authorizer,
-        graphs: &[GraphId],
-        query: &str,
-        limit: usize,
+        req: GraphSearchRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
-        if limit == 0 {
+        if req.limit == 0 {
             return Ok(Vec::new());
         }
 
         let mut seen = std::collections::HashSet::new();
-        let mut hits = Vec::new();
-        for graph in graphs {
-            if !seen.insert(graph.as_str().to_string()) {
+        let mut selected = Vec::new();
+        for graph in req.graphs {
+            if !seen.insert(graph.as_str()) {
                 continue;
             }
             if !self.store.contains_graph(graph)?
@@ -1437,69 +1542,140 @@ impl CraqleNode {
             {
                 continue;
             }
-            hits.extend(self.search.search_in_graph(graph.as_str(), query, limit)?);
+            selected.push(graph.clone());
         }
 
-        Ok(limit_search_hits(hits, limit))
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // A per-graph search is a full top-k collection each, so it only pays
+        // off for a handful of graphs; beyond that one filtered search over
+        // the whole set is cheaper and returns the same global top-k.
+        let hits = if selected.len() <= SEARCH_GRAPHS_PER_GRAPH_LIMIT {
+            let mut hits = Vec::new();
+            for graph in &selected {
+                hits.extend(
+                    self.search
+                        .search_in_graph(graph.as_str(), req.query, req.limit)?,
+                );
+            }
+            limit_search_hits(hits, req.limit)
+        } else {
+            self.search.search_in_graphs(search::GraphSetQuery {
+                graphs: &selected,
+                query: req.query,
+                limit: req.limit,
+            })?
+        };
+
+        Ok(hits)
+    }
+
+    #[deprecated(
+        note = "use CraqleNode::search_graphs_with with a GraphSearchRequest; removed in W-CLEAN"
+    )]
+    pub fn search_graphs(
+        &self,
+        auth: &dyn Authorizer,
+        graphs: &[GraphId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_graphs_with(
+            auth,
+            GraphSearchRequest {
+                graphs,
+                query,
+                limit,
+            },
+        )
     }
 
     /// Resolve one visible subject into `(predicate, object)` pairs.
+    pub fn describe_subject_with(
+        &self,
+        auth: &dyn Authorizer,
+        req: DescribeRequest<'_>,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
+        self.ensure_graph_action(req.graph, auth, Action::Read)?;
+        let ctx = self.describe_ctx(req.graph)?;
+        self.describe_in_ctx(&ctx, req.subject_id)
+    }
+
+    #[deprecated(
+        note = "use CraqleNode::describe_subject_with with a DescribeRequest; removed in W-CLEAN"
+    )]
     pub fn describe_subject(
         &self,
         auth: &dyn Authorizer,
         graph: &GraphId,
         subject_id: &str,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        self.ensure_graph_action(graph, auth, Action::Read)?;
-
-        let orphaned = self.orphaned_entities(graph)?;
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
-        if orphaned.contains(&subject) {
-            return Ok(Vec::new());
-        }
-
-        let graph_term = EncodedTerm::from_named_node(&graph.0);
-        let Some(graph_id) = self.store.lookup_term(&graph_term)? else {
-            return Ok(Vec::new());
-        };
-        let Some(subject_id) = self.store.lookup_term(&subject)? else {
-            return Ok(Vec::new());
-        };
-
-        Ok(self
-            .store
-            .triples_for_subject(graph_id, subject_id)?
-            .into_iter()
-            .filter(|(_, object)| !orphaned.contains(object))
-            .collect())
+        self.describe_subject_with(auth, DescribeRequest { graph, subject_id })
     }
 
     /// Hydrate search hits with visible RDF properties.
+    ///
+    /// Search results usually cluster into a handful of graphs, so the policy
+    /// read and the orphan-set rebuild are memoized per graph rather than
+    /// repeated per hit (finding R8). Hits in a graph the caller may not read
+    /// are skipped rather than failing the whole call, matching how
+    /// [`CraqleNode::search_with`] drops them.
     pub fn hydrate_search_hits(
         &self,
         auth: &dyn Authorizer,
         hits: &[SearchHit],
     ) -> Result<Vec<HydratedSearchHit>> {
+        let mut contexts: HashMap<String, Option<DescribeCtx>> = HashMap::new();
         let mut hydrated = Vec::with_capacity(hits.len());
+
         for hit in hits {
-            let graph = GraphId::new(&hit.graph_id);
+            let ctx = match contexts.entry(hit.graph_id.clone()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let graph = GraphId::new(&hit.graph_id);
+                    let ctx = match self.ensure_graph_action(&graph, auth, Action::Read) {
+                        Ok(()) => Some(self.describe_ctx(&graph)?),
+                        Err(CraqleError::Authorization(_)) => None,
+                        Err(error) => return Err(error),
+                    };
+                    entry.insert(ctx)
+                }
+            };
+
+            let Some(ctx) = ctx.as_ref() else {
+                continue;
+            };
             hydrated.push(HydratedSearchHit {
                 hit: hit.clone(),
-                properties: self.describe_subject(auth, &graph, &hit.subject_iri)?,
+                properties: self.describe_in_ctx(ctx, &hit.subject_iri)?,
             });
         }
+
         Ok(hydrated)
     }
 
     /// Search and hydrate visible resources in one call.
+    pub fn search_resources_with(
+        &self,
+        auth: &dyn Authorizer,
+        req: SearchRequest<'_>,
+    ) -> Result<Vec<HydratedSearchHit>> {
+        let hits = self.search_with(auth, req)?;
+        self.hydrate_search_hits(auth, &hits)
+    }
+
+    #[deprecated(
+        note = "use CraqleNode::search_resources_with with a SearchRequest; removed in W-CLEAN"
+    )]
     pub fn search_resources(
         &self,
         auth: &dyn Authorizer,
         query: &str,
         limit: usize,
     ) -> Result<Vec<HydratedSearchHit>> {
-        let hits = self.search(auth, query, limit)?;
-        self.hydrate_search_hits(auth, &hits)
+        self.search_resources_with(auth, SearchRequest { query, limit })
     }
 
     /// Block until the background full-text indexer has processed queued work.
@@ -1508,11 +1684,41 @@ impl CraqleNode {
     }
 
     /// Rebuild the full-text index from store state.
+    ///
+    /// Commits Tantivy and persists Fjall once per batch of graphs rather than
+    /// once per graph: every commit replays the queued deletes against every
+    /// segment, which made a per-graph commit super-linear in corpus size
+    /// (finding W8).
     pub fn reindex_search(&self) -> Result<()> {
+        let mut covered = Vec::with_capacity(REINDEX_COMMIT_BATCH_GRAPHS);
         for graph in self.store.graphs()? {
-            self.refresh_search_for_graph(&graph)?;
+            self.search.reindex_from_store(&self.store, &graph)?;
+            covered.push(graph);
+            if covered.len() >= REINDEX_COMMIT_BATCH_GRAPHS {
+                self.commit_reindexed_graphs(&mut covered)?;
+            }
         }
-        Ok(())
+        self.commit_reindexed_graphs(&mut covered)
+    }
+
+    /// Commit the Tantivy work for `covered`, then clear those graphs' FTS
+    /// queue entries, then persist once.
+    ///
+    /// ORDERING HAZARD (G7): the queue clearing MUST follow the Tantivy commit
+    /// that covers these graphs. Clear first and crash before the commit, and
+    /// those updates are lost permanently — nothing would ever re-enqueue
+    /// them. Crash after the commit but before the clear and the worker merely
+    /// re-does the work on its next drain. Only the second direction is safe,
+    /// so the order below is not an implementation detail.
+    fn commit_reindexed_graphs(&self, covered: &mut Vec<GraphId>) -> Result<()> {
+        if covered.is_empty() {
+            return Ok(());
+        }
+        self.search.commit()?;
+        for graph in covered.drain(..) {
+            self.store.clear_fts_queue_for_graph(&graph)?;
+        }
+        self.persist_fjall()
     }
 
     /// Run manual store compaction as a post-ingest maintenance step.
@@ -1527,9 +1733,19 @@ impl CraqleNode {
         self.persist_fjall()
     }
 
+    /// Every graph the caller may read.
+    ///
+    /// Streams graph term ids and decodes each name through the shared term
+    /// cache instead of materializing the full graph list first. This is O(corpus)
+    /// by definition; prefer [`CraqleNode::query`], which checks visibility
+    /// only for the graphs a query touches.
     pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
         let mut visible = Vec::new();
-        for graph in self.store.graphs()? {
+        for graph_id in self.store.graph_term_id_iter() {
+            let term = self.store.decode_graph_term(graph_id?)?;
+            let Some(graph) = term.to_named_node().map(GraphId) else {
+                continue;
+            };
             let policy = self.store.graph_policy(&graph)?;
             if auth.authorize(&graph, &policy, Action::Read).is_ok() {
                 visible.push(graph);
@@ -1578,6 +1794,47 @@ impl CraqleNode {
     /// test assertions. Not a sync mechanism.
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
         Ok(self.store.graph_snapshot(graph)?)
+    }
+
+    /// Build the per-graph state `describe_in_ctx` needs.
+    fn describe_ctx(&self, graph: &GraphId) -> Result<DescribeCtx> {
+        let graph_term = EncodedTerm::from_named_node(&graph.0);
+        Ok(DescribeCtx {
+            graph_tid: self.store.lookup_term(&graph_term)?,
+            orphaned: self.orphaned_entities(graph)?,
+        })
+    }
+
+    /// Resolve a subject's visible `(predicate, object)` pairs within a graph
+    /// whose readability the caller has already established.
+    ///
+    /// The orphan set is load-bearing twice: it hides orphaned subjects, and it
+    /// drops triples whose *object* points at an orphan. Both are required for
+    /// G6 ("invalid visible crates are never exported"). Returning an empty
+    /// list for an orphaned subject, rather than an error, is deliberate.
+    fn describe_in_ctx(
+        &self,
+        ctx: &DescribeCtx,
+        subject_id: &str,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
+        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        if ctx.orphaned.contains(&subject) {
+            return Ok(Vec::new());
+        }
+
+        let Some(graph_tid) = ctx.graph_tid else {
+            return Ok(Vec::new());
+        };
+        let Some(subject_tid) = self.store.lookup_term(&subject)? else {
+            return Ok(Vec::new());
+        };
+
+        Ok(self
+            .store
+            .triples_for_subject(graph_tid, subject_tid)?
+            .into_iter()
+            .filter(|(_, object)| !ctx.orphaned.contains(object))
+            .collect())
     }
 
     fn ensure_graph_action(
@@ -1677,8 +1934,8 @@ impl CraqleNode {
 
     fn schedule_full_search_reindex(&self) -> Result<()> {
         let mut batch = self.store.new_batch();
-        for graph in self.store.graphs()? {
-            self.store.enqueue_fts_reindex(&mut batch, &graph)?;
+        for graph_id in self.store.graph_term_ids()? {
+            self.store.enqueue_fts_reindex_by_id(&mut batch, graph_id)?;
         }
         self.store.commit(batch)?;
         self.persist_fjall()?;
@@ -1695,13 +1952,6 @@ impl CraqleNode {
 
     fn schedule_search_update(&self) {
         self.search_worker.wake();
-    }
-
-    fn refresh_search_for_graph(&self, graph: &GraphId) -> Result<()> {
-        self.search.reindex_from_store(&self.store, graph)?;
-        self.search.commit()?;
-        self.store.clear_fts_queue_for_graph(graph)?;
-        self.persist_fjall()
     }
 
     pub fn persist_fjall(&self) -> Result<()> {
@@ -1827,20 +2077,68 @@ fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<Gr
     }
 }
 
+/// Per-graph state for resolving several subjects of the same graph.
+///
+/// `graph_tid` is `None` when the graph name was never interned, i.e. the
+/// graph holds no triples to describe.
+struct DescribeCtx {
+    graph_tid: Option<store::TermId>,
+    orphaned: std::collections::HashSet<EncodedTerm>,
+}
+
+/// Memo of "may this caller read this graph?", valid for one call.
+///
+/// Authorization is always re-evaluated against the policy currently in the
+/// store, so a policy change is picked up by the next call (G8).
+struct ReadableGraphs<'a> {
+    node: &'a CraqleNode,
+    auth: &'a dyn Authorizer,
+    memo: HashMap<String, bool>,
+}
+
+impl<'a> ReadableGraphs<'a> {
+    fn new(node: &'a CraqleNode, auth: &'a dyn Authorizer) -> Self {
+        Self {
+            node,
+            auth,
+            memo: HashMap::new(),
+        }
+    }
+
+    fn allows(&mut self, graph_id: &str) -> Result<bool> {
+        if let Some(readable) = self.memo.get(graph_id) {
+            return Ok(*readable);
+        }
+
+        let graph = GraphId::new(graph_id);
+        let readable = self.node.store.contains_graph(&graph)?
+            && self
+                .auth
+                .authorize(&graph, &self.node.store.graph_policy(&graph)?, Action::Read)
+                .is_ok();
+        self.memo.insert(graph_id.to_string(), readable);
+        Ok(readable)
+    }
+}
+
 fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
 }
 
+/// Merge hits from several searches into one score-ordered page.
+///
+/// Only needed where hits arrive from more than one collection; a single
+/// Tantivy search already returns score-descending order. The comparator
+/// borrows the key fields instead of cloning two `String`s per hit and
+/// rebuilding the key for both sides of every comparison (finding R8). Callers
+/// never pass duplicate `(graph, subject)` pairs, so an unstable sort is a
+/// total order here and no dedup pass is required.
 fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
-    hits.sort_by_key(|hit| {
-        (
-            Reverse(score_key(hit.score)),
-            hit.graph_id.clone(),
-            hit.subject_iri.clone(),
-        )
-    });
-    hits.dedup_by(|left, right| {
-        left.graph_id == right.graph_id && left.subject_iri == right.subject_iri
+    hits.sort_unstable_by(|left, right| {
+        Reverse(score_key(left.score))
+            .cmp(&Reverse(score_key(right.score)))
+            .then_with(|| left.graph_id.cmp(&right.graph_id))
+            .then_with(|| left.subject_iri.cmp(&right.subject_iri))
     });
     hits.truncate(limit);
     hits
