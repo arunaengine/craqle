@@ -40,39 +40,15 @@ pub struct MergeResult {
 /// Number of shards backing [`GRAPH_WRITE_LOCKS`].
 const GRAPH_WRITE_LOCK_SHARDS: usize = 32;
 
-/// Orders one graph's *engine-level* write pipeline — the part that happens
-/// before and around the store's own commit guard. Two things need it:
+/// Makes publish order the apply order for one graph, and the `@context` tag
+/// mint atomic.
 ///
-/// **1. The sync publish must be applied in publish order (G1, G2, G3).**
-/// `IrokleGraphSync::publish_changes` stamps the batch with the publishing
-/// actor's next irokle sequence number, and the local apply gates on
-/// `VectorClock::contains`, which is monotonic per actor. Two threads publishing
-/// to the same graph get sequence numbers `n` and `n+1`, but nothing stops the
-/// thread holding `n+1` from reaching the apply first: the clock then advances
-/// to `n+1` and the `n` batch is discarded as "already applied", silently losing
-/// every add in it. Holding this lock across publish *and* apply makes publish
-/// order the apply order.
+/// Not `graph_commit_guard`: both uses must span a call that takes that guard
+/// internally (`set_graph_context`, and `ensure_graph_topic` on a first
+/// publish), and `std::sync::Mutex` is not reentrant. Process-wide because one
+/// store is shared by several engines.
 ///
-/// **2. The `@context` tag mint must be atomic (G5).** Without it two concurrent
-/// local context writes both read the same stored tag and
-/// `ContextTag::next_local` mints the *identical* `(counter, actor)` for two
-/// different context values — a tie the last-write-wins register cannot resolve,
-/// so peers need not converge.
-///
-/// This deliberately is **not** `GraphStore::graph_commit_guard`. Both uses have
-/// to span a call that takes that guard internally — `GraphStore::set_graph_context`
-/// and, on a first publish, `ensure_graph_topic` → `set_irokle_topic_id` — and
-/// `std::sync::Mutex` is not reentrant, so reusing the store guard would
-/// self-deadlock (addendum A1). Releasing it in between would reopen both races.
-///
-/// Process-wide (a `static`) rather than per-engine: one store is shared by
-/// several `ReplicationEngine`s — the sync engine, the local-only engine, and the
-/// per-request engines built for explicit actors — so an engine-local mutex would
-/// not serialize them. Sharded by graph IRI; a collision only serializes two
-/// unrelated graphs.
-///
-/// Lock order: **graph write lock ▸ graph commit guard**. Nothing acquires them
-/// the other way round, and neither is ever taken twice on one path.
+/// Lock order: **graph write lock ▸ graph commit guard**, never the reverse.
 static GRAPH_WRITE_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
     (0..GRAPH_WRITE_LOCK_SHARDS)
         .map(|_| Mutex::new(()))
@@ -155,21 +131,13 @@ impl ReplicationEngine {
         &self.store
     }
 
-    /// Persist a graph's raw RO-Crate render hints (last-write-wins) and, when
-    /// sync is configured, replicate the change to peers so their exports match.
+    /// Persist a graph's render hints (last-write-wins) and replicate them when
+    /// sync is configured, minting one tag for both the local write and the event.
     ///
-    /// A fresh ordering tag is minted here (`stored_counter + 1`, actor =
-    /// this engine's actor) and used for both the local store and the published
-    /// event, so peers apply the same deterministic last-write-wins resolution.
-    ///
-    /// Publish-first invariant (load-bearing). The `ContextUpdated` event is
-    /// published to peers *before* the local store is updated. This ordering
-    /// makes the operation self-healing: if the publish fails, the local stored
-    /// hints are left unchanged and a retry re-mints the same-or-higher tag and
-    /// re-publishes. Reversing the order (store locally, then publish) would, on
-    /// a publish failure, leave the local hints updated so that a retry trips
-    /// the unchanged-state short-circuit in `store_import_context` and never
-    /// re-publishes — leaving peers permanently without the update.
+    /// Publish-first, and load-bearing (G4): storing locally first would leave a
+    /// failed publish looking like success, so the retry would trip
+    /// `store_import_context`'s unchanged-state short-circuit and peers would
+    /// never receive the update.
     pub fn set_graph_context(
         &self,
         graph: &GraphId,
@@ -771,19 +739,13 @@ impl ReplicationEngine {
     /// Bring the persisted diagnostics record back in step with the state the
     /// commit just produced. **Call with the graph commit guard held.**
     ///
-    /// Two cases, cheapest first:
+    /// Re-stamps the previous verdict when the write cannot have moved the orphan
+    /// set; otherwise recomputes.
     ///
-    /// 1. The write cannot have moved the orphan set, so the previous verdict is
-    ///    re-stamped against the new clock.
-    /// 2. Anything else: recompute from the store.
-    ///
-    /// Passing validation is deliberately *not* a third case. `validate` runs
-    /// before the commit guard is taken, so two writes that each validate
-    /// against the same pre-state can both pass and still orphan an entity
-    /// between them (two deletes, each cutting one of an entity's two parents).
-    /// Asserting "validated, therefore orphan-free" would then persist that lie
-    /// under a matching clock tag, where no reader would ever correct it. The
-    /// orphan set is derived state, so it is derived (G6).
+    /// "Validated, therefore orphan-free" is deliberately *not* a third case:
+    /// `validate` runs before the guard is taken, so two writes cutting one
+    /// parent each can both pass and jointly orphan an entity — and the lie would
+    /// persist under a matching clock tag that no reader corrects (G6).
     fn settle_diagnostics(
         &self,
         graph: &GraphId,
@@ -809,17 +771,13 @@ impl ReplicationEngine {
     /// Recompute the orphan set from the store and persist it, re-queueing the
     /// entities whose visibility changed for search (G6, G7).
     ///
-    /// `previous` must be the orphan set as it stood *before* the write. It
-    /// cannot be re-read here: the commit has already advanced the graph clock,
-    /// so a read now finds the stored record's tag stale and recomputes it from
-    /// post-write state — which would make `previous` equal `current` every
-    /// time, and silently skip the search re-queue for any entity whose
-    /// visibility the write flipped without touching it directly.
+    /// `previous` must be the pre-write set and cannot be re-read here: the clock
+    /// has already advanced, so a read would recompute from post-write state,
+    /// making `previous == current` and skipping the re-queue every time.
     ///
-    /// The re-queue comes first and the record second, in that order: the two
-    /// are separate commits, and a crash between them must leave the older
-    /// baseline behind so the next rebuild re-queues, never the newer one with
-    /// nothing enqueued (G7).
+    /// Re-queue first, record second: they are separate commits, and a crash
+    /// between them must leave the older baseline so the next rebuild re-queues
+    /// (G7).
     fn recompute_graph_diagnostics(
         &self,
         graph: &GraphId,

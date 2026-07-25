@@ -396,24 +396,8 @@ fn collect_search_worker_messages(
     false
 }
 
-/// Drain the FTS queues until everything enqueued *before this call* is indexed.
-///
-/// The bound matters: without it, a writer that keeps enqueueing between the
-/// drain and the acknowledgement keeps the loop alive forever and
-/// `flush_search_updates()` never returns (finding W15b). Pinning the dirty
-/// token up front turns the contract into "everything enqueued before the call
-/// is indexed", which is what callers actually need, and lets sustained ingest
-/// carry on in the background.
-/// Runs one drain cycle, turning a panic into an error instead of letting it
-/// kill the indexer thread.
-///
-/// The search index is derived state whose only source of truth is the store. A
-/// panic here would poison the Tantivy writer mutex *and* take the one thread
-/// able to repair it, so the index would stay diverged from the store until the
-/// process restarted — the lingering inconsistency the recovery rules forbid.
-/// Catching it keeps the loop alive so the next cycle's poisoned-writer recovery
-/// rebuilds the writer and re-derives the index. The caller already backs off
-/// before retrying, so a persistently panicking drain cannot spin hot.
+/// Runs one drain cycle, turning a panic into an error rather than losing the
+/// indexer thread — it is the only thread that can repair the index.
 fn drain_search_queue_guarded(ctx: &SearchWorkerCtx) -> std::result::Result<(), String> {
     let drain = panic::AssertUnwindSafe(|| flush_search_queue(&ctx.store, &ctx.search));
     match panic::catch_unwind(drain) {
@@ -436,6 +420,11 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
+/// Drains the FTS queues until everything enqueued *before this call* is indexed.
+///
+/// Bounded by the dirty token observed on entry: without that, a writer that
+/// keeps enqueueing holds the loop open and `flush_search_updates()` never
+/// returns.
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
     #[cfg(test)]
     if search.take_armed_drain_panic() {
@@ -1460,16 +1449,12 @@ impl CraqleNode {
 
     /// Execute a SPARQL query against the local node.
     ///
-    /// Visibility is decided lazily, once per graph the evaluation actually
-    /// touches, instead of by materializing the whole visible set up front:
-    /// enumerating every graph cost a term decode, a full metadata decode and
-    /// an authorization call per graph in the corpus, even for a query that
-    /// reads one graph (finding R1).
+    /// Visibility is decided lazily, once per graph the evaluation touches,
+    /// rather than by materializing the whole visible set up front.
     ///
-    /// The predicate cannot report failure, so a store read error must deny.
-    /// `ensure_graph_action` already folds both "read failed" and "policy says
-    /// no" into `Err`, and `is_ok()` maps that to *not visible* — never to
-    /// visible (G8 soundness).
+    /// The predicate cannot report failure, so a read error must deny:
+    /// `ensure_graph_action` folds both "read failed" and "policy says no" into
+    /// `Err`, and `is_ok()` maps that to not-visible, never to visible (G8).
     pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
         Ok(self
             .sparql
@@ -1525,18 +1510,13 @@ impl CraqleNode {
 
     /// Search visible resources in the local search index.
     ///
-    /// Tantivy collects a global top-k by score with no idea of who is asking,
-    /// so authorization runs afterwards against the *stored* policy — never as
-    /// an index-side filter, because the index can lag the store and a policy
-    /// may have changed since a document was written (G8 soundness).
+    /// Tantivy collects a global top-k, so authorization runs afterwards against
+    /// the *stored* policy — never as an index-side filter, since the index can
+    /// lag the store (G8 soundness).
     ///
-    /// Filtering afterwards used to silently truncate the result: a single
-    /// over-fetch of `limit * 4` returned fewer than `limit` readable hits
-    /// whenever unreadable graphs dominated the top of the ranking (finding
-    /// K2 — a completeness bug, not just a slow path). The loop below widens
-    /// the over-fetch until either enough readable hits are found or the index
-    /// is exhausted, so an authorized caller is never shown a short page while
-    /// matching, readable documents exist (G8 completeness).
+    /// The over-fetch widens until enough readable hits are found or the index is
+    /// exhausted; a single fixed over-fetch silently truncated the page whenever
+    /// unreadable graphs dominated the ranking (G8 completeness).
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         if req.limit == 0 {
             return Ok(Vec::new());
