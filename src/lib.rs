@@ -33,6 +33,7 @@ mod sync;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::panic;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -336,10 +337,7 @@ fn run_search_update_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: 
         // always gets a fresh wake through.
         ctx.wake_pending.store(false, Ordering::SeqCst);
 
-        let result = match flush_search_queue(&ctx.store, &ctx.search) {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        };
+        let result = drain_search_queue_guarded(&ctx);
         let failed = result.is_err();
         for reply in flush_replies {
             let _ = reply.send(result.clone());
@@ -379,7 +377,44 @@ fn collect_search_worker_messages(
 /// token up front turns the contract into "everything enqueued before the call
 /// is indexed", which is what callers actually need, and lets sustained ingest
 /// carry on in the background.
+/// Runs one drain cycle, turning a panic into an error instead of letting it
+/// kill the indexer thread.
+///
+/// The search index is derived state whose only source of truth is the store. A
+/// panic here would poison the Tantivy writer mutex *and* take the one thread
+/// able to repair it, so the index would stay diverged from the store until the
+/// process restarted — the lingering inconsistency the recovery rules forbid.
+/// Catching it keeps the loop alive so the next cycle's poisoned-writer recovery
+/// rebuilds the writer and re-derives the index. The caller already backs off
+/// before retrying, so a persistently panicking drain cannot spin hot.
+fn drain_search_queue_guarded(ctx: &SearchWorkerCtx) -> std::result::Result<(), String> {
+    let drain = panic::AssertUnwindSafe(|| flush_search_queue(&ctx.store, &ctx.search));
+    match panic::catch_unwind(drain) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(payload) => Err(format!(
+            "search worker panicked: {}",
+            panic_message(&*payload)
+        )),
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
+    #[cfg(test)]
+    if search.take_armed_drain_panic() {
+        panic!("injected drain panic");
+    }
+
     let max_token = store.current_dirty_token();
     let mut processed_any = false;
     loop {
@@ -2147,4 +2182,80 @@ fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     });
     hits.truncate(limit);
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writer_auth() -> GrantAuthorizer {
+        GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)])
+    }
+
+    fn crate_request(graph: &GraphId, name: &str) -> CreateCrateRequest {
+        CreateCrateRequest::new(
+            graph.clone(),
+            name,
+            "description",
+            "2025-01-01",
+            None,
+            GraphPolicy {
+                public: true,
+                permission_paths: vec!["/t/x".to_string()],
+            },
+        )
+    }
+
+    /// A panic inside the indexer drain must not take the worker thread down.
+    ///
+    /// The search index is derived state, and the thread that repairs it is the
+    /// same one that drains the queue. If a panic killed it, the index would
+    /// stay diverged from the store until the process restarted — the lingering
+    /// inconsistency the recovery rules forbid.
+    #[test]
+    fn search_worker_survives_a_panicking_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth = writer_auth();
+
+        let first = GraphId::new("urn:test:worker-panic-a");
+        node.create_crate(&auth, crate_request(&first, "zebrafish alpha"))
+            .unwrap();
+        node.flush_search_updates().expect("baseline flush");
+
+        node.search.arm_drain_panic();
+
+        let second = GraphId::new("urn:test:worker-panic-b");
+        node.create_crate(&auth, crate_request(&second, "zebrafish beta"))
+            .unwrap();
+
+        // The armed cycle surfaces the panic as an error rather than dying; a
+        // later cycle then completes normally on the same thread.
+        let _ = node.flush_search_updates();
+        node.flush_search_updates()
+            .expect("worker must still be alive after the panic");
+        assert!(
+            !node.search.take_armed_drain_panic(),
+            "the injected panic must actually have fired, or this test is vacuous"
+        );
+
+        let hits = node
+            .search_with(
+                &auth,
+                SearchRequest {
+                    query: "zebrafish",
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both crates must be searchable after the worker panicked"
+        );
+    }
 }

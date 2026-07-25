@@ -41,6 +41,16 @@ impl SearchIndex {
         Ok(Self)
     }
 
+    /// Test-only parity with the real index; the stub never indexes, so there
+    /// is no drain cycle to make panic.
+    #[cfg(test)]
+    pub(crate) fn arm_drain_panic(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn take_armed_drain_panic(&self) -> bool {
+        false
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         Ok(Self)
     }
