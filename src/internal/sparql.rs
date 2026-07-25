@@ -54,7 +54,8 @@ pub type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
 /// callback evaluated lazily per touched graph (memoized per query).
 #[derive(Clone, Copy)]
 enum GraphScope<'a> {
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: every graph is visible.
+    #[cfg(test)]
     All,
     List(&'a [GraphId]),
     Predicate(&'a VisibleFn<'a>),
@@ -158,6 +159,7 @@ impl SparqlEngine {
 
         let mut prepared = self.evaluator.prepare(&query);
         let dataset = match scope {
+            #[cfg(test)]
             GraphScope::All => {
                 prepared.dataset_mut().set_default_graph_as_union();
                 StoreDataset::new(&self.store, None)
@@ -444,6 +446,7 @@ impl<'a> FtsGraphVisibility<'a> {
 
     fn allows(&self, graph_iri: &str) -> bool {
         match self.scope {
+            #[cfg(test)]
             GraphScope::All => true,
             GraphScope::List(_) => self
                 .listed
