@@ -480,7 +480,7 @@ mod tests {
     /// acknowledgement, so the flush could spin forever (finding W15b).
     #[test]
     fn flush_returns_under_sustained_ingest() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
@@ -502,7 +502,17 @@ mod tests {
         .unwrap();
 
         let stop = AtomicBool::new(false);
+        // Stops the writer even if an assertion unwinds; without it a failure
+        // leaves the writer looping forever inside `scope`'s join.
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let written = AtomicUsize::new(0);
         std::thread::scope(|scope| {
+            let _stopper = StopOnDrop(&stop);
             scope.spawn(|| {
                 let writer = writer_auth();
                 let mut idx = 0usize;
@@ -522,6 +532,7 @@ mod tests {
                     )
                     .unwrap();
                     idx += 1;
+                    written.store(idx, Ordering::SeqCst);
                 }
                 idx
             });
@@ -529,23 +540,30 @@ mod tests {
             // Give the writer a head start so the queue is genuinely busy.
             std::thread::sleep(std::time::Duration::from_millis(250));
 
-            // The assertion is that this returns at all.
+            // Pin the concurrent stream, not just the pre-loop marker: every
+            // entity written before the flush must be searchable after it.
+            let enqueued_before = written.load(Ordering::SeqCst);
             node.flush_search_updates().unwrap();
 
-            // Everything enqueued before the flush is indexed once it returns.
-            let hits = node
-                .search(
-                    &reader,
-                    SearchRequest {
-                        query: "sustainedmarker",
-                        limit: 10,
-                    },
-                )
-                .unwrap();
             assert!(
-                hits.iter().any(|hit| hit.graph_id == graph.as_str()),
-                "work enqueued before the flush must be searchable after it"
+                enqueued_before > 0,
+                "the writer must have ingested something, or this proves nothing"
             );
+            for idx in 0..enqueued_before {
+                let hits = node
+                    .search(
+                        &reader,
+                        SearchRequest {
+                            query: &format!("\"Background Entity {idx}\""),
+                            limit: 10,
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    !hits.is_empty(),
+                    "entity {idx} was enqueued before the flush but is not searchable after it"
+                );
+            }
 
             stop.store(true, Ordering::SeqCst);
         });
