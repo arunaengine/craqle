@@ -2338,30 +2338,6 @@ impl GraphStore {
             .unwrap_or(0))
     }
 
-    pub fn predicate_object_count_by_ids(
-        &self,
-        graph: TermId,
-        predicate: TermId,
-        object: TermId,
-    ) -> Result<usize> {
-        Ok(self.with_derived_indexes(|indexes| {
-            indexes
-                .by_predicate_object
-                .get(&(predicate, object))
-                .and_then(|graphs| graphs.get(&graph))
-                .map(HashSet::len)
-                .unwrap_or(0)
-        }))
-    }
-
-    pub fn apply_subject_predicate_count_deltas(
-        &self,
-        _batch: &mut WriteBatch,
-        _deltas: &HashMap<(TermId, TermId, TermId), i64>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     /// OR-Set add: stage `add.dot` into the quad's dot set (G1).
     ///
     /// Does not lock — the caller must hold the graph commit guard, otherwise
