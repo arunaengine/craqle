@@ -26,15 +26,19 @@ pub const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub fn with_watchdog(label: &'static str, body: impl FnOnce() + Send + 'static) {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        body();
-        let _ = done.send(());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        let _ = done.send(outcome);
     });
     match finished.recv_timeout(WATCHDOG_TIMEOUT) {
-        Ok(()) => {}
+        Ok(Ok(())) => {}
+        // Re-raised here so a failing assertion still reports its own message.
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             panic!("{label} made no progress within {WATCHDOG_TIMEOUT:?}: suspected deadlock")
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{label} panicked"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{label} ended without reporting an outcome")
+        }
     }
 }
 
