@@ -226,16 +226,6 @@ pub struct PatchEntityRequest {
     pub replaced_predicates: Vec<NamedNode>,
 }
 
-/// Input for updating one property value on an existing entity.
-#[derive(Debug, Clone)]
-pub struct UpdatePropertyRequest {
-    pub graph: GraphId,
-    pub entity_id: String,
-    pub predicate: String,
-    pub old_value: Option<String>,
-    pub new_value: String,
-}
-
 /// Search hit together with hydrated RDF properties.
 #[derive(Debug, Clone)]
 pub struct HydratedSearchHit {
@@ -1406,22 +1396,6 @@ impl CraqleNode {
     pub fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<()> {
         self.replication.rebuild_graph_diagnostics(graph)?;
         Ok(())
-    }
-
-    /// Update a property using a typed request.
-    pub fn update_property_with(
-        &self,
-        auth: &dyn Authorizer,
-        request: UpdatePropertyRequest,
-    ) -> Result<Batch> {
-        self.update_property(
-            auth,
-            &request.graph,
-            &request.entity_id,
-            &request.predicate,
-            request.old_value.as_deref(),
-            &request.new_value,
-        )
     }
 
     /// Replace or add a single property value on an entity.
