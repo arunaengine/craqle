@@ -1048,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn test_https_schema_description_is_indexed() {
+    fn https_schema_description_is_indexed() {
         let dir = tempdir().unwrap();
         let node = crate::CraqleNode::open(dir.path()).unwrap();
         let graph = crate::core::GraphId::new("urn:test:https-schema-search");
@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_old_analyzer_index_is_rebuilt_on_node_open() {
+    fn old_analyzer_index_is_rebuilt_on_node_open() {
         let dir = tempdir().unwrap();
         let graph = crate::core::GraphId::new("urn:test:search-analyzer-reindex");
         let auth = crate::AllowAllAuthorizer;

@@ -9,7 +9,7 @@ mod tests {
     use crate::support::*;
 
     #[test]
-    fn test_search_after_create() {
+    fn a_created_crate_is_searchable() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -42,7 +42,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reindex_search_keeps_results_available() {
+    fn reindex_search_keeps_results_available() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_index_persists_across_restart() {
+    fn the_search_index_persists_across_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:crate-fts-persist");
 
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_batch_sync_updates_search_without_reindex() {
+    fn remote_batch_sync_updates_search_without_reindex() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:remote-batch-search");
         let writer = writer_auth();
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_delete_removes_search_results_after_flush() {
+    fn graph_delete_removes_search_results_after_flush() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:delete-search");

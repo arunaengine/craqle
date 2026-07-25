@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reachability_allows_alternate_parent_path() {
+    fn reachability_accepts_an_alternate_parent_path() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-multi-parent");
         let writer = writer_auth();
