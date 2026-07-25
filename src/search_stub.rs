@@ -68,10 +68,6 @@ impl SearchIndex {
         Ok(())
     }
 
-    pub fn delete_resource(&self, _graph_id: &str, _subject_iri: &str) -> Result<()> {
-        Ok(())
-    }
-
     pub fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>> {
         Ok(Vec::new())
     }

@@ -422,17 +422,6 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Delete a document for the given graph/resource pair.
-    pub fn delete_resource(&self, graph_id: &str, subject_iri: &str) -> Result<()> {
-        let writer = self.writer()?;
-        writer.delete_term(Term::from_field_text(
-            self.f_doc_key,
-            &doc_key(graph_id, subject_iri),
-        ));
-        self.dirty.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
     /// Full-text search across all graphs.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
