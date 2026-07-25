@@ -221,7 +221,7 @@ fn optimize_pattern(
             collect_pattern_vars(&inner, &mut expr_bound);
             let expr = optimize_expression(expr, &expr_bound, cx);
             if let GraphPattern::Bgp { patterns } = *inner {
-                rewrite_filter_over_bgp(expr, patterns, bound, cx)
+                rewrite_filter_over_bgp(FilterOverBgp { expr, patterns }, bound, cx)
             } else {
                 GraphPattern::Filter {
                     expr,
@@ -513,12 +513,18 @@ fn fold_variable_into_patterns(
     true
 }
 
-fn rewrite_filter_over_bgp(
+/// A `FILTER` applied directly over a BGP — the shape equality folding rewrites.
+struct FilterOverBgp {
     expr: Expression,
-    mut patterns: Vec<TriplePattern>,
+    patterns: Vec<TriplePattern>,
+}
+
+fn rewrite_filter_over_bgp(
+    filter: FilterOverBgp,
     bound: &HashSet<String>,
     cx: &PlanCtx<'_>,
 ) -> GraphPattern {
+    let FilterOverBgp { expr, mut patterns } = filter;
     let mut conjuncts = Vec::new();
     flatten_and(expr, &mut conjuncts);
 
