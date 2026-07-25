@@ -94,49 +94,24 @@ pub struct ReplicationEngine {
     sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
 }
 
+/// How a write should leave the graph's persisted diagnostics record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiagnosticsRefresh {
+enum DiagnosticsPlan {
+    /// Refresh the record as part of this commit, under its guard.
     Immediate,
+    /// Bulk import: the caller rebuilds diagnostics once at the end.
     Deferred,
 }
 
-/// How a write should leave the graph's persisted diagnostics record.
-#[derive(Debug, Clone, Copy)]
-struct DiagnosticsPlan {
-    refresh: DiagnosticsRefresh,
-    /// The change set was run through the full rule set, which — given a graph
-    /// that was already orphan-free — proves the post state is orphan-free too.
-    validated_orphan_free: bool,
-}
-
 impl DiagnosticsPlan {
-    /// Trusted writes that maintain structure incrementally: still refreshed
-    /// immediately, but nothing proves the post state orphan-free, so only the
-    /// "reachability untouched" fast path applies.
-    const UNVALIDATED: Self = Self {
-        refresh: DiagnosticsRefresh::Immediate,
-        validated_orphan_free: false,
-    };
-
-    const VALIDATED: Self = Self {
-        refresh: DiagnosticsRefresh::Immediate,
-        validated_orphan_free: true,
-    };
-
-    /// Bulk import: the caller rebuilds diagnostics once at the end.
-    const DEFERRED: Self = Self {
-        refresh: DiagnosticsRefresh::Deferred,
-        validated_orphan_free: false,
-    };
-
     /// Run `capture` only when this write refreshes diagnostics immediately.
     fn pending_diagnostics<F>(&self, capture: F) -> crate::store::Result<Option<PendingDiagnostics>>
     where
         F: FnOnce() -> crate::store::Result<PendingDiagnostics>,
     {
-        match self.refresh {
-            DiagnosticsRefresh::Immediate => capture().map(Some),
-            DiagnosticsRefresh::Deferred => Ok(None),
+        match self {
+            Self::Immediate => capture().map(Some),
+            Self::Deferred => Ok(None),
         }
     }
 }
@@ -302,7 +277,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::UNVALIDATED,
+            plan: DiagnosticsPlan::Immediate,
         })
     }
 
@@ -322,7 +297,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::DEFERRED,
+            plan: DiagnosticsPlan::Deferred,
         })
     }
 
@@ -401,7 +376,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::VALIDATED,
+            plan: DiagnosticsPlan::Immediate,
         })
     }
 
@@ -578,7 +553,7 @@ impl ReplicationEngine {
         self.store.commit(batch)?;
 
         if let Some(pending) = &pending {
-            self.settle_diagnostics(graph, DiagnosticsOutcome { pending, plan })
+            self.settle_diagnostics(graph, pending)
                 .map_err(UpdateError::Store)?;
         }
 
@@ -612,7 +587,7 @@ impl ReplicationEngine {
     /// enforces causal delivery; this path intentionally bypasses Craqle's old
     /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
     pub fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
-        self.apply_irokle_batch_with_plan(&incoming, DiagnosticsPlan::UNVALIDATED)
+        self.apply_irokle_batch_with_plan(&incoming, DiagnosticsPlan::Immediate)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
@@ -652,7 +627,7 @@ impl ReplicationEngine {
         self.apply_single_batch(incoming, &mut vector_clock)?;
 
         if let Some(pending) = &pending {
-            self.settle_diagnostics(graph, DiagnosticsOutcome { pending, plan })?;
+            self.settle_diagnostics(graph, pending)?;
         }
         Ok(MergeResult { applied: true })
     }
@@ -770,20 +745,24 @@ impl ReplicationEngine {
     /// Bring the persisted diagnostics record back in step with the state the
     /// commit just produced. **Call with the graph commit guard held.**
     ///
-    /// Three cases, cheapest first:
+    /// Two cases, cheapest first:
     ///
     /// 1. The write cannot have moved the orphan set, so the previous verdict is
     ///    re-stamped against the new clock.
-    /// 2. The graph was orphan-free and the write was validated, so it is still
-    ///    orphan-free.
-    /// 3. Anything else: recompute from the store.
+    /// 2. Anything else: recompute from the store.
+    ///
+    /// Passing validation is deliberately *not* a third case. `validate` runs
+    /// before the commit guard is taken, so two writes that each validate
+    /// against the same pre-state can both pass and still orphan an entity
+    /// between them (two deletes, each cutting one of an entity's two parents).
+    /// Asserting "validated, therefore orphan-free" would then persist that lie
+    /// under a matching clock tag, where no reader would ever correct it. The
+    /// orphan set is derived state, so it is derived (G6).
     fn settle_diagnostics(
         &self,
         graph: &GraphId,
-        outcome: DiagnosticsOutcome<'_>,
+        pending: &PendingDiagnostics,
     ) -> crate::store::Result<()> {
-        let DiagnosticsOutcome { pending, plan } = outcome;
-
         // Case 1. `orphaned_data_entities` reads exactly two triple shapes:
         // `?s rdf:type schema:Dataset|schema:MediaObject` (which entities count
         // as data entities) and `?s schema:hasPart ?o` (which adds to that set
@@ -796,15 +775,7 @@ impl ReplicationEngine {
             return self.store.set_graph_diagnostics(graph, &pending.previous);
         }
 
-        // Case 2. A validated write leaves no orphan reachable from anything it
-        // touched, and a graph that was already orphan-free has no others.
-        if plan.validated_orphan_free && !pending.previous.has_orphans() {
-            return self
-                .store
-                .set_graph_diagnostics(graph, &GraphDiagnostics::default());
-        }
-
-        // Case 3. `pending.previous` was captured before the write; re-reading
+        // Case 2. `pending.previous` was captured before the write; re-reading
         // it here would yield the post-write set and defeat the search re-queue.
         self.recompute_graph_diagnostics(graph, &pending.previous)
     }
@@ -895,12 +866,6 @@ struct PendingDiagnostics {
     previous: GraphDiagnostics,
     /// What the write touches, in the terms the orphan set depends on.
     summary: DeltaSummary,
-}
-
-/// Inputs to the post-commit diagnostics decision.
-struct DiagnosticsOutcome<'a> {
-    pending: &'a PendingDiagnostics,
-    plan: DiagnosticsPlan,
 }
 
 /// The orphan set before and after a recompute.

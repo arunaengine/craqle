@@ -7,11 +7,18 @@ mod support;
 /// races could mint a duplicate dot, drop an add, or lose a vector-clock entry.
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
 
+    use craqle::MaterializedQuadChange as Change;
     use craqle::*;
 
     use crate::support::*;
+
+    /// Generous enough that a slow machine never trips it, short enough that a
+    /// lock-order regression fails the run instead of hanging it.
+    const PROGRESS_TIMEOUT: Duration = Duration::from_secs(180);
 
     const WRITERS: usize = 8;
     /// Writes per thread. More rounds means a wider window for a lost update.
@@ -291,6 +298,205 @@ mod tests {
                 "each churn cycle leaves exactly one keyword"
             );
         });
+    }
+
+    // ── F2: validation runs outside the commit guard ────────────────────────
+
+    /// Racing pairs. Each pair needs both writers to validate before either
+    /// commits, so a handful of pairs is not enough to be sure of hitting it.
+    const RACE_ROUNDS: usize = 24;
+    /// Filler entities, purely to widen the validation window.
+    const FILLER_ENTITIES: usize = 400;
+
+    /// An owned node: a detached racing thread outlives the test body, so it
+    /// cannot borrow a cluster peer.
+    fn standalone_node(dir: &tempfile::TempDir) -> Arc<CraqleNode> {
+        Arc::new(
+            CraqleNode::open_with_options(
+                dir.path(),
+                CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn entity(graph: &GraphId, name: &str) -> EncodedTerm {
+        EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(format!(
+            "{}/{name}",
+            graph.as_str()
+        )))
+    }
+
+    fn insert(graph: &GraphId, triple: (EncodedTerm, EncodedTerm, EncodedTerm)) -> Change {
+        Change::Insert {
+            graph: graph.clone(),
+            subject: triple.0,
+            predicate: triple.1,
+            object: triple.2,
+        }
+    }
+
+    /// `root ─hasPart→ p1 ─hasPart→ x ←hasPart─ p2 ←hasPart─ root`, so cutting
+    /// either edge into `x` on its own leaves it reachable.
+    fn two_parent_fixture(graph: &GraphId, round: usize) -> Vec<Change> {
+        let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let name = EncodedTerm::from_named_node(&vocab::schema_name());
+        let dataset = EncodedTerm::from_named_node(&vocab::schema_dataset());
+        let media = EncodedTerm::from_named_node(&vocab::schema_media_object());
+        let root = EncodedTerm::from_named_node(&graph.0);
+        let child = entity(graph, &format!("x-{round}"));
+
+        let mut changes = vec![
+            insert(graph, (child.clone(), rdf_type.clone(), media)),
+            insert(
+                graph,
+                (
+                    child.clone(),
+                    name.clone(),
+                    literal_term(&format!("child {round}")),
+                ),
+            ),
+        ];
+        for parent in 0..2 {
+            let parent = entity(graph, &format!("p{parent}-{round}"));
+            changes.extend([
+                insert(graph, (parent.clone(), rdf_type.clone(), dataset.clone())),
+                insert(
+                    graph,
+                    (
+                        parent.clone(),
+                        name.clone(),
+                        literal_term(&format!("parent {round}")),
+                    ),
+                ),
+                insert(graph, (root.clone(), has_part.clone(), parent.clone())),
+                insert(graph, (parent, has_part.clone(), child.clone())),
+            ]);
+        }
+        changes
+    }
+
+    fn cut_parent_edge(graph: &GraphId, round: usize, parent: usize) -> Change {
+        Change::Delete {
+            graph: graph.clone(),
+            subject: entity(graph, &format!("p{parent}-{round}")),
+            predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
+            object: entity(graph, &format!("x-{round}")),
+        }
+    }
+
+    /// The orphans the graph state actually implies: a child of the fixture is
+    /// orphaned exactly when both of its `hasPart` edges are gone.
+    fn expected_orphans(node: &CraqleNode, graph: &GraphId) -> BTreeSet<String> {
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let edges: HashSet<(String, String)> = node
+            .graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .filter(|quad| quad.predicate == has_part)
+            .map(|quad| (quad.subject.0, quad.object.0))
+            .collect();
+
+        let mut orphans = BTreeSet::new();
+        for round in 0..RACE_ROUNDS {
+            let child = entity(graph, &format!("x-{round}"));
+            let linked = (0..2).any(|parent| {
+                let parent = entity(graph, &format!("p{parent}-{round}"));
+                edges.contains(&(parent.0, child.0.clone()))
+            });
+            if !linked {
+                orphans.insert(child.0.trim_matches(['<', '>']).to_string());
+            }
+        }
+        orphans
+    }
+
+    /// F2 — two validated writes race, each cutting one of an entity's two
+    /// parents. Validation runs before the commit guard, so both can pass and
+    /// the entity ends up unreachable; the persisted diagnostics must describe
+    /// the orphan they left behind rather than the clean graph each writer was
+    /// promised (G6).
+    #[test]
+    fn racing_validated_deletes_record_the_orphan_they_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = standalone_node(&dir);
+        let graph = GraphId::new("urn:test:f2-orphan-race");
+        node.create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "race crate",
+                "description",
+                "2025-01-01",
+                None,
+                public_policy(),
+            ),
+        )
+        .unwrap();
+
+        let mut fixture: Vec<Change> = (0..RACE_ROUNDS)
+            .flat_map(|round| two_parent_fixture(&graph, round))
+            .collect();
+        let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let media = EncodedTerm::from_named_node(&vocab::schema_media_object());
+        let root = EncodedTerm::from_named_node(&graph.0);
+        for filler in 0..FILLER_ENTITIES {
+            let subject = entity(&graph, &format!("filler-{filler}"));
+            fixture.push(insert(
+                &graph,
+                (subject.clone(), rdf_type.clone(), media.clone()),
+            ));
+            fixture.push(insert(&graph, (root.clone(), has_part.clone(), subject)));
+        }
+        node.apply_changes_unchecked(&graph, fixture).unwrap();
+        assert!(
+            !node.graph_diagnostics(&graph).unwrap().has_orphans(),
+            "the fixture must start orphan-free"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        for round in 0..RACE_ROUNDS {
+            let start = Arc::new(Barrier::new(2));
+            for parent in 0..2 {
+                let node = Arc::clone(&node);
+                let graph = graph.clone();
+                let start = Arc::clone(&start);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    // A racer that loses the interleaving is rejected by the
+                    // reachability rule; what matters is the record the winners
+                    // leave behind.
+                    let _ =
+                        node.apply_changes(&graph, vec![cut_parent_edge(&graph, round, parent)]);
+                    tx.send(()).unwrap();
+                });
+            }
+        }
+        drop(tx);
+        for _ in 0..(RACE_ROUNDS * 2) {
+            rx.recv_timeout(PROGRESS_TIMEOUT)
+                .expect("a racing validated write never finished");
+        }
+
+        let expected = expected_orphans(&node, &graph);
+        assert!(
+            !expected.is_empty(),
+            "no round interleaved validation with a commit, so this run proved nothing"
+        );
+        let recorded: BTreeSet<String> = node
+            .graph_diagnostics(&graph)
+            .unwrap()
+            .orphaned_entities
+            .into_iter()
+            .collect();
+        assert_eq!(
+            recorded, expected,
+            "the persisted orphan set must describe the graph the writes actually left"
+        );
     }
 
     fn graph_has_keyword(
