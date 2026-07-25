@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_existence_is_identical_in_both_dataset_regimes() {
+    fn dataset_regimes_agree() {
         let tmp = tempfile::tempdir().unwrap();
         let node = open_node(&tmp);
 
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_graphs_without_visible_quads_yield_no_rows() {
+    fn graph_yields_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let node = open_node(&tmp);
 
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_graph_is_absent_even_though_its_iri_is_still_referenced() {
+    fn deleted_graph_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let node = open_node(&tmp);
 

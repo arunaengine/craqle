@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn reachability_accepts_an_alternate_parent_path() {
+    fn alternate_parent_accepted() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-multi-parent");
         let writer = writer_auth();
@@ -319,7 +319,7 @@ mod tests {
     /// not overflow the stack. The reachability walk climbs one frame per link,
     /// so a recursive implementation dies well before this depth.
     #[test]
-    fn deep_haspart_chain_no_stack_overflow() {
+    fn deep_chain_terminates() {
         const DEPTH: usize = 10_000;
 
         let (_tmp, net) = setup_network(1);
@@ -371,7 +371,7 @@ mod tests {
     /// W4 — the delta index resolves a triple last-writer-wins, so deleting and
     /// re-inserting the root type in one change set leaves the root intact.
     #[test]
-    fn delete_then_reinsert_same_triple_passes_validation() {
+    fn reinsert_passes_validation() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-reinsert");
         seeded_crate(&net, &graph);
@@ -406,7 +406,7 @@ mod tests {
     /// The mirror image: insert-then-delete of the same triple removes it, so
     /// validation must reject the change set.
     #[test]
-    fn reinsert_then_delete_same_triple_fails_validation() {
+    fn delete_fails_validation() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-reinsert-reverse");
         seeded_crate(&net, &graph);
@@ -446,7 +446,7 @@ mod tests {
     /// walk must not call the members reachable just because they reach each
     /// other. Pinned on both the validated path and the recomputed diagnostics.
     #[test]
-    fn haspart_cycle_detached_from_root_is_orphaned() {
+    fn detached_cycle_orphaned() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-cycle");
         seeded_crate(&net, &graph);
@@ -494,7 +494,7 @@ mod tests {
     /// The same cycle *is* reachable once the root links into it, and the walk
     /// must terminate rather than loop between the two members.
     #[test]
-    fn haspart_cycle_attached_to_root_is_reachable() {
+    fn attached_cycle_reachable() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-cycle-attached");
         seeded_crate(&net, &graph);

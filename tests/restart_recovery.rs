@@ -90,7 +90,7 @@ fn open_node(dir: &std::path::Path, graph: &GraphId) -> CraqleNode {
 /// Diagnostics are durable: a reopened node reports the same orphan set it
 /// reported before shutdown, without being told to rebuild.
 #[test]
-fn diagnostics_persist_across_reopen() {
+fn diagnostics_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let graph = GraphId::new("urn:test:restart:diagnostics-persist");
 
@@ -115,7 +115,7 @@ fn diagnostics_persist_across_reopen() {
 /// exactly the state a crash between the quad commit and the diagnostics write
 /// leaves behind. Reopening must repair it, not serve the pre-bulk set.
 #[test]
-fn diagnostics_repaired_promptly_after_simulated_crash() {
+fn crash_repairs_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let graph = GraphId::new("urn:test:restart:diagnostics-crash");
 
@@ -161,7 +161,7 @@ fn diagnostics_repaired_promptly_after_simulated_crash() {
 /// reproduces exactly the committed state — same quad count, same content
 /// fingerprint, same dot sets.
 #[test]
-fn reopen_full_fingerprint_equality() {
+fn reopen_fingerprint_matches() {
     const ENTITIES: usize = 1_500;
 
     let dir = tempfile::tempdir().unwrap();
@@ -211,7 +211,7 @@ fn reopen_full_fingerprint_equality() {
 /// graph, so recreating a graph starts from a fresh clock instead of inheriting
 /// counters that would suppress replays of the new graph's first batches (G2).
 #[test]
-fn deleted_graph_clock_not_resurrected() {
+fn deleted_clock_resets() {
     let dir = tempfile::tempdir().unwrap();
     let graph = GraphId::new("urn:test:restart:clock-resurrection");
 
@@ -268,7 +268,7 @@ fn quokka_hits(node: &CraqleNode, auth: &GrantAuthorizer) -> Vec<String> {
 /// anyway, so it passed with the fix reverted.
 #[cfg(feature = "search")]
 #[test]
-fn fts_updates_survive_restart() {
+fn updates_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let graph = GraphId::new("urn:test:restart:fts-tokens");
     let auth = writer_auth();

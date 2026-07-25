@@ -27,7 +27,7 @@ mod tests {
     }
 
     #[test]
-    fn import_jsonld_round_trips() {
+    fn import_round_trips() {
         let (_tmp, net) = setup_network(1);
         let source = GraphId::new("urn:test:crate-source");
         let imported = GraphId::new("urn:test:crate-imported");
@@ -62,7 +62,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn import_jsonld_updates_search_without_manual_reindex() {
+    fn import_updates_search() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:import-search");
@@ -104,7 +104,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn trusted_bootstrap_updates_search_without_manual_reindex() {
+    fn bootstrap_updates_search() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:trusted-bootstrap-search");
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_bootstrap_rejects_a_non_empty_graph() {
+    fn bootstrap_rejects_nonempty() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:trusted-bootstrap-non-empty");
@@ -217,7 +217,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn batched_append_updates_search_without_manual_reindex() {
+    fn append_updates_search() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:append-search");
@@ -281,7 +281,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn graph_reindex_marker_refreshes_search_results() {
+    fn reindex_refreshes_search() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:graph-reindex-search");
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rocrate_survives_a_full_create_update_export_lifecycle() {
+    fn crate_survives_lifecycle() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-lifecycle");
         let mgr0 = manager(net.peer(0));
@@ -1333,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn a_null_context_exports_the_default_context() {
+    fn null_context_defaults() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-null");
         let mgr = manager(net.peer(0));
@@ -1582,7 +1582,7 @@ mod tests {
     /// Full, summary and both paged exports all hide orphans, and the pages
     /// concatenate to exactly the full visible sequence.
     #[test]
-    fn orphan_bearing_export_hides_orphans_in_every_view() {
+    fn export_hides_orphans() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:orphan-export");
@@ -1658,7 +1658,7 @@ mod tests {
     /// A single page covering everything renders the same document as the full
     /// export, so the paged and unpaged views cannot drift apart.
     #[test]
-    fn orphan_bearing_full_export_matches_one_covering_page() {
+    fn export_matches_page() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:orphan-export-equivalence");
@@ -1688,7 +1688,7 @@ mod tests {
     /// found" — the O(1) probes that replaced the fan-out decode must keep
     /// answering that way (WS2-T2 hazard, G6).
     #[test]
-    fn append_under_orphaned_parent_is_entity_not_found() {
+    fn append_rejects_orphan() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:orphan-parent");
@@ -2001,7 +2001,7 @@ mod tests {
 
     /// An orphan imported as a blank node — the path that was uncovered.
     #[test]
-    fn orphaned_blank_node_is_hidden_from_every_read() {
+    fn orphan_blank_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:orphan-blank-node");
@@ -2010,7 +2010,7 @@ mod tests {
 
     /// The named-node twin, so the two encodings stay pinned side by side.
     #[test]
-    fn orphaned_named_node_is_hidden_from_every_read() {
+    fn orphan_named_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:orphan-named-node");
@@ -2021,7 +2021,7 @@ mod tests {
     /// names stays fully visible. Encoding orphan ids correctly must not turn
     /// into hiding every blank node.
     #[test]
-    fn non_orphaned_blank_node_stays_visible() {
+    fn linked_blank_visible() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:visible-blank-node");
@@ -2080,7 +2080,7 @@ mod tests {
     /// a write that misses also fails to delete: the stale value survives beside
     /// a new one nothing can see.
     #[test]
-    fn blank_node_property_update_lands_where_reads_look() {
+    fn blank_update_visible() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:blank-node-write");
@@ -2186,7 +2186,7 @@ mod tests {
     /// cursor as the IRI `<_:b0>` on the way back in matches no interned term,
     /// and the store then restarts from offset 0 — the walk repeats page one.
     #[test]
-    fn blank_node_page_cursor_round_trips() {
+    fn blank_cursor_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:blank-node-cursor");
@@ -2251,7 +2251,7 @@ mod tests {
     /// (G4/G5): re-running an unchanged import leaves it exactly as it was, and
     /// an import carrying a different context replaces it.
     #[test]
-    fn context_retry_is_idempotent_and_advances_only_on_change() {
+    fn context_retry_idempotent() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-two-phase-retry");
         let mgr = manager(net.peer(0));
@@ -2301,7 +2301,7 @@ mod tests {
     /// read-time tag check and the open-time repair then accept as fresh —
     /// permanently losing every orphan the graph really has.
     #[test]
-    fn reimporting_an_identical_document_preserves_the_orphan_set() {
+    fn reimport_preserves_orphans() {
         let (_tmp, net) = setup_network(1);
         let node = net.peer(0);
         let graph = GraphId::new("urn:test:f1-orphan-wipe");
@@ -2407,7 +2407,7 @@ mod tests {
     /// here, and closed by re-importing the summary: a view whose data entities
     /// are all root-linked orphans nothing.
     #[test]
-    fn every_export_view_links_its_data_entities_from_the_root() {
+    fn views_link_entities() {
         let (_tmp, net) = setup_network(1);
         let node = net.peer(0);
         let mgr = manager(node);

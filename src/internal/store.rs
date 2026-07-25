@@ -28,7 +28,7 @@ pub enum StoreError {
     },
 }
 
-pub type Result<T> = std::result::Result<T, StoreError>;
+pub(crate) type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -496,7 +496,7 @@ pub struct FtsEnqueue<'a> {
     pub subjects: &'a HashSet<TermId>,
 }
 
-pub struct SubjectPredicate<'a> {
+pub struct GraphSubjectPredicate<'a> {
     pub graph: &'a GraphId,
     pub subject: &'a EncodedTerm,
     pub predicate: &'a EncodedTerm,
@@ -1013,7 +1013,7 @@ impl GraphStore {
     }
 
     /// Diagnostics recomputations performed by this store instance.
-    #[allow(dead_code)] // consumed by WS0 tests and by WS1's diagnostics work
+    #[cfg(test)]
     pub(crate) fn diagnostics_compute_count(&self) -> u64 {
         self.diagnostics_computed.load(Ordering::Relaxed)
     }
@@ -1043,7 +1043,7 @@ impl GraphStore {
     /// of integer comparisons per stored triple instead of three `String` clones
     /// plus hashing of full IRIs. The rule is the specification and the two are
     /// cross-checked on generated graph shapes by
-    /// `orphan_entity_ids_matches_the_rule`; recomputation is on the hot path of
+    /// `orphan_ids_match`; recomputation is on the hot path of
     /// every write that defers its diagnostics refresh, where the decoding
     /// version cost 74ms on a 10,000-entity crate.
     ///
@@ -1769,13 +1769,6 @@ impl GraphStore {
         Ok(self.decode_term_arc(id)?.as_ref().clone())
     }
 
-    /// Decode a graph name term. Graph IRIs are decoded on every visibility
-    /// check, so this goes through the same global cache as any other term
-    ///.
-    pub fn decode_graph_term(&self, id: TermId) -> Result<EncodedTerm> {
-        self.decode_term(id)
-    }
-
     pub fn lookup_term(&self, term: &EncodedTerm) -> Result<Option<TermId>> {
         let id = hash_term(term);
         let Some(existing) = self.terms.get(id.to_be_bytes())? else {
@@ -2380,8 +2373,7 @@ impl GraphStore {
     }
 
     /// Graphs holding at least one quad with `predicate`, so a predicate-only
-    /// pattern scans those graphs instead of every subject in the corpus
-    ///.
+    /// pattern scans those graphs instead of every subject in the corpus.
     pub(crate) fn predicate_graphs(&self, predicate: TermId) -> Vec<TermId> {
         self.with_derived_indexes(|indexes| {
             indexes
@@ -2392,9 +2384,8 @@ impl GraphStore {
         })
     }
 
-    /// The token the next FTS queue entry will receive. Used by tests and by
-    /// the reindex-threshold policy to reason about queue ordering.
-    #[allow(dead_code)] // consumed by WS4's reindex-threshold policy and by WS0 tests
+    /// The token the next FTS queue entry will receive. The reindex-threshold
+    /// policy uses it to reason about queue ordering.
     pub(crate) fn current_dirty_token(&self) -> u64 {
         self.dirty_counter.load(Ordering::SeqCst)
     }
@@ -2498,8 +2489,7 @@ impl GraphStore {
     /// Falls back to the clock embedded in the legacy metadata record when no
     /// `'K'` key exists yet, which is the one-time migration path for stores
     /// written before the split; the first [`GraphStore::set_vector_clock`]
-    /// writes `'K'` and the legacy copy is ignored from then on
-    ///.
+    /// writes `'K'` and the legacy copy is ignored from then on.
     pub(crate) fn get_vector_clock_by_id(&self, graph_id: TermId) -> Result<VectorClock> {
         if let Some(bytes) = self.graphs.get(graph_clock_key(graph_id))? {
             return Ok(postcard::from_bytes(bytes.as_ref())?);
@@ -3035,7 +3025,7 @@ impl GraphStore {
     /// cursor kinds, so an `After` caller can still report progress.
     pub fn objects_page(
         &self,
-        key: SubjectPredicate<'_>,
+        key: GraphSubjectPredicate<'_>,
         page: PageRequest<'_>,
     ) -> Result<(usize, Vec<EncodedTerm>)> {
         if page.limit == 0 {
@@ -3473,7 +3463,7 @@ mod tests {
     /// the batch is large *and* covers half the graph, so re-reading the graph
     /// costs no more than the per-subject entries it replaces.
     #[test]
-    fn fts_enqueue_collapses_when_the_batch_covers_half_the_graph() {
+    fn enqueue_collapses_batch() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:w14:half");
         store.create_graph(&graph).unwrap();
@@ -3491,7 +3481,7 @@ mod tests {
     /// The absolute rule alone turned this write into a rescan of a graph twice
     /// its size — and, in a batched ingest, once per batch.
     #[test]
-    fn fts_enqueue_stays_per_subject_when_the_graph_dwarfs_the_batch() {
+    fn enqueue_below_ratio() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:w14:dwarfed");
         store.create_graph(&graph).unwrap();
@@ -3511,7 +3501,7 @@ mod tests {
     /// A batch that is the whole graph still stays per-subject while it is
     /// small: the absolute bound survives the relative one.
     #[test]
-    fn fts_enqueue_stays_per_subject_below_the_absolute_threshold() {
+    fn enqueue_below_threshold() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:w14:small");
         store.create_graph(&graph).unwrap();
@@ -3529,7 +3519,7 @@ mod tests {
     /// `insert_quad` read-modify-write of the dot set interleave, so two writers
     /// mint the same counter and one add is lost.
     #[test]
-    fn parallel_commits_keep_the_dot_set_intact() {
+    fn commits_keep_dots() {
         const WRITERS: usize = 8;
         const ADDS_PER_WRITER: usize = 25;
 
@@ -3574,7 +3564,7 @@ mod tests {
     /// concurrently — including on graphs that share a lock shard — must make
     /// progress rather than deadlock.
     #[test]
-    fn self_guarding_functions_do_not_deadlock() {
+    fn guards_never_deadlock() {
         const THREADS: usize = 8;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3630,7 +3620,7 @@ mod tests {
     /// index from the store before it returns, so unrelated drift is gone by
     /// the time the caller sees the result — not "at next restart".
     #[test]
-    fn index_anomaly_is_repaired_by_the_detecting_commit() {
+    fn commit_repairs_anomaly() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:index-anomaly");
         store.create_graph(&graph).unwrap();
@@ -3686,7 +3676,7 @@ mod tests {
     /// post-restart entry gets a lower token and is silently dropped without
     /// tantivy ever having indexed the subject.
     #[test]
-    fn fts_tokens_survive_restart() {
+    fn tokens_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:fts-token-restart");
 
@@ -3806,7 +3796,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_graph_clock_not_resurrected() {
+    fn deleted_clock_resets() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:clock-resurrection");
         store.create_graph(&graph).unwrap();
@@ -3868,7 +3858,7 @@ mod tests {
     /// never an orphan). Consistency outranks speed — if these ever diverge, the
     /// rule is right and this test is the thing that says so.
     #[test]
-    fn orphan_entity_ids_matches_the_rule() {
+    fn orphan_ids_match() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:orphan-parity");
         store.create_graph(&graph).unwrap();
@@ -3932,7 +3922,7 @@ mod tests {
     /// A graph with no orphans at all must also agree, and must not invent one
     /// for the root.
     #[test]
-    fn orphan_entity_ids_matches_the_rule_when_orphan_free() {
+    fn orphan_ids_empty() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:orphan-parity-clean");
         store.create_graph(&graph).unwrap();
@@ -3964,7 +3954,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_persist_across_reopen() {
+    fn diagnostics_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:diagnostics-reopen");
 
@@ -4001,7 +3991,7 @@ mod tests {
     /// quad commit and the diagnostics write leaves behind — must be repaired
     /// promptly: at open, and by any read that sees the stale tag.
     #[test]
-    fn diagnostics_repaired_promptly_after_simulated_crash() {
+    fn crash_repairs_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:diagnostics-crash");
 
@@ -4122,7 +4112,7 @@ mod tests {
     /// indexing anything, and the entity whose visibility changed would never
     /// be re-queued (G7).
     #[test]
-    fn a_read_never_moves_the_search_requeue_baseline() {
+    fn read_preserves_baseline() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:diagnostics-read-only");
         store.create_graph(&graph).unwrap();
@@ -4154,7 +4144,7 @@ mod tests {
     /// subjects, because orphans are invisible to search: otherwise the index
     /// keeps showing an entity the store now hides (G6/G7).
     #[test]
-    fn open_repair_requeues_entities_whose_orphan_status_changed() {
+    fn open_requeues_orphans() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:diagnostics-requeue");
 
@@ -4201,7 +4191,7 @@ mod tests {
     // ── Durability under the fjall configuration (G10) ──────────────────
 
     #[test]
-    fn reopen_full_fingerprint_equality() {
+    fn reopen_fingerprint_matches() {
         const ENTITIES: usize = 2_000;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4331,7 +4321,7 @@ mod tests {
     /// rotation there is nothing on disk to compact and the journal is never
     /// reclaimed (C1/C2).
     #[test]
-    fn manual_compact_flushes_pending_writes_to_disk() {
+    fn compact_flushes_writes() {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:manual-compact");

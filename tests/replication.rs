@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_metadata_edits_converge() {
+    fn metadata_edits_converge() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-metadata");
 

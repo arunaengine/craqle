@@ -447,7 +447,7 @@ mod tests {
     /// (which enumerates index candidates). Both still gate every graph
     /// through `graph_is_visible` and every quad through `quad_is_visible`.
     #[test]
-    fn bound_object_patterns_respect_small_visible_sets() {
+    fn patterns_respect_visibility() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             tmp.path(),
@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn expression_term_hooks_preserve_effective_boolean_values() {
+    fn hooks_preserve_booleans() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             tmp.path(),
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn expression_term_hooks_preserve_term_classification() {
+    fn hooks_preserve_classification() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             tmp.path(),
