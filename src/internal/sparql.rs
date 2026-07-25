@@ -87,6 +87,14 @@ const FTS_LIMIT_IRI: &str = "urn:craqle:fts:limit";
 const FTS_SCORE_IRI: &str = "urn:craqle:fts:score";
 const FTS_GRAPH_IRI: &str = "urn:craqle:fts:graph";
 
+/// Over-fetch factor for the FTS SERVICE. Graph visibility is decided per hit
+/// *after* tantivy has ranked them, so asking the index for exactly `fts:limit`
+/// hits silently returns fewer authorized rows than the caller requested.
+const FTS_OVERFETCH_FACTOR: usize = 4;
+/// Floor for the first over-fetch, so a small `fts:limit` still survives a run
+/// of unreadable top-ranked hits without another index round trip.
+const FTS_MIN_FETCH: usize = 64;
+
 impl SparqlEngine {
     pub fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
         Self {
@@ -135,7 +143,13 @@ impl SparqlEngine {
             .parse_query(&full)
             .map_err(|e| SparqlError::Parse(e.to_string()))?;
 
-        rewrite_fts_query(&mut query, &self.search, &self.store, scope)?;
+        rewrite_fts_query(
+            &mut query,
+            FtsRewriteCtx {
+                search: self.search.as_ref(),
+                scope,
+            },
+        )?;
         if optimize {
             crate::planner::optimize_query(&mut query, &self.store);
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
@@ -286,96 +300,94 @@ struct FtsServiceSpec {
     graph: Option<FtsGraphBinding>,
 }
 
-fn rewrite_fts_query(
-    query: &mut Query,
-    search: &SearchIndex,
-    store: &GraphStore,
-    scope: GraphScope<'_>,
-) -> Result<()> {
+/// Everything the FTS SERVICE rewrite needs: the index it reads and the
+/// caller's graph scope.
+#[derive(Clone, Copy)]
+struct FtsRewriteCtx<'a> {
+    search: &'a SearchIndex,
+    scope: GraphScope<'a>,
+}
+
+fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
     match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
         | Query::Describe { pattern, .. }
         | Query::Construct { pattern, .. } => {
             let current = std::mem::replace(pattern, GraphPattern::Bgp { patterns: vec![] });
-            *pattern = rewrite_graph_pattern(current, search, store, scope)?;
+            *pattern = rewrite_graph_pattern(current, cx)?;
         }
     }
     Ok(())
 }
 
-fn rewrite_graph_pattern(
-    pattern: GraphPattern,
-    search: &SearchIndex,
-    store: &GraphStore,
-    scope: GraphScope<'_>,
-) -> Result<GraphPattern> {
+fn rewrite_graph_pattern(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
     Ok(match pattern {
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
             pattern
         }
         GraphPattern::Join { left, right } => GraphPattern::Join {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => GraphPattern::LeftJoin {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
             expression,
         },
         GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
             expr,
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Union { left, right } => GraphPattern::Union {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::Lateral { left, right } => GraphPattern::Lateral {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::Graph { name, inner } => GraphPattern::Graph {
             name,
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Extend {
             inner,
             variable,
             expression,
         } => GraphPattern::Extend {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             variable,
             expression,
         },
         GraphPattern::Minus { left, right } => GraphPattern::Minus {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             expression,
         },
         GraphPattern::Project { inner, variables } => GraphPattern::Project {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             variables,
         },
         GraphPattern::Distinct { inner } => GraphPattern::Distinct {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Reduced { inner } => GraphPattern::Reduced {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Slice {
             inner,
             start,
             length,
         } => GraphPattern::Slice {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             start,
             length,
         },
@@ -384,7 +396,7 @@ fn rewrite_graph_pattern(
             variables,
             aggregates,
         } => GraphPattern::Group {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             variables,
             aggregates,
         },
@@ -394,23 +406,138 @@ fn rewrite_graph_pattern(
             silent,
         } => match name {
             NamedNodePattern::NamedNode(node) if node.as_str() == FTS_SERVICE_IRI => {
-                rewrite_fts_service(*inner, search, store, scope)?
+                rewrite_fts_service(*inner, cx)?
             }
             other => GraphPattern::Service {
                 name: other,
-                inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+                inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
                 silent,
             },
         },
     })
 }
 
-fn rewrite_fts_service(
-    pattern: GraphPattern,
+/// Graph-visibility verdicts for FTS hits, memoized by graph IRI.
+///
+/// Over-fetching surfaces many hits from the same graph and the `Predicate`
+/// scope's callback costs a policy read per call, so each graph is decided at
+/// most once per SERVICE clause.
+struct FtsGraphVisibility<'a> {
+    scope: GraphScope<'a>,
+    listed: Option<HashSet<&'a str>>,
+    memo: RefCell<HashMap<String, bool>>,
+}
+
+impl<'a> FtsGraphVisibility<'a> {
+    fn new(scope: GraphScope<'a>) -> Self {
+        let listed = match scope {
+            GraphScope::List(graphs) => Some(graphs.iter().map(GraphId::as_str).collect()),
+            _ => None,
+        };
+        Self {
+            scope,
+            listed,
+            memo: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn allows(&self, graph_iri: &str) -> bool {
+        match self.scope {
+            GraphScope::All => true,
+            GraphScope::List(_) => self
+                .listed
+                .as_ref()
+                .is_some_and(|listed| listed.contains(graph_iri)),
+            GraphScope::Predicate(visible) => {
+                if let Some(&allowed) = self.memo.borrow().get(graph_iri) {
+                    return allowed;
+                }
+                let allowed = visible(&GraphId::new(graph_iri));
+                self.memo.borrow_mut().insert(graph_iri.to_owned(), allowed);
+                allowed
+            }
+        }
+    }
+}
+
+/// Post-search filter applied to every hit tantivy returns.
+struct FtsHitFilter<'a> {
+    visibility: &'a FtsGraphVisibility<'a>,
+    /// Set when the SERVICE pinned its subject to a concrete IRI.
+    subject: Option<&'a str>,
+}
+
+impl FtsHitFilter<'_> {
+    fn keeps(&self, hit: &crate::search::SearchHit) -> bool {
+        self.visibility.allows(&hit.graph_id)
+            && self
+                .subject
+                .is_none_or(|subject| hit.subject_iri == subject)
+    }
+}
+
+/// One FTS SERVICE lookup: what to search for, how many rows the caller asked
+/// for, and which hits it is allowed to keep.
+struct FtsSearchRequest<'a> {
+    query: &'a str,
+    limit: usize,
+    /// `Some` restricts the index query to a single, already-visible graph.
+    graph: Option<&'a str>,
+    filter: FtsHitFilter<'a>,
+}
+
+/// Collects up to `request.limit` hits the caller is authorized to see.
+///
+/// Visibility is decided *after* tantivy has ranked the hits, so fetching
+/// exactly `limit` silently drops authorized rows whenever a top-ranked hit
+/// sits in a graph the caller cannot read — a G8 completeness violation. We
+/// over-fetch and escalate until either `limit` authorized hits are collected
+/// or the index runs out of matches (`raw < fetch`).
+fn search_visible_hits(
     search: &SearchIndex,
-    store: &GraphStore,
-    scope: GraphScope<'_>,
-) -> Result<GraphPattern> {
+    request: &FtsSearchRequest<'_>,
+) -> Result<Vec<crate::search::SearchHit>> {
+    let mut fetch = request
+        .limit
+        .saturating_mul(FTS_OVERFETCH_FACTOR)
+        .max(FTS_MIN_FETCH);
+    loop {
+        let raw = match request.graph {
+            Some(graph) => search.search_in_graph(graph, request.query, fetch)?,
+            None => search.search(request.query, fetch)?,
+        };
+        let raw_len = raw.len();
+
+        let mut kept = Vec::with_capacity(request.limit.min(raw_len));
+        for hit in raw {
+            if !request.filter.keeps(&hit) {
+                continue;
+            }
+            kept.push(hit);
+            if kept.len() == request.limit {
+                return Ok(kept);
+            }
+        }
+
+        // Short of `limit`. If the index returned fewer hits than we asked
+        // for it has no more matches, so this is the complete answer.
+        if raw_len < fetch {
+            return Ok(kept);
+        }
+        match fetch.checked_mul(FTS_OVERFETCH_FACTOR) {
+            Some(next) => fetch = next,
+            None => return Ok(kept),
+        }
+    }
+}
+
+/// Rewrites an FTS SERVICE clause into an inline `VALUES` block.
+///
+/// The index is read at its **last committed state**: FTS updates still
+/// sitting in the durable queue (drained by the search worker, G7) are not
+/// visible to this clause. Callers that need read-your-writes must flush the
+/// search worker first.
+fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
     let spec = parse_fts_service_spec(pattern)?;
     if spec.limit == 0 {
         return Ok(GraphPattern::Values {
@@ -419,36 +546,6 @@ fn rewrite_fts_service(
         });
     }
 
-    // Built only when a SERVICE clause exists; hit counts are bounded by
-    // `spec.limit`, so the predicate path checks each hit's graph directly.
-    let visible_set: Option<HashSet<&str>> = match scope {
-        GraphScope::List(graphs) => Some(graphs.iter().map(GraphId::as_str).collect()),
-        _ => None,
-    };
-    let graph_visible = |iri: &str| match scope {
-        GraphScope::All => true,
-        GraphScope::List(_) => visible_set
-            .as_ref()
-            .is_some_and(|visible| visible.contains(iri)),
-        GraphScope::Predicate(visible) => visible(&GraphId::new(iri)),
-    };
-
-    flush_queued_search_updates(search, store)?;
-    let hits = match &spec.graph {
-        Some(FtsGraphBinding::Fixed(graph)) => {
-            if !graph_visible(graph.as_str()) {
-                Vec::new()
-            } else {
-                search.search_in_graph(
-                    graph.as_str(),
-                    spec.query.as_deref().unwrap_or(""),
-                    spec.limit,
-                )?
-            }
-        }
-        _ => search.search(spec.query.as_deref().unwrap_or(""), spec.limit)?,
-    };
-
     let variables = requested_fts_variables(&spec);
     if variables.is_empty() {
         return Err(SparqlError::Unsupported(
@@ -456,20 +553,39 @@ fn rewrite_fts_service(
         ));
     }
 
-    let subject_filter = match &spec.subject {
-        Some(FtsSubjectPattern::NamedNode(node)) => Some(node.as_str()),
+    let visibility = FtsGraphVisibility::new(cx.scope);
+    let graph = match &spec.graph {
+        Some(FtsGraphBinding::Fixed(graph)) => {
+            if !visibility.allows(graph.as_str()) {
+                return Ok(GraphPattern::Values {
+                    variables,
+                    bindings: Vec::new(),
+                });
+            }
+            Some(graph.as_str())
+        }
         _ => None,
     };
 
-    let mut bindings = Vec::new();
-    for hit in hits {
-        if !graph_visible(hit.graph_id.as_str()) {
-            continue;
-        }
-        if subject_filter.is_some_and(|subject| hit.subject_iri != subject) {
-            continue;
-        }
-        bindings.push(fts_binding_row(&variables, &spec, &hit)?);
+    let hits = search_visible_hits(
+        cx.search,
+        &FtsSearchRequest {
+            query: spec.query.as_deref().unwrap_or(""),
+            limit: spec.limit,
+            graph,
+            filter: FtsHitFilter {
+                visibility: &visibility,
+                subject: match &spec.subject {
+                    Some(FtsSubjectPattern::NamedNode(node)) => Some(node.as_str()),
+                    _ => None,
+                },
+            },
+        },
+    )?;
+
+    let mut bindings = Vec::with_capacity(hits.len());
+    for hit in &hits {
+        bindings.push(fts_binding_row(&variables, &spec, hit)?);
     }
 
     Ok(GraphPattern::Values {
@@ -637,10 +753,6 @@ fn fts_binding_row(
 
 fn ground_named_node(iri: &str) -> GroundTerm {
     GroundTerm::NamedNode(NamedNode::new_unchecked(iri))
-}
-
-fn flush_queued_search_updates(_search: &SearchIndex, _store: &GraphStore) -> Result<()> {
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
