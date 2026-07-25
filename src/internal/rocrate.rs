@@ -230,8 +230,22 @@ struct ExportView<'a> {
 struct RootExportView<'a> {
     graph_id: &'a GraphId,
     triples: Vec<(EncodedTerm, EncodedTerm)>,
-    page_entities: &'a [EncodedTerm],
+    /// The ids the root must declare as `hasPart`: every data entity this
+    /// export emits. RO-Crate 1.2 requires each of them to be linked from the
+    /// root, so an export that emits one without a link is not a valid crate.
+    has_part: Vec<String>,
     ctx: &'a ContextTermMap,
+}
+
+/// The non-page entities a partial view emits.
+///
+/// Split because the two halves are linked differently: contextual entities
+/// need no `hasPart`, while profile artifacts are `File`/`MediaObject` data
+/// entities and so MUST hang off the root's `hasPart`.
+#[derive(Default)]
+struct PartialViewEntities {
+    contextual: BTreeSet<String>,
+    artifacts: BTreeSet<String>,
 }
 
 /// Everything needed to render the metadata descriptor of an export.
@@ -1207,10 +1221,31 @@ impl RoCrateManager {
             triples: self.subject_triples(cx, METADATA_ID)?,
             ctx: view.ctx,
         })?;
+
+        let extra = self.collect_partial_view_entities(cx, view.page_entities)?;
+        let mut has_part: Vec<String> = view
+            .page_entities
+            .iter()
+            .filter_map(encoded_reference_value)
+            .collect();
+        let mut entities = Vec::with_capacity(extra.contextual.len() + extra.artifacts.len());
+        for subject_id in extra.contextual.iter().chain(extra.artifacts.iter()) {
+            let triples = self.subject_triples(cx, subject_id)?;
+            if triples.is_empty() {
+                continue;
+            }
+            // Only artifacts that made it into the document get a link, so the
+            // root never points at an entity this export does not describe.
+            if extra.artifacts.contains(subject_id) {
+                has_part.push(subject_id.clone());
+            }
+            entities.push(export_graph_entity(subject_id, triples, view.ctx)?);
+        }
+
         let root = export_root_entity(RootExportView {
             graph_id: &cx.graph,
             triples: self.root_triples_excluding_has_part(cx)?,
-            page_entities: view.page_entities,
+            has_part,
             ctx: view.ctx,
         })?;
 
@@ -1218,14 +1253,7 @@ impl RoCrateManager {
             GraphVector::MetadataDescriptor(metadata),
             GraphVector::RootDataEntity(root),
         ];
-
-        for subject_id in self.collect_partial_view_contextual_entities(cx, view.page_entities)? {
-            let triples = self.subject_triples(cx, &subject_id)?;
-            if triples.is_empty() {
-                continue;
-            }
-            graph.push(export_graph_entity(&subject_id, triples, view.ctx)?);
-        }
+        graph.extend(entities);
 
         for entity in view.page_entities {
             let Some(subject_id) = encoded_reference_value(entity) else {
@@ -1655,11 +1683,11 @@ impl RoCrateManager {
         }
     }
 
-    fn collect_partial_view_contextual_entities(
+    fn collect_partial_view_entities(
         &self,
         cx: &CrateCtx,
         page_entities: &[EncodedTerm],
-    ) -> Result<Vec<String>, RoCrateError> {
+    ) -> Result<PartialViewEntities, RoCrateError> {
         let page_subjects: HashSet<String> = page_entities
             .iter()
             .filter_map(encoded_reference_value)
@@ -1668,7 +1696,7 @@ impl RoCrateManager {
         queue.extend(page_subjects.iter().cloned());
 
         let mut expanded = HashSet::new();
-        let mut contextuals = BTreeSet::new();
+        let mut collected = PartialViewEntities::default();
         let has_artifact =
             EncodedTerm::from_named_node(&NamedNode::new_unchecked(PROF_HAS_ARTIFACT_IRI));
 
@@ -1697,23 +1725,28 @@ impl RoCrateManager {
                 }
 
                 let triples = self.subject_triples(cx, &candidate_id)?;
+                if triples.is_empty() {
+                    continue;
+                }
                 let is_profile_artifact = is_resource_descriptor
                     && predicate == has_artifact
                     && (triples_have_type(&triples, "File")
                         || triples_have_type(&triples, "MediaObject"));
-                if triples.is_empty()
-                    || (!triples_describe_contextual_entity(&triples) && !is_profile_artifact)
-                {
+                let inserted = if is_profile_artifact {
+                    collected.artifacts.insert(candidate_id.clone())
+                } else if triples_describe_contextual_entity(&triples) {
+                    collected.contextual.insert(candidate_id.clone())
+                } else {
                     continue;
-                }
+                };
 
-                if contextuals.insert(candidate_id.clone()) {
+                if inserted {
                     queue.push_back(candidate_id);
                 }
             }
         }
 
-        Ok(contextuals.into_iter().collect())
+        Ok(collected)
     }
 }
 
@@ -2667,22 +2700,16 @@ fn export_root_entity(view: RootExportView<'_>) -> Result<RootDataEntity, RoCrat
         }
     }
 
-    if !view.page_entities.is_empty() {
-        let ids = view
-            .page_entities
-            .iter()
-            .filter_map(encoded_reference_value)
-            .collect::<Vec<_>>();
-        if !ids.is_empty() {
-            dynamic.insert(
-                "hasPart".to_string(),
-                if ids.len() == 1 {
-                    EntityValue::EntityId(Id::Id(ids[0].clone()))
-                } else {
-                    EntityValue::EntityId(Id::IdArray(ids))
-                },
-            );
-        }
+    let mut ids = view.has_part;
+    if !ids.is_empty() {
+        dynamic.insert(
+            "hasPart".to_string(),
+            if ids.len() == 1 {
+                EntityValue::EntityId(Id::Id(ids.remove(0)))
+            } else {
+                EntityValue::EntityId(Id::IdArray(ids))
+            },
+        );
     }
 
     Ok(RootDataEntity {
