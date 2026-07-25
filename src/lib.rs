@@ -2230,6 +2230,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "search")]
     fn crate_request(graph: &GraphId, name: &str) -> CreateCrateRequest {
         CreateCrateRequest::new(
             graph.clone(),

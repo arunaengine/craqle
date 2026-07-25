@@ -595,6 +595,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "search")]
     fn search_hits(node: &CraqleNode, query: &str) -> usize {
         node.search(&writer_auth(), SearchRequest { query, limit: 10 })
             .unwrap()
