@@ -2326,9 +2326,7 @@ impl GraphStore {
             indexes
                 .by_subject
                 .get(&quad.subject)
-                .is_some_and(|entries| {
-                    entries.contains(&(quad.predicate, quad.object, quad.graph))
-                })
+                .is_some_and(|entries| entries.contains(&(quad.predicate, quad.object, quad.graph)))
         })
     }
 
@@ -2482,7 +2480,9 @@ impl GraphStore {
         Ok(())
     }
 
-    #[deprecated(note = "use GraphStore::set_vector_clock_by_id with a ClockUpdate; removed in W-CLEAN")]
+    #[deprecated(
+        note = "use GraphStore::set_vector_clock_by_id with a ClockUpdate; removed in W-CLEAN"
+    )]
     pub fn set_vector_clock(
         &self,
         batch: &mut WriteBatch,
@@ -2580,7 +2580,11 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn enqueue_fts_reindex_by_id(&self, batch: &mut WriteBatch, graph_id: TermId) -> Result<()> {
+    pub fn enqueue_fts_reindex_by_id(
+        &self,
+        batch: &mut WriteBatch,
+        graph_id: TermId,
+    ) -> Result<()> {
         let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
         batch.insert(
             &self.graphs,
@@ -3438,7 +3442,9 @@ mod tests {
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))
             .unwrap();
         let mut batch = store.new_batch();
-        store.enqueue_fts_reindex_by_id(&mut batch, graph_id).unwrap();
+        store
+            .enqueue_fts_reindex_by_id(&mut batch, graph_id)
+            .unwrap();
         store.commit(batch).unwrap();
 
         let queued = store.drain_fts_reindex_queue(10).unwrap();
@@ -3629,7 +3635,9 @@ mod tests {
                     .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
                     .unwrap();
             }
-            store.enqueue_fts_reindex_by_id(&mut batch, graph_id).unwrap();
+            store
+                .enqueue_fts_reindex_by_id(&mut batch, graph_id)
+                .unwrap();
             store.commit(batch).unwrap();
             store.persist().unwrap();
 
@@ -3699,7 +3707,13 @@ mod tests {
             postcard::to_allocvec(&meta).unwrap(),
         );
         store.commit(batch).unwrap();
-        assert!(store.graphs.get(graph_clock_key(graph_id)).unwrap().is_none());
+        assert!(
+            store
+                .graphs
+                .get(graph_clock_key(graph_id))
+                .unwrap()
+                .is_none()
+        );
 
         assert_eq!(legacy_clock, store.get_vector_clock(&graph).unwrap());
 
@@ -3742,7 +3756,13 @@ mod tests {
             store.get_vector_clock(&graph).unwrap(),
             "a recreated graph must not inherit the deleted graph's clock"
         );
-        assert!(store.graph_diagnostics(&graph).unwrap().orphaned_entities.is_empty());
+        assert!(
+            store
+                .graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty()
+        );
     }
 
     // ── WS0-T5: persisted, clock-tagged diagnostics (K6) ────────────────
@@ -3982,7 +4002,9 @@ mod tests {
                     subject: store
                         .resolve_term(&named(&format!("urn:bulk:s{index}")))
                         .unwrap(),
-                    predicate: store.resolve_term(&named("http://schema.org/name")).unwrap(),
+                    predicate: store
+                        .resolve_term(&named("http://schema.org/name"))
+                        .unwrap(),
                     object: store
                         .resolve_term(&EncodedTerm(format!("\"entity {index}\"")))
                         .unwrap(),
@@ -3999,7 +4021,13 @@ mod tests {
                 clock.advance(actor, counter);
             }
             store
-                .set_vector_clock_by_id(&mut batch, ClockUpdate { graph_id, clock: &clock })
+                .set_vector_clock_by_id(
+                    &mut batch,
+                    ClockUpdate {
+                        graph_id,
+                        clock: &clock,
+                    },
+                )
                 .unwrap();
             store.commit(batch).unwrap();
             store.persist().unwrap();
@@ -4048,7 +4076,9 @@ mod tests {
         store
             .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
             .unwrap();
-        store.enqueue_fts_reindex_by_id(&mut batch, graph_id).unwrap();
+        store
+            .enqueue_fts_reindex_by_id(&mut batch, graph_id)
+            .unwrap();
         store.commit(batch).unwrap();
 
         store.clear_fts_queue_for_graph(&graph).unwrap();

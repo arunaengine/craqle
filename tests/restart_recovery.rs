@@ -48,12 +48,14 @@ fn inserts(
 ) -> Vec<MaterializedQuadChange> {
     triples
         .into_iter()
-        .map(|(subject, predicate, object)| MaterializedQuadChange::Insert {
-            graph: graph.clone(),
-            subject,
-            predicate,
-            object,
-        })
+        .map(
+            |(subject, predicate, object)| MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject,
+                predicate,
+                object,
+            },
+        )
         .collect()
 }
 

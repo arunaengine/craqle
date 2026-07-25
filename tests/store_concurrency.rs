@@ -41,12 +41,14 @@ fn write_unchecked(
 ) {
     let changes = triples
         .into_iter()
-        .map(|(subject, predicate, object)| MaterializedQuadChange::Insert {
-            graph: graph.clone(),
-            subject,
-            predicate,
-            object,
-        })
+        .map(
+            |(subject, predicate, object)| MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject,
+                predicate,
+                object,
+            },
+        )
         .collect();
     node.apply_changes_unchecked(graph, changes).unwrap();
 }
@@ -268,7 +270,10 @@ fn concurrent_reads_and_writes_stay_consistent() {
 
     assert_eq!(
         WRITES,
-        node.graph_diagnostics(&graph).unwrap().orphaned_entities.len(),
+        node.graph_diagnostics(&graph)
+            .unwrap()
+            .orphaned_entities
+            .len(),
         "the final diagnostics must describe the final graph state"
     );
 }
