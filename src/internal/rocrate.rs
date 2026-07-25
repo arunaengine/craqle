@@ -382,9 +382,7 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         if is_replacement {
             // Keep checked and prevalidated replacement paths in lockstep.
             self.reset_context_after_replacement(&graph_id)?;
@@ -783,9 +781,7 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
@@ -817,9 +813,7 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
@@ -1412,9 +1406,7 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(batch)
     }
 
@@ -1427,9 +1419,7 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(graph_id, insert_changes(graph_id, target))?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(batch)
     }
 
