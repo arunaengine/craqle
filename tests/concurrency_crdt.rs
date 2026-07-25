@@ -508,6 +508,7 @@ mod tests {
     /// never named by the write, so never enqueued by it — would stay out of
     /// the index forever (G6, G7).
     #[test]
+    #[cfg(feature = "search")]
     fn a_worker_read_between_a_bulk_relink_and_its_rebuild_keeps_search_correct() {
         let dir = tempfile::tempdir().unwrap();
         let node = standalone_node(&dir);
