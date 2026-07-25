@@ -378,18 +378,6 @@ struct StoredDiagnostics {
     at_clock: VectorClock,
 }
 
-/// Number of times [`GraphStore::compute_graph_diagnostics`] has run in this
-/// process. Tests use it to prove that a reopen served diagnostics from the
-/// persisted record rather than recomputing them.
-static DIAGNOSTICS_COMPUTE_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// Consumed by WS0 tests and by WS1's diagnostics work; not called by the
-// library itself.
-#[allow(dead_code)]
-pub(crate) fn diagnostics_compute_count() -> u64 {
-    DIAGNOSTICS_COMPUTE_COUNT.load(Ordering::Relaxed)
-}
-
 pub struct GraphStore {
     db: Database,
     persist_mode: PersistMode,
@@ -413,8 +401,10 @@ pub struct GraphStore {
     /// [`TERM_DECODE_CACHE_CAP`] (WS0-T4).
     term_decode_cache: RwLock<HashMap<TermId, Arc<EncodedTerm>>>,
     dirty_counter: AtomicU64,
-    #[cfg(test)]
-    corrupt_index_hook: AtomicU64,
+    /// How many times this store instance has recomputed graph diagnostics.
+    /// Tests use it to prove a reopen served the persisted record instead of
+    /// recomputing, and that a stale record was repaired at open.
+    diagnostics_computed: AtomicU64,
 }
 
 // ── Frozen WS0 parameter structs ────────────────────────────────────────────
@@ -1005,8 +995,14 @@ impl GraphStore {
         f(guard.as_ref().expect("derived indexes initialized"))
     }
 
+    /// Diagnostics recomputations performed by this store instance.
+    #[allow(dead_code)] // consumed by WS0 tests and by WS1's diagnostics work
+    pub(crate) fn diagnostics_compute_count(&self) -> u64 {
+        self.diagnostics_computed.load(Ordering::Relaxed)
+    }
+
     fn compute_graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
-        DIAGNOSTICS_COMPUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.diagnostics_computed.fetch_add(1, Ordering::Relaxed);
         let snapshot = crate::rules::GraphSnapshot::from_store(self, graph)?;
         Ok(GraphDiagnostics::from_orphaned_entities(
             crate::rules::orphaned_data_entities(&snapshot)
@@ -1485,8 +1481,7 @@ impl GraphStore {
             diagnostics_cache: RwLock::new(HashMap::new()),
             term_decode_cache: RwLock::new(HashMap::new()),
             dirty_counter: AtomicU64::new(1),
-            #[cfg(test)]
-            corrupt_index_hook: AtomicU64::new(0),
+            diagnostics_computed: AtomicU64::new(0),
         };
 
         store.rebuild_indexes()?;
@@ -3098,7 +3093,6 @@ impl GraphStore {
     /// commit repairs it (WS0-T2).
     #[cfg(test)]
     fn corrupt_index_for_test(&self, quad: EncodedQuad) {
-        self.corrupt_index_hook.fetch_add(1, Ordering::SeqCst);
         let mut indexes = self.indexes_write();
         indexes.remove_quad(quad);
     }
@@ -3163,6 +3157,54 @@ mod tests {
         );
     }
 
+    fn named(iri: &str) -> EncodedTerm {
+        EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(iri))
+    }
+
+    /// Resolve a quad's four terms, interning any that are new.
+    fn encode_quad(store: &GraphStore, graph: &GraphId, triple: (&str, &str, &str)) -> EncodedQuad {
+        EncodedQuad {
+            graph: store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap(),
+            subject: store.resolve_term(&named(triple.0)).unwrap(),
+            predicate: store.resolve_term(&named(triple.1)).unwrap(),
+            object: store.resolve_term(&named(triple.2)).unwrap(),
+        }
+    }
+
+    /// Commit one add the way a real writer does: under the graph commit guard,
+    /// minting the counter and advancing the clock in the same batch.
+    fn commit_add(store: &GraphStore, graph: &GraphId, quad: EncodedQuad) -> Dot {
+        let _commit_guard = store.graph_commit_guard(graph);
+        let actor = ActorId::random();
+        let mut batch = store.new_batch();
+        let counter = store
+            .next_counter_by_id(
+                &mut batch,
+                CounterKey {
+                    graph_id: quad.graph,
+                    actor,
+                },
+            )
+            .unwrap();
+        let dot = Dot { actor, counter };
+        store.add_quad(&mut batch, QuadAdd { quad, dot }).unwrap();
+        let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
+        clock.advance(actor, counter);
+        store
+            .set_vector_clock_by_id(
+                &mut batch,
+                ClockUpdate {
+                    graph_id: quad.graph,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        dot
+    }
+
     fn insert_quad(
         store: &GraphStore,
         graph: &GraphId,
@@ -3175,22 +3217,15 @@ mod tests {
             store.create_graph(graph).unwrap();
         }
         let mut batch = store.new_batch();
-        let graph_id = store
-            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
-            .unwrap();
-        let subject_id = store.resolve_term(subject).unwrap();
-        let predicate_id = store.resolve_term(predicate).unwrap();
-        let object_id = store.resolve_term(object).unwrap();
-        store
-            .insert_quad(
-                &mut batch,
-                graph_id,
-                subject_id,
-                predicate_id,
-                object_id,
-                &dot,
-            )
-            .unwrap();
+        let quad = EncodedQuad {
+            graph: store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap(),
+            subject: store.resolve_term(subject).unwrap(),
+            predicate: store.resolve_term(predicate).unwrap(),
+            object: store.resolve_term(object).unwrap(),
+        };
+        store.add_quad(&mut batch, QuadAdd { quad, dot }).unwrap();
         store.commit(batch).unwrap();
     }
 
@@ -3287,13 +3322,17 @@ mod tests {
         witnessed.advance(actor, 1);
         let mut batch = store.new_batch();
         store
-            .remove_quad(
+            .retract_quad(
                 &mut batch,
-                graph_id,
-                subject_id,
-                predicate_id,
-                object_id,
-                &witnessed,
+                QuadRemove {
+                    quad: EncodedQuad {
+                        graph: graph_id,
+                        subject: subject_id,
+                        predicate: predicate_id,
+                        object: object_id,
+                    },
+                    witnessed: &witnessed,
+                },
             )
             .unwrap();
         store.commit(batch).unwrap();
@@ -3323,9 +3362,16 @@ mod tests {
             ))
             .unwrap();
 
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
         let mut batch = store.new_batch();
-        store.enqueue_fts(&mut batch, &graph, subject).unwrap();
-        store.enqueue_fts(&mut batch, &graph, subject).unwrap();
+        store
+            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .unwrap();
+        store
+            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .unwrap();
         store.commit(batch).unwrap();
 
         let queued = store.drain_fts_queue(10).unwrap();
@@ -3340,8 +3386,11 @@ mod tests {
         let graph = GraphId::new("urn:test:graph");
         store.create_graph(&graph).unwrap();
 
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
         let mut batch = store.new_batch();
-        store.enqueue_fts_reindex(&mut batch, &graph).unwrap();
+        store.enqueue_fts_reindex_by_id(&mut batch, graph_id).unwrap();
         store.commit(batch).unwrap();
 
         let queued = store.drain_fts_reindex_queue(10).unwrap();
@@ -3349,6 +3398,541 @@ mod tests {
         assert_eq!(queued[0].0, graph);
         store.acknowledge_fts_reindex_queue(&queued).unwrap();
         assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+    }
+
+    // ── WS0-T1 / T2: commit guard and prompt index repair ───────────────
+
+    /// Concurrent adds to one quad must each contribute a distinct dot (G1).
+    ///
+    /// Without the commit guard the `next_counter` read-then-write and the
+    /// `add_quad` read-modify-write of the dot set interleave, so two writers
+    /// mint the same counter and one add is lost.
+    #[test]
+    fn parallel_commits_keep_the_dot_set_intact() {
+        const WRITERS: usize = 8;
+        const ADDS_PER_WRITER: usize = 25;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open(dir.path()).unwrap());
+        let graph = GraphId::new("urn:test:parallel-commits");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+
+        std::thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                let store = Arc::clone(&store);
+                let graph = graph.clone();
+                scope.spawn(move || {
+                    for _ in 0..ADDS_PER_WRITER {
+                        commit_add(&store, &graph, quad);
+                    }
+                });
+            }
+        });
+
+        let snapshot = store.graph_snapshot(&graph).unwrap();
+        assert_eq!(1, snapshot.quads.len(), "all writers target the same quad");
+
+        let dots = &snapshot.quads[0].dots;
+        assert_eq!(
+            WRITERS * ADDS_PER_WRITER,
+            dots.len(),
+            "every add must contribute its own dot; a shorter set means adds were lost"
+        );
+        let unique: HashSet<(ActorId, u64)> =
+            dots.iter().map(|dot| (dot.actor, dot.counter)).collect();
+        assert_eq!(dots.len(), unique.len(), "two adds shared a dot");
+
+        // Every minted counter is reflected in the graph clock (G2).
+        let clock = store.get_vector_clock(&graph).unwrap();
+        let clocked: u64 = clock.0.values().sum();
+        assert_eq!(dots.len() as u64, clocked);
+    }
+
+    /// The self-guarding store functions take their own guard, so calling them
+    /// concurrently — including on graphs that share a lock shard — must make
+    /// progress rather than deadlock.
+    #[test]
+    fn self_guarding_functions_do_not_deadlock() {
+        const THREADS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open(dir.path()).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    // Two threads per graph, so the same shard is contended.
+                    let graph = GraphId::new(&format!("urn:test:self-guard:{}", index % 4));
+                    for round in 0..20u64 {
+                        store.create_graph(&graph).unwrap();
+                        store
+                            .set_graph_policy(&graph, &GraphPolicy::default())
+                            .unwrap();
+                        store
+                            .set_irokle_topic_id(&graph, [(index * 32 + round as usize) as u8; 32])
+                            .unwrap();
+                        store
+                            .set_graph_context(
+                                &graph,
+                                Some("{}"),
+                                ContextTag {
+                                    counter: round + 1,
+                                    actor: ActorId::random(),
+                                },
+                            )
+                            .unwrap();
+                        store.set_graph_tombstone(&graph).unwrap();
+                        store.delete_graph(&graph).unwrap();
+                    }
+                    tx.send(index).unwrap();
+                })
+            })
+            .collect();
+        drop(tx);
+
+        for _ in 0..THREADS {
+            rx.recv_timeout(std::time::Duration::from_secs(120))
+                .expect("self-guarding store functions deadlocked");
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    /// Prompt-repair proof: a commit that trips the anomaly check rebuilds the
+    /// index from the store before it returns, so unrelated drift is gone by
+    /// the time the caller sees the result — not "at next restart".
+    #[test]
+    fn index_anomaly_is_repaired_by_the_detecting_commit() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:index-anomaly");
+        store.create_graph(&graph).unwrap();
+
+        let removed = encode_quad(&store, &graph, ("urn:s1", "urn:p", "urn:o1"));
+        let collateral = encode_quad(&store, &graph, ("urn:s2", "urn:p", "urn:o2"));
+        let removed_dot = commit_add(&store, &graph, removed);
+        commit_add(&store, &graph, collateral);
+        assert!(store.index_contains(removed));
+        assert!(store.index_contains(collateral));
+
+        // Simulate drift: both quads vanish from the index while the store
+        // still holds them.
+        store.corrupt_index_for_test(removed);
+        store.corrupt_index_for_test(collateral);
+        assert!(!store.index_contains(removed));
+        assert!(!store.index_contains(collateral));
+
+        // Retracting `removed` makes the index remove find nothing -> anomaly.
+        let mut witnessed = VectorClock::new();
+        witnessed.advance(removed_dot.actor, removed_dot.counter);
+        let _commit_guard = store.graph_commit_guard(&graph);
+        let mut batch = store.new_batch();
+        assert!(
+            store
+                .retract_quad(
+                    &mut batch,
+                    QuadRemove {
+                        quad: removed,
+                        witnessed: &witnessed,
+                    },
+                )
+                .unwrap()
+        );
+        store.commit(batch).unwrap();
+
+        assert!(
+            store.index_contains(collateral),
+            "the detecting commit must rebuild the index, restoring unrelated drift"
+        );
+        assert!(
+            !store.index_contains(removed),
+            "the rebuilt index must match the store, where the quad is gone"
+        );
+        assert!(!store.contains_quad(removed));
+        assert!(store.contains_quad(collateral));
+    }
+
+    // ── WS0-T6: FTS queue tokens across restarts (K4) ───────────────────
+
+    /// A reindex token issued before a restart must never acknowledge a
+    /// subject entry queued after it. With the counter restarting at 1 the
+    /// post-restart entry gets a lower token and is silently dropped without
+    /// tantivy ever having indexed the subject.
+    #[test]
+    fn fts_tokens_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:fts-token-restart");
+
+        let reindex_token = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let graph_id = store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap();
+
+            let mut batch = store.new_batch();
+            for name in ["urn:pre1", "urn:pre2", "urn:pre3"] {
+                let subject = store.resolve_term(&named(name)).unwrap();
+                store
+                    .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+                    .unwrap();
+            }
+            store.enqueue_fts_reindex_by_id(&mut batch, graph_id).unwrap();
+            store.commit(batch).unwrap();
+            store.persist().unwrap();
+
+            let queued = store.drain_fts_reindex_queue(10).unwrap();
+            assert_eq!(1, queued.len());
+            // The pre-restart subject entries are legitimately covered.
+            store
+                .acknowledge_fts_subjects_for_reindexed_graphs(&queued)
+                .unwrap();
+            assert!(store.drain_fts_queue(10).unwrap().is_empty());
+            queued[0].1
+        };
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        assert!(
+            store.current_dirty_token() > reindex_token,
+            "the token counter must resume past every live queue token"
+        );
+
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let subject = store.resolve_term(&named("urn:post-restart")).unwrap();
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        let reindex_queued = store.drain_fts_reindex_queue(10).unwrap();
+        assert_eq!(vec![(graph.clone(), reindex_token)], reindex_queued);
+        store
+            .acknowledge_fts_subjects_for_reindexed_graphs(&reindex_queued)
+            .unwrap();
+
+        let remaining = store.drain_fts_queue(10).unwrap();
+        assert_eq!(
+            1,
+            remaining.len(),
+            "a subject queued after the reindex must survive its acknowledgement"
+        );
+        assert_eq!(subject, remaining[0].1);
+    }
+
+    // ── WS0-T3: vector-clock key split ──────────────────────────────────
+
+    #[test]
+    fn clock_split_migration() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:clock-migration");
+        store.create_graph(&graph).unwrap();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+
+        // A store written before the split: the clock lives inside the meta
+        // record and there is no 'K' key.
+        let legacy_actor = ActorId::random();
+        let mut legacy_clock = VectorClock::new();
+        legacy_clock.advance(legacy_actor, 7);
+        let mut meta = store.read_graph_meta_by_id(graph_id).unwrap().unwrap();
+        meta.clock = legacy_clock.clone();
+        let mut batch = store.new_batch();
+        batch.insert(
+            &store.graphs,
+            graph_meta_key(graph_id),
+            postcard::to_allocvec(&meta).unwrap(),
+        );
+        store.commit(batch).unwrap();
+        assert!(store.graphs.get(graph_clock_key(graph_id)).unwrap().is_none());
+
+        assert_eq!(legacy_clock, store.get_vector_clock(&graph).unwrap());
+
+        // The first clock write creates 'K', which wins from then on.
+        let mut fresh = legacy_clock.clone();
+        fresh.advance(legacy_actor, 9);
+        let mut batch = store.new_batch();
+        store
+            .set_vector_clock_by_id(
+                &mut batch,
+                ClockUpdate {
+                    graph_id,
+                    clock: &fresh,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        assert_eq!(fresh, store.get_vector_clock(&graph).unwrap());
+        // The clock write must not have touched the metadata record.
+        let meta_after = store.read_graph_meta_by_id(graph_id).unwrap().unwrap();
+        assert_eq!(legacy_clock, meta_after.clock);
+    }
+
+    #[test]
+    fn deleted_graph_clock_not_resurrected() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:clock-resurrection");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        assert!(!store.get_vector_clock(&graph).unwrap().0.is_empty());
+
+        store.delete_graph(&graph).unwrap();
+        assert_eq!(VectorClock::new(), store.get_vector_clock(&graph).unwrap());
+
+        store.create_graph(&graph).unwrap();
+        assert_eq!(
+            VectorClock::new(),
+            store.get_vector_clock(&graph).unwrap(),
+            "a recreated graph must not inherit the deleted graph's clock"
+        );
+        assert!(store.graph_diagnostics(&graph).unwrap().orphaned_entities.is_empty());
+    }
+
+    // ── WS0-T5: persisted, clock-tagged diagnostics (K6) ────────────────
+
+    /// Attach `entity` to the graph as a data entity that is *not* reachable
+    /// from the root, i.e. an orphan.
+    fn commit_orphan(store: &GraphStore, graph: &GraphId, entity: &str) {
+        let quad = encode_quad(
+            store,
+            graph,
+            (
+                entity,
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://schema.org/MediaObject",
+            ),
+        );
+        commit_add(store, graph, quad);
+    }
+
+    #[test]
+    fn diagnostics_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:diagnostics-reopen");
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            commit_orphan(&store, &graph, "urn:orphan:a");
+            assert_eq!(
+                vec!["urn:orphan:a".to_string()],
+                store.graph_diagnostics(&graph).unwrap().orphaned_entities
+            );
+            store.persist().unwrap();
+        }
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(
+            0,
+            store.diagnostics_compute_count(),
+            "opening with a matching clock tag must reuse the persisted record"
+        );
+        assert_eq!(
+            vec!["urn:orphan:a".to_string()],
+            store.graph_diagnostics(&graph).unwrap().orphaned_entities
+        );
+        assert_eq!(
+            0,
+            store.diagnostics_compute_count(),
+            "reads with a matching tag must not recompute either"
+        );
+    }
+
+    /// Quads committed without a diagnostics refresh — what a crash between the
+    /// quad commit and the diagnostics write leaves behind — must be repaired
+    /// promptly: at open, and by any read that sees the stale tag.
+    #[test]
+    fn diagnostics_repaired_promptly_after_simulated_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:diagnostics-crash");
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            commit_orphan(&store, &graph, "urn:orphan:known");
+            assert_eq!(
+                vec!["urn:orphan:known".to_string()],
+                store.graph_diagnostics(&graph).unwrap().orphaned_entities
+            );
+
+            // A raw commit: quads and clock advance durably, diagnostics never
+            // refreshed. The persisted record now describes an older state.
+            let quad = encode_quad(
+                &store,
+                &graph,
+                (
+                    "urn:orphan:crashed",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://schema.org/MediaObject",
+                ),
+            );
+            let actor = ActorId::random();
+            let mut batch = store.new_batch();
+            let counter = store
+                .next_counter_by_id(
+                    &mut batch,
+                    CounterKey {
+                        graph_id: quad.graph,
+                        actor,
+                    },
+                )
+                .unwrap();
+            store
+                .add_quad(
+                    &mut batch,
+                    QuadAdd {
+                        quad,
+                        dot: Dot { actor, counter },
+                    },
+                )
+                .unwrap();
+            let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
+            clock.advance(actor, counter);
+            store
+                .set_vector_clock_by_id(
+                    &mut batch,
+                    ClockUpdate {
+                        graph_id: quad.graph,
+                        clock: &clock,
+                    },
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+            store.persist().unwrap();
+        }
+
+        let expected = vec![
+            "urn:orphan:crashed".to_string(),
+            "urn:orphan:known".to_string(),
+        ];
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            // Open repaired it: exactly one graph had a stale tag.
+            assert_eq!(
+                1,
+                store.diagnostics_compute_count(),
+                "open must detect the stale clock tag and recompute"
+            );
+            assert_eq!(
+                expected,
+                store.graph_diagnostics(&graph).unwrap().orphaned_entities
+            );
+            assert_eq!(
+                1,
+                store.diagnostics_compute_count(),
+                "the read is served from the record open repaired"
+            );
+
+            // Repair on read: dirty the graph again without refreshing
+            // diagnostics, then read. The clock tag no longer matches, so the
+            // reader must recompute rather than serve the stale set.
+            commit_orphan(&store, &graph, "urn:orphan:later");
+            assert_eq!(
+                vec![
+                    "urn:orphan:crashed".to_string(),
+                    "urn:orphan:known".to_string(),
+                    "urn:orphan:later".to_string(),
+                ],
+                store.graph_diagnostics(&graph).unwrap().orphaned_entities
+            );
+            assert_eq!(2, store.diagnostics_compute_count());
+            store.persist().unwrap();
+        }
+
+        // And the repair is durable: the next open has nothing to fix.
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(
+            0,
+            reopened.diagnostics_compute_count(),
+            "the previous run must have persisted a correctly tagged record"
+        );
+    }
+
+    // ── WS0-T7: durability under the new fjall configuration (G10) ──────
+
+    #[test]
+    fn reopen_full_fingerprint_equality() {
+        const ENTITIES: usize = 2_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:reopen-fingerprint");
+
+        let (fingerprint, snapshot) = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let graph_id = store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap();
+            let actor = ActorId::random();
+
+            let _commit_guard = store.graph_commit_guard(&graph);
+            let mut batch = store.new_batch();
+            let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+            for index in 0..ENTITIES {
+                let counter = store
+                    .next_counter_by_id(&mut batch, CounterKey { graph_id, actor })
+                    .unwrap();
+                let quad = EncodedQuad {
+                    graph: graph_id,
+                    subject: store
+                        .resolve_term(&named(&format!("urn:bulk:s{index}")))
+                        .unwrap(),
+                    predicate: store.resolve_term(&named("http://schema.org/name")).unwrap(),
+                    object: store
+                        .resolve_term(&EncodedTerm(format!("\"entity {index}\"")))
+                        .unwrap(),
+                };
+                store
+                    .add_quad(
+                        &mut batch,
+                        QuadAdd {
+                            quad,
+                            dot: Dot { actor, counter },
+                        },
+                    )
+                    .unwrap();
+                clock.advance(actor, counter);
+            }
+            store
+                .set_vector_clock_by_id(&mut batch, ClockUpdate { graph_id, clock: &clock })
+                .unwrap();
+            store.commit(batch).unwrap();
+            store.persist().unwrap();
+
+            let mut snapshot = store.graph_snapshot(&graph).unwrap();
+            snapshot.quads.sort_by(|left, right| {
+                (&left.subject, &left.predicate, &left.object).cmp(&(
+                    &right.subject,
+                    &right.predicate,
+                    &right.object,
+                ))
+            });
+            (store.graph_fingerprint(&graph).unwrap(), snapshot)
+        };
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(fingerprint, reopened.graph_fingerprint(&graph).unwrap());
+        assert_eq!(ENTITIES as u64, fingerprint.0);
+
+        let mut reopened_snapshot = reopened.graph_snapshot(&graph).unwrap();
+        reopened_snapshot.quads.sort_by(|left, right| {
+            (&left.subject, &left.predicate, &left.object).cmp(&(
+                &right.subject,
+                &right.predicate,
+                &right.object,
+            ))
+        });
+        assert_eq!(snapshot, reopened_snapshot);
     }
 
     #[test]
@@ -3362,9 +3946,14 @@ mod tests {
             ))
             .unwrap();
 
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
         let mut batch = store.new_batch();
-        store.enqueue_fts(&mut batch, &graph, subject).unwrap();
-        store.enqueue_fts_reindex(&mut batch, &graph).unwrap();
+        store
+            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .unwrap();
+        store.enqueue_fts_reindex_by_id(&mut batch, graph_id).unwrap();
         store.commit(batch).unwrap();
 
         store.clear_fts_queue_for_graph(&graph).unwrap();
