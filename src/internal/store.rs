@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -77,7 +77,33 @@ const TERM_DECODE_CACHE_CAP: usize = 1_000_000;
 const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
 const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const MAX_DB_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
-const WRITE_HEAVY_MEMTABLE_BYTES: u64 = 1_024 * 1_024 * 1_024;
+/// Memtable ceiling for the append-heavy keyspaces (`quads`, `log`).
+///
+/// This is the *only* knob that makes fjall 3.1.6 flush at all, and therefore
+/// the only knob that lets a journal be reclaimed: journal rotation and the
+/// `max_journaling_size` eviction both live inside the flush worker's message
+/// handler, which is reached solely from `check_memtable_rotate`, i.e. from a
+/// memtable exceeding this value. The previous 1 GiB never filled — the `quads`
+/// keyspace is ~84 MB at 40,000 graphs — so nothing ever flushed, the store held
+/// zero SSTables and the single journal grew with total write churn, making cold
+/// start O(bytes ever written) rather than O(data) (findings C1/C2).
+const WRITE_HEAVY_MEMTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
+/// Memtable ceiling for the point-read keyspaces (`terms`, `graphs`).
+///
+/// Deliberately smaller than [`WRITE_HEAVY_MEMTABLE_BYTES`]: a journal file is
+/// only deleted once *every* keyspace holding a watermark in it has flushed, so
+/// a lightly written keyspace sitting on a large memtable pins journals that the
+/// busy keyspaces have long since flushed past.
+const POINT_READ_MEMTABLE_BYTES: u64 = 32 * 1_024 * 1_024;
+/// Ceiling on retained journal bytes, and hence on crash-recovery replay.
+///
+/// fjall rotates a journal file at a hard-coded ~61 MiB and only then checks
+/// this budget, so this is the tightest value that still bounds anything: the
+/// check fires on essentially every rotation and leaves just the active file
+/// behind. Replay is therefore bounded by one journal file (~2 s at the ~31
+/// ms/MiB this store replays at) instead of growing until the old 16 GiB
+/// ceiling forced a rotation.
+const MAX_JOURNALING_BYTES: u64 = 64 * 1_024 * 1_024;
 const WRITE_HEAVY_TABLE_TARGET_BYTES: u64 = 256 * 1_024 * 1_024;
 const WRITE_HEAVY_L0_THRESHOLD: u8 = 12;
 const WRITE_HEAVY_LEVEL_RATIO: f32 = 20.0;
@@ -376,6 +402,17 @@ impl DerivedIndexState {
 struct StoredDiagnostics {
     diagnostics: GraphDiagnostics,
     at_clock: VectorClock,
+}
+
+/// The interned ids of the four vocabulary terms orphan detection matches on.
+///
+/// `None` means the term was never interned, so no stored quad can mention it.
+struct OrphanVocab {
+    rdf_type: Option<TermId>,
+    /// `schema:Dataset` and `schema:MediaObject` — the two types that make a
+    /// non-root subject a data entity.
+    data_types: [Option<TermId>; 2],
+    has_part: Option<TermId>,
 }
 
 pub struct GraphStore {
@@ -1001,19 +1038,104 @@ impl GraphStore {
         self.diagnostics_computed.load(Ordering::Relaxed)
     }
 
+    /// The vocabulary term ids orphan detection matches on.
+    ///
+    /// `None` means the term was never interned, so no stored quad can mention
+    /// it and the branch that tests for it simply never fires.
+    fn orphan_vocab(&self) -> Result<OrphanVocab> {
+        let id = |named_node: oxrdf::NamedNode| {
+            self.lookup_term(&EncodedTerm::from_named_node(&named_node))
+        };
+        Ok(OrphanVocab {
+            rdf_type: id(crate::core::vocab::rdf_type())?,
+            data_types: [
+                id(crate::core::vocab::schema_dataset())?,
+                id(crate::core::vocab::schema_media_object())?,
+            ],
+            has_part: id(crate::core::vocab::schema_has_part())?,
+        })
+    }
+
+    /// Term ids of the graph's orphaned data entities.
+    ///
+    /// Evaluates [`crate::rules::orphaned_data_entities`] entirely on term ids
+    /// against the in-memory index: nothing is decoded, so the cost is a handful
+    /// of integer comparisons per stored triple instead of three `String` clones
+    /// plus hashing of full IRIs. The rule is the specification and the two are
+    /// cross-checked on generated graph shapes by
+    /// `orphan_entity_ids_matches_the_rule`; recomputation is on the hot path of
+    /// every write that defers its diagnostics refresh, where the decoding
+    /// version cost 74ms on a 10,000-entity crate.
+    ///
+    /// The crate root is the graph term itself, so its term id *is* `graph_id`.
+    fn orphaned_entity_ids(&self, graph_id: TermId, vocab: &OrphanVocab) -> HashSet<TermId> {
+        let mut data_entities: HashSet<TermId> = HashSet::new();
+        let mut adjacency: HashMap<TermId, Vec<TermId>> = HashMap::new();
+        {
+            // Guards IndexState for the single pass over the graph's triples.
+            let indexes = self.indexes_read();
+            let Some(subjects) = indexes.graph_subjects.get(&graph_id) else {
+                return HashSet::new();
+            };
+            for &subject in subjects {
+                let Some(entries) = indexes.by_graph_subject.get(&(graph_id, subject)) else {
+                    continue;
+                };
+                for &(predicate, object) in entries {
+                    if vocab.has_part == Some(predicate) {
+                        adjacency.entry(subject).or_default().push(object);
+                        if subject != graph_id {
+                            data_entities.insert(subject);
+                        }
+                        if object != graph_id {
+                            data_entities.insert(object);
+                        }
+                    }
+                    if vocab.rdf_type == Some(predicate)
+                        && subject != graph_id
+                        && vocab.data_types.contains(&Some(object))
+                    {
+                        data_entities.insert(subject);
+                    }
+                }
+            }
+        }
+
+        if data_entities.is_empty() {
+            return HashSet::new();
+        }
+
+        let mut reachable: HashSet<TermId> = HashSet::from([graph_id]);
+        let mut queue: VecDeque<TermId> = VecDeque::from([graph_id]);
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in adjacency.get(&current).into_iter().flatten() {
+                if reachable.insert(neighbor) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        data_entities.retain(|entity| !reachable.contains(entity));
+        data_entities
+    }
+
     fn compute_graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
         self.diagnostics_computed.fetch_add(1, Ordering::Relaxed);
-        let snapshot = crate::rules::GraphSnapshot::from_store(self, graph)?;
-        Ok(GraphDiagnostics::from_orphaned_entities(
-            crate::rules::orphaned_data_entities(&snapshot)
-                .into_iter()
-                .map(|term| {
-                    term.to_named_node()
-                        .map(|named_node| named_node.as_str().to_string())
-                        .unwrap_or(term.0)
-                })
-                .collect(),
-        ))
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphDiagnostics::default());
+        };
+        let orphans = self.orphaned_entity_ids(graph_id, &self.orphan_vocab()?);
+        // Only the orphans are decoded; the common case is none at all.
+        let mut entities = Vec::with_capacity(orphans.len());
+        for orphan in orphans {
+            let term = self.decode_term_arc(orphan)?;
+            entities.push(
+                term.to_named_node()
+                    .map(|named_node| named_node.as_str().to_string())
+                    .unwrap_or_else(|| term.0.clone()),
+            );
+        }
+        Ok(GraphDiagnostics::from_orphaned_entities(entities))
     }
 
     /// Open-time repair pass for the persisted diagnostics (register row 4).
@@ -1478,11 +1600,17 @@ impl GraphStore {
         // durability behaviour to an unstable option; per-keyspace
         // `max_memtable_size` below still bounds memtable growth, so the
         // durability contract (G10) is unchanged.
+        //
+        // `max_journaling_size` and `max_memtable_size` only bound replay
+        // *together*: measured over a 40,000-graph corpus, capping the journal
+        // alone left 218 MiB of journal and an 8.7 s reopen, because the
+        // eviction that enforces the cap only runs after a flush and the 1 GiB
+        // memtables never produced one. See [`MAX_JOURNALING_BYTES`].
         let db = Database::builder(path.as_ref())
             .manual_journal_persist(true)
             .cache_size(recommended_db_cache_bytes())
             .journal_compression(CompressionType::None)
-            .max_journaling_size(16 * 1_024 * 1_024 * 1_024)
+            .max_journaling_size(MAX_JOURNALING_BYTES)
             .worker_threads(worker_threads)
             .open()?;
         Self::from_database_with_persist_mode(db, persist_mode)
@@ -1499,7 +1627,7 @@ impl GraphStore {
         let point_read_heavy = || {
             KeyspaceCreateOptions::default()
                 .expect_point_read_hits(true)
-                .max_memtable_size(256 * 1_024 * 1_024)
+                .max_memtable_size(POINT_READ_MEMTABLE_BYTES)
         };
         let write_heavy = || {
             KeyspaceCreateOptions::default()
@@ -3951,6 +4079,109 @@ mod tests {
             ),
         );
         commit_add(store, graph, quad);
+    }
+
+    /// The id-based orphan pass in [`GraphStore::compute_graph_diagnostics`] is
+    /// an optimisation of `rules::orphaned_data_entities`, so it has to agree
+    /// with it on every shape that distinguishes them: reachable and unreachable
+    /// entities, chains, `hasPart` cycles, entities that are only ever a
+    /// `hasPart` object, typed non-data entities, and the root itself (which is
+    /// never an orphan). Consistency outranks speed — if these ever diverge, the
+    /// rule is right and this test is the thing that says so.
+    #[test]
+    fn orphan_entity_ids_matches_the_rule() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:orphan-parity");
+        store.create_graph(&graph).unwrap();
+
+        let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let has_part = "http://schema.org/hasPart";
+        let media = "http://schema.org/MediaObject";
+        let dataset = "http://schema.org/Dataset";
+        let person = "http://schema.org/Person";
+        let root = graph.as_str().to_string();
+
+        for triple in [
+            // Reachable in one hop.
+            (root.as_str(), has_part, "urn:e:reachable"),
+            ("urn:e:reachable", rdf_type, media),
+            // Reachable through a two-hop chain.
+            ("urn:e:reachable", has_part, "urn:e:grandchild"),
+            ("urn:e:grandchild", rdf_type, media),
+            // Typed data entity nothing points at.
+            ("urn:e:orphan", rdf_type, media),
+            // Orphan that is a Dataset rather than a MediaObject.
+            ("urn:e:orphan-dataset", rdf_type, dataset),
+            // A `hasPart` cycle with no path from the root: both ends orphaned,
+            // and both count as data entities purely from the edge.
+            ("urn:e:cycle-a", has_part, "urn:e:cycle-b"),
+            ("urn:e:cycle-b", has_part, "urn:e:cycle-a"),
+            // Only ever a `hasPart` object, never typed, and unreachable.
+            ("urn:e:orphan-parent", has_part, "urn:e:untyped-child"),
+            // Typed as something that is not a data entity: never an orphan.
+            ("urn:e:person", rdf_type, person),
+            // The root's own type must not make the root an orphan.
+            (root.as_str(), rdf_type, dataset),
+        ] {
+            let quad = encode_quad(&store, &graph, triple);
+            commit_add(&store, &graph, quad);
+        }
+
+        let snapshot = crate::rules::GraphSnapshot::from_store(&store, &graph).unwrap();
+        let expected = GraphDiagnostics::from_orphaned_entities(
+            crate::rules::orphaned_data_entities(&snapshot)
+                .into_iter()
+                .map(|term| {
+                    term.to_named_node()
+                        .map(|named_node| named_node.as_str().to_string())
+                        .unwrap_or(term.0)
+                })
+                .collect(),
+        );
+
+        assert!(
+            expected.has_orphans(),
+            "the fixture must actually produce orphans, or this proves nothing"
+        );
+        assert_eq!(
+            expected,
+            store.compute_graph_diagnostics(&graph).unwrap(),
+            "the id-based orphan pass disagrees with rules::orphaned_data_entities"
+        );
+    }
+
+    /// A graph with no orphans at all must also agree, and must not invent one
+    /// for the root.
+    #[test]
+    fn orphan_entity_ids_matches_the_rule_when_orphan_free() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:orphan-parity-clean");
+        store.create_graph(&graph).unwrap();
+
+        let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let has_part = "http://schema.org/hasPart";
+        let media = "http://schema.org/MediaObject";
+        let root = graph.as_str().to_string();
+
+        for triple in [
+            (root.as_str(), rdf_type, "http://schema.org/Dataset"),
+            (root.as_str(), has_part, "urn:e:one"),
+            ("urn:e:one", rdf_type, media),
+            ("urn:e:one", has_part, "urn:e:two"),
+            ("urn:e:two", rdf_type, media),
+        ] {
+            let quad = encode_quad(&store, &graph, triple);
+            commit_add(&store, &graph, quad);
+        }
+
+        let snapshot = crate::rules::GraphSnapshot::from_store(&store, &graph).unwrap();
+        assert!(crate::rules::orphaned_data_entities(&snapshot).is_empty());
+        assert!(
+            !store
+                .compute_graph_diagnostics(&graph)
+                .unwrap()
+                .has_orphans()
+        );
     }
 
     #[test]
