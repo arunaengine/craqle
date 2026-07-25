@@ -673,6 +673,8 @@ fn opening_with_irokle_replays_durable_graph_events() {
     }));
 }
 
+/// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+#[cfg(feature = "search")]
 #[test]
 fn search_filters_private_graphs_by_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -736,6 +738,8 @@ fn search_filters_private_graphs_by_policy() {
     assert_eq!(writer_hits.len(), 2);
 }
 
+/// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+#[cfg(feature = "search")]
 #[test]
 fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
     let dir = tempfile::tempdir().unwrap();
@@ -819,6 +823,8 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
 /// The large-set path of `search_graphs` swaps one search-per-graph for a
 /// single search with an index-side graph filter (finding R8). Both paths must
 /// return the same graph-restricted, policy-respecting page.
+/// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+#[cfg(feature = "search")]
 #[test]
 fn search_graphs_agrees_across_the_per_graph_threshold() {
     let dir = tempfile::tempdir().unwrap();
@@ -905,6 +911,8 @@ fn search_graphs_agrees_across_the_per_graph_threshold() {
     );
 }
 
+/// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+#[cfg(feature = "search")]
 #[test]
 fn search_hits_can_be_hydrated_from_rdf() {
     let dir = tempfile::tempdir().unwrap();
@@ -1005,18 +1013,21 @@ fn cluster_sync_converges_through_public_api() {
     let exported = cluster.peer(1).export_rocrate(&anonymous, &graph).unwrap();
     assert!(exported.contains("Cluster File"));
 
-    cluster.reindex_search().unwrap();
-    let hits = cluster
-        .peer(1)
-        .search(
-            &anonymous,
-            SearchRequest {
-                query: "cluster",
-                limit: 10,
-            },
-        )
-        .unwrap();
-    assert!(!hits.is_empty());
+    #[cfg(feature = "search")]
+    {
+        cluster.reindex_search().unwrap();
+        let hits = cluster
+            .peer(1)
+            .search(
+                &anonymous,
+                SearchRequest {
+                    query: "cluster",
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert!(!hits.is_empty());
+    }
 
     cluster.partition(0, 1);
     cluster.heal(0, 1);
@@ -1092,17 +1103,20 @@ fn cluster_query_options_can_fan_out_across_peers() {
     };
     assert!(federated_rows.len() > local_rows.len());
 
-    cluster.flush_search_updates().unwrap();
-    let hits = cluster
-        .search_from_peer(
-            0,
-            &anonymous,
-            "peer",
-            10,
-            QueryOptions { local_only: false },
-        )
-        .unwrap();
-    assert!(hits.iter().any(|hit| hit.graph_id == "urn:test:peer1"));
+    #[cfg(feature = "search")]
+    {
+        cluster.flush_search_updates().unwrap();
+        let hits = cluster
+            .search_from_peer(
+                0,
+                &anonymous,
+                "peer",
+                10,
+                QueryOptions { local_only: false },
+            )
+            .unwrap();
+        assert!(hits.iter().any(|hit| hit.graph_id == "urn:test:peer1"));
+    }
 }
 
 #[test]
@@ -1175,25 +1189,28 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
             .any(|name| name.contains("Private Federated Dataset"))
     );
 
-    cluster.flush_search_updates().unwrap();
-    let hits = cluster
-        .search_from_peer(
-            0,
-            &anonymous,
-            "federated",
-            10,
-            QueryOptions { local_only: false },
-        )
-        .unwrap();
-    assert!(
-        hits.iter()
-            .any(|hit| hit.graph_id == "urn:test:federated-public")
-    );
-    assert!(
-        !hits
-            .iter()
-            .any(|hit| hit.graph_id == "urn:test:federated-private")
-    );
+    #[cfg(feature = "search")]
+    {
+        cluster.flush_search_updates().unwrap();
+        let hits = cluster
+            .search_from_peer(
+                0,
+                &anonymous,
+                "federated",
+                10,
+                QueryOptions { local_only: false },
+            )
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.graph_id == "urn:test:federated-public")
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|hit| hit.graph_id == "urn:test:federated-private")
+        );
+    }
 }
 
 #[test]

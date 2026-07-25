@@ -1440,6 +1440,7 @@ fn materialize_graph_target_removals(
 mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
+    #[cfg(feature = "search")]
     use crate::search::QueueBound;
     use crate::store::{EncodedQuad, FtsSubject, QuadAdd};
     use oxrdf::{Literal, Term};
@@ -2282,6 +2283,9 @@ mod tests {
         assert!(matches!(changes[1], MaterializedQuadChange::Insert { .. }));
     }
 
+    /// Needs a real tantivy index: the `search`-off stub returns no hits,
+    /// which would make the FTS SERVICE clause bind nothing at all.
+    #[cfg(feature = "search")]
     #[test]
     fn service_fts_binds_hits_and_scores() {
         let (_dir, store, search, engine) = setup_engine();
@@ -2345,6 +2349,9 @@ mod tests {
         );
     }
 
+    /// Needs a real tantivy index: the `search`-off stub returns no hits,
+    /// which would make the FTS SERVICE clause bind nothing at all.
+    #[cfg(feature = "search")]
     #[test]
     fn service_fts_respects_visibility_predicate() {
         let (_dir, store, search, engine) = setup_engine();

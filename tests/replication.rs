@@ -533,8 +533,12 @@ mod tests {
         assert!(violation_messages(&net, 0, &graph).is_empty());
         assert!(violation_messages(&net, 1, &graph).is_empty());
 
-        assert!(!reindex_and_search(&net, 0, "updated").is_empty());
-        assert!(!reindex_and_search(&net, 1, "improved").is_empty());
+        // Search needs a real tantivy index; the rest of the scenario does not.
+        #[cfg(feature = "search")]
+        {
+            assert!(!reindex_and_search(&net, 0, "updated").is_empty());
+            assert!(!reindex_and_search(&net, 1, "improved").is_empty());
+        }
     }
 
     #[test]
