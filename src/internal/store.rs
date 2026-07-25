@@ -4548,7 +4548,7 @@ mod tests {
         let predicate =
             EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:p"));
         for index in 0..2_000u64 {
-            let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(&format!(
+            let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(format!(
                 "urn:test:s{index}"
             )));
             insert_quad(
