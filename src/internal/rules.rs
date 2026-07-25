@@ -1845,11 +1845,10 @@ mod tests {
             }
         }
 
-        /// The second fast path: a validated write on an orphan-free graph is
-        /// declared orphan-free without reading the store. It must still land on
-        /// the set a recompute would produce.
+        /// A validated write that touches reachability derives its orphan set
+        /// rather than inheriting one from validation.
         #[test]
-        fn validated_orphan_free_fast_path_agrees_with_a_full_recompute() {
+        fn validated_write_touching_reachability_derives_the_orphan_set() {
             let graph = GraphId::new("urn:test:fast-path-validated");
             let dir = tempfile::tempdir().unwrap();
             let (store, engine) = engine_at(dir.path());
@@ -1868,8 +1867,10 @@ mod tests {
                 .unwrap();
             assert!(!store.graph_diagnostics(&graph).unwrap().has_orphans());
 
-            // Reachability *is* touched, so only the validated-orphan-free
-            // branch can skip the recompute here.
+            // Reachability *is* touched, so this must recompute. Trusting
+            // validation to imply orphan-freeness was unsound: two writes that
+            // each validate against the same pre-state can jointly orphan an
+            // entity, and stamping clean recorded that as permanent.
             let grow = inserts(
                 &graph,
                 &[
@@ -1879,10 +1880,9 @@ mod tests {
             );
             let before = store.diagnostics_compute_count();
             engine.local_apply_changes(&graph, grow.clone()).unwrap();
-            assert_eq!(
-                before,
-                store.diagnostics_compute_count(),
-                "a validated write on an orphan-free graph must not recompute"
+            assert!(
+                store.diagnostics_compute_count() > before,
+                "a validated write touching reachability must derive the orphan set, not assume it"
             );
 
             let observed = store.graph_diagnostics(&graph).unwrap();
