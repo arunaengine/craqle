@@ -1577,4 +1577,320 @@ mod tests {
             None
         );
     }
+
+    /// W1 — the diagnostics fast path must agree with a full recompute.
+    ///
+    /// `ReplicationEngine::settle_diagnostics` skips the recompute whenever
+    /// `DeltaSummary::touches_reachability` is clear, and re-stamps the previous
+    /// verdict against the new clock instead. A triple shape that
+    /// `summarize` fails to recognise would therefore persist a *wrong* orphan
+    /// set carrying a matching tag, and nothing ever re-checks such a record —
+    /// not the open-time repair pass, not a later read. These tests drive the
+    /// engine through the same public entry points the node uses and compare
+    /// the verdict it leaves behind against a from-scratch recompute of the
+    /// same final graph, while pinning which side of the branch was taken.
+    mod diagnostics_fast_path {
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::core::{ActorId, GraphDiagnostics};
+        use crate::replication::ReplicationEngine;
+        use crate::search::SearchIndex;
+        use crate::sparql::SparqlEngine;
+        use crate::store::GraphStore;
+
+        type Triple = (EncodedTerm, EncodedTerm, EncodedTerm);
+
+        const CHILD: &str = "urn:test:fast-path:child";
+        const LOOSE: &str = "urn:test:fast-path:loose";
+        const EXTRA: &str = "urn:test:fast-path:extra";
+
+        fn iri(value: &str) -> EncodedTerm {
+            EncodedTerm(format!("<{value}>"))
+        }
+
+        fn text(value: &str) -> EncodedTerm {
+            EncodedTerm(format!("\"{value}\""))
+        }
+
+        fn engine_at(dir: &std::path::Path) -> (Arc<GraphStore>, ReplicationEngine) {
+            let store = Arc::new(GraphStore::open(dir).unwrap());
+            let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+            let sparql = Arc::new(SparqlEngine::new(store.clone(), search));
+            let engine = ReplicationEngine::new(store.clone(), sparql, ActorId::random());
+            (store, engine)
+        }
+
+        fn inserts(graph: &GraphId, triples: &[Triple]) -> Vec<MaterializedQuadChange> {
+            triples
+                .iter()
+                .map(
+                    |(subject, predicate, object)| MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: subject.clone(),
+                        predicate: predicate.clone(),
+                        object: object.clone(),
+                    },
+                )
+                .collect()
+        }
+
+        fn deletes(graph: &GraphId, triples: &[Triple]) -> Vec<MaterializedQuadChange> {
+            triples
+                .iter()
+                .map(
+                    |(subject, predicate, object)| MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: subject.clone(),
+                        predicate: predicate.clone(),
+                        object: object.clone(),
+                    },
+                )
+                .collect()
+        }
+
+        /// Root Dataset, one reachable child, and one detached data entity, so
+        /// every case starts from a graph that already has an orphan and can
+        /// gain or lose one in either direction.
+        fn seed(graph: &GraphId) -> Vec<Triple> {
+            vec![
+                (
+                    iri(graph.as_str()),
+                    RDF_TYPE.clone(),
+                    SCHEMA_DATASET.clone(),
+                ),
+                (iri(graph.as_str()), SCHEMA_HAS_PART.clone(), iri(CHILD)),
+                (iri(CHILD), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+                (iri(CHILD), SCHEMA_NAME.clone(), text("child")),
+                (iri(LOOSE), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+            ]
+        }
+
+        /// The orphan set a store that has never seen a diagnostics record
+        /// computes for `triples`. Written through the deferred plan, so the
+        /// stored record's tag is stale and the read recomputes from the quads.
+        fn recomputed(graph: &GraphId, triples: &[Triple]) -> GraphDiagnostics {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, engine) = engine_at(dir.path());
+            engine
+                .local_apply_changes_bulk_unchecked(graph, inserts(graph, triples))
+                .unwrap();
+            store.graph_diagnostics(graph).unwrap()
+        }
+
+        fn apply_change(triples: &mut Vec<Triple>, change: &MaterializedQuadChange) {
+            match change {
+                MaterializedQuadChange::Insert {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                } => {
+                    let triple = (subject.clone(), predicate.clone(), object.clone());
+                    if !triples.contains(&triple) {
+                        triples.push(triple);
+                    }
+                }
+                MaterializedQuadChange::Delete {
+                    subject,
+                    predicate,
+                    object,
+                    ..
+                } => triples
+                    .retain(|held| held != &(subject.clone(), predicate.clone(), object.clone())),
+            }
+        }
+
+        struct Case {
+            label: &'static str,
+            changes: Vec<MaterializedQuadChange>,
+            fast_path: bool,
+        }
+
+        fn cases(graph: &GraphId) -> Vec<Case> {
+            let root = iri(graph.as_str());
+            vec![
+                Case {
+                    label: "types a new entity as a MediaObject",
+                    changes: inserts(
+                        graph,
+                        &[(iri(EXTRA), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone())],
+                    ),
+                    fast_path: false,
+                },
+                Case {
+                    label: "types a new entity as a Dataset",
+                    changes: inserts(
+                        graph,
+                        &[(iri(EXTRA), RDF_TYPE.clone(), SCHEMA_DATASET.clone())],
+                    ),
+                    fast_path: false,
+                },
+                Case {
+                    label: "attaches the detached entity",
+                    changes: inserts(
+                        graph,
+                        &[(root.clone(), SCHEMA_HAS_PART.clone(), iri(LOOSE))],
+                    ),
+                    fast_path: false,
+                },
+                Case {
+                    label: "detaches the reachable child",
+                    changes: deletes(
+                        graph,
+                        &[(root.clone(), SCHEMA_HAS_PART.clone(), iri(CHILD))],
+                    ),
+                    fast_path: false,
+                },
+                Case {
+                    label: "untypes the detached entity",
+                    changes: deletes(
+                        graph,
+                        &[(iri(LOOSE), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone())],
+                    ),
+                    fast_path: false,
+                },
+                Case {
+                    label: "detaches then re-attaches the same edge",
+                    changes: deletes(
+                        graph,
+                        &[(root.clone(), SCHEMA_HAS_PART.clone(), iri(CHILD))],
+                    )
+                    .into_iter()
+                    .chain(inserts(
+                        graph,
+                        &[(root.clone(), SCHEMA_HAS_PART.clone(), iri(CHILD))],
+                    ))
+                    .collect(),
+                    fast_path: false,
+                },
+                Case {
+                    label: "touches an unrelated predicate on an existing entity",
+                    changes: inserts(
+                        graph,
+                        &[(iri(CHILD), SCHEMA_DESCRIPTION.clone(), text("about"))],
+                    ),
+                    fast_path: true,
+                },
+                Case {
+                    label: "touches an unrelated predicate on a new subject",
+                    changes: inserts(graph, &[(iri(EXTRA), SCHEMA_NAME.clone(), text("extra"))]),
+                    fast_path: true,
+                },
+                Case {
+                    label: "types an entity as something that is not a data entity",
+                    changes: inserts(
+                        graph,
+                        &[(iri(EXTRA), RDF_TYPE.clone(), SCHEMA_CREATIVE_WORK.clone())],
+                    ),
+                    fast_path: true,
+                },
+                Case {
+                    label: "removes a name and puts it back",
+                    changes: deletes(graph, &[(iri(CHILD), SCHEMA_NAME.clone(), text("child"))])
+                        .into_iter()
+                        .chain(inserts(
+                            graph,
+                            &[(iri(CHILD), SCHEMA_NAME.clone(), text("renamed"))],
+                        ))
+                        .collect(),
+                    fast_path: true,
+                },
+            ]
+        }
+
+        #[test]
+        fn fast_path_agrees_with_a_full_recompute() {
+            let graph = GraphId::new("urn:test:fast-path");
+            for case in cases(&graph) {
+                let dir = tempfile::tempdir().unwrap();
+                let (store, engine) = engine_at(dir.path());
+                let mut triples = seed(&graph);
+                engine
+                    .local_apply_changes_unchecked(&graph, inserts(&graph, &triples))
+                    .unwrap();
+
+                let before = store.diagnostics_compute_count();
+                engine
+                    .local_apply_changes_unchecked(&graph, case.changes.clone())
+                    .unwrap();
+                let settled = store.diagnostics_compute_count();
+                assert_eq!(
+                    case.fast_path,
+                    settled == before,
+                    "`{}` took the wrong branch: {} recomputes",
+                    case.label,
+                    settled - before
+                );
+
+                // Reading the verdict must not recompute it: the record the
+                // fast path persisted has to carry the post-write clock tag.
+                let observed = store.graph_diagnostics(&graph).unwrap();
+                assert_eq!(
+                    settled,
+                    store.diagnostics_compute_count(),
+                    "`{}` left a record a reader has to repair",
+                    case.label
+                );
+
+                for change in &case.changes {
+                    apply_change(&mut triples, change);
+                }
+                assert_eq!(
+                    recomputed(&graph, &triples),
+                    observed,
+                    "`{}` persisted an orphan set a full recompute disagrees with",
+                    case.label
+                );
+            }
+        }
+
+        /// The second fast path: a validated write on an orphan-free graph is
+        /// declared orphan-free without reading the store. It must still land on
+        /// the set a recompute would produce.
+        #[test]
+        fn validated_orphan_free_fast_path_agrees_with_a_full_recompute() {
+            let graph = GraphId::new("urn:test:fast-path-validated");
+            let dir = tempfile::tempdir().unwrap();
+            let (store, engine) = engine_at(dir.path());
+
+            let mut triples: Vec<Triple> = vec![
+                (
+                    iri(graph.as_str()),
+                    RDF_TYPE.clone(),
+                    SCHEMA_DATASET.clone(),
+                ),
+                (iri(graph.as_str()), SCHEMA_HAS_PART.clone(), iri(CHILD)),
+                (iri(CHILD), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+            ];
+            engine
+                .local_apply_changes_unchecked(&graph, inserts(&graph, &triples))
+                .unwrap();
+            assert!(!store.graph_diagnostics(&graph).unwrap().has_orphans());
+
+            // Reachability *is* touched, so only the validated-orphan-free
+            // branch can skip the recompute here.
+            let grow = inserts(
+                &graph,
+                &[
+                    (iri(graph.as_str()), SCHEMA_HAS_PART.clone(), iri(EXTRA)),
+                    (iri(EXTRA), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+                ],
+            );
+            let before = store.diagnostics_compute_count();
+            engine.local_apply_changes(&graph, grow.clone()).unwrap();
+            assert_eq!(
+                before,
+                store.diagnostics_compute_count(),
+                "a validated write on an orphan-free graph must not recompute"
+            );
+
+            let observed = store.graph_diagnostics(&graph).unwrap();
+            for change in &grow {
+                apply_change(&mut triples, change);
+            }
+            assert_eq!(recomputed(&graph, &triples), observed);
+            assert!(!observed.has_orphans());
+        }
+    }
 }

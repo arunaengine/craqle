@@ -6,7 +6,11 @@ mod support;
 /// the index for exactly `fts:limit` documents silently returns fewer
 /// authorized rows than the caller requested whenever the top-ranked hits sit
 /// in graphs the caller cannot read. Authorized results must never be omitted.
-#[cfg(test)]
+///
+/// Every case here needs a real tantivy index: the `search`-off stub answers
+/// every query with an empty result set, which satisfies "no unauthorized graph
+/// leaked" vacuously.
+#[cfg(all(test, feature = "search"))]
 mod tests {
     use std::collections::BTreeSet;
 
@@ -93,6 +97,13 @@ mod tests {
     }
 
     fn fts_graph_rows(node: &CraqleNode, sparql: &str) -> BTreeSet<String> {
+        graph_rows_for(node, visible, sparql)
+    }
+
+    fn graph_rows_for<F>(node: &CraqleNode, visible: F, sparql: &str) -> BTreeSet<String>
+    where
+        F: Fn(&GraphId) -> bool,
+    {
         solution_rows(node.query_graphs_with(visible, sparql).unwrap())
             .into_iter()
             .map(|row| row.get("g").expect("?g must be bound").0.clone())
@@ -163,29 +174,58 @@ mod tests {
         }
     }
 
+    /// The escalation loop has to terminate on an exhausted index *and* keep
+    /// escalating while authorized hits are still out of reach.
+    ///
+    /// `rows.is_empty()` alone was the one FTS assertion that also held with the
+    /// loop deleted, and with the `search` feature off. Two things pin it now:
+    /// the query runs under a watchdog, so "it terminated" is asserted rather
+    /// than delegated to the harness not hanging; and every readable graph is
+    /// authorized alone in turn, which the reader can only satisfy by fetching
+    /// past `fts:limit` — one authorized document among 250 equal-scoring ones
+    /// is not in the top `limit` for all but one of them.
     #[test]
     fn fts_service_terminates_when_nothing_is_authorized() {
-        let tmp = tempfile::tempdir().unwrap();
-        let node = seeded_node(&tmp);
+        // The watchdog is the termination assertion: an escalation loop that
+        // never notices an exhausted index hangs the harness rather than
+        // failing, and `rows.is_empty()` below would never be reached.
+        with_watchdog("fts_service_terminates_when_nothing_is_authorized", || {
+            let tmp = tempfile::tempdir().unwrap();
+            let node = seeded_node(&tmp);
+            let sparql = |limit: usize| {
+                format!(
+                    r#"
+                    SELECT ?s ?g
+                    WHERE {{
+                        SERVICE <urn:craqle:fts> {{
+                            ?s fts:query "proteomics" .
+                            ?s fts:graph ?g .
+                            ?s fts:limit {limit} .
+                        }}
+                    }}
+                    "#
+                )
+            };
 
-        // Escalation must stop once the index is exhausted rather than loop.
-        let sparql = format!(
-            r#"
-            SELECT ?s ?g
-            WHERE {{
-                SERVICE <urn:craqle:fts> {{
-                    ?s fts:query "proteomics" .
-                    ?s fts:graph ?g .
-                    ?s fts:limit {FTS_LIMIT} .
-                }}
-            }}
-            "#
-        );
-        let rows = solution_rows(
-            node.query_graphs_with(|_: &GraphId| false, &sparql)
-                .unwrap(),
-        );
-        assert!(rows.is_empty());
+            let rows = graph_rows_for(&node, |_: &GraphId| false, &sparql(FTS_LIMIT));
+            assert!(
+                rows.is_empty(),
+                "an unauthorized reader must see nothing: {rows:?}"
+            );
+
+            // ... and the loop escalates far enough to reach a lone authorized
+            // graph buried among 250 equal-scoring documents.
+            let single = sparql(1);
+            for idx in 0..READABLE {
+                let wanted = readable_graph(idx);
+                let found = graph_rows_for(&node, |graph: &GraphId| graph == &wanted, &single);
+                assert_eq!(
+                    BTreeSet::from([format!("<{}>", wanted.as_str())]),
+                    found,
+                    "the only authorized graph was dropped before the limit was filled"
+                );
+            }
+        });
     }
 
     #[test]

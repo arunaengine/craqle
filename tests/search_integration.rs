@@ -1,6 +1,8 @@
 mod support;
 
-#[cfg(test)]
+/// Every test here asserts on real tantivy results, so the `search`-off stub —
+/// which answers every query with an empty set — cannot satisfy any of them.
+#[cfg(all(test, feature = "search"))]
 mod tests {
     use craqle::*;
 
@@ -674,6 +676,116 @@ mod tests {
             .len(),
             0,
             "an orphaned entity must not remain searchable"
+        );
+    }
+
+    /// The other direction: re-attaching an orphan must put it *back* in the
+    /// search index (G6, G7).
+    ///
+    /// The re-queue diffs the orphan set with `symmetric_difference`, so both
+    /// transitions have to be covered. With a one-sided `difference` the hiding
+    /// direction still passes and this one does not: the child is un-orphaned
+    /// everywhere except in search, where it stays invisible until some
+    /// unrelated write happens to dirty it.
+    #[test]
+    fn re_attaching_an_orphan_returns_it_to_the_search_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth =
+            GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
+        let graph = GraphId::new("urn:test:orphan-requeue-back");
+
+        node.create_crate(
+            &auth,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "requeue crate",
+                "description",
+                "2025-01-01",
+                None,
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/t/x".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+        node.append_new_root_data_entities(
+            &auth,
+            &graph,
+            vec![NewDataEntity {
+                entity_id: "data/coelacanth.dat".to_string(),
+                entity_type: "http://schema.org/MediaObject".to_string(),
+                name: "coelacanth".to_string(),
+                additional_triples: Vec::new(),
+            }],
+        )
+        .unwrap();
+
+        let searchable = |node: &CraqleNode| {
+            node.search(
+                &auth,
+                SearchRequest {
+                    query: "coelacanth",
+                    limit: 10,
+                },
+            )
+            .unwrap()
+            .len()
+        };
+        let settle = |node: &CraqleNode| {
+            node.rebuild_graph_diagnostics(&graph).unwrap();
+            node.flush_search_updates().unwrap();
+        };
+
+        settle(&node);
+        assert_eq!(1, searchable(&node), "the child starts out searchable");
+
+        // The only edge to the child. Cut it, then restore it — naming the edge
+        // both times and the child neither time.
+        let edge = node
+            .graph_snapshot(&graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
+            .expect("root must link the child");
+        let link = |graph: &GraphId| MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: edge.subject.clone(),
+            predicate: edge.predicate.clone(),
+            object: edge.object.clone(),
+        };
+        let unlink = |graph: &GraphId| MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: edge.subject.clone(),
+            predicate: edge.predicate.clone(),
+            object: edge.object.clone(),
+        };
+
+        node.apply_changes_bulk_unchecked(&graph, vec![unlink(&graph)])
+            .unwrap();
+        settle(&node);
+        assert_eq!(0, searchable(&node), "the orphan must leave the index");
+
+        node.apply_changes_bulk_unchecked(&graph, vec![link(&graph)])
+            .unwrap();
+        settle(&node);
+        assert!(
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "re-attaching must clear the orphan record"
+        );
+        assert_eq!(
+            1,
+            searchable(&node),
+            "a re-attached entity must come back to search without being touched"
         );
     }
 }

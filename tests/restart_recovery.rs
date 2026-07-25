@@ -10,10 +10,12 @@
 //! exactly the state it committed, and nothing is served stale.
 
 use craqle::{
-    CraqleNode, EncodedTerm, GrantAuthorizer, GraphDiagnostics, GraphId, GraphPolicy,
-    MaterializedQuadChange, PermissionGrant, PermissionLevel, SearchRequest, vocab,
+    CraqleNode, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy, MaterializedQuadChange, vocab,
 };
+#[cfg(feature = "search")]
+use craqle::{GrantAuthorizer, PermissionGrant, PermissionLevel, SearchRequest};
 
+#[cfg(feature = "search")]
 fn writer_auth() -> GrantAuthorizer {
     GrantAuthorizer::new(vec![PermissionGrant {
         pattern: "*".to_string(),
@@ -233,11 +235,38 @@ fn deleted_graph_clock_not_resurrected() {
     assert!(orphans(&node.graph_diagnostics(&graph).unwrap()).is_empty());
 }
 
+#[cfg(feature = "search")]
+fn quokka_hits(node: &CraqleNode, auth: &GrantAuthorizer) -> Vec<String> {
+    let mut hits: Vec<String> = node
+        .search(
+            auth,
+            SearchRequest {
+                query: "quokka",
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.subject_iri)
+        .collect();
+    hits.sort();
+    hits
+}
+
 /// G7 across a restart: work queued before shutdown and work queued after it
 /// must both reach the search index. This is the observable consequence of the
 /// FTS queue tokens resuming past every live token (K4) — with the counter
 /// restarting at 1, post-restart entries can be acknowledged away by a
 /// pre-restart token and their subjects never get indexed.
+///
+/// Nothing here re-derives the index. The pre-restart entry is left in the
+/// durable queue (no `flush_search_updates` before the shutdown) and the
+/// reopened node is never asked to `reindex_search`, so both subjects have to
+/// reach tantivy through the queue that survived the restart. The previous
+/// version flushed first and rebuilt after, which left every queue empty at
+/// reopen — bit-identical to the bug — and then recomputed the whole index
+/// anyway, so it passed with the fix reverted.
+#[cfg(feature = "search")]
 #[test]
 fn fts_updates_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -256,23 +285,9 @@ fn fts_updates_survive_restart() {
                 EncodedTerm("\"quokka before restart\"".to_string()),
             )],
         );
-        node.flush_search_updates().unwrap();
-        assert_eq!(
-            1,
-            node.search(
-                &auth,
-                SearchRequest {
-                    query: "quokka",
-                    limit: 10
-                }
-            )
-            .unwrap()
-            .len()
-        );
     }
 
     let node = open_node(dir.path(), &graph);
-    node.reindex_search().unwrap();
     write_unchecked(
         &node,
         &graph,
@@ -284,25 +299,24 @@ fn fts_updates_survive_restart() {
     );
     node.flush_search_updates().unwrap();
 
-    let mut hits: Vec<String> = node
-        .search(
-            &auth,
-            SearchRequest {
-                query: "quokka",
-                limit: 10,
-            },
-        )
-        .unwrap()
-        .into_iter()
-        .map(|hit| hit.subject_iri)
-        .collect();
-    hits.sort();
     assert_eq!(
         vec![
             "urn:entity:after".to_string(),
             "urn:entity:before".to_string()
         ],
-        hits,
+        quokka_hits(&node, &auth),
         "a subject queued after the restart must not be dropped by a pre-restart token"
+    );
+
+    // The repair is durable: a second reopen serves both without re-indexing.
+    drop(node);
+    let reopened = open_node(dir.path(), &graph);
+    assert_eq!(
+        vec![
+            "urn:entity:after".to_string(),
+            "urn:entity:before".to_string()
+        ],
+        quokka_hits(&reopened, &auth),
+        "the reopened index must serve what the previous session committed"
     );
 }
