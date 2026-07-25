@@ -369,7 +369,7 @@ impl SearchIndex {
     fn enqueue_full_rebuild(&self, store: &GraphStore) -> Result<()> {
         let mut batch = store.new_batch();
         for graph_id in store.graph_term_ids()? {
-            store.enqueue_fts_reindex_by_id(&mut batch, graph_id)?;
+            store.enqueue_fts_reindex(&mut batch, graph_id)?;
         }
         store.commit(batch)?;
         Ok(store.persist()?)
@@ -528,11 +528,7 @@ impl SearchIndex {
     /// index *before* acknowledging the queue entries it covered — a crash in
     /// between only re-does work, whereas acknowledging first would silently
     /// drop updates Tantivy never committed (G7).
-    pub fn process_queued_updates_bounded(
-        &self,
-        store: &GraphStore,
-        bound: QueueBound,
-    ) -> Result<usize> {
+    pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
         let bound = self.settle_poisoned_writer(store, bound)?;
 
         let queued_deletes = drain_upto(&bound, |chunk| Ok(store.drain_fts_delete_queue(chunk)?))?;
@@ -601,19 +597,6 @@ impl SearchIndex {
         self.commit()?;
         store.acknowledge_fts_queue(&queued)?;
         Ok(prepared.len())
-    }
-
-    #[deprecated(
-        note = "use SearchIndex::process_queued_updates_bounded with a QueueBound; removed in W-CLEAN"
-    )]
-    pub fn process_queued_updates(&self, store: &GraphStore, limit: usize) -> Result<usize> {
-        self.process_queued_updates_bounded(
-            store,
-            QueueBound {
-                chunk: limit,
-                max_token: None,
-            },
-        )
     }
 
     fn apply_prepared_op(&self, writer: &mut IndexWriter, op: &PreparedDocOp) -> Result<()> {
@@ -1136,7 +1119,15 @@ mod tests {
         .unwrap();
         node.flush_search_updates().unwrap();
 
-        let hits = node.search(&auth, "contextneedle", 10).unwrap();
+        let hits = node
+            .search(
+                &auth,
+                crate::SearchRequest {
+                    query: "contextneedle",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(
             hits.iter()
                 .any(|hit| hit.graph_id == graph.as_str() && hit.subject_iri == graph.as_str())
@@ -1282,7 +1273,15 @@ mod tests {
 
         let reopened = crate::CraqleNode::open(dir.path()).unwrap();
         reopened.flush_search_updates().unwrap();
-        let hits = reopened.search(&auth, "universitat", 10).unwrap();
+        let hits = reopened
+            .search(
+                &auth,
+                crate::SearchRequest {
+                    query: "universitat",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(
             hits.iter()
                 .any(|hit| hit.graph_id == graph.as_str() && hit.subject_iri == graph.as_str())
@@ -1366,7 +1365,7 @@ mod tests {
         .unwrap();
         node.flush_search_updates().unwrap();
         let found = |node: &crate::CraqleNode| {
-            node.search_with(
+            node.search(
                 &auth,
                 crate::SearchRequest {
                     query: "poisonneedle",

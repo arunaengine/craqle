@@ -5,7 +5,7 @@ use std::path::Path;
 
 use craqle::{
     Authorizer, CraqleError, CraqleGraphEvent, CraqleIrokleOptions, CraqleNode, CraqleOptions,
-    EncodedTerm, GraphId, QueryResults, SearchHit, VectorClock,
+    EncodedTerm, GraphId, QueryResults, SearchHit, SearchRequest, VectorClock,
 };
 use irokle::Event;
 
@@ -196,12 +196,12 @@ impl CraqleCluster {
         options: QueryOptions,
     ) -> Result<Vec<SearchHit>> {
         if options.local_only {
-            return Ok(self.peers[peer].search(auth, query, limit)?);
+            return Ok(self.peers[peer].search(auth, SearchRequest { query, limit })?);
         }
 
         let mut hits = Vec::new();
         for index in self.federated_peer_indexes(peer) {
-            hits.extend(self.peers[index].search(auth, query, limit)?);
+            hits.extend(self.peers[index].search(auth, SearchRequest { query, limit })?);
         }
 
         hits.sort_by(|left, right| {

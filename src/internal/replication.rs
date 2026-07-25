@@ -462,7 +462,7 @@ impl ReplicationEngine {
         let graph_id = self
             .store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
-        let counter = self.store.next_counter_by_id(
+        let counter = self.store.next_counter(
             &mut batch,
             CounterKey {
                 graph_id,
@@ -483,7 +483,7 @@ impl ReplicationEngine {
             cache: &mut term_cache,
         };
 
-        self.store.seed_term_cache_in_ctx(
+        self.store.seed_term_cache(
             &mut cx,
             changes.iter().flat_map(|change| match change {
                 MaterializedQuadChange::Insert {
@@ -518,7 +518,7 @@ impl ReplicationEngine {
                             object: &object,
                         },
                     )?;
-                    self.store.add_quad(cx.batch, QuadAdd { quad, dot })?;
+                    self.store.insert_quad(cx.batch, QuadAdd { quad, dot })?;
                     affected_subjects.insert(quad.subject);
                     ops.push(QuadOp::Add {
                         subject,
@@ -542,7 +542,7 @@ impl ReplicationEngine {
                             object: &object,
                         },
                     )?;
-                    self.store.retract_quad(
+                    self.store.remove_quad(
                         cx.batch,
                         QuadRemove {
                             quad,
@@ -561,14 +561,14 @@ impl ReplicationEngine {
         }
 
         vector_clock.advance(self.actor, counter);
-        self.store.set_vector_clock_by_id(
+        self.store.set_vector_clock(
             &mut batch,
             ClockUpdate {
                 graph_id,
                 clock: &vector_clock,
             },
         )?;
-        self.store.enqueue_fts_subjects_by_id(
+        self.store.enqueue_fts_subjects(
             &mut batch,
             FtsEnqueue {
                 graph_id,
@@ -599,9 +599,9 @@ impl ReplicationEngine {
     ) -> crate::store::Result<EncodedQuad> {
         Ok(EncodedQuad {
             graph: terms.graph_id,
-            subject: self.store.resolve_term_in_ctx(cx, terms.subject)?,
-            predicate: self.store.resolve_term_in_ctx(cx, terms.predicate)?,
-            object: self.store.resolve_term_in_ctx(cx, terms.object)?,
+            subject: self.store.resolve_term_cached(cx, terms.subject)?,
+            predicate: self.store.resolve_term_cached(cx, terms.predicate)?,
+            object: self.store.resolve_term_cached(cx, terms.object)?,
         })
     }
 
@@ -683,7 +683,7 @@ impl ReplicationEngine {
             cache: &mut term_cache,
         };
 
-        self.store.seed_term_cache_in_ctx(
+        self.store.seed_term_cache(
             &mut cx,
             incoming.ops.iter().flat_map(|op| match op {
                 QuadOp::Add {
@@ -722,7 +722,8 @@ impl ReplicationEngine {
                             object,
                         },
                     )?;
-                    self.store.add_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+                    self.store
+                        .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
                     affected_subjects.insert(quad.subject);
                 }
                 QuadOp::Remove {
@@ -741,21 +742,21 @@ impl ReplicationEngine {
                         },
                     )?;
                     self.store
-                        .retract_quad(cx.batch, QuadRemove { quad, witnessed })?;
+                        .remove_quad(cx.batch, QuadRemove { quad, witnessed })?;
                     affected_subjects.insert(quad.subject);
                 }
             }
         }
 
         vector_clock.advance(incoming.actor, incoming.counter);
-        self.store.set_vector_clock_by_id(
+        self.store.set_vector_clock(
             &mut batch,
             ClockUpdate {
                 graph_id,
                 clock: vector_clock,
             },
         )?;
-        self.store.enqueue_fts_subjects_by_id(
+        self.store.enqueue_fts_subjects(
             &mut batch,
             FtsEnqueue {
                 graph_id,
@@ -862,7 +863,7 @@ impl ReplicationEngine {
             let Some(subject_tid) = self.store.lookup_term(&subject)? else {
                 continue;
             };
-            self.store.enqueue_fts_by_id(
+            self.store.enqueue_fts(
                 &mut batch,
                 FtsSubject {
                     graph_id,

@@ -1,7 +1,7 @@
 //! WS0 concurrency guarantees, exercised end to end through the public
 //! `CraqleNode` API.
 //!
-//! The guard-level proofs — parallel `add_quad` + `commit` keeping the dot set
+//! The guard-level proofs — parallel `insert_quad` + `commit` keeping the dot set
 //! intact, the self-guarding store functions not deadlocking, and the
 //! `#[cfg(test)]` corrupt-index hook showing that the detecting commit repairs
 //! the index — live in `src/internal/store.rs`'s unit tests, because

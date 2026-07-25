@@ -11,7 +11,7 @@
 
 use craqle::{
     CraqleNode, EncodedTerm, GrantAuthorizer, GraphDiagnostics, GraphId, GraphPolicy,
-    MaterializedQuadChange, PermissionGrant, PermissionLevel, vocab,
+    MaterializedQuadChange, PermissionGrant, PermissionLevel, SearchRequest, vocab,
 };
 
 fn writer_auth() -> GrantAuthorizer {
@@ -257,7 +257,18 @@ fn fts_updates_survive_restart() {
             )],
         );
         node.flush_search_updates().unwrap();
-        assert_eq!(1, node.search(&auth, "quokka", 10).unwrap().len());
+        assert_eq!(
+            1,
+            node.search(
+                &auth,
+                SearchRequest {
+                    query: "quokka",
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .len()
+        );
     }
 
     let node = open_node(dir.path(), &graph);
@@ -274,7 +285,13 @@ fn fts_updates_survive_restart() {
     node.flush_search_updates().unwrap();
 
     let mut hits: Vec<String> = node
-        .search(&auth, "quokka", 10)
+        .search(
+            &auth,
+            SearchRequest {
+                query: "quokka",
+                limit: 10,
+            },
+        )
         .unwrap()
         .into_iter()
         .map(|hit| hit.subject_iri)

@@ -93,7 +93,13 @@ mod tests {
 
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, &format!("DOC-{probe:06}"), 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: &format!("DOC-{probe:06}"),
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(
@@ -175,7 +181,13 @@ mod tests {
 
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, &format!("APPEND-{probe:06}"), 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: &format!("APPEND-{probe:06}"),
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(
@@ -221,7 +233,13 @@ mod tests {
 
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, "updated replacement marker", 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "updated replacement marker",
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(!hits.is_empty());
@@ -263,7 +281,13 @@ mod tests {
 
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, "Incremental Update Marker", 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "Incremental Update Marker",
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(!hits.is_empty());
@@ -304,7 +328,13 @@ mod tests {
         let probe = entity_count + extra_count - 1;
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, &format!("DOC-{probe:06}"), 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: &format!("DOC-{probe:06}"),
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(!hits.is_empty());

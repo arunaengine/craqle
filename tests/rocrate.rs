@@ -73,13 +73,29 @@ mod tests {
             .unwrap();
         node.flush_search_updates().unwrap();
 
-        let hits = node.search(&reader, "DOC-000123", 10).unwrap();
+        let hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "DOC-000123",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(
             hits.iter().any(|hit| hit.graph_id == graph.as_str()
                 && hit.subject_iri == "./bulk/entity-000123.dat")
         );
 
-        let keyword_hits = node.search(&reader, "import-bulk-keyword", 10).unwrap();
+        let keyword_hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "import-bulk-keyword",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(!keyword_hits.is_empty());
     }
 
@@ -97,13 +113,29 @@ mod tests {
             .unwrap();
         node.flush_search_updates().unwrap();
 
-        let hits = node.search(&reader, "DOC-000123", 10).unwrap();
+        let hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "DOC-000123",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(
             hits.iter().any(|hit| hit.graph_id == graph.as_str()
                 && hit.subject_iri == "./bulk/entity-000123.dat")
         );
 
-        let keyword_hits = node.search(&reader, "trusted-bulk-keyword", 10).unwrap();
+        let keyword_hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "trusted-bulk-keyword",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(!keyword_hits.is_empty());
     }
 
@@ -214,13 +246,29 @@ mod tests {
         .unwrap();
         node.flush_search_updates().unwrap();
 
-        let hits = node.search(&reader, "APPEND-000123", 10).unwrap();
+        let hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "APPEND-000123",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(
             hits.iter().any(|hit| hit.graph_id == graph.as_str()
                 && hit.subject_iri == "./bulk/entity-000123.dat")
         );
 
-        let keyword_hits = node.search(&reader, "append-bulk-keyword", 10).unwrap();
+        let keyword_hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "append-bulk-keyword",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(!keyword_hits.is_empty());
     }
 
@@ -261,7 +309,15 @@ mod tests {
 
         node.reindex_search().unwrap();
 
-        let hits = node.search(&reader, "REINDEX-000010", 10).unwrap();
+        let hits = node
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "REINDEX-000010",
+                    limit: 10,
+                },
+            )
+            .unwrap();
         assert!(
             hits.iter().any(|hit| hit.graph_id == graph.as_str()
                 && hit.subject_iri == "./bulk/entity-000010.dat")
@@ -1778,7 +1834,7 @@ mod tests {
 
     /// The `(predicate, object)` pairs `describe_subject` exposes for a subject.
     fn described(node: &CraqleNode, graph: &GraphId, subject_id: &str) -> Vec<(String, String)> {
-        node.describe_subject_with(
+        node.describe_subject(
             &GrantAuthorizer::default(),
             DescribeRequest { graph, subject_id },
         )
@@ -1794,11 +1850,9 @@ mod tests {
     fn searched_terms(node: &CraqleNode, query: &str) -> Vec<String> {
         node.flush_search_updates().unwrap();
         let request = || SearchRequest { query, limit: 10 };
-        let hits = node
-            .search_with(&GrantAuthorizer::default(), request())
-            .unwrap();
+        let hits = node.search(&GrantAuthorizer::default(), request()).unwrap();
         let hydrated = node
-            .search_resources_with(&GrantAuthorizer::default(), request())
+            .search_resources(&GrantAuthorizer::default(), request())
             .unwrap();
         assert_eq!(
             hits.len(),

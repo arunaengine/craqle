@@ -1440,6 +1440,8 @@ fn materialize_graph_target_removals(
 mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
+    use crate::search::QueueBound;
+    use crate::store::{EncodedQuad, FtsSubject, QuadAdd};
     use oxrdf::{Literal, Term};
 
     fn setup_engine() -> (
@@ -1483,17 +1485,29 @@ mod tests {
         store
             .insert_quad(
                 &mut batch,
-                graph_id,
-                subject_id,
-                predicate_id,
-                object_id,
-                &Dot {
-                    actor: ActorId::random(),
-                    counter: 1,
+                QuadAdd {
+                    quad: EncodedQuad {
+                        graph: graph_id,
+                        subject: subject_id,
+                        predicate: predicate_id,
+                        object: object_id,
+                    },
+                    dot: Dot {
+                        actor: ActorId::random(),
+                        counter: 1,
+                    },
                 },
             )
             .unwrap();
-        store.enqueue_fts(&mut batch, graph, subject_id).unwrap();
+        store
+            .enqueue_fts(
+                &mut batch,
+                FtsSubject {
+                    graph_id,
+                    subject: subject_id,
+                },
+            )
+            .unwrap();
         store.commit(batch).unwrap();
     }
 
@@ -2290,7 +2304,17 @@ mod tests {
                 "Large-scale proteomics experiment",
             ))),
         );
-        while search.process_queued_updates(&store, 50_000).unwrap() != 0 {}
+        while search
+            .process_queued_updates(
+                &store,
+                QueueBound {
+                    chunk: 50_000,
+                    max_token: None,
+                },
+            )
+            .unwrap()
+            != 0
+        {}
 
         let query = r#"
             SELECT ?s ?g ?score ?name
@@ -2344,7 +2368,17 @@ mod tests {
                 "Proteomics Archive",
             ))),
         );
-        while search.process_queued_updates(&store, 50_000).unwrap() != 0 {}
+        while search
+            .process_queued_updates(
+                &store,
+                QueueBound {
+                    chunk: 50_000,
+                    max_token: None,
+                },
+            )
+            .unwrap()
+            != 0
+        {}
 
         let query = r#"
             SELECT ?s ?g

@@ -422,7 +422,7 @@ fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
             chunk: SEARCH_QUEUE_FLUSH_CHUNK,
             max_token: Some(max_token),
         };
-        let processed = search.process_queued_updates_bounded(store, bound)?;
+        let processed = search.process_queued_updates(store, bound)?;
         if processed == 0 {
             if processed_any {
                 store.persist()?;
@@ -1419,7 +1419,7 @@ impl CraqleNode {
         new_value: &str,
     ) -> Result<Batch> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        let batch = self.manager().apply_property_update(
+        let batch = self.manager().update_property(
             graph,
             rocrate::PropertyUpdate {
                 entity_id,
@@ -1510,11 +1510,7 @@ impl CraqleNode {
     /// the over-fetch until either enough readable hits are found or the index
     /// is exhausted, so an authorized caller is never shown a short page while
     /// matching, readable documents exist (G8 completeness).
-    pub fn search_with(
-        &self,
-        auth: &dyn Authorizer,
-        req: SearchRequest<'_>,
-    ) -> Result<Vec<SearchHit>> {
+    pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         if req.limit == 0 {
             return Ok(Vec::new());
         }
@@ -1544,24 +1540,14 @@ impl CraqleNode {
         }
     }
 
-    #[deprecated(note = "use CraqleNode::search_with with a SearchRequest; removed in W-CLEAN")]
-    pub fn search(
-        &self,
-        auth: &dyn Authorizer,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchHit>> {
-        self.search_with(auth, SearchRequest { query, limit })
-    }
-
     /// Search visible resources in an explicit set of graph IRIs.
     ///
     /// Every selected graph is authorized against its stored policy *before*
     /// the index is consulted, so no post-filtering — and therefore no
     /// escalation loop — is needed: every hit the index can return already
     /// belongs to a graph the caller may read. Missing or non-readable graphs
-    /// are ignored, matching [`CraqleNode::search_with`].
-    pub fn search_graphs_with(
+    /// are ignored, matching [`CraqleNode::search`].
+    pub fn search_graphs(
         &self,
         auth: &dyn Authorizer,
         req: GraphSearchRequest<'_>,
@@ -1613,28 +1599,8 @@ impl CraqleNode {
         Ok(hits)
     }
 
-    #[deprecated(
-        note = "use CraqleNode::search_graphs_with with a GraphSearchRequest; removed in W-CLEAN"
-    )]
-    pub fn search_graphs(
-        &self,
-        auth: &dyn Authorizer,
-        graphs: &[GraphId],
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchHit>> {
-        self.search_graphs_with(
-            auth,
-            GraphSearchRequest {
-                graphs,
-                query,
-                limit,
-            },
-        )
-    }
-
     /// Resolve one visible subject into `(predicate, object)` pairs.
-    pub fn describe_subject_with(
+    pub fn describe_subject(
         &self,
         auth: &dyn Authorizer,
         req: DescribeRequest<'_>,
@@ -1644,25 +1610,13 @@ impl CraqleNode {
         self.describe_in_ctx(&ctx, req.subject_id)
     }
 
-    #[deprecated(
-        note = "use CraqleNode::describe_subject_with with a DescribeRequest; removed in W-CLEAN"
-    )]
-    pub fn describe_subject(
-        &self,
-        auth: &dyn Authorizer,
-        graph: &GraphId,
-        subject_id: &str,
-    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        self.describe_subject_with(auth, DescribeRequest { graph, subject_id })
-    }
-
     /// Hydrate search hits with visible RDF properties.
     ///
     /// Search results usually cluster into a handful of graphs, so the policy
     /// read and the orphan-set rebuild are memoized per graph rather than
     /// repeated per hit (finding R8). Hits in a graph the caller may not read
     /// are skipped rather than failing the whole call, matching how
-    /// [`CraqleNode::search_with`] drops them.
+    /// [`CraqleNode::search`] drops them.
     pub fn hydrate_search_hits(
         &self,
         auth: &dyn Authorizer,
@@ -1698,25 +1652,13 @@ impl CraqleNode {
     }
 
     /// Search and hydrate visible resources in one call.
-    pub fn search_resources_with(
+    pub fn search_resources(
         &self,
         auth: &dyn Authorizer,
         req: SearchRequest<'_>,
     ) -> Result<Vec<HydratedSearchHit>> {
-        let hits = self.search_with(auth, req)?;
+        let hits = self.search(auth, req)?;
         self.hydrate_search_hits(auth, &hits)
-    }
-
-    #[deprecated(
-        note = "use CraqleNode::search_resources_with with a SearchRequest; removed in W-CLEAN"
-    )]
-    pub fn search_resources(
-        &self,
-        auth: &dyn Authorizer,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<HydratedSearchHit>> {
-        self.search_resources_with(auth, SearchRequest { query, limit })
     }
 
     /// Block until the background full-text indexer has processed queued work.
@@ -1981,7 +1923,7 @@ impl CraqleNode {
     fn schedule_full_search_reindex(&self) -> Result<()> {
         let mut batch = self.store.new_batch();
         for graph_id in self.store.graph_term_ids()? {
-            self.store.enqueue_fts_reindex_by_id(&mut batch, graph_id)?;
+            self.store.enqueue_fts_reindex(&mut batch, graph_id)?;
         }
         self.store.commit(batch)?;
         self.persist_fjall()?;
@@ -2250,7 +2192,7 @@ mod tests {
         );
 
         let hits = node
-            .search_with(
+            .search(
                 &auth,
                 SearchRequest {
                     query: "zebrafish",

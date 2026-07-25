@@ -28,7 +28,7 @@ mod tests {
 
         let hits = net
             .peer(0)
-            .search_with(
+            .search(
                 &GrantAuthorizer::default(),
                 SearchRequest {
                     query: "genomics",
@@ -61,7 +61,7 @@ mod tests {
         net.reindex_search().unwrap();
         let hits = net
             .peer(0)
-            .search_with(
+            .search(
                 &GrantAuthorizer::default(),
                 SearchRequest {
                     query: "proteomics",
@@ -236,7 +236,7 @@ mod tests {
             node.flush_search_updates().unwrap();
 
             let hits = node
-                .search_with(
+                .search(
                     &GrantAuthorizer::default(),
                     SearchRequest {
                         query: "proteomics",
@@ -253,7 +253,7 @@ mod tests {
         let reopened = CraqleNode::open(tmp.path().join("peer0")).unwrap();
         reopened.flush_search_updates().unwrap();
         let hits = reopened
-            .search_with(
+            .search(
                 &GrantAuthorizer::default(),
                 SearchRequest {
                     query: "proteomics",
@@ -306,7 +306,7 @@ mod tests {
 
         let hits = net
             .peer(1)
-            .search_with(
+            .search(
                 &GrantAuthorizer::default(),
                 SearchRequest {
                     query: "RBATCH-000049",
@@ -343,7 +343,7 @@ mod tests {
         node.flush_search_updates().unwrap();
         assert!(
             !node
-                .search_with(
+                .search(
                     &reader,
                     SearchRequest {
                         query: "deleted",
@@ -370,7 +370,7 @@ mod tests {
         node.flush_search_updates().unwrap();
 
         assert!(
-            node.search_with(
+            node.search(
                 &reader,
                 SearchRequest {
                     query: "deleted",
@@ -382,7 +382,7 @@ mod tests {
         );
         assert!(
             !node
-                .search_with(
+                .search(
                     &reader,
                     SearchRequest {
                         query: "replacement",
@@ -449,7 +449,7 @@ mod tests {
 
         for limit in [25, 50] {
             let hits = node
-                .search_with(
+                .search(
                     &reader,
                     SearchRequest {
                         query: "escalationneedle",
@@ -534,7 +534,7 @@ mod tests {
 
             // Everything enqueued before the flush is indexed once it returns.
             let hits = node
-                .search_with(
+                .search(
                     &reader,
                     SearchRequest {
                         query: "sustainedmarker",
@@ -601,7 +601,15 @@ mod tests {
         node.flush_search_updates().unwrap();
 
         assert_eq!(
-            node.search(&auth, "pufferfish", 10).unwrap().len(),
+            node.search(
+                &auth,
+                SearchRequest {
+                    query: "pufferfish",
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .len(),
             1,
             "the child must be searchable before it is orphaned"
         );
@@ -637,7 +645,15 @@ mod tests {
             "the child must now be recorded as orphaned"
         );
         assert_eq!(
-            node.search(&auth, "pufferfish", 10).unwrap().len(),
+            node.search(
+                &auth,
+                SearchRequest {
+                    query: "pufferfish",
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .len(),
             0,
             "an orphaned entity must not remain searchable"
         );

@@ -1208,7 +1208,7 @@ impl GraphStore {
         }
 
         let mut batch = self.new_batch();
-        self.enqueue_fts_subjects_by_id(
+        self.enqueue_fts_subjects(
             &mut batch,
             FtsEnqueue {
                 graph_id,
@@ -1724,7 +1724,7 @@ impl GraphStore {
     }
 
     /// Intern `term` into `cx.batch`, memoized in `cx.cache`.
-    pub fn resolve_term_in_ctx(
+    pub fn resolve_term_cached(
         &self,
         cx: &mut BatchTermCtx<'_>,
         term: &EncodedTerm,
@@ -1738,42 +1738,15 @@ impl GraphStore {
     }
 
     /// Intern every term that is not memoized yet, in one pass.
-    pub fn seed_term_cache_in_ctx<'t>(
+    pub fn seed_term_cache<'t>(
         &self,
         cx: &mut BatchTermCtx<'_>,
         terms: impl IntoIterator<Item = &'t EncodedTerm>,
     ) -> Result<()> {
         for term in terms {
-            self.resolve_term_in_ctx(cx, term)?;
+            self.resolve_term_cached(cx, term)?;
         }
         Ok(())
-    }
-
-    #[deprecated(
-        note = "use GraphStore::resolve_term_in_ctx with a BatchTermCtx; removed in W-CLEAN"
-    )]
-    pub fn resolve_term_cached(
-        &self,
-        batch: &mut WriteBatch,
-        cache: &mut HashMap<String, TermId>,
-        term: &EncodedTerm,
-    ) -> Result<TermId> {
-        self.resolve_term_in_ctx(&mut BatchTermCtx { batch, cache }, term)
-    }
-
-    #[deprecated(
-        note = "use GraphStore::seed_term_cache_in_ctx with a BatchTermCtx; removed in W-CLEAN"
-    )]
-    pub fn seed_term_cache<'a, I>(
-        &self,
-        batch: &mut WriteBatch,
-        cache: &mut HashMap<String, TermId>,
-        terms: I,
-    ) -> Result<()>
-    where
-        I: IntoIterator<Item = &'a EncodedTerm>,
-    {
-        self.seed_term_cache_in_ctx(&mut BatchTermCtx { batch, cache }, terms)
     }
 
     fn read_term(&self, id: TermId) -> Result<EncodedTerm> {
@@ -1903,7 +1876,7 @@ impl GraphStore {
             batch.remove(&self.graphs, reindex_key);
         }
 
-        // `Relaxed` for the same reason as `enqueue_fts_by_id`.
+        // `Relaxed` for the same reason as `enqueue_fts`.
         let delete_token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
             &self.graphs,
@@ -2402,7 +2375,7 @@ impl GraphStore {
     ///
     /// Does not lock — the caller must hold the graph commit guard, otherwise
     /// two concurrent adds can read the same dot set and one add is lost.
-    pub fn add_quad(&self, batch: &mut WriteBatch, add: QuadAdd) -> Result<bool> {
+    pub fn insert_quad(&self, batch: &mut WriteBatch, add: QuadAdd) -> Result<bool> {
         let QuadAdd { quad, dot } = add;
         let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
         let mut dots = self.current_quad_dots(batch, &key)?;
@@ -2417,7 +2390,7 @@ impl GraphStore {
     /// never a dot the remover did not witness (G1).
     ///
     /// Does not lock — the caller must hold the graph commit guard.
-    pub fn retract_quad(&self, batch: &mut WriteBatch, removal: QuadRemove<'_>) -> Result<bool> {
+    pub fn remove_quad(&self, batch: &mut WriteBatch, removal: QuadRemove<'_>) -> Result<bool> {
         let QuadRemove { quad, witnessed } = removal;
         let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
         let mut dots = self.current_quad_dots(batch, &key)?;
@@ -2427,54 +2400,6 @@ impl GraphStore {
             return Ok(false);
         }
         self.write_quad_state(batch, quad, dots)
-    }
-
-    #[deprecated(note = "use GraphStore::add_quad with a QuadAdd; removed in W-CLEAN")]
-    pub fn insert_quad(
-        &self,
-        batch: &mut WriteBatch,
-        graph: TermId,
-        subject: TermId,
-        predicate: TermId,
-        object: TermId,
-        dot: &Dot,
-    ) -> Result<bool> {
-        self.add_quad(
-            batch,
-            QuadAdd {
-                quad: EncodedQuad {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                },
-                dot: *dot,
-            },
-        )
-    }
-
-    #[deprecated(note = "use GraphStore::retract_quad with a QuadRemove; removed in W-CLEAN")]
-    pub fn remove_quad(
-        &self,
-        batch: &mut WriteBatch,
-        graph: TermId,
-        subject: TermId,
-        predicate: TermId,
-        object: TermId,
-        witnessed: &VectorClock,
-    ) -> Result<bool> {
-        self.retract_quad(
-            batch,
-            QuadRemove {
-                quad: EncodedQuad {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                },
-                witnessed,
-            },
-        )
     }
 
     /// Is this exact quad live? O(1) against the derived indexes, committed
@@ -2625,11 +2550,7 @@ impl GraphStore {
     ///
     /// Does not lock — the caller must hold the graph commit guard, which is
     /// what makes the read-clock → advance → write-clock cycle atomic (G2).
-    pub fn set_vector_clock_by_id(
-        &self,
-        batch: &mut WriteBatch,
-        update: ClockUpdate<'_>,
-    ) -> Result<()> {
+    pub fn set_vector_clock(&self, batch: &mut WriteBatch, update: ClockUpdate<'_>) -> Result<()> {
         batch.insert(
             &self.graphs,
             graph_clock_key(update.graph_id),
@@ -2638,26 +2559,12 @@ impl GraphStore {
         Ok(())
     }
 
-    #[deprecated(
-        note = "use GraphStore::set_vector_clock_by_id with a ClockUpdate; removed in W-CLEAN"
-    )]
-    pub fn set_vector_clock(
-        &self,
-        batch: &mut WriteBatch,
-        graph: &GraphId,
-        clock: &VectorClock,
-    ) -> Result<()> {
-        let graph_id =
-            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.set_vector_clock_by_id(batch, ClockUpdate { graph_id, clock })
-    }
-
     /// Next per-(graph, actor) event counter, staged into `batch`.
     ///
     /// The caller MUST hold the graph commit guard: the read-then-write of the
     /// log head is what guarantees two concurrent local writes never mint the
     /// same dot (G1).
-    pub fn next_counter_by_id(&self, batch: &mut WriteBatch, key: CounterKey) -> Result<u64> {
+    pub fn next_counter(&self, batch: &mut WriteBatch, key: CounterKey) -> Result<u64> {
         let head = log_head_key(key.graph_id, &key.actor);
         let counter = match self.log.get(head)? {
             Some(value) => decode_u64_bytes(value.as_ref(), "log head")? + 1,
@@ -2665,24 +2572,6 @@ impl GraphStore {
         };
         batch.insert(&self.log, head, counter.to_be_bytes());
         Ok(counter)
-    }
-
-    #[deprecated(note = "use GraphStore::next_counter_by_id with a CounterKey; removed in W-CLEAN")]
-    pub fn next_counter(
-        &self,
-        batch: &mut WriteBatch,
-        graph: &GraphId,
-        actor: &ActorId,
-    ) -> Result<u64> {
-        let graph_id =
-            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.next_counter_by_id(
-            batch,
-            CounterKey {
-                graph_id,
-                actor: *actor,
-            },
-        )
     }
 
     pub(crate) fn decode_term_cached(
@@ -2711,7 +2600,7 @@ impl GraphStore {
     /// that is single-location read-read coherence, which every ordering
     /// guarantees. `SeqCst` bought a fence on the hottest write path for
     /// nothing.
-    pub fn enqueue_fts_by_id(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
+    pub fn enqueue_fts(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
         let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
             &self.graphs,
@@ -2726,19 +2615,15 @@ impl GraphStore {
     ///
     /// See [`GraphStore::fts_reindex_is_cheaper`] for the rule and for why
     /// picking the per-subject branch cannot lose search freshness (G7).
-    pub fn enqueue_fts_subjects_by_id(
-        &self,
-        batch: &mut WriteBatch,
-        req: FtsEnqueue<'_>,
-    ) -> Result<()> {
+    pub fn enqueue_fts_subjects(&self, batch: &mut WriteBatch, req: FtsEnqueue<'_>) -> Result<()> {
         if req.subjects.is_empty() {
             return Ok(());
         }
         if self.fts_reindex_is_cheaper(req.graph_id, req.subjects.len()) {
-            return self.enqueue_fts_reindex_by_id(batch, req.graph_id);
+            return self.enqueue_fts_reindex(batch, req.graph_id);
         }
         for subject in req.subjects {
-            self.enqueue_fts_by_id(
+            self.enqueue_fts(
                 batch,
                 FtsSubject {
                     graph_id: req.graph_id,
@@ -2780,12 +2665,8 @@ impl GraphStore {
             && subjects * 2 >= self.graph_subject_count(graph_id)
     }
 
-    pub fn enqueue_fts_reindex_by_id(
-        &self,
-        batch: &mut WriteBatch,
-        graph_id: TermId,
-    ) -> Result<()> {
-        // `Relaxed` for the same reason as `enqueue_fts_by_id`.
+    pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph_id: TermId) -> Result<()> {
+        // `Relaxed` for the same reason as `enqueue_fts`.
         let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
             &self.graphs,
@@ -2793,42 +2674,6 @@ impl GraphStore {
             token.to_be_bytes(),
         );
         Ok(())
-    }
-
-    #[deprecated(note = "use GraphStore::enqueue_fts_by_id with an FtsSubject; removed in W-CLEAN")]
-    pub fn enqueue_fts(
-        &self,
-        batch: &mut WriteBatch,
-        graph: &GraphId,
-        subject: TermId,
-    ) -> Result<()> {
-        let graph_id =
-            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.enqueue_fts_by_id(batch, FtsSubject { graph_id, subject })
-    }
-
-    #[deprecated(
-        note = "use GraphStore::enqueue_fts_subjects_by_id with an FtsEnqueue; removed in W-CLEAN"
-    )]
-    pub fn enqueue_fts_subjects(
-        &self,
-        batch: &mut WriteBatch,
-        graph: &GraphId,
-        subjects: &HashSet<TermId>,
-    ) -> Result<()> {
-        if subjects.is_empty() {
-            return Ok(());
-        }
-        let graph_id =
-            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.enqueue_fts_subjects_by_id(batch, FtsEnqueue { graph_id, subjects })
-    }
-
-    #[deprecated(note = "use GraphStore::enqueue_fts_reindex_by_id; removed in W-CLEAN")]
-    pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph: &GraphId) -> Result<()> {
-        let graph_id =
-            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        self.enqueue_fts_reindex_by_id(batch, graph_id)
     }
 
     pub fn drain_fts_queue(&self, limit: usize) -> Result<Vec<(GraphId, TermId, u64)>> {
@@ -3296,51 +3141,6 @@ impl GraphStore {
         Ok((total, objects))
     }
 
-    #[deprecated(note = "use GraphStore::objects_page with a PageRequest; removed in W-CLEAN")]
-    pub fn objects_for_subject_predicate_page(
-        &self,
-        graph: &GraphId,
-        subject: &EncodedTerm,
-        predicate: &EncodedTerm,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(usize, Vec<EncodedTerm>)> {
-        self.objects_page(
-            SubjectPredicate {
-                graph,
-                subject,
-                predicate,
-            },
-            PageRequest {
-                cursor: PageCursor::Offset(offset),
-                limit,
-            },
-        )
-    }
-
-    #[deprecated(note = "use GraphStore::objects_page with a PageRequest; removed in W-CLEAN")]
-    pub fn objects_for_subject_predicate_page_after(
-        &self,
-        graph: &GraphId,
-        subject: &EncodedTerm,
-        predicate: &EncodedTerm,
-        after: Option<&EncodedTerm>,
-        limit: usize,
-    ) -> Result<Vec<EncodedTerm>> {
-        self.objects_page(
-            SubjectPredicate {
-                graph,
-                subject,
-                predicate,
-            },
-            PageRequest {
-                cursor: PageCursor::After(after),
-                limit,
-            },
-        )
-        .map(|(_, objects)| objects)
-    }
-
     /// Test-only hook: drop a live quad from the in-memory index without
     /// touching the store, simulating index drift so tests can prove the next
     /// commit repairs it (WS0-T2).
@@ -3433,7 +3233,7 @@ mod tests {
         let actor = ActorId::random();
         let mut batch = store.new_batch();
         let counter = store
-            .next_counter_by_id(
+            .next_counter(
                 &mut batch,
                 CounterKey {
                     graph_id: quad.graph,
@@ -3442,11 +3242,13 @@ mod tests {
             )
             .unwrap();
         let dot = Dot { actor, counter };
-        store.add_quad(&mut batch, QuadAdd { quad, dot }).unwrap();
+        store
+            .insert_quad(&mut batch, QuadAdd { quad, dot })
+            .unwrap();
         let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
         clock.advance(actor, counter);
         store
-            .set_vector_clock_by_id(
+            .set_vector_clock(
                 &mut batch,
                 ClockUpdate {
                     graph_id: quad.graph,
@@ -3478,7 +3280,9 @@ mod tests {
             predicate: store.resolve_term(predicate).unwrap(),
             object: store.resolve_term(object).unwrap(),
         };
-        store.add_quad(&mut batch, QuadAdd { quad, dot }).unwrap();
+        store
+            .insert_quad(&mut batch, QuadAdd { quad, dot })
+            .unwrap();
         store.commit(batch).unwrap();
     }
 
@@ -3575,7 +3379,7 @@ mod tests {
         witnessed.advance(actor, 1);
         let mut batch = store.new_batch();
         store
-            .retract_quad(
+            .remove_quad(
                 &mut batch,
                 QuadRemove {
                     quad: EncodedQuad {
@@ -3620,10 +3424,10 @@ mod tests {
             .unwrap();
         let mut batch = store.new_batch();
         store
-            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
             .unwrap();
         store
-            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
             .unwrap();
         store.commit(batch).unwrap();
 
@@ -3643,9 +3447,7 @@ mod tests {
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))
             .unwrap();
         let mut batch = store.new_batch();
-        store
-            .enqueue_fts_reindex_by_id(&mut batch, graph_id)
-            .unwrap();
+        store.enqueue_fts_reindex(&mut batch, graph_id).unwrap();
         store.commit(batch).unwrap();
 
         let queued = store.drain_fts_reindex_queue(10).unwrap();
@@ -3668,7 +3470,7 @@ mod tests {
             batch: &mut batch,
             cache: &mut cache,
         };
-        let mut resolve = |term| store.resolve_term_in_ctx(&mut cx, &term).unwrap();
+        let mut resolve = |term| store.resolve_term_cached(&mut cx, &term).unwrap();
 
         let graph_id = resolve(EncodedTerm::from_named_node(&graph.0));
         let predicate = resolve(named("urn:test:w14:p"));
@@ -3680,7 +3482,7 @@ mod tests {
         let actor = ActorId::random();
         for (i, subject) in subjects.iter().enumerate() {
             store
-                .add_quad(
+                .insert_quad(
                     &mut batch,
                     QuadAdd {
                         quad: EncodedQuad {
@@ -3713,7 +3515,7 @@ mod tests {
         let subjects: HashSet<TermId> = subjects.iter().copied().collect();
         let mut batch = store.new_batch();
         store
-            .enqueue_fts_subjects_by_id(
+            .enqueue_fts_subjects(
                 &mut batch,
                 FtsEnqueue {
                     graph_id,
@@ -3785,7 +3587,7 @@ mod tests {
     /// Concurrent adds to one quad must each contribute a distinct dot (G1).
     ///
     /// Without the commit guard the `next_counter` read-then-write and the
-    /// `add_quad` read-modify-write of the dot set interleave, so two writers
+    /// `insert_quad` read-modify-write of the dot set interleave, so two writers
     /// mint the same counter and one add is lost.
     #[test]
     fn parallel_commits_keep_the_dot_set_intact() {
@@ -3915,7 +3717,7 @@ mod tests {
         let mut batch = store.new_batch();
         assert!(
             store
-                .retract_quad(
+                .remove_quad(
                     &mut batch,
                     QuadRemove {
                         quad: removed,
@@ -3960,12 +3762,10 @@ mod tests {
             for name in ["urn:pre1", "urn:pre2", "urn:pre3"] {
                 let subject = store.resolve_term(&named(name)).unwrap();
                 store
-                    .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+                    .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
                     .unwrap();
             }
-            store
-                .enqueue_fts_reindex_by_id(&mut batch, graph_id)
-                .unwrap();
+            store.enqueue_fts_reindex(&mut batch, graph_id).unwrap();
             store.commit(batch).unwrap();
             store.persist().unwrap();
 
@@ -3991,7 +3791,7 @@ mod tests {
         let subject = store.resolve_term(&named("urn:post-restart")).unwrap();
         let mut batch = store.new_batch();
         store
-            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
             .unwrap();
         store.commit(batch).unwrap();
 
@@ -4050,7 +3850,7 @@ mod tests {
         fresh.advance(legacy_actor, 9);
         let mut batch = store.new_batch();
         store
-            .set_vector_clock_by_id(
+            .set_vector_clock(
                 &mut batch,
                 ClockUpdate {
                     graph_id,
@@ -4277,7 +4077,7 @@ mod tests {
             let actor = ActorId::random();
             let mut batch = store.new_batch();
             let counter = store
-                .next_counter_by_id(
+                .next_counter(
                     &mut batch,
                     CounterKey {
                         graph_id: quad.graph,
@@ -4286,7 +4086,7 @@ mod tests {
                 )
                 .unwrap();
             store
-                .add_quad(
+                .insert_quad(
                     &mut batch,
                     QuadAdd {
                         quad,
@@ -4297,7 +4097,7 @@ mod tests {
             let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
             clock.advance(actor, counter);
             store
-                .set_vector_clock_by_id(
+                .set_vector_clock(
                     &mut batch,
                     ClockUpdate {
                         graph_id: quad.graph,
@@ -4426,7 +4226,7 @@ mod tests {
             let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
             for index in 0..ENTITIES {
                 let counter = store
-                    .next_counter_by_id(&mut batch, CounterKey { graph_id, actor })
+                    .next_counter(&mut batch, CounterKey { graph_id, actor })
                     .unwrap();
                 let quad = EncodedQuad {
                     graph: graph_id,
@@ -4441,7 +4241,7 @@ mod tests {
                         .unwrap(),
                 };
                 store
-                    .add_quad(
+                    .insert_quad(
                         &mut batch,
                         QuadAdd {
                             quad,
@@ -4452,7 +4252,7 @@ mod tests {
                 clock.advance(actor, counter);
             }
             store
-                .set_vector_clock_by_id(
+                .set_vector_clock(
                     &mut batch,
                     ClockUpdate {
                         graph_id,
@@ -4505,11 +4305,9 @@ mod tests {
             .unwrap();
         let mut batch = store.new_batch();
         store
-            .enqueue_fts_by_id(&mut batch, FtsSubject { graph_id, subject })
+            .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
             .unwrap();
-        store
-            .enqueue_fts_reindex_by_id(&mut batch, graph_id)
-            .unwrap();
+        store.enqueue_fts_reindex(&mut batch, graph_id).unwrap();
         store.commit(batch).unwrap();
 
         store.clear_fts_queue_for_graph(&graph).unwrap();
