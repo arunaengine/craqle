@@ -492,7 +492,7 @@ impl RoCrateManager {
                 graph_id,
                 parent_id,
                 &vocab::schema_has_part(),
-                encoded_identifier(&entity_id),
+                encoded_subject(&entity_id),
             ));
         }
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
@@ -534,7 +534,7 @@ impl RoCrateManager {
                 graph_id,
                 &parent_id,
                 &vocab::schema_has_part(),
-                encoded_identifier(&entity_id),
+                encoded_subject(&entity_id),
             ));
 
             for (predicate, object) in entity_subject_triples(&EntitySpec {
@@ -545,7 +545,7 @@ impl RoCrateManager {
             })? {
                 changes.push(MaterializedQuadChange::Insert {
                     graph: graph_id.clone(),
-                    subject: EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)),
+                    subject: encoded_subject(&entity_id),
                     predicate,
                     object,
                 });
@@ -674,7 +674,7 @@ impl RoCrateManager {
         let returned = page.len();
         let has_more = offset + returned < total;
         let next_cursor = has_more
-            .then(|| page.last().and_then(encoded_named_node_value))
+            .then(|| page.last().and_then(encoded_reference_value))
             .flatten();
 
         Ok(RoCratePage {
@@ -694,9 +694,14 @@ impl RoCrateManager {
         limit: usize,
     ) -> Result<RoCratePage, RoCrateError> {
         let cx = self.crate_ctx(graph_id)?;
+        // Acceptor half of the cursor round trip: decode exactly what
+        // [`encoded_reference_value`] emits. A page whose last entity is a blank node
+        // hands back `_:b0`, and re-encoding that as the IRI `<_:b0>` matches no
+        // interned term — `objects_page` then silently restarts from offset 0 and
+        // the caller re-reads page one forever.
         let after = after_entity_id
             .map(normalize_entity_id)
-            .map(|id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(id)));
+            .map(|id| encoded_subject(&id));
         // One extra entry beyond `limit` is the has-more probe.
         let (total, mut page) = self.root_linked_data_entity_page(
             &cx,
@@ -711,7 +716,7 @@ impl RoCrateManager {
         }
         let returned = page.len();
         let next_cursor = has_more
-            .then(|| page.last().and_then(encoded_named_node_value))
+            .then(|| page.last().and_then(encoded_reference_value))
             .flatten();
         let jsonld = self.render_export_view(
             &cx,
@@ -859,7 +864,10 @@ impl RoCrateManager {
         let cx = self.crate_ctx(graph_id)?;
         self.require_rocrate_initialized(&cx)?;
         let entity_id = normalize_entity_id(update.entity_id);
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
+        // The same encoding `subject_triples` reads with. Wrapping a `_:b0` id as
+        // the IRI `<_:b0>` made the read below succeed and the write below land on
+        // a term no reader ever looks at.
+        let subject = encoded_subject(&entity_id);
         let current = self.subject_triples(&cx, &entity_id)?;
         if current.is_empty() {
             return Err(RoCrateError::EntityNotFound(entity_id));
@@ -1047,7 +1055,7 @@ impl RoCrateManager {
                 &cx.graph,
                 upsert.parent_id,
                 &vocab::schema_has_part(),
-                encoded_identifier(upsert.entity.entity_id),
+                encoded_subject(upsert.entity.entity_id),
             ));
         }
         Ok(self.engine.local_apply_changes(&cx.graph, changes)?)
@@ -1060,7 +1068,7 @@ impl RoCrateManager {
         cx: &CrateCtx,
         spec: &EntitySpec<'_>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(spec.entity_id));
+        let subject = encoded_subject(spec.entity_id);
         let desired: BTreeSet<(EncodedTerm, EncodedTerm)> =
             entity_subject_triples(spec)?.into_iter().collect();
         let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
@@ -1096,7 +1104,7 @@ impl RoCrateManager {
         cx: &CrateCtx,
         patch: SubjectPatch<'_>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(patch.subject_id));
+        let subject = encoded_subject(patch.subject_id);
         let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
             .subject_triples(cx, patch.subject_id)?
             .into_iter()
@@ -1196,8 +1204,8 @@ impl RoCrateManager {
     }
 
     fn has_part_link(&self, cx: &CrateCtx, link: HasPartLink<'_>) -> Result<bool, RoCrateError> {
-        let parent = EncodedTerm::from_named_node(&NamedNode::new_unchecked(link.parent_id));
-        let child = encoded_identifier(link.child_id);
+        let parent = encoded_subject(link.parent_id);
+        let child = encoded_subject(link.child_id);
         // Same orphan hiding the old `subject_triples`-based check had: an
         // orphaned parent exposes no triples at all, and an orphaned child is
         // filtered out of its parent's objects, so either end being orphaned
@@ -1247,10 +1255,9 @@ impl RoCrateManager {
         }
 
         for entity in view.page_entities {
-            let Some(subject) = entity.to_named_node() else {
+            let Some(subject_id) = encoded_reference_value(entity) else {
                 continue;
             };
-            let subject_id = subject.as_str().to_string();
             if subject_id == cx.root_id() || subject_id == METADATA_ID {
                 continue;
             }
@@ -1682,7 +1689,7 @@ impl RoCrateManager {
     ) -> Result<Vec<String>, RoCrateError> {
         let page_subjects: HashSet<String> = page_entities
             .iter()
-            .filter_map(encoded_named_node_value)
+            .filter_map(encoded_reference_value)
             .collect();
         let mut queue = VecDeque::from([METADATA_ID.to_string(), cx.root_id().to_string()]);
         queue.extend(page_subjects.iter().cloned());
@@ -1745,7 +1752,7 @@ fn insert_change(
 ) -> MaterializedQuadChange {
     MaterializedQuadChange::Insert {
         graph: graph_id.clone(),
-        subject: EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id)),
+        subject: encoded_subject(subject_id),
         predicate: EncodedTerm::from_named_node(predicate),
         object,
     }
@@ -1950,10 +1957,13 @@ impl SubmittedPointers {
                 continue;
             };
             let normalized = normalize_entity_id(id);
+            // Keyed by the same term the change set carries, so a document that
+            // spells a nested entity out as `"@id": "_:b0"` still resolves to its
+            // own JSON pointer instead of falling back to the whole `@graph`.
             let entity_term = if import_root.as_deref() == Some(normalized.as_str()) {
                 root_term(graph_id)
             } else {
-                encoded_identifier(&normalized)
+                encoded_subject(&normalized)
             };
             let entity_pointer = format!("{}/{index}", pointers.graph);
             pointers
@@ -2554,13 +2564,22 @@ fn encoded_class_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
     )))
 }
 
+/// A value that is an IRI by construction — a constant or an id derived from the
+/// graph name. Never reachable from a caller-supplied entity id; use
+/// [`encoded_subject`] for those.
 fn encoded_identifier(value: &str) -> EncodedTerm {
     EncodedTerm::from_named_node(&NamedNode::new_unchecked(value))
 }
 
-/// A subject identifier, which import may have minted as a blank node. Shares
-/// [`EncodedTerm::from_subject_id`] with the SPARQL and describe readers so all
-/// three agree on how an orphan id encodes (G6).
+/// An entity identifier, which import may have minted as a blank node.
+///
+/// Blank nodes are addressable entities in craqle: `oxjsonld` mints one for every
+/// inline nested entity, and every reader — SPARQL, describe, search, export —
+/// hands those ids back in bare `_:b0` form. So every caller-supplied id → term
+/// conversion goes through here, on the write path as much as the read path.
+/// Wrapping `_:b0` as the IRI `<_:b0>` yields a *different* term, which is how a
+/// write could land somewhere no read would ever look (and how an orphaned blank
+/// node stayed visible, G6).
 fn encoded_subject(value: &str) -> EncodedTerm {
     EncodedTerm::from_subject_id(value)
 }
@@ -2679,7 +2698,7 @@ fn export_root_entity(view: RootExportView<'_>) -> Result<RootDataEntity, RoCrat
         let ids = view
             .page_entities
             .iter()
-            .filter_map(|term| term.to_named_node().map(|node| node.as_str().to_string()))
+            .filter_map(encoded_reference_value)
             .collect::<Vec<_>>();
         if !ids.is_empty() {
             dynamic.insert(
@@ -2763,10 +2782,13 @@ fn object_named_node_value(object: &EncodedTerm) -> Option<String> {
         .map(|node| normalize_compact_term(node.as_str()))
 }
 
-fn encoded_named_node_value(object: &EncodedTerm) -> Option<String> {
-    object.to_named_node().map(|node| node.as_str().to_string())
-}
-
+/// The bare id an entity reference denotes: an IRI unwrapped from its angle
+/// brackets, a blank node kept as its `_:b0` label.
+///
+/// Also the emit half of the page-cursor round trip. `export_jsonld_page_after`
+/// re-encodes whatever this returns with [`encoded_subject`], so the two must
+/// stay inverses; a page ending on a blank-node entity used to emit no cursor at
+/// all, silently truncating the caller's walk.
 fn encoded_reference_value(object: &EncodedTerm) -> Option<String> {
     match object.to_term() {
         Some(Term::NamedNode(node)) => Some(node.as_str().to_string()),

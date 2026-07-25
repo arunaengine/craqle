@@ -1923,6 +1923,202 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Blank nodes are addressable entities (write path).
+    //
+    // Every read hands blank-node ids back in bare `_:b0` form — search hits,
+    // `describe_subject`, exported `@id`s, page cursors — so a caller can and
+    // will feed one straight back into a write. The write path therefore has to
+    // encode an entity id exactly the way the read path does. Wrapping `_:b0` as
+    // the IRI `<_:b0>` yields a *different* term: the write reports success and
+    // then no reader ever resolves it.
+    // ---------------------------------------------------------------------
+
+    const RENAMED: &str = "Renamed Nested Person";
+
+    /// Every `<subject> <predicate> <object>` triple of a graph, as raw
+    /// N-Triples-form strings.
+    fn snapshot_terms(node: &CraqleNode, graph: &GraphId) -> Vec<(String, String, String)> {
+        node.graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .map(|quad| (quad.subject.0, quad.predicate.0, quad.object.0))
+            .collect()
+    }
+
+    /// A property update addressed by a blank-node id must land on the term the
+    /// reads resolve. `update_property` with `old_value: None` is replace-all, so
+    /// a write that misses also fails to delete: the stale value survives beside
+    /// a new one nothing can see.
+    #[test]
+    fn blank_node_property_update_lands_where_reads_look() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:blank-node-write");
+        let entities = nested_entity_fixture(&node, &graph, true);
+        assert!(
+            entities.linked.id.starts_with("_:"),
+            "fixture must offer a reachable blank-node entity, got `{}`",
+            entities.linked.id
+        );
+
+        manager(&node)
+            .update_property(&graph, &entities.linked.id, "name", None, RENAMED)
+            .unwrap();
+
+        let described = described(&node, &graph, &entities.linked.id);
+        assert!(
+            described
+                .iter()
+                .any(|(_, object)| object == &literal_term(RENAMED).0),
+            "describe_subject must see the update: {described:?}"
+        );
+        assert!(
+            !described
+                .iter()
+                .any(|(_, object)| object == &literal_term(LINKED_NAME).0),
+            "replace-all must delete the previous value, not shadow it: {described:?}"
+        );
+
+        let exported = manager(&node).export_jsonld(&graph).unwrap();
+        assert!(
+            exported.contains(RENAMED) && !exported.contains(LINKED_NAME),
+            "the update must be readable back through export: {exported}"
+        );
+        assert!(
+            queried_terms(&node, &graph).contains(&literal_term(RENAMED).0),
+            "the update must be readable back through SPARQL"
+        );
+
+        let mangled: Vec<_> = snapshot_terms(&node, &graph)
+            .into_iter()
+            .filter(|(subject, _, object)| subject.starts_with("<_:") || object.starts_with("<_:"))
+            .collect();
+        assert!(
+            mangled.is_empty(),
+            "a blank node must never be written as the IRI `<_:…>`: {mangled:?}"
+        );
+    }
+
+    /// A crate whose root `hasPart` mixes one named data entity with two inline
+    /// nested ones, which the importer mints as blank nodes.
+    fn mixed_part_fixture(node: &CraqleNode, graph: &GraphId) {
+        let inline = |name: &str| serde_json::json!({"@type": "File", "name": name});
+        let document = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Mixed Part Crate",
+                    "description": "Root parts spanning named and blank nodes",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "hasPart": [
+                        {"@id": "./named.txt"},
+                        inline("First Inline Part"),
+                        inline("Second Inline Part")
+                    ]
+                },
+                {"@id": "./named.txt", "@type": "File", "name": "Named Part"}
+            ]
+        });
+        manager(node)
+            .import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+    }
+
+    /// The root's `hasPart` objects read straight off the store, as bare ids.
+    /// Ground truth for the walk below, independent of the export renderer.
+    fn root_part_ids(node: &CraqleNode, graph: &GraphId) -> std::collections::BTreeSet<String> {
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        snapshot_terms(node, graph)
+            .into_iter()
+            .filter(|(subject, predicate, _)| {
+                subject == &named(graph.as_str()).0 && predicate == &has_part.0
+            })
+            .map(|(_, _, object)| {
+                EncodedTerm(object.clone())
+                    .to_named_node()
+                    .map_or(object, |node| node.as_str().to_string())
+            })
+            .collect()
+    }
+
+    /// Paging is a round trip: what a page emits as `next_cursor` is what the
+    /// next call must accept. A page ending on a blank-node entity emitted no
+    /// cursor at all, which silently truncated the walk; re-encoding such a
+    /// cursor as the IRI `<_:b0>` on the way back in matches no interned term,
+    /// and the store then restarts from offset 0 — the walk repeats page one.
+    #[test]
+    fn blank_node_page_cursor_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:blank-node-cursor");
+        mixed_part_fixture(&node, &graph);
+        let mgr = manager(&node);
+
+        let expected = root_part_ids(&node, &graph);
+        assert_eq!(
+            expected.iter().filter(|id| id.starts_with("_:")).count(),
+            2,
+            "fixture must link two blank-node parts from the root: {expected:?}"
+        );
+
+        // One entity per page, so every cursor is emitted from — and fed back
+        // as — a single entity id, two of the three of them blank nodes.
+        let mut collected: Vec<String> = Vec::new();
+        let mut cursors: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..expected.len() {
+            let page = mgr
+                .export_jsonld_page_after(&graph, cursor.as_deref(), 1)
+                .unwrap();
+            assert_eq!(page.total_data_entities, expected.len());
+            let ids = root_has_part_ids(&parsed(&page.jsonld), &graph);
+            assert_eq!(
+                ids.len(),
+                page.returned_data_entities,
+                "a paged entity must be rendered, not merely counted: {}",
+                page.jsonld
+            );
+            collected.extend(ids);
+            let Some(next) = page.next_cursor else { break };
+            assert_eq!(
+                Some(&next),
+                collected.last(),
+                "the cursor must name the page's last entity"
+            );
+            cursors.push(next.clone());
+            cursor = Some(next);
+        }
+
+        assert!(
+            cursors.iter().any(|id| id.starts_with("_:")),
+            "the walk must actually round-trip a blank-node cursor: {cursors:?}"
+        );
+        assert_eq!(
+            collected.len(),
+            expected.len(),
+            "single-entity pages must visit every root part exactly once, with \
+             no repeats and no gaps: {collected:?}"
+        );
+        assert_eq!(
+            collected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "the cursor walk must cover exactly the root's parts"
+        );
+    }
+
     /// The import context register is a two-phase, publish-first LWW register
     /// (G4/G5): re-running an unchanged import leaves it exactly as it was, and
     /// an import carrying a different context replaces it.

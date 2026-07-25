@@ -163,6 +163,11 @@ impl EncodedTerm {
     /// and an orphaned blank node stays visible to export, SPARQL and search
     /// (G6). Every string → [`EncodedTerm`] round trip for a *subject* must go
     /// through here.
+    ///
+    /// This binds writes as tightly as reads. Blank nodes are addressable
+    /// entities: an entity id supplied to the RO-Crate write API may name one,
+    /// and encoding it as an IRI would target a term no reader resolves — the
+    /// write would appear to succeed and then be invisible.
     pub fn from_subject_id(id: &str) -> Self {
         if id.starts_with("_:") {
             Self(id.to_string())
