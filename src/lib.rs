@@ -68,6 +68,33 @@ pub use auth::{
 };
 pub use irokle;
 
+/// Test-only stall between a publish and its own apply, in microseconds.
+///
+/// The pair is one critical section: the window between the two is exactly
+/// where a concurrent write slips in and makes apply order differ from publish
+/// order. In a real run that window is a few instructions wide, far too narrow
+/// to hit on purpose, so tests widen it. Compiled out of every non-test build.
+#[cfg(test)]
+static PUBLISH_APPLY_STALL_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn stall_publish_apply() {
+    let micros = PUBLISH_APPLY_STALL_MICROS.load(Ordering::Relaxed);
+    if micros == 0 {
+        return;
+    }
+    // Jittered: a fixed stall would delay every writer equally and so preserve
+    // the order they entered in, which is the order under test.
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()));
+    std::thread::sleep(Duration::from_micros(jitter % micros + 1));
+}
+
+#[cfg(not(test))]
+fn stall_publish_apply() {}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CraqleError {
     #[error("io: {0}")]
@@ -1751,12 +1778,18 @@ impl CraqleNode {
     }
 
     pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
+        // Orders the tombstone against this graph's writes, and the publish
+        // against its own apply; see `replication::GRAPH_WRITE_LOCKS`. Every
+        // tombstone writer takes it, so a write that checks the tombstone
+        // before applying cannot race one halfway through.
+        let _write_guard = replication::graph_write_guard(graph);
+
         if let Some(sync) = &self.sync
             && sync.graph_topic_id(&self.store, graph)?.is_some()
             && !self.store.graph_tombstoned(graph)?
         {
             let record = sync.publish_delete(&self.store, graph)?;
-            self.apply_irokle_record(&record)?;
+            self.apply_irokle_record_locked(&record)?;
             return self.persist_fjall();
         }
         self.store.set_graph_tombstone(graph)?;
@@ -1870,8 +1903,15 @@ impl CraqleNode {
             if self.store.contains_graph(graph)? && self.store.graph_policy(graph)? == policy {
                 return Ok(());
             }
+            // Orders the publish against its own apply; see
+            // `replication::GRAPH_WRITE_LOCKS`. Policy has no ordering tag, so
+            // two writes that apply in the opposite order to their publish
+            // sequence leave this node on a policy its peers have replaced —
+            // the permissive one, if that is the one that lost (G8).
+            let _write_guard = replication::graph_write_guard(graph);
             let record = sync.publish_policy(&self.store, graph, policy.clone())?;
-            self.apply_irokle_record(&record)?;
+            stall_publish_apply();
+            self.apply_irokle_record_locked(&record)?;
             return Ok(());
         }
 
@@ -2365,5 +2405,147 @@ mod tests {
 
     fn context_race_graph(round: usize) -> GraphId {
         GraphId::new(&format!("urn:test:context-apply-{round}"))
+    }
+
+    fn policy_at(path: &str) -> GraphPolicy {
+        GraphPolicy {
+            public: true,
+            permission_paths: vec![format!("/t/{path}")],
+        }
+    }
+
+    /// G8 — concurrent policy writes must leave this node on the policy their
+    /// publish sequence ends with, which is the one every peer converges to.
+    ///
+    /// A policy event carries no ordering tag, so publish order is the only
+    /// thing that decides the winner. Publishing and applying without a lock
+    /// between them lets two writes apply in the opposite order, leaving this
+    /// node on a policy its peers have already replaced — the permissive one,
+    /// if that is the one that lost.
+    #[test]
+    fn concurrent_policy_writes_settle_on_the_last_published() {
+        const ROUNDS: usize = 10;
+        const WRITERS: usize = 4;
+        const STALL_MICROS: u64 = 2_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = sync_node(&dir);
+
+        // Widen the publish→apply window, so a writer that does not hold it
+        // open under a lock is overtaken instead of merely being able to be.
+        PUBLISH_APPLY_STALL_MICROS.store(STALL_MICROS, Ordering::Relaxed);
+        for round in 0..ROUNDS {
+            let graph = GraphId::new(&format!("urn:test:policy-race-{round}"));
+            node.import_graph_policy(&graph, policy_at("seed")).unwrap();
+
+            let (tx, rx) = mpsc::channel();
+            for writer in 0..WRITERS {
+                let node = Arc::clone(&node);
+                let graph = graph.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    node.set_graph_policy(&writer_auth(), &graph, policy_at(&format!("w{writer}")))
+                        .unwrap();
+                    tx.send(()).unwrap();
+                });
+            }
+            drop(tx);
+            await_workers(&rx, WRITERS);
+
+            assert_eq!(
+                last_published_policy(&node, &graph),
+                node.store.graph_policy(&graph).unwrap(),
+                "round {round} settled on a policy its peers have replaced"
+            );
+        }
+        PUBLISH_APPLY_STALL_MICROS.store(0, Ordering::Relaxed);
+    }
+
+    /// The policy a peer replaying this graph's topic ends up on.
+    fn last_published_policy(node: &CraqleNode, graph: &GraphId) -> GraphPolicy {
+        let sync = node.sync.clone().expect("sync node");
+        let topic = sync
+            .graph_topic_id(&node.store, graph)
+            .unwrap()
+            .expect("a bound topic");
+        sync.topic_records_since(topic, None)
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|record| match record.event {
+                CraqleGraphEvent::Policy { policy, .. } => Some(policy.normalized()),
+                _ => None,
+            })
+            .next_back()
+            .expect("at least one published policy")
+    }
+
+    /// G4 — a write racing a delete must not resurrect the graph.
+    ///
+    /// The local write applies through the replication engine, which never
+    /// passes `CraqleNode::apply_irokle_record`'s tombstone check; without one
+    /// of its own it re-creates the graph the delete just tombstoned. Nothing
+    /// clears a tombstone, so every later replicated record for that graph is
+    /// dropped and the divergence can never be repaired.
+    #[test]
+    fn a_write_racing_a_delete_never_resurrects_the_graph() {
+        const ROUNDS: usize = 16;
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = sync_node(&dir);
+        let (tx, rx) = mpsc::channel();
+
+        for round in 0..ROUNDS {
+            let graph = GraphId::new(&format!("urn:test:delete-race-{round}"));
+            node.import_graph_policy(&graph, policy_at("delete-race"))
+                .unwrap();
+            seed_write(&node, &graph);
+
+            let start = Arc::new(std::sync::Barrier::new(2));
+            for racer in 0..2 {
+                let node = Arc::clone(&node);
+                let graph = graph.clone();
+                let start = Arc::clone(&start);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    if racer == 0 {
+                        node.delete_graph_unchecked(&graph).unwrap();
+                    } else {
+                        seed_write(&node, &graph);
+                    }
+                    tx.send(()).unwrap();
+                });
+            }
+        }
+        drop(tx);
+        await_workers(&rx, ROUNDS * 2);
+
+        for round in 0..ROUNDS {
+            let graph = GraphId::new(&format!("urn:test:delete-race-{round}"));
+            assert!(
+                node.store.graph_tombstoned(&graph).unwrap(),
+                "round {round} never recorded the delete"
+            );
+            assert!(
+                !node.contains_graph(&graph).unwrap(),
+                "round {round} resurrected a tombstoned graph"
+            );
+        }
+    }
+
+    /// A bare quad write, skipping the crate-structure rules these tests are
+    /// not about.
+    fn seed_write(node: &CraqleNode, graph: &GraphId) {
+        node.apply_changes_unchecked(
+            graph,
+            vec![MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: EncodedTerm::from_named_node(&graph.0),
+                predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                object: EncodedTerm("\"race\"".to_string()),
+            }],
+        )
+        .unwrap();
     }
 }

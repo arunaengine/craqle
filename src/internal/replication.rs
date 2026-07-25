@@ -399,6 +399,14 @@ impl ReplicationEngine {
             // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
             let _write_guard = graph_write_guard(graph);
 
+            // A deleted graph stays deleted. Publishing alone would resurrect
+            // it: binding the topic writes the graph's metadata record back.
+            // Every tombstone writer takes the lock held here, so a delete
+            // cannot land between this check and the publish.
+            if self.store.graph_tombstoned(graph)? {
+                return self.empty_batch(graph);
+            }
+
             // Publish-first (G4): the event goes out before any local state
             // changes, and outside the commit guard, because the publish may bind
             // an irokle topic and that takes the guard itself (addendum A1).
@@ -585,6 +593,7 @@ impl ReplicationEngine {
     }
 
     /// Apply a causally ordered batch produced from an Irokle graph event.
+    /// **Call with the graph's write lock held.**
     ///
     /// Irokle actor sequences include genesis and topic-control operations, so
     /// they are not contiguous over Craqle domain events. The Irokle DAG already
@@ -594,6 +603,9 @@ impl ReplicationEngine {
         self.apply_irokle_batch_with_plan(&incoming, DiagnosticsPlan::Immediate)
     }
 
+    /// **Call with the graph's write lock held.** Every caller does, and so
+    /// does every writer of a graph tombstone, which is what makes the check
+    /// below atomic against a concurrent delete.
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
     fn apply_irokle_batch_with_plan(
         &self,
@@ -601,6 +613,16 @@ impl ReplicationEngine {
         plan: DiagnosticsPlan,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
+
+        // A deleted graph stays deleted. This is also the *local* write's apply
+        // path, which never passes through `CraqleNode::apply_irokle_record`,
+        // so without the check a write racing a delete re-creates the graph the
+        // delete just tombstoned — and the tombstone then drops every later
+        // replicated record for it, so replication can never repair the
+        // divergence.
+        if self.store.graph_tombstoned(graph)? {
+            return Ok(MergeResult { applied: false });
+        }
 
         // Self-guarding, so it must run before the commit guard is taken.
         if !self.store.contains_graph(graph)? {
