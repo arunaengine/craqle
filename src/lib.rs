@@ -2251,6 +2251,7 @@ mod tests {
     /// stay diverged from the store until the process restarted — the lingering
     /// inconsistency the recovery rules forbid.
     #[test]
+    #[cfg(feature = "search")]
     fn search_worker_survives_a_panicking_drain() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
