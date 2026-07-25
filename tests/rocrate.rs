@@ -27,7 +27,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_jsonld_roundtrip() {
+    fn import_jsonld_round_trips() {
         let (_tmp, net) = setup_network(1);
         let source = GraphId::new("urn:test:crate-source");
         let imported = GraphId::new("urn:test:crate-imported");
@@ -62,7 +62,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn test_import_jsonld_updates_search_without_manual_reindex() {
+    fn import_jsonld_updates_search_without_manual_reindex() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:import-search");
@@ -104,7 +104,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn test_trusted_bootstrap_import_updates_search_without_manual_reindex() {
+    fn trusted_bootstrap_updates_search_without_manual_reindex() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:trusted-bootstrap-search");
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trusted_bootstrap_rejects_non_empty_graph() {
+    fn trusted_bootstrap_rejects_a_non_empty_graph() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:trusted-bootstrap-non-empty");
@@ -217,7 +217,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn test_batched_append_updates_search_without_manual_reindex() {
+    fn batched_append_updates_search_without_manual_reindex() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:append-search");
@@ -281,7 +281,7 @@ mod tests {
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
     #[cfg(feature = "search")]
     #[test]
-    fn test_graph_reindex_marker_refreshes_search_results() {
+    fn graph_reindex_marker_refreshes_search_results() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:graph-reindex-search");
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_rocrate_lifecycle_scenario() {
+    fn a_rocrate_survives_a_full_create_update_export_lifecycle() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-lifecycle");
         let mgr0 = manager(net.peer(0));
@@ -1333,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_null_context_exports_default() {
+    fn a_null_context_exports_the_default_context() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-null");
         let mgr = manager(net.peer(0));
