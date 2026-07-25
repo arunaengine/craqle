@@ -2217,4 +2217,75 @@ mod tests {
             "a changed @context must replace the stored one (LWW): {updated}"
         );
     }
+
+    /// Known defect: a no-op re-import erases a correct orphan set.
+    ///
+    /// The import paths stamp `GraphDiagnostics::default()` after a deferred
+    /// bulk apply instead of recomputing, and the record is written with a
+    /// matching clock tag — so neither the read check nor the open-time repair
+    /// ever corrects it. Simply recomputing instead is NOT the fix: profile
+    /// artifacts are reachable only via `prof:hasArtifact`, which the orphan
+    /// rule does not walk, so an honest recompute hides them and breaks
+    /// `profile_summary_includes_only_resource_descriptor_artifact_files`.
+    /// Teaching the reachability rule about profile edges has to come first.
+    #[test]
+    #[ignore = "documents an open defect; see the comment above"]
+    fn reimporting_an_identical_document_preserves_the_orphan_set() {
+        let (_tmp, net) = setup_network(1);
+        let node = net.peer(0);
+        let graph = GraphId::new("urn:test:f1-orphan-wipe");
+        let doc = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+                 "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                 "about": {"@id": graph.as_str()}},
+                {"@id": graph.as_str(), "@type": "Dataset", "name": "f1",
+                 "description": "d", "datePublished": "2025-01-01",
+                 "license": "https://creativecommons.org/licenses/by/4.0/"}
+            ]
+        })
+        .to_string();
+
+        node.apply_rocrate_document_with_policy(
+            &writer_auth(),
+            graph.clone(),
+            &doc,
+            public_policy(),
+        )
+        .unwrap();
+
+        // Introduce a genuine orphan directly.
+        node.apply_changes_bulk_unchecked(
+            &graph,
+            vec![MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: EncodedTerm("<urn:test:stray>".into()),
+                predicate: EncodedTerm("<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".into()),
+                object: EncodedTerm("<http://schema.org/MediaObject>".into()),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(&graph).unwrap();
+        assert_eq!(
+            node.graph_diagnostics(&graph).unwrap().orphaned_entities,
+            vec!["urn:test:stray".to_string()],
+            "precondition: the stray entity is a recorded orphan"
+        );
+
+        // Re-import the byte-identical document: an empty diff.
+        node.apply_rocrate_document_with_policy(
+            &writer_auth(),
+            graph.clone(),
+            &doc,
+            public_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            node.graph_diagnostics(&graph).unwrap().orphaned_entities,
+            vec!["urn:test:stray".to_string()],
+            "a no-op re-import must not erase the orphan set"
+        );
+    }
 }
