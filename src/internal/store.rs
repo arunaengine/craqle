@@ -1764,7 +1764,8 @@ impl GraphStore {
             batch.remove(&self.graphs, reindex_key);
         }
 
-        let delete_token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        // `Relaxed` for the same reason as `enqueue_fts_by_id`.
+        let delete_token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
             &self.graphs,
             graph_search_delete_key(graph_id),
@@ -2545,8 +2546,16 @@ impl GraphStore {
     ///
     /// Does not lock; the token comes from a process-wide counter that is
     /// seeded past every live queue token at open (WS0-T6).
+    ///
+    /// `Relaxed` is enough for the mint. The counter orders nothing but itself:
+    /// the queue entry's visibility comes from the fjall batch, not from this
+    /// atomic. What [`GraphStore::current_dirty_token`] needs is that a mint
+    /// which happened-before its load is reflected in the value it reads, and
+    /// that is single-location read-read coherence, which every ordering
+    /// guarantees. `SeqCst` bought a fence on the hottest write path for
+    /// nothing.
     pub fn enqueue_fts_by_id(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
-        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
             &self.graphs,
             graph_dirty_key(key.graph_id, key.subject),
@@ -2555,8 +2564,11 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Queue a set of subjects, collapsing to a whole-graph reindex once the
-    /// set is large enough that per-subject entries cost more than a rescan.
+    /// Queue a set of subjects, collapsing to a whole-graph reindex only when
+    /// the rescan is genuinely the cheaper of the two.
+    ///
+    /// See [`GraphStore::fts_reindex_is_cheaper`] for the rule and for why
+    /// picking the per-subject branch cannot lose search freshness (G7).
     pub fn enqueue_fts_subjects_by_id(
         &self,
         batch: &mut WriteBatch,
@@ -2565,7 +2577,7 @@ impl GraphStore {
         if req.subjects.is_empty() {
             return Ok(());
         }
-        if req.subjects.len() >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD {
+        if self.fts_reindex_is_cheaper(req.graph_id, req.subjects.len()) {
             return self.enqueue_fts_reindex_by_id(batch, req.graph_id);
         }
         for subject in req.subjects {
@@ -2580,12 +2592,44 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Whether rescanning the whole graph is cheaper than queueing `subjects`
+    /// individual dirty entries.
+    ///
+    /// The batch has to be large in absolute terms *and* cover a substantial
+    /// fraction of the graph. The absolute bound on its own was measuring the
+    /// wrong thing (finding W14): a 10k-subject write against a 100k-entity
+    /// graph escalated into a 100k-subject rescan, ten times the work the write
+    /// actually dirtied, and a large ingest split into batches re-scanned
+    /// everything it had already written once per batch.
+    ///
+    /// [`GraphStore::graph_subject_count`] is an O(1) read off the in-memory
+    /// index, so the extra test costs nothing. It observes the graph as it
+    /// stood before `batch`, which is the conservative direction: a batch that
+    /// is adding subjects is compared against the smaller, pre-write graph and
+    /// so escalates more readily, never less.
+    ///
+    /// **Why the per-subject branch is safe (G7).** The queue is a dirty-set:
+    /// over-queueing only costs work, under-queueing silently loses search
+    /// freshness, so moving work out of the rescan branch is only legitimate if
+    /// the per-subject entries still cover everything the write changed. They
+    /// do: every caller passes exactly the subjects its own write changed, and
+    /// the one effect a write can have on a subject it never touched — flipping
+    /// that subject in or out of the orphan set, which hides it from search
+    /// (G6) — is queued separately and per-subject by the diagnostics
+    /// settlement that follows every commit. Neither branch of this function
+    /// ever covered that case, so neither branch depends on it.
+    fn fts_reindex_is_cheaper(&self, graph_id: TermId, subjects: usize) -> bool {
+        subjects >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD
+            && subjects * 2 >= self.graph_subject_count(graph_id)
+    }
+
     pub fn enqueue_fts_reindex_by_id(
         &self,
         batch: &mut WriteBatch,
         graph_id: TermId,
     ) -> Result<()> {
-        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        // `Relaxed` for the same reason as `enqueue_fts_by_id`.
+        let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
         batch.insert(
             &self.graphs,
             graph_reindex_key(graph_id),
@@ -3452,6 +3496,131 @@ mod tests {
         assert_eq!(queued[0].0, graph);
         store.acknowledge_fts_reindex_queue(&queued).unwrap();
         assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+    }
+
+    // ── W14: the reindex collapse is relative to graph size ─────────────
+
+    /// Give `graph` exactly `count` distinct subjects, in one batch.
+    ///
+    /// Returns the graph's term id together with its subject ids, in ascending
+    /// seed order, so a caller can enqueue a prefix of them.
+    fn seed_subjects(store: &GraphStore, graph: &GraphId, count: usize) -> (TermId, Vec<TermId>) {
+        let mut batch = store.new_batch();
+        let mut cache = HashMap::new();
+        let mut cx = BatchTermCtx {
+            batch: &mut batch,
+            cache: &mut cache,
+        };
+        let mut resolve = |term| store.resolve_term_in_ctx(&mut cx, &term).unwrap();
+
+        let graph_id = resolve(EncodedTerm::from_named_node(&graph.0));
+        let predicate = resolve(named("urn:test:w14:p"));
+        let object = resolve(named("urn:test:w14:o"));
+        let subjects: Vec<TermId> = (0..count)
+            .map(|i| resolve(named(&format!("urn:test:w14:s{i}"))))
+            .collect();
+
+        let actor = ActorId::random();
+        for (i, subject) in subjects.iter().enumerate() {
+            store
+                .add_quad(
+                    &mut batch,
+                    QuadAdd {
+                        quad: EncodedQuad {
+                            graph: graph_id,
+                            subject: *subject,
+                            predicate,
+                            object,
+                        },
+                        dot: Dot {
+                            actor,
+                            counter: i as u64 + 1,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        store.commit(batch).unwrap();
+
+        assert_eq!(count, store.graph_subject_count(graph_id));
+        (graph_id, subjects)
+    }
+
+    /// Enqueue `subjects` for `graph_id` and report `(subject entries, reindex
+    /// entries)` the enqueue produced.
+    fn enqueue_and_count(
+        store: &GraphStore,
+        graph_id: TermId,
+        subjects: &[TermId],
+    ) -> (usize, usize) {
+        let subjects: HashSet<TermId> = subjects.iter().copied().collect();
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts_subjects_by_id(
+                &mut batch,
+                FtsEnqueue {
+                    graph_id,
+                    subjects: &subjects,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        let per_subject = store.drain_fts_queue(usize::MAX).unwrap().len();
+        let reindexes = store.drain_fts_reindex_queue(usize::MAX).unwrap().len();
+        (per_subject, reindexes)
+    }
+
+    /// The collapse still fires when the rescan really is the cheaper option:
+    /// the batch is large *and* covers half the graph, so re-reading the graph
+    /// costs no more than the per-subject entries it replaces.
+    #[test]
+    fn fts_enqueue_collapses_when_the_batch_covers_half_the_graph() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:w14:half");
+        store.create_graph(&graph).unwrap();
+
+        let (graph_id, subjects) =
+            seed_subjects(&store, &graph, FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD * 2);
+        let batch = &subjects[..FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD];
+
+        assert_eq!((0, 1), enqueue_and_count(&store, graph_id, batch));
+    }
+
+    /// One subject past the halfway mark the rescan is the more expensive
+    /// option, and the enqueue must stay per-subject (finding W14).
+    ///
+    /// The absolute rule alone turned this write into a rescan of a graph twice
+    /// its size — and, in a batched ingest, once per batch.
+    #[test]
+    fn fts_enqueue_stays_per_subject_when_the_graph_dwarfs_the_batch() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:w14:dwarfed");
+        store.create_graph(&graph).unwrap();
+
+        let (graph_id, subjects) =
+            seed_subjects(&store, &graph, FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD * 2 + 1);
+        let batch = &subjects[..FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD];
+
+        // Every affected subject is queued: the relative rule may only move
+        // work off the rescan branch, never drop it (G7).
+        assert_eq!(
+            (FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD, 0),
+            enqueue_and_count(&store, graph_id, batch)
+        );
+    }
+
+    /// A batch that is the whole graph still stays per-subject while it is
+    /// small: the absolute bound survives the relative one.
+    #[test]
+    fn fts_enqueue_stays_per_subject_below_the_absolute_threshold() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:w14:small");
+        store.create_graph(&graph).unwrap();
+
+        let (graph_id, subjects) = seed_subjects(&store, &graph, 100);
+
+        assert_eq!((100, 0), enqueue_and_count(&store, graph_id, &subjects));
     }
 
     // ── WS0-T1 / T2: commit guard and prompt index repair ───────────────
