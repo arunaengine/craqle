@@ -2274,18 +2274,15 @@ mod tests {
         );
     }
 
-    /// Known defect: a no-op re-import erases a correct orphan set.
+    /// Import must *compute* the orphan set, never assert it.
     ///
-    /// The import paths stamp `GraphDiagnostics::default()` after a deferred
-    /// bulk apply instead of recomputing, and the record is written with a
-    /// matching clock tag — so neither the read check nor the open-time repair
-    /// ever corrects it. Simply recomputing instead is NOT the fix: profile
-    /// artifacts are reachable only via `prof:hasArtifact`, which the orphan
-    /// rule does not walk, so an honest recompute hides them and breaks
-    /// `profile_summary_includes_only_resource_descriptor_artifact_files`.
-    /// Teaching the reachability rule about profile edges has to come first.
+    /// The import paths apply their changes with `DiagnosticsPlan::DEFERRED`, so
+    /// nothing settles diagnostics for them; they must therefore call
+    /// `rebuild_graph_diagnostics`. Stamping `GraphDiagnostics::default()`
+    /// instead writes a wrong set under a *matching* clock tag, which both the
+    /// read-time tag check and the open-time repair then accept as fresh —
+    /// permanently losing every orphan the graph really has.
     #[test]
-    #[ignore = "documents an open defect; see the comment above"]
     fn reimporting_an_identical_document_preserves_the_orphan_set() {
         let (_tmp, net) = setup_network(1);
         let node = net.peer(0);
