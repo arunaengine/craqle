@@ -264,4 +264,258 @@ mod tests {
         let diagnostics = net.peer(0).graph_diagnostics(&graph).unwrap();
         assert!(!diagnostics.has_orphans());
     }
+
+    fn iri(value: &str) -> EncodedTerm {
+        EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(value))
+    }
+
+    fn insert(graph: &GraphId, triple: (&str, EncodedTerm, EncodedTerm)) -> MaterializedQuadChange {
+        MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: iri(triple.0),
+            predicate: triple.1,
+            object: triple.2,
+        }
+    }
+
+    fn media_object_triples(graph: &GraphId, entity: &str) -> Vec<MaterializedQuadChange> {
+        vec![
+            insert(
+                graph,
+                (
+                    entity,
+                    EncodedTerm::from_named_node(&vocab::rdf_type()),
+                    iri("http://schema.org/MediaObject"),
+                ),
+            ),
+            insert(
+                graph,
+                (
+                    entity,
+                    EncodedTerm::from_named_node(&vocab::schema_name()),
+                    EncodedTerm(format!("\"{entity}\"")),
+                ),
+            ),
+        ]
+    }
+
+    fn seeded_crate(net: &sim::CraqleCluster, graph: &GraphId) {
+        net.peer(0)
+            .create_crate(
+                &writer_auth(),
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "Reachability",
+                    "Reachability fixtures",
+                    "2025-01-01",
+                    "https://creativecommons.org/licenses/by/4.0/",
+                    public_policy(),
+                ),
+            )
+            .unwrap();
+    }
+
+    /// K3 — validating a write at the bottom of a very deep `hasPart` chain must
+    /// not overflow the stack. The reachability walk climbs one frame per link,
+    /// so a recursive implementation dies well before this depth.
+    #[test]
+    fn deep_haspart_chain_no_stack_overflow() {
+        const DEPTH: usize = 10_000;
+
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-deep-chain");
+        seeded_crate(&net, &graph);
+
+        // Build the chain with the trusted bulk path so the chain itself is not
+        // what is under test.
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let mut changes = Vec::with_capacity(DEPTH * 3);
+        for link in 0..DEPTH {
+            let entity = format!("./link-{link}");
+            let parent = if link == 0 {
+                graph.as_str().to_string()
+            } else {
+                format!("./link-{}", link - 1)
+            };
+            changes.push(MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: iri(&parent),
+                predicate: has_part.clone(),
+                object: iri(&entity),
+            });
+            changes.extend(media_object_triples(&graph, &entity));
+        }
+        net.peer(0)
+            .apply_changes_bulk_unchecked(&graph, changes)
+            .unwrap();
+        net.peer(0).rebuild_graph_diagnostics(&graph).unwrap();
+        assert!(!net.peer(0).graph_diagnostics(&graph).unwrap().has_orphans());
+
+        // One *validated* write at the deep end: the orphan check has to walk
+        // every link back up to the root.
+        let deepest = format!("./link-{}", DEPTH - 1);
+        let leaf = "./deep-leaf.txt";
+        let mut tail = vec![MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: iri(&deepest),
+            predicate: has_part.clone(),
+            object: iri(leaf),
+        }];
+        tail.extend(media_object_triples(&graph, leaf));
+        net.peer(0).apply_changes(&graph, tail).unwrap();
+
+        assert!(graph_contains(&net, 0, &graph, "deep-leaf.txt"));
+        assert!(!net.peer(0).graph_diagnostics(&graph).unwrap().has_orphans());
+    }
+
+    /// W4 — the delta index resolves a triple last-writer-wins, so deleting and
+    /// re-inserting the root type in one change set leaves the root intact.
+    #[test]
+    fn delete_then_reinsert_same_triple_passes_validation() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-reinsert");
+        seeded_crate(&net, &graph);
+
+        let root_type = (
+            EncodedTerm::from_named_node(&graph.0),
+            EncodedTerm::from_named_node(&vocab::rdf_type()),
+            iri("http://schema.org/Dataset"),
+        );
+        let changes = vec![
+            MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: root_type.0.clone(),
+                predicate: root_type.1.clone(),
+                object: root_type.2.clone(),
+            },
+            MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: root_type.0.clone(),
+                predicate: root_type.1.clone(),
+                object: root_type.2.clone(),
+            },
+        ];
+
+        net.peer(0).apply_changes(&graph, changes).unwrap();
+        assert!(
+            net.peer(0).graph_violations(&graph).unwrap().is_empty(),
+            "delete-then-reinsert must leave the root data entity in place"
+        );
+    }
+
+    /// The mirror image: insert-then-delete of the same triple removes it, so
+    /// validation must reject the change set.
+    #[test]
+    fn reinsert_then_delete_same_triple_fails_validation() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-reinsert-reverse");
+        seeded_crate(&net, &graph);
+
+        let root = EncodedTerm::from_named_node(&graph.0);
+        let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+        let dataset = iri("http://schema.org/Dataset");
+        let changes = vec![
+            MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: root.clone(),
+                predicate: rdf_type.clone(),
+                object: dataset.clone(),
+            },
+            MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: root,
+                predicate: rdf_type,
+                object: dataset,
+            },
+        ];
+
+        match net.peer(0).apply_changes(&graph, changes) {
+            Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
+                assert!(
+                    violations.iter().any(|violation| matches!(
+                        violation,
+                        CrateViolation::MissingRootDataEntity
+                    )),
+                    "expected the last delete to win, got {violations:?}"
+                );
+            }
+            other => panic!("expected root-destruction validation failure, got {other:?}"),
+        }
+    }
+
+    /// A `hasPart` cycle that is not attached to the root is unreachable: the
+    /// walk must not call the members reachable just because they reach each
+    /// other. Pinned on both the validated path and the recomputed diagnostics.
+    #[test]
+    fn haspart_cycle_detached_from_root_is_orphaned() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-cycle");
+        seeded_crate(&net, &graph);
+
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let mut cycle = vec![
+            insert(&graph, ("./cycle-a", has_part.clone(), iri("./cycle-b"))),
+            insert(&graph, ("./cycle-b", has_part.clone(), iri("./cycle-a"))),
+        ];
+        cycle.extend(media_object_triples(&graph, "./cycle-a"));
+        cycle.extend(media_object_triples(&graph, "./cycle-b"));
+
+        // The validated path rejects it outright.
+        match net.peer(0).apply_changes(&graph, cycle.clone()) {
+            Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
+                assert!(
+                    violations.iter().any(|violation| matches!(
+                        violation,
+                        CrateViolation::OrphanedDataEntity { .. }
+                    )),
+                    "a detached cycle is not reachable, got {violations:?}"
+                );
+            }
+            other => panic!("expected an orphan violation, got {other:?}"),
+        }
+
+        // Forced in through the trusted bulk path, both members are reported as
+        // orphans by the recomputed diagnostics.
+        net.peer(0)
+            .apply_changes_bulk_unchecked(&graph, cycle)
+            .unwrap();
+        net.peer(0).rebuild_graph_diagnostics(&graph).unwrap();
+        let orphans = net
+            .peer(0)
+            .graph_diagnostics(&graph)
+            .unwrap()
+            .orphaned_entities;
+        for member in ["./cycle-a", "./cycle-b"] {
+            assert!(
+                orphans.iter().any(|entity| entity == member),
+                "{member} should be orphaned, got {orphans:?}"
+            );
+        }
+    }
+
+    /// The same cycle *is* reachable once the root links into it, and the walk
+    /// must terminate rather than loop between the two members.
+    #[test]
+    fn haspart_cycle_attached_to_root_is_reachable() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:crate-cycle-attached");
+        seeded_crate(&net, &graph);
+
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let mut cycle = vec![
+            MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: EncodedTerm::from_named_node(&graph.0),
+                predicate: has_part.clone(),
+                object: iri("./ring-a"),
+            },
+            insert(&graph, ("./ring-a", has_part.clone(), iri("./ring-b"))),
+            insert(&graph, ("./ring-b", has_part.clone(), iri("./ring-a"))),
+        ];
+        cycle.extend(media_object_triples(&graph, "./ring-a"));
+        cycle.extend(media_object_triples(&graph, "./ring-b"));
+
+        net.peer(0).apply_changes(&graph, cycle).unwrap();
+        assert!(!net.peer(0).graph_diagnostics(&graph).unwrap().has_orphans());
+    }
 }
