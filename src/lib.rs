@@ -1419,9 +1419,15 @@ impl CraqleNode {
         new_value: &str,
     ) -> Result<Batch> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        let batch = self
-            .manager()
-            .update_property(graph, entity_id, predicate, old_value, new_value)?;
+        let batch = self.manager().apply_property_update(
+            graph,
+            rocrate::PropertyUpdate {
+                entity_id,
+                predicate,
+                old_value,
+                new_value,
+            },
+        )?;
         self.finish_batch(graph, batch)
     }
 
