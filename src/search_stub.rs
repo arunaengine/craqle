@@ -43,7 +43,9 @@ impl SearchIndex {
 
     /// Test-only parity with the real index; the stub never indexes, so there
     /// is no drain cycle to make panic.
+    /// Parity with the real index; the stub has no drain to make panic.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn arm_drain_panic(&self) {}
 
     #[cfg(test)]
