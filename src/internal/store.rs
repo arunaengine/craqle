@@ -1195,8 +1195,10 @@ impl GraphStore {
         let after: HashSet<&String> = current.orphaned_entities.iter().collect();
         let mut subjects = HashSet::new();
         for entity in before.symmetric_difference(&after) {
-            let term =
-                EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(entity.as_str()));
+            // `from_subject_id`, not `from_named_node`: diagnostics store a
+            // blank node as `_:b0`, and re-encoding that as the IRI `<_:b0>`
+            // would miss the lookup and silently never re-index it (G6, G7).
+            let term = EncodedTerm::from_subject_id(entity.as_str());
             if let Some(subject) = self.lookup_term(&term)? {
                 subjects.insert(subject);
             }
@@ -1993,6 +1995,24 @@ impl GraphStore {
             .map(|bytes| postcard::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(Into::into)
+    }
+
+    /// The orphan set as last *persisted*, without verifying its clock tag and
+    /// without recomputing.
+    ///
+    /// This is the set the search index currently reflects, which is what a
+    /// re-queue must diff against. Every other reader wants
+    /// [`GraphStore::graph_diagnostics`], which refuses to serve a stale record;
+    /// this one is deliberately allowed to return one, so callers must not use
+    /// it to decide visibility.
+    pub(crate) fn last_persisted_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphDiagnostics::default());
+        };
+        Ok(self
+            .read_stored_diagnostics(graph_id)?
+            .map(|record| record.diagnostics)
+            .unwrap_or_default())
     }
 
     fn store_diagnostics_record(

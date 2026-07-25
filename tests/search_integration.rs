@@ -550,4 +550,96 @@ mod tests {
             stop.store(true, Ordering::SeqCst);
         });
     }
+
+    /// An entity that becomes orphaned by a write that never touches it must leave
+    /// the search index (G6, G7).
+    ///
+    /// Deleting `root hasPart child` orphans the child without naming it in the
+    /// change set. The diagnostics settle then has to notice that the orphan set
+    /// moved and re-queue the child for indexing — otherwise search keeps returning
+    /// an entity that export and SPARQL now hide, and nothing repairs it until some
+    /// unrelated write happens to dirty that subject.
+    #[test]
+    fn entity_orphaned_by_an_untouched_write_leaves_the_search_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth =
+            GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
+        let graph = GraphId::new("urn:test:orphan-requeue");
+
+        node.create_crate(
+            &auth,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "requeue crate",
+                "description",
+                "2025-01-01",
+                None,
+                GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/t/x".to_string()],
+                },
+            ),
+        )
+        .unwrap();
+        node.append_new_root_data_entities(
+            &auth,
+            &graph,
+            vec![NewDataEntity {
+                entity_id: "data/pufferfish.dat".to_string(),
+                entity_type: "http://schema.org/MediaObject".to_string(),
+                name: "pufferfish".to_string(),
+                additional_triples: Vec::new(),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(&graph).unwrap();
+        node.flush_search_updates().unwrap();
+
+        assert_eq!(
+            node.search(&auth, "pufferfish", 10).unwrap().len(),
+            1,
+            "the child must be searchable before it is orphaned"
+        );
+
+        // Cut the only edge to the child, naming just the edge — never the child.
+        let has_part = "<http://schema.org/hasPart>";
+        let edge = node
+            .graph_snapshot(&graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .find(|quad| quad.predicate.0 == has_part)
+            .expect("root must link the child");
+        node.apply_changes_bulk_unchecked(
+            &graph,
+            vec![MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: edge.subject,
+                predicate: edge.predicate,
+                object: edge.object,
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(&graph).unwrap();
+        node.flush_search_updates().unwrap();
+
+        assert_eq!(
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .len(),
+            1,
+            "the child must now be recorded as orphaned"
+        );
+        assert_eq!(
+            node.search(&auth, "pufferfish", 10).unwrap().len(),
+            0,
+            "an orphaned entity must not remain searchable"
+        );
+    }
 }
