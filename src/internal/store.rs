@@ -63,16 +63,16 @@ const LOG_BATCH_PREFIX: u8 = b'B';
 const TOPIC_CLOCK_PREFIX: u8 = b'C';
 const TOPIC_BINDING_PREFIX: u8 = b'T';
 const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
-/// Per-graph vector clock, split out of the graph meta record (WS0-T3) so a
+/// Per-graph vector clock, split out of the graph meta record so a
 /// commit writes only the clock and never rewrites policy/context/topic bytes.
 const GRAPH_CLOCK_PREFIX: u8 = b'K';
-/// Persisted, clock-tagged graph diagnostics (WS0-T5, finding K6).
+/// Persisted, clock-tagged graph diagnostics.
 const GRAPH_DIAGNOSTICS_PREFIX: u8 = b'O';
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
 /// Upper bound on the global term-decode cache. Term ids are content hashes so
 /// entries are never invalidated; the cache is simply cleared when it hits the
-/// cap (WS0-T4).
+/// cap.
 const TERM_DECODE_CACHE_CAP: usize = 1_000_000;
 const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
 const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
@@ -126,7 +126,7 @@ fn recommended_db_cache_bytes() -> u64 {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct StoredGraphMeta {
     policy: GraphPolicy,
-    /// Legacy home of the per-graph vector clock. Since WS0-T3 the clock lives
+    /// Legacy home of the per-graph vector clock. The clock now lives
     /// under its own `'K' || graph_id` key and this field is only read as a
     /// one-time migration fallback for stores written before the split; it is
     /// ignored as soon as the `'K'` key exists. Never written by
@@ -165,7 +165,7 @@ pub struct WriteBatch {
     /// Uncommitted dot sets, so later operations in the same batch read the
     /// batch-local state instead of the (still stale) durable one. `None` means
     /// "written empty", i.e. the quad is dead. Keyed by the fixed-size quad key
-    /// so no per-quad `Vec` is allocated (WS0-T8).
+    /// so no per-quad `Vec` is allocated.
     pending_quad_states: HashMap<QuadKey, Option<Vec<Dot>>>,
     pending_terms: HashMap<TermId, String>,
     quad_mutations: Vec<QuadMutation>,
@@ -203,8 +203,7 @@ impl WriteBatch {
 /// is the source of truth: an insert found the `(predicate, object)` pair
 /// already present, or a remove found nothing to remove. Both are impossible
 /// while every read→write cycle of a graph is serialized by its commit guard,
-/// so seeing one means the index has drifted and must be rebuilt (WS0-T2,
-/// derived-state register row 1).
+/// so seeing one means the index has drifted and must be rebuilt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexApply {
     Ok,
@@ -269,7 +268,7 @@ struct DerivedIndexState {
     by_object: HashMap<TermId, HashMap<TermId, HashSet<(TermId, TermId)>>>,
     /// predicate → graph → live quad count, so a predicate-only pattern can be
     /// answered by scanning just the graphs that actually contain it instead of
-    /// every subject in the corpus (WS0-T11). Counts are needed so a graph is
+    /// every subject in the corpus. Counts are needed so a graph is
     /// dropped only when its last quad for that predicate goes away.
     predicate_graph_counts: HashMap<TermId, HashMap<TermId, usize>>,
     // Approximate corpus-wide cardinalities for the query planner; quad
@@ -397,7 +396,7 @@ impl DerivedIndexState {
 /// The tag is what makes the cache self-checking: every quad-mutating commit
 /// advances the graph clock (`set_vector_clock` is part of the same batch), so
 /// `at_clock != current clock` proves the record describes an older state and
-/// must be recomputed. See derived-state register row 4 / finding K6.
+/// must be recomputed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct StoredDiagnostics {
     diagnostics: GraphDiagnostics,
@@ -435,7 +434,7 @@ pub struct GraphStore {
     diagnostics_cache: RwLock<HashMap<TermId, StoredDiagnostics>>,
     /// Global term-id → term cache. Term ids are content hashes, so an entry
     /// can never become wrong; the map is bounded by clearing at
-    /// [`TERM_DECODE_CACHE_CAP`] (WS0-T4).
+    /// [`TERM_DECODE_CACHE_CAP`].
     term_decode_cache: RwLock<HashMap<TermId, Arc<EncodedTerm>>>,
     dirty_counter: AtomicU64,
     /// How many times this store instance has recomputed graph diagnostics.
@@ -722,7 +721,7 @@ impl GraphStore {
         (id.0 as usize) % self.term_locks.len()
     }
 
-    // ── Locking (WS0-T1) ────────────────────────────────────────────────────
+    // ── Locking ────────────────────────────────────────────────────
 
     /// Serialize the whole read→write→commit cycle for `graph`.
     ///
@@ -850,7 +849,7 @@ impl GraphStore {
 
         if is_live {
             // Encode first so the dot vector can be moved into the pending map
-            // instead of cloned (WS0-T8).
+            // instead of cloned.
             batch.insert(&self.quads, key, encode_dots(&dots));
             batch.pending_quad_states.insert(key, Some(dots));
         } else {
@@ -915,7 +914,7 @@ impl GraphStore {
     /// If any mutation reports an [`IndexApply::Anomaly`] the index has drifted
     /// from the store and is rebuilt **synchronously, before this call
     /// returns** — the derived state is never left inconsistent past the commit
-    /// that detected the drift (WS0-T2, plan constraint #3).
+    /// that detected the drift.
     fn apply_quad_mutations(&self, mutations: Vec<QuadMutation>) -> Result<()> {
         if mutations.is_empty() {
             return Ok(());
@@ -1119,7 +1118,7 @@ impl GraphStore {
         Ok(GraphDiagnostics::from_orphaned_entities(entities))
     }
 
-    /// Open-time repair pass for the persisted diagnostics (register row 4).
+    /// Open-time repair pass for the persisted diagnostics.
     ///
     /// A record whose clock tag still matches the graph's clock describes the
     /// current state and is simply loaded into the memory cache; anything else
@@ -1579,7 +1578,7 @@ impl GraphStore {
             .min(32);
         // `max_write_buffer_size` is `#[deprecated = "todo"]` and `#[doc(hidden)]`
         // upstream (fjall 3.1.6) — a knob whose behaviour is not settled. We
-        // stop setting it (WS0-T7, plan SECTION 6 item 3) rather than pin
+        // stop setting it rather than pin
         // durability behaviour to an unstable option; per-keyspace
         // `max_memtable_size` below still bounds memtable growth, so the
         // durability contract (G10) is unchanged.
@@ -1649,7 +1648,7 @@ impl GraphStore {
         Ok(store)
     }
 
-    /// Restore the FTS queue token counter across restarts (WS0-T6, **K4**).
+    /// Restore the FTS queue token counter across restarts.
     ///
     /// Acknowledgement is token-comparison based: a reindex/delete entry clears
     /// every subject entry whose token is `<=` its own. If the counter restarted
@@ -1737,7 +1736,7 @@ impl GraphStore {
         }
     }
 
-    /// Decode a term id through the global term cache (WS0-T4).
+    /// Decode a term id through the global term cache.
     ///
     /// Term ids are content hashes of immutable term bytes, so a cached entry
     /// can never become stale and needs no invalidation path — the only bound
@@ -1772,7 +1771,7 @@ impl GraphStore {
 
     /// Decode a graph name term. Graph IRIs are decoded on every visibility
     /// check, so this goes through the same global cache as any other term
-    /// (derived-state register row 5, folded into row 6).
+    ///.
     pub fn decode_graph_term(&self, id: TermId) -> Result<EncodedTerm> {
         self.decode_term(id)
     }
@@ -1822,7 +1821,7 @@ impl GraphStore {
         self.contains_graph_by_id(graph_id)
     }
 
-    /// O(1) existence probe that never decodes the metadata record (WS0-T9).
+    /// O(1) existence probe that never decodes the metadata record.
     pub(crate) fn contains_graph_by_id(&self, graph_id: TermId) -> Result<bool> {
         Ok(self.graphs.contains_key(graph_meta_key(graph_id))?)
     }
@@ -1843,8 +1842,8 @@ impl GraphStore {
 
         batch.remove(&self.graphs, graph_meta_key(graph_id));
         // The clock and the diagnostics record live under their own keys since
-        // WS0-T3/T5; a recreated graph must start from a fresh clock, not
-        // inherit the deleted one (register row 13).
+        // A recreated graph must start from a fresh clock, not
+        // inherit the deleted one.
         batch.remove(&self.graphs, graph_clock_key(graph_id));
         batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
@@ -1893,7 +1892,7 @@ impl GraphStore {
         Ok(self.graph_subject_count(graph_id) == 0)
     }
 
-    /// Live subject count for a graph, straight off the in-memory index (WS0-T9).
+    /// Live subject count for a graph, straight off the in-memory index.
     pub(crate) fn graph_subject_count(&self, graph_id: TermId) -> usize {
         self.indexes_read()
             .graph_subjects
@@ -1950,7 +1949,7 @@ impl GraphStore {
             })
     }
 
-    // ── Persisted, clock-tagged diagnostics (WS0-T5, finding K6) ────────────
+    // ── Persisted, clock-tagged diagnostics ────────────
 
     fn read_stored_diagnostics(&self, graph_id: TermId) -> Result<Option<StoredDiagnostics>> {
         self.graphs
@@ -2144,7 +2143,7 @@ impl GraphStore {
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]). In particular
     /// `IrokleGraphSync::ensure_graph_topic` reaches this, so any publish that
-    /// may bind a topic must run *before* the caller takes its guard (addendum A1).
+    /// may bind a topic must run *before* the caller takes its guard.
     pub fn set_irokle_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
         let mut batch = self.new_batch();
@@ -2281,7 +2280,7 @@ impl GraphStore {
         };
 
         // One prefix scan yields both the quads and their dot sets, instead of
-        // an index scan plus a point read per quad (WS0-T9).
+        // an index scan plus a point read per quad.
         let mut quads = Vec::new();
         self.for_each_stored_quad(graph_id, |quad, dots| {
             quads.push(SnapshotQuadState {
@@ -2370,7 +2369,7 @@ impl GraphStore {
     }
 
     /// Is this exact quad live? O(1) against the derived indexes, committed
-    /// state only — uncommitted batch state is invisible here (WS0-T9).
+    /// state only — uncommitted batch state is invisible here.
     pub fn contains_quad(&self, quad: EncodedQuad) -> bool {
         self.with_derived_indexes(|indexes| {
             indexes
@@ -2382,7 +2381,7 @@ impl GraphStore {
 
     /// Graphs holding at least one quad with `predicate`, so a predicate-only
     /// pattern scans those graphs instead of every subject in the corpus
-    /// (WS0-T11).
+    ///.
     pub(crate) fn predicate_graphs(&self, predicate: TermId) -> Vec<TermId> {
         self.with_derived_indexes(|indexes| {
             indexes
@@ -2394,7 +2393,7 @@ impl GraphStore {
     }
 
     /// The token the next FTS queue entry will receive. Used by tests and by
-    /// the reindex-threshold policy to reason about queue ordering (WS0-T9).
+    /// the reindex-threshold policy to reason about queue ordering.
     #[allow(dead_code)] // consumed by WS4's reindex-threshold policy and by WS0 tests
     pub(crate) fn current_dirty_token(&self) -> u64 {
         self.dirty_counter.load(Ordering::SeqCst)
@@ -2468,7 +2467,7 @@ impl GraphStore {
     /// handing each one to `visit` together with its raw dot-set bytes.
     ///
     /// One sequential prefix scan replaces "in-memory scan + one point read per
-    /// quad to fetch its dots" (WS0-T9). Reads committed state only.
+    /// quad to fetch its dots". Reads committed state only.
     pub(crate) fn for_each_stored_quad<F>(&self, graph: TermId, mut visit: F) -> Result<()>
     where
         F: FnMut(EncodedQuad, &[u8]) -> Result<()>,
@@ -2500,7 +2499,7 @@ impl GraphStore {
     /// `'K'` key exists yet, which is the one-time migration path for stores
     /// written before the split; the first [`GraphStore::set_vector_clock`]
     /// writes `'K'` and the legacy copy is ignored from then on
-    /// (derived-state register row 13).
+    ///.
     pub(crate) fn get_vector_clock_by_id(&self, graph_id: TermId) -> Result<VectorClock> {
         if let Some(bytes) = self.graphs.get(graph_clock_key(graph_id))? {
             return Ok(postcard::from_bytes(bytes.as_ref())?);
@@ -2513,7 +2512,7 @@ impl GraphStore {
 
     /// Write **only** the graph's clock key; the metadata record (policy,
     /// context, topic binding) is never rewritten, so a commit cannot clobber a
-    /// concurrent policy or context write (WS0-T3).
+    /// concurrent policy or context write.
     ///
     /// Does not lock — the caller must hold the graph commit guard, which is
     /// what makes the read-clock → advance → write-clock cycle atomic (G2).
@@ -2957,7 +2956,7 @@ impl GraphStore {
     }
 
     /// Copy a subject's `(predicate, object)` id pairs out of the index,
-    /// dropping `excluded` **while the read lock is held** (addendum A3).
+    /// dropping `excluded` **while the read lock is held**.
     ///
     /// Filtering by term id before anything is decoded means excluding a
     /// high-cardinality predicate (`hasPart` on a crate root) never copies or
@@ -3083,7 +3082,7 @@ impl GraphStore {
 
     /// Test-only hook: drop a live quad from the in-memory index without
     /// touching the store, simulating index drift so tests can prove the next
-    /// commit repairs it (WS0-T2).
+    /// commit repairs it.
     #[cfg(test)]
     fn corrupt_index_for_test(&self, quad: EncodedQuad) {
         let mut indexes = self.indexes_write();
@@ -3487,7 +3486,7 @@ mod tests {
     }
 
     /// One subject past the halfway mark the rescan is the more expensive
-    /// option, and the enqueue must stay per-subject (finding W14).
+    /// option, and the enqueue must stay per-subject.
     ///
     /// The absolute rule alone turned this write into a rescan of a graph twice
     /// its size — and, in a batched ingest, once per batch.
@@ -3522,7 +3521,7 @@ mod tests {
         assert_eq!((100, 0), enqueue_and_count(&store, graph_id, &subjects));
     }
 
-    // ── WS0-T1 / T2: commit guard and prompt index repair ───────────────
+    // ── Commit guard and prompt index repair ────────────────────────────
 
     /// Concurrent adds to one quad must each contribute a distinct dot (G1).
     ///
@@ -3680,7 +3679,7 @@ mod tests {
         assert!(store.contains_quad(collateral));
     }
 
-    // ── WS0-T6: FTS queue tokens across restarts (K4) ───────────────────
+    // ── FTS queue tokens across restarts ────────────────────────────────
 
     /// A reindex token issued before a restart must never acknowledge a
     /// subject entry queued after it. With the counter restarting at 1 the
@@ -3750,7 +3749,7 @@ mod tests {
         assert_eq!(subject, remaining[0].1);
     }
 
-    // ── WS0-T3: vector-clock key split ──────────────────────────────────
+    // ── Vector-clock key split ──────────────────────────────────────────
 
     #[test]
     fn clock_split_migration() {
@@ -3833,7 +3832,7 @@ mod tests {
         );
     }
 
-    // ── WS0-T5: persisted, clock-tagged diagnostics (K6) ────────────────
+    // ── Persisted, clock-tagged diagnostics ─────────────────────────────
 
     /// Attach `entity` to the graph as a data entity that is *not* reachable
     /// from the root, i.e. an orphan.
@@ -4199,7 +4198,7 @@ mod tests {
         );
     }
 
-    // ── WS0-T7: durability under the new fjall configuration (G10) ──────
+    // ── Durability under the fjall configuration (G10) ──────────────────
 
     #[test]
     fn reopen_full_fingerprint_equality() {

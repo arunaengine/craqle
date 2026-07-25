@@ -1138,7 +1138,7 @@ impl RoCrateManager {
 
     /// The root's visible triples minus its `hasPart` fan-out, which every
     /// export pages separately. Filtering by predicate id happens inside the
-    /// store, before anything is decoded (addendum A3).
+    /// store, before anything is decoded.
     fn root_triples_excluding_has_part(
         &self,
         cx: &CrateCtx,
