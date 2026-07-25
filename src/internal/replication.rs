@@ -2,14 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use crate::core::*;
-use crate::rules::{ChangeSet, DeltaSummary, GraphSnapshot, Rule};
+use crate::rules::{ChangeSet, DeltaSummary, Rule};
 use crate::sparql::SparqlEngine;
 use crate::store::{
     BatchTermCtx, ClockUpdate, CounterKey, EncodedQuad, FtsEnqueue, FtsSubject, GraphStore,
     QuadAdd, QuadRemove, TermId,
 };
 use chrono::Utc;
-use oxrdf::NamedNode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -331,7 +330,14 @@ impl ReplicationEngine {
         // Guards the recompute→persist cycle so the record cannot be tagged with
         // a clock newer than the state it describes.
         let _commit_guard = self.store.graph_commit_guard(graph);
-        self.recompute_graph_diagnostics(graph)
+        // The last persisted set is what the search index reflects, so it is the
+        // right thing to diff against. Reading it through `graph_diagnostics`
+        // would recompute a stale record first and lose the difference.
+        let previous = self
+            .store
+            .last_persisted_diagnostics(graph)
+            .map_err(UpdateError::Store)?;
+        self.recompute_graph_diagnostics(graph, &previous)
             .map_err(UpdateError::Store)
     }
 
@@ -797,30 +803,39 @@ impl ReplicationEngine {
                 .set_graph_diagnostics(graph, &GraphDiagnostics::default());
         }
 
-        // Case 3.
-        self.recompute_graph_diagnostics(graph)
+        // Case 3. `pending.previous` was captured before the write; re-reading
+        // it here would yield the post-write set and defeat the search re-queue.
+        self.recompute_graph_diagnostics(graph, &pending.previous)
     }
 
     /// Recompute the orphan set from the store and persist it, re-queueing the
     /// entities whose visibility changed for search (G6, G7).
-    fn recompute_graph_diagnostics(&self, graph: &GraphId) -> crate::store::Result<()> {
-        let snapshot = GraphSnapshot::from_store(&self.store, graph)?;
-        let previous = self.store.graph_diagnostics(graph)?;
-        let current = GraphDiagnostics::from_orphaned_entities(
-            crate::rules::orphaned_data_entities(&snapshot)
-                .into_iter()
-                .map(|term| encoded_identifier_value(&term))
-                .collect(),
-        );
-
-        if previous == current {
-            // Still re-stamp: the record is tagged with the clock it was
-            // computed at, and the caller has just advanced it.
-            return self.store.set_graph_diagnostics(graph, &current);
+    ///
+    /// `previous` must be the orphan set as it stood *before* the write. It
+    /// cannot be re-read here: the commit has already advanced the graph clock,
+    /// so a read now finds the stored record's tag stale and recomputes it from
+    /// post-write state — which would make `previous` equal `current` every
+    /// time, and silently skip the search re-queue for any entity whose
+    /// visibility the write flipped without touching it directly.
+    fn recompute_graph_diagnostics(
+        &self,
+        graph: &GraphId,
+        previous: &GraphDiagnostics,
+    ) -> crate::store::Result<()> {
+        // Reading through the store both recomputes against post-write state
+        // (the tag is stale) and re-stamps the record with the current clock.
+        let current = self.store.graph_diagnostics(graph)?;
+        if *previous == current {
+            return Ok(());
         }
 
-        self.store.set_graph_diagnostics(graph, &current)?;
-        self.enqueue_orphan_fts_updates(graph, OrphanChange { previous, current })
+        self.enqueue_orphan_fts_updates(
+            graph,
+            OrphanChange {
+                previous: previous.clone(),
+                current,
+            },
+        )
     }
 
     fn enqueue_orphan_fts_updates(
@@ -840,8 +855,10 @@ impl ReplicationEngine {
         let mut dirty = false;
 
         for entity_id in previous.symmetric_difference(&current) {
-            let subject =
-                EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity_id.as_str()));
+            // `from_subject_id`, not `from_named_node`: diagnostics store a
+            // blank node as `_:b0`, and re-encoding that as the IRI `<_:b0>`
+            // would miss the lookup and silently never re-index it (G6, G7).
+            let subject = EncodedTerm::from_subject_id(entity_id.as_str());
             let Some(subject_tid) = self.store.lookup_term(&subject)? else {
                 continue;
             };
@@ -889,12 +906,6 @@ struct DiagnosticsOutcome<'a> {
 struct OrphanChange {
     previous: GraphDiagnostics,
     current: GraphDiagnostics,
-}
-
-fn encoded_identifier_value(term: &EncodedTerm) -> String {
-    term.to_named_node()
-        .map(|node| node.as_str().to_string())
-        .unwrap_or_else(|| term.0.clone())
 }
 
 fn update_error_from_merge(error: MergeError) -> UpdateError {
