@@ -562,6 +562,10 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(graph_id, changes)?;
+        // `additional_triples` may carry a `hasPart` edge that adopts an
+        // existing orphan. That entity is never written, so only the orphan
+        // record can return it to the search index (G7).
+        self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(AppendDataEntitiesReport {
             batch,
             entity_count,
