@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
     ActorId, Batch, ContextTag, Dot, GraphId, GraphPolicy, MaterializedQuadChange, QuadOp,
@@ -8,7 +9,7 @@ use crate::store::GraphStore;
 use chrono::Utc;
 use irokle::history::HistoryOrder;
 use irokle::oplog::Oplog;
-use irokle::reducer::EventRecord;
+use irokle::reducer::{EventRecord, OpMeta};
 use irokle::{Event, PublishOptions, ReplicationPolicy, TopicGenesis, WriteConcern};
 use serde::{Deserialize, Serialize};
 
@@ -210,11 +211,23 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
 pub struct IrokleGraphSync<S: irokle::Storage> {
     node: irokle::Irokle<S>,
     options: CraqleIrokleOptions,
+    /// Memo of confirmed graph → irokle topic bindings (derived-state register
+    /// row 12). Bindings are write-once for a live graph, so a hit can never be
+    /// wrong while the graph exists; only *confirmed* bindings are inserted and
+    /// a miss is never cached, because a concurrent sync admission can create
+    /// the topic between two calls.
+    ///
+    /// Shared across clones so every handle to one node sees one memo.
+    topic_memo: Arc<RwLock<HashMap<GraphId, irokle::TopicId>>>,
 }
 
 impl<S: irokle::Storage> IrokleGraphSync<S> {
     pub fn new(node: irokle::Irokle<S>, options: CraqleIrokleOptions) -> Self {
-        Self { node, options }
+        Self {
+            node,
+            options,
+            topic_memo: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     pub fn node(&self) -> &irokle::Irokle<S> {
@@ -229,6 +242,57 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
         let topic_id = self.ensure_graph_topic(store, graph)?;
         Ok(self.node.open_topic::<CraqleGraphEvent>(topic_id)?)
     }
+
+    fn memoized_topic(&self, graph: &GraphId) -> Option<irokle::TopicId> {
+        // Guards the graph → topic memo.
+        let memo = self
+            .topic_memo
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        memo.get(graph).copied()
+    }
+
+    /// Record a binding the store has confirmed. Never called with a guess.
+    fn remember_topic(&self, graph: &GraphId, topic_id: irokle::TopicId) {
+        // Guards the graph → topic memo.
+        let mut memo = self
+            .topic_memo
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        memo.insert(graph.clone(), topic_id);
+    }
+
+    /// Drop a memoized binding. Deleting a graph drops its metadata record, and
+    /// with it the stored binding, so the memo must not outlive it.
+    fn forget_topic(&self, graph: &GraphId) {
+        // Guards the graph → topic memo.
+        let mut memo = self
+            .topic_memo
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        memo.remove(graph);
+    }
+
+    /// Persist a binding whose topic is known to exist, then memoize it.
+    ///
+    /// The store write comes first: the memo must never claim a binding the
+    /// durable record does not have.
+    fn bind_confirmed_topic(
+        &self,
+        store: &GraphStore,
+        binding: GraphTopic<'_>,
+    ) -> SyncResult<irokle::TopicId> {
+        let GraphTopic { graph, topic_id } = binding;
+        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        self.remember_topic(graph, topic_id);
+        Ok(topic_id)
+    }
+}
+
+/// A graph together with the irokle topic it is (to be) bound to.
+struct GraphTopic<'a> {
+    graph: &'a GraphId,
+    topic_id: irokle::TopicId,
 }
 
 impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
@@ -272,12 +336,16 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         graph: &GraphId,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, graph)?;
-        Ok(topic.publish_with(
+        let record = topic.publish_with(
             CraqleGraphEvent::GraphDeleted {
                 graph: graph.clone(),
             },
             self.publish_options(),
-        )?)
+        )?;
+        // The delete is now durable in the topic, so the graph's metadata record
+        // (which carries the stored binding) is about to go away everywhere.
+        self.forget_topic(graph);
+        Ok(record)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str()))]
@@ -319,9 +387,20 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<irokle::TopicId> {
+        // Memo hit, confirmed against graph existence. The metadata record is
+        // where the binding lives, so a graph that no longer has one must fall
+        // through and re-bind; the probe is two key lookups against the decode
+        // of a metadata record that may carry a multi-kilobyte `@context`.
+        if let Some(topic_id) = self.memoized_topic(graph)
+            && store.contains_graph(graph)?
+        {
+            return Ok(topic_id);
+        }
+
         // An existing binding (e.g. from data created before deterministic
         // topic ids) stays authoritative for its graph.
         if let Some(topic_id) = self.graph_topic_id(store, graph)? {
+            self.remember_topic(graph, topic_id);
             return Ok(topic_id);
         }
 
@@ -335,8 +414,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                         actual: state.event_type_id,
                     }));
                 }
-                store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
-                return Ok(topic_id);
+                return self.bind_confirmed_topic(store, GraphTopic { graph, topic_id });
             }
 
             let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
@@ -348,11 +426,11 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             let oplog = Oplog::with_storage(self.node.storage().clone());
             match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
                 Ok(_) => {
-                    store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
-                    return Ok(topic_id);
+                    return self.bind_confirmed_topic(store, GraphTopic { graph, topic_id });
                 }
                 // A concurrent sync admission may create the topic between the
-                // state read and the genesis commit; re-check and reuse it.
+                // state read and the genesis commit; re-check and reuse it. This
+                // is exactly why a *missing* binding is never memoized.
                 Err(error) => genesis_error = Some(error),
             }
         }
@@ -375,9 +453,10 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                     incoming: topic_id,
                 });
             }
+            self.remember_topic(graph, existing);
             return Ok(());
         }
-        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        self.bind_confirmed_topic(store, GraphTopic { graph, topic_id })?;
         Ok(())
     }
 
@@ -522,18 +601,30 @@ pub(crate) fn graph_topic_id(graph: &GraphId) -> irokle::TopicId {
     irokle::TopicId::from_bytes(*hasher.finalize().as_bytes())
 }
 
-pub(crate) fn batch_from_irokle_record(
-    record: &EventRecord<CraqleGraphEvent>,
-) -> SyncResult<Option<Batch>> {
-    let CraqleGraphEvent::QuadChanges { graph, changes } = &record.event else {
-        return Ok(None);
-    };
-    let actor = actor_from_irokle(record.meta.actor_id);
-    let counter = record.meta.actor_seq;
-    let base_clock = clock_from_irokle(&record.meta.observed_clock);
-    let dot = Dot { actor, counter };
-    let mut ops = Vec::with_capacity(changes.len());
+/// The graph an event targets plus the irokle metadata that dates it.
+struct EventBatchCtx<'a> {
+    graph: &'a GraphId,
+    meta: &'a OpMeta,
+}
 
+/// Turn one event's changes into a replication [`Batch`].
+///
+/// Op order is the event's change order, unchanged — irokle delivers records in
+/// causal order and craqle applies them in delivery order (G3), so reordering
+/// here would break both the OR-Set semantics of a delete-then-add pair and the
+/// publish-first contract (G4).
+fn batch_from_changes<I>(cx: EventBatchCtx<'_>, changes: I) -> SyncResult<Batch>
+where
+    I: IntoIterator<Item = MaterializedQuadChange>,
+{
+    let EventBatchCtx { graph, meta } = cx;
+    let actor = actor_from_irokle(meta.actor_id);
+    let counter = meta.actor_seq;
+    let base_clock = clock_from_irokle(&meta.observed_clock);
+    let dot = Dot { actor, counter };
+
+    let changes = changes.into_iter();
+    let mut ops = Vec::with_capacity(changes.size_hint().0);
     for change in changes {
         match change {
             MaterializedQuadChange::Insert {
@@ -542,11 +633,11 @@ pub(crate) fn batch_from_irokle_record(
                 predicate,
                 object,
             } => {
-                ensure_change_graph(graph, change_graph)?;
+                ensure_change_graph(graph, &change_graph)?;
                 ops.push(QuadOp::Add {
-                    subject: subject.clone(),
-                    predicate: predicate.clone(),
-                    object: object.clone(),
+                    subject,
+                    predicate,
+                    object,
                     dot,
                 });
             }
@@ -556,25 +647,57 @@ pub(crate) fn batch_from_irokle_record(
                 predicate,
                 object,
             } => {
-                ensure_change_graph(graph, change_graph)?;
+                ensure_change_graph(graph, &change_graph)?;
                 ops.push(QuadOp::Remove {
-                    subject: subject.clone(),
-                    predicate: predicate.clone(),
-                    object: object.clone(),
+                    subject,
+                    predicate,
+                    object,
                     witnessed: base_clock.clone(),
                 });
             }
         }
     }
 
-    Ok(Some(Batch {
+    Ok(Batch {
         graph: graph.clone(),
         actor,
         counter,
         base_clock,
         ops,
         timestamp: Utc::now(),
-    }))
+    })
+}
+
+/// Borrowing variant, for callers that only hold a reference to the record
+/// (catch-up and reconcile replay both re-read their records afterwards).
+pub(crate) fn batch_from_irokle_record(
+    record: &EventRecord<CraqleGraphEvent>,
+) -> SyncResult<Option<Batch>> {
+    let CraqleGraphEvent::QuadChanges { graph, changes } = &record.event else {
+        return Ok(None);
+    };
+    let cx = EventBatchCtx {
+        graph,
+        meta: &record.meta,
+    };
+    batch_from_changes(cx, changes.iter().cloned()).map(Some)
+}
+
+/// Consuming variant: moves every term string out of the record instead of
+/// cloning it. Used on the local publish path, where the record is dropped
+/// immediately after the batch is built (W3).
+pub(crate) fn batch_from_irokle_event_record(
+    record: EventRecord<CraqleGraphEvent>,
+) -> SyncResult<Option<Batch>> {
+    let EventRecord { event, meta } = record;
+    let CraqleGraphEvent::QuadChanges { graph, changes } = event else {
+        return Ok(None);
+    };
+    let cx = EventBatchCtx {
+        graph: &graph,
+        meta: &meta,
+    };
+    batch_from_changes(cx, changes).map(Some)
 }
 
 fn ensure_change_graph(expected: &GraphId, actual: &GraphId) -> SyncResult<()> {
