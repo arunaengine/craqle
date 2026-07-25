@@ -1485,10 +1485,10 @@ mod tests {
             .collect()
     }
 
-    /// The root entity's `hasPart` ids, in emitted order. A single-element
-    /// fan-out serializes as one object rather than an array.
-    fn root_has_part_ids(document: &serde_json::Value, graph: &GraphId) -> Vec<String> {
-        match &graph_entry(document, graph.as_str())["hasPart"] {
+    /// One entity's `hasPart` ids, in emitted order. A single-element fan-out
+    /// serializes as one object rather than an array.
+    fn entry_has_part_ids(entry: &serde_json::Value) -> Vec<String> {
+        match &entry["hasPart"] {
             serde_json::Value::Null => Vec::new(),
             serde_json::Value::Object(single) => {
                 vec![single["@id"].as_str().unwrap().to_string()]
@@ -1498,6 +1498,62 @@ mod tests {
                 .map(|entry| entry["@id"].as_str().unwrap().to_string())
                 .collect(),
             other => panic!("unexpected hasPart shape {other}"),
+        }
+    }
+
+    fn root_has_part_ids(document: &serde_json::Value, graph: &GraphId) -> Vec<String> {
+        entry_has_part_ids(graph_entry(document, graph.as_str()))
+    }
+
+    /// One entity's `@type` terms, whichever JSON shape they took.
+    fn entry_types(entry: &serde_json::Value) -> Vec<String> {
+        match &entry["@type"] {
+            serde_json::Value::String(term) => vec![term.clone()],
+            serde_json::Value::Array(terms) => terms
+                .iter()
+                .filter_map(|term| term.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// RO-Crate 1.2, *Data Entities*: every data entity a crate contains MUST be
+    /// linked from the Root Data Entity by `hasPart`, directly or indirectly.
+    /// A view that emits one without such a path is not a crate at all — and
+    /// re-importing it correctly orphans the entity, losing it.
+    fn assert_data_entities_are_root_linked(document: &serde_json::Value, graph: &GraphId) {
+        let entries = document["@graph"].as_array().expect("@graph array");
+        let mut reachable = std::collections::HashSet::from([graph.as_str().to_string()]);
+        let mut queue = vec![graph.as_str().to_string()];
+        while let Some(id) = queue.pop() {
+            let Some(entry) = entries
+                .iter()
+                .find(|entry| entry["@id"] == serde_json::json!(id))
+            else {
+                continue;
+            };
+            for child in entry_has_part_ids(entry) {
+                if reachable.insert(child.clone()) {
+                    queue.push(child);
+                }
+            }
+        }
+
+        for entry in entries {
+            let Some(id) = entry["@id"].as_str() else {
+                continue;
+            };
+            if id == graph.as_str()
+                || !entry_types(entry)
+                    .iter()
+                    .any(|term| matches!(term.as_str(), "File" | "Dataset" | "MediaObject"))
+            {
+                continue;
+            }
+            assert!(
+                reachable.contains(id),
+                "data entity `{id}` has no hasPart path from the root: {document:#}"
+            );
         }
     }
 
@@ -2286,6 +2342,110 @@ mod tests {
             node.graph_diagnostics(&graph).unwrap().orphaned_entities,
             vec!["urn:test:stray".to_string()],
             "a no-op re-import must not erase the orphan set"
+        );
+    }
+
+    fn profile_crate_document(graph: &GraphId) -> String {
+        serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "hasResource": "http://www.w3.org/ns/dx/prof#hasResource",
+                    "hasArtifact": "http://www.w3.org/ns/dx/prof#hasArtifact"
+                }
+            ],
+            "@graph": [
+                {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+                 "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                 "about": {"@id": graph.as_str()}},
+                {"@id": graph.as_str(), "@type": "Dataset", "name": "Profile Crate",
+                 "description": "profile artifacts beside ordinary files",
+                 "datePublished": "2025-01-01",
+                 "license": "https://creativecommons.org/licenses/by/4.0/",
+                 "conformsTo": {"@id": "#profile"},
+                 "author": {"@id": "#alice"},
+                 "hasPart": [
+                     {"@id": "./data/one.txt"},
+                     {"@id": "./data/two.txt"},
+                     {"@id": "./profile/mode.json"}
+                 ]},
+                {"@id": "#alice", "@type": "Person", "name": "Alice Example"},
+                {"@id": "#profile", "@type": "http://www.w3.org/ns/dx/prof#Profile",
+                 "name": "Test Profile", "hasResource": {"@id": "#mode-descriptor"}},
+                {"@id": "#mode-descriptor",
+                 "@type": "http://www.w3.org/ns/dx/prof#ResourceDescriptor",
+                 "name": "Mode Rules", "hasArtifact": {"@id": "./profile/mode.json"}},
+                {"@id": "./profile/mode.json", "@type": "File", "name": "Mode Rules"},
+                {"@id": "./data/one.txt", "@type": "File", "name": "One"},
+                {"@id": "./data/two.txt", "@type": "File", "name": "Two"}
+            ]
+        })
+        .to_string()
+    }
+
+    /// Every export view is itself a valid crate.
+    ///
+    /// The summary view is the one that used to break this: it emitted profile
+    /// artifacts as data entities while re-deriving the root's `hasPart` from
+    /// the (empty) page, so nothing linked them. Checked across the full,
+    /// summary and both paged views so a regression on any export path shows up
+    /// here, and closed by re-importing the summary: a view whose data entities
+    /// are all root-linked orphans nothing.
+    #[test]
+    fn every_export_view_links_its_data_entities_from_the_root() {
+        let (_tmp, net) = setup_network(1);
+        let node = net.peer(0);
+        let mgr = manager(node);
+        let graph = GraphId::new("urn:test:export-view-validity");
+        mgr.import_jsonld(graph.clone(), &profile_crate_document(&graph))
+            .unwrap();
+
+        let full = parsed(&mgr.export_jsonld(&graph).unwrap());
+        assert_data_entities_are_root_linked(&full, &graph);
+
+        let summary_json = mgr.export_jsonld_summary(&graph).unwrap();
+        let summary = parsed(&summary_json);
+        assert_data_entities_are_root_linked(&summary, &graph);
+        assert!(
+            graph_ids(&summary).contains(&"./profile/mode.json".to_string()),
+            "the fixture must put a data entity in the summary, or this proves nothing"
+        );
+        assert!(
+            !graph_ids(&summary).contains(&"./data/one.txt".to_string()),
+            "ordinary root hasPart files stay out of summary exports"
+        );
+
+        for limit in [1, 2, 3] {
+            let mut offset = 0usize;
+            loop {
+                let page = mgr.export_jsonld_page(&graph, offset, limit).unwrap();
+                assert_data_entities_are_root_linked(&parsed(&page.jsonld), &graph);
+                let after = mgr
+                    .export_jsonld_page_after(&graph, None, limit)
+                    .unwrap()
+                    .jsonld;
+                assert_data_entities_are_root_linked(&parsed(&after), &graph);
+                match page.next_offset {
+                    Some(next) => offset = next,
+                    None => break,
+                }
+            }
+        }
+
+        let reimported = GraphId::new("urn:test:export-view-validity-roundtrip");
+        mgr.import_jsonld(reimported.clone(), &summary_json)
+            .unwrap();
+        assert!(
+            node.graph_diagnostics(&reimported)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "re-importing a valid view must orphan nothing"
+        );
+        assert!(
+            graph_ids(&parsed(&mgr.export_jsonld_summary(&reimported).unwrap()))
+                .contains(&"./profile/mode.json".to_string()),
+            "the artifact must survive the summary round trip"
         );
     }
 }
