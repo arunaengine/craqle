@@ -157,15 +157,16 @@ impl SparqlEngine {
             GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
                 // Scope the dataset to the visible graph list so patterns are
                 // planned as graph-specific lookups instead of union scans.
+                //
+                // Membership is decided by the *metadata* record, not by the
+                // term table: a deleted graph's IRI survives interning, so
+                // filtering on `lookup_term` would resurrect it here while the
+                // union regime (which reads graph metadata) rightly omits it.
+                // Both regimes must answer graph existence identically (G9).
                 let mut seen = HashSet::with_capacity(graphs.len());
                 let mut names: Vec<NamedNode> = Vec::with_capacity(graphs.len());
                 for graph in graphs {
-                    if seen.insert(graph.as_str())
-                        && self
-                            .store
-                            .lookup_term(&EncodedTerm::from_named_node(&graph.0))?
-                            .is_some()
-                    {
+                    if seen.insert(graph.as_str()) && self.store.contains_graph(graph)? {
                         names.push(graph.0.clone());
                     }
                 }
@@ -1058,6 +1059,24 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
                     Err(error) => Some(Err(error.into())),
                 }),
         )
+    }
+
+    /// Graph existence for `GRAPH <g> { ... }` (charter G9).
+    ///
+    /// A named graph exists iff its metadata record exists **and** the caller
+    /// may see it. spareval's default implementation instead probes for one
+    /// visible quad, which makes an empty graph — or one whose entities are
+    /// all orphan-hidden — report as non-existent, and which disagrees with
+    /// the explicit-dataset regime used for small visible sets.
+    fn contains_internal_graph_name(
+        &self,
+        graph_name: &Self::InternalTerm,
+    ) -> std::result::Result<bool, Self::Error> {
+        let StoreTerm::Existing(graph) = graph_name else {
+            // The IRI is not even interned, so no graph was ever created for it.
+            return Ok(false);
+        };
+        Ok(self.store.contains_graph_by_id(*graph)? && self.visibility.graph_is_visible(*graph)?)
     }
 
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
