@@ -436,6 +436,10 @@ pub struct GraphStore {
     /// can never become wrong; the map is bounded by clearing at
     /// [`TERM_DECODE_CACHE_CAP`].
     term_decode_cache: RwLock<HashMap<TermId, Arc<EncodedTerm>>>,
+    /// Set by a test to stall between the durable commit and the index apply,
+    /// widening a window that is otherwise microseconds wide.
+    #[cfg(test)]
+    commit_stall: Mutex<Option<std::time::Duration>>,
     dirty_counter: AtomicU64,
     /// How many times this store instance has recomputed graph diagnostics.
     /// Tests use it to prove a reopen served the persisted record instead of
@@ -908,30 +912,20 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Apply a committed batch's quad mutations to the in-memory indexes.
+    /// Commit a batch and mirror its quad mutations into the in-memory indexes.
     ///
-    /// Runs after the durable commit, so the store already holds the new truth.
-    /// If any mutation reports an [`IndexApply::Anomaly`] the index has drifted
-    /// from the store and is rebuilt **synchronously, before this call
-    /// returns** — the derived state is never left inconsistent past the commit
-    /// that detected the drift.
-    fn apply_quad_mutations(&self, mutations: Vec<QuadMutation>) -> Result<()> {
+    /// An [`IndexApply::Anomaly`] means the index drifted from the store, so it
+    /// is rebuilt before this returns rather than left inconsistent.
+    fn apply_quad_mutations(
+        &self,
+        batch: fjall::OwnedWriteBatch,
+        mutations: Vec<QuadMutation>,
+    ) -> Result<()> {
         if mutations.is_empty() {
-            return Ok(());
+            return Ok(batch.commit()?);
         }
 
-        let mut anomaly = false;
-        {
-            // Guards IndexState: the (graph, subject) → (predicate, object) map.
-            let mut indexes = self.indexes_write();
-            for mutation in &mutations {
-                let outcome = match mutation {
-                    QuadMutation::Insert(quad) => indexes.insert_quad(*quad),
-                    QuadMutation::Remove(quad) => indexes.remove_quad(*quad),
-                };
-                anomaly |= outcome == IndexApply::Anomaly;
-            }
-        }
+        let anomaly = self.commit_with_index(batch, &mutations)?;
 
         if anomaly {
             // Drop the mirror and the order cache with it; rebuild_indexes
@@ -969,6 +963,54 @@ impl GraphStore {
             cache.remove(&(quad.graph, quad.subject, quad.predicate));
         }
         Ok(())
+    }
+
+    /// Stall inside the publish window. Test-only.
+    #[cfg(test)]
+    fn stall_after_commit(&self) {
+        let stall = *self
+            .commit_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(delay) = stall {
+            std::thread::sleep(delay);
+        }
+    }
+
+    /// Make every later commit stall between the durable write and the index
+    /// apply. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_commit_stall(&self, delay: std::time::Duration) {
+        *self
+            .commit_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Publish the durable batch and the index together, reporting anomalies.
+    ///
+    /// The lock spans the commit: a reader that sees the new clock must not
+    /// then read an index predating it (G6).
+    fn commit_with_index(
+        &self,
+        batch: fjall::OwnedWriteBatch,
+        mutations: &[QuadMutation],
+    ) -> Result<bool> {
+        // Guards IndexState: the (graph, subject) → (predicate, object) map.
+        let mut indexes = self.indexes_write();
+        batch.commit()?;
+        #[cfg(test)]
+        self.stall_after_commit();
+
+        let mut anomaly = false;
+        for mutation in mutations {
+            let outcome = match mutation {
+                QuadMutation::Insert(quad) => indexes.insert_quad(*quad),
+                QuadMutation::Remove(quad) => indexes.remove_quad(*quad),
+            };
+            anomaly |= outcome == IndexApply::Anomaly;
+        }
+        Ok(anomaly)
     }
 
     fn build_derived_indexes(&self) -> DerivedIndexState {
@@ -1638,6 +1680,8 @@ impl GraphStore {
             object_order_cache: RwLock::new(HashMap::new()),
             diagnostics_cache: RwLock::new(HashMap::new()),
             term_decode_cache: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            commit_stall: Mutex::new(None),
             dirty_counter: AtomicU64::new(1),
             diagnostics_computed: AtomicU64::new(0),
         };
@@ -2941,8 +2985,7 @@ impl GraphStore {
             pending_terms: _,
             quad_mutations,
         } = batch;
-        inner.commit()?;
-        self.apply_quad_mutations(quad_mutations)
+        self.apply_quad_mutations(inner, quad_mutations)
     }
 
     /// Copy a subject's `(predicate, object)` id pairs out of the index,
@@ -3835,6 +3878,41 @@ mod tests {
         let _commit_guard = store.graph_commit_guard(graph);
         let diagnostics = store.compute_graph_diagnostics(graph).unwrap();
         store.set_graph_diagnostics(graph, &diagnostics).unwrap();
+    }
+
+    /// A reader that sees the post-commit clock must not then read an index
+    /// that predates it: it would compute a pre-write orphan set, tag it with
+    /// the post-write clock, and every later reader would accept that as fresh
+    /// until the next write (G6).
+    #[test]
+    fn commit_publishes_atomically() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:commit-atomicity");
+        store.create_graph(&graph).unwrap();
+        commit_orphan(&store, &graph, "urn:test:first");
+        settle_diagnostics(&store, &graph);
+
+        let before = store.get_vector_clock(&graph).unwrap();
+        store.set_commit_stall(std::time::Duration::from_millis(300));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| commit_orphan(&store, &graph, "urn:test:second"));
+
+            // Spin on the clock, which the same batch published, until the
+            // durable half of that commit lands.
+            while store.get_vector_clock(&graph).unwrap() == before {
+                std::hint::spin_loop();
+            }
+            assert_eq!(
+                2,
+                store
+                    .graph_diagnostics(&graph)
+                    .unwrap()
+                    .orphaned_entities
+                    .len(),
+                "a reader past the new clock must see the index that clock describes"
+            );
+        });
     }
 
     fn commit_orphan(store: &GraphStore, graph: &GraphId, entity: &str) {
