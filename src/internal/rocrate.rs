@@ -3707,7 +3707,13 @@ mod tests {
                     "datePublished": "2025-01-01",
                     "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
                     "conformsTo": {"@id": "#profile"},
-                    "hasPart": {"@id": "./data/plain.txt"}
+                    // Profile artifacts are data entities, so RO-Crate 1.2
+                    // requires the root to link them by `hasPart` as well.
+                    "hasPart": [
+                        {"@id": "./data/plain.txt"},
+                        {"@id": "./mode.json"},
+                        {"@id": "./schema.json"}
+                    ]
                 },
                 {
                     "@id": "#profile",
