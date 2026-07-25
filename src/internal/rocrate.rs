@@ -3403,21 +3403,39 @@ mod tests {
     use irokle::reducer::EventRecord;
 
     /// A [`CraqleGraphSync`] decorator that delegates every call to `inner`,
-    /// except `publish_context`, which fails while `fail_context` is set. Used to
-    /// simulate a phase-2 (context) publish failure after phase-1 (quads) has
-    /// already committed and published.
-    struct FlakyContextSync {
+    /// except the two publishes an import performs, each of which fails while
+    /// its flag is set. `fail_changes` injects a phase-1 (quad) failure, which
+    /// under publish-first must leave no local trace at all; `fail_context`
+    /// injects a phase-2 (context) failure after phase 1 has already committed
+    /// and published.
+    struct FlakySync {
         inner: Arc<dyn CraqleGraphSync>,
+        fail_changes: AtomicBool,
         fail_context: AtomicBool,
     }
 
-    impl CraqleGraphSync for FlakyContextSync {
+    impl FlakySync {
+        fn new(inner: Arc<dyn CraqleGraphSync>) -> Self {
+            Self {
+                inner,
+                fail_changes: AtomicBool::new(false),
+                fail_context: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl CraqleGraphSync for FlakySync {
         fn publish_changes(
             &self,
             store: &crate::store::GraphStore,
             graph: &GraphId,
             changes: Vec<MaterializedQuadChange>,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            if self.fail_changes.load(Ordering::SeqCst) {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "injected quad publish failure".to_string(),
+                ));
+            }
             self.inner.publish_changes(store, graph, changes)
         }
 
@@ -3537,39 +3555,180 @@ mod tests {
         }
     }
 
-    /// A failed context publish (phase 2) leaves the already-applied quads
-    /// (phase 1) in place with the stored context unchanged, and re-importing the
-    /// same document heals it: the empty quad diff is a no-op while the context
-    /// store/publish is retried.
-    #[test]
-    fn context_publish_failure_leaves_quads_and_heals_on_reimport() {
+    /// A store plus a manager whose sync layer can be made to fail either
+    /// publish phase on demand.
+    fn flaky_manager() -> (
+        tempfile::TempDir,
+        Arc<crate::store::GraphStore>,
+        Arc<FlakySync>,
+        RoCrateManager,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::GraphStore::open(dir.path()).unwrap());
         let search = Arc::new(crate::search::SearchIndex::open_in_memory().unwrap());
-        let sparql = Arc::new(crate::sparql::SparqlEngine::new(
-            store.clone(),
-            search.clone(),
-        ));
-        let actor = crate::core::ActorId::random();
+        let sparql = Arc::new(crate::sparql::SparqlEngine::new(store.clone(), search));
 
         let node = irokle::Irokle::builder().build().unwrap();
         let inner: Arc<dyn CraqleGraphSync> = Arc::new(crate::sync::IrokleGraphSync::new(
             node,
             crate::sync::CraqleIrokleOptions::new(),
         ));
-        let flaky = Arc::new(FlakyContextSync {
-            inner,
-            fail_context: AtomicBool::new(true),
-        });
+        let flaky = Arc::new(FlakySync::new(inner));
         let sync: Arc<dyn CraqleGraphSync> = flaky.clone();
 
         let engine = Arc::new(ReplicationEngine::new_with_sync(
             store.clone(),
-            sparql.clone(),
-            actor,
+            sparql,
+            crate::core::ActorId::random(),
             Some(sync),
         ));
-        let manager = RoCrateManager::new(engine);
+        (dir, store.clone(), flaky, RoCrateManager::new(engine))
+    }
+
+    /// Everything a write is allowed to move, read in one shot so a failed
+    /// publish can be compared against the state that preceded it.
+    #[derive(Debug, PartialEq)]
+    struct LocalState {
+        fingerprint: (u64, [u8; 32], [u8; 32]),
+        clock: crate::core::VectorClock,
+        diagnostics: crate::core::GraphDiagnostics,
+        context: Option<String>,
+        context_tag: crate::core::ContextTag,
+    }
+
+    impl LocalState {
+        fn read(store: &crate::store::GraphStore, graph: &GraphId) -> Self {
+            Self {
+                fingerprint: store.graph_fingerprint(graph).unwrap(),
+                clock: store.get_vector_clock(graph).unwrap(),
+                diagnostics: store.graph_diagnostics(graph).unwrap(),
+                context: store.graph_context(graph).unwrap(),
+                context_tag: store.graph_context_tag(graph).unwrap(),
+            }
+        }
+    }
+
+    /// G4 publish-first for the *quad* phase: a `publish_changes` that fails
+    /// must move no local state whatsoever.
+    ///
+    /// The context phase already had fault injection; this is the phase that
+    /// matters more, because applying before publishing would leave this node
+    /// holding quads and a clock entry no peer will ever be told about — a
+    /// divergence nothing later reconciles. Every field a write can touch is
+    /// compared, not just the quad count.
+    #[test]
+    fn quad_publish_failure_moves_no_local_state() {
+        let (_dir, store, flaky, manager) = flaky_manager();
+        let graph = GraphId::new("urn:test:quad-publish-failure");
+        let document = |extra: &str| {
+            serde_json::json!({
+                "@context": ROCRATE_CONTEXT_URL,
+                "@graph": [
+                    {
+                        "@id": METADATA_ID,
+                        "@type": "CreativeWork",
+                        "conformsTo": {"@id": ROCRATE_SPEC_URL},
+                        "about": {"@id": graph.as_str()}
+                    },
+                    {
+                        "@id": graph.as_str(),
+                        "@type": "Dataset",
+                        "name": "Publish First Crate",
+                        "description": extra,
+                        "datePublished": "2025-01-01",
+                        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                    }
+                ]
+            })
+            .to_string()
+        };
+
+        manager
+            .import_jsonld(graph.clone(), &document("baseline"))
+            .unwrap();
+        let before = LocalState::read(&store, &graph);
+        assert!(before.fingerprint.0 > 0, "the baseline import must land");
+
+        flaky.fail_changes.store(true, Ordering::SeqCst);
+        let failed = manager.import_jsonld(graph.clone(), &document("amended"));
+        assert!(
+            failed.is_err(),
+            "the import must surface the injected quad publish failure"
+        );
+        assert_eq!(
+            before,
+            LocalState::read(&store, &graph),
+            "a failed quad publish moved local state"
+        );
+
+        // And the failure is not terminal: retrying once the fault clears lands.
+        flaky.fail_changes.store(false, Ordering::SeqCst);
+        manager
+            .import_jsonld(graph.clone(), &document("amended"))
+            .unwrap();
+        assert_ne!(
+            before,
+            LocalState::read(&store, &graph),
+            "the retried import must apply"
+        );
+    }
+
+    /// The same guarantee on a graph that does not exist yet: a failed quad
+    /// publish must not leave a half-created graph behind.
+    #[test]
+    fn quad_publish_failure_creates_no_graph() {
+        let (_dir, store, flaky, manager) = flaky_manager();
+        let graph = GraphId::new("urn:test:quad-publish-failure-fresh");
+        flaky.fail_changes.store(true, Ordering::SeqCst);
+
+        let document = serde_json::json!({
+            "@context": ROCRATE_CONTEXT_URL,
+            "@graph": [
+                {
+                    "@id": METADATA_ID,
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": ROCRATE_SPEC_URL},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Never Published",
+                    "description": "nothing may survive this",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                }
+            ]
+        });
+
+        assert!(
+            manager
+                .import_jsonld(graph.clone(), &document.to_string())
+                .is_err()
+        );
+        assert!(
+            store.graph_is_empty(&graph).unwrap(),
+            "a failed quad publish must leave no quads"
+        );
+        assert!(
+            store.get_vector_clock(&graph).unwrap().0.is_empty(),
+            "a failed quad publish must not advance the clock"
+        );
+        assert_eq!(
+            crate::core::ContextTag::GENESIS,
+            store.graph_context_tag(&graph).unwrap(),
+            "phase 2 must never run when phase 1 failed"
+        );
+    }
+
+    /// A failed context publish (phase 2) leaves the already-applied quads
+    /// (phase 1) in place with the stored context unchanged, and re-importing the
+    /// same document heals it: the empty quad diff is a no-op while the context
+    /// store/publish is retried.
+    #[test]
+    fn context_publish_failure_leaves_quads_and_heals_on_reimport() {
+        let (_dir, store, flaky, manager) = flaky_manager();
+        flaky.fail_context.store(true, Ordering::SeqCst);
 
         let graph = GraphId::new("urn:test:context-publish-failure");
         let organism_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
@@ -3640,10 +3799,13 @@ mod tests {
                 .is_some_and(|context| context.contains(organism_iri)),
             "healed context should carry the profile IRI: {stored:?}"
         );
+        // Exactly one: the failed publish persisted nothing, so the heal mints
+        // `next_local(GENESIS)`. `>= 1` would also accept a double-mint, which is
+        // the bug G5's publish-first ordering exists to prevent.
         let healed_tag = store.graph_context_tag(&graph).unwrap();
-        assert!(
-            healed_tag.counter >= 1,
-            "healed context tag should have advanced past genesis"
+        assert_eq!(
+            1, healed_tag.counter,
+            "the heal must mint exactly one tag past genesis"
         );
 
         // Healing converges rather than oscillating: a third import of the same
