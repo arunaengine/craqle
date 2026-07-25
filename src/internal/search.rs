@@ -75,6 +75,11 @@ pub struct SearchIndex {
     /// Set when a poisoned writer was rolled back and the index therefore owes
     /// the store a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
+    /// Set by a test to make the next indexer drain cycle panic, proving the
+    /// worker survives one. Per-index rather than global so concurrent tests
+    /// cannot arm each other's workers.
+    #[cfg(test)]
+    armed_drain_panic: AtomicBool,
     needs_rebuild: bool,
     f_doc_key: Field,
     f_graph_id: Field,
@@ -225,6 +230,8 @@ impl SearchIndex {
             writer: Mutex::new(writer),
             dirty: AtomicBool::new(false),
             rebuild_owed: AtomicBool::new(false),
+            #[cfg(test)]
+            armed_drain_panic: AtomicBool::new(false),
             needs_rebuild,
             f_doc_key,
             f_graph_id,
@@ -249,6 +256,8 @@ impl SearchIndex {
             writer: Mutex::new(writer),
             dirty: AtomicBool::new(false),
             rebuild_owed: AtomicBool::new(false),
+            #[cfg(test)]
+            armed_drain_panic: AtomicBool::new(false),
             needs_rebuild: false,
             f_doc_key,
             f_graph_id,
@@ -260,6 +269,18 @@ impl SearchIndex {
     /// Returns `true` when the on-disk index had to be created or migrated.
     pub fn needs_rebuild(&self) -> bool {
         self.needs_rebuild
+    }
+
+    /// Makes the next indexer drain cycle panic. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_drain_panic(&self) {
+        self.armed_drain_panic.store(true, Ordering::SeqCst);
+    }
+
+    /// Consumes a pending injected panic, reporting whether one was armed.
+    #[cfg(test)]
+    pub(crate) fn take_armed_drain_panic(&self) -> bool {
+        self.armed_drain_panic.swap(false, Ordering::SeqCst)
     }
 
     /// Lock the Tantivy writer, repairing it if a panicking thread poisoned
