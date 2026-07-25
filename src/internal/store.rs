@@ -3533,6 +3533,8 @@ mod tests {
                             .set_graph_context(
                                 &graph,
                                 Some("{}"),
+                                None,
+                                None,
                                 ContextTag {
                                     counter: round + 1,
                                     actor: ActorId::random(),

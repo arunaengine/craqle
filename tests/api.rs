@@ -246,7 +246,7 @@ fn create_policy_crate(node: &CraqleNode, graph: &str, name: &str, policy: Graph
             name,
             "Regime equivalence fixture",
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             policy,
         ),
     )
@@ -823,7 +823,7 @@ fn search_graphs_agrees_across_the_per_graph_threshold() {
                 format!("Graph Set {idx}"),
                 "graphsetneedle",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 GraphPolicy {
                     public: true,
                     permission_paths: vec!["/datasets/public/graphset".to_string()],
@@ -843,7 +843,7 @@ fn search_graphs_agrees_across_the_per_graph_threshold() {
             "Graph Set Hidden",
             "graphsetneedle ".repeat(40),
             "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
+            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             GraphPolicy {
                 public: false,
                 permission_paths: vec!["/datasets/private/graphset".to_string()],
