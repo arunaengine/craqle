@@ -1701,9 +1701,18 @@ impl GraphStore {
         self.persist_mode
     }
 
+    /// Flush every keyspace, then compact it.
+    ///
+    /// The rotation is load-bearing: compaction has no input until a memtable
+    /// is flushed, and a memtable only flushes on its own once it exceeds a
+    /// ceiling that fjall persists per keyspace at creation. A store created
+    /// before that ceiling was lowered keeps the old one, so this call was
+    /// otherwise a no-op on exactly the stores needing it (C1/C2). Depends on
+    /// fjall's `#[doc(hidden)]` `rotate_memtable_and_wait`.
     pub fn manual_compact(&self) -> Result<()> {
         self.db.persist(self.persist_mode)?;
         for keyspace in [&self.terms, &self.quads, &self.graphs, &self.log] {
+            keyspace.rotate_memtable_and_wait()?;
             keyspace.major_compact()?;
         }
         self.db.persist(self.persist_mode)?;
@@ -4506,5 +4515,63 @@ mod tests {
         store.clear_fts_queue_for_graph(&graph).unwrap();
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
         assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+    }
+
+    fn table_bytes(root: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let meta = entry.metadata().unwrap();
+                total += if meta.is_dir() {
+                    table_bytes(&path)
+                } else if path.parent().is_some_and(|p| p.ends_with("tables")) {
+                    meta.len()
+                } else {
+                    0
+                };
+            }
+        }
+        total
+    }
+
+    /// `manual_compact` must flush, not just request a compaction: without the
+    /// rotation there is nothing on disk to compact and the journal is never
+    /// reclaimed (C1/C2).
+    #[test]
+    fn manual_compact_flushes_pending_writes_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:manual-compact");
+        store.create_graph(&graph).unwrap();
+
+        let predicate =
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:p"));
+        for index in 0..2_000u64 {
+            let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(&format!(
+                "urn:test:s{index}"
+            )));
+            insert_quad(
+                &store,
+                &graph,
+                &subject,
+                &predicate,
+                &EncodedTerm(format!("\"value {index}\"")),
+                Dot {
+                    actor: ActorId::random(),
+                    counter: index + 1,
+                },
+            );
+        }
+        store.persist().unwrap();
+
+        let before = table_bytes(dir.path());
+        store.manual_compact().unwrap();
+        let after = table_bytes(dir.path());
+
+        assert!(
+            after > before,
+            "manual_compact must land pending writes in tables, but bytes went {before} -> {after}"
+        );
     }
 }
