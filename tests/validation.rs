@@ -308,7 +308,7 @@ mod tests {
                     "Reachability",
                     "Reachability fixtures",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
                 ),
             )
@@ -432,10 +432,9 @@ mod tests {
         match net.peer(0).apply_changes(&graph, changes) {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
-                    violations.iter().any(|violation| matches!(
-                        violation,
-                        CrateViolation::MissingRootDataEntity
-                    )),
+                    violations
+                        .iter()
+                        .any(|violation| violation.code == "missing_root_data_entity"),
                     "expected the last delete to win, got {violations:?}"
                 );
             }
@@ -464,10 +463,9 @@ mod tests {
         match net.peer(0).apply_changes(&graph, cycle.clone()) {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
-                    violations.iter().any(|violation| matches!(
-                        violation,
-                        CrateViolation::OrphanedDataEntity { .. }
-                    )),
+                    violations
+                        .iter()
+                        .any(|violation| violation.code == "orphaned_data_entity"),
                     "a detached cycle is not reachable, got {violations:?}"
                 );
             }

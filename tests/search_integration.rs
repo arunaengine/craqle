@@ -418,7 +418,7 @@ mod tests {
                     format!("Private Escalation {idx}"),
                     "escalationneedle ".repeat(40),
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     GraphPolicy {
                         public: false,
                         permission_paths: vec!["/tests/private/escalation".to_string()],
@@ -436,7 +436,7 @@ mod tests {
                     format!("Public Escalation {idx}"),
                     "escalationneedle",
                     "2025-01-01",
-                    "https://creativecommons.org/licenses/by/4.0/",
+                    Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     GraphPolicy {
                         public: true,
                         permission_paths: vec!["/tests/public/escalation".to_string()],
@@ -495,7 +495,7 @@ mod tests {
                 "Sustained Ingest Dataset",
                 "Contains sustainedmarker before the flush",
                 "2025-01-01",
-                "https://creativecommons.org/licenses/by/4.0/",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
         )

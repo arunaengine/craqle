@@ -948,10 +948,13 @@ impl RoCrateManager {
         Ok(CrateCtx {
             graph: graph.clone(),
             graph_tid,
+            // `encoded_subject`, not `encoded_identifier`: diagnostics store a
+            // blank node as `_:b0`, and re-encoding that as the IRI `<_:b0>`
+            // would leave an orphaned blank node visible to every reader (G6).
             orphaned: diagnostics
                 .orphaned_entities
                 .iter()
-                .map(|entity_id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity_id)))
+                .map(|entity_id| encoded_subject(entity_id))
                 .collect(),
         })
     }
@@ -1176,12 +1179,16 @@ impl RoCrateManager {
 
     /// The interned id of `subject_id`, or `None` when the subject is hidden by
     /// the orphan set or was never interned.
+    ///
+    /// `encoded_subject`, not `encoded_identifier`: JSON-LD import mints blank
+    /// nodes for inline nested entities, and a `_:b0` subject must not be
+    /// re-encoded as the IRI `<_:b0>` or its triples become unreadable.
     fn visible_subject_tid(
         &self,
         cx: &CrateCtx,
         subject_id: &str,
     ) -> Result<Option<TermId>, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let subject = encoded_subject(subject_id);
         if cx.hides(&subject) {
             return Ok(None);
         }
@@ -1558,7 +1565,7 @@ impl RoCrateManager {
         cx: &CrateCtx,
         subject_id: &str,
     ) -> Result<bool, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let subject = encoded_subject(subject_id);
         if cx.hides(&subject) {
             return Ok(false);
         }
