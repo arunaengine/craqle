@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use crate::core::*;
 use crate::rules::{ChangeSet, DeltaSummary, Rule};
@@ -83,6 +83,14 @@ fn graph_write_lock(graph: &GraphId) -> &'static Mutex<()> {
     let hash = blake3::hash(graph.as_str().as_bytes());
     let shard = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap()) as usize;
     &GRAPH_WRITE_LOCKS[shard % GRAPH_WRITE_LOCK_SHARDS]
+}
+
+/// Acquire a graph's engine-level write lock; see [`GRAPH_WRITE_LOCKS`] for
+/// what it orders and for the lock order it belongs to.
+pub(crate) fn graph_write_guard(graph: &GraphId) -> MutexGuard<'static, ()> {
+    graph_write_lock(graph)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The replication engine: local writes and CRDT merge of Irokle records.
@@ -179,9 +187,7 @@ impl ReplicationEngine {
 
         // Guards the context-tag mint through to the store write; see
         // GRAPH_WRITE_LOCKS.
-        let _write_guard = graph_write_lock(graph)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _write_guard = graph_write_guard(graph);
 
         let tag = ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor);
         if let Some(sync) = &self.sync {
@@ -391,9 +397,7 @@ impl ReplicationEngine {
         if let Some(sync) = &self.sync {
             // Orders this graph's publish against its own apply; see
             // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
-            let _write_guard = graph_write_lock(graph)
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let _write_guard = graph_write_guard(graph);
 
             // Publish-first (G4): the event goes out before any local state
             // changes, and outside the commit guard, because the publish may bind

@@ -1946,7 +1946,28 @@ impl CraqleNode {
         Ok(self.store.persist()?)
     }
 
+    /// Apply one replicated record to local state.
+    ///
+    /// Every arm here is a compare-and-set — read the tombstone, the stored
+    /// policy or the stored context tag, then decide whether to write — so the
+    /// whole record has to be applied under the graph's write lock. Without it
+    /// two applies both read the same stored value, both conclude they win, and
+    /// the one that lands second decides the outcome by arrival order; for the
+    /// `@context` register that means the local value can end up superseded on
+    /// every peer but this one, with no later event to correct it (G5, G8).
     fn apply_irokle_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<bool> {
+        // Orders this apply against every other write to the same graph; see
+        // `replication::GRAPH_WRITE_LOCKS`.
+        let _write_guard = replication::graph_write_guard(record.event.graph());
+        self.apply_irokle_record_locked(record)
+    }
+
+    /// **Call with the graph's write lock held**, so a publish and its own
+    /// apply cannot be reordered against a concurrent one.
+    fn apply_irokle_record_locked(
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
     ) -> Result<bool> {
@@ -2135,9 +2156,38 @@ fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ContextTag;
+
+    /// Generous enough that a slow machine never trips it, short enough that a
+    /// lock-order regression fails the run instead of hanging it.
+    const PROGRESS_TIMEOUT: Duration = Duration::from_secs(180);
 
     fn writer_auth() -> GrantAuthorizer {
         GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)])
+    }
+
+    /// A node that replicates through a real irokle topic, so its own published
+    /// records come back to it through `reconcile_irokle`.
+    fn sync_node(dir: &tempfile::TempDir) -> Arc<CraqleNode> {
+        let irokle = irokle::Irokle::builder().build().unwrap();
+        Arc::new(
+            CraqleNode::open_with_options(
+                dir.path(),
+                CraqleOptions::new()
+                    .with_search_storage(SearchStorage::Memory)
+                    .with_irokle(irokle, CraqleIrokleOptions::new()),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Wait for `count` workers, failing rather than hanging on a lock-order
+    /// regression.
+    fn await_workers(rx: &mpsc::Receiver<()>, count: usize) {
+        for _ in 0..count {
+            rx.recv_timeout(PROGRESS_TIMEOUT)
+                .expect("a concurrent writer never finished");
+        }
     }
 
     fn crate_request(graph: &GraphId, name: &str) -> CreateCrateRequest {
@@ -2205,5 +2255,115 @@ mod tests {
             2,
             "both crates must be searchable after the worker panicked"
         );
+    }
+
+    /// G5 — two `@context` writes must never mint the same last-write-wins tag.
+    ///
+    /// The tag is `stored_counter + 1`, so an unsynchronised mint hands the
+    /// identical `(counter, actor)` to two different context values: a tie the
+    /// register cannot break, which leaves peers free to disagree forever.
+    #[test]
+    fn concurrent_context_writes_mint_distinct_tags() {
+        const WRITERS: usize = 8;
+        const WRITES: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = sync_node(&dir);
+        let graph = GraphId::new("urn:test:context-mint");
+        let (tx, rx) = mpsc::channel();
+
+        for writer in 0..WRITERS {
+            let node = Arc::clone(&node);
+            let graph = graph.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for round in 0..WRITES {
+                    node.replication
+                        .set_graph_context(
+                            &graph,
+                            Some(format!("ctx-{writer}-{round}")),
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                }
+                tx.send(()).unwrap();
+            });
+        }
+        drop(tx);
+        await_workers(&rx, WRITERS);
+
+        assert_eq!(
+            (WRITERS * WRITES) as u64,
+            node.store.graph_context_tag(&graph).unwrap().counter,
+            "every mint must have read a tag no concurrent mint was still using"
+        );
+    }
+
+    /// G5 — two `ContextUpdated` applies racing on one graph must converge on
+    /// the higher tag, not on whichever landed last.
+    ///
+    /// The apply is a compare-and-set: read the stored tag, decide, write. Run
+    /// unsynchronised, both applies read the same stored tag, both conclude
+    /// they dominate it, and arrival order picks the winner — so the register
+    /// can settle on a value every peer has already superseded, with no later
+    /// event to correct it.
+    #[test]
+    fn racing_context_applies_converge_on_the_highest_tag() {
+        const ROUNDS: usize = 32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = sync_node(&dir);
+        let sync = node.sync.clone().expect("sync node");
+        let (tx, rx) = mpsc::channel();
+
+        for round in 0..ROUNDS {
+            let graph = context_race_graph(round);
+            // Published, not applied: the local register is still at genesis, so
+            // both records dominate it and neither apply short-circuits.
+            let records = [("low", 1), ("high", 2)].map(|(value, counter)| {
+                let tag = ContextTag {
+                    counter,
+                    actor: node.actor(),
+                };
+                sync.publish_context(
+                    &node.store,
+                    &graph,
+                    Some(value.to_string()),
+                    None,
+                    None,
+                    tag,
+                )
+                .unwrap()
+            });
+
+            let start = Arc::new(std::sync::Barrier::new(records.len()));
+            for record in records {
+                let node = Arc::clone(&node);
+                let start = Arc::clone(&start);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    node.apply_irokle_record(&record).unwrap();
+                    tx.send(()).unwrap();
+                });
+            }
+        }
+        drop(tx);
+        await_workers(&rx, ROUNDS * 2);
+
+        for round in 0..ROUNDS {
+            assert_eq!(
+                Some("high".to_string()),
+                node.store
+                    .graph_context(&context_race_graph(round))
+                    .unwrap(),
+                "round {round} kept the superseded context"
+            );
+        }
+    }
+
+    fn context_race_graph(round: usize) -> GraphId {
+        GraphId::new(&format!("urn:test:context-apply-{round}"))
     }
 }
