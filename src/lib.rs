@@ -1812,12 +1812,17 @@ impl CraqleNode {
     /// drops triples whose *object* points at an orphan. Both are required for
     /// G6 ("invalid visible crates are never exported"). Returning an empty
     /// list for an orphaned subject, rather than an error, is deliberate.
+    ///
+    /// `subject_id` may name a blank node (`_:b0`) — search indexes and returns
+    /// them in that form — so it is encoded with `from_subject_id`. Encoding it
+    /// as an IRI both let an orphaned blank node through the check below and
+    /// made every non-orphaned blank node describe as empty.
     fn describe_in_ctx(
         &self,
         ctx: &DescribeCtx,
         subject_id: &str,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let subject = EncodedTerm::from_subject_id(subject_id);
         if ctx.orphaned.contains(&subject) {
             return Ok(Vec::new());
         }
@@ -1901,7 +1906,7 @@ impl CraqleNode {
             .graph_diagnostics(graph)?
             .orphaned_entities
             .into_iter()
-            .map(|entity_id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)))
+            .map(|entity_id| EncodedTerm::from_subject_id(&entity_id))
             .collect())
     }
 

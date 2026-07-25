@@ -837,7 +837,10 @@ impl<'a> QuadVisibility<'a> {
         let diagnostics = self.store.graph_diagnostics_by_id(graph)?;
         let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
         for entity_id in diagnostics.orphaned_entities {
-            let term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
+            // `from_subject_id`: diagnostics store a blank node as `_:b0`, and
+            // encoding that as the IRI `<_:b0>` makes `lookup_term` miss, which
+            // leaves the orphan visible to every query instead of erroring (G6).
+            let term = EncodedTerm::from_subject_id(&entity_id);
             if let Some(term_id) = self.store.lookup_term(&term)? {
                 orphaned.insert(term_id);
             }

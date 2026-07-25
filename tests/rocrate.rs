@@ -1618,6 +1618,312 @@ mod tests {
         .unwrap();
     }
 
+    // ---------------------------------------------------------------------
+    // Orphan hiding across term kinds (G6).
+    //
+    // `oxjsonld` mints a blank node for every inline nested entity, so an
+    // orphan's id reaches `GraphDiagnostics::orphaned_entities` in N-Triples
+    // form: `<http://…>` becomes the bare IRI, but a blank node stays `_:b…`.
+    // A reader that re-encodes such an id as the IRI `<_:b…>` matches no
+    // interned term, so the orphan stays fully visible. The two fixtures below
+    // pin the blank-node and named-node paths side by side over the same four
+    // surfaces: export, SPARQL, search and describe.
+    // ---------------------------------------------------------------------
+
+    const DETACHED_NAME: &str = "Detached Nested Person";
+    const LINKED_NAME: &str = "Linked Nested Person";
+    const REFERRER_ID: &str = "./referrer.txt";
+
+    /// One nested entity in the two spellings the reads use: `id` is the bare
+    /// form that diagnostics, exported `@id`s and search hits carry, `term` the
+    /// N-Triples form that SPARQL bindings and describe pairs carry. For a
+    /// blank node the two coincide (`_:b…`); for a named node they differ
+    /// (`#linked` versus `<#linked>`), which is precisely why an orphan id has
+    /// to be re-encoded per term kind instead of wrapped in angle brackets.
+    struct NestedEntity {
+        id: String,
+        term: EncodedTerm,
+    }
+
+    impl NestedEntity {
+        fn new(term: EncodedTerm) -> Self {
+            let id = term
+                .to_named_node()
+                .map_or_else(|| term.0.clone(), |node| node.as_str().to_string());
+            Self { id, term }
+        }
+    }
+
+    /// The two nested entities of [`nested_entity_fixture`].
+    struct NestedEntities {
+        /// Unreachable from the root, so every read must hide it.
+        orphan: NestedEntity,
+        /// Reachable, so every read must keep showing it.
+        linked: NestedEntity,
+    }
+
+    /// A crate whose root references two nested entities — one over `creator`,
+    /// one over `mentions` — plus one named file under `hasPart`. The
+    /// `mentions` target is then turned into an unreachable data entity by
+    /// giving it a `hasPart` edge of its own: `hasPart` membership is what
+    /// makes something a data entity, and nothing links the root to it, so it
+    /// becomes an orphan while a live triple still points at it. `inline`
+    /// selects whether the nested entities are written inline (which the
+    /// importer mints as blank nodes) or with explicit `@id`s.
+    fn nested_entity_fixture(node: &CraqleNode, graph: &GraphId, inline: bool) -> NestedEntities {
+        let nested = |slug: &str, name: &str| {
+            let mut entity = serde_json::json!({"@type": "Person", "name": name});
+            if !inline {
+                entity["@id"] = serde_json::json!(format!("#{slug}"));
+            }
+            entity
+        };
+        let document = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Nested Entity Crate",
+                    "description": "Nested entities, one of them detached",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "hasPart": {"@id": REFERRER_ID},
+                    "creator": nested("linked", LINKED_NAME),
+                    "mentions": nested("detached", DETACHED_NAME)
+                },
+                {
+                    "@id": REFERRER_ID,
+                    "@type": "File",
+                    "name": "Referrer File"
+                }
+            ]
+        });
+        manager(node)
+            .import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        let entities = NestedEntities {
+            orphan: subject_named(node, graph, DETACHED_NAME),
+            linked: subject_named(node, graph, LINKED_NAME),
+        };
+        assert_eq!(
+            entities.orphan.term.0.starts_with("_:"),
+            inline,
+            "inline nested entities must import as blank nodes and explicit \
+             `@id`s as named nodes; got `{}`",
+            entities.orphan.term.0
+        );
+
+        node.apply_changes_bulk_unchecked(
+            graph,
+            vec![MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: entities.orphan.term.clone(),
+                predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
+                object: named(REFERRER_ID),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(graph).unwrap();
+
+        assert_eq!(
+            node.graph_diagnostics(graph).unwrap().orphaned_entities,
+            vec![entities.orphan.id.clone()],
+            "the fixture must produce exactly the orphan the assertions rely on"
+        );
+        entities
+    }
+
+    /// The single subject carrying `schema:name "{name}"`.
+    fn subject_named(node: &CraqleNode, graph: &GraphId, name: &str) -> NestedEntity {
+        let predicate = EncodedTerm::from_named_node(&vocab::schema_name());
+        let object = literal_term(name);
+        let mut subjects: Vec<EncodedTerm> = node
+            .graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .filter(|quad| quad.predicate == predicate && quad.object == object)
+            .map(|quad| quad.subject)
+            .collect();
+        subjects.dedup();
+        assert_eq!(
+            subjects.len(),
+            1,
+            "expected exactly one subject named `{name}`, got {subjects:?}"
+        );
+        NestedEntity::new(subjects.remove(0))
+    }
+
+    /// Every subject and object bound by `?s ?p ?o` over one graph.
+    fn queried_terms(node: &CraqleNode, graph: &GraphId) -> Vec<String> {
+        solution_rows(
+            node.query_graphs(
+                std::slice::from_ref(graph),
+                "SELECT ?s ?o WHERE { ?s ?p ?o }",
+            )
+            .unwrap(),
+        )
+        .into_iter()
+        .flat_map(|row| ["s", "o"].map(|variable| row[variable].0.clone()))
+        .collect()
+    }
+
+    /// The `(predicate, object)` pairs `describe_subject` exposes for a subject.
+    fn described(node: &CraqleNode, graph: &GraphId, subject_id: &str) -> Vec<(String, String)> {
+        node.describe_subject_with(
+            &GrantAuthorizer::default(),
+            DescribeRequest { graph, subject_id },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(predicate, object)| (predicate.0, object.0))
+        .collect()
+    }
+
+    /// Every subject `search` returns for `query`, plus every object
+    /// `search_resources` hydrates those hits with, once the index has caught
+    /// up with the store.
+    fn searched_terms(node: &CraqleNode, query: &str) -> Vec<String> {
+        node.flush_search_updates().unwrap();
+        let request = || SearchRequest { query, limit: 10 };
+        let hits = node
+            .search_with(&GrantAuthorizer::default(), request())
+            .unwrap();
+        let hydrated = node
+            .search_resources_with(&GrantAuthorizer::default(), request())
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            hydrated.len(),
+            "search and search_resources must agree on which hits exist"
+        );
+        hits.into_iter()
+            .map(|hit| hit.subject_iri)
+            .chain(
+                hydrated
+                    .into_iter()
+                    .flat_map(|hit| hit.properties.into_iter().map(|(_, object)| object.0)),
+            )
+            .collect()
+    }
+
+    /// Export, SPARQL, search and describe must all hide the orphan, drop the
+    /// live `mentions` triple that still points at it, and keep the reachable
+    /// sibling — whether the nested entities are blank nodes or named nodes.
+    fn assert_orphan_hidden_everywhere(node: &CraqleNode, graph: &GraphId, inline: bool) {
+        let entities = nested_entity_fixture(node, graph, inline);
+
+        let exported = manager(node).export_jsonld(graph).unwrap();
+        assert!(
+            !exported.contains(DETACHED_NAME) && !exported.contains(&entities.orphan.id),
+            "the orphan must never be exported (G6): {exported}"
+        );
+        assert!(
+            exported.contains(LINKED_NAME),
+            "the reachable nested entity must stay exported: {exported}"
+        );
+
+        let bound = queried_terms(node, graph);
+        assert!(
+            !bound.contains(&entities.orphan.term.0),
+            "SPARQL must bind the orphan neither as a subject nor as the object \
+             of the live `mentions` triple (G6): {bound:?}"
+        );
+        assert!(
+            bound.contains(&entities.linked.term.0),
+            "the reachable nested entity must stay queryable: {bound:?}"
+        );
+
+        let found = searched_terms(node, "Nested Person");
+        assert!(
+            !found.contains(&entities.orphan.id) && !found.contains(&entities.orphan.term.0),
+            "search must return neither the orphan nor a hydrated reference to \
+             it (G6): {found:?}"
+        );
+        assert!(
+            found.contains(&entities.linked.id),
+            "the reachable nested entity must stay searchable: {found:?}"
+        );
+
+        assert!(
+            described(node, graph, &entities.orphan.id).is_empty(),
+            "describe_subject must expose nothing for an orphan (G6)"
+        );
+        let root = described(node, graph, graph.as_str());
+        assert!(
+            !root
+                .iter()
+                .any(|(_, object)| object == &entities.orphan.term.0),
+            "describe_subject must drop triples whose object is orphaned (G6): {root:?}"
+        );
+        assert!(
+            root.iter()
+                .any(|(_, object)| object == &entities.linked.term.0),
+            "the root's reference to the reachable nested entity must survive: {root:?}"
+        );
+    }
+
+    /// An orphan imported as a blank node — the path that was uncovered.
+    #[test]
+    fn orphaned_blank_node_is_hidden_from_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:orphan-blank-node");
+        assert_orphan_hidden_everywhere(&node, &graph, true);
+    }
+
+    /// The named-node twin, so the two encodings stay pinned side by side.
+    #[test]
+    fn orphaned_named_node_is_hidden_from_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:orphan-named-node");
+        assert_orphan_hidden_everywhere(&node, &graph, false);
+    }
+
+    /// The inverse of orphan hiding: a blank node that no diagnostics entry
+    /// names stays fully visible. Encoding orphan ids correctly must not turn
+    /// into hiding every blank node.
+    #[test]
+    fn non_orphaned_blank_node_stays_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:visible-blank-node");
+        let entities = nested_entity_fixture(&node, &graph, true);
+
+        assert!(
+            entities.linked.id.starts_with("_:"),
+            "fixture must keep a blank node reachable from the root"
+        );
+        let described = described(&node, &graph, &entities.linked.id);
+        assert!(
+            described
+                .iter()
+                .any(|(_, object)| object == &literal_term(LINKED_NAME).0),
+            "a non-orphaned blank node must describe its own triples: {described:?}"
+        );
+        assert!(
+            queried_terms(&node, &graph).contains(&entities.linked.term.0),
+            "a non-orphaned blank node must stay queryable"
+        );
+        assert!(
+            manager(&node)
+                .export_jsonld(&graph)
+                .unwrap()
+                .contains(LINKED_NAME),
+            "a non-orphaned blank node must stay exported"
+        );
+    }
+
+
     /// The import context register is a two-phase, publish-first LWW register
     /// (G4/G5): re-running an unchanged import leaves it exactly as it was, and
     /// an import carrying a different context replaces it.

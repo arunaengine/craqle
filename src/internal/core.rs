@@ -154,6 +154,23 @@ impl EncodedTerm {
         Self(t.to_string())
     }
 
+    /// Encode a subject identifier that may name either an IRI or a blank node.
+    ///
+    /// Identifiers that travel as plain strings — [`GraphDiagnostics::orphaned_entities`]
+    /// above all — carry a blank node in its bare label form (`_:b0`), never as
+    /// an IRI. Encoding such an id with [`EncodedTerm::from_named_node`] yields
+    /// `<_:b0>`, which matches no interned term: membership tests silently miss
+    /// and an orphaned blank node stays visible to export, SPARQL and search
+    /// (G6). Every string → [`EncodedTerm`] round trip for a *subject* must go
+    /// through here.
+    pub fn from_subject_id(id: &str) -> Self {
+        if id.starts_with("_:") {
+            Self(id.to_string())
+        } else {
+            Self::from_named_node(&NamedNode::new_unchecked(id))
+        }
+    }
+
     /// Parse back to an oxrdf Term (N-Triples syntax).
     pub fn to_term(&self) -> Option<oxrdf::Term> {
         // oxrdf terms Display as N-Triples: <iri>, "lit"^^<dt>, _:bn
