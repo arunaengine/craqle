@@ -981,4 +981,148 @@ mod tests {
             "a re-attached entity must come back to search without being touched"
         );
     }
+
+    fn axolotl_hits(node: &CraqleNode) -> usize {
+        node.search(
+            &GrantAuthorizer::default(),
+            SearchRequest {
+                query: "axolotl",
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .len()
+    }
+
+    /// Orphan one data entity, re-link it with a deferred bulk write, then land
+    /// an unrelated commit before the diagnostics rebuild.
+    ///
+    /// The unrelated write touches neither `rdf:type` nor `hasPart`, so the
+    /// settle takes its re-stamp path — and re-stamping a read that already
+    /// reflects the bulk write would move the re-queue baseline past the
+    /// re-link without queueing it.
+    fn interleave_relink(node: &CraqleNode, graph: &GraphId) {
+        node.create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "interleave crate",
+                "description",
+                "2025-01-01",
+                None,
+                public_policy(),
+            ),
+        )
+        .unwrap();
+        node.append_new_root_data_entities(
+            &writer_auth(),
+            graph,
+            vec![NewDataEntity {
+                entity_id: "data/axolotl.dat".to_string(),
+                entity_type: "http://schema.org/MediaObject".to_string(),
+                name: "axolotl".to_string(),
+                additional_triples: Vec::new(),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(graph).unwrap();
+        node.flush_search_updates().unwrap();
+        assert_eq!(1, axolotl_hits(node), "the child starts out searchable");
+
+        let edge = node
+            .graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
+            .expect("root must link the child");
+        let unlink = MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: edge.subject.clone(),
+            predicate: edge.predicate.clone(),
+            object: edge.object.clone(),
+        };
+        let link = MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: edge.subject.clone(),
+            predicate: edge.predicate.clone(),
+            object: edge.object.clone(),
+        };
+
+        node.apply_changes_bulk_unchecked(graph, vec![unlink])
+            .unwrap();
+        node.rebuild_graph_diagnostics(graph).unwrap();
+        node.flush_search_updates().unwrap();
+        assert_eq!(0, axolotl_hits(node), "the orphan must leave the index");
+
+        // Re-link without rebuilding, then commit something unrelated.
+        node.apply_changes_bulk_unchecked(graph, vec![link])
+            .unwrap();
+        node.apply_changes_unchecked(
+            graph,
+            vec![MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: edge.subject,
+                predicate: EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                    "http://schema.org/description",
+                )),
+                object: EncodedTerm::from_term(&oxrdf::Term::Literal(
+                    oxrdf::Literal::new_simple_literal("an unrelated note"),
+                )),
+            }],
+        )
+        .unwrap();
+
+        node.rebuild_graph_diagnostics(graph).unwrap();
+        node.flush_search_updates().unwrap();
+    }
+
+    /// A settle between a deferred bulk write and its rebuild must not advance
+    /// the re-queue baseline past the re-link it happens to observe (G7).
+    #[test]
+    fn interleaved_relink_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let graph = GraphId::new("urn:test:interleaved-relink");
+
+        interleave_relink(&node, &graph);
+
+        assert!(
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "re-linking must clear the orphan record"
+        );
+        assert_eq!(
+            1,
+            axolotl_hits(&node),
+            "the re-linked entity must come back to search"
+        );
+    }
+
+    /// Restart is not a repair path for this: the persisted record is already
+    /// correct and freshly clock-tagged, so a reopen finds nothing to fix.
+    #[test]
+    fn interleaved_relink_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:interleaved-relink-restart");
+
+        {
+            let node = CraqleNode::open(dir.path()).unwrap();
+            interleave_relink(&node, &graph);
+        }
+
+        let reopened = CraqleNode::open(dir.path()).unwrap();
+        reopened.flush_search_updates().unwrap();
+        assert_eq!(
+            1,
+            axolotl_hits(&reopened),
+            "the re-linked entity must still be searchable after a restart"
+        );
+    }
 }
