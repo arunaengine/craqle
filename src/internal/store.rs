@@ -639,6 +639,10 @@ pub struct GraphStore {
     /// Tests use it to prove a reopen served the persisted record instead of
     /// recomputing, and that a stale record was repaired at open.
     diagnostics_computed: AtomicU64,
+    /// Explicit persists so far. Tests use it to pin a durability call that
+    /// leaves no other trace inside one process.
+    #[cfg(test)]
+    persists: AtomicU64,
 }
 
 // ── Frozen WS0 parameter structs ────────────────────────────────────────────
@@ -1897,6 +1901,8 @@ impl GraphStore {
             fts_queue_lock: Mutex::new(()),
             dirty_counter: AtomicU64::new(1),
             diagnostics_computed: AtomicU64::new(0),
+            #[cfg(test)]
+            persists: AtomicU64::new(0),
         };
 
         store.rebuild_indexes()?;
@@ -3176,7 +3182,15 @@ impl GraphStore {
 
     pub fn persist(&self) -> Result<()> {
         self.db.persist(self.persist_mode)?;
+        #[cfg(test)]
+        self.persists.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Explicit persists run so far. Test-only.
+    #[cfg(test)]
+    pub(crate) fn persists(&self) -> u64 {
+        self.persists.load(Ordering::Relaxed)
     }
 
     fn commit_fjall_batch(&self, batch: fjall::OwnedWriteBatch) -> Result<()> {
