@@ -489,11 +489,11 @@ impl SearchIndex {
 
         let queued_deletes = drain_upto(&bound, |chunk| store.drain_fts_delete_queue(chunk))?;
         if !queued_deletes.is_empty() {
-            for (graph, _) in &queued_deletes {
-                if store.contains_graph(graph)? {
-                    self.reindex_from_store(store, graph)?;
+            for entry in &queued_deletes {
+                if store.contains_graph(&entry.graph)? {
+                    self.reindex_from_store(store, &entry.graph)?;
                 } else {
-                    self.delete_graph_documents_uncommitted(graph.as_str())?;
+                    self.delete_graph_documents_uncommitted(entry.graph.as_str())?;
                 }
             }
 
@@ -505,8 +505,8 @@ impl SearchIndex {
 
         let queued_graphs = drain_upto(&bound, |chunk| store.drain_fts_reindex_queue(chunk))?;
         if !queued_graphs.is_empty() {
-            for (graph, _) in &queued_graphs {
-                self.reindex_from_store(store, graph)?;
+            for entry in &queued_graphs {
+                self.reindex_from_store(store, &entry.graph)?;
             }
 
             self.commit()?;
@@ -527,15 +527,15 @@ impl SearchIndex {
         let mut seen = HashSet::with_capacity(queued.len());
         let mut caches = StoreSyncCaches::default();
         let mut prepared = Vec::with_capacity(queued.len());
-        for (graph, subject, _) in &queued {
-            if !seen.insert((graph.clone(), *subject)) {
+        for entry in &queued {
+            if !seen.insert((entry.graph.clone(), entry.subject)) {
                 continue;
             }
             prepared.push(prepare_subject_op(
                 PrepareSubject {
                     store,
-                    graph,
-                    subject: *subject,
+                    graph: &entry.graph,
+                    subject: entry.subject,
                 },
                 &mut caches,
             )?);
