@@ -91,6 +91,7 @@ mod tests {
             entity_count as i64
         );
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
             .search(
@@ -179,6 +180,7 @@ mod tests {
             entity_count as i64
         );
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
             .search(
@@ -231,6 +233,7 @@ mod tests {
             .unwrap();
         let replace_elapsed = replace_start.elapsed();
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
             .search(
@@ -279,6 +282,7 @@ mod tests {
         .unwrap();
         let update_elapsed = update_start.elapsed();
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
             .search(
@@ -326,6 +330,7 @@ mod tests {
         let replace_elapsed = replace_start.elapsed();
 
         let probe = entity_count + extra_count - 1;
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
             .search(
