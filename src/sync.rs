@@ -254,6 +254,10 @@ pub struct IrokleGraphSync<S: irokle::Storage> {
     ///
     /// Shared across clones so every handle to one node sees one memo.
     topic_memo: Arc<RwLock<HashMap<GraphId, irokle::TopicId>>>,
+    /// Set by a test to fail the next history read, standing in for an
+    /// unreadable topic. Shared across clones, like the memo.
+    #[cfg(test)]
+    armed_history_failure: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S: irokle::Storage> IrokleGraphSync<S> {
@@ -262,11 +266,27 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
             node,
             options,
             topic_memo: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            armed_history_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn node(&self) -> &irokle::Irokle<S> {
         &self.node
+    }
+
+    /// Make the next history read fail. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_history_failure(&self) {
+        self.armed_history_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Consumes a pending injected failure, reporting whether one was armed.
+    #[cfg(test)]
+    pub(crate) fn take_history_failure(&self) -> bool {
+        self.armed_history_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     fn open_graph_topic(
@@ -565,6 +585,12 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         topic_id: irokle::TopicId,
         cursor: Option<&[u8]>,
     ) -> SyncResult<TopicCatchup> {
+        #[cfg(test)]
+        if self.take_history_failure() {
+            return Err(CraqleSyncError::Irokle(irokle::Error::Storage(
+                "injected history failure".to_owned(),
+            )));
+        }
         let clock: irokle::ActorClock = match cursor {
             Some(bytes) => postcard::from_bytes(bytes).unwrap_or_default(),
             None => irokle::ActorClock::default(),
