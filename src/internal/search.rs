@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -73,20 +73,78 @@ pub struct SearchIndex {
     /// Never locked directly: go through [`SearchIndex::writer`], which turns
     /// a poisoned lock into a recovery instead of a panic.
     writer: Mutex<IndexWriter>,
-    dirty: AtomicBool,
+    /// Bumped under the writer lock by every index mutation. A committer
+    /// records the value its writes carried and only reports success once
+    /// `committed_epoch` has reached it.
+    write_epoch: AtomicU64,
+    /// Highest `write_epoch` a finished Tantivy commit has made durable and
+    /// visible to the reader. Advanced only after both succeed, so a failed
+    /// commit leaves the debt outstanding for the next caller (G7).
+    committed_epoch: AtomicU64,
+    /// Serializes commits so a caller cannot mistake another thread's
+    /// in-flight commit for a finished one.
+    ///
+    /// LOCK ORDER: rebuild shard, then this, then [`SearchIndex::writer`].
+    commit_lock: Mutex<()>,
     /// Set when a poisoned writer was rolled back and the index therefore owes
     /// the store a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
-    /// Set by a test to make the next indexer drain cycle panic, proving the
-    /// worker survives one. Per-index rather than global so concurrent tests
-    /// cannot arm each other's workers.
     #[cfg(test)]
-    armed_drain_panic: AtomicBool,
+    hooks: TestHooks,
     needs_rebuild: bool,
     f_doc_key: Field,
     f_graph_id: Field,
     f_subject_iri: Field,
     f_all_text: Field,
+}
+
+/// Interleaving hooks a test arms to pin down a race. Per-index rather than
+/// global so concurrent tests cannot arm each other's workers.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    /// Makes the next indexer drain cycle panic, proving the worker survives one.
+    drain_panic: AtomicBool,
+    /// Pauses a rebuild between its clear and its refill.
+    rebuild: StallHook,
+    /// Pauses a commit just before the Tantivy commit it is about to run.
+    commit: StallHook,
+}
+
+/// A one-shot pause. `run` sleeps once armed and publishes `entered` for the
+/// duration, so another thread can act strictly inside the window.
+#[cfg(test)]
+#[derive(Default)]
+struct StallHook {
+    delay: Mutex<Option<std::time::Duration>>,
+    entered: AtomicBool,
+}
+
+#[cfg(test)]
+impl StallHook {
+    fn arm(&self, delay: std::time::Duration) {
+        *self.delay.lock().unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    fn run(&self) {
+        let delay = self
+            .delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(delay) = delay {
+            self.entered.store(true, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            self.entered.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Spin until a stalling thread is inside the window.
+    fn wait_entered(&self) {
+        while !self.entered.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 /// One document to add or replace.
@@ -218,10 +276,12 @@ impl SearchIndex {
             index,
             reader,
             writer: Mutex::new(writer),
-            dirty: AtomicBool::new(false),
+            write_epoch: AtomicU64::new(0),
+            committed_epoch: AtomicU64::new(0),
+            commit_lock: Mutex::new(()),
             rebuild_owed: AtomicBool::new(false),
             #[cfg(test)]
-            armed_drain_panic: AtomicBool::new(false),
+            hooks: TestHooks::default(),
             needs_rebuild,
             f_doc_key,
             f_graph_id,
@@ -244,10 +304,12 @@ impl SearchIndex {
             index,
             reader,
             writer: Mutex::new(writer),
-            dirty: AtomicBool::new(false),
+            write_epoch: AtomicU64::new(0),
+            committed_epoch: AtomicU64::new(0),
+            commit_lock: Mutex::new(()),
             rebuild_owed: AtomicBool::new(false),
             #[cfg(test)]
-            armed_drain_panic: AtomicBool::new(false),
+            hooks: TestHooks::default(),
             needs_rebuild: false,
             f_doc_key,
             f_graph_id,
@@ -264,13 +326,13 @@ impl SearchIndex {
     /// Makes the next indexer drain cycle panic. Test-only.
     #[cfg(test)]
     pub(crate) fn arm_drain_panic(&self) {
-        self.armed_drain_panic.store(true, Ordering::SeqCst);
+        self.hooks.drain_panic.store(true, Ordering::SeqCst);
     }
 
     /// Consumes a pending injected panic, reporting whether one was armed.
     #[cfg(test)]
     pub(crate) fn take_armed_drain_panic(&self) -> bool {
-        self.armed_drain_panic.swap(false, Ordering::SeqCst)
+        self.hooks.drain_panic.swap(false, Ordering::SeqCst)
     }
 
     /// Lock the Tantivy writer, repairing it if a panicking thread poisoned
@@ -385,7 +447,7 @@ impl SearchIndex {
         document.add_text(self.f_all_text, &all_text);
 
         writer.add_document(document)?;
-        self.dirty.store(true, Ordering::SeqCst);
+        self.write_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -465,15 +527,41 @@ impl SearchIndex {
 
     /// Commit pending writes and reload the reader so subsequent searches
     /// reflect the latest changes.
+    ///
+    /// A completion barrier, not a request: returning `Ok` means a commit
+    /// covering every write made before the call has finished and the reader
+    /// has been reloaded. A plain dirty flag cleared up front let a second
+    /// caller see "clean" while the first commit was still in flight and
+    /// acknowledge queue entries Tantivy had not yet made durable — if that
+    /// commit then failed, the acknowledged work was never indexed (G7).
     pub fn commit(&self) -> Result<()> {
-        if !self.dirty.swap(false, Ordering::SeqCst) {
+        let target = self.write_epoch.load(Ordering::SeqCst);
+        if self.committed_epoch.load(Ordering::SeqCst) >= target {
             return Ok(());
         }
-        {
-            let mut writer = self.writer()?;
-            writer.commit()?;
+
+        let _serialized = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A commit that finished while we queued may already cover us.
+        if self.committed_epoch.load(Ordering::SeqCst) >= target {
+            return Ok(());
         }
+
+        #[cfg(test)]
+        self.hooks.commit.run();
+
+        // Every epoch bump happens under the writer lock, so nothing can slip
+        // in between reading the epoch and committing it.
+        let covered = {
+            let mut writer = self.writer()?;
+            let covered = self.write_epoch.load(Ordering::SeqCst);
+            writer.commit()?;
+            covered
+        };
         self.reader.reload()?;
+        self.committed_epoch.store(covered, Ordering::SeqCst);
         Ok(())
     }
 
@@ -598,7 +686,7 @@ impl SearchIndex {
             // Guards the Tantivy writer for the whole-graph clear only.
             let writer = self.writer()?;
             writer.delete_term(Term::from_field_text(self.f_graph_id, graph_iri));
-            self.dirty.store(true, Ordering::SeqCst);
+            self.write_epoch.fetch_add(1, Ordering::SeqCst);
         }
 
         store.for_each_quad_in_graph::<SearchError, _>(graph_tid, |quad| {
@@ -699,13 +787,13 @@ impl SearchIndex {
             self.f_doc_key,
             &doc_key(graph_id, subject_iri),
         ));
-        self.dirty.store(true, Ordering::SeqCst);
+        self.write_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn delete_graph_documents_uncommitted(&self, graph_id: &str) -> Result<()> {
         let writer = self.writer()?;
         writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
-        self.dirty.store(true, Ordering::SeqCst);
+        self.write_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -867,6 +955,7 @@ fn load_orphaned_subjects<'a>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
     use tempfile::tempdir;
@@ -1290,6 +1379,32 @@ mod tests {
             "the rollback discarded uncommitted work, so a rebuild is owed"
         );
 
+        Ok(())
+    }
+
+    /// A second committer must not report success while the first commit is
+    /// still running: the pipeline acknowledges queue entries once `commit`
+    /// returns, and those writes are neither durable nor visible yet (G7).
+    #[test]
+    fn commit_awaits_inflight() -> Result<()> {
+        let index = Arc::new(SearchIndex::open_in_memory()?);
+        index.index_resource("urn:g", "urn:subject", Some("barriertext"))?;
+        index.hooks.commit.arm(Duration::from_millis(300));
+
+        let stalled = {
+            let index = index.clone();
+            std::thread::spawn(move || index.commit())
+        };
+        index.hooks.commit.wait_entered();
+
+        index.commit()?;
+        assert_eq!(
+            1,
+            index.search("barriertext", 10)?.len(),
+            "commit returned before the write it covers was visible"
+        );
+
+        stalled.join().expect("the stalled committer panicked")?;
         Ok(())
     }
 
