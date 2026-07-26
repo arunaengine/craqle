@@ -154,6 +154,19 @@ impl EncodedTerm {
         Self(t.to_string())
     }
 
+    /// Encode a subject id that may name an IRI or a blank node.
+    ///
+    /// Every string → `EncodedTerm` round trip for a subject must come through
+    /// here: `from_named_node` would turn `_:b0` into `<_:b0>`, which matches no
+    /// interned term, so lookups silently miss on both reads and writes.
+    pub fn from_subject_id(id: &str) -> Self {
+        if id.starts_with("_:") {
+            Self(id.to_string())
+        } else {
+            Self::from_named_node(&NamedNode::new_unchecked(id))
+        }
+    }
+
     /// Parse back to an oxrdf Term (N-Triples syntax).
     pub fn to_term(&self) -> Option<oxrdf::Term> {
         // oxrdf terms Display as N-Triples: <iri>, "lit"^^<dt>, _:bn
@@ -537,10 +550,6 @@ pub mod vocab {
     }
     pub fn schema_media_object() -> NamedNode {
         NamedNode::new_unchecked("http://schema.org/MediaObject")
-    }
-    #[deprecated(note = "renamed to schema_media_object")]
-    pub fn schema_file() -> NamedNode {
-        schema_media_object()
     }
     pub fn schema_keywords() -> NamedNode {
         NamedNode::new_unchecked("http://schema.org/keywords")

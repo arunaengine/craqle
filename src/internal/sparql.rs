@@ -8,7 +8,8 @@ use crate::search::SearchIndex;
 use crate::store::{GraphStore, StoreError, TermId};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use spareval::{
-    DeleteInsertQuad, InternalQuad, QueryEvaluationError, QueryEvaluator, QueryableDataset,
+    DeleteInsertQuad, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
+    QueryableDataset,
 };
 use spargebra::algebra::{GraphPattern, GraphTarget};
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern};
@@ -30,7 +31,7 @@ pub enum SparqlError {
     Search(#[from] crate::search::SearchError),
 }
 
-pub type Result<T> = std::result::Result<T, SparqlError>;
+pub(crate) type Result<T> = std::result::Result<T, SparqlError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryResults {
@@ -39,7 +40,7 @@ pub enum QueryResults {
     Graph(Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>),
 }
 
-pub struct SparqlEngine {
+pub(crate) struct SparqlEngine {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
     evaluator: QueryEvaluator,
@@ -47,13 +48,14 @@ pub struct SparqlEngine {
 
 type VisibleGraphSet = Option<HashSet<TermId>>;
 
-pub type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
+pub(crate) type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
 
 /// Which graphs a query may see. `Predicate` defers the decision to a
 /// callback evaluated lazily per touched graph (memoized per query).
 #[derive(Clone, Copy)]
 enum GraphScope<'a> {
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: every graph is visible.
+    #[cfg(test)]
     All,
     List(&'a [GraphId]),
     Predicate(&'a VisibleFn<'a>),
@@ -87,8 +89,16 @@ const FTS_LIMIT_IRI: &str = "urn:craqle:fts:limit";
 const FTS_SCORE_IRI: &str = "urn:craqle:fts:score";
 const FTS_GRAPH_IRI: &str = "urn:craqle:fts:graph";
 
+/// Over-fetch factor for the FTS SERVICE. Graph visibility is decided per hit
+/// *after* tantivy has ranked them, so asking the index for exactly `fts:limit`
+/// hits silently returns fewer authorized rows than the caller requested.
+const FTS_OVERFETCH_FACTOR: usize = 4;
+/// Floor for the first over-fetch, so a small `fts:limit` still survives a run
+/// of unreadable top-ranked hits without another index round trip.
+const FTS_MIN_FETCH: usize = 64;
+
 impl SparqlEngine {
-    pub fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
+    pub(crate) fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
         Self {
             store,
             search,
@@ -97,15 +107,19 @@ impl SparqlEngine {
     }
 
     #[cfg(test)]
-    pub fn query(&self, sparql: &str) -> Result<QueryResults> {
+    pub(crate) fn query(&self, sparql: &str) -> Result<QueryResults> {
         self.run_query(sparql, GraphScope::All, planner_enabled())
     }
 
-    pub fn query_with_graphs(&self, sparql: &str, graphs: &[GraphId]) -> Result<QueryResults> {
+    pub(crate) fn query_with_graphs(
+        &self,
+        sparql: &str,
+        graphs: &[GraphId],
+    ) -> Result<QueryResults> {
         self.run_query(sparql, GraphScope::List(graphs), planner_enabled())
     }
 
-    pub fn query_with_visibility(
+    pub(crate) fn query_with_visibility(
         &self,
         sparql: &str,
         visible: &VisibleFn<'_>,
@@ -115,7 +129,7 @@ impl SparqlEngine {
 
     /// Like [`SparqlEngine::query_with_visibility`] with explicit control over
     /// the craqle plan optimizer (used by tests and as a debugging hatch).
-    pub fn query_with_visibility_planned(
+    pub(crate) fn query_with_visibility_planned(
         &self,
         sparql: &str,
         visible: &VisibleFn<'_>,
@@ -135,7 +149,13 @@ impl SparqlEngine {
             .parse_query(&full)
             .map_err(|e| SparqlError::Parse(e.to_string()))?;
 
-        rewrite_fts_query(&mut query, &self.search, &self.store, scope)?;
+        rewrite_fts_query(
+            &mut query,
+            FtsRewriteCtx {
+                search: self.search.as_ref(),
+                scope,
+            },
+        )?;
         if optimize {
             crate::planner::optimize_query(&mut query, &self.store);
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
@@ -143,6 +163,7 @@ impl SparqlEngine {
 
         let mut prepared = self.evaluator.prepare(&query);
         let dataset = match scope {
+            #[cfg(test)]
             GraphScope::All => {
                 prepared.dataset_mut().set_default_graph_as_union();
                 StoreDataset::new(&self.store, None)
@@ -157,15 +178,16 @@ impl SparqlEngine {
             GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
                 // Scope the dataset to the visible graph list so patterns are
                 // planned as graph-specific lookups instead of union scans.
+                //
+                // Membership is decided by the *metadata* record, not by the
+                // term table: a deleted graph's IRI survives interning, so
+                // filtering on `lookup_term` would resurrect it here while the
+                // union regime (which reads graph metadata) rightly omits it.
+                // Both regimes must answer graph existence identically (G9).
                 let mut seen = HashSet::with_capacity(graphs.len());
                 let mut names: Vec<NamedNode> = Vec::with_capacity(graphs.len());
                 for graph in graphs {
-                    if seen.insert(graph.as_str())
-                        && self
-                            .store
-                            .lookup_term(&EncodedTerm::from_named_node(&graph.0))?
-                            .is_some()
-                    {
+                    if seen.insert(graph.as_str()) && self.store.contains_graph(graph)? {
                         names.push(graph.0.clone());
                     }
                 }
@@ -192,7 +214,7 @@ impl SparqlEngine {
         collect_query_results(results)
     }
 
-    pub fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
+    pub(crate) fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let update = SparqlParser::new()
             .parse_update(&full)
@@ -285,96 +307,94 @@ struct FtsServiceSpec {
     graph: Option<FtsGraphBinding>,
 }
 
-fn rewrite_fts_query(
-    query: &mut Query,
-    search: &SearchIndex,
-    store: &GraphStore,
-    scope: GraphScope<'_>,
-) -> Result<()> {
+/// Everything the FTS SERVICE rewrite needs: the index it reads and the
+/// caller's graph scope.
+#[derive(Clone, Copy)]
+struct FtsRewriteCtx<'a> {
+    search: &'a SearchIndex,
+    scope: GraphScope<'a>,
+}
+
+fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
     match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
         | Query::Describe { pattern, .. }
         | Query::Construct { pattern, .. } => {
             let current = std::mem::replace(pattern, GraphPattern::Bgp { patterns: vec![] });
-            *pattern = rewrite_graph_pattern(current, search, store, scope)?;
+            *pattern = rewrite_graph_pattern(current, cx)?;
         }
     }
     Ok(())
 }
 
-fn rewrite_graph_pattern(
-    pattern: GraphPattern,
-    search: &SearchIndex,
-    store: &GraphStore,
-    scope: GraphScope<'_>,
-) -> Result<GraphPattern> {
+fn rewrite_graph_pattern(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
     Ok(match pattern {
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
             pattern
         }
         GraphPattern::Join { left, right } => GraphPattern::Join {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => GraphPattern::LeftJoin {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
             expression,
         },
         GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
             expr,
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Union { left, right } => GraphPattern::Union {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::Lateral { left, right } => GraphPattern::Lateral {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::Graph { name, inner } => GraphPattern::Graph {
             name,
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Extend {
             inner,
             variable,
             expression,
         } => GraphPattern::Extend {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             variable,
             expression,
         },
         GraphPattern::Minus { left, right } => GraphPattern::Minus {
-            left: Box::new(rewrite_graph_pattern(*left, search, store, scope)?),
-            right: Box::new(rewrite_graph_pattern(*right, search, store, scope)?),
+            left: Box::new(rewrite_graph_pattern(*left, cx)?),
+            right: Box::new(rewrite_graph_pattern(*right, cx)?),
         },
         GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             expression,
         },
         GraphPattern::Project { inner, variables } => GraphPattern::Project {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             variables,
         },
         GraphPattern::Distinct { inner } => GraphPattern::Distinct {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Reduced { inner } => GraphPattern::Reduced {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
         },
         GraphPattern::Slice {
             inner,
             start,
             length,
         } => GraphPattern::Slice {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             start,
             length,
         },
@@ -383,7 +403,7 @@ fn rewrite_graph_pattern(
             variables,
             aggregates,
         } => GraphPattern::Group {
-            inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+            inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
             variables,
             aggregates,
         },
@@ -393,23 +413,135 @@ fn rewrite_graph_pattern(
             silent,
         } => match name {
             NamedNodePattern::NamedNode(node) if node.as_str() == FTS_SERVICE_IRI => {
-                rewrite_fts_service(*inner, search, store, scope)?
+                rewrite_fts_service(*inner, cx)?
             }
             other => GraphPattern::Service {
                 name: other,
-                inner: Box::new(rewrite_graph_pattern(*inner, search, store, scope)?),
+                inner: Box::new(rewrite_graph_pattern(*inner, cx)?),
                 silent,
             },
         },
     })
 }
 
-fn rewrite_fts_service(
-    pattern: GraphPattern,
+/// Graph-visibility verdicts for FTS hits, memoized by graph IRI.
+///
+/// Over-fetching surfaces many hits from the same graph and the `Predicate`
+/// scope's callback costs a policy read per call, so each graph is decided at
+/// most once per SERVICE clause.
+struct FtsGraphVisibility<'a> {
+    scope: GraphScope<'a>,
+    listed: Option<HashSet<&'a str>>,
+    memo: RefCell<HashMap<String, bool>>,
+}
+
+impl<'a> FtsGraphVisibility<'a> {
+    fn new(scope: GraphScope<'a>) -> Self {
+        let listed = match scope {
+            GraphScope::List(graphs) => Some(graphs.iter().map(GraphId::as_str).collect()),
+            _ => None,
+        };
+        Self {
+            scope,
+            listed,
+            memo: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn allows(&self, graph_iri: &str) -> bool {
+        match self.scope {
+            #[cfg(test)]
+            GraphScope::All => true,
+            GraphScope::List(_) => self
+                .listed
+                .as_ref()
+                .is_some_and(|listed| listed.contains(graph_iri)),
+            GraphScope::Predicate(visible) => {
+                if let Some(&allowed) = self.memo.borrow().get(graph_iri) {
+                    return allowed;
+                }
+                let allowed = visible(&GraphId::new(graph_iri));
+                self.memo.borrow_mut().insert(graph_iri.to_owned(), allowed);
+                allowed
+            }
+        }
+    }
+}
+
+/// Post-search filter applied to every hit tantivy returns.
+struct FtsHitFilter<'a> {
+    visibility: &'a FtsGraphVisibility<'a>,
+    /// Set when the SERVICE pinned its subject to a concrete IRI.
+    subject: Option<&'a str>,
+}
+
+impl FtsHitFilter<'_> {
+    fn keeps(&self, hit: &crate::search::SearchHit) -> bool {
+        self.visibility.allows(&hit.graph_id)
+            && self
+                .subject
+                .is_none_or(|subject| hit.subject_iri == subject)
+    }
+}
+
+/// One FTS SERVICE lookup: what to search for, how many rows the caller asked
+/// for, and which hits it is allowed to keep.
+struct FtsSearchRequest<'a> {
+    query: &'a str,
+    limit: usize,
+    /// `Some` restricts the index query to a single, already-visible graph.
+    graph: Option<&'a str>,
+    filter: FtsHitFilter<'a>,
+}
+
+/// Collects up to the requested number of authorized, deduplicated hits,
+/// widening its over-fetch until the page fills or the index runs out.
+fn search_visible_hits(
     search: &SearchIndex,
-    store: &GraphStore,
-    scope: GraphScope<'_>,
-) -> Result<GraphPattern> {
+    request: &FtsSearchRequest<'_>,
+) -> Result<Vec<crate::search::SearchHit>> {
+    let mut fetch = request
+        .limit
+        .saturating_mul(FTS_OVERFETCH_FACTOR)
+        .max(FTS_MIN_FETCH);
+    loop {
+        let raw = match request.graph {
+            Some(graph) => search.search_in_graph(graph, request.query, fetch)?,
+            None => search.search(request.query, fetch)?,
+        };
+        let raw_len = raw.len();
+
+        let mut seen = crate::SeenHits::default();
+        let mut kept = Vec::with_capacity(request.limit.min(raw_len));
+        for hit in raw {
+            if !seen.admits(&hit) || !request.filter.keeps(&hit) {
+                continue;
+            }
+            kept.push(hit);
+            if kept.len() == request.limit {
+                return Ok(kept);
+            }
+        }
+
+        // Short of `limit`. If the index returned fewer hits than we asked
+        // for it has no more matches, so this is the complete answer.
+        if raw_len < fetch {
+            return Ok(kept);
+        }
+        match fetch.checked_mul(FTS_OVERFETCH_FACTOR) {
+            Some(next) => fetch = next,
+            None => return Ok(kept),
+        }
+    }
+}
+
+/// Rewrites an FTS SERVICE clause into an inline `VALUES` block.
+///
+/// The index is read at its **last committed state**: FTS updates still
+/// sitting in the durable queue (drained by the search worker, G7) are not
+/// visible to this clause. Callers that need read-your-writes must flush the
+/// search worker first.
+fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
     let spec = parse_fts_service_spec(pattern)?;
     if spec.limit == 0 {
         return Ok(GraphPattern::Values {
@@ -418,36 +550,6 @@ fn rewrite_fts_service(
         });
     }
 
-    // Built only when a SERVICE clause exists; hit counts are bounded by
-    // `spec.limit`, so the predicate path checks each hit's graph directly.
-    let visible_set: Option<HashSet<&str>> = match scope {
-        GraphScope::List(graphs) => Some(graphs.iter().map(GraphId::as_str).collect()),
-        _ => None,
-    };
-    let graph_visible = |iri: &str| match scope {
-        GraphScope::All => true,
-        GraphScope::List(_) => visible_set
-            .as_ref()
-            .is_some_and(|visible| visible.contains(iri)),
-        GraphScope::Predicate(visible) => visible(&GraphId::new(iri)),
-    };
-
-    flush_queued_search_updates(search, store)?;
-    let hits = match &spec.graph {
-        Some(FtsGraphBinding::Fixed(graph)) => {
-            if !graph_visible(graph.as_str()) {
-                Vec::new()
-            } else {
-                search.search_in_graph(
-                    graph.as_str(),
-                    spec.query.as_deref().unwrap_or(""),
-                    spec.limit,
-                )?
-            }
-        }
-        _ => search.search(spec.query.as_deref().unwrap_or(""), spec.limit)?,
-    };
-
     let variables = requested_fts_variables(&spec);
     if variables.is_empty() {
         return Err(SparqlError::Unsupported(
@@ -455,20 +557,39 @@ fn rewrite_fts_service(
         ));
     }
 
-    let subject_filter = match &spec.subject {
-        Some(FtsSubjectPattern::NamedNode(node)) => Some(node.as_str()),
+    let visibility = FtsGraphVisibility::new(cx.scope);
+    let graph = match &spec.graph {
+        Some(FtsGraphBinding::Fixed(graph)) => {
+            if !visibility.allows(graph.as_str()) {
+                return Ok(GraphPattern::Values {
+                    variables,
+                    bindings: Vec::new(),
+                });
+            }
+            Some(graph.as_str())
+        }
         _ => None,
     };
 
-    let mut bindings = Vec::new();
-    for hit in hits {
-        if !graph_visible(hit.graph_id.as_str()) {
-            continue;
-        }
-        if subject_filter.is_some_and(|subject| hit.subject_iri != subject) {
-            continue;
-        }
-        bindings.push(fts_binding_row(&variables, &spec, &hit)?);
+    let hits = search_visible_hits(
+        cx.search,
+        &FtsSearchRequest {
+            query: spec.query.as_deref().unwrap_or(""),
+            limit: spec.limit,
+            graph,
+            filter: FtsHitFilter {
+                visibility: &visibility,
+                subject: match &spec.subject {
+                    Some(FtsSubjectPattern::NamedNode(node)) => Some(node.as_str()),
+                    _ => None,
+                },
+            },
+        },
+    )?;
+
+    let mut bindings = Vec::with_capacity(hits.len());
+    for hit in &hits {
+        bindings.push(fts_binding_row(&variables, &spec, hit)?);
     }
 
     Ok(GraphPattern::Values {
@@ -477,6 +598,8 @@ fn rewrite_fts_service(
     })
 }
 
+/// Read one FTS SERVICE block's arguments. `fts:limit` is clamped to
+/// [`crate::MAX_SEARCH_LIMIT`] (10_000), never rejected.
 fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     let GraphPattern::Bgp { patterns } = pattern else {
         return Err(SparqlError::Unsupported(
@@ -516,9 +639,16 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
                         "fts:limit must be bound to an integer literal".into(),
                     ));
                 };
-                spec.limit = literal.value().parse::<usize>().map_err(|_| {
-                    SparqlError::Unsupported("fts:limit must be a positive integer".into())
-                })?;
+                // Clamped, not rejected: a large limit is a legitimate "give
+                // me everything" and the other fts: arguments only error on
+                // input they cannot interpret at all.
+                spec.limit = literal
+                    .value()
+                    .parse::<usize>()
+                    .map_err(|_| {
+                        SparqlError::Unsupported("fts:limit must be a positive integer".into())
+                    })?
+                    .min(crate::MAX_SEARCH_LIMIT);
             }
             FTS_SCORE_IRI => {
                 let TermPattern::Variable(variable) = pattern.object else {
@@ -638,10 +768,6 @@ fn ground_named_node(iri: &str) -> GroundTerm {
     GroundTerm::NamedNode(NamedNode::new_unchecked(iri))
 }
 
-fn flush_queued_search_updates(_search: &SearchIndex, _store: &GraphStore) -> Result<()> {
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum StoreTerm {
     Existing(TermId),
@@ -696,7 +822,7 @@ impl<'a> QuadVisibility<'a> {
                 if let Some(&allowed) = memo.borrow().get(&graph) {
                     return Ok(allowed);
                 }
-                let term = self.store.decode_graph_term(graph)?;
+                let term = self.store.decode_term(graph)?;
                 // Non-IRI graph terms fail closed.
                 let allowed = if term.0.starts_with('<') && term.0.ends_with('>') {
                     let mut iri = term.0;
@@ -723,7 +849,10 @@ impl<'a> QuadVisibility<'a> {
         let diagnostics = self.store.graph_diagnostics_by_id(graph)?;
         let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
         for entity_id in diagnostics.orphaned_entities {
-            let term = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
+            // `from_subject_id`: diagnostics store a blank node as `_:b0`, and
+            // encoding that as the IRI `<_:b0>` makes `lookup_term` miss, which
+            // leaves the orphan visible to every query instead of erroring (G6).
+            let term = EncodedTerm::from_subject_id(&entity_id);
             if let Some(term_id) = self.store.lookup_term(&term)? {
                 orphaned.insert(term_id);
             }
@@ -778,76 +907,137 @@ type QuadResultIter<'a> = Box<
     dyn Iterator<Item = std::result::Result<crate::store::EncodedQuad, StoreDatasetError>> + 'a,
 >;
 
+/// A triple pattern resolved to term ids; `None` in a slot means "any".
+#[derive(Clone, Copy)]
+struct PatternIds {
+    subject: Option<TermId>,
+    predicate: Option<TermId>,
+    object: Option<TermId>,
+}
+
+/// Graphs a union scan will visit for one pattern.
+enum GraphCandidates {
+    /// A candidate list produced by an index probe.
+    Indexed(Vec<TermId>),
+    /// The query's visible-graph list, shared by `Rc` instead of deep-copied
+    /// on every pattern evaluation.
+    Visible(Rc<Vec<TermId>>),
+    /// Nothing narrows the pattern down; fall back to one cross-graph scan.
+    Unbounded,
+}
+
+/// Walks a shared visible-graph list by cloning the `Rc`, never the `Vec`.
+struct VisibleGraphIter {
+    graphs: Rc<Vec<TermId>>,
+    next: usize,
+}
+
+impl Iterator for VisibleGraphIter {
+    type Item = TermId;
+
+    fn next(&mut self) -> Option<TermId> {
+        let graph = *self.graphs.get(self.next)?;
+        self.next += 1;
+        Some(graph)
+    }
+}
+
+/// Which graphs can hold a match for `pattern`.
+///
+/// A bound object narrows the corpus through the object indexes; a small
+/// visible set narrows it through the caller's authorization. Both are valid
+/// starting points — every visited graph is still probed through the same
+/// index, so the quads produced are identical — so we walk whichever side is
+/// shorter instead of always enumerating every corpus graph holding `(p, o)`.
+/// Visibility semantics are untouched: `graph_is_visible` still runs per graph
+/// and `quad_is_visible` still runs per quad.
+fn candidate_graphs(visibility: &QuadVisibility<'_>, pattern: PatternIds) -> GraphCandidates {
+    let store = visibility.store;
+    let indexed = match (pattern.predicate, pattern.object) {
+        (Some(predicate), Some(object)) => Some(store.predicate_object_graphs(predicate, object)),
+        (None, Some(object)) => Some(store.object_graphs(object)),
+        (_, None) => None,
+    };
+
+    match (&visibility.filter, indexed) {
+        (GraphFilter::Set { ordered, .. }, Some(graphs)) if ordered.len() <= graphs.len() => {
+            GraphCandidates::Visible(ordered.clone())
+        }
+        (_, Some(graphs)) => GraphCandidates::Indexed(graphs),
+        (GraphFilter::Set { ordered, .. }, None) => GraphCandidates::Visible(ordered.clone()),
+        (GraphFilter::Predicate { .. }, None) => {
+            GraphCandidates::Indexed(store.populated_graph_ids())
+        }
+        (GraphFilter::All, None) => GraphCandidates::Unbounded,
+    }
+}
+
 /// Quads of all visible graphs matching the pattern, evaluated lazily so that
 /// short-circuiting consumers (ASK, LIMIT) stop after a few graphs instead of
 /// materializing the whole union. Streams graph-at-a-time wherever an index
 /// can enumerate candidate graphs, checking visibility per graph before any
 /// per-quad work so the cost tracks the graphs evaluation actually consumes.
 fn union_quads_for_pattern<'a>(
-    store: &'a GraphStore,
     visibility: &QuadVisibility<'a>,
-    subject: Option<TermId>,
-    predicate: Option<TermId>,
-    object: Option<TermId>,
+    pattern: PatternIds,
 ) -> QuadResultIter<'a> {
-    if subject.is_none() {
-        let candidate_graphs = match (&visibility.filter, object) {
-            // Bound object: only graphs containing a matching quad.
-            (_, Some(object_id)) => Some(match predicate {
-                Some(predicate_id) => store.predicate_object_graphs(predicate_id, object_id),
-                None => store.object_graphs(object_id),
-            }),
-            // Unbound object: every populated graph is a candidate.
-            (GraphFilter::Set { ordered, .. }, None) => Some(ordered.as_ref().clone()),
-            (GraphFilter::Predicate { .. }, None) => Some(store.populated_graph_ids()),
-            (GraphFilter::All, None) => None,
-        };
-        if let Some(graphs) = candidate_graphs {
-            let visibility = visibility.clone();
-            return Box::new(graphs.into_iter().flat_map(move |graph| {
-                let visible = match visibility.graph_is_visible(graph) {
-                    Ok(visible) => visible,
-                    Err(error) => return EitherIter::Right(std::iter::once(Err(error))),
-                };
-                if !visible {
-                    return EitherIter::Left(Vec::new().into_iter().map(Ok));
-                }
-                let quads = match (predicate, object) {
-                    (Some(predicate_id), Some(object_id)) => store
-                        .predicate_object_subjects_in_graph(graph, predicate_id, object_id)
-                        .into_iter()
-                        .map(|subject| crate::store::EncodedQuad {
-                            graph,
-                            subject,
-                            predicate: predicate_id,
-                            object: object_id,
-                        })
-                        .collect::<Vec<_>>(),
-                    (None, Some(object_id)) => store
-                        .object_entries_in_graph(graph, object_id)
-                        .into_iter()
-                        .map(|(subject, predicate)| crate::store::EncodedQuad {
-                            graph,
-                            subject,
-                            predicate,
-                            object: object_id,
-                        })
-                        .collect::<Vec<_>>(),
-                    (_, None) => {
-                        match store.quads_for_pattern(Some(graph), None, predicate, None) {
-                            Ok(quads) => quads,
-                            Err(error) => {
-                                return EitherIter::Right(std::iter::once(Err(error.into())));
-                            }
+    let store = visibility.store;
+    let graphs = match pattern.subject {
+        Some(_) => None,
+        None => match candidate_graphs(visibility, pattern) {
+            GraphCandidates::Indexed(graphs) => Some(EitherIter::Left(graphs.into_iter())),
+            GraphCandidates::Visible(graphs) => {
+                Some(EitherIter::Right(VisibleGraphIter { graphs, next: 0 }))
+            }
+            GraphCandidates::Unbounded => None,
+        },
+    };
+
+    if let Some(graphs) = graphs {
+        let visibility = visibility.clone();
+        return Box::new(graphs.flat_map(move |graph| {
+            let visible = match visibility.graph_is_visible(graph) {
+                Ok(visible) => visible,
+                Err(error) => return EitherIter::Right(std::iter::once(Err(error))),
+            };
+            if !visible {
+                return EitherIter::Left(Vec::new().into_iter().map(Ok));
+            }
+            let quads = match (pattern.predicate, pattern.object) {
+                (Some(predicate), Some(object)) => store
+                    .predicate_object_subjects_in_graph(graph, predicate, object)
+                    .into_iter()
+                    .map(|subject| crate::store::EncodedQuad {
+                        graph,
+                        subject,
+                        predicate,
+                        object,
+                    })
+                    .collect::<Vec<_>>(),
+                (None, Some(object)) => store
+                    .object_entries_in_graph(graph, object)
+                    .into_iter()
+                    .map(|(subject, predicate)| crate::store::EncodedQuad {
+                        graph,
+                        subject,
+                        predicate,
+                        object,
+                    })
+                    .collect::<Vec<_>>(),
+                (_, None) => {
+                    match store.quads_for_pattern(Some(graph), None, pattern.predicate, None) {
+                        Ok(quads) => quads,
+                        Err(error) => {
+                            return EitherIter::Right(std::iter::once(Err(error.into())));
                         }
                     }
-                };
-                EitherIter::Left(quads.into_iter().map(Ok))
-            }));
-        }
+                }
+            };
+            EitherIter::Left(quads.into_iter().map(Ok))
+        }));
     }
 
-    match store.quads_for_pattern(None, subject, predicate, object) {
+    match store.quads_for_pattern(None, pattern.subject, pattern.predicate, pattern.object) {
         Ok(quads) => Box::new(quads.into_iter().map(Ok)),
         Err(error) => Box::new(std::iter::once(Err(error.into()))),
     }
@@ -898,15 +1088,20 @@ impl<'a> StoreDataset<'a> {
         }
     }
 
-    fn decode_term(&self, id: TermId) -> std::result::Result<EncodedTerm, StoreDatasetError> {
-        self.store.decode_term(id).map_err(Into::into)
+    /// Decode through the store's global term cache: term ids are content
+    /// hashes of immutable bytes, so a decoded term never goes stale. Row
+    /// decoding is the hottest read in evaluation — one point read plus one
+    /// `String` allocation per variable reference per row without the cache.
+    fn decode_term(&self, id: TermId) -> std::result::Result<Arc<EncodedTerm>, StoreDatasetError> {
+        self.store.decode_term_arc(id).map_err(Into::into)
     }
 
     fn externalize_encoded_term(
         &self,
-        term: EncodedTerm,
+        term: &EncodedTerm,
     ) -> std::result::Result<Term, StoreDatasetError> {
-        term.to_term().ok_or(StoreDatasetError::InvalidTerm(term.0))
+        term.to_term()
+            .ok_or_else(|| StoreDatasetError::InvalidTerm(term.0.clone()))
     }
 
     fn externalize_store_term(
@@ -914,8 +1109,11 @@ impl<'a> StoreDataset<'a> {
         term: StoreTerm,
     ) -> std::result::Result<Term, StoreDatasetError> {
         match term {
-            StoreTerm::Existing(id) => self.externalize_encoded_term(self.decode_term(id)?),
-            StoreTerm::Missing(term) => self.externalize_encoded_term(term),
+            StoreTerm::Existing(id) => {
+                let decoded = self.decode_term(id)?;
+                self.externalize_encoded_term(&decoded)
+            }
+            StoreTerm::Missing(term) => self.externalize_encoded_term(&term),
         }
     }
 }
@@ -946,27 +1144,21 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             return Box::new(std::iter::empty());
         }
 
-        let subject = match subject {
+        let bound = |term: ResolvedPatternTerm| match term {
             ResolvedPatternTerm::Any => None,
             ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!(),
+            ResolvedPatternTerm::Missing => unreachable!("missing terms short-circuit above"),
         };
-        let predicate = match predicate {
-            ResolvedPatternTerm::Any => None,
-            ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!(),
-        };
-        let object = match object {
-            ResolvedPatternTerm::Any => None,
-            ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!(),
+        let pattern = PatternIds {
+            subject: bound(subject),
+            predicate: bound(predicate),
+            object: bound(object),
         };
 
         let visibility = self.visibility.clone();
         match graph_name {
             Some(None) => {
-                let quads =
-                    union_quads_for_pattern(self.store, &visibility, subject, predicate, object);
+                let quads = union_quads_for_pattern(&visibility, pattern);
                 let mut seen = HashSet::new();
                 Box::new(quads.filter_map(move |quad| {
                     let quad = match quad {
@@ -998,10 +1190,12 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
                     Ok(false) => return Box::new(std::iter::empty()),
                     Err(error) => return Box::new(std::iter::once(Err(error))),
                 }
-                match self
-                    .store
-                    .quads_for_pattern(Some(*graph), subject, predicate, object)
-                {
+                match self.store.quads_for_pattern(
+                    Some(*graph),
+                    pattern.subject,
+                    pattern.predicate,
+                    pattern.object,
+                ) {
                     Ok(quads) => Box::new(quads.into_iter().filter_map(move |quad| {
                         match visibility.quad_is_visible(&quad) {
                             Ok(true) => Some(Ok(InternalQuad {
@@ -1019,8 +1213,7 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             }
             Some(Some(StoreTerm::Missing(_))) => Box::new(std::iter::empty()),
             None => {
-                let quads =
-                    union_quads_for_pattern(self.store, &visibility, subject, predicate, object);
+                let quads = union_quads_for_pattern(&visibility, pattern);
                 Box::new(quads.filter_map(move |quad| {
                     let quad = match quad {
                         Ok(quad) => quad,
@@ -1060,6 +1253,24 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
         )
     }
 
+    /// Graph existence for `GRAPH <g> { ... }` (charter G9).
+    ///
+    /// A named graph exists iff its metadata record exists **and** the caller
+    /// may see it. spareval's default implementation instead probes for one
+    /// visible quad, which makes an empty graph — or one whose entities are
+    /// all orphan-hidden — report as non-existent, and which disagrees with
+    /// the explicit-dataset regime used for small visible sets.
+    fn contains_internal_graph_name(
+        &self,
+        graph_name: &Self::InternalTerm,
+    ) -> std::result::Result<bool, Self::Error> {
+        let StoreTerm::Existing(graph) = graph_name else {
+            // The IRI is not even interned, so no graph was ever created for it.
+            return Ok(false);
+        };
+        Ok(self.store.contains_graph_by_id(*graph)? && self.visibility.graph_is_visible(*graph)?)
+    }
+
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
         let encoded = EncodedTerm::from_term(&term);
         Ok(match self.store.lookup_term(&encoded)? {
@@ -1071,25 +1282,47 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
     fn externalize_term(&self, term: Self::InternalTerm) -> std::result::Result<Term, Self::Error> {
         self.externalize_store_term(term)
     }
+
+    /// Expression-term hooks: pinned to our cached decode/lookup path rather
+    /// than left to spareval's defaults, which are defined in terms of
+    /// `externalize_term`/`internalize_term` and would silently change shape
+    /// if the trait's defaults ever do.
+    ///
+    /// `internal_term_effective_boolean_value` is deliberately *not*
+    /// overridden: spareval defines it as
+    /// `externalize_expression_term(term)?.effective_boolean_value()`, and
+    /// `ExpressionTerm::effective_boolean_value` is crate-private. Any override
+    /// would have to restate spareval's EBV table by hand and could drift from
+    /// it — silently changing FILTER results. Inheriting the default keeps EBV
+    /// exact and still routes through the cached externalization below.
+    fn internalize_expression_term(
+        &self,
+        term: ExpressionTerm,
+    ) -> std::result::Result<Self::InternalTerm, Self::Error> {
+        self.internalize_term(term.into())
+    }
+
+    fn externalize_expression_term(
+        &self,
+        term: Self::InternalTerm,
+    ) -> std::result::Result<ExpressionTerm, Self::Error> {
+        Ok(self.externalize_store_term(term)?.into())
+    }
 }
 
 fn collect_query_results(results: spareval::QueryResults<'_>) -> Result<QueryResults> {
     match results {
         spareval::QueryResults::Solutions(solutions) => {
-            let variables: Vec<String> = solutions
-                .variables()
-                .iter()
-                .map(|variable| variable.as_str().to_string())
-                .collect();
-
+            // Each solution carries its own (variable, term) pairs and yields
+            // only the bound ones, so building the row from them is exactly
+            // the old "for every projected variable, look it up" loop without
+            // the per-cell linear scan and per-cell name clone.
             let mut rows = Vec::new();
             for solution in solutions {
                 let solution = solution.map_err(map_eval_error)?;
-                let mut row = HashMap::new();
-                for variable in &variables {
-                    if let Some(term) = solution.get(variable.as_str()) {
-                        row.insert(variable.clone(), EncodedTerm::from_term(term));
-                    }
+                let mut row = HashMap::with_capacity(solution.len());
+                for (variable, term) in solution.iter() {
+                    row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term));
                 }
                 rows.push(row);
             }
@@ -1219,6 +1452,9 @@ fn materialize_graph_target_removals(
 mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
+    #[cfg(feature = "search")]
+    use crate::search::QueueBound;
+    use crate::store::{EncodedQuad, FtsSubject, QuadAdd};
     use oxrdf::{Literal, Term};
 
     fn setup_engine() -> (
@@ -1262,17 +1498,29 @@ mod tests {
         store
             .insert_quad(
                 &mut batch,
-                graph_id,
-                subject_id,
-                predicate_id,
-                object_id,
-                &Dot {
-                    actor: ActorId::random(),
-                    counter: 1,
+                QuadAdd {
+                    quad: EncodedQuad {
+                        graph: graph_id,
+                        subject: subject_id,
+                        predicate: predicate_id,
+                        object: object_id,
+                    },
+                    dot: Dot {
+                        actor: ActorId::random(),
+                        counter: 1,
+                    },
                 },
             )
             .unwrap();
-        store.enqueue_fts(&mut batch, graph, subject_id).unwrap();
+        store
+            .enqueue_fts(
+                &mut batch,
+                FtsSubject {
+                    graph_id,
+                    subject: subject_id,
+                },
+            )
+            .unwrap();
         store.commit(batch).unwrap();
     }
 
@@ -2047,6 +2295,9 @@ mod tests {
         assert!(matches!(changes[1], MaterializedQuadChange::Insert { .. }));
     }
 
+    /// Needs a real tantivy index: the `search`-off stub returns no hits,
+    /// which would make the FTS SERVICE clause bind nothing at all.
+    #[cfg(feature = "search")]
     #[test]
     fn service_fts_binds_hits_and_scores() {
         let (_dir, store, search, engine) = setup_engine();
@@ -2069,7 +2320,17 @@ mod tests {
                 "Large-scale proteomics experiment",
             ))),
         );
-        while search.process_queued_updates(&store, 50_000).unwrap() != 0 {}
+        while search
+            .process_queued_updates(
+                &store,
+                QueueBound {
+                    chunk: 50_000,
+                    max_token: None,
+                },
+            )
+            .unwrap()
+            != 0
+        {}
 
         let query = r#"
             SELECT ?s ?g ?score ?name
@@ -2100,6 +2361,9 @@ mod tests {
         );
     }
 
+    /// Needs a real tantivy index: the `search`-off stub returns no hits,
+    /// which would make the FTS SERVICE clause bind nothing at all.
+    #[cfg(feature = "search")]
     #[test]
     fn service_fts_respects_visibility_predicate() {
         let (_dir, store, search, engine) = setup_engine();
@@ -2123,7 +2387,17 @@ mod tests {
                 "Proteomics Archive",
             ))),
         );
-        while search.process_queued_updates(&store, 50_000).unwrap() != 0 {}
+        while search
+            .process_queued_updates(
+                &store,
+                QueueBound {
+                    chunk: 50_000,
+                    max_token: None,
+                },
+            )
+            .unwrap()
+            != 0
+        {}
 
         let query = r#"
             SELECT ?s ?g

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::replication::ReplicationEngine;
+use crate::store::{EncodedQuad, GraphSubjectPredicate, PageCursor, PageRequest, TermId};
 use oxjsonld::{JsonLdParser, JsonLdRemoteDocument};
 use oxrdf::{NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use rocraters::ro_crate::constraints::{DataType, EntityValue, Id, License};
@@ -118,6 +119,158 @@ pub fn validate_rocrate_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateE
     canonicalize_value(&value)
 }
 
+/// Per-operation view of one crate: the graph, its interned term id, and the
+/// orphaned entities hidden from every read (G6).
+///
+/// Built once per public operation and threaded through every read beneath it.
+/// The orphan set is snapshotted at operation start, which strengthens the old
+/// behaviour rather than weakening it: every read within one operation now
+/// agrees on the same visible set instead of straddling a concurrent commit.
+struct CrateCtx {
+    graph: GraphId,
+    /// `None` when the graph term was never interned, i.e. the graph holds no
+    /// quads. Every read below then yields nothing, as it did before.
+    graph_tid: Option<TermId>,
+    orphaned: HashSet<EncodedTerm>,
+}
+
+impl CrateCtx {
+    fn root_id(&self) -> &str {
+        root_id(&self.graph)
+    }
+
+    fn root_term(&self) -> EncodedTerm {
+        root_term(&self.graph)
+    }
+
+    /// Is this term hidden from readers because it is an orphaned entity?
+    fn hides(&self, term: &EncodedTerm) -> bool {
+        self.orphaned.contains(term)
+    }
+
+    /// Drop `(predicate, object)` pairs whose object is orphaned — the object
+    /// side of orphan hiding, preserving input order.
+    fn retain_visible(
+        &self,
+        mut triples: Vec<(EncodedTerm, EncodedTerm)>,
+    ) -> Vec<(EncodedTerm, EncodedTerm)> {
+        triples.retain(|(_, object)| !self.hides(object));
+        triples
+    }
+}
+
+/// Which stored triples a replacement diffs against: the visible ones, plus
+/// everything a subject the target rewrites holds, orphan-hidden triples too.
+///
+/// An orphan the target never mentions stays out, so omitting one cannot delete
+/// it (G6), while rewriting one replaces it instead of merging into it.
+struct ReplacementBase<'a> {
+    cx: &'a CrateCtx,
+    rewritten: HashSet<&'a EncodedTerm>,
+}
+
+impl<'a> ReplacementBase<'a> {
+    fn new(cx: &'a CrateCtx, target: &'a BTreeSet<TripleKey>) -> Self {
+        Self {
+            cx,
+            rewritten: target.iter().map(|(subject, _, _)| subject).collect(),
+        }
+    }
+
+    fn covers(&self, (subject, _, object): &TripleKey) -> bool {
+        self.rewritten.contains(subject) || !(self.cx.hides(subject) || self.cx.hides(object))
+    }
+}
+
+/// The three terms of a triple probed for liveness inside a [`CrateCtx`]'s graph.
+struct TripleProbe<'a> {
+    subject: &'a EncodedTerm,
+    predicate: &'a EncodedTerm,
+    object: &'a EncodedTerm,
+}
+
+/// A `hasPart` edge probed for existence.
+struct HasPartLink<'a> {
+    parent_id: &'a str,
+    child_id: &'a str,
+}
+
+/// The triples one entity should carry after a write: its type, its name, and
+/// any caller-supplied extras. `entity_id` is already normalized.
+pub(crate) struct EntitySpec<'a> {
+    pub entity_id: &'a str,
+    pub entity_type: &'a str,
+    pub name: &'a str,
+    pub additional_triples: &'a [(NamedNode, Term)],
+}
+
+/// One entity to write together with the parent it hangs under.
+struct EntityUpsert<'a> {
+    parent_id: &'a str,
+    entity: EntitySpec<'a>,
+}
+
+/// An incremental patch to one subject: the triples it should carry afterwards
+/// plus any predicates to clear even when the patch supplies no value for them.
+struct SubjectPatch<'a> {
+    subject_id: &'a str,
+    desired: Vec<(EncodedTerm, EncodedTerm)>,
+    replaced_predicates: &'a [NamedNode],
+}
+
+/// A single property mutation on one entity.
+///
+/// `old_value: Some(v)` replaces only the triple matching `v`; `None` removes
+/// **all** existing values for the predicate first (replace-all semantics).
+pub(crate) struct PropertyUpdate<'a> {
+    pub entity_id: &'a str,
+    pub predicate: &'a str,
+    pub old_value: Option<&'a str>,
+    pub new_value: &'a str,
+}
+
+/// What an export renders: the page of root-linked data entities to inline,
+/// and whether to pretty-print the result.
+struct ExportRender<'a> {
+    page_entities: &'a [EncodedTerm],
+    pretty: bool,
+}
+
+/// Inputs the view builder needs beyond the crate context.
+struct ExportView<'a> {
+    page_entities: &'a [EncodedTerm],
+    ctx: &'a ContextTermMap,
+}
+
+/// Everything needed to render the root data entity of an export.
+struct RootExportView<'a> {
+    graph_id: &'a GraphId,
+    triples: Vec<(EncodedTerm, EncodedTerm)>,
+    /// The ids the root must declare as `hasPart`: every data entity this
+    /// export emits. RO-Crate 1.2 requires each of them to be linked from the
+    /// root, so an export that emits one without a link is not a valid crate.
+    has_part: Vec<String>,
+    ctx: &'a ContextTermMap,
+}
+
+/// The non-page entities a partial view emits.
+///
+/// Split because the two halves are linked differently: contextual entities
+/// need no `hasPart`, while profile artifacts are `File`/`MediaObject` data
+/// entities and so MUST hang off the root's `hasPart`.
+#[derive(Default)]
+struct PartialViewEntities {
+    contextual: BTreeSet<String>,
+    artifacts: BTreeSet<String>,
+}
+
+/// Everything needed to render the metadata descriptor of an export.
+struct MetadataExportView<'a> {
+    graph_id: &'a GraphId,
+    triples: Vec<(EncodedTerm, EncodedTerm)>,
+    ctx: &'a ContextTermMap,
+}
+
 /// Description of one new entity to append during batch ingest.
 #[derive(Debug, Clone)]
 pub struct NewDataEntity {
@@ -136,17 +289,17 @@ pub struct AppendDataEntitiesReport {
 }
 
 /// RO-Crate lifecycle management built on the replication engine.
-pub struct RoCrateManager {
+pub(crate) struct RoCrateManager {
     engine: Arc<ReplicationEngine>,
 }
 
 impl RoCrateManager {
-    pub fn new(engine: Arc<ReplicationEngine>) -> Self {
+    pub(crate) fn new(engine: Arc<ReplicationEngine>) -> Self {
         Self { engine }
     }
 
     /// Create a new RO-Crate with its base entities.
-    pub fn create_crate(
+    pub(crate) fn create_crate(
         &self,
         graph_id: GraphId,
         name: &str,
@@ -154,8 +307,9 @@ impl RoCrateManager {
         date_published: &str,
         license: Option<&str>,
     ) -> Result<Batch, RoCrateError> {
-        let license_value = license.map(encoded_license_value).transpose()?;
-        if self.graph_is_empty(&graph_id)? {
+        let cx = self.crate_ctx(&graph_id)?;
+        if self.graph_is_empty(&cx)? {
+            let license_value = license.map(encoded_license_value).transpose()?;
             let changes = create_crate_scaffold_changes_with_license(
                 &graph_id,
                 name,
@@ -175,7 +329,7 @@ impl RoCrateManager {
                     date_published,
                     license_from_str(license)?,
                 );
-                self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+                self.plan_rocrate_replacement(&cx, &mut rocrate)?
             }
             None => {
                 let target =
@@ -187,7 +341,7 @@ impl RoCrateManager {
                         None,
                     ));
                 validate_complete_import_triples(&graph_id, &target, None)?;
-                diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?
+                diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
             }
         };
         let batch = self.engine.local_apply_changes(&graph_id, changes)?;
@@ -198,7 +352,7 @@ impl RoCrateManager {
     /// Create-crate path for scaffold requests already validated at their
     /// origin. Skips post-state rule validation; scaffold output is
     /// structurally valid by construction.
-    pub fn create_crate_prevalidated(
+    pub(crate) fn create_crate_prevalidated(
         &self,
         graph_id: GraphId,
         name: &str,
@@ -206,7 +360,8 @@ impl RoCrateManager {
         date_published: &str,
         license: Option<&str>,
     ) -> Result<Batch, RoCrateError> {
-        let is_replacement = !self.graph_is_empty(&graph_id)?;
+        let cx = self.crate_ctx(&graph_id)?;
+        let is_replacement = !self.graph_is_empty(&cx)?;
         let changes = if is_replacement {
             match license {
                 Some(license) => {
@@ -217,7 +372,7 @@ impl RoCrateManager {
                         date_published,
                         license_from_str(license)?,
                     );
-                    self.plan_rocrate_replacement(&graph_id, &mut rocrate)?
+                    self.plan_rocrate_replacement(&cx, &mut rocrate)?
                 }
                 None => {
                     let target =
@@ -228,7 +383,7 @@ impl RoCrateManager {
                             date_published,
                             None,
                         ));
-                    diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?
+                    diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
                 }
             }
         } else {
@@ -243,9 +398,7 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         if is_replacement {
             // Keep checked and prevalidated replacement paths in lockstep.
             self.reset_context_after_replacement(&graph_id)?;
@@ -254,7 +407,7 @@ impl RoCrateManager {
     }
 
     /// Validate and materialize the changes for creating a crate without applying them.
-    pub fn validate_create_crate(
+    pub(crate) fn validate_create_crate(
         &self,
         graph_id: &GraphId,
         name: &str,
@@ -262,8 +415,8 @@ impl RoCrateManager {
         date_published: &str,
         license: Option<&str>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let current = self.current_triples(graph_id)?;
-        if current.is_empty() {
+        let cx = self.crate_ctx(graph_id)?;
+        if self.graph_is_empty(&cx)? {
             let changes = create_crate_scaffold_changes_with_license(
                 graph_id,
                 name,
@@ -297,11 +450,11 @@ impl RoCrateManager {
             )),
         };
         validate_complete_import_triples(graph_id, &target, None)?;
-        diff_triples(graph_id, &current, &target)
+        diff_triples(graph_id, &self.replacement_base(&cx, &target)?, &target)
     }
 
     /// Add a data entity with automatic hasPart linkage from root.
-    pub fn add_data_entity(
+    pub(crate) fn add_data_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -310,18 +463,23 @@ impl RoCrateManager {
         additional_triples: Vec<(NamedNode, oxrdf::Term)>,
     ) -> Result<Batch, RoCrateError> {
         let entity_id = normalize_entity_id(entity_id);
-        self.require_rocrate_initialized(graph_id)?;
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
         self.upsert_data_entity_incremental(
-            graph_id,
-            root_id(graph_id),
-            &entity_id,
-            entity_type,
-            name,
-            additional_triples,
+            &cx,
+            EntityUpsert {
+                parent_id: cx.root_id(),
+                entity: EntitySpec {
+                    entity_id: &entity_id,
+                    entity_type,
+                    name,
+                    additional_triples: &additional_triples,
+                },
+            },
         )
     }
 
-    pub fn patch_data_entity(
+    pub(crate) fn patch_data_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -331,29 +489,43 @@ impl RoCrateManager {
         replaced_predicates: &[NamedNode],
     ) -> Result<Batch, RoCrateError> {
         let entity_id = normalize_entity_id(entity_id);
-        self.require_rocrate_initialized(graph_id)?;
-        let parent_id = root_id(graph_id);
-        if self.subject_triples(graph_id, parent_id)?.is_empty() {
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
+        let parent_id = cx.root_id();
+        if !self.visible_subject_exists(&cx, parent_id)? {
             return Err(RoCrateError::EntityNotFound(parent_id.to_string()));
         }
         let mut changes = self.patch_subject_changes(
-            graph_id,
-            &entity_id,
-            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
-            replaced_predicates,
+            &cx,
+            SubjectPatch {
+                subject_id: &entity_id,
+                desired: entity_subject_triples(&EntitySpec {
+                    entity_id: &entity_id,
+                    entity_type,
+                    name,
+                    additional_triples: &additional_triples,
+                })?,
+                replaced_predicates,
+            },
         )?;
-        if !self.has_part_link(graph_id, parent_id, &entity_id)? {
+        if !self.has_part_link(
+            &cx,
+            HasPartLink {
+                parent_id,
+                child_id: &entity_id,
+            },
+        )? {
             changes.push(insert_change(
                 graph_id,
                 parent_id,
                 &vocab::schema_has_part(),
-                encoded_identifier(&entity_id),
+                encoded_subject(&entity_id),
             ));
         }
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
-    pub fn append_new_root_data_entities(
+    pub(crate) fn append_new_root_data_entities(
         &self,
         graph_id: &GraphId,
         entities: Vec<NewDataEntity>,
@@ -361,16 +533,17 @@ impl RoCrateManager {
         self.append_new_data_entities_under(graph_id, root_id(graph_id), entities)
     }
 
-    pub fn append_new_data_entities_under(
+    pub(crate) fn append_new_data_entities_under(
         &self,
         graph_id: &GraphId,
         parent_id: &str,
         entities: Vec<NewDataEntity>,
     ) -> Result<AppendDataEntitiesReport, RoCrateError> {
-        self.require_rocrate_initialized(graph_id)?;
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
 
         let parent_id = normalize_entity_id(parent_id);
-        if !self.visible_subject_exists(graph_id, &parent_id)? {
+        if !self.visible_subject_exists(&cx, &parent_id)? {
             return Err(RoCrateError::EntityNotFound(parent_id));
         }
 
@@ -388,18 +561,18 @@ impl RoCrateManager {
                 graph_id,
                 &parent_id,
                 &vocab::schema_has_part(),
-                encoded_identifier(&entity_id),
+                encoded_subject(&entity_id),
             ));
 
-            for (predicate, object) in entity_subject_triples(
-                &entity_id,
-                &entity.entity_type,
-                &entity.name,
-                &entity.additional_triples,
-            )? {
+            for (predicate, object) in entity_subject_triples(&EntitySpec {
+                entity_id: &entity_id,
+                entity_type: &entity.entity_type,
+                name: &entity.name,
+                additional_triples: &entity.additional_triples,
+            })? {
                 changes.push(MaterializedQuadChange::Insert {
                     graph: graph_id.clone(),
-                    subject: EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)),
+                    subject: encoded_subject(&entity_id),
                     predicate,
                     object,
                 });
@@ -411,6 +584,10 @@ impl RoCrateManager {
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(graph_id, changes)?;
+        // `additional_triples` may carry a `hasPart` edge that adopts an
+        // existing orphan. That entity is never written, so only the orphan
+        // record can return it to the search index (G7).
+        self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(AppendDataEntitiesReport {
             batch,
             entity_count,
@@ -419,7 +596,7 @@ impl RoCrateManager {
     }
 
     /// Add a contextual entity (no hasPart linkage needed).
-    pub fn add_contextual_entity(
+    pub(crate) fn add_contextual_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -427,19 +604,22 @@ impl RoCrateManager {
         name: &str,
         additional_triples: Vec<(NamedNode, oxrdf::Term)>,
     ) -> Result<Batch, RoCrateError> {
-        self.require_rocrate_initialized(graph_id)?;
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
         let entity_id = normalize_entity_id(entity_id);
-        let mut changes = self.replace_subject_changes(
-            graph_id,
-            &entity_id,
-            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
+        let changes = self.replace_subject_changes(
+            &cx,
+            &EntitySpec {
+                entity_id: &entity_id,
+                entity_type,
+                name,
+                additional_triples: &additional_triples,
+            },
         )?;
-        Ok(self
-            .engine
-            .local_apply_changes(graph_id, std::mem::take(&mut changes))?)
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
-    pub fn patch_contextual_entity(
+    pub(crate) fn patch_contextual_entity(
         &self,
         graph_id: &GraphId,
         entity_id: &str,
@@ -448,41 +628,84 @@ impl RoCrateManager {
         additional_triples: Vec<(NamedNode, oxrdf::Term)>,
         replaced_predicates: &[NamedNode],
     ) -> Result<Batch, RoCrateError> {
-        self.require_rocrate_initialized(graph_id)?;
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
         let entity_id = normalize_entity_id(entity_id);
         let changes = self.patch_subject_changes(
-            graph_id,
-            &entity_id,
-            entity_subject_triples(&entity_id, entity_type, name, &additional_triples)?,
-            replaced_predicates,
+            &cx,
+            SubjectPatch {
+                subject_id: &entity_id,
+                desired: entity_subject_triples(&EntitySpec {
+                    entity_id: &entity_id,
+                    entity_type,
+                    name,
+                    additional_triples: &additional_triples,
+                })?,
+                replaced_predicates,
+            },
         )?;
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
     /// Export a graph to RO-Crate JSON-LD.
-    pub fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
-        let page = self.visible_root_linked_data_entities(graph_id)?;
-        self.render_export_view(graph_id, &page, true)
+    pub(crate) fn export_jsonld(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
+        let cx = self.crate_ctx(graph_id)?;
+        // The full export is the same visible sequence as an unbounded page, so
+        // both go through one implementation and cannot drift apart.
+        let (_, page) = self.root_linked_data_entity_page(
+            &cx,
+            PageRequest {
+                cursor: PageCursor::Offset(0),
+                limit: usize::MAX,
+            },
+        )?;
+        self.render_export_view(
+            &cx,
+            ExportRender {
+                page_entities: &page,
+                pretty: true,
+            },
+        )
     }
 
     /// Export a lightweight partial RO-Crate view without data entities.
-    pub fn export_jsonld_summary(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
-        self.render_export_view(graph_id, &[], false)
+    pub(crate) fn export_jsonld_summary(&self, graph_id: &GraphId) -> Result<String, RoCrateError> {
+        let cx = self.crate_ctx(graph_id)?;
+        self.render_export_view(
+            &cx,
+            ExportRender {
+                page_entities: &[],
+                pretty: false,
+            },
+        )
     }
 
     /// Export an offset-based partial RO-Crate page of root-linked data entities.
-    pub fn export_jsonld_page(
+    pub(crate) fn export_jsonld_page(
         &self,
         graph_id: &GraphId,
         offset: usize,
         limit: usize,
     ) -> Result<RoCratePage, RoCrateError> {
-        let (total, page) = self.root_linked_data_entity_page(graph_id, offset, limit)?;
-        let jsonld = self.render_export_view(graph_id, &page, false)?;
+        let cx = self.crate_ctx(graph_id)?;
+        let (total, page) = self.root_linked_data_entity_page(
+            &cx,
+            PageRequest {
+                cursor: PageCursor::Offset(offset),
+                limit,
+            },
+        )?;
+        let jsonld = self.render_export_view(
+            &cx,
+            ExportRender {
+                page_entities: &page,
+                pretty: false,
+            },
+        )?;
         let returned = page.len();
         let has_more = offset + returned < total;
         let next_cursor = has_more
-            .then(|| page.last().and_then(encoded_named_node_value))
+            .then(|| page.last().and_then(encoded_reference_value))
             .flatten();
 
         Ok(RoCratePage {
@@ -495,27 +718,44 @@ impl RoCrateManager {
     }
 
     /// Export a cursor-based partial RO-Crate page of root-linked data entities.
-    pub fn export_jsonld_page_after(
+    pub(crate) fn export_jsonld_page_after(
         &self,
         graph_id: &GraphId,
         after_entity_id: Option<&str>,
         limit: usize,
     ) -> Result<RoCratePage, RoCrateError> {
-        let (total, mut page) = self.root_linked_data_entity_page_after(
-            graph_id,
-            after_entity_id,
-            limit.saturating_add(1),
+        let cx = self.crate_ctx(graph_id)?;
+        // Acceptor half of the cursor round trip: decode exactly what
+        // [`encoded_reference_value`] emits. A page whose last entity is a blank node
+        // hands back `_:b0`, and re-encoding that as the IRI `<_:b0>` matches no
+        // interned term — `objects_page` then silently restarts from offset 0 and
+        // the caller re-reads page one forever.
+        let after = after_entity_id
+            .map(normalize_entity_id)
+            .map(|id| encoded_subject(&id));
+        // One extra entry beyond `limit` is the has-more probe.
+        let (total, mut page) = self.root_linked_data_entity_page(
+            &cx,
+            PageRequest {
+                cursor: PageCursor::After(after.as_ref()),
+                limit: limit.saturating_add(1),
+            },
         )?;
-        page.truncate(limit.saturating_add(1));
         let has_more = page.len() > limit;
         if has_more {
             page.truncate(limit);
         }
         let returned = page.len();
         let next_cursor = has_more
-            .then(|| page.last().and_then(encoded_named_node_value))
+            .then(|| page.last().and_then(encoded_reference_value))
             .flatten();
-        let jsonld = self.render_export_view(graph_id, &page, false)?;
+        let jsonld = self.render_export_view(
+            &cx,
+            ExportRender {
+                page_entities: &page,
+                pretty: false,
+            },
+        )?;
 
         Ok(RoCratePage {
             jsonld,
@@ -531,22 +771,7 @@ impl RoCrateManager {
     /// New or empty graphs use the trusted bootstrap fast path. Existing graphs
     /// use a validated full-document replacement path that diffs against the
     /// current graph state.
-    pub fn import_jsonld(&self, graph_id: GraphId, jsonld: &str) -> Result<Batch, RoCrateError> {
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        let context = extract_raw_context(&value);
-        let license = extract_raw_license(&value);
-        let batch = if self.graph_is_missing_or_empty(&graph_id)? {
-            self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?
-        } else {
-            self.replace_jsonld_in_existing_graph(graph_id.clone(), value)?
-        };
-        self.store_import_context(&graph_id, context, license)?;
-        Ok(batch)
-    }
-
-    /// Strict import path that validates complete RO-Crate semantics even for
-    /// new-graph bootstrap imports.
-    pub fn import_jsonld_checked(
+    pub(crate) fn import_jsonld(
         &self,
         graph_id: GraphId,
         jsonld: &str,
@@ -554,13 +779,32 @@ impl RoCrateManager {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
         let license = extract_raw_license(&value);
-        let changes = self.plan_import_value_checked(&graph_id, value)?;
+        let cx = self.crate_ctx(&graph_id)?;
+        let batch = if self.graph_is_missing_or_empty(&graph_id)? {
+            self.import_jsonld_into_empty_graph_trusted(&graph_id, value)?
+        } else {
+            self.replace_jsonld_in_existing_graph(&cx, value)?
+        };
+        self.store_import_context(&graph_id, context, license)?;
+        Ok(batch)
+    }
+
+    /// Strict import path that validates complete RO-Crate semantics even for
+    /// new-graph bootstrap imports.
+    pub(crate) fn import_jsonld_checked(
+        &self,
+        graph_id: GraphId,
+        jsonld: &str,
+    ) -> Result<Batch, RoCrateError> {
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        let context = extract_raw_context(&value);
+        let license = extract_raw_license(&value);
+        let cx = self.crate_ctx(&graph_id)?;
+        let changes = self.plan_import_value_checked(&cx, value)?;
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
@@ -570,7 +814,7 @@ impl RoCrateManager {
     /// Skips complete RO-Crate semantic validation but keeps replace/diff
     /// semantics, CRDT authoring, and structural JSON-LD error handling. Only
     /// callers replaying origin-validated documents may use this.
-    pub fn import_jsonld_prevalidated(
+    pub(crate) fn import_jsonld_prevalidated(
         &self,
         graph_id: GraphId,
         jsonld: &str,
@@ -580,20 +824,19 @@ impl RoCrateManager {
         let license = extract_raw_license(&value);
         validate_jsonld_import(&value)?;
         let target = jsonld_triples(&graph_id, &value)?;
+        let cx = self.crate_ctx(&graph_id)?;
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
             insert_changes(&graph_id, target)
         } else {
-            match self.append_like_replace_changes(&graph_id, &target)? {
+            match self.append_like_changes(&cx, &target)? {
                 Some(changes) => changes,
-                None => diff_triples(&graph_id, &self.current_triples(&graph_id)?, &target)?,
+                None => diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?,
             }
         };
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
@@ -602,7 +845,7 @@ impl RoCrateManager {
     ///
     /// This skips semantic RO-Crate validation and current-state diffing, and
     /// is intended for callers that already trust the input document.
-    pub fn bootstrap_jsonld_trusted(
+    pub(crate) fn bootstrap_jsonld_trusted(
         &self,
         graph_id: GraphId,
         jsonld: &str,
@@ -617,58 +860,56 @@ impl RoCrateManager {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
         let license = extract_raw_license(&value);
-        let batch = self.import_jsonld_into_empty_graph_trusted(graph_id.clone(), value)?;
+        let batch = self.import_jsonld_into_empty_graph_trusted(&graph_id, value)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
     /// Compute the canonical change set for replacing a graph with a JSON-LD RO-Crate.
-    pub fn plan_import_jsonld(
+    pub(crate) fn plan_import_jsonld(
         &self,
         graph_id: &GraphId,
         jsonld: &str,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        self.plan_import_value(graph_id, value)
+        self.plan_import_value(&self.crate_ctx(graph_id)?, value)
     }
 
     /// Compute and validate the strict import change set without applying it.
-    pub fn plan_import_jsonld_checked(
+    pub(crate) fn plan_import_jsonld_checked(
         &self,
         graph_id: &GraphId,
         jsonld: &str,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        self.plan_import_value_checked(graph_id, value)
+        self.plan_import_value_checked(&self.crate_ctx(graph_id)?, value)
     }
 
-    /// Update a property on an entity.
-    ///
-    /// When `old_value` is `Some(v)`, only the triple matching `v` is replaced.
-    /// When `old_value` is `None`, **all** existing values for the given predicate
-    /// are removed before inserting `new_value` (replace-all semantics).
-    pub fn update_property(
+    /// Apply one property mutation to an entity. See [`PropertyUpdate`] for the
+    /// `old_value` semantics.
+    pub(crate) fn update_property(
         &self,
         graph_id: &GraphId,
-        entity_id: &str,
-        predicate: &str,
-        old_value: Option<&str>,
-        new_value: &str,
+        update: PropertyUpdate<'_>,
     ) -> Result<Batch, RoCrateError> {
-        self.require_rocrate_initialized(graph_id)?;
-        let entity_id = normalize_entity_id(entity_id);
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id));
-        let current = self.subject_triples(graph_id, &entity_id)?;
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
+        let entity_id = normalize_entity_id(update.entity_id);
+        // The same encoding `subject_triples` reads with. Wrapping a `_:b0` id as
+        // the IRI `<_:b0>` made the read below succeed and the write below land on
+        // a term no reader ever looks at.
+        let subject = encoded_subject(&entity_id);
+        let current = self.subject_triples(&cx, &entity_id)?;
         if current.is_empty() {
             return Err(RoCrateError::EntityNotFound(entity_id));
         }
 
-        let property = normalize_property(predicate);
+        let property = normalize_property(update.predicate);
         let predicate_node = property_named_node(&property)?;
         let predicate_term = EncodedTerm::from_named_node(&predicate_node);
         let mut changes = Vec::new();
 
-        match old_value {
+        match update.old_value {
             Some(old_value) => {
                 let old_object = property_value_encoded(&property, old_value)?;
                 if current
@@ -701,76 +942,148 @@ impl RoCrateManager {
             graph: graph_id.clone(),
             subject,
             predicate: predicate_term,
-            object: property_value_encoded(&property, new_value)?,
+            object: property_value_encoded(&property, update.new_value)?,
         });
 
         Ok(self.engine.local_apply_changes(graph_id, changes)?)
     }
 
-    fn graph_is_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
-        Ok(self.current_triples(graph_id)?.is_empty())
+    /// Build the per-operation context: the graph's interned term id plus a
+    /// snapshot of its orphan set. See [`CrateCtx`] for the consistency note.
+    fn crate_ctx(&self, graph: &GraphId) -> Result<CrateCtx, RoCrateError> {
+        let store = self.engine.store();
+        let graph_tid = store.lookup_term(&root_term(graph))?;
+        let diagnostics = match graph_tid {
+            Some(graph_tid) => store.graph_diagnostics_by_id(graph_tid)?,
+            None => crate::core::GraphDiagnostics::default(),
+        };
+        Ok(CrateCtx {
+            graph: graph.clone(),
+            graph_tid,
+            // `encoded_subject`, not `encoded_identifier`: diagnostics store a
+            // blank node as `_:b0`, and re-encoding that as the IRI `<_:b0>`
+            // would leave an orphaned blank node visible to every reader (G6).
+            orphaned: diagnostics
+                .orphaned_entities
+                .iter()
+                .map(|entity_id| encoded_subject(entity_id))
+                .collect(),
+        })
     }
 
-    fn require_rocrate_initialized(&self, graph_id: &GraphId) -> Result<(), RoCrateError> {
-        let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
-        let dataset = EncodedTerm::from_named_node(&vocab::schema_dataset());
-        let current = self.subject_triples(graph_id, root_id(graph_id))?;
-        if current
-            .iter()
-            .any(|(predicate, object)| predicate == &rdf_type && object == &dataset)
-        {
+    fn graph_is_empty(&self, cx: &CrateCtx) -> Result<bool, RoCrateError> {
+        Ok(self.current_triples(cx)?.is_empty())
+    }
+
+    fn require_rocrate_initialized(&self, cx: &CrateCtx) -> Result<(), RoCrateError> {
+        if self.root_is_dataset(cx)? {
             Ok(())
         } else {
             Err(RoCrateError::InvalidGraph(format!(
                 "graph `{}` is not initialized as an RO-Crate",
-                graph_id.as_str()
+                cx.graph.as_str()
             )))
         }
     }
 
-    fn upsert_data_entity_incremental(
-        &self,
-        graph_id: &GraphId,
-        parent_id: &str,
-        entity_id: &str,
-        entity_type: &str,
-        name: &str,
-        additional_triples: Vec<(NamedNode, oxrdf::Term)>,
-    ) -> Result<Batch, RoCrateError> {
-        if self.subject_triples(graph_id, parent_id)?.is_empty() {
-            return Err(RoCrateError::EntityNotFound(parent_id.to_string()));
+    /// Is `<root> rdf:type schema:Dataset` live and visible?
+    ///
+    /// Three term lookups plus one O(1) index probe. The previous shape answered
+    /// this by decoding the root's entire `hasPart` fan-out, which made bulk
+    /// ingest quadratic: a fixed 10-entity append cost 415µs at 200 existing
+    /// entities and 13.9ms at 10,000 (W2).
+    fn root_is_dataset(&self, cx: &CrateCtx) -> Result<bool, RoCrateError> {
+        let root = cx.root_term();
+        let dataset = EncodedTerm::from_named_node(&vocab::schema_dataset());
+        // Orphan hiding, preserved exactly: `subject_triples` yields nothing for
+        // an orphaned subject and drops pairs whose object is orphaned, so an
+        // orphaned root (or, pathologically, an orphaned `schema:Dataset`) must
+        // keep failing this check as it did before (G6).
+        if cx.hides(&root) || cx.hides(&dataset) {
+            return Ok(false);
         }
-        let mut changes = self.replace_subject_changes(
-            graph_id,
-            entity_id,
-            entity_subject_triples(entity_id, entity_type, name, &additional_triples)?,
-        )?;
-        if !self.has_part_link(graph_id, parent_id, entity_id)? {
-            changes.push(insert_change(
-                graph_id,
-                parent_id,
-                &vocab::schema_has_part(),
-                encoded_identifier(entity_id),
-            ));
-        }
-        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+        let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+        self.triple_is_live(
+            cx,
+            TripleProbe {
+                subject: &root,
+                predicate: &rdf_type,
+                object: &dataset,
+            },
+        )
     }
 
+    /// O(1) probe for one live triple in the context's graph. Committed state
+    /// only, like every other read here.
+    fn triple_is_live(&self, cx: &CrateCtx, probe: TripleProbe<'_>) -> Result<bool, RoCrateError> {
+        let Some(graph) = cx.graph_tid else {
+            return Ok(false);
+        };
+        let store = self.engine.store();
+        let (Some(subject), Some(predicate), Some(object)) = (
+            store.lookup_term(probe.subject)?,
+            store.lookup_term(probe.predicate)?,
+            store.lookup_term(probe.object)?,
+        ) else {
+            return Ok(false);
+        };
+        Ok(store.contains_quad(EncodedQuad {
+            graph,
+            subject,
+            predicate,
+            object,
+        }))
+    }
+
+    fn upsert_data_entity_incremental(
+        &self,
+        cx: &CrateCtx,
+        upsert: EntityUpsert<'_>,
+    ) -> Result<Batch, RoCrateError> {
+        // O(1) visibility probe. The previous `subject_triples(parent).is_empty()`
+        // decoded the parent's whole fan-out just to test emptiness (W2); this is
+        // also exactly the check `append_new_data_entities_under` already made, so
+        // the two entry points now agree on what "parent exists" means.
+        if !self.visible_subject_exists(cx, upsert.parent_id)? {
+            return Err(RoCrateError::EntityNotFound(upsert.parent_id.to_string()));
+        }
+        let mut changes = self.replace_subject_changes(cx, &upsert.entity)?;
+        if !self.has_part_link(
+            cx,
+            HasPartLink {
+                parent_id: upsert.parent_id,
+                child_id: upsert.entity.entity_id,
+            },
+        )? {
+            changes.push(insert_change(
+                &cx.graph,
+                upsert.parent_id,
+                &vocab::schema_has_part(),
+                encoded_subject(upsert.entity.entity_id),
+            ));
+        }
+        Ok(self.engine.local_apply_changes(&cx.graph, changes)?)
+    }
+
+    /// Diff one subject's stored triples against exactly the triples `spec`
+    /// describes: deletes for what is no longer wanted, inserts for what is new.
     fn replace_subject_changes(
         &self,
-        graph_id: &GraphId,
-        subject_id: &str,
-        desired_triples: Vec<(EncodedTerm, EncodedTerm)>,
+        cx: &CrateCtx,
+        spec: &EntitySpec<'_>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
-        let current = self.subject_triples(graph_id, subject_id)?;
-        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = desired_triples.into_iter().collect();
-        let current: BTreeSet<(EncodedTerm, EncodedTerm)> = current.into_iter().collect();
+        let subject = encoded_subject(spec.entity_id);
+        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> =
+            entity_subject_triples(spec)?.into_iter().collect();
+        let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
+            .stored_subject_triples(cx, spec.entity_id)?
+            .into_iter()
+            .collect();
 
         let mut changes = Vec::new();
         for (predicate, object) in current.difference(&desired) {
             changes.push(MaterializedQuadChange::Delete {
-                graph: graph_id.clone(),
+                graph: cx.graph.clone(),
                 subject: subject.clone(),
                 predicate: predicate.clone(),
                 object: object.clone(),
@@ -778,7 +1091,7 @@ impl RoCrateManager {
         }
         for (predicate, object) in desired.difference(&current) {
             changes.push(MaterializedQuadChange::Insert {
-                graph: graph_id.clone(),
+                graph: cx.graph.clone(),
                 subject: subject.clone(),
                 predicate: predicate.clone(),
                 object: object.clone(),
@@ -787,30 +1100,36 @@ impl RoCrateManager {
         Ok(changes)
     }
 
+    /// Incremental counterpart of [`Self::replace_subject_changes`]: only the
+    /// predicates the patch mentions (its own, plus `replaced_predicates`) are
+    /// cleared, so unrelated triples on the subject survive.
     fn patch_subject_changes(
         &self,
-        graph_id: &GraphId,
-        subject_id: &str,
-        desired_triples: Vec<(EncodedTerm, EncodedTerm)>,
-        replaced_predicates: &[NamedNode],
+        cx: &CrateCtx,
+        patch: SubjectPatch<'_>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
+        let subject = encoded_subject(patch.subject_id);
         let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
-            .subject_triples(graph_id, subject_id)?
+            .stored_subject_triples(cx, patch.subject_id)?
             .into_iter()
             .collect();
-        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = desired_triples.into_iter().collect();
+        let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = patch.desired.into_iter().collect();
         let mut replaced: BTreeSet<EncodedTerm> = desired
             .iter()
             .map(|(predicate, _)| predicate.clone())
             .collect();
-        replaced.extend(replaced_predicates.iter().map(EncodedTerm::from_named_node));
+        replaced.extend(
+            patch
+                .replaced_predicates
+                .iter()
+                .map(EncodedTerm::from_named_node),
+        );
 
         let mut changes = Vec::new();
         for (predicate, object) in current.difference(&desired) {
             if replaced.contains(predicate) {
                 changes.push(MaterializedQuadChange::Delete {
-                    graph: graph_id.clone(),
+                    graph: cx.graph.clone(),
                     subject: subject.clone(),
                     predicate: predicate.clone(),
                     object: object.clone(),
@@ -819,7 +1138,7 @@ impl RoCrateManager {
         }
         for (predicate, object) in desired.difference(&current) {
             changes.push(MaterializedQuadChange::Insert {
-                graph: graph_id.clone(),
+                graph: cx.graph.clone(),
                 subject: subject.clone(),
                 predicate: predicate.clone(),
                 object: object.clone(),
@@ -828,127 +1147,154 @@ impl RoCrateManager {
         Ok(changes)
     }
 
+    /// The visible `(predicate, object)` pairs of one subject: nothing when the
+    /// subject itself is orphaned, and never a pair pointing at an orphan (G6).
     fn subject_triples(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         subject_id: &str,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
-        let orphaned = self.orphaned_entities(graph_id)?;
-        let store = self.engine.store();
-        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
-        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
-            return Ok(Vec::new());
-        };
-        let subject_term = encoded_subject(subject_id);
-        if orphaned.contains(&subject_term) {
+        if cx.hides(&encoded_subject(subject_id)) {
             return Ok(Vec::new());
         }
-        let Some(subject_tid) = store.lookup_term(&subject_term)? else {
-            return Ok(Vec::new());
-        };
-        Ok(store
-            .triples_for_subject(graph_tid, subject_tid)?
-            .into_iter()
-            .filter(|(_, object)| !orphaned.contains(object))
-            .collect())
+        Ok(cx.retain_visible(self.stored_subject_triples(cx, subject_id)?))
     }
 
-    fn subject_triples_excluding_predicate(
+    /// The `(predicate, object)` pairs a subject really holds, orphan-hidden
+    /// ones included: the diff base a replace or patch must delete against.
+    fn stored_subject_triples(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         subject_id: &str,
-        excluded_predicate: &NamedNode,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
-        let orphaned = self.orphaned_entities(graph_id)?;
         let store = self.engine.store();
-        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
-        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+        let (Some(graph_tid), Some(subject_tid)) = (
+            cx.graph_tid,
+            store.lookup_term(&encoded_subject(subject_id))?,
+        ) else {
             return Ok(Vec::new());
         };
-        let subject_term = encoded_subject(subject_id);
-        if orphaned.contains(&subject_term) {
-            return Ok(Vec::new());
-        }
-        let Some(subject_tid) = store.lookup_term(&subject_term)? else {
-            return Ok(Vec::new());
-        };
-        let excluded_term = EncodedTerm::from_named_node(excluded_predicate);
-        let Some(excluded_tid) = store.lookup_term(&excluded_term)? else {
-            return Ok(store
-                .triples_for_subject(graph_tid, subject_tid)?
-                .into_iter()
-                .filter(|(_, object)| !orphaned.contains(object))
-                .collect());
-        };
-        Ok(store
-            .triples_for_subject_excluding_predicate(graph_tid, subject_tid, excluded_tid)?
-            .into_iter()
-            .filter(|(_, object)| !orphaned.contains(object))
-            .collect())
+        Ok(store.triples_for_subject(graph_tid, subject_tid)?)
     }
 
-    fn has_part_link(
+    /// The root's visible triples minus its `hasPart` fan-out, which every
+    /// export pages separately. Filtering by predicate id happens inside the
+    /// store, before anything is decoded.
+    fn root_triples_excluding_has_part(
         &self,
-        graph_id: &GraphId,
-        parent_id: &str,
-        child_id: &str,
-    ) -> Result<bool, RoCrateError> {
+        cx: &CrateCtx,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
+        let (Some(graph_tid), Some(subject_tid)) =
+            (cx.graph_tid, self.visible_subject_tid(cx, cx.root_id())?)
+        else {
+            return Ok(Vec::new());
+        };
+        let store = self.engine.store();
         let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
-        let child = encoded_identifier(child_id);
-        Ok(self
-            .subject_triples(graph_id, parent_id)?
-            .into_iter()
-            .any(|(predicate, object)| predicate == has_part && object == child))
+        let triples = match store.lookup_term(&has_part)? {
+            Some(excluded) => {
+                store.triples_for_subject_excluding_predicate(graph_tid, subject_tid, excluded)?
+            }
+            None => store.triples_for_subject(graph_tid, subject_tid)?,
+        };
+        Ok(cx.retain_visible(triples))
+    }
+
+    /// The interned id of `subject_id`, or `None` when the subject is hidden by
+    /// the orphan set or was never interned.
+    ///
+    /// `encoded_subject`, not `encoded_identifier`: JSON-LD import mints blank
+    /// nodes for inline nested entities, and a `_:b0` subject must not be
+    /// re-encoded as the IRI `<_:b0>` or its triples become unreadable.
+    fn visible_subject_tid(
+        &self,
+        cx: &CrateCtx,
+        subject_id: &str,
+    ) -> Result<Option<TermId>, RoCrateError> {
+        let subject = encoded_subject(subject_id);
+        if cx.hides(&subject) {
+            return Ok(None);
+        }
+        Ok(self.engine.store().lookup_term(&subject)?)
+    }
+
+    fn has_part_link(&self, cx: &CrateCtx, link: HasPartLink<'_>) -> Result<bool, RoCrateError> {
+        let parent = encoded_subject(link.parent_id);
+        let child = encoded_subject(link.child_id);
+        // Same orphan hiding the old `subject_triples`-based check had: an
+        // orphaned parent exposes no triples at all, and an orphaned child is
+        // filtered out of its parent's objects, so either end being orphaned
+        // keeps the link invisible (G6).
+        if cx.hides(&parent) || cx.hides(&child) {
+            return Ok(false);
+        }
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        self.triple_is_live(
+            cx,
+            TripleProbe {
+                subject: &parent,
+                predicate: &has_part,
+                object: &child,
+            },
+        )
     }
 
     fn build_partial_export_view(
         &self,
-        graph_id: &GraphId,
-        page_entities: &[EncodedTerm],
-        ctx: &ContextTermMap,
+        cx: &CrateCtx,
+        view: ExportView<'_>,
     ) -> Result<RoCrate, RoCrateError> {
-        let metadata = export_metadata_descriptor(
-            graph_id,
-            self.subject_triples(graph_id, METADATA_ID)?,
-            ctx,
-        )?;
-        let root = export_root_entity(
-            graph_id,
-            self.subject_triples_excluding_predicate(
-                graph_id,
-                root_id(graph_id),
-                &vocab::schema_has_part(),
-            )?,
-            page_entities,
-            ctx,
-        )?;
+        let metadata = export_metadata_descriptor(MetadataExportView {
+            graph_id: &cx.graph,
+            triples: self.subject_triples(cx, METADATA_ID)?,
+            ctx: view.ctx,
+        })?;
+
+        let extra = self.collect_partial_view_entities(cx, view.page_entities)?;
+        let mut has_part: Vec<String> = view
+            .page_entities
+            .iter()
+            .filter_map(encoded_reference_value)
+            .collect();
+        let mut entities = Vec::with_capacity(extra.contextual.len() + extra.artifacts.len());
+        for subject_id in extra.contextual.iter().chain(extra.artifacts.iter()) {
+            let triples = self.subject_triples(cx, subject_id)?;
+            if triples.is_empty() {
+                continue;
+            }
+            // Only artifacts that made it into the document get a link, so the
+            // root never points at an entity this export does not describe.
+            if extra.artifacts.contains(subject_id) {
+                has_part.push(subject_id.clone());
+            }
+            entities.push(export_graph_entity(subject_id, triples, view.ctx)?);
+        }
+
+        let root = export_root_entity(RootExportView {
+            graph_id: &cx.graph,
+            triples: self.root_triples_excluding_has_part(cx)?,
+            has_part,
+            ctx: view.ctx,
+        })?;
 
         let mut graph = vec![
             GraphVector::MetadataDescriptor(metadata),
             GraphVector::RootDataEntity(root),
         ];
+        graph.extend(entities);
 
-        for subject_id in self.collect_partial_view_contextual_entities(graph_id, page_entities)? {
-            let triples = self.subject_triples(graph_id, &subject_id)?;
-            if triples.is_empty() {
-                continue;
-            }
-            graph.push(export_graph_entity(&subject_id, triples, ctx)?);
-        }
-
-        for entity in page_entities {
-            let Some(subject) = entity.to_named_node() else {
+        for entity in view.page_entities {
+            let Some(subject_id) = encoded_reference_value(entity) else {
                 continue;
             };
-            let subject_id = subject.as_str().to_string();
-            if subject_id == root_id(graph_id) || subject_id == METADATA_ID {
+            if subject_id == cx.root_id() || subject_id == METADATA_ID {
                 continue;
             }
-            let triples = self.subject_triples(graph_id, &subject_id)?;
+            let triples = self.subject_triples(cx, &subject_id)?;
             if triples.is_empty() {
                 continue;
             }
-            graph.push(export_graph_entity(&subject_id, triples, ctx)?);
+            graph.push(export_graph_entity(&subject_id, triples, view.ctx)?);
         }
 
         Ok(RoCrate {
@@ -962,22 +1308,27 @@ impl RoCrateManager {
     /// output matches the bare default RO-Crate context byte-for-byte.
     fn render_export_view(
         &self,
-        graph_id: &GraphId,
-        page_entities: &[EncodedTerm],
-        pretty: bool,
+        cx: &CrateCtx,
+        render: ExportRender<'_>,
     ) -> Result<String, RoCrateError> {
-        let raw_context = self.engine.store().graph_context(graph_id)?;
-        let raw_license = match self.engine.store().graph_license(graph_id)? {
-            Some((raw, digest)) if digest == self.graph_digest(graph_id)? => {
+        let raw_context = self.engine.store().graph_context(&cx.graph)?;
+        let raw_license = match self.engine.store().graph_license(&cx.graph)? {
+            Some((raw, digest)) if digest == self.graph_digest(cx)? => {
                 Some(serde_json::from_str(&raw)?)
             }
             _ => None,
         };
         let ctx = ContextTermMap::from_raw(raw_context.as_deref());
-        let rocrate = self.build_partial_export_view(graph_id, page_entities, &ctx)?;
+        let rocrate = self.build_partial_export_view(
+            cx,
+            ExportView {
+                page_entities: render.page_entities,
+                ctx: &ctx,
+            },
+        )?;
         let mut document = serde_json::to_value(&rocrate)?;
         let license_values = self
-            .subject_triples(graph_id, root_id(graph_id))?
+            .subject_triples(cx, cx.root_id())?
             .into_iter()
             .filter(|(predicate, _)| {
                 predicate == &EncodedTerm::from_named_node(&vocab::schema_license())
@@ -989,7 +1340,7 @@ impl RoCrateManager {
             .and_then(serde_json::Value::as_array_mut)
             .and_then(|entries| {
                 entries.iter_mut().find(|entry| {
-                    entry.get("@id").and_then(serde_json::Value::as_str) == Some(root_id(graph_id))
+                    entry.get("@id").and_then(serde_json::Value::as_str) == Some(cx.root_id())
                 })
             })
             .and_then(serde_json::Value::as_object_mut)
@@ -1014,9 +1365,9 @@ impl RoCrateManager {
             }
         }
         match raw_context {
-            None if pretty => Ok(serde_json::to_string_pretty(&document)?),
+            None if render.pretty => Ok(serde_json::to_string_pretty(&document)?),
             None => Ok(serde_json::to_string(&document)?),
-            Some(raw) => splice_context_json(document, &raw, pretty),
+            Some(raw) => splice_context_json(document, &raw, render.pretty),
         }
     }
 
@@ -1032,16 +1383,21 @@ impl RoCrateManager {
 
     fn plan_import_value(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         value: serde_json::Value,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let graph_id = &cx.graph;
         validate_jsonld_import(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
-        if !self.engine.store().contains_graph(graph_id)? {
+        let graph_exists = match cx.graph_tid {
+            Some(graph_tid) => self.engine.store().contains_graph_by_id(graph_tid)?,
+            None => false,
+        };
+        if !graph_exists {
             return Ok(insert_changes(graph_id, target));
         }
 
-        let current = self.current_triples(graph_id)?;
+        let current = self.replacement_base(cx, &target)?;
         if current.is_empty() {
             return Ok(insert_changes(graph_id, target));
         }
@@ -1051,9 +1407,10 @@ impl RoCrateManager {
 
     fn plan_import_value_checked(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         value: serde_json::Value,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let graph_id = &cx.graph;
         validate_jsonld_import(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
         let pointers = SubmittedPointers::new(&value, graph_id);
@@ -1063,9 +1420,9 @@ impl RoCrateManager {
             return Ok(insert_changes(graph_id, target));
         }
 
-        match self.append_like_replace_changes(graph_id, &target)? {
+        match self.append_like_changes(cx, &target)? {
             Some(changes) => Ok(changes),
-            None => diff_triples(graph_id, &self.current_triples(graph_id)?, &target),
+            None => diff_triples(graph_id, &self.replacement_base(cx, &target)?, &target),
         }
     }
 
@@ -1075,46 +1432,39 @@ impl RoCrateManager {
 
     fn replace_jsonld_in_existing_graph(
         &self,
-        graph_id: GraphId,
+        cx: &CrateCtx,
         value: serde_json::Value,
     ) -> Result<Batch, RoCrateError> {
-        let changes = self.plan_import_value_checked(&graph_id, value)?;
+        let graph_id = &cx.graph;
+        let changes = self.plan_import_value_checked(cx, value)?;
         let batch = self
             .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+            .local_apply_changes_bulk_unchecked(graph_id, changes)?;
+        self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(batch)
     }
 
     fn import_jsonld_into_empty_graph_trusted(
         &self,
-        graph_id: GraphId,
+        graph_id: &GraphId,
         value: serde_json::Value,
     ) -> Result<Batch, RoCrateError> {
-        let target = jsonld_triples(&graph_id, &value)?;
+        let target = jsonld_triples(graph_id, &value)?;
         let batch = self
             .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, insert_changes(&graph_id, target))?;
-        self.engine
-            .store()
-            .set_graph_diagnostics(&graph_id, &crate::core::GraphDiagnostics::default())?;
+            .local_apply_changes_bulk_unchecked(graph_id, insert_changes(graph_id, target))?;
+        self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(batch)
     }
 
-    /// Persist (and, when sync is configured, replicate) the raw context and
-    /// license render hints captured from an import. Last-write-wins: only
-    /// updates when a hint actually changed.
+    /// Persist, and replicate when sync is configured, the render hints captured
+    /// from an import. Last-write-wins; only writes when a hint changed.
     ///
-    /// Two-phase contract. Import is not a single atomic transaction: the quad
-    /// changes are committed and published (phase 1, by the caller) *before* the
-    /// render hints are updated here (phase 2). If phase 2 fails, the import
-    /// returns an error with the quads already applied and the stored hints
-    /// unchanged. This is self-healing: re-importing the same document produces
-    /// an empty quad diff (a no-op batch, so phase 1 does nothing), and because
-    /// the stored hints still differ from the freshly captured ones, their
-    /// store/publish is retried and the two phases converge.
+    /// Phase 2 of a two-phase import: the quads are already committed. A failure
+    /// here leaves the hints unchanged and self-heals, because re-importing the
+    /// same document produces an empty quad diff while the hints still differ, so
+    /// the store/publish is retried. Publish-first (G4), with a tag minted strictly
+    /// above the stored one (G5), so the retry also wins over what it is healing.
     fn store_import_context(
         &self,
         graph_id: &GraphId,
@@ -1122,10 +1472,13 @@ impl RoCrateManager {
         license: Option<String>,
     ) -> Result<(), RoCrateError> {
         let current = self.engine.store().graph_context(graph_id)?;
-        let license_digest = license
-            .as_ref()
-            .map(|_| self.graph_digest(graph_id))
-            .transpose()?;
+        // Built fresh, not from the caller's operation context: this runs after
+        // the write, so the digest must describe the state the licence now
+        // annotates, not the state the operation started from.
+        let license_digest = match license.as_ref() {
+            Some(_) => Some(self.graph_digest(&self.crate_ctx(graph_id)?)?),
+            None => None,
+        };
         let current_license = self.engine.store().graph_license(graph_id)?;
         if current == context && current_license == license.clone().zip(license_digest) {
             return Ok(());
@@ -1143,22 +1496,17 @@ impl RoCrateManager {
 
     fn plan_rocrate_replacement(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         rocrate: &mut RoCrate,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         normalize_rocrate(rocrate);
-        diff_triples(
-            graph_id,
-            &self.current_triples(graph_id)?,
-            &rocrate_triples(rocrate)?,
-        )
+        let target = rocrate_triples(rocrate)?;
+        diff_triples(&cx.graph, &self.replacement_base(cx, &target)?, &target)
     }
 
-    fn current_triples(&self, graph_id: &GraphId) -> Result<BTreeSet<TripleKey>, RoCrateError> {
-        let orphaned = self.orphaned_entities(graph_id)?;
+    fn current_triples(&self, cx: &CrateCtx) -> Result<BTreeSet<TripleKey>, RoCrateError> {
         let store = self.engine.store();
-        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
-        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+        let Some(graph_tid) = cx.graph_tid else {
             return Ok(BTreeSet::new());
         };
 
@@ -1168,7 +1516,7 @@ impl RoCrateManager {
             let subject = store.decode_term_cached(&mut term_cache, quad.subject)?;
             let predicate = store.decode_term_cached(&mut term_cache, quad.predicate)?;
             let object = store.decode_term_cached(&mut term_cache, quad.object)?;
-            if triple_is_visible(&subject, &object, &orphaned) {
+            if !cx.hides(&subject) && !cx.hides(&object) {
                 triples.insert((subject, predicate, object));
             }
             Ok(())
@@ -1176,9 +1524,37 @@ impl RoCrateManager {
         Ok(triples)
     }
 
-    fn graph_digest(&self, graph_id: &GraphId) -> Result<[u8; 32], RoCrateError> {
+    /// The triples a replacement deletes against, per [`ReplacementBase`].
+    fn replacement_base(
+        &self,
+        cx: &CrateCtx,
+        target: &BTreeSet<TripleKey>,
+    ) -> Result<BTreeSet<TripleKey>, RoCrateError> {
+        let store = self.engine.store();
+        let Some(graph_tid) = cx.graph_tid else {
+            return Ok(BTreeSet::new());
+        };
+
+        let base = ReplacementBase::new(cx, target);
+        let mut triples = BTreeSet::new();
+        let mut term_cache = HashMap::new();
+        store.for_each_quad_in_graph::<crate::store::StoreError, _>(graph_tid, |quad| {
+            let triple = (
+                store.decode_term_cached(&mut term_cache, quad.subject)?,
+                store.decode_term_cached(&mut term_cache, quad.predicate)?,
+                store.decode_term_cached(&mut term_cache, quad.object)?,
+            );
+            if base.covers(&triple) {
+                triples.insert(triple);
+            }
+            Ok(())
+        })?;
+        Ok(triples)
+    }
+
+    fn graph_digest(&self, cx: &CrateCtx) -> Result<[u8; 32], RoCrateError> {
         let mut hasher = blake3::Hasher::new();
-        for (subject, predicate, object) in self.current_triples(graph_id)? {
+        for (subject, predicate, object) in self.current_triples(cx)? {
             for term in [subject, predicate, object] {
                 let bytes = term.0.as_bytes();
                 hasher.update(&(bytes.len() as u64).to_be_bytes());
@@ -1188,29 +1564,30 @@ impl RoCrateManager {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    fn append_like_replace_changes(
+    /// Shortcut for [`Self::replacement_base`] + `diff_triples` when the target
+    /// is a superset of that base, so both agree on which triples count.
+    fn append_like_changes(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         target: &BTreeSet<TripleKey>,
     ) -> Result<Option<Vec<MaterializedQuadChange>>, RoCrateError> {
-        let orphaned = self.orphaned_entities(graph_id)?;
+        let graph_id = &cx.graph;
         let store = self.engine.store();
-        let graph_term = EncodedTerm::from_named_node(&graph_id.0);
-        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+        let Some(graph_tid) = cx.graph_tid else {
             return Ok(Some(insert_changes(graph_id, target.clone())));
         };
 
+        let base = ReplacementBase::new(cx, target);
         let mut remaining = target.clone();
         let mut term_cache = HashMap::new();
         let append_like =
             match store.for_each_quad_in_graph::<AppendLikeCheckError, _>(graph_tid, |quad| {
-                let subject = store.decode_term_cached(&mut term_cache, quad.subject)?;
-                let predicate = store.decode_term_cached(&mut term_cache, quad.predicate)?;
-                let object = store.decode_term_cached(&mut term_cache, quad.object)?;
-                if !triple_is_visible(&subject, &object, &orphaned) {
-                    return Ok(());
-                }
-                if !remaining.remove(&(subject, predicate, object)) {
+                let triple = (
+                    store.decode_term_cached(&mut term_cache, quad.subject)?,
+                    store.decode_term_cached(&mut term_cache, quad.predicate)?,
+                    store.decode_term_cached(&mut term_cache, quad.object)?,
+                );
+                if base.covers(&triple) && !remaining.remove(&triple) {
                     return Err(AppendLikeCheckError::NeedsFullDiff);
                 }
                 Ok(())
@@ -1229,125 +1606,133 @@ impl RoCrateManager {
 
     fn visible_subject_exists(
         &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         subject_id: &str,
     ) -> Result<bool, RoCrateError> {
-        let subject = EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id));
-        if self.orphaned_entities(graph_id)?.contains(&subject) {
+        let subject = encoded_subject(subject_id);
+        if cx.hides(&subject) {
             return Ok(false);
         }
-        Ok(self.engine.store().contains_subject(graph_id, &subject)?)
+        Ok(self.engine.store().contains_subject(&cx.graph, &subject)?)
     }
 
-    fn orphaned_entities(&self, graph_id: &GraphId) -> Result<HashSet<EncodedTerm>, RoCrateError> {
-        Ok(self
-            .engine
-            .store()
-            .graph_diagnostics(graph_id)?
-            .orphaned_entities
-            .into_iter()
-            .map(|entity_id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(&entity_id)))
-            .collect())
-    }
-
-    fn visible_root_linked_data_entities(
-        &self,
-        graph_id: &GraphId,
-    ) -> Result<Vec<EncodedTerm>, RoCrateError> {
-        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
-        let mut entities: Vec<EncodedTerm> = self
-            .subject_triples(graph_id, root_id(graph_id))?
-            .into_iter()
-            .filter(|(predicate, _)| predicate == &has_part)
-            .map(|(_, object)| object)
-            .collect();
-        entities.sort();
-        entities.dedup();
-        Ok(entities)
-    }
-
+    /// One page of the root's *visible* `hasPart` objects, plus the visible total.
+    ///
+    /// With no orphans this is a straight `objects_page`. When the graph carries
+    /// orphans the previous shape decoded and sorted the root's entire fan-out
+    /// **per page** (R3); instead we walk the same ordered id sequence in
+    /// windows, skipping hidden entries until `limit` visible ones are gathered.
+    /// The visible sequence is identical either way because both paths take
+    /// `objects_page`'s ordering, which sorts by decoded term string — the same
+    /// order the old `sort()` over decoded objects produced.
     fn root_linked_data_entity_page(
         &self,
-        graph_id: &GraphId,
-        offset: usize,
-        limit: usize,
+        cx: &CrateCtx,
+        page: PageRequest<'_>,
     ) -> Result<(usize, Vec<EncodedTerm>), RoCrateError> {
-        if self.orphaned_entities(graph_id)?.is_empty() {
-            let root = root_term(graph_id);
-            let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
-            return Ok(self
-                .engine
-                .store()
-                .objects_for_subject_predicate_page(graph_id, &root, &has_part, offset, limit)?);
+        let store = self.engine.store();
+        let root = cx.root_term();
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+
+        if cx.orphaned.is_empty() {
+            return Ok(store.objects_page(
+                GraphSubjectPredicate {
+                    graph: &cx.graph,
+                    subject: &root,
+                    predicate: &has_part,
+                },
+                page,
+            )?);
         }
 
-        let visible = self.visible_root_linked_data_entities(graph_id)?;
-        let total = visible.len();
-        let page = visible.into_iter().skip(offset).take(limit).collect();
-        Ok((total, page))
+        // An orphaned root exposes no triples at all, so it links to nothing (G6).
+        if cx.hides(&root) {
+            return Ok((0, Vec::new()));
+        }
+
+        // Exact visible total without decoding the fan-out: count the raw objects
+        // off the index, then subtract the orphans that are actually linked from
+        // the root — one O(1) live-quad probe per orphan.
+        let raw_total = store.count_objects_for_subject_predicate(&cx.graph, &root, &has_part)?;
+        let mut hidden = 0usize;
+        for orphan in &cx.orphaned {
+            if self.triple_is_live(
+                cx,
+                TripleProbe {
+                    subject: &root,
+                    predicate: &has_part,
+                    object: orphan,
+                },
+            )? {
+                hidden += 1;
+            }
+        }
+        let total = raw_total.saturating_sub(hidden);
+
+        let limit = page.limit;
+        if limit == 0 {
+            return Ok((total, Vec::new()));
+        }
+        let (mut skip, start_after) = match page.cursor {
+            PageCursor::Offset(offset) => (offset, None),
+            PageCursor::After(after) => (0, after),
+        };
+        // Enough headroom that a single window can still yield `limit` visible
+        // entries even if every hidden entry happens to fall inside it.
+        let step = limit.saturating_add(hidden);
+
+        let mut visible = Vec::new();
+        let mut anchor: Option<EncodedTerm> = None;
+        loop {
+            let cursor = match &anchor {
+                Some(term) => PageCursor::After(Some(term)),
+                None => PageCursor::After(start_after),
+            };
+            let (_, window) = store.objects_page(
+                GraphSubjectPredicate {
+                    graph: &cx.graph,
+                    subject: &root,
+                    predicate: &has_part,
+                },
+                PageRequest {
+                    cursor,
+                    limit: step,
+                },
+            )?;
+            let Some(last) = window.last().cloned() else {
+                return Ok((total, visible));
+            };
+            for object in window {
+                if cx.hides(&object) {
+                    continue;
+                }
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                visible.push(object);
+                if visible.len() == limit {
+                    return Ok((total, visible));
+                }
+            }
+            anchor = Some(last);
+        }
     }
 
-    fn root_linked_data_entity_page_after(
+    fn collect_partial_view_entities(
         &self,
-        graph_id: &GraphId,
-        after_entity_id: Option<&str>,
-        limit: usize,
-    ) -> Result<(usize, Vec<EncodedTerm>), RoCrateError> {
-        let after = after_entity_id.map(normalize_entity_id);
-        if self.orphaned_entities(graph_id)?.is_empty() {
-            let root = root_term(graph_id);
-            let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
-            let after = after
-                .as_ref()
-                .map(|id| EncodedTerm::from_named_node(&NamedNode::new_unchecked(id.as_str())));
-            let total = self
-                .engine
-                .store()
-                .count_objects_for_subject_predicate(graph_id, &root, &has_part)?;
-            let page = self
-                .engine
-                .store()
-                .objects_for_subject_predicate_page_after(
-                    graph_id,
-                    &root,
-                    &has_part,
-                    after.as_ref(),
-                    limit,
-                )?;
-            return Ok((total, page));
-        }
-
-        let visible = self.visible_root_linked_data_entities(graph_id)?;
-        let total = visible.len();
-        let mut page: Vec<EncodedTerm> = visible
-            .into_iter()
-            .skip_while(|entity| {
-                after.as_deref().is_some_and(|after_id| {
-                    encoded_named_node_value(entity).as_deref() != Some(after_id)
-                })
-            })
-            .collect();
-        if after.is_some() && !page.is_empty() {
-            page.remove(0);
-        }
-        page.truncate(limit);
-        Ok((total, page))
-    }
-
-    fn collect_partial_view_contextual_entities(
-        &self,
-        graph_id: &GraphId,
+        cx: &CrateCtx,
         page_entities: &[EncodedTerm],
-    ) -> Result<Vec<String>, RoCrateError> {
+    ) -> Result<PartialViewEntities, RoCrateError> {
         let page_subjects: HashSet<String> = page_entities
             .iter()
-            .filter_map(encoded_named_node_value)
+            .filter_map(encoded_reference_value)
             .collect();
-        let mut queue = VecDeque::from([METADATA_ID.to_string(), root_id(graph_id).to_string()]);
+        let mut queue = VecDeque::from([METADATA_ID.to_string(), cx.root_id().to_string()]);
         queue.extend(page_subjects.iter().cloned());
 
         let mut expanded = HashSet::new();
-        let mut contextuals = BTreeSet::new();
+        let mut collected = PartialViewEntities::default();
         let has_artifact =
             EncodedTerm::from_named_node(&NamedNode::new_unchecked(PROF_HAS_ARTIFACT_IRI));
 
@@ -1356,14 +1741,10 @@ impl RoCrateManager {
                 continue;
             }
 
-            let references = if subject_id == root_id(graph_id) {
-                self.subject_triples_excluding_predicate(
-                    graph_id,
-                    root_id(graph_id),
-                    &vocab::schema_has_part(),
-                )?
+            let references = if subject_id == cx.root_id() {
+                self.root_triples_excluding_has_part(cx)?
             } else {
-                self.subject_triples(graph_id, &subject_id)?
+                self.subject_triples(cx, &subject_id)?
             };
             let is_resource_descriptor =
                 triples_have_type(&references, PROF_RESOURCE_DESCRIPTOR_IRI);
@@ -1372,31 +1753,36 @@ impl RoCrateManager {
                 let Some(candidate_id) = encoded_reference_value(&object) else {
                     continue;
                 };
-                if candidate_id == root_id(graph_id)
+                if candidate_id == cx.root_id()
                     || candidate_id == METADATA_ID
                     || page_subjects.contains(&candidate_id)
                 {
                     continue;
                 }
 
-                let triples = self.subject_triples(graph_id, &candidate_id)?;
+                let triples = self.subject_triples(cx, &candidate_id)?;
+                if triples.is_empty() {
+                    continue;
+                }
                 let is_profile_artifact = is_resource_descriptor
                     && predicate == has_artifact
                     && (triples_have_type(&triples, "File")
                         || triples_have_type(&triples, "MediaObject"));
-                if triples.is_empty()
-                    || (!triples_describe_contextual_entity(&triples) && !is_profile_artifact)
-                {
+                let inserted = if is_profile_artifact {
+                    collected.artifacts.insert(candidate_id.clone())
+                } else if triples_describe_contextual_entity(&triples) {
+                    collected.contextual.insert(candidate_id.clone())
+                } else {
                     continue;
-                }
+                };
 
-                if contextuals.insert(candidate_id.clone()) {
+                if inserted {
                     queue.push_back(candidate_id);
                 }
             }
         }
 
-        Ok(contextuals.into_iter().collect())
+        Ok(collected)
     }
 }
 
@@ -1408,7 +1794,7 @@ fn insert_change(
 ) -> MaterializedQuadChange {
     MaterializedQuadChange::Insert {
         graph: graph_id.clone(),
-        subject: EncodedTerm::from_named_node(&NamedNode::new_unchecked(subject_id)),
+        subject: encoded_subject(subject_id),
         predicate: EncodedTerm::from_named_node(predicate),
         object,
     }
@@ -1523,14 +1909,6 @@ fn triples_from_insert_changes(changes: &[MaterializedQuadChange]) -> BTreeSet<T
         .collect()
 }
 
-fn triple_is_visible(
-    subject: &EncodedTerm,
-    object: &EncodedTerm,
-    orphaned: &HashSet<EncodedTerm>,
-) -> bool {
-    !orphaned.contains(subject) && !orphaned.contains(object)
-}
-
 fn diff_triples(
     graph_id: &GraphId,
     current: &BTreeSet<TripleKey>,
@@ -1621,10 +1999,13 @@ impl SubmittedPointers {
                 continue;
             };
             let normalized = normalize_entity_id(id);
+            // Keyed by the same term the change set carries, so a document that
+            // spells a nested entity out as `"@id": "_:b0"` still resolves to its
+            // own JSON pointer instead of falling back to the whole `@graph`.
             let entity_term = if import_root.as_deref() == Some(normalized.as_str()) {
                 root_term(graph_id)
             } else {
-                encoded_identifier(&normalized)
+                encoded_subject(&normalized)
             };
             let entity_pointer = format!("{}/{index}", pointers.graph);
             pointers
@@ -1788,10 +2169,15 @@ fn validate_complete_import_triples(
     let root_description = EncodedTerm::from_named_node(&vocab::schema_description());
     let root_date_published = EncodedTerm::from_named_node(&vocab::schema_date_published());
 
-    let mut subjects = BTreeSet::new();
-    let mut typed_subjects = HashSet::new();
-    let mut adjacency: HashMap<EncodedTerm, Vec<EncodedTerm>> = HashMap::new();
-    let mut data_entities = BTreeSet::new();
+    // Borrowed throughout: `triples` outlives every collection here, so nothing
+    // needs cloning. `BTreeSet<&EncodedTerm>` orders exactly as
+    // `BTreeSet<EncodedTerm>` did (`Ord` on `&T` delegates to `Ord` on `T`, i.e.
+    // the inner `String`), so the lexicographically smallest untyped subject and
+    // the smallest orphan reported below stay byte-identical.
+    let mut subjects: BTreeSet<&EncodedTerm> = BTreeSet::new();
+    let mut typed_subjects: HashSet<&EncodedTerm> = HashSet::new();
+    let mut adjacency: HashMap<&EncodedTerm, Vec<&EncodedTerm>> = HashMap::new();
+    let mut data_entities: BTreeSet<&EncodedTerm> = BTreeSet::new();
     let mut has_root_dataset = false;
     let mut has_metadata_type = false;
     let mut root_name_count = 0usize;
@@ -1799,7 +2185,7 @@ fn validate_complete_import_triples(
     let mut root_date_published_count = 0usize;
 
     for (subject, predicate, object) in triples {
-        subjects.insert(subject.clone());
+        subjects.insert(subject);
 
         if subject == &root && predicate == &root_name {
             root_name_count += 1;
@@ -1811,7 +2197,7 @@ fn validate_complete_import_triples(
             root_date_published_count += 1;
         }
         if predicate == &rdf_type {
-            typed_subjects.insert(subject.clone());
+            typed_subjects.insert(subject);
             if subject == &root && object == &dataset {
                 has_root_dataset = true;
             }
@@ -1819,20 +2205,17 @@ fn validate_complete_import_triples(
                 has_metadata_type = true;
             }
             if subject != &root && (object == &dataset || object == &media_object) {
-                data_entities.insert(subject.clone());
+                data_entities.insert(subject);
             }
         }
 
         if predicate == &has_part {
-            adjacency
-                .entry(subject.clone())
-                .or_default()
-                .push(object.clone());
+            adjacency.entry(subject).or_default().push(object);
             if subject != &root {
-                data_entities.insert(subject.clone());
+                data_entities.insert(subject);
             }
             if object != &root {
-                data_entities.insert(object.clone());
+                data_entities.insert(object);
             }
         }
     }
@@ -1888,14 +2271,13 @@ fn validate_complete_import_triples(
         ));
     }
 
-    let mut reachable = HashSet::new();
-    let mut queue = VecDeque::from([root.clone()]);
-    reachable.insert(root.clone());
+    let mut reachable: HashSet<&EncodedTerm> = HashSet::from([&root]);
+    let mut queue: VecDeque<&EncodedTerm> = VecDeque::from([&root]);
     while let Some(current) = queue.pop_front() {
-        if let Some(children) = adjacency.get(&current) {
+        if let Some(children) = adjacency.get(current) {
             for child in children {
-                if reachable.insert(child.clone()) {
-                    queue.push_back(child.clone());
+                if reachable.insert(child) {
+                    queue.push_back(child);
                 }
             }
         }
@@ -1905,8 +2287,11 @@ fn validate_complete_import_triples(
         .into_iter()
         .find(|entity| !reachable.contains(entity))
     {
-        let pointer = violation_pointer(pointers, &orphan, &has_part);
-        violations.push(crate::core::CrateViolation::orphaned(orphan.0, pointer));
+        let pointer = violation_pointer(pointers, orphan, &has_part);
+        violations.push(crate::core::CrateViolation::orphaned(
+            orphan.0.clone(),
+            pointer,
+        ));
     }
 
     if violations.is_empty() {
@@ -2152,23 +2537,20 @@ fn remap_node(node: NamedNode, import_root: Option<&str>, graph_id: &GraphId) ->
 }
 
 fn entity_subject_triples(
-    _entity_id: &str,
-    entity_type: &str,
-    name: &str,
-    additional_triples: &[(NamedNode, oxrdf::Term)],
+    spec: &EntitySpec<'_>,
 ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
     let mut triples = vec![
         (
             EncodedTerm::from_named_node(&vocab::rdf_type()),
-            encoded_class_term(entity_type)?,
+            encoded_class_term(spec.entity_type)?,
         ),
         (
             EncodedTerm::from_named_node(&vocab::schema_name()),
-            encoded_literal(name),
+            encoded_literal(spec.name),
         ),
     ];
 
-    for (predicate, object) in additional_triples {
+    for (predicate, object) in spec.additional_triples {
         triples.push((
             EncodedTerm::from_named_node(predicate),
             EncodedTerm::from_term(object),
@@ -2224,16 +2606,24 @@ fn encoded_class_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
     )))
 }
 
+/// A value that is an IRI by construction — a constant or an id derived from the
+/// graph name. Never reachable from a caller-supplied entity id; use
+/// [`encoded_subject`] for those.
 fn encoded_identifier(value: &str) -> EncodedTerm {
     EncodedTerm::from_named_node(&NamedNode::new_unchecked(value))
 }
 
+/// An entity identifier, which import may have minted as a blank node.
+///
+/// Blank nodes are addressable entities in craqle: `oxjsonld` mints one for every
+/// inline nested entity, and every reader — SPARQL, describe, search, export —
+/// hands those ids back in bare `_:b0` form. So every caller-supplied id → term
+/// conversion goes through here, on the write path as much as the read path.
+/// Wrapping `_:b0` as the IRI `<_:b0>` yields a *different* term, which is how a
+/// write could land somewhere no read would ever look (and how an orphaned blank
+/// node stayed visible, G6).
 fn encoded_subject(value: &str) -> EncodedTerm {
-    if value.starts_with("_:") {
-        EncodedTerm(value.to_string())
-    } else {
-        encoded_identifier(value)
-    }
+    EncodedTerm::from_subject_id(value)
 }
 
 fn encoded_literal(value: &str) -> EncodedTerm {
@@ -2285,17 +2675,15 @@ fn expand_known_compact_iri(value: &str) -> Result<NamedNode, RoCrateError> {
 }
 
 fn export_metadata_descriptor(
-    graph_id: &GraphId,
-    triples: Vec<(EncodedTerm, EncodedTerm)>,
-    ctx: &ContextTermMap,
+    view: MetadataExportView<'_>,
 ) -> Result<MetadataDescriptor, RoCrateError> {
     let mut type_terms = Vec::new();
     let mut conforms_to = None;
     let mut about = None;
     let mut dynamic = HashMap::new();
 
-    for (predicate, object) in triples {
-        let key = predicate_key(&predicate, ctx);
+    for (predicate, object) in view.triples {
+        let key = predicate_key(&predicate, view.ctx);
         match key.as_str() {
             "type" | "@type" => {
                 if let Some(value) = object_named_node_value(&object) {
@@ -2305,7 +2693,7 @@ fn export_metadata_descriptor(
             "conformsTo" => conforms_to = Some(id_from_encoded_term(&object)),
             "about" => about = Some(id_from_encoded_term(&object)),
             _ => {
-                let value = context_value(ctx, &key, &object);
+                let value = context_value(view.ctx, &key, &object);
                 insert_entity_value(&mut dynamic, key, value);
             }
         }
@@ -2315,17 +2703,12 @@ fn export_metadata_descriptor(
         id: METADATA_ID.to_string(),
         type_: data_type_from_terms(type_terms, "CreativeWork"),
         conforms_to: conforms_to.unwrap_or_else(|| Id::Id(ROCRATE_SPEC_URL.to_string())),
-        about: about.unwrap_or_else(|| Id::Id(root_id(graph_id).to_string())),
+        about: about.unwrap_or_else(|| Id::Id(root_id(view.graph_id).to_string())),
         dynamic_entity: (!dynamic.is_empty()).then_some(dynamic),
     })
 }
 
-fn export_root_entity(
-    graph_id: &GraphId,
-    triples: Vec<(EncodedTerm, EncodedTerm)>,
-    page_entities: &[EncodedTerm],
-    ctx: &ContextTermMap,
-) -> Result<RootDataEntity, RoCrateError> {
+fn export_root_entity(view: RootExportView<'_>) -> Result<RootDataEntity, RoCrateError> {
     let mut type_terms = Vec::new();
     let mut name = None;
     let mut description = None;
@@ -2333,8 +2716,8 @@ fn export_root_entity(
     let mut license = None;
     let mut dynamic = HashMap::new();
 
-    for (predicate, object) in triples {
-        let key = predicate_key(&predicate, ctx);
+    for (predicate, object) in view.triples {
+        let key = predicate_key(&predicate, view.ctx);
         match key.as_str() {
             "type" | "@type" => {
                 if let Some(value) = object_named_node_value(&object) {
@@ -2347,31 +2730,26 @@ fn export_root_entity(
             "license" => license = Some(license_from_encoded_term(&object)),
             "hasPart" => {}
             _ => {
-                let value = context_value(ctx, &key, &object);
+                let value = context_value(view.ctx, &key, &object);
                 insert_entity_value(&mut dynamic, key, value);
             }
         }
     }
 
-    if !page_entities.is_empty() {
-        let ids = page_entities
-            .iter()
-            .filter_map(|term| term.to_named_node().map(|node| node.as_str().to_string()))
-            .collect::<Vec<_>>();
-        if !ids.is_empty() {
-            dynamic.insert(
-                "hasPart".to_string(),
-                if ids.len() == 1 {
-                    EntityValue::EntityId(Id::Id(ids[0].clone()))
-                } else {
-                    EntityValue::EntityId(Id::IdArray(ids))
-                },
-            );
-        }
+    let mut ids = view.has_part;
+    if !ids.is_empty() {
+        dynamic.insert(
+            "hasPart".to_string(),
+            if ids.len() == 1 {
+                EntityValue::EntityId(Id::Id(ids.remove(0)))
+            } else {
+                EntityValue::EntityId(Id::IdArray(ids))
+            },
+        );
     }
 
     Ok(RootDataEntity {
-        id: root_id(graph_id).to_string(),
+        id: root_id(view.graph_id).to_string(),
         type_: data_type_from_terms(type_terms, "Dataset"),
         name: name.ok_or_else(|| RoCrateError::InvalidGraph("root entity missing name".into()))?,
         description: description
@@ -2440,10 +2818,13 @@ fn object_named_node_value(object: &EncodedTerm) -> Option<String> {
         .map(|node| normalize_compact_term(node.as_str()))
 }
 
-fn encoded_named_node_value(object: &EncodedTerm) -> Option<String> {
-    object.to_named_node().map(|node| node.as_str().to_string())
-}
-
+/// The bare id an entity reference denotes: an IRI unwrapped from its angle
+/// brackets, a blank node kept as its `_:b0` label.
+///
+/// Also the emit half of the page-cursor round trip. `export_jsonld_page_after`
+/// re-encodes whatever this returns with [`encoded_subject`], so the two must
+/// stay inverses; a page ending on a blank-node entity used to emit no cursor at
+/// all, silently truncating the caller's walk.
 fn encoded_reference_value(object: &EncodedTerm) -> Option<String> {
     match object.to_term() {
         Some(Term::NamedNode(node)) => Some(node.as_str().to_string()),
@@ -3068,21 +3449,39 @@ mod tests {
     use irokle::reducer::EventRecord;
 
     /// A [`CraqleGraphSync`] decorator that delegates every call to `inner`,
-    /// except `publish_context`, which fails while `fail_context` is set. Used to
-    /// simulate a phase-2 (context) publish failure after phase-1 (quads) has
-    /// already committed and published.
-    struct FlakyContextSync {
+    /// except the two publishes an import performs, each of which fails while
+    /// its flag is set. `fail_changes` injects a phase-1 (quad) failure, which
+    /// under publish-first must leave no local trace at all; `fail_context`
+    /// injects a phase-2 (context) failure after phase 1 has already committed
+    /// and published.
+    struct FlakySync {
         inner: Arc<dyn CraqleGraphSync>,
+        fail_changes: AtomicBool,
         fail_context: AtomicBool,
     }
 
-    impl CraqleGraphSync for FlakyContextSync {
+    impl FlakySync {
+        fn new(inner: Arc<dyn CraqleGraphSync>) -> Self {
+            Self {
+                inner,
+                fail_changes: AtomicBool::new(false),
+                fail_context: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl CraqleGraphSync for FlakySync {
         fn publish_changes(
             &self,
             store: &crate::store::GraphStore,
             graph: &GraphId,
             changes: Vec<MaterializedQuadChange>,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            if self.fail_changes.load(Ordering::SeqCst) {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "injected quad publish failure".to_string(),
+                ));
+            }
             self.inner.publish_changes(store, graph, changes)
         }
 
@@ -3202,39 +3601,180 @@ mod tests {
         }
     }
 
-    /// A failed context publish (phase 2) leaves the already-applied quads
-    /// (phase 1) in place with the stored context unchanged, and re-importing the
-    /// same document heals it: the empty quad diff is a no-op while the context
-    /// store/publish is retried.
-    #[test]
-    fn context_publish_failure_leaves_quads_and_heals_on_reimport() {
+    /// A store plus a manager whose sync layer can be made to fail either
+    /// publish phase on demand.
+    fn flaky_manager() -> (
+        tempfile::TempDir,
+        Arc<crate::store::GraphStore>,
+        Arc<FlakySync>,
+        RoCrateManager,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::GraphStore::open(dir.path()).unwrap());
         let search = Arc::new(crate::search::SearchIndex::open_in_memory().unwrap());
-        let sparql = Arc::new(crate::sparql::SparqlEngine::new(
-            store.clone(),
-            search.clone(),
-        ));
-        let actor = crate::core::ActorId::random();
+        let sparql = Arc::new(crate::sparql::SparqlEngine::new(store.clone(), search));
 
         let node = irokle::Irokle::builder().build().unwrap();
         let inner: Arc<dyn CraqleGraphSync> = Arc::new(crate::sync::IrokleGraphSync::new(
             node,
             crate::sync::CraqleIrokleOptions::new(),
         ));
-        let flaky = Arc::new(FlakyContextSync {
-            inner,
-            fail_context: AtomicBool::new(true),
-        });
+        let flaky = Arc::new(FlakySync::new(inner));
         let sync: Arc<dyn CraqleGraphSync> = flaky.clone();
 
         let engine = Arc::new(ReplicationEngine::new_with_sync(
             store.clone(),
-            sparql.clone(),
-            actor,
+            sparql,
+            crate::core::ActorId::random(),
             Some(sync),
         ));
-        let manager = RoCrateManager::new(engine);
+        (dir, store.clone(), flaky, RoCrateManager::new(engine))
+    }
+
+    /// Everything a write is allowed to move, read in one shot so a failed
+    /// publish can be compared against the state that preceded it.
+    #[derive(Debug, PartialEq)]
+    struct LocalState {
+        fingerprint: (u64, [u8; 32], [u8; 32]),
+        clock: crate::core::VectorClock,
+        diagnostics: crate::core::GraphDiagnostics,
+        context: Option<String>,
+        context_tag: crate::core::ContextTag,
+    }
+
+    impl LocalState {
+        fn read(store: &crate::store::GraphStore, graph: &GraphId) -> Self {
+            Self {
+                fingerprint: store.graph_fingerprint(graph).unwrap(),
+                clock: store.get_vector_clock(graph).unwrap(),
+                diagnostics: store.graph_diagnostics(graph).unwrap(),
+                context: store.graph_context(graph).unwrap(),
+                context_tag: store.graph_context_tag(graph).unwrap(),
+            }
+        }
+    }
+
+    /// G4 publish-first for the *quad* phase: a `publish_changes` that fails
+    /// must move no local state whatsoever.
+    ///
+    /// The context phase already had fault injection; this is the phase that
+    /// matters more, because applying before publishing would leave this node
+    /// holding quads and a clock entry no peer will ever be told about — a
+    /// divergence nothing later reconciles. Every field a write can touch is
+    /// compared, not just the quad count.
+    #[test]
+    fn publish_persists_nothing() {
+        let (_dir, store, flaky, manager) = flaky_manager();
+        let graph = GraphId::new("urn:test:quad-publish-failure");
+        let document = |extra: &str| {
+            serde_json::json!({
+                "@context": ROCRATE_CONTEXT_URL,
+                "@graph": [
+                    {
+                        "@id": METADATA_ID,
+                        "@type": "CreativeWork",
+                        "conformsTo": {"@id": ROCRATE_SPEC_URL},
+                        "about": {"@id": graph.as_str()}
+                    },
+                    {
+                        "@id": graph.as_str(),
+                        "@type": "Dataset",
+                        "name": "Publish First Crate",
+                        "description": extra,
+                        "datePublished": "2025-01-01",
+                        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                    }
+                ]
+            })
+            .to_string()
+        };
+
+        manager
+            .import_jsonld(graph.clone(), &document("baseline"))
+            .unwrap();
+        let before = LocalState::read(&store, &graph);
+        assert!(before.fingerprint.0 > 0, "the baseline import must land");
+
+        flaky.fail_changes.store(true, Ordering::SeqCst);
+        let failed = manager.import_jsonld(graph.clone(), &document("amended"));
+        assert!(
+            failed.is_err(),
+            "the import must surface the injected quad publish failure"
+        );
+        assert_eq!(
+            before,
+            LocalState::read(&store, &graph),
+            "a failed quad publish moved local state"
+        );
+
+        // And the failure is not terminal: retrying once the fault clears lands.
+        flaky.fail_changes.store(false, Ordering::SeqCst);
+        manager
+            .import_jsonld(graph.clone(), &document("amended"))
+            .unwrap();
+        assert_ne!(
+            before,
+            LocalState::read(&store, &graph),
+            "the retried import must apply"
+        );
+    }
+
+    /// The same guarantee on a graph that does not exist yet: a failed quad
+    /// publish must not leave a half-created graph behind.
+    #[test]
+    fn publish_creates_nothing() {
+        let (_dir, store, flaky, manager) = flaky_manager();
+        let graph = GraphId::new("urn:test:quad-publish-failure-fresh");
+        flaky.fail_changes.store(true, Ordering::SeqCst);
+
+        let document = serde_json::json!({
+            "@context": ROCRATE_CONTEXT_URL,
+            "@graph": [
+                {
+                    "@id": METADATA_ID,
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": ROCRATE_SPEC_URL},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Never Published",
+                    "description": "nothing may survive this",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                }
+            ]
+        });
+
+        assert!(
+            manager
+                .import_jsonld(graph.clone(), &document.to_string())
+                .is_err()
+        );
+        assert!(
+            store.graph_is_empty(&graph).unwrap(),
+            "a failed quad publish must leave no quads"
+        );
+        assert!(
+            store.get_vector_clock(&graph).unwrap().0.is_empty(),
+            "a failed quad publish must not advance the clock"
+        );
+        assert_eq!(
+            crate::core::ContextTag::GENESIS,
+            store.graph_context_tag(&graph).unwrap(),
+            "phase 2 must never run when phase 1 failed"
+        );
+    }
+
+    /// A failed context publish (phase 2) leaves the already-applied quads
+    /// (phase 1) in place with the stored context unchanged, and re-importing the
+    /// same document heals it: the empty quad diff is a no-op while the context
+    /// store/publish is retried.
+    #[test]
+    fn context_publish_failure_leaves_quads_and_heals_on_reimport() {
+        let (_dir, store, flaky, manager) = flaky_manager();
+        flaky.fail_context.store(true, Ordering::SeqCst);
 
         let graph = GraphId::new("urn:test:context-publish-failure");
         let organism_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
@@ -3276,7 +3816,7 @@ mod tests {
         );
         assert!(
             manager
-                .current_triples(&graph)
+                .current_triples(&manager.crate_ctx(&graph).unwrap())
                 .unwrap()
                 .iter()
                 .any(|(_, predicate, _)| predicate
@@ -3305,9 +3845,26 @@ mod tests {
                 .is_some_and(|context| context.contains(organism_iri)),
             "healed context should carry the profile IRI: {stored:?}"
         );
-        assert!(
-            store.graph_context_tag(&graph).unwrap().counter >= 1,
-            "healed context tag should have advanced past genesis"
+        // Exactly one: the failed publish persisted nothing, so the heal mints
+        // `next_local(GENESIS)`. `>= 1` would also accept a double-mint, which is
+        // the bug G5's publish-first ordering exists to prevent.
+        let healed_tag = store.graph_context_tag(&graph).unwrap();
+        assert_eq!(
+            1, healed_tag.counter,
+            "the heal must mint exactly one tag past genesis"
+        );
+
+        // Healing converges rather than oscillating: a third import of the same
+        // document now finds `current == context`, so it neither republishes nor
+        // mints a new tag. The LWW register (G5) has reached a fixpoint.
+        manager
+            .import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+        assert_eq!(store.graph_context(&graph).unwrap(), stored);
+        assert_eq!(
+            store.graph_context_tag(&graph).unwrap(),
+            healed_tag,
+            "an unchanged re-import must not mint a new context tag"
         );
     }
 
@@ -3348,7 +3905,13 @@ mod tests {
                     "datePublished": "2025-01-01",
                     "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
                     "conformsTo": {"@id": "#profile"},
-                    "hasPart": {"@id": "./data/plain.txt"}
+                    // Profile artifacts are data entities, so RO-Crate 1.2
+                    // requires the root to link them by `hasPart` as well.
+                    "hasPart": [
+                        {"@id": "./data/plain.txt"},
+                        {"@id": "./mode.json"},
+                        {"@id": "./schema.json"}
+                    ]
                 },
                 {
                     "@id": "#profile",

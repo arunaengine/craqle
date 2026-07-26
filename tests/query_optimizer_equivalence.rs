@@ -14,6 +14,11 @@ mod tests {
 
     const GRAPH_COUNT: usize = 400;
     const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    /// Above `sparql::EXPLICIT_DATASET_GRAPH_LIMIT`, so an explicit visible
+    /// list runs through the union view with a `Set` graph filter — the path
+    /// where a bound object used to enumerate every corpus graph holding
+    /// `(p, o)` no matter how few graphs the caller could actually see.
+    const UNION_VISIBLE_GRAPHS: usize = 40;
 
     fn term_iri(iri: &str) -> EncodedTerm {
         EncodedTerm(format!("<{iri}>"))
@@ -393,5 +398,278 @@ mod tests {
         // the "01" spelling and must still match.
         let visible_count = (0..GRAPH_COUNT).filter(|idx| idx % 7 != 0).count();
         assert_eq!(optimized.len(), visible_count);
+    }
+
+    // ── Bound-object patterns under a small visible set (finding R5) ─────────
+
+    fn bound_object_shapes() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "bound_object_type",
+                "SELECT ?d WHERE { ?d a <http://schema.org/Dataset> }".to_string(),
+            ),
+            (
+                "bound_object_only",
+                "SELECT ?s ?p WHERE { ?s ?p <http://schema.org/File> }".to_string(),
+            ),
+            (
+                "bound_object_graph_var",
+                "SELECT ?g ?d WHERE { GRAPH ?g { ?d a <http://schema.org/Dataset> } }".to_string(),
+            ),
+            (
+                "bound_object_typed_literal",
+                "SELECT ?d WHERE { ?d <http://schema.org/version> \
+                 \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> }"
+                    .to_string(),
+            ),
+            (
+                "bound_object_exact_part",
+                "SELECT ?d WHERE { ?d <http://schema.org/hasPart> <urn:eq:crate:0000/file-1> }"
+                    .to_string(),
+            ),
+            (
+                "bound_object_join_chain",
+                "SELECT ?d ?fn WHERE { ?d a <http://schema.org/Dataset> . \
+                 ?d <http://schema.org/hasPart> ?f . ?f a <http://schema.org/File> . \
+                 ?f <http://schema.org/name> ?fn }"
+                    .to_string(),
+            ),
+            (
+                "bound_object_ask",
+                "ASK { ?s ?p <http://schema.org/File> }".to_string(),
+            ),
+        ]
+    }
+
+    /// A caller seeing 40 of 400 graphs must get exactly the same answer
+    /// whether the visible set is handed over as an explicit list (which now
+    /// walks the visible members for bound objects) or as a lazy predicate
+    /// (which enumerates index candidates). Both still gate every graph
+    /// through `graph_is_visible` and every quad through `quad_is_visible`.
+    #[test]
+    fn patterns_respect_visibility() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            tmp.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let corpus = seeded_corpus(&node);
+
+        let listed: Vec<GraphId> = corpus.iter().take(UNION_VISIBLE_GRAPHS).cloned().collect();
+        let allowed: BTreeSet<String> = listed
+            .iter()
+            .map(|graph| graph.as_str().to_string())
+            .collect();
+        let by_predicate = |graph: &GraphId| allowed.contains(graph.as_str());
+
+        for (label, sparql) in bound_object_shapes() {
+            let from_list = canonical_rows(node.query_graphs(&listed, &sparql).unwrap());
+            let from_predicate =
+                canonical_rows(node.query_graphs_with(by_predicate, &sparql).unwrap());
+            assert_eq!(
+                from_list, from_predicate,
+                "{label}: explicit visible list diverged from the visibility predicate\n\
+                 query: {sparql}"
+            );
+            assert!(!from_list.is_empty(), "{label}: shape must return rows");
+
+            // Planner-on vs planner-off identity over the same visible set.
+            assert_equivalent(&node, label, &sparql);
+        }
+
+        // Soundness: no graph outside the visible set may surface.
+        let graphs = solution_rows(
+            node.query_graphs(
+                &listed,
+                "SELECT ?g WHERE { GRAPH ?g { ?d a <http://schema.org/Dataset> } }",
+            )
+            .unwrap(),
+        );
+        assert_eq!(graphs.len(), UNION_VISIBLE_GRAPHS);
+        for row in &graphs {
+            let name = row.get("g").unwrap().0.trim_matches(['<', '>']).to_string();
+            assert!(allowed.contains(&name), "invisible graph leaked: {name}");
+        }
+    }
+
+    // ── FILTER / effective-boolean-value matrix (finding R6) ─────────────────
+
+    /// Expected SPARQL effective boolean value. `Error` means "not an EBV
+    /// type", which a FILTER turns into an eliminated solution — distinct from
+    /// `False`, which `!` flips back to a kept row.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Ebv {
+        True,
+        False,
+        Error,
+    }
+
+    const EBV_VALUE: &str = "urn:eq:ebv:value";
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema";
+
+    /// One row per term shape the expression evaluator has to classify. The
+    /// expectations are spareval's EBV table, which craqle must not perturb by
+    /// routing term externalization through its own cache.
+    fn ebv_matrix() -> Vec<(&'static str, String, Ebv)> {
+        let typed = |value: &str, datatype: &str| format!("\"{value}\"^^<{XSD}#{datatype}>");
+        vec![
+            ("bool-true", typed("true", "boolean"), Ebv::True),
+            ("bool-false", typed("false", "boolean"), Ebv::False),
+            ("str-empty", "\"\"".to_string(), Ebv::False),
+            ("str-plain", "\"text\"".to_string(), Ebv::True),
+            ("xsd-str-empty", typed("", "string"), Ebv::False),
+            ("xsd-str-plain", typed("text", "string"), Ebv::True),
+            ("int-zero", typed("0", "integer"), Ebv::False),
+            ("int-positive", typed("5", "integer"), Ebv::True),
+            ("int-negative", typed("-3", "integer"), Ebv::True),
+            ("decimal-zero", typed("0.0", "decimal"), Ebv::False),
+            ("decimal-positive", typed("1.5", "decimal"), Ebv::True),
+            ("double-zero", typed("0.0E0", "double"), Ebv::False),
+            ("double-positive", typed("1.0E0", "double"), Ebv::True),
+            ("double-nan", typed("NaN", "double"), Ebv::False),
+            ("float-zero", typed("0", "float"), Ebv::False),
+            ("float-positive", typed("2.5", "float"), Ebv::True),
+            ("lang-string", "\"text\"@en".to_string(), Ebv::Error),
+            ("date", typed("2026-01-01", "date"), Ebv::Error),
+            (
+                "custom-typed",
+                "\"abc\"^^<urn:eq:ebv:custom>".to_string(),
+                Ebv::Error,
+            ),
+            ("iri", "<urn:eq:ebv:target>".to_string(), Ebv::Error),
+            ("blank", "_:ebvBlank".to_string(), Ebv::Error),
+        ]
+    }
+
+    fn ebv_entity(name: &str) -> String {
+        format!("<urn:eq:ebv:e:{name}>")
+    }
+
+    fn seed_ebv_graph(node: &CraqleNode) {
+        let graph = GraphId::new("urn:eq:ebv:graph");
+        let changes = ebv_matrix()
+            .into_iter()
+            .map(|(name, literal, _)| MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: EncodedTerm(ebv_entity(name)),
+                predicate: term_iri(EBV_VALUE),
+                object: EncodedTerm(literal),
+            })
+            .collect();
+        node.apply_changes_unchecked(&graph, changes).unwrap();
+        node.ensure_query_indexes();
+    }
+
+    /// Entities kept by `FILTER(<expression>)`, asserted identical with the
+    /// planner on and off.
+    fn ebv_entities(node: &CraqleNode, expression: &str) -> BTreeSet<String> {
+        let sparql = format!("SELECT ?e WHERE {{ ?e <{EBV_VALUE}> ?v . FILTER({expression}) }}");
+        let entities = |optimize: bool| -> BTreeSet<String> {
+            solution_rows(
+                node.query_graphs_with_planner(|_: &GraphId| true, &sparql, optimize)
+                    .unwrap(),
+            )
+            .into_iter()
+            .map(|row| row.get("e").expect("?e must be bound").0.clone())
+            .collect()
+        };
+        let optimized = entities(true);
+        assert_eq!(
+            optimized,
+            entities(false),
+            "planner changed FILTER({expression})"
+        );
+        optimized
+    }
+
+    fn ebv_expecting(wanted: Ebv) -> BTreeSet<String> {
+        ebv_matrix()
+            .into_iter()
+            .filter(|(_, _, ebv)| *ebv == wanted)
+            .map(|(name, _, _)| ebv_entity(name))
+            .collect()
+    }
+
+    #[test]
+    fn hooks_preserve_booleans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            tmp.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        seed_ebv_graph(&node);
+
+        // FILTER(?v) keeps exactly the true-EBV rows; type errors drop out.
+        assert_eq!(ebv_entities(&node, "?v"), ebv_expecting(Ebv::True));
+        // `!` flips false to true but leaves type errors dropped, so this is
+        // the only way to tell "EBV false" apart from "not an EBV type".
+        assert_eq!(ebv_entities(&node, "!?v"), ebv_expecting(Ebv::False));
+        // Boolean connectives must not turn a type error into a verdict.
+        assert_eq!(ebv_entities(&node, "?v || ?v"), ebv_expecting(Ebv::True));
+        assert_eq!(ebv_entities(&node, "?v && ?v"), ebv_expecting(Ebv::True));
+        assert_eq!(
+            ebv_entities(&node, "IF(?v, true, false)"),
+            ebv_expecting(Ebv::True)
+        );
+
+        let errors = ebv_expecting(Ebv::Error);
+        assert!(!errors.is_empty());
+        assert!(ebv_entities(&node, "?v").is_disjoint(&errors));
+        assert!(ebv_entities(&node, "!?v").is_disjoint(&errors));
+    }
+
+    #[test]
+    fn hooks_preserve_classification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            tmp.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        seed_ebv_graph(&node);
+
+        let all: BTreeSet<String> = ebv_matrix()
+            .into_iter()
+            .map(|(name, _, _)| ebv_entity(name))
+            .collect();
+
+        // Externalization must reproduce the term kind, not just its EBV.
+        assert_eq!(
+            ebv_entities(&node, "isIRI(?v)"),
+            BTreeSet::from([ebv_entity("iri")])
+        );
+        assert_eq!(
+            ebv_entities(&node, "isBlank(?v)"),
+            BTreeSet::from([ebv_entity("blank")])
+        );
+        let literals: BTreeSet<String> = all
+            .difference(&BTreeSet::from([ebv_entity("iri"), ebv_entity("blank")]))
+            .cloned()
+            .collect();
+        assert_eq!(ebv_entities(&node, "isLiteral(?v)"), literals);
+
+        // Datatypes survive the round trip through the term cache.
+        assert_eq!(
+            ebv_entities(&node, &format!("datatype(?v) = <{XSD}#integer>")),
+            BTreeSet::from([
+                ebv_entity("int-zero"),
+                ebv_entity("int-positive"),
+                ebv_entity("int-negative"),
+            ])
+        );
+        assert_eq!(
+            ebv_entities(&node, "lang(?v) = \"en\""),
+            BTreeSet::from([ebv_entity("lang-string")])
+        );
+
+        // STR() is defined for IRIs and literals but not for blank nodes,
+        // where SPARQL raises a type error and the solution is eliminated.
+        let stringable: BTreeSet<String> = all
+            .difference(&BTreeSet::from([ebv_entity("blank")]))
+            .cloned()
+            .collect();
+        assert_eq!(ebv_entities(&node, "STRLEN(STR(?v)) >= 0"), stringable);
     }
 }

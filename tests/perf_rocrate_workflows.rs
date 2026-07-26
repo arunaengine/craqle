@@ -91,9 +91,16 @@ mod tests {
             entity_count as i64
         );
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, &format!("DOC-{probe:06}"), 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: &format!("DOC-{probe:06}"),
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(
@@ -173,9 +180,16 @@ mod tests {
             entity_count as i64
         );
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, &format!("APPEND-{probe:06}"), 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: &format!("APPEND-{probe:06}"),
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(
@@ -219,9 +233,16 @@ mod tests {
             .unwrap();
         let replace_elapsed = replace_start.elapsed();
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, "updated replacement marker", 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "updated replacement marker",
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(!hits.is_empty());
@@ -261,9 +282,16 @@ mod tests {
         .unwrap();
         let update_elapsed = update_start.elapsed();
 
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, "Incremental Update Marker", 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: "Incremental Update Marker",
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(!hits.is_empty());
@@ -302,9 +330,16 @@ mod tests {
         let replace_elapsed = replace_start.elapsed();
 
         let probe = entity_count + extra_count - 1;
+        node.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = node
-            .search(&reader, &format!("DOC-{probe:06}"), 10)
+            .search(
+                &reader,
+                SearchRequest {
+                    query: &format!("DOC-{probe:06}"),
+                    limit: 10,
+                },
+            )
             .unwrap();
         let search_elapsed = search_start.elapsed();
         assert!(!hits.is_empty());

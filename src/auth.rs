@@ -171,13 +171,12 @@ impl Authorizer for GrantAuthorizer {
             return Ok(());
         }
 
-        let matching_grants: Vec<&PermissionGrant> = self
-            .grants
-            .iter()
-            .filter(|grant| grant.level.allows(action))
-            .collect();
+        // Test for the existence of a usable grant without materializing them:
+        // `visible_graphs` and the search filters call this once per candidate
+        // graph, and the collected `Vec` was allocated only to be measured.
+        let has_usable_grant = self.grants.iter().any(|grant| grant.level.allows(action));
 
-        if matching_grants.is_empty() || policy.permission_paths.is_empty() {
+        if !has_usable_grant || policy.permission_paths.is_empty() {
             return Err(AuthorizationError::PermissionDenied {
                 action,
                 graph: graph.as_str().to_string(),
