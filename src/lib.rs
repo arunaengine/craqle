@@ -2344,7 +2344,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "search")]
     fn crate_request(graph: &GraphId, name: &str) -> CreateCrateRequest {
         CreateCrateRequest::new(
             graph.clone(),
@@ -2495,6 +2494,157 @@ mod tests {
             node.search.search("racyneedle", 10).unwrap().len(),
             "the upsert and the refill each produced a document for one subject"
         );
+    }
+
+    /// Two replicas of one topic: `origin` publishes, `replica` picks the
+    /// records up through `reconcile_irokle` into its own store.
+    struct ReplicaPair {
+        _dir: tempfile::TempDir,
+        irokle: irokle::Irokle,
+        origin: CraqleNode,
+        replica: CraqleNode,
+    }
+
+    fn replica_pair() -> ReplicaPair {
+        let dir = tempfile::tempdir().unwrap();
+        let irokle = irokle::Irokle::builder().build().unwrap();
+        let open = |name: &str| {
+            CraqleNode::open_with_options(
+                dir.path().join(name),
+                CraqleOptions::new()
+                    .with_search_storage(SearchStorage::Memory)
+                    .with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+            )
+            .unwrap()
+        };
+        ReplicaPair {
+            origin: open("origin"),
+            replica: open("replica"),
+            irokle,
+            _dir: dir,
+        }
+    }
+
+    fn keyword_object(value: &str) -> EncodedTerm {
+        EncodedTerm(format!("\"{value}\""))
+    }
+
+    /// One keyword write on the crate root, published as a single record.
+    fn write_keyword(node: &CraqleNode, graph: &GraphId, value: &str) {
+        node.insert_quads(
+            graph,
+            vec![(
+                EncodedTerm::from_named_node(&graph.0),
+                EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                keyword_object(value),
+            )],
+        )
+        .unwrap();
+    }
+
+    fn has_keyword(node: &CraqleNode, graph: &GraphId, value: &str) -> bool {
+        let object = keyword_object(value);
+        node.graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .iter()
+            .any(|quad| quad.object == object)
+    }
+
+    fn topic_cursor(node: &CraqleNode, topic: irokle::TopicId) -> Option<Vec<u8>> {
+        node.store.applied_topic_clock(topic.as_bytes()).unwrap()
+    }
+
+    /// G3 — a retryable apply failure must stop the pass at that record, and a
+    /// later pass must still deliver it.
+    ///
+    /// Quarantining it instead loses it twice over: the cursor moves past it,
+    /// and the record behind it raises the graph clock past its dot, so the
+    /// dedup gate would drop it even on redelivery. The replica then stays
+    /// short one write forever, with nothing left to repair it.
+    #[test]
+    fn stall_retries_record() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:reconcile-stall");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "stall"))
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+
+        // Two writes by one actor: the second is what makes a skipped first
+        // permanent, by raising the clock past its dot.
+        write_keyword(&pair.origin, &graph, "first");
+        write_keyword(&pair.origin, &graph, "second");
+
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let cursor = topic_cursor(&pair.replica, topic);
+
+        pair.replica.replication.arm_apply_failure();
+        let error = pair.replica.reconcile_irokle().unwrap_err();
+        assert!(
+            matches!(error, CraqleError::Merge(MergeError::Store(_))),
+            "the stall must reach the caller, got `{error}`"
+        );
+        assert!(
+            !pair.replica.replication.take_apply_failure(),
+            "the injected failure never fired, so this test proves nothing"
+        );
+        assert!(!has_keyword(&pair.replica, &graph, "first"));
+        assert!(
+            !has_keyword(&pair.replica, &graph, "second"),
+            "a record behind the stalled one must not apply"
+        );
+        assert_eq!(
+            cursor,
+            topic_cursor(&pair.replica, topic),
+            "the cursor must stay at the record that failed"
+        );
+
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(has_keyword(&pair.replica, &graph, "first"));
+        assert!(has_keyword(&pair.replica, &graph, "second"));
+        assert_eq!(
+            pair.origin.graph_fingerprint(&graph).unwrap(),
+            pair.replica.graph_fingerprint(&graph).unwrap(),
+            "the replicas must converge once the failure is gone"
+        );
+    }
+
+    /// A record no retry could ever accept stays quarantined: the pass skips
+    /// it and still applies the records behind it.
+    #[test]
+    fn rejection_skips_record() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:reconcile-rejection");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "rejection"))
+            .unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+
+        // A change naming a graph its own event does not: rejected on decode,
+        // every time it is offered.
+        let elsewhere = GraphId::new("urn:test:reconcile-elsewhere");
+        pair.irokle
+            .open_topic::<CraqleGraphEvent>(topic)
+            .unwrap()
+            .publish(CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes: vec![MaterializedQuadChange::Insert {
+                    graph: elsewhere.clone(),
+                    subject: EncodedTerm::from_named_node(&elsewhere.0),
+                    predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    object: keyword_object("injected"),
+                }],
+            })
+            .unwrap();
+        write_keyword(&pair.origin, &graph, "after");
+
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(
+            has_keyword(&pair.replica, &graph, "after"),
+            "a quarantined record must not hold back the ones behind it"
+        );
+        assert!(!pair.replica.contains_graph(&elsewhere).unwrap());
     }
 
     /// A panic inside the indexer drain must not take the worker thread down.
