@@ -144,6 +144,24 @@ pub enum CraqleSyncError {
     InvalidEvent(String),
 }
 
+impl CraqleSyncError {
+    /// Whether the bytes read are what failed, rather than the transport or
+    /// storage carrying them. No retry can clear these.
+    pub fn rejects_record(&self) -> bool {
+        match self {
+            Self::InvalidEvent(_) => true,
+            Self::Store(error) => error.rejects_record(),
+            Self::Irokle(error) => matches!(
+                error,
+                irokle::Error::Encode(_)
+                    | irokle::Error::Decode(_)
+                    | irokle::Error::EventTypeMismatch { .. }
+            ),
+            _ => false,
+        }
+    }
+}
+
 pub(crate) type SyncResult<T> = std::result::Result<T, CraqleSyncError>;
 
 pub(crate) trait CraqleGraphSync: Send + Sync {

@@ -132,6 +132,7 @@ impl CraqleError {
         match self {
             Self::Merge(MergeError::InputRejected(_)) | Self::SyncInputRejected(_) => true,
             Self::Merge(MergeError::Store(error)) | Self::Store(error) => error.rejects_record(),
+            Self::Sync(error) => error.rejects_record(),
             _ => false,
         }
     }
@@ -588,6 +589,7 @@ impl CraqleOptions {
 
 /// What one topic's reconcile pass applied, and the failure that stopped it.
 /// Carried together so a stall cannot hide the prefix that landed before it.
+#[derive(Default)]
 struct TopicPass {
     applied: usize,
     stalled: Option<CraqleError>,
@@ -800,7 +802,20 @@ impl CraqleNode {
         let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
         // A history read that fails is retryable, so it stalls its topic. A
         // silent skip would leave the topic unread for the rest of the process.
-        let catchup = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
+        let catchup = match sync.topic_records_since(topic_id, stored_cursor.as_deref()) {
+            Ok(catchup) => catchup,
+            // Except when the stored history itself cannot be decoded: no retry
+            // clears that, so the topic is quarantined instead of stalled.
+            Err(error) if error.rejects_record() => {
+                tracing::warn!(
+                    topic = %topic_id,
+                    %error,
+                    "quarantined an undecodable craqle topic history",
+                );
+                return Ok(TopicPass::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let sync::TopicCatchup {
             records,
