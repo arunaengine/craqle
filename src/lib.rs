@@ -465,12 +465,6 @@ fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
     }
 }
 
-/// Main application handle for local RO-Crate operations.
-///
-/// Prefer this root API for service integration. It offers authorization-aware
-/// RO-Crate creation, entity append/update operations, JSON-LD export, search,
-/// and replication message handling without requiring direct access to the
-/// lower-level storage or replication internals.
 /// A graph whose reindex scan was pinned at `upto`. Only queue entries at or
 /// below that token were covered by the scan.
 struct ScannedGraph {
@@ -478,6 +472,8 @@ struct ScannedGraph {
     upto: u64,
 }
 
+/// Main application handle for local RO-Crate operations: authorization-aware
+/// crate writes, JSON-LD export, search, and replication.
 pub struct CraqleNode {
     actor: ActorId,
     store: Arc<GraphStore>,

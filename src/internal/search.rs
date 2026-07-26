@@ -148,10 +148,17 @@ impl StallHook {
         }
     }
 
-    /// Spin until a stalling thread is inside the window.
+    /// Spin until a stalling thread is inside the window. Panics rather than
+    /// hanging if that thread died before entering it.
     fn wait_entered(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !self.entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stall window was never entered"
+            );
             std::hint::spin_loop();
+            std::thread::yield_now();
         }
     }
 }
