@@ -2760,6 +2760,38 @@ mod tests {
         );
     }
 
+    /// An open must not fail on a reconcile a retry clears, or a node whose
+    /// peer blipped once would refuse to start at all.
+    #[test]
+    fn open_retries_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let irokle = irokle::Irokle::builder().build().unwrap();
+        let origin = CraqleNode::open_with_options(
+            dir.path().join("origin"),
+            CraqleOptions::new()
+                .with_search_storage(SearchStorage::Memory)
+                .with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+        )
+        .unwrap();
+        let graph = GraphId::new("urn:test:open-retry");
+        origin
+            .create_crate(&writer_auth(), crate_request(&graph, "retry"))
+            .unwrap();
+
+        let (sync, options) = armed_sync(irokle);
+        sync.arm_history_failure();
+        let replica = CraqleNode::open_with_options(dir.path().join("replica"), options)
+            .expect("a reconcile a retry clears must not fail the open");
+        assert!(
+            !sync.take_history_failure(),
+            "the injected failure never fired, so this test proves nothing"
+        );
+        assert!(
+            replica.contains_graph(&graph).unwrap(),
+            "the retry must have caught the node up"
+        );
+    }
+
     /// A term too large for the store is content, not weather: it must be
     /// quarantined at the decode boundary rather than poison-pill its topic.
     #[test]
