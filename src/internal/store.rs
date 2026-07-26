@@ -624,6 +624,12 @@ pub struct GraphStore {
     /// between an acknowledgement's token read and its commit.
     #[cfg(test)]
     fts_ack_stall: Mutex<Option<std::time::Duration>>,
+    /// Set by a test to stall a rebuild between its durable scan and the
+    /// install; `rebuild_stalled` publishes that the window has been entered.
+    #[cfg(test)]
+    rebuild_stall: Mutex<Option<std::time::Duration>>,
+    #[cfg(test)]
+    rebuild_stalled: std::sync::atomic::AtomicBool,
     /// Serializes every durable mutation of the FTS queues: minting a dirty
     /// token and staging its entry, the acknowledgement check-and-remove, and
     /// the queue clears. Without it an enqueue can land between an
@@ -1124,15 +1130,16 @@ impl GraphStore {
     }
 
     /// Rebuild every derived structure from the durable `quads` keyspace, the
-    /// source of truth. This is the repair action for derived-state register
-    /// rows 1–3 and 6.
+    /// source of truth. The clock mirror is kept: those commits did land.
     ///
-    /// The clock mirror is kept: it is published by commits that did land, so
-    /// resetting it here would move a graph's clock backwards.
+    /// Scan and install share the write lock, so no commit can publish between
+    /// them and be erased. The scan takes no other lock, so it cannot deadlock.
     fn rebuild_indexes(&self) -> Result<()> {
-        let rebuilt = self.build_indexes()?;
         {
             let mut indexes = self.indexes_write();
+            let rebuilt = self.build_indexes()?;
+            #[cfg(test)]
+            self.stall_in_rebuild();
             indexes.graph_subjects = rebuilt.graph_subjects;
             indexes.by_graph_subject = rebuilt.by_graph_subject;
             indexes.derived = None;
@@ -1183,6 +1190,34 @@ impl GraphStore {
             .commit_stall
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Stall a rebuild between its scan and its install. Test-only.
+    #[cfg(test)]
+    fn stall_in_rebuild(&self) {
+        let stall = *self
+            .rebuild_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(delay) = stall {
+            self.rebuild_stalled.store(true, Ordering::SeqCst);
+            std::thread::sleep(delay);
+        }
+    }
+
+    /// Make the next rebuild pause between its scan and its install. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_rebuild_stall(&self, delay: std::time::Duration) {
+        *self
+            .rebuild_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Whether a rebuild is inside its stall. Test-only.
+    #[cfg(test)]
+    pub(crate) fn rebuild_stalled(&self) -> bool {
+        self.rebuild_stalled.load(Ordering::SeqCst)
     }
 
     /// Stall between an acknowledgement's token read and its commit. Test-only.
@@ -1898,6 +1933,10 @@ impl GraphStore {
             commit_stall: Mutex::new(None),
             #[cfg(test)]
             fts_ack_stall: Mutex::new(None),
+            #[cfg(test)]
+            rebuild_stall: Mutex::new(None),
+            #[cfg(test)]
+            rebuild_stalled: std::sync::atomic::AtomicBool::new(false),
             fts_queue_lock: Mutex::new(()),
             dirty_counter: AtomicU64::new(1),
             diagnostics_computed: AtomicU64::new(0),
@@ -4307,6 +4346,72 @@ mod tests {
                 "a reader past the new clock must see the index that clock describes"
             );
         });
+    }
+
+    /// Spin until a rebuild is inside its stall, failing rather than hanging if
+    /// the rebuilding thread died before it got there.
+    fn await_rebuild_stall(store: &GraphStore) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.rebuild_stalled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rebuild never entered its stall"
+            );
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
+    }
+
+    /// The graph's quads as the index sees them and as the store holds them.
+    fn index_and_store(
+        store: &GraphStore,
+        graph_id: TermId,
+    ) -> (Vec<EncodedQuad>, Vec<EncodedQuad>) {
+        let mut indexed = Vec::new();
+        store
+            .for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+                indexed.push(quad);
+                Ok(())
+            })
+            .unwrap();
+        let mut stored = Vec::new();
+        store
+            .for_each_stored_quad(graph_id, |quad, _| {
+                stored.push(quad);
+                Ok(())
+            })
+            .unwrap();
+        let key = |quad: &EncodedQuad| (quad.subject, quad.predicate, quad.object);
+        indexed.sort_by_key(key);
+        stored.sort_by_key(key);
+        (indexed, stored)
+    }
+
+    /// A rebuild scans the durable quads and then installs what it read. While
+    /// the scan ran unlocked, a commit landing inside that window was erased
+    /// from the index by the install, yet kept the clock it had published.
+    #[test]
+    fn rebuild_keeps_commits() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:rebuild-race");
+        store.create_graph(&graph).unwrap();
+        let seeded = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:seeded"));
+        commit_add(&store, &graph, seeded);
+        let raced = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:raced"));
+
+        store.set_rebuild_stall(std::time::Duration::from_millis(300));
+        std::thread::scope(|scope| {
+            scope.spawn(|| store.rebuild_indexes().unwrap());
+            await_rebuild_stall(&store);
+            commit_add(&store, &graph, raced);
+        });
+
+        let (indexed, stored) = index_and_store(&store, raced.graph);
+        assert!(
+            indexed.contains(&raced),
+            "a commit that landed during a rebuild must survive its install"
+        );
+        assert_eq!(stored, indexed, "the index must describe the stored quads");
     }
 
     /// Repopulating the object-order cache reads the index, then decodes and
