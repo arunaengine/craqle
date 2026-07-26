@@ -3,7 +3,7 @@ mod support;
 use craqle::*;
 use serde::{Deserialize, Serialize};
 
-use support::{CraqleCluster, QueryOptions};
+use support::{CraqleCluster, QueryOptions, with_watchdog};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
 #[irokle(type_id = "craqle.test.other-app.v1")]
@@ -321,43 +321,47 @@ fn read_requires_matching_path_while_write_implies_read() {
     assert!(!writer_rows.is_empty());
 }
 
+/// Wrapped: this hung once under extreme load, and a hang is a defect the
+/// harness should report rather than a run it should burn.
 #[test]
 fn write_access_is_required_for_updates() {
-    let dir = tempfile::tempdir().unwrap();
-    let node = CraqleNode::open(dir.path()).unwrap();
-    let graph = GraphId::new("urn:test:update");
-    let writer = writer_auth();
-    let reader = reader_auth();
+    with_watchdog("write_access_is_required_for_updates", || {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:update");
+        let writer = writer_auth();
+        let reader = reader_auth();
 
-    node.create_crate(
-        &writer,
-        CreateCrateRequest::new(
-            graph.clone(),
-            "Protected Dataset",
-            "Only writers may mutate this crate",
-            "2025-01-01",
-            Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            GraphPolicy {
-                public: false,
-                permission_paths: vec!["/datasets/public/demo".to_string()],
-            },
-        ),
-    )
-    .unwrap();
-
-    let err = node
-        .apply_sparql_update(
-            &reader,
-            "INSERT DATA { GRAPH <urn:test:update> { <urn:test:item> schema:name \"forbidden\" } }",
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Protected Dataset",
+                "Only writers may mutate this crate",
+                "2025-01-01",
+                Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                GraphPolicy {
+                    public: false,
+                    permission_paths: vec!["/datasets/public/demo".to_string()],
+                },
+            ),
         )
-        .unwrap_err();
-    assert!(matches!(err, CraqleError::Authorization(_)));
+        .unwrap();
 
-    node.apply_sparql_update(
-        &writer,
-        "INSERT { GRAPH <urn:test:update> { ?root schema:hasPart <urn:test:item> . <urn:test:item> rdf:type schema:MediaObject . <urn:test:item> schema:name \"allowed\" } } WHERE { GRAPH <urn:test:update> { ?root rdf:type schema:Dataset . ?root schema:datePublished ?date . } }",
-    )
-    .unwrap();
+        let err = node
+            .apply_sparql_update(
+                &reader,
+                "INSERT DATA { GRAPH <urn:test:update> { <urn:test:item> schema:name \"forbidden\" } }",
+            )
+            .unwrap_err();
+        assert!(matches!(err, CraqleError::Authorization(_)));
+
+        node.apply_sparql_update(
+            &writer,
+            "INSERT { GRAPH <urn:test:update> { ?root schema:hasPart <urn:test:item> . <urn:test:item> rdf:type schema:MediaObject . <urn:test:item> schema:name \"allowed\" } } WHERE { GRAPH <urn:test:update> { ?root rdf:type schema:Dataset . ?root schema:datePublished ?date . } }",
+        )
+        .unwrap();
+    });
 }
 
 #[test]
