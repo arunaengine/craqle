@@ -55,7 +55,42 @@ impl CraqleGraphEvent {
 
 pub(crate) struct TopicCatchup {
     pub records: Vec<EventRecord<CraqleGraphEvent>>,
-    pub cursor: Option<Vec<u8>>,
+    pub cursor: TopicCursor,
+}
+
+/// How far a reconcile pass has consumed a topic's history.
+///
+/// Records are consumed one at a time, so a record the pass could not apply
+/// leaves the cursor behind it and the next pass redelivers it (G3).
+pub(crate) struct TopicCursor {
+    clock: irokle::ActorClock,
+    consumed: bool,
+}
+
+impl TopicCursor {
+    fn resuming(clock: irokle::ActorClock) -> Self {
+        Self {
+            clock,
+            consumed: false,
+        }
+    }
+
+    pub(crate) fn consume(&mut self, record: &EventRecord<CraqleGraphEvent>) {
+        self.clock
+            .observe(record.meta.actor_id, record.meta.actor_seq);
+        self.consumed = true;
+    }
+
+    /// `None` until a record has been consumed, so a pass that stalls on the
+    /// first one leaves the stored cursor untouched.
+    pub(crate) fn encode(&self) -> SyncResult<Option<Vec<u8>>> {
+        if !self.consumed {
+            return Ok(None);
+        }
+        postcard::to_allocvec(&self.clock)
+            .map(Some)
+            .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -530,26 +565,15 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         topic_id: irokle::TopicId,
         cursor: Option<&[u8]>,
     ) -> SyncResult<TopicCatchup> {
-        let mut clock: irokle::ActorClock = match cursor {
+        let clock: irokle::ActorClock = match cursor {
             Some(bytes) => postcard::from_bytes(bytes).unwrap_or_default(),
             None => irokle::ActorClock::default(),
         };
         let topic = self.node.open_topic::<CraqleGraphEvent>(topic_id)?;
         let records = topic.history_after(&clock, HistoryOrder::OldestFirst)?;
-        if records.is_empty() {
-            return Ok(TopicCatchup {
-                records,
-                cursor: None,
-            });
-        }
-        for record in &records {
-            clock.observe(record.meta.actor_id, record.meta.actor_seq);
-        }
-        let cursor = postcard::to_allocvec(&clock)
-            .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
         Ok(TopicCatchup {
             records,
-            cursor: Some(cursor),
+            cursor: TopicCursor::resuming(clock),
         })
     }
 

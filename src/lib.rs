@@ -125,6 +125,21 @@ pub enum CraqleError {
     MultiGraphUpdateUnsupported,
 }
 
+impl CraqleError {
+    /// Whether this rejects a record for what it contains, rather than
+    /// reporting a failure that could go the other way next time.
+    ///
+    /// A rejected record can never apply, so a reconcile may quarantine it and
+    /// move on. Everything else — store IO above all — is retryable, and a
+    /// reconcile that skipped past it would lose the record for good (G3).
+    pub fn rejects_record(&self) -> bool {
+        matches!(
+            self,
+            Self::Merge(MergeError::InputRejected(_)) | Self::SyncInputRejected(_)
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CraqleError>;
 
 /// Request-path durability policy for callers with an external durable WAL.
@@ -733,15 +748,32 @@ impl CraqleNode {
         };
 
         let mut applied = 0;
+        let mut stalled = None;
         for topic_id in sync.craqle_topic_ids()? {
-            applied += self.reconcile_irokle_topic(sync, topic_id)?;
+            match self.reconcile_irokle_topic(sync, topic_id) {
+                Ok(count) => applied += count,
+                // Topics carry independent cursors, so one stall holds back
+                // only its own topic. The first is reported once the rest have
+                // had their pass.
+                Err(error) => stalled = stalled.or(Some(error)),
+            }
         }
         if applied > 0 {
             self.persist_fjall()?;
         }
-        Ok(applied)
+        match stalled {
+            Some(error) => Err(error),
+            None => Ok(applied),
+        }
     }
 
+    /// Apply a topic's outstanding records in order, stopping at the first one
+    /// that failed for a reason a retry could clear.
+    ///
+    /// Skipping such a record and carrying on would lose it twice over: the
+    /// cursor would move past it, and a later record from the same actor would
+    /// raise the graph clock past its dot, so even a redelivery would be
+    /// dropped as already applied (G3).
     fn reconcile_irokle_topic(
         &self,
         sync: &Arc<dyn sync::CraqleGraphSync>,
@@ -760,25 +792,47 @@ impl CraqleNode {
             }
         };
 
+        let sync::TopicCatchup {
+            records,
+            mut cursor,
+        } = catchup;
+
         let mut applied = 0;
-        for record in &catchup.records {
+        let mut stalled = None;
+        for record in &records {
             match self.apply_reconciled_record(sync, topic_id, record) {
                 Ok(true) => applied += 1,
                 Ok(false) => {}
-                Err(error) => {
+                Err(error) if error.rejects_record() => {
                     tracing::warn!(
                         topic = %topic_id,
                         %error,
                         "quarantined craqle record during reconcile",
                     );
                 }
+                Err(error) => {
+                    tracing::warn!(
+                        topic = %topic_id,
+                        %error,
+                        "stalled craqle reconcile at a retryable failure",
+                    );
+                    stalled = Some(error);
+                    break;
+                }
             }
+            cursor.consume(record);
         }
-        if let Some(cursor) = catchup.cursor {
+
+        // Persisted even when the pass stalled: it covers exactly the prefix
+        // that was consumed, so the retry resumes at the failed record.
+        if let Some(cursor) = cursor.encode()? {
             self.store
                 .set_applied_topic_clock(topic_id.as_bytes(), &cursor)?;
         }
-        Ok(applied)
+        match stalled {
+            Some(error) => Err(error),
+            None => Ok(applied),
+        }
     }
 
     fn apply_reconciled_record(
