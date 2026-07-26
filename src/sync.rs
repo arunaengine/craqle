@@ -750,7 +750,7 @@ fn check_term(term: &EncodedTerm) -> SyncResult<()> {
             text.len()
         )));
     }
-    let shaped = (text.starts_with('<') && text.ends_with('>') && text.len() > 1)
+    let shaped = (text.starts_with('<') && text.ends_with('>'))
         || (text.starts_with('"') && text.len() > 1)
         || text.starts_with("_:");
     if shaped {
