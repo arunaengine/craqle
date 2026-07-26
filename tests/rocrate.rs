@@ -1743,6 +1743,188 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Writing to an orphaned entity (G6).
+    //
+    // Orphan hiding empties a subject's visible view, so a diff against that
+    // view emits no deletes and re-attachment resurfaces what it replaced.
+    // ---------------------------------------------------------------------
+
+    const REWRITTEN_ID: &str = "./data/rewritten.dat";
+    const STALE_NAME: &str = "Stale Name";
+    const FRESH_NAME: &str = "Fresh Name";
+    const STALE_TYPE: &str = "http://schema.org/MediaObject";
+    const FRESH_TYPE: &str = "http://schema.org/Dataset";
+
+    /// A crate whose one data entity is orphaned by cutting the root's
+    /// `hasPart` edge, leaving its stale triples stored but hidden.
+    fn orphaned_entity_crate(node: &CraqleNode, graph: &GraphId) {
+        let mgr = manager(node);
+        mgr.create_crate(
+            graph.clone(),
+            "Orphan Rewrite Crate",
+            "Writing to an orphan must replace its stored triples",
+            "2025-01-01",
+            "https://creativecommons.org/licenses/by/4.0/",
+        )
+        .unwrap();
+        mgr.add_data_entity(
+            graph,
+            REWRITTEN_ID,
+            STALE_TYPE,
+            STALE_NAME,
+            vec![(
+                vocab::schema_keywords(),
+                oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal("stale")),
+            )],
+        )
+        .unwrap();
+
+        node.apply_changes_bulk_unchecked(
+            graph,
+            vec![MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: named(graph.as_str()),
+                predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
+                object: named(REWRITTEN_ID),
+            }],
+        )
+        .unwrap();
+        node.rebuild_graph_diagnostics(graph).unwrap();
+        assert_eq!(
+            node.graph_diagnostics(graph).unwrap().orphaned_entities,
+            vec![REWRITTEN_ID.to_string()],
+            "the fixture must actually orphan the entity"
+        );
+    }
+
+    /// Every stored object of `REWRITTEN_ID` under one predicate, hidden
+    /// triples included — the state a write has to have replaced.
+    fn stored_objects(
+        node: &CraqleNode,
+        graph: &GraphId,
+        predicate: &oxrdf::NamedNode,
+    ) -> Vec<String> {
+        let predicate = EncodedTerm::from_named_node(predicate);
+        let subject = named(REWRITTEN_ID);
+        node.graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .filter(|quad| quad.subject == subject && quad.predicate == predicate)
+            .map(|quad| quad.object.0)
+            .collect()
+    }
+
+    /// The re-attached entity carries exactly the fresh content: one name, one
+    /// type, and nothing left over from before the rewrite.
+    fn assert_fresh_entity(node: &CraqleNode, graph: &GraphId) {
+        assert_eq!(
+            stored_objects(node, graph, &vocab::schema_name()),
+            vec![literal_term(FRESH_NAME).0],
+            "the stale name must be gone, not merely hidden"
+        );
+        assert_eq!(
+            stored_objects(node, graph, &vocab::rdf_type()),
+            vec![named(FRESH_TYPE).0],
+            "the stale type must be gone, not merely hidden"
+        );
+        assert!(
+            stored_objects(node, graph, &vocab::schema_keywords()).is_empty(),
+            "a property the rewrite dropped must not survive"
+        );
+
+        node.rebuild_graph_diagnostics(graph).unwrap();
+        assert!(
+            node.graph_diagnostics(graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "the write must have re-attached the entity"
+        );
+        let exported = manager(node).export_jsonld(graph).unwrap();
+        assert!(
+            exported.contains(FRESH_NAME) && !exported.contains(STALE_NAME),
+            "export must show only the fresh content: {exported}"
+        );
+    }
+
+    /// Replacing an orphaned entity diffs against its stored triples, so
+    /// re-attachment cannot resurface the ones it replaced.
+    #[test]
+    fn replace_rewrites_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:orphan-replace");
+        orphaned_entity_crate(&node, &graph);
+
+        manager(&node)
+            .add_data_entity(&graph, REWRITTEN_ID, FRESH_TYPE, FRESH_NAME, vec![])
+            .unwrap();
+
+        assert_fresh_entity(&node, &graph);
+    }
+
+    /// Same for the incremental path: a patch clears the predicates it names
+    /// even when orphan hiding makes the subject look empty.
+    #[test]
+    fn patch_rewrites_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:orphan-patch");
+        orphaned_entity_crate(&node, &graph);
+
+        node.patch_data_with(
+            &writer_auth(),
+            PatchEntityRequest {
+                entity: CreateEntityRequest {
+                    graph: graph.clone(),
+                    entity_id: REWRITTEN_ID.to_string(),
+                    entity_type: FRESH_TYPE.to_string(),
+                    name: FRESH_NAME.to_string(),
+                    additional_triples: Vec::new(),
+                },
+                replaced_predicates: vec![vocab::schema_keywords()],
+            },
+            CraqleRequestDurability::Durable,
+            None,
+        )
+        .unwrap();
+
+        assert_fresh_entity(&node, &graph);
+    }
+
+    /// Same for a full replacement: a document that re-links the orphan must
+    /// replace its stored triples rather than merge with them.
+    #[test]
+    fn import_rewrites_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:orphan-import");
+        orphaned_entity_crate(&node, &graph);
+
+        let document = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+                 "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                 "about": {"@id": graph.as_str()}},
+                {"@id": graph.as_str(), "@type": "Dataset",
+                 "name": "Orphan Rewrite Crate",
+                 "description": "Writing to an orphan must replace its stored triples",
+                 "datePublished": "2025-01-01",
+                 "license": "https://creativecommons.org/licenses/by/4.0/",
+                 "hasPart": [{"@id": REWRITTEN_ID}]},
+                {"@id": REWRITTEN_ID, "@type": "Dataset", "name": FRESH_NAME}
+            ]
+        });
+        manager(&node)
+            .import_jsonld(graph.clone(), &document.to_string())
+            .unwrap();
+
+        assert_fresh_entity(&node, &graph);
+    }
+
+    // ---------------------------------------------------------------------
     // Orphan hiding across term kinds (G6).
     //
     // `oxjsonld` mints a blank node for every inline nested entity, so an
