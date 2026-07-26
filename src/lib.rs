@@ -2266,6 +2266,49 @@ mod tests {
         )
     }
 
+    /// A whole-graph rebuild clears the graph, then refills it from a store
+    /// scan. An upsert for the same graph landing in that window survived the
+    /// clear and was then duplicated by the refill, leaving two documents for
+    /// one subject that the acknowledged queue entries called settled (G7).
+    #[test]
+    #[cfg(feature = "search")]
+    fn rebuild_excludes_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth = writer_auth();
+
+        let graph = GraphId::new("urn:test:rebuild-upsert-race");
+        node.create_crate(&auth, crate_request(&graph, "racyneedle"))
+            .unwrap();
+        node.flush_search_updates().expect("baseline flush");
+
+        node.search
+            .arm_rebuild_stall(std::time::Duration::from_millis(300));
+        let rebuild = {
+            let (search, store, graph) = (node.search.clone(), node.store.clone(), graph.clone());
+            std::thread::spawn(move || search.reindex_from_store(&store, &graph).unwrap())
+        };
+
+        // Re-index the same subject with the text the refill is about to write,
+        // so a lost race shows up as two documents rather than one.
+        node.search.await_rebuild_stall();
+        node.search
+            .index_resource(graph.as_str(), graph.as_str(), Some("racyneedle"))
+            .unwrap();
+        rebuild.join().expect("the rebuild thread panicked");
+        node.search.commit().unwrap();
+
+        assert_eq!(
+            1,
+            node.search.search("racyneedle", 10).unwrap().len(),
+            "the upsert and the refill each produced a document for one subject"
+        );
+    }
+
     /// A panic inside the indexer drain must not take the worker thread down.
     ///
     /// The search index is derived state, and the thread that repairs it is the
