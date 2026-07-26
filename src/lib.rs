@@ -2505,6 +2505,17 @@ mod tests {
         }
     }
 
+    /// Options carrying a sync handle the caller keeps, so a test can arm a
+    /// failing history read on the node it is about to open.
+    fn armed_sync<S: irokle::Storage>(
+        node: irokle::Irokle<S>,
+    ) -> (Arc<IrokleGraphSync<S>>, CraqleOptions) {
+        let sync = Arc::new(IrokleGraphSync::new(node, CraqleIrokleOptions::new()));
+        let mut options = CraqleOptions::new().with_search_storage(SearchStorage::Memory);
+        options.sync = Some(sync.clone());
+        (sync, options)
+    }
+
     fn keyword_object(value: &str) -> EncodedTerm {
         EncodedTerm(format!("\"{value}\""))
     }
@@ -2587,6 +2598,45 @@ mod tests {
             pair.origin.graph_fingerprint(&graph).unwrap(),
             pair.replica.graph_fingerprint(&graph).unwrap(),
             "the replicas must converge once the failure is gone"
+        );
+    }
+
+    /// A topic whose history cannot be read must stall, not be skipped: a
+    /// silent skip leaves the replica short every record it never saw.
+    #[test]
+    fn unreadable_topic_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let irokle = irokle::Irokle::builder().build().unwrap();
+        let origin = CraqleNode::open_with_options(
+            dir.path().join("origin"),
+            CraqleOptions::new()
+                .with_search_storage(SearchStorage::Memory)
+                .with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+        )
+        .unwrap();
+        let graph = GraphId::new("urn:test:unreadable-topic");
+        origin
+            .create_crate(&writer_auth(), crate_request(&graph, "unreadable"))
+            .unwrap();
+
+        let (sync, options) = armed_sync(irokle);
+        let replica = CraqleNode::open_with_options(dir.path().join("replica"), options).unwrap();
+
+        sync.arm_history_failure();
+        let error = replica.reconcile_irokle().unwrap_err();
+        assert!(
+            matches!(error, CraqleError::Sync(_)),
+            "an unreadable topic must reach the caller, got `{error}`"
+        );
+        assert!(
+            !sync.take_history_failure(),
+            "the injected failure never fired, so this test proves nothing"
+        );
+
+        replica.reconcile_irokle().unwrap();
+        assert!(
+            replica.contains_graph(&graph).unwrap(),
+            "the next pass must still deliver the topic"
         );
     }
 
