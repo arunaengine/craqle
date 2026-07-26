@@ -393,7 +393,7 @@ impl ReplicationEngine {
             // changes, and outside the commit guard, because the publish may bind
             // an irokle topic and that takes the guard itself.
             let record = sync.publish_changes(&self.store, graph, changes)?;
-            let Some(batch) = crate::sync::batch_from_irokle_event_record(record)? else {
+            let Some(batch) = crate::sync::batch_from_owned(record)? else {
                 return Err(UpdateError::InvalidChangeSet(
                     "irokle changes publish did not return a quad-change record".to_string(),
                 ));
@@ -650,7 +650,7 @@ impl ReplicationEngine {
                 fjall::Error::Io(std::io::Error::other("injected apply failure")),
             )));
         }
-        let batch = crate::sync::batch_from_irokle_record(record)
+        let batch = crate::sync::batch_from_record(record)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
         batch
             .map(|batch| self.apply_irokle_batch(batch))

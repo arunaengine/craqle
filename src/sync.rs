@@ -790,7 +790,7 @@ fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
 
 /// Borrowing variant, for callers that only hold a reference to the record
 /// (catch-up and reconcile replay both re-read their records afterwards).
-pub(crate) fn batch_from_irokle_record(
+pub(crate) fn batch_from_record(
     record: &EventRecord<CraqleGraphEvent>,
 ) -> SyncResult<Option<Batch>> {
     let CraqleGraphEvent::QuadChanges { graph, changes } = &record.event else {
@@ -806,9 +806,7 @@ pub(crate) fn batch_from_irokle_record(
 
 /// Consuming variant: moves every term string out of the record instead of
 /// cloning it, for callers that drop the record right after.
-pub(crate) fn batch_from_irokle_event_record(
-    record: EventRecord<CraqleGraphEvent>,
-) -> SyncResult<Option<Batch>> {
+pub(crate) fn batch_from_owned(record: EventRecord<CraqleGraphEvent>) -> SyncResult<Option<Batch>> {
     let EventRecord { event, meta } = record;
     let CraqleGraphEvent::QuadChanges { graph, changes } = event else {
         return Ok(None);
