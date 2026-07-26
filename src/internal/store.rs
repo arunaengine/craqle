@@ -330,18 +330,21 @@ impl IndexState {
     fn publish(&mut self, publish: &PendingPublish) -> bool {
         let mut anomaly = false;
         for mutation in &publish.quad_mutations {
-            let quad = match mutation {
-                QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
+            let (quad, inserting) = match mutation {
+                QuadMutation::Insert(quad) => (*quad, true),
+                QuadMutation::Remove(quad) => (*quad, false),
             };
-            let outcome = match mutation {
-                QuadMutation::Insert(quad) => self.insert_quad(*quad),
-                QuadMutation::Remove(quad) => self.remove_quad(*quad),
+            let outcome = if inserting {
+                self.insert_quad(quad)
+            } else {
+                self.remove_quad(quad)
             };
             anomaly |= outcome == IndexApply::Anomaly;
             if let Some(derived) = self.derived.as_mut() {
-                match mutation {
-                    QuadMutation::Insert(quad) => derived.insert_quad(*quad),
-                    QuadMutation::Remove(quad) => derived.remove_quad(*quad),
+                if inserting {
+                    derived.insert_quad(quad);
+                } else {
+                    derived.remove_quad(quad);
                 }
             }
             self.object_order
