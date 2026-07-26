@@ -168,7 +168,7 @@ pub struct WriteBatch {
     /// so no per-quad `Vec` is allocated.
     pending_quad_states: HashMap<QuadKey, Option<Vec<Dot>>>,
     pending_terms: HashMap<TermId, String>,
-    quad_mutations: Vec<QuadMutation>,
+    publish: PendingPublish,
 }
 
 impl WriteBatch {
@@ -177,7 +177,7 @@ impl WriteBatch {
             inner,
             pending_quad_states: HashMap::new(),
             pending_terms: HashMap::new(),
-            quad_mutations: Vec::new(),
+            publish: PendingPublish::default(),
         }
     }
 
@@ -210,15 +210,59 @@ enum IndexApply {
     Anomaly,
 }
 
+/// Every in-memory structure a reader correlates with a graph's vector clock,
+/// behind one lock so a commit publishes all of them at once.
+///
+/// Splitting them cost consistency: `fjall::Batch::commit` applies a batch's
+/// keys to the memtables one at a time, so the durable clock still reads
+/// pre-commit while the same batch's quads are already visible. Freshness
+/// checks therefore read [`IndexState::clocks`], and a read that observes a
+/// published clock has by construction waited for the index, the derived
+/// mirror and the order cache that clock describes (G6).
 #[derive(Default)]
 struct IndexState {
     graph_subjects: HashMap<TermId, HashSet<TermId>>,
     by_graph_subject: HashMap<(TermId, TermId), HashSet<(TermId, TermId)>>,
+    /// Planner/cross-graph mirror, built on first use.
+    derived: Option<DerivedIndexState>,
+    object_order: ObjectOrderCache,
+    /// Per-graph clocks as published by each graph's last commit. A missing
+    /// entry is the empty clock, which is what the durable read yields for a
+    /// graph that has never committed.
+    clocks: HashMap<TermId, VectorClock>,
 }
 
 type ObjectOrderKey = (TermId, TermId, TermId);
 type ObjectOrderValues = Arc<Vec<TermId>>;
-type ObjectOrderCache = HashMap<ObjectOrderKey, ObjectOrderValues>;
+
+/// `(graph, subject, predicate)` → objects in decoded-term order.
+#[derive(Default)]
+struct ObjectOrderCache {
+    entries: HashMap<ObjectOrderKey, ObjectOrderValues>,
+}
+
+impl ObjectOrderCache {
+    fn get(&self, key: &ObjectOrderKey) -> Option<ObjectOrderValues> {
+        self.entries.get(key).cloned()
+    }
+
+    fn invalidate(&mut self, key: &ObjectOrderKey) {
+        self.entries.remove(key);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Drop every entry belonging to `graph`, e.g. when the graph is deleted.
+    fn drop_graph(&mut self, graph: TermId) {
+        self.entries.retain(|(cached, _, _), _| *cached != graph);
+    }
+
+    fn insert(&mut self, key: ObjectOrderKey, objects: ObjectOrderValues) {
+        self.entries.insert(key, objects);
+    }
+}
 
 impl IndexState {
     fn insert_quad(&mut self, quad: EncodedQuad) -> IndexApply {
@@ -258,6 +302,57 @@ impl IndexState {
         } else {
             IndexApply::Anomaly
         }
+    }
+
+    /// Apply one commit's whole in-memory half, reporting whether any mutation
+    /// disagreed with the durable `quads` keyspace.
+    ///
+    /// The clocks land last only for readability — the caller holds the write
+    /// lock across all of it, so nothing observes an intermediate state.
+    fn publish(&mut self, publish: &PendingPublish) -> bool {
+        let mut anomaly = false;
+        for mutation in &publish.quad_mutations {
+            let quad = match mutation {
+                QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
+            };
+            let outcome = match mutation {
+                QuadMutation::Insert(quad) => self.insert_quad(*quad),
+                QuadMutation::Remove(quad) => self.remove_quad(*quad),
+            };
+            anomaly |= outcome == IndexApply::Anomaly;
+            if let Some(derived) = self.derived.as_mut() {
+                match mutation {
+                    QuadMutation::Insert(quad) => derived.insert_quad(*quad),
+                    QuadMutation::Remove(quad) => derived.remove_quad(*quad),
+                }
+            }
+            self.object_order
+                .invalidate(&(quad.graph, quad.subject, quad.predicate));
+        }
+
+        for (&graph_id, clock) in &publish.clocks {
+            match clock {
+                Some(clock) => self.clocks.insert(graph_id, clock.clone()),
+                None => self.clocks.remove(&graph_id),
+            };
+        }
+        anomaly
+    }
+}
+
+/// The in-memory half of a commit, staged alongside the durable batch and
+/// published once that batch lands.
+#[derive(Default)]
+struct PendingPublish {
+    quad_mutations: Vec<QuadMutation>,
+    /// `None` clears the mirror entry, which is what removing a graph's clock
+    /// key means.
+    clocks: HashMap<TermId, Option<VectorClock>>,
+}
+
+impl PendingPublish {
+    fn is_empty(&self) -> bool {
+        self.quad_mutations.is_empty() && self.clocks.is_empty()
     }
 }
 
@@ -427,8 +522,6 @@ pub struct GraphStore {
     /// [`GraphStore::graph_commit_guard`].
     commit_locks: Vec<Mutex<()>>,
     indexes: RwLock<IndexState>,
-    derived_indexes: RwLock<Option<DerivedIndexState>>,
-    object_order_cache: RwLock<ObjectOrderCache>,
     /// Memory mirror of the persisted `'O'` records; always carries the clock
     /// tag so a reader can tell a fresh entry from a stale one.
     diagnostics_cache: RwLock<HashMap<TermId, StoredDiagnostics>>,
@@ -863,11 +956,17 @@ impl GraphStore {
 
         match (was_live, is_live) {
             (false, true) => {
-                batch.quad_mutations.push(QuadMutation::Insert(quad));
+                batch
+                    .publish
+                    .quad_mutations
+                    .push(QuadMutation::Insert(quad));
                 Ok(true)
             }
             (true, false) => {
-                batch.quad_mutations.push(QuadMutation::Remove(quad));
+                batch
+                    .publish
+                    .quad_mutations
+                    .push(QuadMutation::Remove(quad));
                 Ok(true)
             }
             _ => Ok(false),
@@ -892,19 +991,18 @@ impl GraphStore {
     /// Rebuild every derived structure from the durable `quads` keyspace, the
     /// source of truth. This is the repair action for derived-state register
     /// rows 1–3 and 6.
+    ///
+    /// The clock mirror is kept: it is published by commits that did land, so
+    /// resetting it here would move a graph's clock backwards.
     fn rebuild_indexes(&self) -> Result<()> {
-        let indexes = self.build_indexes()?;
-        // Order matters only in that all derived state is dropped before the
-        // fresh index becomes visible; every consumer rebuilds lazily.
-        *self.indexes_write() = indexes;
-        *self
-            .derived_indexes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-        self.object_order_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        let rebuilt = self.build_indexes()?;
+        {
+            let mut indexes = self.indexes_write();
+            indexes.graph_subjects = rebuilt.graph_subjects;
+            indexes.by_graph_subject = rebuilt.by_graph_subject;
+            indexes.derived = None;
+            indexes.object_order.clear();
+        }
         self.term_decode_cache
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -912,55 +1010,20 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Commit a batch and mirror its quad mutations into the in-memory indexes.
+    /// Commit a batch and publish its in-memory half.
     ///
     /// An [`IndexApply::Anomaly`] means the index drifted from the store, so it
     /// is rebuilt before this returns rather than left inconsistent.
-    fn apply_quad_mutations(
-        &self,
-        batch: fjall::OwnedWriteBatch,
-        mutations: Vec<QuadMutation>,
-    ) -> Result<()> {
-        if mutations.is_empty() {
+    fn apply_commit(&self, batch: fjall::OwnedWriteBatch, publish: PendingPublish) -> Result<()> {
+        if publish.is_empty() {
             return Ok(batch.commit()?);
         }
 
-        let anomaly = self.commit_with_index(batch, &mutations)?;
-
-        if anomaly {
-            // Drop the mirror and the order cache with it; rebuild_indexes
-            // resets both from the store.
+        if self.commit_with_index(batch, &publish)? {
             tracing::warn!(
                 "index anomaly detected while applying a commit; rebuilding indexes from the store"
             );
             return self.rebuild_indexes();
-        }
-
-        // Guards the lazily built planner/cross-graph mirror of IndexState.
-        if let Some(derived) = self
-            .derived_indexes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-        {
-            for mutation in &mutations {
-                match mutation {
-                    QuadMutation::Insert(quad) => derived.insert_quad(*quad),
-                    QuadMutation::Remove(quad) => derived.remove_quad(*quad),
-                }
-            }
-        }
-
-        // Guards the (graph, subject, predicate) → sorted objects cache.
-        let mut cache = self
-            .object_order_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        for mutation in &mutations {
-            let quad = match mutation {
-                QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
-            };
-            cache.remove(&(quad.graph, quad.subject, quad.predicate));
         }
         Ok(())
     }
@@ -989,32 +1052,25 @@ impl GraphStore {
 
     /// Publish the durable batch and the index together, reporting anomalies.
     ///
-    /// The lock spans the commit: a reader that sees the new clock must not
-    /// then read an index predating it (G6).
+    /// The lock spans the commit and covers every structure a reader pairs with
+    /// the clock, so a reader past the new clock can never read an index,
+    /// derived mirror or object ordering predating it (G6).
+    ///
+    /// No other lock is taken here and nothing is read from the store, so the
+    /// section stays short and cannot deadlock against a reader.
     fn commit_with_index(
         &self,
         batch: fjall::OwnedWriteBatch,
-        mutations: &[QuadMutation],
+        publish: &PendingPublish,
     ) -> Result<bool> {
-        // Guards IndexState: the (graph, subject) → (predicate, object) map.
         let mut indexes = self.indexes_write();
         batch.commit()?;
         #[cfg(test)]
         self.stall_after_commit();
-
-        let mut anomaly = false;
-        for mutation in mutations {
-            let outcome = match mutation {
-                QuadMutation::Insert(quad) => indexes.insert_quad(*quad),
-                QuadMutation::Remove(quad) => indexes.remove_quad(*quad),
-            };
-            anomaly |= outcome == IndexApply::Anomaly;
-        }
-        Ok(anomaly)
+        Ok(indexes.publish(publish))
     }
 
-    fn build_derived_indexes(&self) -> DerivedIndexState {
-        let indexes = self.indexes_read();
+    fn build_derived_indexes(indexes: &IndexState) -> DerivedIndexState {
         let mut derived = DerivedIndexState::default();
         for (&(graph, subject), entries) in &indexes.by_graph_subject {
             for &(predicate, object) in entries {
@@ -1035,23 +1091,21 @@ impl GraphStore {
 
     fn with_derived_indexes<R>(&self, f: impl FnOnce(&DerivedIndexState) -> R) -> R {
         {
-            let guard = self
-                .derived_indexes
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
-            if let Some(derived) = guard.as_ref() {
+            let indexes = self.indexes_read();
+            if let Some(derived) = indexes.derived.as_ref() {
                 return f(derived);
             }
         }
 
-        let mut guard = self
-            .derived_indexes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(self.build_derived_indexes());
+        let mut indexes = self.indexes_write();
+        if indexes.derived.is_none() {
+            let derived = Self::build_derived_indexes(&indexes);
+            indexes.derived = Some(derived);
         }
-        f(guard.as_ref().expect("derived indexes initialized"))
+        f(indexes
+            .derived
+            .as_ref()
+            .expect("derived indexes initialized"))
     }
 
     /// Diagnostics recomputations performed by this store instance.
@@ -1167,6 +1221,10 @@ impl GraphStore {
     /// (missing record, or a tag left behind by a crash between the quad commit
     /// and the diagnostics write) is recomputed and re-persisted right here,
     /// not lazily.
+    ///
+    /// Doubles as the seeding pass for the clock mirror, which every later
+    /// freshness check reads. Nothing else holds the store yet, so seeding a
+    /// graph's clock before its diagnostics are looked at is enough ordering.
     fn repair_graph_diagnostics_at_open(&self) -> Result<()> {
         self.diagnostics_cache
             .write()
@@ -1174,7 +1232,8 @@ impl GraphStore {
             .clear();
 
         for graph_id in self.graph_term_ids()? {
-            let clock = self.get_vector_clock_by_id(graph_id)?;
+            let clock = self.durable_vector_clock(graph_id)?;
+            self.indexes_write().clocks.insert(graph_id, clock.clone());
             let stored = self.read_stored_diagnostics(graph_id)?;
             if let Some(record) = stored.filter(|record| record.at_clock == clock) {
                 self.diagnostics_cache
@@ -1556,54 +1615,48 @@ impl GraphStore {
             .unwrap_or(0)
     }
 
+    /// Objects of `(graph, subject, predicate)` in decoded-term order.
     fn ordered_objects_for_subject_predicate(
         &self,
         graph: TermId,
         subject: TermId,
         predicate: TermId,
     ) -> Result<Arc<Vec<TermId>>> {
-        if let Some(cached) = self
-            .object_order_cache
-            .read()
-            .unwrap()
-            .get(&(graph, subject, predicate))
-            .cloned()
-        {
-            return Ok(cached);
-        }
-
-        let object_ids = self
-            .indexes
-            .read()
-            .unwrap()
-            .by_graph_subject
-            .get(&(graph, subject))
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|(candidate_predicate, object)| {
-                        (*candidate_predicate == predicate).then_some(*object)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let key = (graph, subject, predicate);
+        let object_ids = {
+            let indexes = self.indexes_read();
+            if let Some(cached) = indexes.object_order.get(&key) {
+                return Ok(cached);
+            }
+            indexes
+                .by_graph_subject
+                .get(&(graph, subject))
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|(candidate_predicate, object)| {
+                            (*candidate_predicate == predicate).then_some(*object)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
 
         let mut ordered = object_ids
             .into_iter()
             .map(|object| Ok((self.decode_term(object)?.0, object)))
             .collect::<Result<Vec<_>>>()?;
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
-        let ordered = Arc::new(
+        let objects = Arc::new(
             ordered
                 .into_iter()
                 .map(|(_, object)| object)
                 .collect::<Vec<_>>(),
         );
-        self.object_order_cache
-            .write()
-            .unwrap()
-            .insert((graph, subject, predicate), ordered.clone());
-        Ok(ordered)
+        self.indexes_write()
+            .object_order
+            .insert(key, Arc::clone(&objects));
+        Ok(objects)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -1676,8 +1729,6 @@ impl GraphStore {
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             indexes: RwLock::new(IndexState::default()),
-            derived_indexes: RwLock::new(None),
-            object_order_cache: RwLock::new(HashMap::new()),
             diagnostics_cache: RwLock::new(HashMap::new()),
             term_decode_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
@@ -1882,6 +1933,7 @@ impl GraphStore {
         // A recreated graph must start from a fresh clock, not
         // inherit the deleted one.
         batch.remove(&self.graphs, graph_clock_key(graph_id));
+        batch.publish.clocks.insert(graph_id, None);
         batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
@@ -1915,10 +1967,7 @@ impl GraphStore {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&graph_id);
-        self.object_order_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|(graph_term, _, _), _| *graph_term != graph_id);
+        self.indexes_write().object_order.drop_graph(graph_id);
         Ok(())
     }
 
@@ -2528,13 +2577,29 @@ impl GraphStore {
         self.get_vector_clock_by_id(graph_id)
     }
 
-    /// Read a graph's vector clock from its own `'K'` key.
+    /// A graph's vector clock as published by its last commit.
+    ///
+    /// Reads the in-memory mirror, never the `'K'` key: a fjall batch becomes
+    /// visible key by key, so the durable clock still reads pre-commit while
+    /// the same batch's quads are already visible. A freshness check trusting
+    /// that clock accepts the pre-write orphan set as current (G6).
+    pub(crate) fn get_vector_clock_by_id(&self, graph_id: TermId) -> Result<VectorClock> {
+        Ok(self
+            .indexes_read()
+            .clocks
+            .get(&graph_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Read a graph's vector clock from its own `'K'` key. Open-time only —
+    /// everything else reads the mirror seeded from this.
     ///
     /// Falls back to the clock embedded in the legacy metadata record when no
     /// `'K'` key exists yet, which is the one-time migration path for stores
     /// written before the split; the first [`GraphStore::set_vector_clock`]
     /// writes `'K'` and the legacy copy is ignored from then on.
-    pub(crate) fn get_vector_clock_by_id(&self, graph_id: TermId) -> Result<VectorClock> {
+    fn durable_vector_clock(&self, graph_id: TermId) -> Result<VectorClock> {
         if let Some(bytes) = self.graphs.get(graph_clock_key(graph_id))? {
             return Ok(postcard::from_bytes(bytes.as_ref())?);
         }
@@ -2548,6 +2613,10 @@ impl GraphStore {
     /// context, topic binding) is never rewritten, so a commit cannot clobber a
     /// concurrent policy or context write.
     ///
+    /// The mirror update is staged, not applied: the batch can still fail, and
+    /// only [`GraphStore::commit_with_index`] knows when the clock is really
+    /// visible.
+    ///
     /// Does not lock — the caller must hold the graph commit guard, which is
     /// what makes the read-clock → advance → write-clock cycle atomic (G2).
     pub fn set_vector_clock(&self, batch: &mut WriteBatch, update: ClockUpdate<'_>) -> Result<()> {
@@ -2556,6 +2625,10 @@ impl GraphStore {
             graph_clock_key(update.graph_id),
             postcard::to_allocvec(update.clock)?,
         );
+        batch
+            .publish
+            .clocks
+            .insert(update.graph_id, Some(update.clock.clone()));
         Ok(())
     }
 
@@ -2983,9 +3056,9 @@ impl GraphStore {
             inner,
             pending_quad_states: _,
             pending_terms: _,
-            quad_mutations,
+            publish,
         } = batch;
-        self.apply_quad_mutations(inner, quad_mutations)
+        self.apply_commit(inner, publish)
     }
 
     /// Copy a subject's `(predicate, object)` id pairs out of the index,
@@ -3784,9 +3857,12 @@ mod tests {
 
     // ── Vector-clock key split ──────────────────────────────────────────
 
+    /// Open is the only moment a store written before the split can still be
+    /// carrying its clock inside the metadata record, so that is where the
+    /// fallback runs and seeds the mirror every later read uses.
     #[test]
     fn clock_split_migration() {
-        let (_dir, store) = setup_store();
+        let (dir, store) = setup_store();
         let graph = GraphId::new("urn:test:clock-migration");
         store.create_graph(&graph).unwrap();
         let graph_id = store
@@ -3814,7 +3890,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        drop(store);
 
+        let store = GraphStore::open(dir.path()).unwrap();
         assert_eq!(legacy_clock, store.get_vector_clock(&graph).unwrap());
 
         // The first clock write creates 'K', which wins from then on.
