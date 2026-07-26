@@ -1,7 +1,10 @@
 use std::error::Error;
 use std::fs;
 
-use craqle::{CraqleNode, GrantAuthorizer, GraphId, GraphPolicy, PermissionGrant, PermissionLevel};
+use craqle::{
+    CraqleNode, GrantAuthorizer, GraphId, GraphPolicy, PermissionGrant, PermissionLevel,
+    SearchRequest,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let root = std::env::temp_dir().join(format!("craqle-demo-{}", std::process::id()));
@@ -56,7 +59,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("[Export] JSON-LD:\n{jsonld}\n");
 
     node.reindex_search()?;
-    let hits = node.search(&reader, "genomic", 10)?;
+    let hits = node.search(
+        &reader,
+        SearchRequest {
+            query: "genomic",
+            limit: 10,
+        },
+    )?;
     println!("[Search] Results for 'genomic': {} hits", hits.len());
     for hit in &hits {
         println!("  - {} (score: {:.2})", hit.subject_iri, hit.score);

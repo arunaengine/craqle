@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_metadata_editing_scenario() {
+    fn metadata_edits_converge() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-metadata");
 
@@ -533,8 +533,12 @@ mod tests {
         assert!(violation_messages(&net, 0, &graph).is_empty());
         assert!(violation_messages(&net, 1, &graph).is_empty());
 
-        assert!(!reindex_and_search(&net, 0, "updated").is_empty());
-        assert!(!reindex_and_search(&net, 1, "improved").is_empty());
+        // Search needs a real tantivy index; the rest of the scenario does not.
+        #[cfg(feature = "search")]
+        {
+            assert!(!reindex_and_search(&net, 0, "updated").is_empty());
+            assert!(!reindex_and_search(&net, 1, "improved").is_empty());
+        }
     }
 
     #[test]

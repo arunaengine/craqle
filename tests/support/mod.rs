@@ -12,6 +12,36 @@ pub use perf::*;
 #[allow(unused_imports)]
 pub use sim::*;
 
+/// Generous enough that a slow machine never trips it, short enough that a real
+/// deadlock fails the run instead of hanging it.
+pub const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Run `body` on a detached thread and fail if it does not finish in time.
+///
+/// The branch these tests guard replaces one engine-wide lock with a two-level
+/// hierarchy, and a lock-order regression there presents as a **hang**, not as a
+/// failed assertion. Joining would inherit the hang, so the worker is left
+/// detached: the test fails, the harness keeps going, and CI reports a defect
+/// instead of burning a runner until the job timeout.
+pub fn with_watchdog(label: &'static str, body: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        let _ = done.send(outcome);
+    });
+    match finished.recv_timeout(WATCHDOG_TIMEOUT) {
+        Ok(Ok(())) => {}
+        // Re-raised here so a failing assertion still reports its own message.
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{label} made no progress within {WATCHDOG_TIMEOUT:?}: suspected deadlock")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{label} ended without reporting an outcome")
+        }
+    }
+}
+
 pub fn create_test_crate(net: &sim::CraqleCluster, peer: usize, graph: &GraphId) {
     net.peer(peer)
         .create_crate(
@@ -272,7 +302,10 @@ pub fn keyword_delete(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
 pub fn reindex_and_search(net: &sim::CraqleCluster, peer: usize, query: &str) -> Vec<String> {
     net.reindex_search().unwrap();
     net.peer(peer)
-        .search(&GrantAuthorizer::default(), query, 10)
+        .search(
+            &GrantAuthorizer::default(),
+            SearchRequest { query, limit: 10 },
+        )
         .unwrap()
         .into_iter()
         .map(|hit| hit.subject_iri)

@@ -24,7 +24,8 @@
 //! property paths, sub-SELECTs, SERVICE bodies) is left untouched: the pass
 //! only recurses into those nodes, it never moves work across them.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, NamedNode, Term};
@@ -34,6 +35,31 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
 use crate::store::GraphStore;
+
+/// State shared by one `optimize_query` pass.
+///
+/// The greedy BGP ordering calls `estimate_pattern` O(k²) times on top of the
+/// initial pass, and every call re-resolves the same constant terms — roughly
+/// 150 term-table point reads for a five-pattern BGP, all loop-invariant.
+/// `term_ids` memoizes them for the duration of the pass.
+///
+/// Derived-state note: the memo lives and dies with a single
+/// optimization pass, so it needs no invalidation path. Store errors are
+/// deliberately *not* memoized, so a transient failure cannot pin a wrong
+/// verdict for the rest of the pass.
+struct PlanCtx<'a> {
+    store: &'a GraphStore,
+    term_ids: RefCell<HashMap<EncodedTerm, Option<u128>>>,
+}
+
+impl<'a> PlanCtx<'a> {
+    fn new(store: &'a GraphStore) -> Self {
+        Self {
+            store,
+            term_ids: RefCell::new(HashMap::new()),
+        }
+    }
+}
 
 /// Per-row cost guesses for patterns whose selective position is a variable
 /// that will already be bound when the pattern runs inside a lateral chain.
@@ -46,6 +72,7 @@ const COST_BOUND_O: u64 = 8;
 const COST_BOUND_ONLY_P: u64 = 1 << 20;
 
 pub(crate) fn optimize_query(query: &mut Query, store: &GraphStore) {
+    let cx = PlanCtx::new(store);
     match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
@@ -57,7 +84,7 @@ pub(crate) fn optimize_query(query: &mut Query, store: &GraphStore) {
                     patterns: Vec::new(),
                 },
             );
-            *pattern = optimize_pattern(current, &HashSet::new(), store);
+            *pattern = optimize_pattern(current, &HashSet::new(), &cx);
         }
     }
 }
@@ -152,84 +179,84 @@ fn collect_pattern_vars(pattern: &GraphPattern, out: &mut HashSet<String>) {
 fn optimize_pattern(
     pattern: GraphPattern,
     bound: &HashSet<String>,
-    store: &GraphStore,
+    cx: &PlanCtx<'_>,
 ) -> GraphPattern {
     match pattern {
-        GraphPattern::Bgp { patterns } => reorder_bgp(patterns, bound, store),
+        GraphPattern::Bgp { patterns } => reorder_bgp(patterns, bound, cx),
         GraphPattern::Path { .. } | GraphPattern::Values { .. } => pattern,
         GraphPattern::Join { left, right } => GraphPattern::Join {
-            left: Box::new(optimize_pattern(*left, bound, store)),
-            right: Box::new(optimize_pattern(*right, bound, store)),
+            left: Box::new(optimize_pattern(*left, bound, cx)),
+            right: Box::new(optimize_pattern(*right, bound, cx)),
         },
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => {
-            let left = optimize_pattern(*left, bound, store);
+            let left = optimize_pattern(*left, bound, cx);
             // sparopt evaluates fit OPTIONAL bodies as for-loop left joins
             // with the outer row bound, so order the body accordingly.
             let mut right_bound = bound.clone();
             collect_pattern_vars(&left, &mut right_bound);
-            let right = optimize_pattern(*right, &right_bound, store);
+            let right = optimize_pattern(*right, &right_bound, cx);
             let mut expr_bound = right_bound.clone();
             collect_pattern_vars(&right, &mut expr_bound);
             GraphPattern::LeftJoin {
                 left: Box::new(left),
                 right: Box::new(right),
-                expression: expression.map(|e| optimize_expression(e, &expr_bound, store)),
+                expression: expression.map(|e| optimize_expression(e, &expr_bound, cx)),
             }
         }
         GraphPattern::Lateral { left, right } => {
-            let left = optimize_pattern(*left, bound, store);
+            let left = optimize_pattern(*left, bound, cx);
             let mut right_bound = bound.clone();
             collect_pattern_vars(&left, &mut right_bound);
             GraphPattern::Lateral {
-                right: Box::new(optimize_pattern(*right, &right_bound, store)),
+                right: Box::new(optimize_pattern(*right, &right_bound, cx)),
                 left: Box::new(left),
             }
         }
         GraphPattern::Filter { expr, inner } => {
             let mut expr_bound = bound.clone();
             collect_pattern_vars(&inner, &mut expr_bound);
-            let expr = optimize_expression(expr, &expr_bound, store);
+            let expr = optimize_expression(expr, &expr_bound, cx);
             if let GraphPattern::Bgp { patterns } = *inner {
-                rewrite_filter_over_bgp(expr, patterns, bound, store)
+                rewrite_filter_over_bgp(FilterOverBgp { expr, patterns }, bound, cx)
             } else {
                 GraphPattern::Filter {
                     expr,
-                    inner: Box::new(optimize_pattern(*inner, bound, store)),
+                    inner: Box::new(optimize_pattern(*inner, bound, cx)),
                 }
             }
         }
         GraphPattern::Union { left, right } => GraphPattern::Union {
-            left: Box::new(optimize_pattern(*left, bound, store)),
-            right: Box::new(optimize_pattern(*right, bound, store)),
+            left: Box::new(optimize_pattern(*left, bound, cx)),
+            right: Box::new(optimize_pattern(*right, bound, cx)),
         },
         GraphPattern::Graph { name, inner } => GraphPattern::Graph {
             name,
-            inner: Box::new(optimize_pattern(*inner, bound, store)),
+            inner: Box::new(optimize_pattern(*inner, bound, cx)),
         },
         GraphPattern::Extend {
             inner,
             variable,
             expression,
         } => {
-            let inner = optimize_pattern(*inner, bound, store);
+            let inner = optimize_pattern(*inner, bound, cx);
             let mut expr_bound = bound.clone();
             collect_pattern_vars(&inner, &mut expr_bound);
             GraphPattern::Extend {
-                expression: optimize_expression(expression, &expr_bound, store),
+                expression: optimize_expression(expression, &expr_bound, cx),
                 inner: Box::new(inner),
                 variable,
             }
         }
         GraphPattern::Minus { left, right } => GraphPattern::Minus {
-            left: Box::new(optimize_pattern(*left, bound, store)),
-            right: Box::new(optimize_pattern(*right, bound, store)),
+            left: Box::new(optimize_pattern(*left, bound, cx)),
+            right: Box::new(optimize_pattern(*right, bound, cx)),
         },
         GraphPattern::OrderBy { inner, expression } => {
-            let inner = optimize_pattern(*inner, bound, store);
+            let inner = optimize_pattern(*inner, bound, cx);
             let mut expr_bound = bound.clone();
             collect_pattern_vars(&inner, &mut expr_bound);
             GraphPattern::OrderBy {
@@ -238,31 +265,31 @@ fn optimize_pattern(
                     .into_iter()
                     .map(|order| match order {
                         OrderExpression::Asc(e) => {
-                            OrderExpression::Asc(optimize_expression(e, &expr_bound, store))
+                            OrderExpression::Asc(optimize_expression(e, &expr_bound, cx))
                         }
                         OrderExpression::Desc(e) => {
-                            OrderExpression::Desc(optimize_expression(e, &expr_bound, store))
+                            OrderExpression::Desc(optimize_expression(e, &expr_bound, cx))
                         }
                     })
                     .collect(),
             }
         }
         GraphPattern::Project { inner, variables } => GraphPattern::Project {
-            inner: Box::new(optimize_pattern(*inner, bound, store)),
+            inner: Box::new(optimize_pattern(*inner, bound, cx)),
             variables,
         },
         GraphPattern::Distinct { inner } => GraphPattern::Distinct {
-            inner: Box::new(optimize_pattern(*inner, bound, store)),
+            inner: Box::new(optimize_pattern(*inner, bound, cx)),
         },
         GraphPattern::Reduced { inner } => GraphPattern::Reduced {
-            inner: Box::new(optimize_pattern(*inner, bound, store)),
+            inner: Box::new(optimize_pattern(*inner, bound, cx)),
         },
         GraphPattern::Slice {
             inner,
             start,
             length,
         } => {
-            let mut inner = optimize_pattern(*inner, bound, store);
+            let mut inner = optimize_pattern(*inner, bound, cx);
             if let Some(length) = length {
                 inner = push_slice_cap(inner, start.saturating_add(length));
             }
@@ -277,7 +304,7 @@ fn optimize_pattern(
             variables,
             aggregates,
         } => {
-            let inner = optimize_pattern(*inner, bound, store);
+            let inner = optimize_pattern(*inner, bound, cx);
             let mut expr_bound = bound.clone();
             collect_pattern_vars(&inner, &mut expr_bound);
             GraphPattern::Group {
@@ -296,7 +323,7 @@ fn optimize_pattern(
                                 distinct,
                             } => AggregateExpression::FunctionCall {
                                 name,
-                                expr: optimize_expression(expr, &expr_bound, store),
+                                expr: optimize_expression(expr, &expr_bound, cx),
                                 distinct,
                             },
                         };
@@ -314,9 +341,9 @@ fn optimize_pattern(
 fn optimize_expression(
     expression: Expression,
     bound: &HashSet<String>,
-    store: &GraphStore,
+    cx: &PlanCtx<'_>,
 ) -> Expression {
-    let walk = |e: Box<Expression>| Box::new(optimize_expression(*e, bound, store));
+    let walk = |e: Box<Expression>| Box::new(optimize_expression(*e, bound, cx));
     match expression {
         Expression::NamedNode(_)
         | Expression::Literal(_)
@@ -333,7 +360,7 @@ fn optimize_expression(
         Expression::In(e, list) => Expression::In(
             walk(e),
             list.into_iter()
-                .map(|e| optimize_expression(e, bound, store))
+                .map(|e| optimize_expression(e, bound, cx))
                 .collect(),
         ),
         Expression::Add(a, b) => Expression::Add(walk(a), walk(b)),
@@ -346,18 +373,18 @@ fn optimize_expression(
         // EXISTS bodies are never join-reordered by sparopt; the outer row's
         // variables are bound when the body runs.
         Expression::Exists(inner) => {
-            Expression::Exists(Box::new(optimize_pattern(*inner, bound, store)))
+            Expression::Exists(Box::new(optimize_pattern(*inner, bound, cx)))
         }
         Expression::If(a, b, c) => Expression::If(walk(a), walk(b), walk(c)),
         Expression::Coalesce(list) => Expression::Coalesce(
             list.into_iter()
-                .map(|e| optimize_expression(e, bound, store))
+                .map(|e| optimize_expression(e, bound, cx))
                 .collect(),
         ),
         Expression::FunctionCall(function, args) => Expression::FunctionCall(
             function,
             args.into_iter()
-                .map(|e| optimize_expression(e, bound, store))
+                .map(|e| optimize_expression(e, bound, cx))
                 .collect(),
         ),
     }
@@ -426,12 +453,12 @@ fn foldable_equality(conjunct: &Expression) -> Option<(oxrdf::Variable, Foldable
 
 /// True when a non-canonical spelling of the same string value exists in the
 /// term table; folding would then miss value-equal rows the filter matches.
-fn has_non_canonical_string_spelling(store: &GraphStore, literal: &Literal) -> bool {
+fn has_non_canonical_string_spelling(cx: &PlanCtx<'_>, literal: &Literal) -> bool {
     let alternate = EncodedTerm(format!(
         "{}^^<http://www.w3.org/2001/XMLSchema#string>",
         literal
     ));
-    matches!(store.lookup_term(&alternate), Ok(Some(_)))
+    matches!(cx.store.lookup_term(&alternate), Ok(Some(_)))
 }
 
 fn fold_variable_into_patterns(
@@ -486,12 +513,18 @@ fn fold_variable_into_patterns(
     true
 }
 
-fn rewrite_filter_over_bgp(
+/// A `FILTER` applied directly over a BGP — the shape equality folding rewrites.
+struct FilterOverBgp {
     expr: Expression,
-    mut patterns: Vec<TriplePattern>,
+    patterns: Vec<TriplePattern>,
+}
+
+fn rewrite_filter_over_bgp(
+    filter: FilterOverBgp,
     bound: &HashSet<String>,
-    store: &GraphStore,
+    cx: &PlanCtx<'_>,
 ) -> GraphPattern {
+    let FilterOverBgp { expr, mut patterns } = filter;
     let mut conjuncts = Vec::new();
     flatten_and(expr, &mut conjuncts);
 
@@ -501,7 +534,7 @@ fn rewrite_filter_over_bgp(
         let folded = foldable_equality(&conjunct).and_then(|(variable, constant)| {
             match &constant {
                 FoldableConstant::StringLiteral(literal)
-                    if has_non_canonical_string_spelling(store, literal) =>
+                    if has_non_canonical_string_spelling(cx, literal) =>
                 {
                     return None;
                 }
@@ -516,7 +549,7 @@ fn rewrite_filter_over_bgp(
         }
     }
 
-    let mut node = reorder_bgp(patterns, bound, store);
+    let mut node = reorder_bgp(patterns, bound, cx);
     for (variable, constant) in bindings {
         let expression = match constant {
             FoldableConstant::Iri(node) => Expression::NamedNode(node),
@@ -549,13 +582,12 @@ enum Slot {
     Unsupported,
 }
 
-fn term_slot(term: &TermPattern, bound: &HashSet<String>, store: &GraphStore) -> Slot {
+fn term_slot(term: &TermPattern, bound: &HashSet<String>, cx: &PlanCtx<'_>) -> Slot {
     match term {
-        TermPattern::NamedNode(node) => const_slot(store, &EncodedTerm::from_named_node(node)),
-        TermPattern::Literal(literal) => const_slot(
-            store,
-            &EncodedTerm::from_term(&Term::Literal(literal.clone())),
-        ),
+        TermPattern::NamedNode(node) => const_slot(cx, &EncodedTerm::from_named_node(node)),
+        TermPattern::Literal(literal) => {
+            const_slot(cx, &EncodedTerm::from_term(&Term::Literal(literal.clone())))
+        }
         TermPattern::Variable(v) => {
             if bound.contains(v.as_str()) {
                 Slot::BoundVar
@@ -575,20 +607,23 @@ fn term_slot(term: &TermPattern, bound: &HashSet<String>, store: &GraphStore) ->
     }
 }
 
-fn const_slot(store: &GraphStore, term: &EncodedTerm) -> Slot {
-    match store.lookup_term(term) {
-        Ok(id) => Slot::Const(id.map(|id| id.0)),
+fn const_slot(cx: &PlanCtx<'_>, term: &EncodedTerm) -> Slot {
+    if let Some(&id) = cx.term_ids.borrow().get(term) {
+        return Slot::Const(id);
+    }
+    match cx.store.lookup_term(term) {
+        Ok(id) => {
+            let id = id.map(|id| id.0);
+            cx.term_ids.borrow_mut().insert(term.clone(), id);
+            Slot::Const(id)
+        }
         Err(_) => Slot::Unsupported,
     }
 }
 
-fn predicate_slot(
-    predicate: &NamedNodePattern,
-    bound: &HashSet<String>,
-    store: &GraphStore,
-) -> Slot {
+fn predicate_slot(predicate: &NamedNodePattern, bound: &HashSet<String>, cx: &PlanCtx<'_>) -> Slot {
     match predicate {
-        NamedNodePattern::NamedNode(node) => const_slot(store, &EncodedTerm::from_named_node(node)),
+        NamedNodePattern::NamedNode(node) => const_slot(cx, &EncodedTerm::from_named_node(node)),
         NamedNodePattern::Variable(v) => {
             if bound.contains(v.as_str()) {
                 Slot::BoundVar
@@ -605,12 +640,12 @@ fn predicate_slot(
 fn estimate_pattern(
     pattern: &TriplePattern,
     bound: &HashSet<String>,
-    store: &GraphStore,
+    cx: &PlanCtx<'_>,
 ) -> Option<u64> {
     use crate::store::TermId;
-    let subject = term_slot(&pattern.subject, bound, store);
-    let predicate = predicate_slot(&pattern.predicate, bound, store);
-    let object = term_slot(&pattern.object, bound, store);
+    let subject = term_slot(&pattern.subject, bound, cx);
+    let predicate = predicate_slot(&pattern.predicate, bound, cx);
+    let object = term_slot(&pattern.object, bound, cx);
     if matches!(subject, Slot::Unsupported)
         || matches!(predicate, Slot::Unsupported)
         || matches!(object, Slot::Unsupported)
@@ -626,17 +661,17 @@ fn estimate_pattern(
 
     Some(match (subject, predicate, object) {
         (Slot::Const(Some(s)), predicate, object) => {
-            let mut estimate = store.stat_subject_count(TermId(s)) as u64;
+            let mut estimate = cx.store.stat_subject_count(TermId(s)) as u64;
             match (&predicate, &object) {
                 (Slot::Const(Some(p)), Slot::Const(Some(o))) => {
-                    let pair = store.stat_predicate_object_count(TermId(*p), TermId(*o)) as u64;
+                    let pair = cx.store.stat_predicate_object_count(TermId(*p), TermId(*o)) as u64;
                     estimate = estimate.min(pair).min(1);
                 }
                 (Slot::Const(Some(p)), _) => {
-                    estimate = estimate.min(store.stat_predicate_count(TermId(*p)) as u64);
+                    estimate = estimate.min(cx.store.stat_predicate_count(TermId(*p)) as u64);
                 }
                 (_, Slot::Const(Some(o))) => {
-                    estimate = estimate.min(store.stat_object_count(TermId(*o)) as u64);
+                    estimate = estimate.min(cx.store.stat_object_count(TermId(*o)) as u64);
                 }
                 _ => {}
             }
@@ -646,20 +681,20 @@ fn estimate_pattern(
         (Slot::BoundVar, Slot::Const(_), _) => COST_BOUND_S_CONST_P,
         (Slot::BoundVar, _, _) => COST_BOUND_S,
         (Slot::FreeVar, Slot::Const(Some(p)), Slot::Const(Some(o))) => {
-            store.stat_predicate_object_count(TermId(p), TermId(o)) as u64
+            cx.store.stat_predicate_object_count(TermId(p), TermId(o)) as u64
         }
         (Slot::FreeVar, Slot::Const(_), Slot::BoundVar) => COST_CONST_P_BOUND_O,
         (Slot::FreeVar, Slot::Const(Some(p)), Slot::FreeVar) => {
-            store.stat_predicate_count(TermId(p)) as u64
+            cx.store.stat_predicate_count(TermId(p)) as u64
         }
-        (Slot::FreeVar, _, Slot::Const(Some(o))) => store.stat_object_count(TermId(o)) as u64,
+        (Slot::FreeVar, _, Slot::Const(Some(o))) => cx.store.stat_object_count(TermId(o)) as u64,
         (Slot::FreeVar, _, Slot::BoundVar) => COST_BOUND_O,
         (Slot::FreeVar, Slot::BoundVar, Slot::FreeVar) => {
-            COST_BOUND_ONLY_P.min(store.stat_total_quads() as u64)
+            COST_BOUND_ONLY_P.min(cx.store.stat_total_quads() as u64)
         }
-        (Slot::FreeVar, Slot::FreeVar, Slot::FreeVar) => store.stat_total_quads() as u64,
+        (Slot::FreeVar, Slot::FreeVar, Slot::FreeVar) => cx.store.stat_total_quads() as u64,
         // Const(None) and Unsupported handled above.
-        _ => store.stat_total_quads() as u64,
+        _ => cx.store.stat_total_quads() as u64,
     })
 }
 
@@ -682,7 +717,7 @@ fn lateral_chain(patterns: Vec<TriplePattern>) -> GraphPattern {
 fn reorder_bgp(
     patterns: Vec<TriplePattern>,
     bound: &HashSet<String>,
-    store: &GraphStore,
+    cx: &PlanCtx<'_>,
 ) -> GraphPattern {
     if patterns.len() < 2 {
         return GraphPattern::Bgp { patterns };
@@ -690,7 +725,7 @@ fn reorder_bgp(
 
     let estimates: Vec<Option<u64>> = patterns
         .iter()
-        .map(|pattern| estimate_pattern(pattern, bound, store))
+        .map(|pattern| estimate_pattern(pattern, bound, cx))
         .collect();
     if estimates.iter().any(Option::is_none) {
         return GraphPattern::Bgp { patterns };
@@ -747,7 +782,7 @@ fn reorder_bgp(
                 .filter(|&idx| chain.is_empty() || connected(idx))
                 .map(|idx| {
                     (
-                        estimate_pattern(&patterns[idx], &local_bound, store).unwrap_or(u64::MAX),
+                        estimate_pattern(&patterns[idx], &local_bound, cx).unwrap_or(u64::MAX),
                         idx,
                     )
                 })
@@ -758,7 +793,7 @@ fn reorder_bgp(
                         .copied()
                         .map(|idx| {
                             (
-                                estimate_pattern(&patterns[idx], &local_bound, store)
+                                estimate_pattern(&patterns[idx], &local_bound, cx)
                                     .unwrap_or(u64::MAX),
                                 idx,
                             )
@@ -839,6 +874,7 @@ fn push_slice_cap(pattern: GraphPattern, cap: usize) -> GraphPattern {
 mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphId};
+    use crate::store::{EncodedQuad, QuadAdd};
     use spargebra::SparqlParser;
     use std::sync::Arc;
 
@@ -869,13 +905,17 @@ mod tests {
         store
             .insert_quad(
                 &mut batch,
-                graph_id,
-                subject_id,
-                predicate_id,
-                object_id,
-                &Dot {
-                    actor: ActorId::random(),
-                    counter: 1,
+                QuadAdd {
+                    quad: EncodedQuad {
+                        graph: graph_id,
+                        subject: subject_id,
+                        predicate: predicate_id,
+                        object: object_id,
+                    },
+                    dot: Dot {
+                        actor: ActorId::random(),
+                        counter: 1,
+                    },
                 },
             )
             .unwrap();
