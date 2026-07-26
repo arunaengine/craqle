@@ -2177,9 +2177,8 @@ impl GraphStore {
         })?;
 
         batch.remove(&self.graphs, graph_meta_key(graph_id));
-        // The clock and the diagnostics record live under their own keys since
-        // A recreated graph must start from a fresh clock, not
-        // inherit the deleted one.
+        // The clock and the diagnostics record live under their own keys: a
+        // recreated graph must start fresh, not inherit the deleted one's.
         batch.remove(&self.graphs, graph_clock_key(graph_id));
         batch.publish.clocks.insert(graph_id, None);
         batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
