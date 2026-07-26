@@ -159,6 +159,29 @@ impl CrateCtx {
     }
 }
 
+/// Which stored triples a replacement diffs against: the visible ones, plus
+/// everything a subject the target rewrites holds, orphan-hidden triples too.
+///
+/// An orphan the target never mentions stays out, so omitting one cannot delete
+/// it (G6), while rewriting one replaces it instead of merging into it.
+struct ReplacementBase<'a> {
+    cx: &'a CrateCtx,
+    rewritten: HashSet<&'a EncodedTerm>,
+}
+
+impl<'a> ReplacementBase<'a> {
+    fn new(cx: &'a CrateCtx, target: &'a BTreeSet<TripleKey>) -> Self {
+        Self {
+            cx,
+            rewritten: target.iter().map(|(subject, _, _)| subject).collect(),
+        }
+    }
+
+    fn covers(&self, (subject, _, object): &TripleKey) -> bool {
+        self.rewritten.contains(subject) || !(self.cx.hides(subject) || self.cx.hides(object))
+    }
+}
+
 /// The three terms of a triple probed for liveness inside a [`CrateCtx`]'s graph.
 struct TripleProbe<'a> {
     subject: &'a EncodedTerm,
@@ -318,7 +341,7 @@ impl RoCrateManager {
                         None,
                     ));
                 validate_complete_import_triples(&graph_id, &target, None)?;
-                diff_triples(&graph_id, &self.current_triples(&cx)?, &target)?
+                diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
             }
         };
         let batch = self.engine.local_apply_changes(&graph_id, changes)?;
@@ -360,7 +383,7 @@ impl RoCrateManager {
                             date_published,
                             None,
                         ));
-                    diff_triples(&graph_id, &self.current_triples(&cx)?, &target)?
+                    diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
                 }
             }
         } else {
@@ -393,8 +416,7 @@ impl RoCrateManager {
         license: Option<&str>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let cx = self.crate_ctx(graph_id)?;
-        let current = self.current_triples(&cx)?;
-        if current.is_empty() {
+        if self.graph_is_empty(&cx)? {
             let changes = create_crate_scaffold_changes_with_license(
                 graph_id,
                 name,
@@ -428,7 +450,7 @@ impl RoCrateManager {
             )),
         };
         validate_complete_import_triples(graph_id, &target, None)?;
-        diff_triples(graph_id, &current, &target)
+        diff_triples(graph_id, &self.replacement_base(&cx, &target)?, &target)
     }
 
     /// Add a data entity with automatic hasPart linkage from root.
@@ -806,9 +828,9 @@ impl RoCrateManager {
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
             insert_changes(&graph_id, target)
         } else {
-            match self.append_like_replace_changes(&cx, &target)? {
+            match self.append_like_changes(&cx, &target)? {
                 Some(changes) => changes,
-                None => diff_triples(&graph_id, &self.current_triples(&cx)?, &target)?,
+                None => diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?,
             }
         };
         let batch = self
@@ -1043,7 +1065,7 @@ impl RoCrateManager {
         Ok(self.engine.local_apply_changes(&cx.graph, changes)?)
     }
 
-    /// Diff one subject's visible triples against exactly the triples `spec`
+    /// Diff one subject's stored triples against exactly the triples `spec`
     /// describes: deletes for what is no longer wanted, inserts for what is new.
     fn replace_subject_changes(
         &self,
@@ -1054,7 +1076,7 @@ impl RoCrateManager {
         let desired: BTreeSet<(EncodedTerm, EncodedTerm)> =
             entity_subject_triples(spec)?.into_iter().collect();
         let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
-            .subject_triples(cx, spec.entity_id)?
+            .stored_subject_triples(cx, spec.entity_id)?
             .into_iter()
             .collect();
 
@@ -1088,7 +1110,7 @@ impl RoCrateManager {
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let subject = encoded_subject(patch.subject_id);
         let current: BTreeSet<(EncodedTerm, EncodedTerm)> = self
-            .subject_triples(cx, patch.subject_id)?
+            .stored_subject_triples(cx, patch.subject_id)?
             .into_iter()
             .collect();
         let desired: BTreeSet<(EncodedTerm, EncodedTerm)> = patch.desired.into_iter().collect();
@@ -1132,16 +1154,27 @@ impl RoCrateManager {
         cx: &CrateCtx,
         subject_id: &str,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
-        let (Some(graph_tid), Some(subject_tid)) =
-            (cx.graph_tid, self.visible_subject_tid(cx, subject_id)?)
-        else {
+        if cx.hides(&encoded_subject(subject_id)) {
+            return Ok(Vec::new());
+        }
+        Ok(cx.retain_visible(self.stored_subject_triples(cx, subject_id)?))
+    }
+
+    /// The `(predicate, object)` pairs a subject really holds, orphan-hidden
+    /// ones included: the diff base a replace or patch must delete against.
+    fn stored_subject_triples(
+        &self,
+        cx: &CrateCtx,
+        subject_id: &str,
+    ) -> Result<Vec<(EncodedTerm, EncodedTerm)>, RoCrateError> {
+        let store = self.engine.store();
+        let (Some(graph_tid), Some(subject_tid)) = (
+            cx.graph_tid,
+            store.lookup_term(&encoded_subject(subject_id))?,
+        ) else {
             return Ok(Vec::new());
         };
-        Ok(cx.retain_visible(
-            self.engine
-                .store()
-                .triples_for_subject(graph_tid, subject_tid)?,
-        ))
+        Ok(store.triples_for_subject(graph_tid, subject_tid)?)
     }
 
     /// The root's visible triples minus its `hasPart` fan-out, which every
@@ -1364,7 +1397,7 @@ impl RoCrateManager {
             return Ok(insert_changes(graph_id, target));
         }
 
-        let current = self.current_triples(cx)?;
+        let current = self.replacement_base(cx, &target)?;
         if current.is_empty() {
             return Ok(insert_changes(graph_id, target));
         }
@@ -1387,9 +1420,9 @@ impl RoCrateManager {
             return Ok(insert_changes(graph_id, target));
         }
 
-        match self.append_like_replace_changes(cx, &target)? {
+        match self.append_like_changes(cx, &target)? {
             Some(changes) => Ok(changes),
-            None => diff_triples(graph_id, &self.current_triples(cx)?, &target),
+            None => diff_triples(graph_id, &self.replacement_base(cx, &target)?, &target),
         }
     }
 
@@ -1467,11 +1500,8 @@ impl RoCrateManager {
         rocrate: &mut RoCrate,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         normalize_rocrate(rocrate);
-        diff_triples(
-            &cx.graph,
-            &self.current_triples(cx)?,
-            &rocrate_triples(rocrate)?,
-        )
+        let target = rocrate_triples(rocrate)?;
+        diff_triples(&cx.graph, &self.replacement_base(cx, &target)?, &target)
     }
 
     fn current_triples(&self, cx: &CrateCtx) -> Result<BTreeSet<TripleKey>, RoCrateError> {
@@ -1494,6 +1524,34 @@ impl RoCrateManager {
         Ok(triples)
     }
 
+    /// The triples a replacement deletes against, per [`ReplacementBase`].
+    fn replacement_base(
+        &self,
+        cx: &CrateCtx,
+        target: &BTreeSet<TripleKey>,
+    ) -> Result<BTreeSet<TripleKey>, RoCrateError> {
+        let store = self.engine.store();
+        let Some(graph_tid) = cx.graph_tid else {
+            return Ok(BTreeSet::new());
+        };
+
+        let base = ReplacementBase::new(cx, target);
+        let mut triples = BTreeSet::new();
+        let mut term_cache = HashMap::new();
+        store.for_each_quad_in_graph::<crate::store::StoreError, _>(graph_tid, |quad| {
+            let triple = (
+                store.decode_term_cached(&mut term_cache, quad.subject)?,
+                store.decode_term_cached(&mut term_cache, quad.predicate)?,
+                store.decode_term_cached(&mut term_cache, quad.object)?,
+            );
+            if base.covers(&triple) {
+                triples.insert(triple);
+            }
+            Ok(())
+        })?;
+        Ok(triples)
+    }
+
     fn graph_digest(&self, cx: &CrateCtx) -> Result<[u8; 32], RoCrateError> {
         let mut hasher = blake3::Hasher::new();
         for (subject, predicate, object) in self.current_triples(cx)? {
@@ -1506,7 +1564,9 @@ impl RoCrateManager {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    fn append_like_replace_changes(
+    /// Shortcut for [`Self::replacement_base`] + `diff_triples` when the target
+    /// is a superset of that base, so both agree on which triples count.
+    fn append_like_changes(
         &self,
         cx: &CrateCtx,
         target: &BTreeSet<TripleKey>,
@@ -1517,17 +1577,17 @@ impl RoCrateManager {
             return Ok(Some(insert_changes(graph_id, target.clone())));
         };
 
+        let base = ReplacementBase::new(cx, target);
         let mut remaining = target.clone();
         let mut term_cache = HashMap::new();
         let append_like =
             match store.for_each_quad_in_graph::<AppendLikeCheckError, _>(graph_tid, |quad| {
-                let subject = store.decode_term_cached(&mut term_cache, quad.subject)?;
-                let predicate = store.decode_term_cached(&mut term_cache, quad.predicate)?;
-                let object = store.decode_term_cached(&mut term_cache, quad.object)?;
-                if cx.hides(&subject) || cx.hides(&object) {
-                    return Ok(());
-                }
-                if !remaining.remove(&(subject, predicate, object)) {
+                let triple = (
+                    store.decode_term_cached(&mut term_cache, quad.subject)?,
+                    store.decode_term_cached(&mut term_cache, quad.predicate)?,
+                    store.decode_term_cached(&mut term_cache, quad.object)?,
+                );
+                if base.covers(&triple) && !remaining.remove(&triple) {
                     return Err(AppendLikeCheckError::NeedsFullDiff);
                 }
                 Ok(())
