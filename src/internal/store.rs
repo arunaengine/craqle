@@ -2648,6 +2648,9 @@ impl GraphStore {
     }
 
     pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
+        // Commits publish under this lock, so holding it keeps the scan
+        // from observing a batch that is still being applied.
+        let _indexes = self.indexes_read();
         let Some(graph_id) = self.graph_id_for(graph)? else {
             let empty = *blake3::hash(&[]).as_bytes();
             return Ok((0, empty, empty));
