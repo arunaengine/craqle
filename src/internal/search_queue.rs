@@ -50,11 +50,14 @@ where
     T: QueueEntry,
     D: Fn(usize) -> Result<Vec<T>>,
 {
+    // Widening multiplies, so a zero chunk would never grow and never see the
+    // whole queue: the loop below would spin forever.
+    let mut chunk = bound.chunk.max(1);
+
     let Some(max_token) = bound.max_token else {
-        return drain(bound.chunk);
+        return drain(chunk);
     };
 
-    let mut chunk = bound.chunk;
     loop {
         let drained = drain(chunk)?;
         let whole_queue_seen = drained.len() < chunk;
@@ -109,6 +112,20 @@ mod tests {
         let drained = drain_upto(&bound, queue(&[99, 99, 99])).unwrap();
 
         assert!(drained.is_empty());
+    }
+
+    /// A zero chunk must still make progress: widening it by multiplication
+    /// leaves it at zero, so the drain would loop without ever reading.
+    #[test]
+    fn drain_clamps_chunk() {
+        let bound = QueueBound {
+            chunk: 0,
+            max_token: Some(10),
+        };
+
+        let drained = drain_upto(&bound, queue(&[7])).unwrap();
+
+        assert_eq!(vec![7], drained.iter().map(|e| e.1).collect::<Vec<_>>());
     }
 
     #[test]
