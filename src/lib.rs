@@ -586,6 +586,13 @@ impl CraqleOptions {
     }
 }
 
+/// What one topic's reconcile pass applied, and the failure that stopped it.
+/// Carried together so a stall cannot hide the prefix that landed before it.
+struct TopicPass {
+    applied: usize,
+    stalled: Option<CraqleError>,
+}
+
 impl CraqleNode {
     /// Open a node rooted at `path` with default options.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -742,15 +749,19 @@ impl CraqleNode {
 
         let mut applied = 0;
         let mut stalled = None;
+        // Topics carry independent cursors, so one stall holds back only its
+        // own topic; the first failure is reported once the rest have run.
         for topic_id in sync.craqle_topic_ids()? {
             match self.reconcile_irokle_topic(sync, topic_id) {
-                Ok(count) => applied += count,
-                // Topics carry independent cursors, so one stall holds back
-                // only its own topic. The first is reported once the rest have
-                // had their pass.
+                Ok(pass) => {
+                    applied += pass.applied;
+                    stalled = stalled.or(pass.stalled);
+                }
                 Err(error) => stalled = stalled.or(Some(error)),
             }
         }
+        // Before the stall reaches the caller: a pass that applied a prefix
+        // owes that prefix and its cursor the configured durability.
         if applied > 0 {
             self.persist_fjall()?;
         }
@@ -766,7 +777,7 @@ impl CraqleNode {
         &self,
         sync: &Arc<dyn sync::CraqleGraphSync>,
         topic_id: irokle::TopicId,
-    ) -> Result<usize> {
+    ) -> Result<TopicPass> {
         let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
         // A history read that fails is retryable, so it stalls its topic. A
         // silent skip would leave the topic unread for the rest of the process.
@@ -809,10 +820,7 @@ impl CraqleNode {
             self.store
                 .set_applied_topic_clock(topic_id.as_bytes(), &cursor)?;
         }
-        match stalled {
-            Some(error) => Err(error),
-            None => Ok(applied),
-        }
+        Ok(TopicPass { applied, stalled })
     }
 
     fn apply_reconciled_record(
