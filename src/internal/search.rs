@@ -539,8 +539,12 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
 
+        // Sanitized exactly as in `search` and `search_in_graph`: this is the
+        // arm `search_graphs` picks above a graph-count threshold, and a raw
+        // parse there made the same user query mean something else — or fail
+        // outright — purely because one more graph was readable (G8).
         let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = query_parser.parse_query(req.query)?;
+        let parsed = query_parser.parse_query(&sanitize_query(req.query))?;
 
         let graph_clauses: Vec<(Occur, Box<dyn Query>)> = req
             .graphs

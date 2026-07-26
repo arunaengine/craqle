@@ -1587,25 +1587,46 @@ impl CraqleNode {
 
         // A per-graph search is a full top-k collection each, so it only pays
         // off for a handful of graphs; beyond that one filtered search over
-        // the whole set is cheaper and returns the same global top-k.
+        // the whole set is cheaper. This is a performance fork only — the two
+        // arms must answer identically, which `graph_arms_agree` pins down.
         let hits = if selected.len() <= SEARCH_GRAPHS_PER_GRAPH_LIMIT {
-            let mut hits = Vec::new();
-            for graph in &selected {
-                hits.extend(
-                    self.search
-                        .search_in_graph(graph.as_str(), req.query, req.limit)?,
-                );
-            }
-            limit_search_hits(hits, req.limit)
+            self.search_graph_arm(&selected, &req)?
         } else {
-            self.search.search_in_graphs(search::GraphSetQuery {
-                graphs: &selected,
-                query: req.query,
-                limit: req.limit,
-            })?
+            self.search_set_arm(&selected, &req)?
         };
 
+        // Both arms are ordered here rather than in one of them, so a tie
+        // cannot resolve differently either side of the threshold.
+        Ok(limit_search_hits(hits, req.limit))
+    }
+
+    /// One full top-k collection per graph, concatenated for the caller to order.
+    fn search_graph_arm(
+        &self,
+        selected: &[GraphId],
+        req: &GraphSearchRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut hits = Vec::new();
+        for graph in selected {
+            hits.extend(
+                self.search
+                    .search_in_graph(graph.as_str(), req.query, req.limit)?,
+            );
+        }
         Ok(hits)
+    }
+
+    /// One collection over the whole set, narrowed by a graph filter.
+    fn search_set_arm(
+        &self,
+        selected: &[GraphId],
+        req: &GraphSearchRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        Ok(self.search.search_in_graphs(search::GraphSetQuery {
+            graphs: selected,
+            query: req.query,
+            limit: req.limit,
+        })?)
     }
 
     /// Resolve one visible subject into `(predicate, object)` pairs.
@@ -2264,6 +2285,58 @@ mod tests {
                 permission_paths: vec!["/t/x".to_string()],
             },
         )
+    }
+
+    /// `search_graphs` forks strategy above `SEARCH_GRAPHS_PER_GRAPH_LIMIT`
+    /// graphs. That is a performance fork, so both arms must answer
+    /// identically — including for a query carrying characters the Tantivy
+    /// parser reads as syntax, which the set arm used to hand over unescaped.
+    #[test]
+    #[cfg(feature = "search")]
+    fn graph_arms_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth = writer_auth();
+
+        // Only the first seven graphs carry the needle, so querying seven
+        // graphs and querying all nine must return the same hits — one query
+        // either side of the threshold.
+        let graphs: Vec<GraphId> = (0..9)
+            .map(|i| GraphId::new(&format!("urn:t:arm{i}")))
+            .collect();
+        for (index, graph) in graphs.iter().enumerate() {
+            let name = if index < 7 {
+                "agreeneedle"
+            } else {
+                "quiettext"
+            };
+            node.create_crate(&auth, crate_request(graph, name))
+                .unwrap();
+        }
+        node.flush_search_updates().unwrap();
+
+        let run = |set: &[GraphId]| {
+            node.search_graphs(
+                &auth,
+                GraphSearchRequest {
+                    graphs: set,
+                    query: "agreeneedle:one",
+                    limit: 20,
+                },
+            )
+            .expect("both arms must accept the same query")
+            .into_iter()
+            .map(|hit| (hit.graph_id, hit.subject_iri))
+            .collect::<Vec<_>>()
+        };
+
+        let per_graph = run(&graphs[..7]);
+        assert_eq!(7, per_graph.len(), "the needle must be findable at all");
+        assert_eq!(per_graph, run(&graphs), "the two arms disagree");
     }
 
     /// A whole-graph rebuild clears the graph, then refills it from a store
