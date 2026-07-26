@@ -812,7 +812,7 @@ impl ReplicationEngine {
     ) -> crate::store::Result<()> {
         let baseline = self.store.last_persisted_diagnostics(graph)?;
         if baseline != *current {
-            self.enqueue_orphan_fts_updates(
+            self.queue_orphan_updates(
                 graph,
                 OrphanChange {
                     previous: baseline,
@@ -823,7 +823,7 @@ impl ReplicationEngine {
         self.store.set_graph_diagnostics(graph, current)
     }
 
-    fn enqueue_orphan_fts_updates(
+    fn queue_orphan_updates(
         &self,
         graph: &GraphId,
         change: OrphanChange,
@@ -840,11 +840,16 @@ impl ReplicationEngine {
         let mut dirty = false;
 
         for entity_id in previous.symmetric_difference(&current) {
-            // `from_subject_id`, not `from_named_node`: diagnostics store a
-            // blank node as `_:b0`, and re-encoding that as the IRI `<_:b0>`
-            // would miss the lookup and silently never re-index it (G6, G7).
+            // `from_subject_id`, not `from_named_node`: a blank node is stored
+            // as `_:b0`, and the IRI `<_:b0>` would miss the lookup.
             let subject = EncodedTerm::from_subject_id(entity_id.as_str());
             let Some(subject_tid) = self.store.lookup_term(&subject)? else {
+                // A literal cannot be re-encoded as a subject, so its search
+                // document stays stale until something else dirties it.
+                tracing::warn!(
+                    entity = entity_id.as_str(),
+                    "orphan re-queue skipped an entity it could not look up"
+                );
                 continue;
             };
             self.store.enqueue_fts(

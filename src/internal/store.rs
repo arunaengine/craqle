@@ -1475,14 +1475,10 @@ impl GraphStore {
     }
 
     /// Re-queue for search every entity whose orphan status changed during a
-    /// repair.
+    /// repair, since orphaned entities are invisible to search.
     ///
-    /// Orphaned entities are invisible to search (G6), so a repair that flips
-    /// an entity in or out of the orphan set leaves the search index disagreeing
-    /// with the store until that subject is re-indexed. Without this, a crash
-    /// between a quad commit and its diagnostics write would keep an entity
-    /// searchable — or wrongly hidden — until something unrelated happened to
-    /// dirty it (G7).
+    /// Without it a crash between a quad commit and its diagnostics write
+    /// strands an entity as searchable, or wrongly hidden, until it is dirtied.
     fn requeue_orphan_changes(
         &self,
         graph_id: TermId,
@@ -1497,12 +1493,19 @@ impl GraphStore {
         let after: HashSet<&String> = current.orphaned_entities.iter().collect();
         let mut subjects = HashSet::new();
         for entity in before.symmetric_difference(&after) {
-            // `from_subject_id`, not `from_named_node`: diagnostics store a
-            // blank node as `_:b0`, and re-encoding that as the IRI `<_:b0>`
-            // would miss the lookup and silently never re-index it (G6, G7).
+            // `from_subject_id`, not `from_named_node`: a blank node is stored
+            // as `_:b0`, and the IRI `<_:b0>` would miss the lookup.
             let term = EncodedTerm::from_subject_id(entity.as_str());
-            if let Some(subject) = self.lookup_term(&term)? {
-                subjects.insert(subject);
+            match self.lookup_term(&term)? {
+                Some(subject) => {
+                    subjects.insert(subject);
+                }
+                // A literal cannot be re-encoded as a subject, so its search
+                // document stays stale until something else dirties it.
+                None => tracing::warn!(
+                    entity = entity.as_str(),
+                    "orphan re-queue skipped an entity it could not look up"
+                ),
             }
         }
         if subjects.is_empty() {
