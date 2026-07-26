@@ -161,6 +161,7 @@ mod tests {
 
         let search_term = format!("cold-start-keyword-{:02}", config.graph_count / 2);
         let expected_graph_id = format!("urn:perf:cold-start:{:02}", config.graph_count / 2);
+        reopened.flush_search_updates().unwrap();
         let search_start = Instant::now();
         let hits = reopened
             .search(
