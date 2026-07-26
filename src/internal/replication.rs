@@ -76,6 +76,11 @@ pub(crate) struct ReplicationEngine {
     rules: Vec<Box<dyn Rule>>,
     actor: ActorId,
     sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+    /// Set by a test to fail the next replicated apply with a store error,
+    /// standing in for a transient fjall failure. Per-engine rather than global
+    /// so concurrent tests cannot arm each other's nodes.
+    #[cfg(test)]
+    armed_apply_failure: std::sync::atomic::AtomicBool,
 }
 
 /// How a write should leave the graph's persisted diagnostics record.
@@ -124,11 +129,27 @@ impl ReplicationEngine {
             rules: crate::rules::default_rules(),
             actor,
             sync,
+            #[cfg(test)]
+            armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub(crate) fn store(&self) -> &Arc<GraphStore> {
         &self.store
+    }
+
+    /// Make the next replicated apply fail with a store error. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_apply_failure(&self) {
+        self.armed_apply_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Consumes a pending injected failure, reporting whether one was armed.
+    #[cfg(test)]
+    pub(crate) fn take_apply_failure(&self) -> bool {
+        self.armed_apply_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Persist a graph's render hints (last-write-wins) and replicate them when
@@ -623,6 +644,12 @@ impl ReplicationEngine {
         &self,
         record: &irokle::reducer::EventRecord<crate::sync::CraqleGraphEvent>,
     ) -> Result<Option<MergeResult>, MergeError> {
+        #[cfg(test)]
+        if self.take_apply_failure() {
+            return Err(MergeError::Store(crate::store::StoreError::Fjall(
+                fjall::Error::Io(std::io::Error::other("injected apply failure")),
+            )));
+        }
         let batch = crate::sync::batch_from_irokle_record(record)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
         batch
