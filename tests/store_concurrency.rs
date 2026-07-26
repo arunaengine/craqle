@@ -231,6 +231,75 @@ fn lifecycle_never_deadlocks() {
     });
 }
 
+/// fjall applies a write batch item by item, so a reader can see a commit's
+/// quads while the same batch's clock key has not landed. A freshness check
+/// reading the durable clock then matches the *previous* orphan record and
+/// serves a pre-write orphan set as current (G6). One wide batch holds that
+/// gap open long enough to catch it reliably; `reads_stay_consistent` only
+/// catches it a few times in a hundred runs.
+#[test]
+fn diagnostics_never_lag() {
+    with_watchdog("diagnostics_never_lag", || {
+        const PER_BATCH: usize = 400;
+        const ROUNDS: usize = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:concurrency:wide-batch");
+        let node = Arc::new(CraqleNode::open(dir.path()).unwrap());
+        node.import_graph_policy(&graph, public_policy()).unwrap();
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let node = Arc::clone(&node);
+                let graph = graph.clone();
+                let done = Arc::clone(&done);
+                scope.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        // One quad per entity and one orphan per quad, so the
+                        // orphan set a diagnostics read returns is the quad
+                        // count of the graph it read.
+                        let (before, _, _) = node.graph_fingerprint(&graph).unwrap();
+                        let orphaned = node.graph_diagnostics(&graph).unwrap().orphaned_entities;
+                        let (after, _, _) = node.graph_fingerprint(&graph).unwrap();
+                        let observed = orphaned.len() as u64;
+                        assert!(
+                            (before..=after).contains(&observed),
+                            "diagnostics read {observed} orphans, outside the \
+                             {before}..={after} quads the graph held during the read"
+                        );
+                    }
+                });
+            }
+
+            let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
+            let media_object = EncodedTerm::from_named_node(&vocab::schema_media_object());
+            for round in 0..ROUNDS {
+                let triples = (0..PER_BATCH)
+                    .map(|index| {
+                        (
+                            named(&format!("urn:wide:r{round}-e{index}")),
+                            rdf_type.clone(),
+                            media_object.clone(),
+                        )
+                    })
+                    .collect();
+                write_unchecked(&node, &graph, triples);
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert_eq!(
+            PER_BATCH * ROUNDS,
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .len(),
+            "the final diagnostics must describe the final graph state"
+        );
+    });
+}
+
 /// Reads must stay consistent with writes while both run: a diagnostics read
 /// never observes a set that disagrees with the graph it is reading, and never
 /// blocks writers indefinitely.
