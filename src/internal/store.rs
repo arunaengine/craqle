@@ -3135,52 +3135,6 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn clear_fts_reindex_for_graph(&self, graph: &GraphId) -> Result<()> {
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(());
-        };
-
-        let _queue = self.fts_queue_guard();
-        let reindex_key = graph_reindex_key(graph_id);
-        if self.graphs.get(reindex_key)?.is_none() {
-            return Ok(());
-        }
-
-        let mut batch = self.buffered_batch();
-        batch.remove(&self.graphs, reindex_key);
-        self.commit_fjall_batch(batch)?;
-        Ok(())
-    }
-
-    pub fn clear_fts_queue_subjects(
-        &self,
-        graph: &GraphId,
-        subjects: &[EncodedTerm],
-    ) -> Result<()> {
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(());
-        };
-
-        let _queue = self.fts_queue_guard();
-        let mut batch = self.buffered_batch();
-        let mut dirty = false;
-        for subject in subjects {
-            let Some(subject_id) = self.lookup_term(subject)? else {
-                continue;
-            };
-            let key = graph_dirty_key(graph_id, subject_id);
-            if self.graphs.get(key)?.is_some() {
-                batch.remove(&self.graphs, key);
-                dirty = true;
-            }
-        }
-
-        if dirty {
-            self.commit_fjall_batch(batch)?;
-        }
-        Ok(())
-    }
-
     pub fn clear_fts_queue(&self) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
