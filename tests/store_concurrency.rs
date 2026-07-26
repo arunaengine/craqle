@@ -300,6 +300,59 @@ fn diagnostics_never_lag() {
     });
 }
 
+/// A fingerprint races wide batches: each batch commits atomically behind the
+/// index lock, so every observed quad count must be a whole number of batches.
+/// A scan bypassing that lock read torn counts mid-batch.
+#[test]
+fn fingerprints_never_tear() {
+    with_watchdog("fingerprints_never_tear", || {
+        const PER_BATCH: usize = 400;
+        const ROUNDS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:concurrency:fingerprint-tear");
+        let node = Arc::new(CraqleNode::open(dir.path()).unwrap());
+        node.import_graph_policy(&graph, public_policy()).unwrap();
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let node = Arc::clone(&node);
+                let graph = graph.clone();
+                let done = Arc::clone(&done);
+                scope.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let (count, _, _) = node.graph_fingerprint(&graph).unwrap();
+                        assert_eq!(
+                            0,
+                            count % PER_BATCH as u64,
+                            "fingerprint observed a torn batch: {count} quads"
+                        );
+                    }
+                });
+            }
+
+            let name = EncodedTerm::from_named_node(&vocab::schema_name());
+            for round in 0..ROUNDS {
+                let triples = (0..PER_BATCH)
+                    .map(|index| {
+                        (
+                            named(&format!("urn:tear:r{round}-e{index}")),
+                            name.clone(),
+                            EncodedTerm(format!("\"entity {index}\"")),
+                        )
+                    })
+                    .collect();
+                write_unchecked(&node, &graph, triples);
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let (count, _, _) = node.graph_fingerprint(&graph).unwrap();
+        assert_eq!((PER_BATCH * ROUNDS) as u64, count);
+    });
+}
+
 /// Reads must stay consistent with writes while both run: a diagnostics read
 /// never observes a set that disagrees with the graph it is reading, and never
 /// blocks writers indefinitely.
