@@ -637,10 +637,13 @@ impl SearchIndex {
         let queued_deletes = drain_upto(&bound, |chunk| store.drain_fts_delete_queue(chunk))?;
         if !queued_deletes.is_empty() {
             for entry in &queued_deletes {
+                // Taken before the probe: read outside the shard, the answer can
+                // already be stale by the time its branch runs.
+                let _rebuild = self.lock_graph(entry.graph.as_str());
                 if store.contains_graph(&entry.graph)? {
-                    self.reindex_from_store(store, &entry.graph)?;
+                    self.reindex_locked(store, &entry.graph)?;
                 } else {
-                    self.delete_graph_documents_uncommitted(entry.graph.as_str())?;
+                    self.delete_documents_locked(entry.graph.as_str())?;
                 }
             }
 
@@ -733,13 +736,15 @@ impl SearchIndex {
     ///
     /// Returns the number of entities indexed.
     pub fn reindex_from_store(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
+        // Held across the clear, the scan and the refill, or a concurrent
+        // upsert is duplicated by the refill or overwritten by the scan.
+        let _rebuild = self.lock_graph(graph.as_str());
+        self.reindex_locked(store, graph)
+    }
+
+    /// The caller MUST hold this graph's rebuild shard.
+    fn reindex_locked(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
         let graph_iri = graph.as_str();
-        // Held across the clear, the scan and the refill. Without it a
-        // concurrent upsert for this graph lands after the clear and is then
-        // duplicated by the refill, or is overwritten by data the scan read
-        // before the upsert reached the store — either way the queue entry is
-        // acknowledged as settled (G7).
-        let _rebuild = self.lock_graph(graph_iri);
         let graph_term = EncodedTerm::from_named_node(&graph.0);
         let graph_tid = match store.lookup_term(&graph_term)? {
             Some(tid) => tid,
@@ -864,12 +869,20 @@ impl SearchIndex {
         self.write_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn delete_graph_documents_uncommitted(&self, graph_id: &str) -> Result<()> {
-        let _rebuild = self.lock_graph(graph_id);
+    /// Drop every document of a graph, leaving the writer uncommitted.
+    /// The caller MUST hold this graph's rebuild shard.
+    fn delete_documents_locked(&self, graph_id: &str) -> Result<()> {
         let writer = self.writer()?;
         writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
         self.write_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// [`SearchIndex::delete_documents_locked`], taking the shard itself.
+    #[cfg(test)]
+    fn delete_graph_documents(&self, graph_id: &str) -> Result<()> {
+        let _rebuild = self.lock_graph(graph_id);
+        self.delete_documents_locked(graph_id)
     }
 }
 
@@ -1542,9 +1555,7 @@ mod tests {
         // Drop the graph's documents behind the store's back, so the index is
         // stale in exactly the way an interrupted writer leaves it. Nothing is
         // queued for it: only a re-derivation from the store can bring it back.
-        node.search
-            .delete_graph_documents_uncommitted(graph.as_str())
-            .unwrap();
+        node.search.delete_graph_documents(graph.as_str()).unwrap();
         node.search.commit().unwrap();
         assert_eq!(0, found(&node));
 
