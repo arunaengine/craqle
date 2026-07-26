@@ -126,17 +126,14 @@ pub enum CraqleError {
 }
 
 impl CraqleError {
-    /// Whether this rejects a record for what it contains, rather than
-    /// reporting a failure that could go the other way next time.
-    ///
-    /// A rejected record can never apply, so a reconcile may quarantine it and
-    /// move on. Everything else — store IO above all — is retryable, and a
-    /// reconcile that skipped past it would lose the record for good (G3).
+    /// Whether this rejects a record for what it contains, so a reconcile may
+    /// quarantine it; everything else is retryable and must stall instead.
     pub fn rejects_record(&self) -> bool {
-        matches!(
-            self,
-            Self::Merge(MergeError::InputRejected(_)) | Self::SyncInputRejected(_)
-        )
+        match self {
+            Self::Merge(MergeError::InputRejected(_)) | Self::SyncInputRejected(_) => true,
+            Self::Merge(MergeError::Store(error)) | Self::Store(error) => error.rejects_record(),
+            _ => false,
+        }
     }
 }
 
