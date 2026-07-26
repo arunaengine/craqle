@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
-    ActorId, Batch, ContextTag, Dot, GraphId, GraphPolicy, MaterializedQuadChange, QuadOp,
-    VectorClock,
+    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
+    QuadOp, VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
@@ -692,6 +692,58 @@ where
     })
 }
 
+/// Largest term craqle accepts from a topic. Well past any real IRI or literal,
+/// and small enough that one record cannot be an allocation attack.
+const MAX_TERM_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reject a term the store could only fail on: oversized, or outside the three
+/// N-Triples shapes craqle encodes.
+fn check_term(term: &EncodedTerm) -> SyncResult<()> {
+    let text = term.0.as_str();
+    if text.len() > MAX_TERM_BYTES {
+        return Err(CraqleSyncError::InvalidEvent(format!(
+            "term of {} bytes exceeds the {MAX_TERM_BYTES} byte limit",
+            text.len()
+        )));
+    }
+    let shaped = (text.starts_with('<') && text.ends_with('>') && text.len() > 1)
+        || (text.starts_with('"') && text.len() > 1)
+        || text.starts_with("_:");
+    if shaped {
+        Ok(())
+    } else {
+        Err(CraqleSyncError::InvalidEvent(format!(
+            "term `{}` is not an encoded IRI, literal or blank node",
+            text.chars().take(64).collect::<String>()
+        )))
+    }
+}
+
+/// Validate every term a record carries before any of it reaches the store, so
+/// content a retry could never accept is rejected here.
+fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
+    for change in changes {
+        let terms = match change {
+            MaterializedQuadChange::Insert {
+                subject,
+                predicate,
+                object,
+                ..
+            }
+            | MaterializedQuadChange::Delete {
+                subject,
+                predicate,
+                object,
+                ..
+            } => [subject, predicate, object],
+        };
+        for term in terms {
+            check_term(term)?;
+        }
+    }
+    Ok(())
+}
+
 /// Borrowing variant, for callers that only hold a reference to the record
 /// (catch-up and reconcile replay both re-read their records afterwards).
 pub(crate) fn batch_from_irokle_record(
@@ -700,6 +752,7 @@ pub(crate) fn batch_from_irokle_record(
     let CraqleGraphEvent::QuadChanges { graph, changes } = &record.event else {
         return Ok(None);
     };
+    check_changes(changes)?;
     let cx = EventBatchCtx {
         graph,
         meta: &record.meta,
@@ -708,8 +761,7 @@ pub(crate) fn batch_from_irokle_record(
 }
 
 /// Consuming variant: moves every term string out of the record instead of
-/// cloning it. Used on the local publish path, where the record is dropped
-/// immediately after the batch is built (W3).
+/// cloning it, for callers that drop the record right after.
 pub(crate) fn batch_from_irokle_event_record(
     record: EventRecord<CraqleGraphEvent>,
 ) -> SyncResult<Option<Batch>> {
@@ -717,6 +769,7 @@ pub(crate) fn batch_from_irokle_event_record(
     let CraqleGraphEvent::QuadChanges { graph, changes } = event else {
         return Ok(None);
     };
+    check_changes(&changes)?;
     let cx = EventBatchCtx {
         graph: &graph,
         meta: &meta,

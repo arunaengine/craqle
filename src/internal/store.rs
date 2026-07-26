@@ -29,6 +29,17 @@ pub enum StoreError {
     },
 }
 
+impl StoreError {
+    /// Whether the bytes offered are what failed, rather than the storage layer
+    /// underneath them. A retry can only ever reproduce these.
+    pub fn rejects_record(&self) -> bool {
+        matches!(
+            self,
+            Self::TermCollision { .. } | Self::InvalidEncoding { .. }
+        )
+    }
+}
+
 pub(crate) type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(
