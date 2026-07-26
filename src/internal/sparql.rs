@@ -602,6 +602,8 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
     })
 }
 
+/// Read one FTS SERVICE block's arguments. `fts:limit` is clamped to
+/// [`crate::MAX_SEARCH_LIMIT`] (10_000), never rejected.
 fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     let GraphPattern::Bgp { patterns } = pattern else {
         return Err(SparqlError::Unsupported(
