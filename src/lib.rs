@@ -760,30 +760,17 @@ impl CraqleNode {
         }
     }
 
-    /// Apply a topic's outstanding records in order, stopping at the first one
-    /// that failed for a reason a retry could clear.
-    ///
-    /// Skipping such a record and carrying on would lose it twice over: the
-    /// cursor would move past it, and a later record from the same actor would
-    /// raise the graph clock past its dot, so even a redelivery would be
-    /// dropped as already applied (G3).
+    /// Apply a topic's outstanding records in order, stopping at the first
+    /// failure a retry could clear rather than losing that record for good.
     fn reconcile_irokle_topic(
         &self,
         sync: &Arc<dyn sync::CraqleGraphSync>,
         topic_id: irokle::TopicId,
     ) -> Result<usize> {
         let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
-        let catchup = match sync.topic_records_since(topic_id, stored_cursor.as_deref()) {
-            Ok(catchup) => catchup,
-            Err(error) => {
-                tracing::warn!(
-                    topic = %topic_id,
-                    %error,
-                    "skipping unreadable craqle topic during reconcile",
-                );
-                return Ok(0);
-            }
-        };
+        // A history read that fails is retryable, so it stalls its topic. A
+        // silent skip would leave the topic unread for the rest of the process.
+        let catchup = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
 
         let sync::TopicCatchup {
             records,
