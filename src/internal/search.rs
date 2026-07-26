@@ -481,6 +481,23 @@ impl SearchIndex {
         )
     }
 
+    /// Adds a second document under an existing key, bypassing the delete
+    /// that normally keeps one document per key. Test seeding only.
+    #[cfg(test)]
+    pub(crate) fn seed_duplicate(&self, graph_id: &str, subject_iri: &str) -> Result<()> {
+        let _rebuild = self.lock_graph(graph_id);
+        let mut writer = self.writer()?;
+        self.add_document(
+            &mut writer,
+            ResourceDoc {
+                graph_id,
+                subject_iri,
+                all_text: None,
+                delete_existing: false,
+            },
+        )
+    }
+
     /// Add `doc` to the index, optionally replacing the document with the same
     /// `(graph, subject)` key first.
     fn add_document(&self, writer: &mut IndexWriter, doc: ResourceDoc<'_>) -> Result<()> {

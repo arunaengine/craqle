@@ -494,13 +494,8 @@ struct FtsSearchRequest<'a> {
     filter: FtsHitFilter<'a>,
 }
 
-/// Collects up to `request.limit` hits the caller is authorized to see.
-///
-/// Visibility is decided *after* tantivy has ranked the hits, so fetching
-/// exactly `limit` silently drops authorized rows whenever a top-ranked hit
-/// sits in a graph the caller cannot read — a G8 completeness violation. We
-/// over-fetch and escalate until either `limit` authorized hits are collected
-/// or the index runs out of matches (`raw < fetch`).
+/// Collects up to the requested number of authorized, deduplicated hits,
+/// widening its over-fetch until the page fills or the index runs out.
 fn search_visible_hits(
     search: &SearchIndex,
     request: &FtsSearchRequest<'_>,
@@ -516,9 +511,10 @@ fn search_visible_hits(
         };
         let raw_len = raw.len();
 
+        let mut seen = crate::SeenHits::default();
         let mut kept = Vec::with_capacity(request.limit.min(raw_len));
         for hit in raw {
-            if !request.filter.keeps(&hit) {
+            if !seen.admits(&hit) || !request.filter.keeps(&hit) {
                 continue;
             }
             kept.push(hit);

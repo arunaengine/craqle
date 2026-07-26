@@ -1597,15 +1597,8 @@ impl CraqleNode {
 
     /// Search visible resources in the local search index.
     ///
-    /// `req.limit` is clamped to [`MAX_SEARCH_LIMIT`] (10_000), never rejected.
-    ///
-    /// Tantivy collects a global top-k, so authorization runs afterwards against
-    /// the *stored* policy — never as an index-side filter, since the index can
-    /// lag the store (G8 soundness).
-    ///
-    /// The over-fetch widens until enough readable hits are found or the index is
-    /// exhausted; a single fixed over-fetch silently truncated the page whenever
-    /// unreadable graphs dominated the ranking (G8 completeness).
+    /// Clamps the limit, authorizes hits against stored policy, and drops
+    /// duplicates so each graph-and-subject pair fills at most one page slot.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 {
@@ -1613,9 +1606,8 @@ impl CraqleNode {
         }
 
         let mut readable = ReadableGraphs::new(self, auth);
-        // Clamping the limit is what bounds this: the escalation below only
-        // widens when the index actually filled the previous fetch, so it
-        // tracks the corpus rather than the caller's number.
+        // Bounded by the clamp above: escalation only widens while the index
+        // actually filled the previous fetch, so it tracks the corpus.
         let mut fetch = limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
         loop {
             let raw_hits = self.search.search(req.query, fetch)?;
@@ -1623,16 +1615,17 @@ impl CraqleNode {
             // give; widening again cannot produce another readable hit.
             let index_exhausted = raw_hits.len() < fetch;
 
+            let mut seen = SeenHits::default();
             let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
             for hit in raw_hits {
-                if readable.allows(&hit.graph_id)? {
+                if seen.admits(&hit) && readable.allows(&hit.graph_id)? {
                     hits.push(hit);
                 }
             }
 
             if hits.len() >= limit || index_exhausted {
-                // Tantivy already returned score-descending order and the
-                // filter preserves it, so no re-sort is needed here.
+                // Score-descending order arrives from the index and both
+                // filters preserve it, so no re-sort is needed here.
                 hits.truncate(limit);
                 return Ok(hits);
             }
@@ -2314,14 +2307,20 @@ fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
 }
 
-/// Merge hits from several searches into one score-ordered page.
-///
-/// Only needed where hits arrive from more than one collection; a single
-/// Tantivy search already returns score-descending order. The comparator
-/// borrows the key fields instead of cloning two `String`s per hit and
-/// rebuilding the key for both sides of every comparison. Callers
-/// never pass duplicate `(graph, subject)` pairs, so an unstable sort is a
-/// total order here and no dedup pass is required.
+/// Remembers graph-and-subject pairs so later duplicates can be dropped.
+#[derive(Default)]
+pub(crate) struct SeenHits(std::collections::HashSet<(String, String)>);
+
+impl SeenHits {
+    /// True exactly once per pair: only the first occurrence is admitted.
+    pub(crate) fn admits(&mut self, hit: &SearchHit) -> bool {
+        self.0
+            .insert((hit.graph_id.clone(), hit.subject_iri.clone()))
+    }
+}
+
+/// Merge hits from several searches into one score-ordered page, keeping only
+/// the highest-scoring occurrence of each graph-and-subject pair.
 fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
     hits.sort_unstable_by(|left, right| {
         Reverse(score_key(left.score))
@@ -2329,6 +2328,8 @@ fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
             .then_with(|| left.graph_id.cmp(&right.graph_id))
             .then_with(|| left.subject_iri.cmp(&right.subject_iri))
     });
+    let mut seen = SeenHits::default();
+    hits.retain(|hit| seen.admits(hit));
     hits.truncate(limit);
     hits
 }
@@ -2520,6 +2521,111 @@ mod tests {
             node.search.search("racyneedle", 10).unwrap().len(),
             "the upsert and the refill each produced a document for one subject"
         );
+    }
+
+    /// Seeds two searchable subjects, then plants a second index document for
+    /// the strongest one so its subject appears twice in raw rankings.
+    #[cfg(feature = "search")]
+    fn duplicated_node(dir: &tempfile::TempDir) -> (CraqleNode, GraphId, GraphId) {
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth = writer_auth();
+
+        let strong = GraphId::new("urn:test:dedup-strong");
+        let weak = GraphId::new("urn:test:dedup-weak");
+        node.create_crate(&auth, crate_request(&strong, "quiettext"))
+            .unwrap();
+        node.create_crate(&auth, crate_request(&weak, "dupneedle"))
+            .unwrap();
+        node.flush_search_updates().unwrap();
+
+        node.search
+            .index_resource(
+                strong.as_str(),
+                "urn:dupneedle:dupneedle",
+                Some("dupneedle"),
+            )
+            .unwrap();
+        node.search
+            .seed_duplicate(strong.as_str(), "urn:dupneedle:dupneedle")
+            .unwrap();
+        node.search.commit().unwrap();
+        (node, strong, weak)
+    }
+
+    /// A duplicated index document must not consume a page slot: both search
+    /// entry points must fill a two-slot page with two distinct subjects.
+    #[test]
+    #[cfg(feature = "search")]
+    fn search_dedups_subjects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, strong, weak) = duplicated_node(&dir);
+        let auth = writer_auth();
+
+        let hits = node
+            .search(
+                &auth,
+                SearchRequest {
+                    query: "dupneedle",
+                    limit: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(2, hits.len());
+        assert_ne!(
+            hits[0].subject_iri, hits[1].subject_iri,
+            "one subject filled both page slots"
+        );
+
+        let graphs = [strong, weak];
+        let hits = node
+            .search_graphs(
+                &auth,
+                GraphSearchRequest {
+                    graphs: &graphs,
+                    query: "dupneedle",
+                    limit: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(2, hits.len());
+        assert_ne!(
+            hits[0].subject_iri, hits[1].subject_iri,
+            "one subject filled both page slots"
+        );
+    }
+
+    /// Duplicate index documents must not become duplicate rows: the FTS
+    /// clause binds each matching subject exactly once.
+    #[test]
+    #[cfg(feature = "search")]
+    fn fts_dedups_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _strong, _weak) = duplicated_node(&dir);
+
+        let sparql = r#"
+            SELECT ?s ?g
+            WHERE {
+                SERVICE <urn:craqle:fts> {
+                    ?s fts:query "dupneedle" .
+                    ?s fts:graph ?g .
+                    ?s fts:limit 10 .
+                }
+            }
+        "#;
+        let rows = match node.query_graphs_with(|_| true, sparql).unwrap() {
+            QueryResults::Solutions(rows) => rows,
+            other => panic!("expected solutions, got {other:?}"),
+        };
+        assert_eq!(2, rows.len(), "duplicate hits changed row cardinality");
+        let subjects: std::collections::HashSet<_> = rows
+            .iter()
+            .map(|row| row.get("s").expect("subject must be bound").0.clone())
+            .collect();
+        assert_eq!(2, subjects.len(), "a subject was bound more than once");
     }
 
     /// Two replicas of one topic: `origin` publishes, `replica` picks the
