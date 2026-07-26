@@ -1597,6 +1597,8 @@ impl CraqleNode {
 
     /// Search visible resources in the local search index.
     ///
+    /// `req.limit` is clamped to [`MAX_SEARCH_LIMIT`] (10_000), never rejected.
+    ///
     /// Tantivy collects a global top-k, so authorization runs afterwards against
     /// the *stored* policy — never as an index-side filter, since the index can
     /// lag the store (G8 soundness).
@@ -1639,6 +1641,8 @@ impl CraqleNode {
     }
 
     /// Search visible resources in an explicit set of graph IRIs.
+    ///
+    /// `req.limit` is clamped to [`MAX_SEARCH_LIMIT`] (10_000), never rejected.
     ///
     /// Every selected graph is authorized against its stored policy *before*
     /// the index is consulted, so no post-filtering — and therefore no
