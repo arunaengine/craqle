@@ -593,6 +593,25 @@ struct TopicPass {
     stalled: Option<CraqleError>,
 }
 
+/// Reconcile passes an open makes before giving up.
+const OPEN_RECONCILE_ATTEMPTS: usize = 3;
+const OPEN_RECONCILE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Catch a node up at open, retrying a stall a transient store or history
+/// failure could clear rather than failing the open on it.
+fn reconcile_at_open(node: &CraqleNode) -> Result<()> {
+    for attempt in 1..OPEN_RECONCILE_ATTEMPTS {
+        match node.reconcile_irokle() {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(attempt, %error, "retrying a stalled reconcile at open");
+                std::thread::sleep(OPEN_RECONCILE_BACKOFF);
+            }
+        }
+    }
+    node.reconcile_irokle().map(|_| ())
+}
+
 impl CraqleNode {
     /// Open a node rooted at `path` with default options.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -622,7 +641,7 @@ impl CraqleNode {
         let search_needs_rebuild =
             search.needs_rebuild() || search_storage == SearchStorage::Memory;
         let node = Self::from_store_and_search(store, search.clone(), options);
-        node.reconcile_irokle()?;
+        reconcile_at_open(&node)?;
         if search_needs_rebuild {
             node.schedule_full_search_reindex()?;
         }
