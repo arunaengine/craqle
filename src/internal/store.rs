@@ -1192,18 +1192,11 @@ impl GraphStore {
     }
 
     /// Publish the durable batch and the index together, reporting anomalies.
+    /// A reader past the new clock never sees state predating it.
     ///
-    /// The lock spans the commit and covers every structure a reader pairs with
-    /// the clock, so a reader past the new clock can never read an index,
-    /// derived mirror or object ordering predating it (G6).
-    ///
-    /// The queue lock nests inside (via commit_durable); nothing else is taken
-    /// and nothing is read from the store, so the section cannot deadlock.
-    fn commit_with_index(
-        &self,
-        commit: DurableCommit,
-        publish: &PendingPublish,
-    ) -> Result<bool> {
+    /// Only the queue lock nests inside, and the fjall reads made here take no
+    /// further lock, so the section cannot deadlock.
+    fn commit_with_index(&self, commit: DurableCommit, publish: &PendingPublish) -> Result<bool> {
         let mut indexes = self.indexes_write();
         self.commit_durable(commit)?;
         #[cfg(test)]
@@ -1230,6 +1223,8 @@ impl GraphStore {
         self.with_derived_indexes(|_| ());
     }
 
+    /// Runs `f` under the index lock, so `f` must not call back into the store:
+    /// any store lock it takes self-deadlocks.
     fn with_derived_indexes<R>(&self, f: impl FnOnce(&DerivedIndexState) -> R) -> R {
         {
             let indexes = self.indexes_read();
