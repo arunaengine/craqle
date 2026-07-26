@@ -254,6 +254,15 @@ pub struct DescribeRequest<'a> {
     pub subject_id: &'a str,
 }
 
+/// Hard cap on a caller-supplied search limit, applied at every entry point.
+///
+/// Tantivy's top-k collector pre-allocates `limit * 2` and the over-fetch
+/// multiplies the limit again before that, so an unbounded limit is an
+/// allocation the caller picks — `fts:limit 10000000000000` from a remote
+/// query aborted the process. Ten thousand rows is well past any real page
+/// and still a trivially sized collector.
+pub const MAX_SEARCH_LIMIT: usize = 10_000;
+
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
 /// Smallest Tantivy over-fetch before authorization filtering.
@@ -1520,29 +1529,33 @@ impl CraqleNode {
     /// exhausted; a single fixed over-fetch silently truncated the page whenever
     /// unreadable graphs dominated the ranking (G8 completeness).
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
-        if req.limit == 0 {
+        let limit = req.limit.min(MAX_SEARCH_LIMIT);
+        if limit == 0 {
             return Ok(Vec::new());
         }
 
         let mut readable = ReadableGraphs::new(self, auth);
-        let mut fetch = req.limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
+        // Clamping the limit is what bounds this: the escalation below only
+        // widens when the index actually filled the previous fetch, so it
+        // tracks the corpus rather than the caller's number.
+        let mut fetch = limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
         loop {
             let raw_hits = self.search.search(req.query, fetch)?;
             // Fewer hits than asked for means the index has nothing more to
             // give; widening again cannot produce another readable hit.
             let index_exhausted = raw_hits.len() < fetch;
 
-            let mut hits = Vec::with_capacity(raw_hits.len().min(req.limit));
+            let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
             for hit in raw_hits {
                 if readable.allows(&hit.graph_id)? {
                     hits.push(hit);
                 }
             }
 
-            if hits.len() >= req.limit || index_exhausted {
+            if hits.len() >= limit || index_exhausted {
                 // Tantivy already returned score-descending order and the
                 // filter preserves it, so no re-sort is needed here.
-                hits.truncate(req.limit);
+                hits.truncate(limit);
                 return Ok(hits);
             }
             fetch = fetch.saturating_mul(4);
@@ -1561,6 +1574,11 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         req: GraphSearchRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
+        // Clamped once here, so both arms and the final ordering agree on it.
+        let req = GraphSearchRequest {
+            limit: req.limit.min(MAX_SEARCH_LIMIT),
+            ..req
+        };
         if req.limit == 0 {
             return Ok(Vec::new());
         }
@@ -2285,6 +2303,49 @@ mod tests {
                 permission_paths: vec!["/t/x".to_string()],
             },
         )
+    }
+
+    /// Both node-level search entry points take a caller-supplied limit that
+    /// Tantivy turns into a `limit * 2` pre-allocation, so `usize::MAX` used
+    /// to abort the process rather than return a page.
+    #[test]
+    #[cfg(feature = "search")]
+    fn huge_limit_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let auth = writer_auth();
+
+        let graph = GraphId::new("urn:test:huge-limit");
+        node.create_crate(&auth, crate_request(&graph, "hugeneedle"))
+            .unwrap();
+        node.flush_search_updates().unwrap();
+
+        let hits = node
+            .search(
+                &auth,
+                SearchRequest {
+                    query: "hugeneedle",
+                    limit: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(1, hits.len());
+
+        let hits = node
+            .search_graphs(
+                &auth,
+                GraphSearchRequest {
+                    graphs: std::slice::from_ref(&graph),
+                    query: "hugeneedle",
+                    limit: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(1, hits.len());
     }
 
     /// `search_graphs` forks strategy above `SEARCH_GRAPHS_PER_GRAPH_LIMIT`
