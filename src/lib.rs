@@ -2554,6 +2554,99 @@ mod tests {
         node.store.applied_topic_clock(topic.as_bytes()).unwrap()
     }
 
+    /// Reopen a replica's store from disk without the reconcile pass `open`
+    /// runs, so the persisted cursor can be read before anything advances it.
+    fn reopen_replica(dir: &Path, irokle: &irokle::Irokle) -> CraqleNode {
+        let store = Arc::new(GraphStore::open(dir.join("store")).unwrap());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        CraqleNode::from_store_and_search(
+            store,
+            search,
+            CraqleOptions::new()
+                .with_search_storage(SearchStorage::Memory)
+                .with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
+        )
+    }
+
+    /// A pass that applies a record and then stalls owes that prefix the
+    /// configured durability, and must resume at the record that failed.
+    #[test]
+    fn stall_persists_prefix() {
+        let ReplicaPair {
+            _dir,
+            irokle,
+            origin,
+            replica,
+        } = replica_pair();
+        let graph = GraphId::new("urn:test:reconcile-prefix");
+        origin
+            .create_crate(&writer_auth(), crate_request(&graph, "prefix"))
+            .unwrap();
+        replica.reconcile_irokle().unwrap();
+        replica.flush_search_updates().unwrap();
+        let topic = origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let baseline = topic_cursor(&replica, topic);
+
+        // A policy record applies without reaching the injected apply failure,
+        // so the quad record behind it is the one that stalls the pass.
+        origin
+            .set_graph_policy(
+                &writer_auth(),
+                &graph,
+                GraphPolicy {
+                    public: false,
+                    permission_paths: vec!["/t/x".to_string()],
+                },
+            )
+            .unwrap();
+        write_keyword(&origin, &graph, "behind-stall");
+
+        let persists = replica.store.persists();
+        replica.replication.arm_apply_failure();
+        let error = replica.reconcile_irokle().unwrap_err();
+        assert!(
+            matches!(error, CraqleError::Merge(MergeError::Store(_))),
+            "the stall must reach the caller, got `{error}`"
+        );
+        assert!(
+            !replica.replication.take_apply_failure(),
+            "the injected failure never fired, so this test proves nothing"
+        );
+        assert!(
+            replica.store.persists() > persists,
+            "the applied prefix must be persisted before the stall returns"
+        );
+        let stalled = topic_cursor(&replica, topic);
+        assert_ne!(
+            baseline, stalled,
+            "the cursor must cover the applied prefix"
+        );
+
+        drop(replica);
+        let reopened = reopen_replica(&_dir.path().join("replica"), &irokle);
+        assert!(
+            !reopened.graph_policy(&graph).unwrap().public,
+            "the record applied before the stall must survive the reopen"
+        );
+        assert_eq!(
+            stalled,
+            topic_cursor(&reopened, topic),
+            "the cursor must survive the reopen"
+        );
+        assert!(
+            !has_keyword(&reopened, &graph, "behind-stall"),
+            "the record that failed must still be pending"
+        );
+
+        reopened.reconcile_irokle().unwrap();
+        assert!(has_keyword(&reopened, &graph, "behind-stall"));
+        assert_eq!(
+            origin.graph_fingerprint(&graph).unwrap(),
+            reopened.graph_fingerprint(&graph).unwrap(),
+            "the replicas must converge once the failure is gone"
+        );
+    }
+
     /// G3 — a retryable apply failure must stop the pass at that record, and a
     /// later pass must still deliver it.
     ///
