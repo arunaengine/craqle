@@ -17,20 +17,49 @@ pub struct QueueBound {
     pub max_token: Option<u64>,
 }
 
-/// A durable FTS queue entry, tagged with the dirty token it was enqueued at.
+/// The dirty tokens one coalesced queue entry carries.
+///
+/// Two are needed because they answer different questions. `oldest` is the
+/// token of the first enqueue that has not been indexed yet, so it decides
+/// whether a bounded flush owes this entry; keeping it is what stops a later
+/// enqueue from lifting pre-flush work above the bound. `latest` advances on
+/// every enqueue, so an acknowledgement can tell an entry it fully covered
+/// from one re-dirtied while it was reading the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirtyTokens {
+    pub oldest: u64,
+    pub latest: u64,
+}
+
+/// A queued subject: one dirty entry in the per-`(graph, subject)` queue.
+#[derive(Clone, Debug)]
+pub struct DirtySubject {
+    pub graph: GraphId,
+    pub subject: TermId,
+    pub tokens: DirtyTokens,
+}
+
+/// A queued whole-graph entry: a reindex or a search-delete.
+#[derive(Clone, Debug)]
+pub struct DirtyGraph {
+    pub graph: GraphId,
+    pub tokens: DirtyTokens,
+}
+
+/// A durable FTS queue entry, tagged with the dirty tokens it accumulated.
 pub(crate) trait QueueEntry {
     fn token(&self) -> u64;
 }
 
-impl QueueEntry for (GraphId, u64) {
+impl QueueEntry for DirtyGraph {
     fn token(&self) -> u64 {
-        self.1
+        self.tokens.oldest
     }
 }
 
-impl QueueEntry for (GraphId, TermId, u64) {
+impl QueueEntry for DirtySubject {
     fn token(&self) -> u64 {
-        self.2
+        self.tokens.oldest
     }
 }
 
@@ -78,14 +107,24 @@ mod tests {
 
     /// A queue whose scan order puts freshly enqueued entries first, which is
     /// what a hash-ordered key space does to a bounded drain.
-    fn queue(tokens: &[u64]) -> impl Fn(usize) -> Result<Vec<(GraphId, u64)>> + '_ {
+    fn queue(tokens: &[u64]) -> impl Fn(usize) -> Result<Vec<DirtyGraph>> + '_ {
         move |chunk| {
             Ok(tokens
                 .iter()
                 .take(chunk)
-                .map(|&token| (GraphId::new("urn:test:queue"), token))
+                .map(|&token| DirtyGraph {
+                    graph: GraphId::new("urn:test:queue"),
+                    tokens: DirtyTokens {
+                        oldest: token,
+                        latest: token,
+                    },
+                })
                 .collect())
         }
+    }
+
+    fn oldest(drained: &[DirtyGraph]) -> Vec<u64> {
+        drained.iter().map(|entry| entry.tokens.oldest).collect()
     }
 
     #[test]
@@ -99,7 +138,7 @@ mod tests {
 
         // Reading one chunk would have found nothing and reported the queue
         // drained, leaving tokens 7 and 3 unindexed past a bounded flush.
-        assert_eq!(vec![7, 3], drained.iter().map(|e| e.1).collect::<Vec<_>>());
+        assert_eq!(vec![7, 3], oldest(&drained));
     }
 
     #[test]
@@ -125,7 +164,7 @@ mod tests {
 
         let drained = drain_upto(&bound, queue(&[7])).unwrap();
 
-        assert_eq!(vec![7], drained.iter().map(|e| e.1).collect::<Vec<_>>());
+        assert_eq!(vec![7], oldest(&drained));
     }
 
     #[test]

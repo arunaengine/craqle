@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::core::*;
+use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, compaction::Leveled,
     config::CompressionPolicy,
@@ -194,6 +195,12 @@ impl PendingFts {
             self.order.push(key);
         }
     }
+}
+
+/// One queue entry an indexing pass covered up to `covered`.
+struct AckedEntry {
+    key: Vec<u8>,
+    covered: u64,
 }
 
 /// A batch's durable half: the staged fjall writes plus the FTS queue keys
@@ -690,6 +697,36 @@ pub enum PageCursor<'a> {
 pub struct PageRequest<'a> {
     pub cursor: PageCursor<'a>,
     pub limit: usize,
+}
+
+fn encode_dirty_tokens(tokens: DirtyTokens) -> [u8; 16] {
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&tokens.oldest.to_be_bytes());
+    value[8..].copy_from_slice(&tokens.latest.to_be_bytes());
+    value
+}
+
+/// Decode a queue entry's tokens, accepting the single-token form a store
+/// written before `oldest` existed still holds: that token was the latest, and
+/// with nothing older recorded it is also the oldest unindexed one.
+fn decode_dirty_tokens(bytes: &[u8], context: &'static str) -> Result<DirtyTokens> {
+    if bytes.len() == 8 {
+        let token = decode_u64_bytes(bytes, context)?;
+        return Ok(DirtyTokens {
+            oldest: token,
+            latest: token,
+        });
+    }
+    if bytes.len() != 16 {
+        return Err(StoreError::InvalidEncoding {
+            context,
+            message: format!("expected 8 or 16 bytes, found {}", bytes.len()),
+        });
+    }
+    Ok(DirtyTokens {
+        oldest: decode_u64_bytes(&bytes[..8], context)?,
+        latest: decode_u64_bytes(&bytes[8..], context)?,
+    })
 }
 
 fn decode_u64_bytes(bytes: &[u8], context: &'static str) -> Result<u64> {
@@ -1880,7 +1917,8 @@ impl GraphStore {
         ] {
             for guard in self.graphs.prefix(prefix) {
                 let (_, value) = guard.into_inner()?;
-                highest = highest.max(decode_u64_bytes(value.as_ref(), "fts queue token")?);
+                let tokens = decode_dirty_tokens(value.as_ref(), "fts queue tokens")?;
+                highest = highest.max(tokens.latest);
             }
         }
         self.dirty_counter.store(highest + 1, Ordering::SeqCst);
@@ -2826,7 +2864,7 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn drain_fts_queue(&self, limit: usize) -> Result<Vec<(GraphId, TermId, u64)>> {
+    pub fn drain_fts_queue(&self, limit: usize) -> Result<Vec<DirtySubject>> {
         let mut result = Vec::new();
         let mut term_cache = HashMap::new();
 
@@ -2837,13 +2875,17 @@ impl GraphStore {
             }
             let graph_id = decode_term_id(&key[1..17], "graph dirty graph")?;
             let subject_id = decode_term_id(&key[17..33], "graph dirty subject")?;
-            let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
+            let tokens = decode_dirty_tokens(value.as_ref(), "graph dirty tokens")?;
             let graph = self
                 .decode_term_cached(&mut term_cache, graph_id)?
                 .to_named_node()
                 .map(GraphId);
             if let Some(graph) = graph {
-                result.push((graph, subject_id, token));
+                result.push(DirtySubject {
+                    graph,
+                    subject: subject_id,
+                    tokens,
+                });
             }
             if result.len() >= limit {
                 break;
@@ -2853,7 +2895,7 @@ impl GraphStore {
         Ok(result)
     }
 
-    pub fn drain_fts_reindex_queue(&self, limit: usize) -> Result<Vec<(GraphId, u64)>> {
+    pub fn drain_fts_reindex_queue(&self, limit: usize) -> Result<Vec<DirtyGraph>> {
         let mut result = Vec::new();
         let mut term_cache = HashMap::new();
 
@@ -2863,13 +2905,13 @@ impl GraphStore {
                 continue;
             }
             let graph_id = decode_term_id(&key[1..17], "graph reindex graph")?;
-            let token = decode_u64_bytes(value.as_ref(), "graph reindex token")?;
+            let tokens = decode_dirty_tokens(value.as_ref(), "graph reindex tokens")?;
             let graph = self
                 .decode_term_cached(&mut term_cache, graph_id)?
                 .to_named_node()
                 .map(GraphId);
             if let Some(graph) = graph {
-                result.push((graph, token));
+                result.push(DirtyGraph { graph, tokens });
             }
             if result.len() >= limit {
                 break;
@@ -2879,7 +2921,7 @@ impl GraphStore {
         Ok(result)
     }
 
-    pub fn drain_fts_delete_queue(&self, limit: usize) -> Result<Vec<(GraphId, u64)>> {
+    pub fn drain_fts_delete_queue(&self, limit: usize) -> Result<Vec<DirtyGraph>> {
         let mut result = Vec::new();
         let mut term_cache = HashMap::new();
 
@@ -2889,13 +2931,13 @@ impl GraphStore {
                 continue;
             }
             let graph_id = decode_term_id(&key[1..17], "graph search delete graph")?;
-            let token = decode_u64_bytes(value.as_ref(), "graph search delete token")?;
+            let tokens = decode_dirty_tokens(value.as_ref(), "graph search delete tokens")?;
             let graph = self
                 .decode_term_cached(&mut term_cache, graph_id)?
                 .to_named_node()
                 .map(GraphId);
             if let Some(graph) = graph {
-                result.push((graph, token));
+                result.push(DirtyGraph { graph, tokens });
             }
             if result.len() >= limit {
                 break;
@@ -2910,23 +2952,24 @@ impl GraphStore {
     ///
     /// The queue lock spans the token read and the commit: an enqueue landing
     /// in between would otherwise be erased by a removal that never covered it.
-    pub fn acknowledge_fts_queue(&self, queued: &[(GraphId, TermId, u64)]) -> Result<()> {
+    pub fn acknowledge_fts_queue(&self, queued: &[DirtySubject]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
-        for (graph, subject, token) in queued {
-            let Some(graph_id) = self.graph_id_for(graph)? else {
+        for entry in queued {
+            let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            let key = graph_dirty_key(graph_id, *subject);
-            if self.graphs.get(key)?.is_some_and(|current| {
-                decode_u64_bytes(current.as_ref(), "graph dirty token").ok() == Some(*token)
-            }) {
-                batch.remove(&self.graphs, key);
-            }
+            self.settle_fts_entry(
+                &mut batch,
+                AckedEntry {
+                    key: graph_dirty_key(graph_id, entry.subject).to_vec(),
+                    covered: entry.tokens.latest,
+                },
+            )?;
         }
         #[cfg(test)]
         self.stall_in_fts_ack();
@@ -2934,45 +2977,47 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn acknowledge_fts_reindex_queue(&self, queued: &[(GraphId, u64)]) -> Result<()> {
+    pub fn acknowledge_fts_reindex_queue(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
-        for (graph, token) in queued {
-            let Some(graph_id) = self.graph_id_for(graph)? else {
+        for entry in queued {
+            let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            let key = graph_reindex_key(graph_id);
-            if self.graphs.get(key)?.is_some_and(|current| {
-                decode_u64_bytes(current.as_ref(), "graph reindex token").ok() == Some(*token)
-            }) {
-                batch.remove(&self.graphs, key);
-            }
+            self.settle_fts_entry(
+                &mut batch,
+                AckedEntry {
+                    key: graph_reindex_key(graph_id).to_vec(),
+                    covered: entry.tokens.latest,
+                },
+            )?;
         }
         self.commit_fjall_batch(batch)?;
         Ok(())
     }
 
-    pub fn acknowledge_fts_delete_queue(&self, queued: &[(GraphId, u64)]) -> Result<()> {
+    pub fn acknowledge_fts_delete_queue(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
-        for (graph, token) in queued {
-            let Some(graph_id) = self.graph_id_for(graph)? else {
+        for entry in queued {
+            let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            let key = graph_search_delete_key(graph_id);
-            if self.graphs.get(key)?.is_some_and(|current| {
-                decode_u64_bytes(current.as_ref(), "graph search delete token").ok() == Some(*token)
-            }) {
-                batch.remove(&self.graphs, key);
-            }
+            self.settle_fts_entry(
+                &mut batch,
+                AckedEntry {
+                    key: graph_search_delete_key(graph_id).to_vec(),
+                    covered: entry.tokens.latest,
+                },
+            )?;
         }
         self.commit_fjall_batch(batch)?;
         Ok(())
@@ -2980,7 +3025,7 @@ impl GraphStore {
 
     pub fn acknowledge_fts_subjects_for_reindexed_graphs(
         &self,
-        queued: &[(GraphId, u64)],
+        queued: &[DirtyGraph],
     ) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -2989,14 +3034,16 @@ impl GraphStore {
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
-        for (graph, reindex_token) in queued {
-            let Some(graph_id) = self.graph_id_for(graph)? else {
+        for entry in queued {
+            let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
             for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
                 let (key, value) = guard.into_inner()?;
-                let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
-                if token <= *reindex_token {
+                let tokens = decode_dirty_tokens(value.as_ref(), "graph dirty tokens")?;
+                // `latest`: a subject dirtied past the reindex token is not
+                // covered by the scan that token bounded.
+                if tokens.latest <= entry.tokens.latest {
                     batch.remove(&self.graphs, key);
                     dirty = true;
                 }
@@ -3009,10 +3056,7 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn acknowledge_fts_queues_for_deleted_graphs(
-        &self,
-        queued: &[(GraphId, u64)],
-    ) -> Result<()> {
+    pub fn acknowledge_fts_queues_for_deleted_graphs(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
@@ -3020,14 +3064,15 @@ impl GraphStore {
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
-        for (graph, delete_token) in queued {
-            let Some(graph_id) = self.graph_id_for(graph)? else {
+        for entry in queued {
+            let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
+            let delete_token = entry.tokens.latest;
             for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
                 let (key, value) = guard.into_inner()?;
-                let token = decode_u64_bytes(value.as_ref(), "graph dirty token")?;
-                if token <= *delete_token {
+                let tokens = decode_dirty_tokens(value.as_ref(), "graph dirty tokens")?;
+                if tokens.latest <= delete_token {
                     batch.remove(&self.graphs, key);
                     dirty = true;
                 }
@@ -3035,9 +3080,8 @@ impl GraphStore {
 
             let reindex_key = graph_reindex_key(graph_id);
             if self.graphs.get(reindex_key)?.is_some_and(|current| {
-                decode_u64_bytes(current.as_ref(), "graph reindex token")
-                    .ok()
-                    .is_some_and(|token| token <= *delete_token)
+                decode_dirty_tokens(current.as_ref(), "graph reindex tokens")
+                    .is_ok_and(|tokens| tokens.latest <= delete_token)
             }) {
                 batch.remove(&self.graphs, reindex_key);
                 dirty = true;
@@ -3171,6 +3215,39 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Retire the part of a queue entry an indexing pass just covered.
+    ///
+    /// Removes the entry when nothing was queued since the drain read it.
+    /// Otherwise the entry stays — the newer write still owes an index — but
+    /// its `oldest` moves past the covered tokens. Leaving it whole instead
+    /// would keep it matching the bound a flush pinned, and a writer that
+    /// keeps dirtying the same subject would hold that flush open forever.
+    ///
+    /// Every token at or below `covered` was durable before the drain read
+    /// the entry, so the pass that followed indexed it.
+    ///
+    /// The caller MUST hold the FTS queue lock.
+    fn settle_fts_entry(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        entry: AckedEntry,
+    ) -> Result<()> {
+        let Some(current) = self.graphs.get(&entry.key)? else {
+            return Ok(());
+        };
+        let stored = decode_dirty_tokens(current.as_ref(), "fts queue tokens")?;
+        if stored.latest <= entry.covered {
+            batch.remove(&self.graphs, entry.key);
+        } else {
+            let narrowed = DirtyTokens {
+                oldest: entry.covered + 1,
+                latest: stored.latest,
+            };
+            batch.insert(&self.graphs, entry.key, encode_dirty_tokens(narrowed));
+        }
+        Ok(())
+    }
+
     /// Take the FTS queue lock, recovering from poison: the state it guards
     /// lives in fjall, not behind the mutex.
     fn fts_queue_guard(&self) -> MutexGuard<'_, ()> {
@@ -3179,13 +3256,35 @@ impl GraphStore {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stamp `key` with a fresh dirty token and stage its queue entry.
+    /// Stamp `key` with a fresh dirty token and stage its queue entry,
+    /// coalescing into whatever the queue already holds for that key.
     ///
-    /// The caller MUST hold the FTS queue lock: minting under it is what makes
+    /// Keeps the older `oldest`. Coalescing a second enqueue by overwriting
+    /// would lift the entry above a bound a flush pinned between the two, and
+    /// the drain would filter out work the flush promised to index. Widening
+    /// the other way only ever over-includes, which costs a reindex.
+    ///
+    /// The caller MUST hold the FTS queue lock: it makes this read-modify-write
+    /// atomic against acknowledgement, and minting under it is what makes
     /// "every entry below the token a flush pinned is already durable" true.
-    fn stage_fts_entry(&self, batch: &mut fjall::OwnedWriteBatch, key: FtsQueueKey) {
+    fn stage_fts_entry(&self, batch: &mut fjall::OwnedWriteBatch, key: FtsQueueKey) -> Result<()> {
         let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
-        batch.insert(&self.graphs, key.bytes(), token.to_be_bytes());
+        let bytes = key.bytes();
+        let tokens = match self.graphs.get(&bytes)? {
+            Some(current) => {
+                let stored = decode_dirty_tokens(current.as_ref(), "fts queue tokens")?;
+                DirtyTokens {
+                    oldest: stored.oldest.min(token),
+                    latest: stored.latest.max(token),
+                }
+            }
+            None => DirtyTokens {
+                oldest: token,
+                latest: token,
+            },
+        };
+        batch.insert(&self.graphs, bytes, encode_dirty_tokens(tokens));
+        Ok(())
     }
 
     /// Publish a batch together with the queue entries it owes.
@@ -3196,7 +3295,7 @@ impl GraphStore {
         } = commit;
         let _queue = self.fts_queue_guard();
         for key in pending_fts.order {
-            self.stage_fts_entry(&mut batch, key);
+            self.stage_fts_entry(&mut batch, key)?;
         }
         self.commit_fjall_batch(batch)
     }
@@ -3362,6 +3461,7 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search_queue::{QueueBound, drain_upto};
 
     fn setup_store() -> (tempfile::TempDir, GraphStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -3637,6 +3737,43 @@ mod tests {
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
     }
 
+    /// Re-dirtying a subject must not lift its entry above a bound pinned
+    /// before it: the flush holding that bound promised to index the first
+    /// write, and a drain filters on the token the entry carries.
+    #[test]
+    fn enqueue_keeps_oldest() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:graph");
+        store.create_graph(&graph).unwrap();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let subject = store.resolve_term(&named("urn:test:subject")).unwrap();
+        let other = store.resolve_term(&named("urn:test:other")).unwrap();
+
+        let enqueue = |subject| {
+            let mut batch = store.new_batch();
+            store
+                .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
+                .unwrap();
+            store.commit(batch).unwrap();
+        };
+
+        enqueue(subject);
+        // What a flush starting right here would pin.
+        let bound = QueueBound {
+            chunk: 10,
+            max_token: Some(store.current_dirty_token()),
+        };
+        // Carry the counter past the bound, then dirty the subject again.
+        enqueue(other);
+        enqueue(subject);
+
+        let drained = drain_upto(&bound, |chunk| store.drain_fts_queue(chunk)).unwrap();
+
+        assert!(drained.iter().any(|entry| entry.subject == subject));
+    }
+
     /// An enqueue landing between an acknowledgement's token read and its
     /// commit must survive: the removal only ever covered the older token, so
     /// erasing the entry would leave that write unindexed for good.
@@ -3691,7 +3828,7 @@ mod tests {
 
         let queued = store.drain_fts_reindex_queue(10).unwrap();
         assert_eq!(1, queued.len());
-        assert_eq!(queued[0].0, graph);
+        assert_eq!(queued[0].graph, graph);
         store.acknowledge_fts_reindex_queue(&queued).unwrap();
         assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
     }
@@ -4015,7 +4152,7 @@ mod tests {
                 .acknowledge_fts_subjects_for_reindexed_graphs(&queued)
                 .unwrap();
             assert!(store.drain_fts_queue(10).unwrap().is_empty());
-            queued[0].1
+            queued[0].tokens.latest
         };
 
         let store = GraphStore::open(dir.path()).unwrap();
@@ -4035,7 +4172,9 @@ mod tests {
         store.commit(batch).unwrap();
 
         let reindex_queued = store.drain_fts_reindex_queue(10).unwrap();
-        assert_eq!(vec![(graph.clone(), reindex_token)], reindex_queued);
+        assert_eq!(1, reindex_queued.len());
+        assert_eq!(graph, reindex_queued[0].graph);
+        assert_eq!(reindex_token, reindex_queued[0].tokens.latest);
         store
             .acknowledge_fts_subjects_for_reindexed_graphs(&reindex_queued)
             .unwrap();
@@ -4046,7 +4185,7 @@ mod tests {
             remaining.len(),
             "a subject queued after the reindex must survive its acknowledgement"
         );
-        assert_eq!(subject, remaining[0].1);
+        assert_eq!(subject, remaining[0].subject);
     }
 
     // ── Vector-clock key split ──────────────────────────────────────────
@@ -4609,7 +4748,7 @@ mod tests {
             .drain_fts_queue(10)
             .unwrap()
             .into_iter()
-            .map(|(_, subject, _)| subject)
+            .map(|entry| entry.subject)
             .collect();
         assert_eq!(
             vec![subject_id],
@@ -4661,7 +4800,7 @@ mod tests {
             .drain_fts_queue(10)
             .unwrap()
             .into_iter()
-            .map(|(_, subject, _)| subject)
+            .map(|entry| entry.subject)
             .collect();
         assert_eq!(
             vec![subject_id],
