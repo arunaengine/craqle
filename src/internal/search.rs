@@ -22,6 +22,9 @@ use crate::store::{GraphStore, TermId};
 const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
 const MEMORY_INDEX_WRITER_HEAP_BYTES: usize = 64_000_000;
 const REINDEX_FLUSH_CHUNK: usize = 2_048;
+/// Rebuild-lock shards. Comfortably above the indexer's concurrency while
+/// staying a fixed, tiny allocation.
+const REBUILD_SHARDS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v2";
 
@@ -86,6 +89,12 @@ pub struct SearchIndex {
     ///
     /// LOCK ORDER: rebuild shard, then this, then [`SearchIndex::writer`].
     commit_lock: Mutex<()>,
+    /// Serializes a graph's clear-and-refill against every other mutation of
+    /// the same graph. Sharded by graph IRI.
+    ///
+    /// LOCK ORDER: these, then `commit_lock`, then [`SearchIndex::writer`];
+    /// multiple shards always in ascending index order.
+    rebuild_shards: [Mutex<()>; REBUILD_SHARDS],
     /// Set when a poisoned writer was rolled back and the index therefore owes
     /// the store a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
@@ -279,6 +288,7 @@ impl SearchIndex {
             write_epoch: AtomicU64::new(0),
             committed_epoch: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
+            rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
             rebuild_owed: AtomicBool::new(false),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -307,6 +317,7 @@ impl SearchIndex {
             write_epoch: AtomicU64::new(0),
             committed_epoch: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
+            rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
             rebuild_owed: AtomicBool::new(false),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -333,6 +344,42 @@ impl SearchIndex {
     #[cfg(test)]
     pub(crate) fn take_armed_drain_panic(&self) -> bool {
         self.hooks.drain_panic.swap(false, Ordering::SeqCst)
+    }
+
+    /// Pauses the next rebuild between its clear and its refill. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_rebuild_stall(&self, delay: std::time::Duration) {
+        self.hooks.rebuild.arm(delay);
+    }
+
+    /// Spins until a rebuild is inside that pause. Test-only.
+    #[cfg(test)]
+    pub(crate) fn await_rebuild_stall(&self) {
+        self.hooks.rebuild.wait_entered();
+    }
+
+    /// Lock one graph's rebuild shard. See `rebuild_shards` for the order this
+    /// must be taken in.
+    fn lock_graph(&self, graph_iri: &str) -> MutexGuard<'_, ()> {
+        self.rebuild_shards[rebuild_shard(graph_iri)]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock every shard the given graphs map onto, ascending, so two callers
+    /// with overlapping graph sets cannot deadlock against each other.
+    fn lock_graphs<'a>(&self, graphs: impl Iterator<Item = &'a str>) -> Vec<MutexGuard<'_, ()>> {
+        let mut shards: Vec<usize> = graphs.map(rebuild_shard).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+            .into_iter()
+            .map(|shard| {
+                self.rebuild_shards[shard]
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            })
+            .collect()
     }
 
     /// Lock the Tantivy writer, repairing it if a panicking thread poisoned
@@ -414,6 +461,7 @@ impl SearchIndex {
         subject_iri: &str,
         all_text: Option<&str>,
     ) -> Result<()> {
+        let _rebuild = self.lock_graph(graph_id);
         let mut writer = self.writer()?;
         self.add_document(
             &mut writer,
@@ -608,6 +656,11 @@ impl SearchIndex {
             return Ok(0);
         }
 
+        // Held across both phases: a rebuild of one of these graphs must not
+        // clear and refill it from a scan that straddles the read below and
+        // the apply that follows it.
+        let rebuild_guards = self.lock_graphs(queued.iter().map(|entry| entry.graph.as_str()));
+
         // Phase 1: read every update from the store with NO writer lock held.
         // This walks up to `bound.chunk` subjects and used to run under the
         // Tantivy writer mutex, blocking every other indexer for the whole
@@ -637,6 +690,7 @@ impl SearchIndex {
                 self.apply_prepared_op(&mut writer, op)?;
             }
         }
+        drop(rebuild_guards);
 
         self.commit()?;
         store.acknowledge_fts_queue(&queued)?;
@@ -669,6 +723,12 @@ impl SearchIndex {
     /// Returns the number of entities indexed.
     pub fn reindex_from_store(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
         let graph_iri = graph.as_str();
+        // Held across the clear, the scan and the refill. Without it a
+        // concurrent upsert for this graph lands after the clear and is then
+        // duplicated by the refill, or is overwritten by data the scan read
+        // before the upsert reached the store — either way the queue entry is
+        // acknowledged as settled (G7).
+        let _rebuild = self.lock_graph(graph_iri);
         let graph_term = EncodedTerm::from_named_node(&graph.0);
         let graph_tid = match store.lookup_term(&graph_term)? {
             Some(tid) => tid,
@@ -688,6 +748,9 @@ impl SearchIndex {
             writer.delete_term(Term::from_field_text(self.f_graph_id, graph_iri));
             self.write_epoch.fetch_add(1, Ordering::SeqCst);
         }
+
+        #[cfg(test)]
+        self.hooks.rebuild.run();
 
         store.for_each_quad_in_graph::<SearchError, _>(graph_tid, |quad| {
             if current_subject != Some(quad.subject) {
@@ -791,6 +854,7 @@ impl SearchIndex {
     }
 
     fn delete_graph_documents_uncommitted(&self, graph_id: &str) -> Result<()> {
+        let _rebuild = self.lock_graph(graph_id);
         let writer = self.writer()?;
         writer.delete_term(Term::from_field_text(self.f_graph_id, graph_id));
         self.write_epoch.fetch_add(1, Ordering::SeqCst);
@@ -862,6 +926,13 @@ fn doc_key(graph_id: &str, subject_iri: &str) -> String {
 fn split_doc_key(doc_key: &str) -> Option<(String, String)> {
     let (graph_id, subject_iri) = doc_key.split_once('\u{1f}')?;
     Some((graph_id.to_string(), subject_iri.to_string()))
+}
+
+fn rebuild_shard(graph_iri: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    graph_iri.hash(&mut hasher);
+    (hasher.finish() % REBUILD_SHARDS as u64) as usize
 }
 
 fn sanitize_query(query: &str) -> String {
