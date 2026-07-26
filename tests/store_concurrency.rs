@@ -353,6 +353,61 @@ fn fingerprints_never_tear() {
     });
 }
 
+/// A snapshot races wide batches: it must be internally consistent, meaning
+/// its clock and its quads describe the same commit. With one dot minted per
+/// batch, the clock total times the batch size must equal the quad count.
+#[test]
+fn snapshots_never_tear() {
+    with_watchdog("snapshots_never_tear", || {
+        const PER_BATCH: usize = 400;
+        const ROUNDS: usize = 16;
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:concurrency:snapshot-tear");
+        let node = Arc::new(CraqleNode::open(dir.path()).unwrap());
+        node.import_graph_policy(&graph, public_policy()).unwrap();
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let node = Arc::clone(&node);
+                let graph = graph.clone();
+                let done = Arc::clone(&done);
+                scope.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let snapshot = node.graph_snapshot(&graph).unwrap();
+                        let quads = snapshot.quads.len() as u64;
+                        let batches: u64 = snapshot.clock.0.values().sum();
+                        assert_eq!(
+                            batches * PER_BATCH as u64,
+                            quads,
+                            "snapshot clock covers {batches} batches but holds {quads} quads"
+                        );
+                    }
+                });
+            }
+
+            let name = EncodedTerm::from_named_node(&vocab::schema_name());
+            for round in 0..ROUNDS {
+                let triples = (0..PER_BATCH)
+                    .map(|index| {
+                        (
+                            named(&format!("urn:snap:r{round}-e{index}")),
+                            name.clone(),
+                            EncodedTerm(format!("\"entity {index}\"")),
+                        )
+                    })
+                    .collect();
+                write_unchecked(&node, &graph, triples);
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let snapshot = node.graph_snapshot(&graph).unwrap();
+        assert_eq!(PER_BATCH * ROUNDS, snapshot.quads.len());
+    });
+}
+
 /// Reads must stay consistent with writes while both run: a diagnostics read
 /// never observes a set that disagrees with the graph it is reading, and never
 /// blocks writers indefinitely.
