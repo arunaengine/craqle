@@ -2603,6 +2603,45 @@ mod tests {
         );
     }
 
+    /// A term too large for the store is content, not weather: it must be
+    /// quarantined at the decode boundary rather than poison-pill its topic.
+    #[test]
+    fn oversize_term_quarantines() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:reconcile-oversize");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "oversize"))
+            .unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+
+        let oversize = format!("\"{}\"", "x".repeat(sync::MAX_TERM_BYTES));
+        pair.irokle
+            .open_topic::<CraqleGraphEvent>(topic)
+            .unwrap()
+            .publish(CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes: vec![MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: EncodedTerm::from_named_node(&graph.0),
+                    predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    object: EncodedTerm(oversize),
+                }],
+            })
+            .unwrap();
+        write_keyword(&pair.origin, &graph, "behind-oversize");
+
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(
+            has_keyword(&pair.replica, &graph, "behind-oversize"),
+            "an oversized term must not hold back the records behind it"
+        );
+        assert_eq!(
+            pair.origin.graph_fingerprint(&graph).unwrap(),
+            pair.replica.graph_fingerprint(&graph).unwrap(),
+            "both replicas must reject the same record and converge"
+        );
+    }
+
     /// A record no retry could ever accept stays quarantined: the pass skips
     /// it and still applies the records behind it.
     #[test]

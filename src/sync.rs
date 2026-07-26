@@ -694,7 +694,7 @@ where
 
 /// Largest term craqle accepts from a topic. Well past any real IRI or literal,
 /// and small enough that one record cannot be an allocation attack.
-const MAX_TERM_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_TERM_BYTES: usize = 4 * 1024 * 1024;
 
 /// Reject a term the store could only fail on: oversized, or outside the three
 /// N-Triples shapes craqle encodes.
