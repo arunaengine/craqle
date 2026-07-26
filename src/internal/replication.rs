@@ -279,14 +279,7 @@ impl ReplicationEngine {
         // Guards the recompute→persist cycle so the record cannot be tagged with
         // a clock newer than the state it describes.
         let _commit_guard = self.store.graph_commit_guard(graph);
-        // The last persisted set is what the search index reflects, so it is the
-        // right thing to diff against. Reading it through `graph_diagnostics`
-        // would recompute a stale record first and lose the difference.
-        let previous = self
-            .store
-            .last_persisted_diagnostics(graph)
-            .map_err(UpdateError::Store)?;
-        self.recompute_graph_diagnostics(graph, &previous)
+        self.recompute_graph_diagnostics(graph)
             .map_err(UpdateError::Store)
     }
 
@@ -760,43 +753,47 @@ impl ReplicationEngine {
         // set identical — the previous verdict is still exact and only needs
         // re-stamping so its clock tag matches the new state (G6).
         if !pending.summary.touches_reachability() {
-            return self.store.set_graph_diagnostics(graph, &pending.previous);
+            return self.publish_graph_diagnostics(graph, &pending.previous);
         }
 
-        // Case 2. `pending.previous` was captured before the write; re-reading
-        // it here would yield the post-write set and defeat the search re-queue.
-        self.recompute_graph_diagnostics(graph, &pending.previous)
+        // Case 2. `pending.previous` is not the post-write set, so recompute.
+        self.recompute_graph_diagnostics(graph)
     }
 
-    /// Recompute the orphan set from the store and persist it, re-queueing the
-    /// entities whose visibility changed for search (G6, G7).
+    /// Recompute the orphan set from post-write state and publish it (G6, G7).
+    fn recompute_graph_diagnostics(&self, graph: &GraphId) -> crate::store::Result<()> {
+        // The commit already made the stored record's clock tag stale, so this
+        // read recomputes. It does not persist: this is the record's writer.
+        let current = self.store.graph_diagnostics(graph)?;
+        self.publish_graph_diagnostics(graph, &current)
+    }
+
+    /// Persist `current` as the graph's orphan record and re-queue for search
+    /// every entity whose orphan status differs from the last persisted set.
     ///
-    /// `previous` must be the pre-write set and cannot be re-read here: the clock
-    /// has already advanced, so a read would recompute from post-write state,
-    /// making `previous == current` and skipping the re-queue every time.
+    /// The baseline is the *persisted* record, never a caller's pre-write read:
+    /// a deferred bulk write that has committed but not yet rebuilt leaves that
+    /// read already reflecting flips the index has never seen, and persisting it
+    /// would strand them (G7).
     ///
     /// Re-queue first, record second: they are separate commits, and a crash
-    /// between them must leave the older baseline so the next rebuild re-queues
-    /// (G7).
-    fn recompute_graph_diagnostics(
+    /// between them must leave the older baseline so the next rebuild re-queues.
+    fn publish_graph_diagnostics(
         &self,
         graph: &GraphId,
-        previous: &GraphDiagnostics,
+        current: &GraphDiagnostics,
     ) -> crate::store::Result<()> {
-        // Recomputes against post-write state, because the commit already made
-        // the stored record's clock tag stale. It does not persist: this is the
-        // writer that owns the record.
-        let current = self.store.graph_diagnostics(graph)?;
-        if *previous != current {
+        let baseline = self.store.last_persisted_diagnostics(graph)?;
+        if baseline != *current {
             self.enqueue_orphan_fts_updates(
                 graph,
                 OrphanChange {
-                    previous: previous.clone(),
+                    previous: baseline,
                     current: current.clone(),
                 },
             )?;
         }
-        self.store.set_graph_diagnostics(graph, &current)
+        self.store.set_graph_diagnostics(graph, current)
     }
 
     fn enqueue_orphan_fts_updates(
