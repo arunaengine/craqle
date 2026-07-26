@@ -160,6 +160,49 @@ enum QuadMutation {
 /// Quad key bytes: `graph || subject || predicate || object`, 4 × 16 bytes.
 type QuadKey = [u8; 64];
 
+/// A durable FTS queue key, minus the dirty token it is stamped with.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FtsQueueKey {
+    Subject { graph: TermId, subject: TermId },
+    Reindex(TermId),
+    Delete(TermId),
+}
+
+impl FtsQueueKey {
+    fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::Subject { graph, subject } => graph_dirty_key(graph, subject).to_vec(),
+            Self::Reindex(graph) => graph_reindex_key(graph).to_vec(),
+            Self::Delete(graph) => graph_search_delete_key(graph).to_vec(),
+        }
+    }
+}
+
+/// FTS queue keys a batch owes, deduplicated but kept in enqueue order.
+///
+/// Order is load-bearing: acknowledgement compares tokens, so a whole-graph
+/// reindex enqueued after some subjects must outrank them and clear them.
+#[derive(Default)]
+struct PendingFts {
+    order: Vec<FtsQueueKey>,
+    seen: HashSet<FtsQueueKey>,
+}
+
+impl PendingFts {
+    fn push(&mut self, key: FtsQueueKey) {
+        if self.seen.insert(key) {
+            self.order.push(key);
+        }
+    }
+}
+
+/// A batch's durable half: the staged fjall writes plus the FTS queue keys
+/// whose tokens are minted when it publishes.
+struct DurableCommit {
+    batch: fjall::OwnedWriteBatch,
+    pending_fts: PendingFts,
+}
+
 pub struct WriteBatch {
     inner: fjall::OwnedWriteBatch,
     /// Uncommitted dot sets, so later operations in the same batch read the
@@ -169,6 +212,10 @@ pub struct WriteBatch {
     pending_quad_states: HashMap<QuadKey, Option<Vec<Dot>>>,
     pending_terms: HashMap<TermId, String>,
     publish: PendingPublish,
+    /// Queue keys this batch dirtied. Their tokens are minted and their entries
+    /// staged when the batch commits, under the queue lock, so no
+    /// acknowledgement can be reading them at the time.
+    pending_fts: PendingFts,
 }
 
 impl WriteBatch {
@@ -178,6 +225,7 @@ impl WriteBatch {
             pending_quad_states: HashMap::new(),
             pending_terms: HashMap::new(),
             publish: PendingPublish::default(),
+            pending_fts: PendingFts::default(),
         }
     }
 
@@ -554,6 +602,20 @@ pub struct GraphStore {
     /// widening a window that is otherwise microseconds wide.
     #[cfg(test)]
     commit_stall: Mutex<Option<std::time::Duration>>,
+    /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
+    /// between an acknowledgement's token read and its commit.
+    #[cfg(test)]
+    fts_ack_stall: Mutex<Option<std::time::Duration>>,
+    /// Serializes every durable mutation of the FTS queues: minting a dirty
+    /// token and staging its entry, the acknowledgement check-and-remove, and
+    /// the queue clears. Without it an enqueue can land between an
+    /// acknowledgement's token read and its committed removal and be erased
+    /// without ever being indexed (G7).
+    ///
+    /// **Lock order: innermost.** Take it last — after the graph commit guard
+    /// and after `indexes` — hold it only across the queue read plus the commit
+    /// that acts on it, and take no other `GraphStore` lock while it is held.
+    fts_queue_lock: Mutex<()>,
     dirty_counter: AtomicU64,
     /// How many times this store instance has recomputed graph diagnostics.
     /// Tests use it to prove a reopen served the persisted record instead of
@@ -1035,12 +1097,12 @@ impl GraphStore {
     ///
     /// An [`IndexApply::Anomaly`] means the index drifted from the store, so it
     /// is rebuilt before this returns rather than left inconsistent.
-    fn apply_commit(&self, batch: fjall::OwnedWriteBatch, publish: PendingPublish) -> Result<()> {
+    fn apply_commit(&self, commit: DurableCommit, publish: PendingPublish) -> Result<()> {
         if publish.is_empty() {
-            return Ok(batch.commit()?);
+            return self.commit_durable(commit);
         }
 
-        if self.commit_with_index(batch, &publish)? {
+        if self.commit_with_index(commit, &publish)? {
             tracing::warn!(
                 "index anomaly detected while applying a commit; rebuilding indexes from the store"
             );
@@ -1071,21 +1133,42 @@ impl GraphStore {
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
     }
 
+    /// Stall between an acknowledgement's token read and its commit. Test-only.
+    #[cfg(test)]
+    fn stall_in_fts_ack(&self) {
+        let stall = *self
+            .fts_ack_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(delay) = stall {
+            std::thread::sleep(delay);
+        }
+    }
+
+    /// Widen the acknowledgement's check-and-remove window. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_fts_ack_stall(&self, delay: std::time::Duration) {
+        *self
+            .fts_ack_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
     /// Publish the durable batch and the index together, reporting anomalies.
     ///
     /// The lock spans the commit and covers every structure a reader pairs with
     /// the clock, so a reader past the new clock can never read an index,
     /// derived mirror or object ordering predating it (G6).
     ///
-    /// No other lock is taken here and nothing is read from the store, so the
-    /// section stays short and cannot deadlock against a reader.
+    /// The queue lock nests inside (via commit_durable); nothing else is taken
+    /// and nothing is read from the store, so the section cannot deadlock.
     fn commit_with_index(
         &self,
-        batch: fjall::OwnedWriteBatch,
+        commit: DurableCommit,
         publish: &PendingPublish,
     ) -> Result<bool> {
         let mut indexes = self.indexes_write();
-        batch.commit()?;
+        self.commit_durable(commit)?;
         #[cfg(test)]
         self.stall_after_commit();
         Ok(indexes.publish(publish))
@@ -1766,6 +1849,9 @@ impl GraphStore {
             term_decode_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
+            #[cfg(test)]
+            fts_ack_stall: Mutex::new(None),
+            fts_queue_lock: Mutex::new(()),
             dirty_counter: AtomicU64::new(1),
             diagnostics_computed: AtomicU64::new(0),
         };
@@ -1978,13 +2064,7 @@ impl GraphStore {
             batch.remove(&self.graphs, reindex_key);
         }
 
-        // `Relaxed` for the same reason as `enqueue_fts`.
-        let delete_token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
-        batch.insert(
-            &self.graphs,
-            graph_search_delete_key(graph_id),
-            delete_token.to_be_bytes(),
-        );
+        batch.pending_fts.push(FtsQueueKey::Delete(graph_id));
 
         for guard in self.log.prefix(log_head_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
@@ -2503,9 +2583,14 @@ impl GraphStore {
         })
     }
 
-    /// The token the next FTS queue entry will receive. The reindex-threshold
-    /// policy uses it to reason about queue ordering.
+    /// The token the next FTS queue entry will receive, pinned under the queue
+    /// lock so every entry below it is already durable.
+    ///
+    /// That is what makes it usable as a flush bound: read it outside the lock
+    /// and a commit could be mid-flight, holding a lower token that the drain
+    /// would not yet see.
     pub(crate) fn current_dirty_token(&self) -> u64 {
+        let _queue = self.fts_queue_guard();
         self.dirty_counter.load(Ordering::SeqCst)
     }
 
@@ -2687,18 +2772,17 @@ impl GraphStore {
     }
 
     /// Queue one subject for search reindexing, in the same durable batch as the
-    /// store mutation that dirtied it (G7). The token comes from a counter seeded
-    /// past every live queue token at open.
+    /// store mutation that dirtied it (G7).
     ///
-    /// `Relaxed` suffices: the entry's visibility comes from the fjall batch, and
-    /// `current_dirty_token` only needs single-location read-read coherence.
+    /// The token is minted when the batch commits, not here: a token handed out
+    /// now but made durable later could sit below a bound a flush pinned in
+    /// between, and the flush would return without the entry ever being visible
+    /// to its drain.
     pub fn enqueue_fts(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
-        let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
-        batch.insert(
-            &self.graphs,
-            graph_dirty_key(key.graph_id, key.subject),
-            token.to_be_bytes(),
-        );
+        batch.pending_fts.push(FtsQueueKey::Subject {
+            graph: key.graph_id,
+            subject: key.subject,
+        });
         Ok(())
     }
 
@@ -2738,13 +2822,7 @@ impl GraphStore {
     }
 
     pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph_id: TermId) -> Result<()> {
-        // `Relaxed` for the same reason as `enqueue_fts`.
-        let token = self.dirty_counter.fetch_add(1, Ordering::Relaxed);
-        batch.insert(
-            &self.graphs,
-            graph_reindex_key(graph_id),
-            token.to_be_bytes(),
-        );
+        batch.pending_fts.push(FtsQueueKey::Reindex(graph_id));
         Ok(())
     }
 
@@ -2827,11 +2905,17 @@ impl GraphStore {
         Ok(result)
     }
 
+    /// Drop the subject entries the indexer just covered, keeping any that were
+    /// re-dirtied since it read them.
+    ///
+    /// The queue lock spans the token read and the commit: an enqueue landing
+    /// in between would otherwise be erased by a removal that never covered it.
     pub fn acknowledge_fts_queue(&self, queued: &[(GraphId, TermId, u64)]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         for (graph, subject, token) in queued {
             let Some(graph_id) = self.graph_id_for(graph)? else {
@@ -2844,6 +2928,8 @@ impl GraphStore {
                 batch.remove(&self.graphs, key);
             }
         }
+        #[cfg(test)]
+        self.stall_in_fts_ack();
         self.commit_fjall_batch(batch)?;
         Ok(())
     }
@@ -2853,6 +2939,7 @@ impl GraphStore {
             return Ok(());
         }
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         for (graph, token) in queued {
             let Some(graph_id) = self.graph_id_for(graph)? else {
@@ -2874,6 +2961,7 @@ impl GraphStore {
             return Ok(());
         }
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         for (graph, token) in queued {
             let Some(graph_id) = self.graph_id_for(graph)? else {
@@ -2898,6 +2986,7 @@ impl GraphStore {
             return Ok(());
         }
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
         for (graph, reindex_token) in queued {
@@ -2928,6 +3017,7 @@ impl GraphStore {
             return Ok(());
         }
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
         for (graph, delete_token) in queued {
@@ -2965,6 +3055,7 @@ impl GraphStore {
             return Ok(());
         };
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
@@ -2996,6 +3087,7 @@ impl GraphStore {
             return Ok(());
         };
 
+        let _queue = self.fts_queue_guard();
         let reindex_key = graph_reindex_key(graph_id);
         if self.graphs.get(reindex_key)?.is_none() {
             return Ok(());
@@ -3016,6 +3108,7 @@ impl GraphStore {
             return Ok(());
         };
 
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
         for subject in subjects {
@@ -3036,6 +3129,7 @@ impl GraphStore {
     }
 
     pub fn clear_fts_queue(&self) -> Result<()> {
+        let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut dirty = false;
         for guard in self.graphs.prefix(graph_dirty_prefix()) {
@@ -3077,14 +3171,49 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Take the FTS queue lock, recovering from poison: the state it guards
+    /// lives in fjall, not behind the mutex.
+    fn fts_queue_guard(&self) -> MutexGuard<'_, ()> {
+        self.fts_queue_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stamp `key` with a fresh dirty token and stage its queue entry.
+    ///
+    /// The caller MUST hold the FTS queue lock: minting under it is what makes
+    /// "every entry below the token a flush pinned is already durable" true.
+    fn stage_fts_entry(&self, batch: &mut fjall::OwnedWriteBatch, key: FtsQueueKey) {
+        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+        batch.insert(&self.graphs, key.bytes(), token.to_be_bytes());
+    }
+
+    /// Publish a batch together with the queue entries it owes.
+    fn commit_durable(&self, commit: DurableCommit) -> Result<()> {
+        let DurableCommit {
+            mut batch,
+            pending_fts,
+        } = commit;
+        let _queue = self.fts_queue_guard();
+        for key in pending_fts.order {
+            self.stage_fts_entry(&mut batch, key);
+        }
+        self.commit_fjall_batch(batch)
+    }
+
     pub fn commit(&self, batch: WriteBatch) -> Result<()> {
         let WriteBatch {
             inner,
             pending_quad_states: _,
             pending_terms: _,
             publish,
+            pending_fts,
         } = batch;
-        self.apply_commit(inner, publish)
+        let commit = DurableCommit {
+            batch: inner,
+            pending_fts,
+        };
+        self.apply_commit(commit, publish)
     }
 
     /// Copy a subject's `(predicate, object)` id pairs out of the index,
@@ -3506,6 +3635,45 @@ mod tests {
         assert_eq!(1, queued.len());
         store.acknowledge_fts_queue(&queued).unwrap();
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
+    }
+
+    /// An enqueue landing between an acknowledgement's token read and its
+    /// commit must survive: the removal only ever covered the older token, so
+    /// erasing the entry would leave that write unindexed for good.
+    #[test]
+    fn ack_keeps_racing_enqueue() {
+        let (_dir, store) = setup_store();
+        let store = Arc::new(store);
+        let graph = GraphId::new("urn:test:graph");
+        store.create_graph(&graph).unwrap();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let subject = store.resolve_term(&named("urn:test:subject")).unwrap();
+
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
+            .unwrap();
+        store.commit(batch).unwrap();
+        let queued = store.drain_fts_queue(10).unwrap();
+        assert_eq!(1, queued.len());
+
+        store.set_fts_ack_stall(std::time::Duration::from_millis(300));
+        let acking = {
+            let store = store.clone();
+            std::thread::spawn(move || store.acknowledge_fts_queue(&queued).unwrap())
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
+            .unwrap();
+        store.commit(batch).unwrap();
+        acking.join().unwrap();
+
+        assert_eq!(1, store.drain_fts_queue(10).unwrap().len());
     }
 
     #[test]
