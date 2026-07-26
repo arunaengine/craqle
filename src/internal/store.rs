@@ -1256,20 +1256,21 @@ impl GraphStore {
             let clock = self.durable_vector_clock(graph_id)?;
             self.indexes_write().clocks.insert(graph_id, clock.clone());
             let stored = self.read_stored_diagnostics(graph_id)?;
-            if let Some(record) = stored.filter(|record| record.at_clock == clock) {
+            if let Some(record) = stored.as_ref().filter(|record| record.at_clock == clock) {
                 self.diagnostics_cache
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(graph_id, record);
+                    .insert(graph_id, record.clone());
                 continue;
             }
 
-            let previous = self
-                .read_stored_diagnostics(graph_id)?
-                .map(|record| record.diagnostics)
-                .unwrap_or_default();
-            let repaired = self.recompute_graph_diagnostics(graph_id)?;
-            self.requeue_orphan_changes(graph_id, (&previous, &repaired))?;
+            let previous = stored.map(|record| record.diagnostics).unwrap_or_default();
+            let repaired = self.compute_tagged_diagnostics(graph_id)?;
+            // Re-queue first, record second, in that order and as separate
+            // commits: a crash or a failed enqueue in between must leave the
+            // older baseline so the next open re-queues again (G7).
+            self.requeue_orphan_changes(graph_id, (&previous, &repaired.diagnostics))?;
+            self.store_diagnostics_record(graph_id, repaired)?;
         }
         Ok(())
     }
@@ -2129,13 +2130,6 @@ impl GraphStore {
             diagnostics: self.compute_graph_diagnostics(&graph)?,
             at_clock,
         })
-    }
-
-    /// Recompute a graph's diagnostics and persist them. Only writers that own
-    /// the search re-queue may call this; see [`GraphStore::graph_diagnostics_by_id`].
-    fn recompute_graph_diagnostics(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
-        let record = self.compute_tagged_diagnostics(graph_id)?;
-        self.store_diagnostics_record(graph_id, record)
     }
 
     fn graph_name_by_id(&self, graph_id: TermId) -> Result<GraphId> {
@@ -4453,6 +4447,58 @@ mod tests {
             vec![subject_id],
             queued,
             "the newly orphaned entity must be re-queued for search at open"
+        );
+    }
+
+    /// The other direction: an entity the root adopted since the record was
+    /// written has to come *back* to search at open, or the restart leaves it
+    /// hidden (G7).
+    #[test]
+    fn open_requeues_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:diagnostics-adopt");
+
+        let subject_id = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            commit_orphan(&store, &graph, "urn:orphan:adopted");
+            settle_diagnostics(&store, &graph);
+            store.clear_fts_queue().unwrap();
+
+            // The root adopts it, and nothing refreshes diagnostics.
+            let quad = encode_quad(
+                &store,
+                &graph,
+                (
+                    graph.as_str(),
+                    "http://schema.org/hasPart",
+                    "urn:orphan:adopted",
+                ),
+            );
+            commit_add(&store, &graph, quad);
+            store.persist().unwrap();
+            quad.object
+        };
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        assert!(
+            store
+                .graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty(),
+            "open must repair the record the adoption invalidated"
+        );
+        let queued: Vec<TermId> = store
+            .drain_fts_queue(10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, subject, _)| subject)
+            .collect();
+        assert_eq!(
+            vec![subject_id],
+            queued,
+            "the adopted entity must be re-queued for search at open"
         );
     }
 
