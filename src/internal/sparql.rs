@@ -641,9 +641,16 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
                         "fts:limit must be bound to an integer literal".into(),
                     ));
                 };
-                spec.limit = literal.value().parse::<usize>().map_err(|_| {
-                    SparqlError::Unsupported("fts:limit must be a positive integer".into())
-                })?;
+                // Clamped, not rejected: a large limit is a legitimate "give
+                // me everything" and the other fts: arguments only error on
+                // input they cannot interpret at all.
+                spec.limit = literal
+                    .value()
+                    .parse::<usize>()
+                    .map_err(|_| {
+                        SparqlError::Unsupported("fts:limit must be a positive integer".into())
+                    })?
+                    .min(crate::MAX_SEARCH_LIMIT);
             }
             FTS_SCORE_IRI => {
                 let TermPattern::Variable(variable) = pattern.object else {

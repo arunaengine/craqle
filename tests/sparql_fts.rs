@@ -145,6 +145,37 @@ mod tests {
         );
     }
 
+    /// `fts:limit` is remote input. Tantivy's collector pre-allocates
+    /// `limit * 2` and the over-fetch multiplies it first, so an unbounded
+    /// limit let one query abort the process instead of returning a page.
+    #[test]
+    fn service_clamps_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = seeded_node(&tmp);
+
+        let sparql = format!(
+            r#"
+            SELECT ?s ?g
+            WHERE {{
+                SERVICE <urn:craqle:fts> {{
+                    ?s fts:query "proteomics" .
+                    ?s fts:graph ?g .
+                    ?s fts:limit {} .
+                }}
+            }}
+            "#,
+            usize::MAX
+        );
+
+        let graphs = fts_graph_rows(&node, &sparql);
+        assert_eq!(
+            READABLE,
+            graphs.len(),
+            "a clamped limit must still answer completely"
+        );
+        assert!(graphs.len() <= craqle::MAX_SEARCH_LIMIT);
+    }
+
     #[test]
     fn service_caps_results() {
         let tmp = tempfile::tempdir().unwrap();
