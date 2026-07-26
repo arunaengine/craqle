@@ -447,6 +447,13 @@ fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
 /// RO-Crate creation, entity append/update operations, JSON-LD export, search,
 /// and replication message handling without requiring direct access to the
 /// lower-level storage or replication internals.
+/// A graph whose reindex scan was pinned at `upto`. Only queue entries at or
+/// below that token were covered by the scan.
+struct ScannedGraph {
+    graph: GraphId,
+    upto: u64,
+}
+
 pub struct CraqleNode {
     actor: ActorId,
     store: Arc<GraphStore>,
@@ -457,6 +464,18 @@ pub struct CraqleNode {
     replication: Arc<ReplicationEngine>,
     local_replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+    /// Set by a test to hold a reindex between a graph's scan and the queue
+    /// clear that covers it.
+    #[cfg(test)]
+    reindex_gate: std::sync::Mutex<Option<ReindexGate>>,
+}
+
+/// Reports that a reindex reached the point between a scan and its clear, then
+/// waits to be released. Test-only.
+#[cfg(test)]
+struct ReindexGate {
+    reached: mpsc::Sender<()>,
+    go: mpsc::Receiver<()>,
 }
 
 // Joined on drop so the store (and its fjall lock) cannot outlive the node.
@@ -615,6 +634,8 @@ impl CraqleNode {
             replication,
             local_replication,
             sync,
+            #[cfg(test)]
+            reindex_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -1662,8 +1683,15 @@ impl CraqleNode {
     pub fn reindex_search(&self) -> Result<()> {
         let mut covered = Vec::with_capacity(REINDEX_COMMIT_BATCH_GRAPHS);
         for graph in self.store.graphs()? {
+            // Pinned before the scan reads anything: a write landing later is
+            // not covered by it and must outlive the clear below.
+            // `current_dirty_token` is the next token to be minted, so the
+            // highest one this scan can cover is the one before it.
+            let upto = self.store.current_dirty_token().saturating_sub(1);
             self.search.reindex_from_store(&self.store, &graph)?;
-            covered.push(graph);
+            covered.push(ScannedGraph { graph, upto });
+            #[cfg(test)]
+            self.gate_after_scan();
             if covered.len() >= REINDEX_COMMIT_BATCH_GRAPHS {
                 self.commit_reindexed_graphs(&mut covered)?;
             }
@@ -1680,15 +1708,48 @@ impl CraqleNode {
     /// them. Crash after the commit but before the clear and the worker merely
     /// re-does the work on its next drain. Only the second direction is safe,
     /// so the order below is not an implementation detail.
-    fn commit_reindexed_graphs(&self, covered: &mut Vec<GraphId>) -> Result<()> {
+    fn commit_reindexed_graphs(&self, covered: &mut Vec<ScannedGraph>) -> Result<()> {
         if covered.is_empty() {
             return Ok(());
         }
         self.search.commit()?;
-        for graph in covered.drain(..) {
-            self.store.clear_fts_queue_for_graph(&graph)?;
+        for scanned in covered.drain(..) {
+            self.store
+                .clear_fts_queue_for_graph(&scanned.graph, scanned.upto)?;
         }
         self.persist_fjall()
+    }
+
+    /// Hold a reindex between a graph's scan and the clear that covers it,
+    /// reporting arrival and waiting for release. Test-only: it makes a window
+    /// that is otherwise microseconds wide something a test can step through.
+    #[cfg(test)]
+    fn gate_after_scan(&self) {
+        let gate = self
+            .reindex_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(());
+            let _ = gate.go.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
+    /// Arm the gate for the next graph a reindex scans. Test-only; the test
+    /// that uses it needs a real index, so the stub build never calls it.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_reindex_gate(
+        &self,
+        reached: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+    ) -> &Self {
+        *self
+            .reindex_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReindexGate { reached, go });
+        self
     }
 
     /// Run manual store compaction as a post-ingest maintenance step.

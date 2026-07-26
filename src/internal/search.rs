@@ -985,6 +985,67 @@ mod tests {
         Ok(())
     }
 
+    /// A write landing after a reindex scan pinned its token must survive the
+    /// clear that follows: the scan never saw it, so wiping its queue entry
+    /// would leave it unindexed with nothing left to re-queue it.
+    #[test]
+    fn reindex_keeps_late_write() {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let auth = crate::AllowAllAuthorizer;
+        let graph = crate::core::GraphId::new("urn:test:reindex-late-write");
+
+        node.create_crate(
+            &auth,
+            crate::CreateCrateRequest::new(
+                graph.clone(),
+                "Reindex Dataset",
+                "Baseline crate",
+                "2025-01-01",
+                None,
+                crate::core::GraphPolicy::default(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        let (reached, scanned) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        node.set_reindex_gate(reached, go);
+        std::thread::scope(|scope| {
+            scope.spawn(|| node.reindex_search().unwrap());
+            scanned.recv().unwrap();
+            // Keep the background indexer off this write, so what makes it
+            // searchable is the queue entry surviving the clear.
+            node.search.arm_drain_panic();
+            node.add_data_entity_with_triples(
+                &auth,
+                &graph,
+                "data/late.dat",
+                "http://schema.org/MediaObject",
+                "Latewrite Entity",
+                Vec::new(),
+            )
+            .unwrap();
+            release.send(()).unwrap();
+        });
+
+        // The first flush may be the one that spends the armed panic.
+        let _ = node.flush_search_updates();
+        node.flush_search_updates().unwrap();
+
+        let hits = node
+            .search(
+                &auth,
+                crate::SearchRequest {
+                    query: "latewrite",
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert!(hits.iter().any(|hit| hit.subject_iri.contains("late.dat")));
+    }
+
     #[test]
     fn https_schema_indexed() {
         let dir = tempdir().unwrap();
