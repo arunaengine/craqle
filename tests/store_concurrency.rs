@@ -300,9 +300,8 @@ fn diagnostics_never_lag() {
     });
 }
 
-/// A fingerprint races wide batches: each batch commits atomically behind the
-/// index lock, so every observed quad count must be a whole number of batches.
-/// A scan bypassing that lock read torn counts mid-batch.
+/// Races a fingerprint against wide batches: every observed quad count must
+/// be a whole number of batches, since each batch commits atomically.
 #[test]
 fn fingerprints_never_tear() {
     with_watchdog("fingerprints_never_tear", || {
@@ -353,9 +352,8 @@ fn fingerprints_never_tear() {
     });
 }
 
-/// A snapshot races wide batches: it must be internally consistent, meaning
-/// its clock and its quads describe the same commit. With one dot minted per
-/// batch, the clock total times the batch size must equal the quad count.
+/// Races snapshots against wide batches: with one dot minted per batch, the
+/// clock total times the batch size must equal the quad count observed.
 #[test]
 fn snapshots_never_tear() {
     with_watchdog("snapshots_never_tear", || {
