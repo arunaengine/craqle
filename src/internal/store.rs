@@ -630,6 +630,12 @@ pub struct GraphStore {
     rebuild_stall: Mutex<Option<std::time::Duration>>,
     #[cfg(test)]
     rebuild_stalled: std::sync::atomic::AtomicBool,
+    /// Set by a test to stall a graph delete between its queue scan and the
+    /// commit; `delete_stalled` publishes that the window has been entered.
+    #[cfg(test)]
+    delete_stall: Mutex<Option<std::time::Duration>>,
+    #[cfg(test)]
+    delete_stalled: std::sync::atomic::AtomicBool,
     /// Serializes every durable mutation of the FTS queues: minting a dirty
     /// token and staging its entry, the acknowledgement check-and-remove, and
     /// the queue clears. Without it an enqueue can land between an
@@ -1218,6 +1224,34 @@ impl GraphStore {
     #[cfg(test)]
     pub(crate) fn rebuild_stalled(&self) -> bool {
         self.rebuild_stalled.load(Ordering::SeqCst)
+    }
+
+    /// Stall a graph delete between its queue scan and its commit. Test-only.
+    #[cfg(test)]
+    fn stall_in_delete(&self) {
+        let stall = *self
+            .delete_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(delay) = stall {
+            self.delete_stalled.store(true, Ordering::SeqCst);
+            std::thread::sleep(delay);
+        }
+    }
+
+    /// Make the next graph delete pause before it commits. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_delete_stall(&self, delay: std::time::Duration) {
+        *self
+            .delete_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Whether a graph delete is inside its stall. Test-only.
+    #[cfg(test)]
+    pub(crate) fn delete_stalled(&self) -> bool {
+        self.delete_stalled.load(Ordering::SeqCst)
     }
 
     /// Stall between an acknowledgement's token read and its commit. Test-only.
@@ -1937,6 +1971,10 @@ impl GraphStore {
             rebuild_stall: Mutex::new(None),
             #[cfg(test)]
             rebuild_stalled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            delete_stall: Mutex::new(None),
+            #[cfg(test)]
+            delete_stalled: std::sync::atomic::AtomicBool::new(false),
             fts_queue_lock: Mutex::new(()),
             dirty_counter: AtomicU64::new(1),
             diagnostics_computed: AtomicU64::new(0),
@@ -2155,6 +2193,9 @@ impl GraphStore {
 
         batch.pending_fts.push(FtsQueueKey::Delete(graph_id));
 
+        #[cfg(test)]
+        self.stall_in_delete();
+
         for guard in self.log.prefix(log_head_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
             batch.remove(&self.log, key);
@@ -2165,11 +2206,36 @@ impl GraphStore {
         }
 
         self.commit(batch)?;
+        self.sweep_graph_queue(graph_id)?;
         self.diagnostics_cache
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&graph_id);
         self.indexes_write().object_order.drop_graph(graph_id);
+        Ok(())
+    }
+
+    /// Drop the subject and reindex queue entries of a graph that is gone.
+    ///
+    /// The delete scans those keys without the queue lock, so an enqueue
+    /// landing before its commit would otherwise outlive the graph.
+    fn sweep_graph_queue(&self, graph_id: TermId) -> Result<()> {
+        let _queue = self.fts_queue_guard();
+        let mut batch = self.buffered_batch();
+        let mut dirty = false;
+        for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+            let (key, _) = guard.into_inner()?;
+            batch.remove(&self.graphs, key);
+            dirty = true;
+        }
+        let reindex_key = graph_reindex_key(graph_id);
+        if self.graphs.get(reindex_key)?.is_some() {
+            batch.remove(&self.graphs, reindex_key);
+            dirty = true;
+        }
+        if dirty {
+            self.commit_fjall_batch(batch)?;
+        }
         Ok(())
     }
 
@@ -4348,14 +4414,14 @@ mod tests {
         });
     }
 
-    /// Spin until a rebuild is inside its stall, failing rather than hanging if
-    /// the rebuilding thread died before it got there.
-    fn await_rebuild_stall(store: &GraphStore) {
+    /// Spin until a stalling thread reports it is inside its window, failing
+    /// rather than hanging if that thread died before it got there.
+    fn spin_until(entered: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !store.rebuild_stalled() {
+        while !entered() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the rebuild never entered its stall"
+                "the stall window was never entered"
             );
             std::hint::spin_loop();
             std::thread::yield_now();
@@ -4402,7 +4468,7 @@ mod tests {
         store.set_rebuild_stall(std::time::Duration::from_millis(300));
         std::thread::scope(|scope| {
             scope.spawn(|| store.rebuild_indexes().unwrap());
-            await_rebuild_stall(&store);
+            spin_until(|| store.rebuild_stalled());
             commit_add(&store, &graph, raced);
         });
 
@@ -5008,6 +5074,46 @@ mod tests {
             .unwrap();
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
         assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+    }
+
+    /// The delete scans the graph's queue keys without the queue lock, so an
+    /// enqueue landing before its commit used to outlive the deleted graph and
+    /// re-index a subject of a graph that no longer exists.
+    #[test]
+    fn delete_sweeps_queue() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:delete-queue-race");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        let subject = store.resolve_term(&named("urn:test:raced")).unwrap();
+
+        store.set_delete_stall(std::time::Duration::from_millis(300));
+        std::thread::scope(|scope| {
+            scope.spawn(|| store.delete_graph(&graph).unwrap());
+            spin_until(|| store.delete_stalled());
+            let mut batch = store.new_batch();
+            store
+                .enqueue_fts(
+                    &mut batch,
+                    FtsSubject {
+                        graph_id: quad.graph,
+                        subject,
+                    },
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+        });
+
+        assert!(
+            store.drain_fts_queue(10).unwrap().is_empty(),
+            "a subject queued during the delete must not outlive the graph"
+        );
+        assert_eq!(
+            1,
+            store.drain_fts_delete_queue(10).unwrap().len(),
+            "the delete's own queue entry must survive the sweep"
+        );
     }
 
     fn table_bytes(root: &std::path::Path) -> u64 {
