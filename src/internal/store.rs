@@ -1925,17 +1925,16 @@ impl GraphStore {
             .max_journaling_size(MAX_JOURNALING_BYTES)
             .worker_threads(worker_threads)
             .open()?;
-        Self::from_database_with_persist_mode(db, persist_mode)
+        Self::with_persist_mode(db, persist_mode)
     }
 
     pub fn from_database(db: Database) -> Result<Self> {
-        Self::from_database_with_persist_mode(db, PersistMode::Buffer)
+        Self::with_persist_mode(db, PersistMode::Buffer)
     }
 
-    pub fn from_database_with_persist_mode(
-        db: Database,
-        persist_mode: PersistMode,
-    ) -> Result<Self> {
+    /// Build a store on an already-open database with an explicit durability
+    /// mode; [`GraphStore::open_with_persist_mode`] opens the database first.
+    pub fn with_persist_mode(db: Database, persist_mode: PersistMode) -> Result<Self> {
         let point_read_heavy = || {
             KeyspaceCreateOptions::default()
                 .expect_point_read_hits(true)
