@@ -2959,11 +2959,12 @@ impl GraphStore {
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
+        let mut dirty = false;
         for entry in queued {
             let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            self.settle_fts_entry(
+            dirty |= self.settle_fts_entry(
                 &mut batch,
                 AckedEntry {
                     key: graph_dirty_key(graph_id, entry.subject).to_vec(),
@@ -2973,7 +2974,9 @@ impl GraphStore {
         }
         #[cfg(test)]
         self.stall_in_fts_ack();
-        self.commit_fjall_batch(batch)?;
+        if dirty {
+            self.commit_fjall_batch(batch)?;
+        }
         Ok(())
     }
 
@@ -2984,11 +2987,12 @@ impl GraphStore {
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
+        let mut dirty = false;
         for entry in queued {
             let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            self.settle_fts_entry(
+            dirty |= self.settle_fts_entry(
                 &mut batch,
                 AckedEntry {
                     key: graph_reindex_key(graph_id).to_vec(),
@@ -2996,7 +3000,9 @@ impl GraphStore {
                 },
             )?;
         }
-        self.commit_fjall_batch(batch)?;
+        if dirty {
+            self.commit_fjall_batch(batch)?;
+        }
         Ok(())
     }
 
@@ -3007,11 +3013,12 @@ impl GraphStore {
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
+        let mut dirty = false;
         for entry in queued {
             let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            self.settle_fts_entry(
+            dirty |= self.settle_fts_entry(
                 &mut batch,
                 AckedEntry {
                     key: graph_search_delete_key(graph_id).to_vec(),
@@ -3019,7 +3026,9 @@ impl GraphStore {
                 },
             )?;
         }
-        self.commit_fjall_batch(batch)?;
+        if dirty {
+            self.commit_fjall_batch(batch)?;
+        }
         Ok(())
     }
 
@@ -3115,10 +3124,15 @@ impl GraphStore {
         keys.push(graph_reindex_key(graph_id).to_vec());
         keys.push(graph_search_delete_key(graph_id).to_vec());
 
+        let mut dirty = false;
         for key in keys {
-            self.settle_fts_entry(&mut batch, AckedEntry { key, covered: upto })?;
+            dirty |= self.settle_fts_entry(&mut batch, AckedEntry { key, covered: upto })?;
         }
-        self.commit_fjall_batch(batch)
+
+        if dirty {
+            self.commit_fjall_batch(batch)?;
+        }
+        Ok(())
     }
 
     pub fn clear_fts_reindex_for_graph(&self, graph: &GraphId) -> Result<()> {
@@ -3226,9 +3240,9 @@ impl GraphStore {
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         entry: AckedEntry,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(current) = self.graphs.get(&entry.key)? else {
-            return Ok(());
+            return Ok(false);
         };
         let stored = decode_dirty_tokens(current.as_ref(), "fts queue tokens")?;
         if stored.latest <= entry.covered {
@@ -3240,7 +3254,7 @@ impl GraphStore {
             };
             batch.insert(&self.graphs, entry.key, encode_dirty_tokens(narrowed));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Take the FTS queue lock, recovering from poison: the state it guards
