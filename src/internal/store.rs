@@ -236,9 +236,15 @@ type ObjectOrderKey = (TermId, TermId, TermId);
 type ObjectOrderValues = Arc<Vec<TermId>>;
 
 /// `(graph, subject, predicate)` → objects in decoded-term order.
+///
+/// Repopulation decodes outside the lock, so an entry computed from an index a
+/// commit has since invalidated must not be installed. `generation` moves on
+/// every invalidation and a repopulating reader only installs what it computed
+/// while the count has not moved.
 #[derive(Default)]
 struct ObjectOrderCache {
     entries: HashMap<ObjectOrderKey, ObjectOrderValues>,
+    generation: u64,
 }
 
 impl ObjectOrderCache {
@@ -248,20 +254,32 @@ impl ObjectOrderCache {
 
     fn invalidate(&mut self, key: &ObjectOrderKey) {
         self.entries.remove(key);
+        self.generation += 1;
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.generation += 1;
     }
 
     /// Drop every entry belonging to `graph`, e.g. when the graph is deleted.
     fn drop_graph(&mut self, graph: TermId) {
         self.entries.retain(|(cached, _, _), _| *cached != graph);
+        self.generation += 1;
     }
 
-    fn insert(&mut self, key: ObjectOrderKey, objects: ObjectOrderValues) {
-        self.entries.insert(key, objects);
+    /// Install `objects` only if nothing was invalidated since `generation`.
+    fn install(&mut self, entry: OrderEntry, generation: u64) {
+        if self.generation == generation {
+            self.entries.insert(entry.key, entry.objects);
+        }
     }
+}
+
+/// One `(graph, subject, predicate)` ordering, decoded and sorted.
+struct OrderEntry {
+    key: ObjectOrderKey,
+    objects: ObjectOrderValues,
 }
 
 impl IndexState {
@@ -1616,6 +1634,12 @@ impl GraphStore {
     }
 
     /// Objects of `(graph, subject, predicate)` in decoded-term order.
+    ///
+    /// Decoding happens with no lock held, so a commit can invalidate the entry
+    /// while it runs. The generation snapshot taken before the index is read is
+    /// what stops the result being cached in that case: an ordering installed
+    /// over a newer one would be served indefinitely on a quiescent graph and
+    /// silently omit a new `hasPart` child from every export page (G6).
     fn ordered_objects_for_subject_predicate(
         &self,
         graph: TermId,
@@ -1623,12 +1647,12 @@ impl GraphStore {
         predicate: TermId,
     ) -> Result<Arc<Vec<TermId>>> {
         let key = (graph, subject, predicate);
-        let object_ids = {
+        let (generation, object_ids) = {
             let indexes = self.indexes_read();
             if let Some(cached) = indexes.object_order.get(&key) {
                 return Ok(cached);
             }
-            indexes
+            let object_ids = indexes
                 .by_graph_subject
                 .get(&(graph, subject))
                 .map(|entries| {
@@ -1639,7 +1663,8 @@ impl GraphStore {
                         })
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (indexes.object_order.generation, object_ids)
         };
 
         let mut ordered = object_ids
@@ -1653,9 +1678,13 @@ impl GraphStore {
                 .map(|(_, object)| object)
                 .collect::<Vec<_>>(),
         );
-        self.indexes_write()
-            .object_order
-            .insert(key, Arc::clone(&objects));
+        self.indexes_write().object_order.install(
+            OrderEntry {
+                key,
+                objects: Arc::clone(&objects),
+            },
+            generation,
+        );
         Ok(objects)
     }
 
@@ -3991,6 +4020,86 @@ mod tests {
                 "a reader past the new clock must see the index that clock describes"
             );
         });
+    }
+
+    /// Repopulating the object-order cache reads the index, then decodes and
+    /// sorts with no lock held. An invalidation landing entirely inside that
+    /// window used to be undone by the ordering the reader had already
+    /// computed — stored untagged, so nothing ever rechecked it, and a graph
+    /// that then went quiet kept paging exports missing the newest `hasPart`
+    /// child (G6).
+    #[test]
+    fn paging_sees_appends() {
+        const SEEDED: usize = 400;
+        const APPENDED: usize = 150;
+
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:order-cache");
+        store.create_graph(&graph).unwrap();
+        let has_part = crate::core::vocab::schema_has_part();
+        let root = EncodedTerm::from_named_node(&graph.0);
+        let predicate = EncodedTerm::from_named_node(&has_part);
+        let append = |index: usize| {
+            let child = format!("urn:test:child-{index:04}");
+            let quad = encode_quad(&store, &graph, (graph.as_str(), has_part.as_str(), &child));
+            commit_add(&store, &graph, quad);
+        };
+        for index in 0..SEEDED {
+            append(index);
+        }
+
+        let total_objects = || {
+            store
+                .count_objects_for_subject_predicate(&graph, &root, &predicate)
+                .unwrap()
+        };
+        let first_page = || {
+            store
+                .objects_page(
+                    GraphSubjectPredicate {
+                        graph: &graph,
+                        subject: &root,
+                        predicate: &predicate,
+                    },
+                    PageRequest {
+                        cursor: PageCursor::Offset(0),
+                        limit: 8,
+                    },
+                )
+                .unwrap()
+                .0
+        };
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        // The writer only ever appends, so the paged total has
+                        // to fall inside the counts sandwiching the read.
+                        let before = total_objects();
+                        let paged = first_page();
+                        let after = total_objects();
+                        assert!(
+                            (before..=after).contains(&paged),
+                            "paging reported {paged} objects, outside the {before}..={after} the \
+                             index held during the read"
+                        );
+                    }
+                });
+            }
+            for index in SEEDED..SEEDED + APPENDED {
+                append(index);
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+
+        assert_eq!(SEEDED + APPENDED, total_objects());
+        assert_eq!(
+            SEEDED + APPENDED,
+            first_page(),
+            "an ordering cached over a newer one is served until the next write"
+        );
     }
 
     fn commit_orphan(store: &GraphStore, graph: &GraphId, entity: &str) {
