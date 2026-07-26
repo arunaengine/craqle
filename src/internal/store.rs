@@ -3094,36 +3094,31 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn clear_fts_queue_for_graph(&self, graph: &GraphId) -> Result<()> {
+    /// Retire this graph's queue entries up to `upto`, the token a scan pinned
+    /// before it started reading.
+    ///
+    /// Entries dirtied past that token survive: the scan never saw those
+    /// writes, and clearing them would leave the subjects unindexed with
+    /// nothing left to re-queue them (G7).
+    pub fn clear_fts_queue_for_graph(&self, graph: &GraphId, upto: u64) -> Result<()> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(());
         };
 
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
-        let mut dirty = false;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
-            batch.remove(&self.graphs, key);
-            dirty = true;
+            keys.push(key.to_vec());
         }
+        keys.push(graph_reindex_key(graph_id).to_vec());
+        keys.push(graph_search_delete_key(graph_id).to_vec());
 
-        let reindex_key = graph_reindex_key(graph_id);
-        if self.graphs.get(reindex_key)?.is_some() {
-            batch.remove(&self.graphs, reindex_key);
-            dirty = true;
+        for key in keys {
+            self.settle_fts_entry(&mut batch, AckedEntry { key, covered: upto })?;
         }
-
-        let delete_key = graph_search_delete_key(graph_id);
-        if self.graphs.get(delete_key)?.is_some() {
-            batch.remove(&self.graphs, delete_key);
-            dirty = true;
-        }
-
-        if dirty {
-            self.commit_fjall_batch(batch)?;
-        }
-        Ok(())
+        self.commit_fjall_batch(batch)
     }
 
     pub fn clear_fts_reindex_for_graph(&self, graph: &GraphId) -> Result<()> {
@@ -4915,7 +4910,9 @@ mod tests {
         store.enqueue_fts_reindex(&mut batch, graph_id).unwrap();
         store.commit(batch).unwrap();
 
-        store.clear_fts_queue_for_graph(&graph).unwrap();
+        store
+            .clear_fts_queue_for_graph(&graph, store.current_dirty_token())
+            .unwrap();
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
         assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
     }
