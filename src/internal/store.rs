@@ -2618,14 +2618,17 @@ impl GraphStore {
     }
 
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
-        let vector_clock = self.get_vector_clock(graph)?;
+        // Held across the clock read and the scan, so both describe the
+        // same committed state and no torn batch is visible.
+        let indexes = self.indexes_read();
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(GraphReplicaSnapshot {
                 graph: graph.clone(),
-                clock: vector_clock,
+                clock: VectorClock::new(),
                 quads: Vec::new(),
             });
         };
+        let vector_clock = indexes.clocks.get(&graph_id).cloned().unwrap_or_default();
 
         // One prefix scan yields both the quads and their dot sets, instead of
         // an index scan plus a point read per quad.
