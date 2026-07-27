@@ -34,6 +34,7 @@ mod sync;
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::panic;
 use std::path::Path;
@@ -591,7 +592,7 @@ impl CraqleOptions {
 /// Carried together so a stall cannot hide the prefix that landed before it.
 #[derive(Default)]
 struct TopicPass {
-    applied: usize,
+    applied: HashSet<GraphId>,
     stalled: Option<CraqleError>,
 }
 
@@ -763,19 +764,21 @@ impl CraqleNode {
         Ok(sync.sync_status(&self.store, graph)?)
     }
 
-    pub fn reconcile_irokle(&self) -> Result<usize> {
+    /// Apply every craqle topic's outstanding records, returning the graphs
+    /// whose content changed. Callers that only want a count read `.len()`.
+    pub fn reconcile_irokle(&self) -> Result<HashSet<GraphId>> {
         let Some(sync) = &self.sync else {
-            return Ok(0);
+            return Ok(HashSet::new());
         };
 
-        let mut applied = 0;
+        let mut applied = HashSet::new();
         let mut stalled = None;
         // Topics carry independent cursors, so one stall holds back only its
         // own topic; the first failure is reported once the rest have run.
         for topic_id in sync.craqle_topic_ids()? {
             match self.reconcile_irokle_topic(sync, topic_id) {
                 Ok(pass) => {
-                    applied += pass.applied;
+                    applied.extend(pass.applied);
                     stalled = stalled.or(pass.stalled);
                 }
                 Err(error) => stalled = stalled.or(Some(error)),
@@ -783,7 +786,7 @@ impl CraqleNode {
         }
         // Before the stall reaches the caller: a pass that applied a prefix
         // owes that prefix and its cursor the configured durability.
-        if applied > 0 {
+        if !applied.is_empty() {
             self.persist_fjall()?;
         }
         match stalled {
@@ -822,12 +825,14 @@ impl CraqleNode {
             mut cursor,
         } = catchup;
 
-        let mut applied = 0;
+        let mut applied = HashSet::new();
         let mut stalled = None;
         for record in &records {
             match self.apply_reconciled_record(sync, topic_id, record) {
-                Ok(true) => applied += 1,
-                Ok(false) => {}
+                Ok(Some(graph)) => {
+                    applied.insert(graph);
+                }
+                Ok(None) => {}
                 Err(error) if error.rejects_record() => {
                     tracing::warn!(
                         topic = %topic_id,
@@ -857,12 +862,13 @@ impl CraqleNode {
         Ok(TopicPass { applied, stalled })
     }
 
+    /// Applies one record, naming the graph it changed when it changed one.
     fn apply_reconciled_record(
         &self,
         sync: &Arc<dyn sync::CraqleGraphSync>,
         topic_id: irokle::TopicId,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
-    ) -> Result<bool> {
+    ) -> Result<Option<GraphId>> {
         let graph = record.event.graph();
         match self.store.topic_graph_binding(topic_id.as_bytes())? {
             Some(bound) if bound != graph.as_str() => {
@@ -872,12 +878,12 @@ impl CraqleNode {
                     claimed = %graph.as_str(),
                     "rejected craqle record targeting a graph outside its topic binding",
                 );
-                return Ok(false);
+                return Ok(None);
             }
             Some(_) => {}
             None => sync.bind_graph_topic(&self.store, graph, topic_id)?,
         }
-        self.apply_irokle_record(record)
+        Ok(self.apply_irokle_record(record)?.then(|| graph.clone()))
     }
 
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
@@ -2710,6 +2716,40 @@ mod tests {
                 .with_search_storage(SearchStorage::Memory)
                 .with_irokle(irokle.clone(), CraqleIrokleOptions::new()),
         )
+    }
+
+    /// A pass must name exactly the graphs it changed, so a caller can
+    /// invalidate derived state per graph instead of wholesale.
+    #[test]
+    fn reconcile_names_graphs() {
+        let pair = replica_pair();
+        let first = GraphId::new("urn:test:reconcile-names-first");
+        let second = GraphId::new("urn:test:reconcile-names-second");
+        for graph in [&first, &second] {
+            pair.origin
+                .create_crate(&writer_auth(), crate_request(graph, "names"))
+                .unwrap();
+        }
+
+        let applied = pair.replica.reconcile_irokle().unwrap();
+        assert_eq!(
+            HashSet::from([first.clone(), second.clone()]),
+            applied,
+            "both created graphs must be reported"
+        );
+
+        write_keyword(&pair.origin, &first, "only-first");
+        let applied = pair.replica.reconcile_irokle().unwrap();
+        assert_eq!(
+            HashSet::from([first.clone()]),
+            applied,
+            "a graph nothing arrived for must not be reported"
+        );
+
+        assert!(
+            pair.replica.reconcile_irokle().unwrap().is_empty(),
+            "a pass with nothing outstanding must report no graphs"
+        );
     }
 
     /// A pass that applies a record and then stalls owes that prefix the
