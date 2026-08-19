@@ -346,3 +346,374 @@ pub(crate) fn quad_is_visible(
     let orphaned = orphaned_for_graph(store, context, quad.graph)?;
     Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::cmp::Ordering;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::core::{ActorId, Dot};
+    use crate::query_context::{QueryCancellation, ReadContext};
+    use crate::store::{ClockUpdate, CounterKey, QuadAdd, StoreError};
+
+    use super::*;
+
+    fn named(iri: &str) -> EncodedTerm {
+        EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(iri))
+    }
+
+    fn setup_store() -> (tempfile::TempDir, GraphStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(directory.path()).unwrap();
+        (directory, store)
+    }
+
+    fn add_quad(
+        store: &GraphStore,
+        graph: &GraphId,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> EncodedQuad {
+        if !store.contains_graph(graph).unwrap() {
+            store.create_graph(graph).unwrap();
+        }
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let quad = EncodedQuad {
+            graph: graph_id,
+            subject: store.resolve_term(&named(subject)).unwrap(),
+            predicate: store.resolve_term(&named(predicate)).unwrap(),
+            object: store.resolve_term(&named(object)).unwrap(),
+        };
+        let _guard = store.graph_commit_guard(graph);
+        let actor = ActorId::random();
+        let mut batch = store.new_batch();
+        let counter = store
+            .next_counter(&mut batch, CounterKey { graph_id, actor })
+            .unwrap();
+        assert!(
+            store
+                .insert_quad(
+                    &mut batch,
+                    QuadAdd {
+                        quad,
+                        dot: Dot { actor, counter },
+                    },
+                )
+                .unwrap()
+        );
+        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        clock.advance(actor, counter);
+        store
+            .set_vector_clock(
+                &mut batch,
+                ClockUpdate {
+                    graph_id,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        quad
+    }
+
+    fn add_many(store: &GraphStore, graph: &GraphId, count: usize) -> TermId {
+        store.create_graph(graph).unwrap();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let predicate = store.resolve_term(&named("urn:test:read:p")).unwrap();
+        let _guard = store.graph_commit_guard(graph);
+        let actor = ActorId::random();
+        let mut batch = store.new_batch();
+        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        for index in 0..count {
+            let subject = store
+                .resolve_term(&named(&format!("urn:test:read:s{index}")))
+                .unwrap();
+            let object = store
+                .resolve_term(&named(&format!("urn:test:read:o{index}")))
+                .unwrap();
+            let counter = store
+                .next_counter(&mut batch, CounterKey { graph_id, actor })
+                .unwrap();
+            assert!(
+                store
+                    .insert_quad(
+                        &mut batch,
+                        QuadAdd {
+                            quad: EncodedQuad {
+                                graph: graph_id,
+                                subject,
+                                predicate,
+                                object,
+                            },
+                            dot: Dot { actor, counter },
+                        },
+                    )
+                    .unwrap()
+            );
+            clock.advance(actor, counter);
+        }
+        store
+            .set_vector_clock(
+                &mut batch,
+                ClockUpdate {
+                    graph_id,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        graph_id
+    }
+
+    fn collect_rows(
+        cursor: impl Iterator<Item = crate::store::Result<EncodedQuad>>,
+    ) -> Vec<EncodedQuad> {
+        cursor.collect::<crate::store::Result<Vec<_>>>().unwrap()
+    }
+
+    fn raw_rows(store: &GraphStore, pattern: QuadPattern) -> Vec<EncodedQuad> {
+        let mut cursor = store.raw_quad_cursor(pattern);
+        let mut rows = Vec::new();
+        while let Some(candidate) = cursor.next_candidate() {
+            let candidate = candidate.unwrap();
+            if candidate.live && pattern.matches(candidate.quad) {
+                rows.push(candidate.quad);
+            }
+        }
+        rows
+    }
+
+    fn sorted(mut rows: Vec<EncodedQuad>) -> Vec<EncodedQuad> {
+        rows.sort_by_key(|quad| (quad.graph, quad.subject, quad.predicate, quad.object));
+        rows
+    }
+
+    fn spin_until(entered: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !entered() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the commit stall was never entered"
+            );
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn raw_cursor_matches_vector_wrapper_for_every_binding_shape() {
+        let (_directory, store) = setup_store();
+        let first_graph = GraphId::new("urn:test:raw:first");
+        let second_graph = GraphId::new("urn:test:raw:second");
+        let first = add_quad(
+            &store,
+            &first_graph,
+            "urn:test:raw:s1",
+            "urn:test:raw:p1",
+            "urn:test:raw:o1",
+        );
+        add_quad(
+            &store,
+            &first_graph,
+            "urn:test:raw:s1",
+            "urn:test:raw:p2",
+            "urn:test:raw:o2",
+        );
+        add_quad(
+            &store,
+            &second_graph,
+            "urn:test:raw:s2",
+            "urn:test:raw:p1",
+            "urn:test:raw:o1",
+        );
+
+        for bindings in 0..16 {
+            let pattern = QuadPattern {
+                graph: (bindings & 1 != 0).then_some(first.graph),
+                subject: (bindings & 2 != 0).then_some(first.subject),
+                predicate: (bindings & 4 != 0).then_some(first.predicate),
+                object: (bindings & 8 != 0).then_some(first.object),
+            };
+            assert_eq!(
+                sorted(raw_rows(&store, pattern)),
+                sorted(
+                    store
+                        .quads_for_pattern(
+                            pattern.graph,
+                            pattern.subject,
+                            pattern.predicate,
+                            pattern.object,
+                        )
+                        .unwrap()
+                ),
+                "binding shape {bindings:04b}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_stops_after_the_first_consumed_row() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:early-stop");
+        let first = add_quad(
+            &store,
+            &graph,
+            "urn:test:early:s1",
+            "urn:test:early:p",
+            "urn:test:early:o1",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:early:s2",
+            "urn:test:early:p",
+            "urn:test:early:o2",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:early:s3",
+            "urn:test:early:p",
+            "urn:test:early:o3",
+        );
+
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern::default(),
+            )
+            .unwrap();
+        assert!(cursor.next().unwrap().is_ok());
+        drop(cursor);
+        assert_eq!(1, context.snapshot().index_seeks);
+        assert_eq!(1, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().matching_quads);
+    }
+
+    #[test]
+    fn exists_uses_one_point_candidate_and_stops_on_a_hit() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:exists");
+        let quad = add_quad(
+            &store,
+            &graph,
+            "urn:test:exists:s",
+            "urn:test:exists:p",
+            "urn:test:exists:o",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:exists:s2",
+            "urn:test:exists:p",
+            "urn:test:exists:o2",
+        );
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let pattern = QuadPattern {
+            subject: Some(quad.subject),
+            predicate: Some(quad.predicate),
+            object: Some(quad.object),
+            ..QuadPattern::default()
+        };
+
+        assert!(
+            view.exists(&context, GraphSelector::Named(quad.graph), pattern)
+                .unwrap()
+        );
+        let statistics = context.snapshot();
+        assert_eq!(1, statistics.index_seeks);
+        assert_eq!(1, statistics.candidate_quads);
+        assert_eq!(1, statistics.matching_quads);
+
+        let missing = store
+            .resolve_term(&named("urn:test:exists:missing"))
+            .unwrap();
+        let context = ReadContext::default();
+        assert!(
+            !view
+                .exists(
+                    &context,
+                    GraphSelector::Named(quad.graph),
+                    QuadPattern {
+                        subject: Some(quad.subject),
+                        predicate: Some(quad.predicate),
+                        object: Some(missing),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(1, context.snapshot().index_seeks);
+        assert_eq!(0, context.snapshot().candidate_quads);
+    }
+
+    #[test]
+    fn count_up_to_zero_and_two_stop_at_the_requested_cap() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:count-up-to");
+        let quad = add_quad(
+            &store,
+            &graph,
+            "urn:test:count:s1",
+            "urn:test:count:p",
+            "urn:test:count:o1",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:count:s2",
+            "urn:test:count:p",
+            "urn:test:count:o2",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:count:s3",
+            "urn:test:count:p",
+            "urn:test:count:o3",
+        );
+        let view = StoreReadView::new(&store);
+
+        let zero = ReadContext::default();
+        assert_eq!(
+            0,
+            view.count_up_to(
+                &zero,
+                GraphSelector::Named(quad.graph),
+                QuadPattern::default(),
+                0,
+            )
+            .unwrap()
+        );
+        assert_eq!(0, zero.snapshot().index_seeks);
+        assert_eq!(0, zero.snapshot().candidate_quads);
+
+        let two = ReadContext::default();
+        assert_eq!(
+            2,
+            view.count_up_to(
+                &two,
+                GraphSelector::Named(quad.graph),
+                QuadPattern::default(),
+                2,
+            )
+            .unwrap()
+        );
+        assert_eq!(1, two.snapshot().index_seeks);
+        assert_eq!(2, two.snapshot().candidate_quads);
+        assert_eq!(2, two.snapshot().matching_quads);
+    }
+
+}
