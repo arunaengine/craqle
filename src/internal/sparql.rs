@@ -1123,6 +1123,19 @@ where
     }
 
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
+        if self.default_union_marker_pending.get()
+            && let Term::BlankNode(node) = &term
+            && self
+                .default_union_marker
+                .as_ref()
+                .is_some_and(|marker| marker == node)
+        {
+            // spareval encodes the configured default graph before evaluating
+            // query terms. Claim exactly that first internalization; a later
+            // matching user term remains ordinary stored or missing data.
+            self.default_union_marker_pending.set(false);
+            return Ok(StoreTerm::DefaultUnion);
+        }
         let encoded = EncodedTerm::from_term(&term);
         Ok(match self.view.lookup_term(self.context, &encoded)? {
             Some(id) => StoreTerm::Existing(id),
@@ -1303,6 +1316,7 @@ fn materialize_graph_target_removals(
 mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
+    use crate::query_context::ReadAccessPath;
     #[cfg(feature = "search")]
     use crate::search::QueueBound;
     use crate::store::{EncodedQuad, FtsSubject, QuadAdd};
