@@ -1,0 +1,23 @@
+{
+  "@context": {
+    "@vocab": "http://schema.org/",
+    "conformsTo": "http://purl.org/dc/terms/conformsTo",
+    "customTerm": "https://example.org/rocrate/customTerm"
+  },
+  "@graph": [
+    {
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "conformsTo": {"@id": "https://w3id.org/ro/crate/1.3"},
+      "about": {"@id": "urn:fixture:rocrate:custom-context-1.3:root"}
+    },
+    {
+      "@id": "urn:fixture:rocrate:custom-context-1.3:root",
+      "@type": "Dataset",
+      "name": "Custom-context RO-Crate 1.3 fixture",
+      "description": "Minimal 1.3 crate with an authored context object.",
+      "datePublished": "2026-08-19",
+      "customTerm": "custom value"
+    }
+  ]
+}
