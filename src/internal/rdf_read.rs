@@ -363,15 +363,17 @@ impl RdfReadView for StoreReadView<'_> {
                 predicate,
                 object,
             };
+            context.record_access_path(ReadAccessPath::SourceGspo);
             context.increment_index_seeks();
-            let Some(candidate) = self.store.raw_quad_point(quad)? else {
+            let Some(candidate) = self.snapshot.raw_quad_point(self.store, quad)? else {
                 return Ok(false);
             };
             context.increment_candidate_quads();
+            context.record_source_read(candidate.bytes_read);
             if !candidate.live || !pattern.matches(candidate.quad) {
                 return Ok(false);
             }
-            if quad_is_visible(self.store, context, candidate.quad)? {
+            if quad_is_visible(self.store, &self.snapshot, context, candidate.quad)? {
                 context.increment_matching_quads();
                 return Ok(true);
             }
@@ -446,7 +448,7 @@ impl RdfReadView for StoreReadView<'_> {
 
     fn lookup_term(&self, context: &ReadContext<'_>, term: &EncodedTerm) -> Result<Option<TermId>> {
         context.check_cancelled()?;
-        self.store.lookup_term(term)
+        self.snapshot.lookup_term(self.store, term)
     }
 
     fn decode_term(&self, context: &ReadContext<'_>, term: TermId) -> Result<EncodedTerm> {
@@ -480,14 +482,14 @@ impl RdfReadView for StoreReadView<'_> {
 
     fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
         context.check_cancelled()?;
-        let visible = graph_is_visible(self.store, context, graph)?;
+        let visible = graph_is_visible(self.store, &self.snapshot, context, graph)?;
         context.check_cancelled()?;
         Ok(visible)
     }
 
     fn quad_is_visible(&self, context: &ReadContext<'_>, quad: EncodedQuad) -> Result<bool> {
         context.check_cancelled()?;
-        quad_is_visible(self.store, context, quad)
+        quad_is_visible(self.store, &self.snapshot, context, quad)
     }
 }
 
@@ -503,6 +505,7 @@ pub(crate) fn decode_term(
 
 pub(crate) fn graph_is_visible(
     store: &GraphStore,
+    snapshot: &StoreReadSnapshot,
     context: &ReadContext<'_>,
     graph: TermId,
 ) -> Result<bool> {
@@ -513,7 +516,7 @@ pub(crate) fn graph_is_visible(
     context.increment_graphs_considered();
     let visible = if let Some(validation_graph) = context.validation_graph() {
         graph == validation_graph
-    } else if !store.contains_graph_by_id(graph)? {
+    } else if !snapshot.contains_graph_by_id(store, graph)? {
         false
     } else {
         match &context.visibility {
@@ -533,6 +536,7 @@ pub(crate) fn graph_is_visible(
 
 fn orphaned_for_graph(
     store: &GraphStore,
+    snapshot: &StoreReadSnapshot,
     context: &ReadContext<'_>,
     graph: TermId,
 ) -> Result<Rc<HashSet<TermId>>> {
@@ -540,16 +544,7 @@ fn orphaned_for_graph(
         return Ok(orphaned);
     }
 
-    // `graph_diagnostics_by_id` is deliberately clock-aware and remains the
-    // source for this read path; it recomputes stale records without persisting.
-    let diagnostics = store.graph_diagnostics_by_id(graph)?;
-    let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
-    for entity in diagnostics.orphaned_entities {
-        if let Some(term) = store.lookup_term(&EncodedTerm::from_subject_id(&entity))? {
-            orphaned.insert(term);
-        }
-    }
-    let orphaned = Rc::new(orphaned);
+    let orphaned = Rc::new(snapshot.orphaned_entity_ids(store, context, graph)?);
     context.remember_orphaned(graph, orphaned.clone());
     Ok(orphaned)
 }

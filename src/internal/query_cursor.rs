@@ -314,12 +314,14 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
 
     pub(crate) fn delta(
         store: &'store GraphStore,
+        snapshot: &'store StoreReadSnapshot,
         context: &'context ReadContext<'visibility>,
         delta: DeltaQuadCursor<'store>,
         pattern: QuadPattern,
     ) -> Self {
         Self {
             store,
+            snapshot,
             context,
             source: Some(QuerySource::Delta(delta)),
             pattern,
@@ -328,47 +330,118 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
         }
     }
 
+    pub(crate) fn default_union(
+        store: &'store GraphStore,
+        snapshot: &'store StoreReadSnapshot,
+        context: &'context ReadContext<'visibility>,
+        raw: RawQuadCursor,
+        pattern: QuadPattern,
+    ) -> Self {
+        Self {
+            store,
+            snapshot,
+            context,
+            source: Some(QuerySource::DefaultUnion {
+                raw,
+                current_group: None,
+                group_emitted: false,
+            }),
+            pattern,
+            candidates_since_check: 0,
+            finished: false,
+        }
+    }
+
     fn next_source_candidate(&mut self) -> Option<Result<RawQuadCandidate>> {
-        let store = self.store;
-        let context = self.context;
         let source = self.source.as_mut()?;
         match source {
             QuerySource::Raw(raw) => raw.next_candidate(),
             QuerySource::Delta(delta) => delta.next_candidate(),
-            QuerySource::Graphs {
-                graphs,
-                next_graph,
-                current,
-                pattern,
-            } => loop {
-                if let Some(cursor) = current {
-                    if let Some(candidate) = cursor.next_candidate() {
-                        return Some(candidate);
-                    }
-                    *current = None;
-                }
+            QuerySource::DefaultUnion { .. } => {
+                unreachable!("default union has its own constant-state cursor")
+            }
+        }
+    }
 
-                let graph = *graphs.get(*next_graph)?;
-                *next_graph += 1;
-                if let Err(error) = context.check_cancelled() {
-                    return Some(Err(error));
+    fn account_candidate(&mut self, candidate: &RawQuadCandidate) -> Result<()> {
+        self.context.increment_candidate_quads();
+        match candidate.storage {
+            CandidateStorage::Source => self.context.record_source_read(candidate.bytes_read),
+            CandidateStorage::QueryIndex => self.context.record_qv_read(candidate.bytes_read),
+            CandidateStorage::Delta => {}
+        }
+        self.candidates_since_check += 1;
+        if self.candidates_since_check == CANCELLATION_CHECK_INTERVAL {
+            self.candidates_since_check = 0;
+            self.context.check_cancelled()?;
+        }
+        Ok(())
+    }
+
+    fn next_default_union(&mut self) -> Option<Result<EncodedQuad>> {
+        loop {
+            let next = match self.source.as_mut() {
+                Some(QuerySource::DefaultUnion { raw, .. }) => raw.next_candidate(),
+                _ => unreachable!("default-union cursor lost its selected source"),
+            };
+            let candidate = match next {
+                Some(Ok(candidate)) => candidate,
+                Some(Err(error)) => return self.fail(error),
+                None => {
+                    self.finished = true;
+                    return None;
                 }
-                let visible = match crate::rdf_read::graph_is_visible(store, context, graph) {
-                    Ok(visible) => visible,
-                    Err(error) => return Some(Err(error)),
-                };
-                if let Err(error) = context.check_cancelled() {
-                    return Some(Err(error));
+            };
+            if let Err(error) = self.account_candidate(&candidate) {
+                return self.fail(error);
+            }
+            if !candidate.live || !self.pattern.matches(candidate.quad) {
+                continue;
+            }
+
+            let group_already_emitted = match self.source.as_mut() {
+                Some(QuerySource::DefaultUnion {
+                    current_group,
+                    group_emitted,
+                    ..
+                }) => {
+                    let group = (
+                        candidate.quad.subject,
+                        candidate.quad.predicate,
+                        candidate.quad.object,
+                    );
+                    if *current_group != Some(group) {
+                        *current_group = Some(group);
+                        *group_emitted = false;
+                        self.context.increment_duplicate_groups();
+                    } else {
+                        self.context.increment_duplicate_copies_skipped();
+                    }
+                    *group_emitted
                 }
-                if !visible {
-                    continue;
-                }
-                context.increment_index_seeks();
-                *current = Some(store.raw_quad_cursor(QuadPattern {
-                    graph: Some(graph),
-                    ..*pattern
-                }));
-            },
+                _ => unreachable!("default-union cursor lost its selected source"),
+            };
+            if group_already_emitted {
+                continue;
+            }
+            let visible = match crate::rdf_read::quad_is_visible(
+                self.store,
+                self.snapshot,
+                self.context,
+                candidate.quad,
+            ) {
+                Ok(visible) => visible,
+                Err(error) => return self.fail(error),
+            };
+            if !visible {
+                continue;
+            }
+            let Some(QuerySource::DefaultUnion { group_emitted, .. }) = self.source.as_mut() else {
+                unreachable!("default-union cursor lost its selected source");
+            };
+            *group_emitted = true;
+            self.context.increment_matching_quads();
+            return Some(Ok(candidate.quad));
         }
     }
 }
@@ -382,6 +455,10 @@ impl Iterator for QueryCursor<'_, '_, '_> {
         }
         if let Err(error) = self.context.check_cancelled() {
             return self.fail(error);
+        }
+
+        if matches!(self.source, Some(QuerySource::DefaultUnion { .. })) {
+            return self.next_default_union();
         }
 
         loop {
@@ -400,19 +477,19 @@ impl Iterator for QueryCursor<'_, '_, '_> {
                     return None;
                 }
             };
-            self.context.increment_candidate_quads();
-            self.candidates_since_check += 1;
-            if self.candidates_since_check == CANCELLATION_CHECK_INTERVAL {
-                self.candidates_since_check = 0;
-                if let Err(error) = self.context.check_cancelled() {
-                    return self.fail(error);
-                }
+            if let Err(error) = self.account_candidate(&candidate) {
+                return self.fail(error);
             }
 
             if !candidate.live || !self.pattern.matches(candidate.quad) {
                 continue;
             }
-            match crate::rdf_read::quad_is_visible(self.store, self.context, candidate.quad) {
+            match crate::rdf_read::quad_is_visible(
+                self.store,
+                self.snapshot,
+                self.context,
+                candidate.quad,
+            ) {
                 Ok(true) => {
                     self.context.increment_matching_quads();
                     return Some(Ok(candidate.quad));
@@ -439,5 +516,7 @@ pub(crate) fn point_candidate(
     Ok(Some(RawQuadCandidate {
         quad,
         live: GraphStore::quad_value_is_live(value.as_ref()),
+        storage: CandidateStorage::Source,
+        bytes_read: (64 + value.len()) as u64,
     }))
 }
