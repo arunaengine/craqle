@@ -448,7 +448,7 @@ impl PendingPublish {
 #[derive(Default)]
 struct DerivedIndexState {
     by_subject: HashMap<TermId, HashSet<(TermId, TermId, TermId)>>,
-    by_predicate_object: HashMap<(TermId, TermId), HashMap<TermId, HashSet<TermId>>>,
+    by_predicate_object: HashMap<(TermId, TermId), PredicateObjectSubjects>,
     by_object: HashMap<TermId, HashMap<TermId, HashSet<(TermId, TermId)>>>,
     /// predicate → graph → live quad count, so a predicate-only pattern can be
     /// answered by scanning just the graphs that actually contain it instead of
@@ -463,6 +463,8 @@ struct DerivedIndexState {
     total_quads: usize,
 }
 
+type PredicateObjectSubjects = HashMap<TermId, Arc<Vec<TermId>>>;
+
 impl DerivedIndexState {
     fn insert_quad(&mut self, quad: EncodedQuad) {
         let is_new = self.by_subject.entry(quad.subject).or_default().insert((
@@ -470,12 +472,16 @@ impl DerivedIndexState {
             quad.object,
             quad.graph,
         ));
-        self.by_predicate_object
+        let subjects = self
+            .by_predicate_object
             .entry((quad.predicate, quad.object))
             .or_default()
             .entry(quad.graph)
-            .or_default()
-            .insert(quad.subject);
+            .or_default();
+        let subjects = Arc::make_mut(subjects);
+        if let Err(index) = subjects.binary_search(&quad.subject) {
+            subjects.insert(index, quad.subject);
+        }
         self.by_object
             .entry(quad.object)
             .or_default()
@@ -550,8 +556,11 @@ impl DerivedIndexState {
             .entry((quad.predicate, quad.object))
         {
             if let Entry::Occupied(mut graphs) = entry.get_mut().entry(quad.graph) {
-                graphs.get_mut().remove(&quad.subject);
-                if graphs.get().is_empty() {
+                let subjects = Arc::make_mut(graphs.get_mut());
+                if let Ok(index) = subjects.binary_search(&quad.subject) {
+                    subjects.remove(index);
+                }
+                if subjects.is_empty() {
                     graphs.remove();
                 }
             }
@@ -1596,13 +1605,23 @@ impl GraphStore {
         predicate: TermId,
         object: TermId,
     ) -> Vec<TermId> {
+        self.predicate_object_subjects_snapshot(graph, predicate, object)
+            .map(|subjects| subjects.as_ref().clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn predicate_object_subjects_snapshot(
+        &self,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Option<Arc<Vec<TermId>>> {
         self.with_derived_indexes(|indexes| {
             indexes
                 .by_predicate_object
                 .get(&(predicate, object))
                 .and_then(|graphs| graphs.get(&graph))
-                .map(|subjects| subjects.iter().copied().collect())
-                .unwrap_or_default()
+                .cloned()
         })
     }
 
@@ -2667,17 +2686,29 @@ impl GraphStore {
         Ok(quads)
     }
 
-    /// Creates a durable quad cursor behind the index-publication barrier.
+    /// Creates a stable quad cursor behind the index-publication barrier.
     ///
-    /// A Fjall batch makes its keys visible one at a time, while quad commits
-    /// hold `indexes` write-locked until the durable and in-memory halves agree.
-    /// Taking this short read lock before creating the snapshot prevents a
-    /// cursor from freezing a partial batch. The returned cursor owns only the
-    /// snapshot and iterator; it never retains this guard across `next`.
+    /// A named predicate-object range clones the existing copy-on-write index
+    /// snapshot. Other patterns create a Fjall snapshot while quad commits hold
+    /// `indexes` write-locked until the durable and in-memory halves agree. The
+    /// returned cursor never retains that guard across `next`.
     pub(crate) fn raw_quad_cursor(
         &self,
         pattern: crate::rdf_read::QuadPattern,
     ) -> crate::query_cursor::RawQuadCursor {
+        if let (Some(graph), None, Some(predicate), Some(object)) = (
+            pattern.graph,
+            pattern.subject,
+            pattern.predicate,
+            pattern.object,
+        ) {
+            return match self.predicate_object_subjects_snapshot(graph, predicate, object) {
+                Some(subjects) => crate::query_cursor::RawQuadCursor::predicate_object(
+                    subjects, graph, predicate, object,
+                ),
+                None => crate::query_cursor::RawQuadCursor::empty(),
+            };
+        }
         let _publication = self.indexes_read();
         let snapshot = self.db.snapshot();
         crate::query_cursor::RawQuadCursor::new(snapshot, &self.quads, pattern)
