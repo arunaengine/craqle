@@ -716,4 +716,353 @@ mod tests {
         assert_eq!(2, two.snapshot().matching_quads);
     }
 
+    #[test]
+    fn cancellation_stops_before_a_scan_and_at_the_periodic_boundary() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:cancellation");
+        let graph_id = add_many(&store, &graph, 1_025);
+        let view = StoreReadView::new(&store);
+
+        let cancelled = QueryCancellation::new();
+        cancelled.cancel();
+        let context = ReadContext::new(cancelled);
+        assert!(matches!(
+            view.scan(
+                &context,
+                GraphSelector::Named(graph_id),
+                QuadPattern::default()
+            ),
+            Err(StoreError::Cancelled)
+        ));
+        assert_eq!(0, context.snapshot().candidate_quads);
+        assert_eq!(0, context.snapshot().index_seeks);
+
+        let cancellation = QueryCancellation::new();
+        let calls = Cell::new(0);
+        let visibility = |_: &GraphId| {
+            calls.set(calls.get() + 1);
+            cancellation.cancel();
+            false
+        };
+        let context = ReadContext::with_graph_visibility(cancellation.clone(), &visibility);
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(graph_id),
+                QuadPattern::default(),
+            )
+            .unwrap();
+        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
+        assert_eq!(1, calls.get());
+        assert_eq!(1_024, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().graphs_considered);
+        assert_eq!(1, context.snapshot().terms_decoded);
+        assert!(cursor.next().is_none());
+    }
+
+    #[test]
+    fn union_respects_set_and_predicate_visibility_once_per_graph() {
+        let (_directory, store) = setup_store();
+        let first_graph = GraphId::new("urn:test:visible:first");
+        let second_graph = GraphId::new("urn:test:visible:second");
+        let first = add_quad(
+            &store,
+            &first_graph,
+            "urn:test:visible:s1",
+            "urn:test:visible:p",
+            "urn:test:visible:o1",
+        );
+        let second = add_quad(
+            &store,
+            &second_graph,
+            "urn:test:visible:s2",
+            "urn:test:visible:p",
+            "urn:test:visible:o2",
+        );
+        let view = StoreReadView::new(&store);
+
+        let context =
+            ReadContext::with_visible_graphs(QueryCancellation::new(), vec![first_graph.clone()]);
+        let rows = collect_rows(
+            view.scan(&context, GraphSelector::Union, QuadPattern::default())
+                .unwrap(),
+        );
+        assert_eq!(vec![first], rows);
+
+        let calls = RefCell::new(HashMap::<String, usize>::new());
+        let visibility = |graph: &GraphId| {
+            *calls
+                .borrow_mut()
+                .entry(graph.as_str().to_string())
+                .or_default() += 1;
+            graph == &first_graph
+        };
+        let context = ReadContext::with_graph_visibility(QueryCancellation::new(), &visibility);
+        let rows = collect_rows(
+            view.scan(&context, GraphSelector::Union, QuadPattern::default())
+                .unwrap(),
+        );
+        assert_eq!(vec![first], rows);
+        assert_eq!(Some(&1), calls.borrow().get(first_graph.as_str()));
+        assert_eq!(Some(&1), calls.borrow().get(second_graph.as_str()));
+        assert_eq!(2, context.snapshot().graphs_considered);
+        assert_eq!(2, context.snapshot().terms_decoded);
+        assert_ne!(first.graph, second.graph);
+    }
+
+    #[test]
+    fn orphaned_subjects_and_objects_are_filtered_from_normal_diagnostics() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:orphan-filter");
+        add_quad(
+            &store,
+            &graph,
+            graph.as_str(),
+            "http://schema.org/hasPart",
+            "urn:test:orphan-filter:reachable",
+        );
+        let orphan_type = add_quad(
+            &store,
+            &graph,
+            "urn:test:orphan-filter:orphan",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://schema.org/MediaObject",
+        );
+        let orphan_object = store
+            .lookup_term(&named("urn:test:orphan-filter:orphan"))
+            .unwrap()
+            .unwrap();
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:orphan-filter:visible",
+            "urn:test:orphan-filter:references",
+            "urn:test:orphan-filter:orphan",
+        );
+        assert!(
+            store
+                .graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .contains(&"urn:test:orphan-filter:orphan".to_string())
+        );
+
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let rows = collect_rows(
+            view.scan(
+                &context,
+                GraphSelector::Named(orphan_type.graph),
+                QuadPattern::default(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            rows.iter()
+                .all(|quad| quad.subject != orphan_type.subject && quad.object != orphan_object)
+        );
+    }
+
+    #[test]
+    fn forward_and_inverse_walks_delegate_to_pattern_scans() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:walks");
+        let first = add_quad(
+            &store,
+            &graph,
+            "urn:test:walks:s1",
+            "urn:test:walks:p",
+            "urn:test:walks:o1",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:walks:s1",
+            "urn:test:walks:p",
+            "urn:test:walks:o2",
+        );
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:walks:s2",
+            "urn:test:walks:p",
+            "urn:test:walks:o1",
+        );
+        let view = StoreReadView::new(&store);
+
+        let context = ReadContext::default();
+        let forward = collect_rows(
+            view.forward_predicate(
+                &context,
+                GraphSelector::Named(first.graph),
+                first.subject,
+                first.predicate,
+            )
+            .unwrap(),
+        );
+        let context = ReadContext::default();
+        let equivalent = collect_rows(
+            view.scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern {
+                    subject: Some(first.subject),
+                    predicate: Some(first.predicate),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted(forward), sorted(equivalent));
+
+        let context = ReadContext::default();
+        let inverse = collect_rows(
+            view.inverse_predicate(
+                &context,
+                GraphSelector::Named(first.graph),
+                first.predicate,
+                first.object,
+            )
+            .unwrap(),
+        );
+        let context = ReadContext::default();
+        let equivalent = collect_rows(
+            view.scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern {
+                    predicate: Some(first.predicate),
+                    object: Some(first.object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted(inverse), sorted(equivalent));
+    }
+
+    #[test]
+    fn term_operations_use_graph_store_and_count_requested_decodes() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:terms");
+        let quad = add_quad(
+            &store,
+            &graph,
+            "urn:test:terms:s",
+            "urn:test:terms:p",
+            "urn:test:terms:o",
+        );
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let subject = named("urn:test:terms:s");
+
+        assert_eq!(
+            Some(quad.subject),
+            view.lookup_term(&context, &subject).unwrap()
+        );
+        assert_eq!(subject, view.decode_term(&context, quad.subject).unwrap());
+        assert!(
+            view.terms_equal(&context, quad.subject, quad.subject)
+                .unwrap()
+        );
+        assert!(
+            !view
+                .terms_equal(&context, quad.subject, quad.object)
+                .unwrap()
+        );
+        assert_ne!(
+            Ordering::Equal,
+            view.compare_terms(&context, quad.subject, quad.object)
+                .unwrap()
+        );
+        assert_eq!(3, context.snapshot().terms_decoded);
+    }
+
+    #[test]
+    fn snapshot_cursor_does_not_hold_the_publication_lock_or_see_later_writes() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:snapshot-barrier");
+        let first = add_quad(
+            &store,
+            &graph,
+            "urn:test:snapshot:s1",
+            "urn:test:snapshot:p",
+            "urn:test:snapshot:o1",
+        );
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern::default(),
+            )
+            .unwrap();
+
+        let (done, received) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                add_quad(
+                    &store,
+                    &graph,
+                    "urn:test:snapshot:s2",
+                    "urn:test:snapshot:p",
+                    "urn:test:snapshot:o2",
+                );
+                done.send(()).unwrap();
+            });
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+
+        assert_eq!(vec![first], collect_rows(cursor));
+    }
+
+    #[test]
+    fn raw_cursor_waits_for_publication_and_snapshots_the_complete_batch() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:raw-publication-barrier");
+        store.create_graph(&graph).unwrap();
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        store.set_commit_stall(Duration::from_millis(500));
+
+        std::thread::scope(|scope| {
+            let store = &store;
+            let graph = &graph;
+            scope.spawn(|| {
+                add_many(store, graph, 2);
+            });
+            spin_until(|| store.commit_stalled());
+
+            let (started, wait_for_start) = mpsc::channel();
+            let (done, wait_for_done) = mpsc::channel();
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                let rows = raw_rows(
+                    store,
+                    QuadPattern {
+                        graph: Some(graph_id),
+                        ..QuadPattern::default()
+                    },
+                );
+                done.send(rows).unwrap();
+            });
+            wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(
+                wait_for_done
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "a raw cursor created during publication must wait for the barrier"
+            );
+            assert_eq!(
+                2,
+                wait_for_done
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .len(),
+                "the cursor snapshot must contain the entire published batch"
+            );
+        });
+    }
 }

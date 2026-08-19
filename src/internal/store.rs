@@ -622,6 +622,10 @@ pub struct GraphStore {
     /// widening a window that is otherwise microseconds wide.
     #[cfg(test)]
     commit_stall: Mutex<Option<std::time::Duration>>,
+    /// True while the test-only post-durable commit stall holds `indexes`
+    /// write-locked.
+    #[cfg(test)]
+    commit_stalled: std::sync::atomic::AtomicBool,
     /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
     /// between an acknowledgement's token read and its commit.
     #[cfg(test)]
@@ -1186,7 +1190,9 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(delay) = stall {
+            self.commit_stalled.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
+            self.commit_stalled.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1194,10 +1200,17 @@ impl GraphStore {
     /// apply. Test-only.
     #[cfg(test)]
     pub(crate) fn set_commit_stall(&self, delay: std::time::Duration) {
+        self.commit_stalled.store(false, Ordering::SeqCst);
         *self
             .commit_stall
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Whether a commit is inside its post-durable publication stall.
+    #[cfg(test)]
+    pub(crate) fn commit_stalled(&self) -> bool {
+        self.commit_stalled.load(Ordering::SeqCst)
     }
 
     /// Stall a rebuild between its scan and its install. Test-only.
@@ -1851,6 +1864,8 @@ impl GraphStore {
             term_decode_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
+            #[cfg(test)]
+            commit_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fts_ack_stall: Mutex::new(None),
             #[cfg(test)]
