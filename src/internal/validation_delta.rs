@@ -381,3 +381,229 @@ impl<'delta> DeltaQuadCursor<'delta> {
         }))
     }
 }
+
+/// Post-change RDF view layered over the durable read view. The base remains
+/// authoritative; this adapter only supplies the candidate write's final
+/// last-change-wins overlay.
+pub(crate) struct DeltaReadView<'store, 'delta> {
+    base: StoreReadView<'store>,
+    index: &'delta DeltaIndex,
+}
+
+impl<'store, 'delta> DeltaReadView<'store, 'delta> {
+    pub(crate) fn new(base: StoreReadView<'store>, index: &'delta DeltaIndex) -> Self {
+        Self { base, index }
+    }
+
+    pub(crate) fn graph(&self) -> TermId {
+        self.index.graph()
+    }
+
+    /// Whether the durable pre-state had any row for `subject`. Rules use this
+    /// only to preserve their existing "newly introduced untyped subject"
+    /// scope; all normal candidate reads use the final delta view.
+    pub(crate) fn base_subject_exists(
+        &self,
+        context: &ReadContext<'_>,
+        subject: TermId,
+    ) -> Result<bool> {
+        self.base.exists(
+            context,
+            GraphSelector::Named(self.graph()),
+            QuadPattern {
+                subject: Some(subject),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn selected_pattern(
+        &self,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Option<QuadPattern> {
+        let mut pattern = selector.apply(pattern)?;
+        if pattern.graph.is_some_and(|graph| graph != self.graph()) {
+            return None;
+        }
+        pattern.graph = Some(self.graph());
+        Some(pattern)
+    }
+}
+
+impl RdfReadView for DeltaReadView<'_, '_> {
+    fn scan<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
+        context.check_cancelled()?;
+        let Some(pattern) = self.selected_pattern(selector, pattern) else {
+            return Ok(QueryCursor::empty(self.base.store(), context, pattern));
+        };
+        // One durable range plus one bounded in-memory delta range, each
+        // counted exactly once when opened.
+        context.increment_index_seeks();
+        if !self.index.is_empty() {
+            context.increment_index_seeks();
+        }
+        let base = self.base.store().raw_quad_cursor(pattern);
+        Ok(QueryCursor::delta(
+            self.base.store(),
+            context,
+            DeltaQuadCursor::new(base, self.index, pattern),
+            pattern,
+        ))
+    }
+
+    fn exists(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<bool> {
+        context.check_cancelled()?;
+        if matches!(selector, GraphSelector::Named(_)) {
+            let Some(pattern) = self.selected_pattern(selector, pattern) else {
+                return Ok(false);
+            };
+            if let (Some(graph), Some(subject), Some(predicate), Some(object)) = (
+                pattern.graph,
+                pattern.subject,
+                pattern.predicate,
+                pattern.object,
+            ) {
+                let quad = EncodedQuad {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                };
+                if let Some(present) = self.index.state(quad) {
+                    // A final delta state is an exact in-memory probe. It has
+                    // the same accounting shape as the durable point path.
+                    context.increment_index_seeks();
+                    context.increment_candidate_quads();
+                    if !present {
+                        return Ok(false);
+                    }
+                    if self.base.quad_is_visible(context, quad)? {
+                        context.increment_matching_quads();
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                // No overlay verdict: retain StoreReadView's exact durable
+                // point probe instead of widening to a graph-subject scan.
+                return self.base.exists(context, selector, pattern);
+            }
+        }
+        let mut cursor = self.scan(context, selector, pattern)?;
+        match cursor.next() {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(error)) => Err(error),
+            None => Ok(false),
+        }
+    }
+
+    fn count_up_to(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+        cap: u64,
+    ) -> Result<u64> {
+        if cap == 0 {
+            return Ok(0);
+        }
+        let mut cursor = self.scan(context, selector, pattern)?;
+        let mut count = 0;
+        while count < cap {
+            match cursor.next() {
+                Some(Ok(_)) => count += 1,
+                Some(Err(error)) => return Err(error),
+                None => break,
+            }
+        }
+        Ok(count)
+    }
+
+    fn forward_predicate<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        subject: TermId,
+        predicate: TermId,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
+        self.scan(
+            context,
+            selector,
+            QuadPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn inverse_predicate<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
+        self.scan(
+            context,
+            selector,
+            QuadPattern {
+                predicate: Some(predicate),
+                object: Some(object),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn lookup_term(&self, context: &ReadContext<'_>, term: &EncodedTerm) -> Result<Option<TermId>> {
+        context.check_cancelled()?;
+        match self.index.lookup_delta_term(term)? {
+            Some(term) => Ok(Some(term)),
+            None => self.base.lookup_term(context, term),
+        }
+    }
+
+    fn decode_term(&self, context: &ReadContext<'_>, term: TermId) -> Result<EncodedTerm> {
+        context.check_cancelled()?;
+        if let Some(decoded) = self.index.delta_term(term) {
+            context.increment_terms_decoded();
+            return Ok(decoded.clone());
+        }
+        self.base.decode_term(context, term)
+    }
+
+    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool> {
+        context.check_cancelled()?;
+        Ok(left == right)
+    }
+
+    fn compare_terms(
+        &self,
+        context: &ReadContext<'_>,
+        left: TermId,
+        right: TermId,
+    ) -> Result<Ordering> {
+        Ok(self
+            .decode_term(context, left)?
+            .0
+            .cmp(&self.decode_term(context, right)?.0))
+    }
+
+    fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
+        self.base.graph_is_visible(context, graph)
+    }
+
+    fn quad_is_visible(&self, context: &ReadContext<'_>, quad: EncodedQuad) -> Result<bool> {
+        self.base.quad_is_visible(context, quad)
+    }
+}

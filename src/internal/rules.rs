@@ -3,7 +3,14 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
 use crate::core::{CrateViolation, EncodedTerm, GraphId, MaterializedQuadChange, QuadOp, vocab};
+use crate::query_context::{QueryCancellation, ReadContext};
+use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::{GraphStore, TermId};
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ── Constant term table ─────────────────────────────────────────────────────
 //
@@ -110,21 +117,37 @@ impl GraphSnapshot {
         }
     }
 
-    /// Build a snapshot by reading every quad for a graph from the store.
+    /// Build a snapshot by streaming the shared validation read interface.
     pub(crate) fn from_store(store: &GraphStore, graph: &GraphId) -> crate::store::Result<Self> {
+        let view = StoreReadView::new(store);
+        let context = ReadContext::for_validation(QueryCancellation::new(), graph);
+        Self::from_read_view(&view, &context, graph)
+    }
+
+    fn from_read_view(
+        view: &impl RdfReadView,
+        context: &ReadContext<'_>,
+        graph: &GraphId,
+    ) -> crate::store::Result<Self> {
+        #[cfg(test)]
+        SNAPSHOT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let graph_term = EncodedTerm::from_named_node(&graph.0);
-        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+        let Some(graph_tid) = view.lookup_term(context, &graph_term)? else {
             return Ok(Self::new(graph.clone(), Vec::new()));
         };
         let mut triples = Vec::new();
-        let mut term_cache = HashMap::new();
-        store.for_each_quad_in_graph::<crate::store::StoreError, _>(graph_tid, |q| {
-            let s = store.decode_term_cached(&mut term_cache, q.subject)?;
-            let p = store.decode_term_cached(&mut term_cache, q.predicate)?;
-            let o = store.decode_term_cached(&mut term_cache, q.object)?;
+        let cursor = view.scan(
+            context,
+            GraphSelector::Named(graph_tid),
+            QuadPattern::default(),
+        )?;
+        for quad in cursor {
+            let q = quad?;
+            let s = view.decode_term(context, q.subject)?;
+            let p = view.decode_term(context, q.predicate)?;
+            let o = view.decode_term(context, q.object)?;
             triples.push((s, p, o));
-            Ok(())
-        })?;
+        }
         Ok(Self::new(graph.clone(), triples))
     }
 
