@@ -193,6 +193,44 @@ impl From<fjall::PersistMode> for CraqleFjallPersistMode {
     }
 }
 
+/// A supported RO-Crate specification version.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum RoCrateVersion {
+    V1_1,
+    V1_2,
+    #[default]
+    V1_3,
+}
+
+impl RoCrateVersion {
+    pub(crate) const fn context_url(self) -> &'static str {
+        match self {
+            Self::V1_1 => "https://w3id.org/ro/crate/1.1/context",
+            Self::V1_2 => "https://w3id.org/ro/crate/1.2/context",
+            Self::V1_3 => "https://w3id.org/ro/crate/1.3/context",
+        }
+    }
+
+    pub(crate) const fn specification_url(self) -> &'static str {
+        match self {
+            Self::V1_1 => "https://w3id.org/ro/crate/1.1",
+            Self::V1_2 => "https://w3id.org/ro/crate/1.2",
+            Self::V1_3 => "https://w3id.org/ro/crate/1.3",
+        }
+    }
+
+    pub(crate) const fn context_bytes(self) -> &'static [u8] {
+        match self {
+            Self::V1_1 => include_bytes!("resources/ro_crate_1_1.jsonld"),
+            Self::V1_2 => include_bytes!("resources/ro_crate_1_2.jsonld"),
+            Self::V1_3 => include_bytes!("resources/ro_crate_1_3.jsonld"),
+        }
+    }
+}
+
 /// Input for creating a new RO-Crate graph.
 #[derive(Debug, Clone)]
 pub struct CreateCrateRequest {
@@ -202,6 +240,12 @@ pub struct CreateCrateRequest {
     pub date_published: String,
     pub license: Option<String>,
     pub policy: GraphPolicy,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateCrateOptions {
+    pub version: RoCrateVersion,
+    pub license: Option<String>,
 }
 
 impl CreateCrateRequest {
