@@ -353,7 +353,6 @@ fn duplicate_graph_results_are_planner_invariant_and_named_rows_keep_multiplicit
 }
 
 #[test]
-#[ignore = "known baseline defect; PR 3 union grouping"]
 fn union_default_graph_deduplicates_identical_triples() {
     let fixture = fixture();
     let query = format!("SELECT ?s WHERE {{ ?s <{SHARED}> \"same\" }}");
