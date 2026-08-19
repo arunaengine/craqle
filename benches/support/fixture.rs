@@ -4,9 +4,11 @@
 //! the temporary database and retains only graph metadata plus a handful of
 //! stable query terms after setup.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use craqle::{
@@ -25,10 +27,6 @@ pub const LOAD_BATCH_SIZE: usize = 512;
 
 const SELECT_LIMIT: usize = 10;
 const DIRECTORY_SIZE_ENTRY_LIMIT: usize = 100_000;
-const CRAQLE_COMMIT: &str = match option_env!("CRAQLE_GIT_COMMIT") {
-    Some(commit) => commit,
-    None => "unknown",
-};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BenchConfig {
@@ -113,6 +111,7 @@ enum Expected {
     Rows {
         count: usize,
         bindings: &'static [&'static str],
+        tolerate_union_duplicates: bool,
     },
     Count {
         expected: usize,
@@ -134,8 +133,8 @@ struct Probe {
 
 struct FixtureMetrics {
     inserted_data_quads: usize,
-    setup_term_allocations: usize,
-    setup_term_bytes: usize,
+    encoded_terms_constructed: usize,
+    encoded_term_payload_bytes: usize,
     database: DirectoryBytes,
 }
 
@@ -187,10 +186,10 @@ impl Fixture {
 
         let mut loader = GraphPartitionedLoader::new(&node, &all_graphs);
         let mut graph_records = vec![0usize; config.corpus.graphs];
-        let mut common_records = vec![0usize; config.corpus.graphs];
+        let mut visible_common_records = 0usize;
         let mut inserted_data_quads = 0usize;
-        let mut setup_term_allocations = 0usize;
-        let mut setup_term_bytes = 0usize;
+        let mut encoded_terms_constructed = 0usize;
+        let mut encoded_term_payload_bytes = 0usize;
         let mut star_probe = None;
         let mut duplicate_probe = None;
         let mut hidden_probe = None;
@@ -214,13 +213,13 @@ impl Fixture {
             let subject = subject_term(record.subject);
             let predicate = predicate_term(record.predicate);
             let object = object_term(record.object);
-            setup_term_allocations += 3;
-            setup_term_bytes += subject.0.len() + predicate.0.len() + object.0.len();
+            encoded_terms_constructed += 3;
+            encoded_term_payload_bytes += subject.0.len() + predicate.0.len() + object.0.len();
 
             graph_records[graph_index] += 1;
             inserted_data_quads += 1;
-            if matches!(record.predicate, PredicateKind::Common(0)) {
-                common_records[graph_index] += 1;
+            if visibility.is_visible() && matches!(record.predicate, PredicateKind::Common(0)) {
+                visible_common_records += 1;
             }
             if visibility.is_visible()
                 && matches!(record.predicate, PredicateKind::Common(0))
@@ -304,16 +303,9 @@ impl Fixture {
         let star_probe = star_probe.expect("find a complete visible canonical star");
         let common_predicate = predicate_term(PredicateKind::Common(0));
         let common_object = object_term(ObjectSpec::Literal(0));
-        let count_graph_index = all_graphs
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| graph_visibility(config.corpus.graphs, *index as u32).is_visible())
-            .max_by_key(|(index, _)| common_records[*index])
-            .map(|(index, _)| index)
-            .expect("find a visible graph for common-predicate COUNT");
         assert!(
-            common_records[count_graph_index] > 0,
-            "the COUNT graph must contain a common predicate"
+            visible_common_records > 0,
+            "the visible union must contain a common predicate"
         );
 
         let terms = QueryTerms {
@@ -324,8 +316,7 @@ impl Fixture {
             rare_predicate: star_probe.predicate.clone(),
             rare_object: star_probe.object.clone(),
         };
-        let count_graph = &all_graphs[count_graph_index];
-        let mut cases = query_cases(&terms, count_graph);
+        let mut cases = query_cases(&terms);
         let count_case = cases
             .iter()
             .position(|case| matches!(case.kind, QueryKind::Count))
@@ -336,7 +327,7 @@ impl Fixture {
             cases[count_case].label,
         );
         assert!(
-            count > 0 && count <= common_records[count_graph_index],
+            count > 0 && count <= visible_common_records,
             "COUNT semantic baseline must describe loaded common-predicate data"
         );
         cases[count_case].expected = Expected::Count { expected: count };
@@ -374,8 +365,8 @@ impl Fixture {
             hidden_query,
             metrics: FixtureMetrics {
                 inserted_data_quads,
-                setup_term_allocations,
-                setup_term_bytes,
+                encoded_terms_constructed,
+                encoded_term_payload_bytes,
                 database: database_bytes,
             },
         }
@@ -485,6 +476,7 @@ impl Fixture {
 
     pub fn print_report(&self, report: &SemanticReport) {
         let metadata = self.config.corpus.metadata();
+        let craqle_commit = repository_commit();
         println!(
             "sparql_hot_path fixture: corpus_version={} seed={:#x} quads={} graphs={} \
              duplicate_percent={} visible_graphs={} hidden_graphs={} inserted_data_quads={} \
@@ -498,7 +490,7 @@ impl Fixture {
             metadata.hidden_graphs,
             self.metrics.inserted_data_quads,
             LOAD_BATCH_SIZE,
-            CRAQLE_COMMIT,
+            craqle_commit,
         );
         if self.metrics.database.complete {
             println!(
@@ -515,8 +507,9 @@ impl Fixture {
             );
         }
         println!(
-            "sparql_hot_path fixture: setup_rdf_term_allocations={} setup_rdf_term_bytes={}",
-            self.metrics.setup_term_allocations, self.metrics.setup_term_bytes
+            "sparql_hot_path fixture: encoded_terms_constructed={} encoded_term_payload_bytes={} \
+             (payload bytes are not allocator measurements)",
+            self.metrics.encoded_terms_constructed, self.metrics.encoded_term_payload_bytes
         );
         println!(
             "sparql_hot_path semantic rows: ask_hit={} ask_miss={} select_limit={} count={} \
@@ -568,15 +561,37 @@ impl Fixture {
                 }
                 _ => panic!("{} must return a boolean", case.label),
             },
-            Expected::Rows { count, bindings } => match results {
+            Expected::Rows {
+                count,
+                bindings,
+                tolerate_union_duplicates,
+            } => match results {
                 QueryResults::Solutions(rows) => {
-                    assert_eq!(rows.len(), *count, "{} row count changed", case.label);
                     assert!(
                         rows.iter()
                             .all(|row| bindings.iter().all(|binding| row.contains_key(*binding))),
                         "{} returned an incomplete binding",
                         case.label
                     );
+                    if *tolerate_union_duplicates {
+                        let unique = rows
+                            .iter()
+                            .map(|row| {
+                                bindings
+                                    .iter()
+                                    .map(|binding| row[*binding].clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<BTreeSet<_>>();
+                        assert_eq!(
+                            unique.len(),
+                            *count,
+                            "{} unique solution count changed",
+                            case.label
+                        );
+                    } else {
+                        assert_eq!(rows.len(), *count, "{} row count changed", case.label);
+                    }
                     CheckValue::Rows(rows.len())
                 }
                 _ => panic!("{} must return solution rows", case.label),
@@ -657,18 +672,15 @@ impl<'a> GraphPartitionedLoader<'a> {
     }
 }
 
-fn query_cases(terms: &QueryTerms, count_graph: &GraphId) -> Vec<QueryCase> {
+fn query_cases(terms: &QueryTerms) -> Vec<QueryCase> {
     let type_predicate = predicate_term(PredicateKind::Type);
     vec![
         QueryCase {
             label: "bound_ask_hit",
             kind: QueryKind::AskHit,
             sparql: format!(
-                "ASK WHERE {{ GRAPH <{}> {{ {} {} {} }} }}",
-                terms.graph.as_str(),
-                terms.subject.0,
-                terms.rare_predicate.0,
-                terms.rare_object.0
+                "ASK WHERE {{ {} {} {} }}",
+                terms.subject.0, terms.rare_predicate.0, terms.rare_object.0
             ),
             expected: Expected::Boolean(true),
         },
@@ -676,10 +688,8 @@ fn query_cases(terms: &QueryTerms, count_graph: &GraphId) -> Vec<QueryCase> {
             label: "bound_ask_miss",
             kind: QueryKind::AskMiss,
             sparql: format!(
-                "ASK WHERE {{ GRAPH <{}> {{ <urn:craqle:bench:performance-corpus-v1:missing> {} {} }} }}",
-                terms.graph.as_str(),
-                terms.rare_predicate.0,
-                terms.rare_object.0
+                "ASK WHERE {{ <urn:craqle:bench:performance-corpus-v1:missing> {} {} }}",
+                terms.rare_predicate.0, terms.rare_object.0
             ),
             expected: Expected::Boolean(false),
         },
@@ -693,14 +703,14 @@ fn query_cases(terms: &QueryTerms, count_graph: &GraphId) -> Vec<QueryCase> {
             expected: Expected::Rows {
                 count: SELECT_LIMIT,
                 bindings: &["s"],
+                tolerate_union_duplicates: false,
             },
         },
         QueryCase {
             label: "exact_count_common_predicate",
             kind: QueryKind::Count,
             sparql: format!(
-                "SELECT (COUNT(*) AS ?count) WHERE {{ GRAPH <{}> {{ ?s {} ?o }} }}",
-                count_graph.as_str(),
+                "SELECT (COUNT(*) AS ?count) WHERE {{ ?s {} ?o }}",
                 terms.common_predicate.0
             ),
             expected: Expected::Count { expected: 0 },
@@ -709,46 +719,39 @@ fn query_cases(terms: &QueryTerms, count_graph: &GraphId) -> Vec<QueryCase> {
             label: "same_subject_property_star",
             kind: QueryKind::PropertyStar,
             sparql: format!(
-                "SELECT ?type ?common ?rare WHERE {{ GRAPH <{}> {{ {} {} ?type ; {} ?common ; {} ?rare }} }}",
-                terms.graph.as_str(),
-                terms.subject.0,
-                type_predicate.0,
-                terms.common_predicate.0,
-                terms.rare_predicate.0,
+                "SELECT ?type ?common ?rare WHERE {{ {} {} ?type ; {} ?common ; {} ?rare }}",
+                terms.subject.0, type_predicate.0, terms.common_predicate.0, terms.rare_predicate.0,
             ),
             expected: Expected::Rows {
                 count: 1,
                 bindings: &["type", "common", "rare"],
+                tolerate_union_duplicates: true,
             },
         },
         QueryCase {
             label: "rare_to_common_join",
             kind: QueryKind::RareToCommon,
             sparql: format!(
-                "SELECT ?s ?common WHERE {{ GRAPH <{}> {{ ?s {} {} . ?s {} ?common }} }}",
-                terms.graph.as_str(),
-                terms.rare_predicate.0,
-                terms.rare_object.0,
-                terms.common_predicate.0,
+                "SELECT ?s ?common WHERE {{ ?s {} {} . ?s {} ?common }}",
+                terms.rare_predicate.0, terms.rare_object.0, terms.common_predicate.0,
             ),
             expected: Expected::Rows {
                 count: 1,
                 bindings: &["s", "common"],
+                tolerate_union_duplicates: true,
             },
         },
         QueryCase {
             label: "common_to_rare_written_order",
             kind: QueryKind::CommonToRare,
             sparql: format!(
-                "SELECT ?s ?common WHERE {{ GRAPH <{}> {{ ?s {} ?common . ?s {} {} }} }}",
-                terms.graph.as_str(),
-                terms.common_predicate.0,
-                terms.rare_predicate.0,
-                terms.rare_object.0,
+                "SELECT ?s ?common WHERE {{ ?s {} ?common . ?s {} {} }}",
+                terms.common_predicate.0, terms.rare_predicate.0, terms.rare_object.0,
             ),
             expected: Expected::Rows {
                 count: 1,
                 bindings: &["s", "common"],
+                tolerate_union_duplicates: true,
             },
         },
     ]
@@ -839,6 +842,24 @@ fn directory_bytes_bounded(root: &Path) -> std::io::Result<DirectoryBytes> {
         entries,
         complete: true,
     })
+}
+
+fn repository_commit() -> String {
+    env::var("CRAQLE_GIT_COMMIT")
+        .ok()
+        .or_else(|| option_env!("CRAQLE_GIT_COMMIT").map(str::to_owned))
+        .or_else(|| {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
