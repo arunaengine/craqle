@@ -1,19 +1,27 @@
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use fjall::{Keyspace, Readable, Snapshot};
 
 use crate::query_context::ReadContext;
 use crate::rdf_read::QuadPattern;
-use crate::store::{EncodedQuad, GraphStore, Result, TermId};
+use crate::store::{
+    EncodedQuad, GraphStore, QueryIndexCursorOrder, Result, StoreReadSnapshot, TermId,
+};
 use crate::validation_delta::DeltaQuadCursor;
 
 enum SourceIterator {
+    Single(Option<RawQuadCandidate>),
     Durable {
+        snapshot: Snapshot,
+        keyspace: Keyspace,
+        iterator: fjall::Iter,
+    },
+    QueryIndex {
         _snapshot: Snapshot,
         iterator: fjall::Iter,
+        order: QueryIndexCursorOrder,
     },
     PredicateObject {
         subjects: Arc<Vec<TermId>>,
@@ -35,6 +43,15 @@ enum SourceIterator {
 pub(crate) struct RawQuadCandidate {
     pub(crate) quad: EncodedQuad,
     pub(crate) live: bool,
+    pub(crate) storage: CandidateStorage,
+    pub(crate) bytes_read: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CandidateStorage {
+    Source,
+    QueryIndex,
+    Delta,
 }
 
 /// Lazy source cursor. It owns either a Fjall snapshot or a copy-on-write
@@ -44,6 +61,12 @@ pub(crate) struct RawQuadCursor {
 }
 
 impl RawQuadCursor {
+    pub(crate) fn single(candidate: Option<RawQuadCandidate>) -> Self {
+        Self {
+            source: SourceIterator::Single(candidate),
+        }
+    }
+
     pub(crate) fn new(snapshot: Snapshot, quads: &Keyspace, pattern: QuadPattern) -> Self {
         let iterator = match (pattern.graph, pattern.subject, pattern.predicate) {
             (Some(graph), Some(subject), Some(predicate)) => {
@@ -64,8 +87,29 @@ impl RawQuadCursor {
         };
         Self {
             source: SourceIterator::Durable {
+                snapshot,
+                keyspace: quads.clone(),
+                iterator,
+            },
+        }
+    }
+
+    pub(crate) fn query_index(
+        snapshot: Snapshot,
+        keyspace: &Keyspace,
+        order: QueryIndexCursorOrder,
+        prefix: Vec<u8>,
+    ) -> Self {
+        let iterator = if prefix.is_empty() {
+            snapshot.iter(keyspace)
+        } else {
+            snapshot.prefix(keyspace, prefix)
+        };
+        Self {
+            source: SourceIterator::QueryIndex {
                 _snapshot: snapshot,
                 iterator,
+                order,
             },
         }
     }
@@ -110,6 +154,7 @@ impl RawQuadCursor {
 
     pub(crate) fn next_candidate(&mut self) -> Option<Result<RawQuadCandidate>> {
         match &mut self.source {
+            SourceIterator::Single(candidate) => candidate.take().map(Ok),
             SourceIterator::Durable { iterator, .. } => {
                 let guard = iterator.next()?;
                 let (key, value) = match guard.into_inner() {

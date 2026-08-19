@@ -1,12 +1,16 @@
+use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId};
-use crate::query_context::{GraphVisibility, ReadContext};
+use crate::query_context::{GraphVisibility, QueryReadMode, ReadAccessPath, ReadContext};
 use crate::query_cursor::QueryCursor;
-use crate::store::{EncodedQuad, GraphStore, Result, TermId};
+use crate::store::{
+    EncodedQuad, GraphStore, QueryIndexAdmission, QueryIndexCursorOrder, Result, StoreError,
+    StoreReadSnapshot, TermId,
+};
 
 /// A quad pattern represented entirely by internally interned term ids.
 #[derive(Clone, Copy, Debug, Default)]
@@ -30,11 +34,12 @@ impl QuadPattern {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum GraphSelector {
     Named(TermId),
-    /// Visits visible named-graph copies. It intentionally preserves each
-    /// source graph id in the returned [`EncodedQuad`]; distinct union grouping
-    /// is a later SPARQL-layer responsibility, not a constant-memory cursor
-    /// operation in this foundation.
+    /// Visits visible named-graph copies. It intentionally preserves every
+    /// source graph id in the returned [`EncodedQuad`].
     Union,
+    /// Visits the distinct default union. This is intentionally separate from
+    /// [`GraphSelector::Union`]: an unbound named graph must preserve copies.
+    DefaultUnion,
 }
 
 impl GraphSelector {
@@ -114,32 +119,60 @@ pub(crate) trait RdfReadView {
 /// Durable-source implementation of [`RdfReadView`].
 pub(crate) struct StoreReadView<'store> {
     store: &'store GraphStore,
+    snapshot: StoreReadSnapshot,
+    read_mode: QueryReadMode,
+    qv_admission: OnceCell<QueryIndexAdmission>,
 }
 
 impl<'store> StoreReadView<'store> {
     pub(crate) fn new(store: &'store GraphStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            snapshot: store.read_snapshot(),
+            read_mode: QueryReadMode::Auto,
+            qv_admission: OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn with_read_mode(store: &'store GraphStore, read_mode: QueryReadMode) -> Self {
+        Self {
+            store,
+            snapshot: store.read_snapshot(),
+            read_mode,
+            qv_admission: OnceCell::new(),
+        }
     }
 
     pub(crate) fn store(&self) -> &'store GraphStore {
         self.store
     }
 
-    fn union_graph_candidates(
-        &self,
-        context: &ReadContext<'_>,
-        pattern: QuadPattern,
-    ) -> Option<Rc<Vec<TermId>>> {
-        if pattern.subject.is_some() {
-            return None;
-        }
+    pub(crate) fn snapshot(&self) -> &StoreReadSnapshot {
+        &self.snapshot
+    }
 
-        let indexed = match (pattern.predicate, pattern.object) {
-            (Some(predicate), Some(object)) => {
-                context.increment_index_seeks();
-                Some(Rc::new(
-                    self.store.predicate_object_graphs(predicate, object),
-                ))
+    fn auto_access_path(selector: GraphSelector, pattern: QuadPattern) -> ReadAccessPath {
+        match selector {
+            GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::SourceGspo,
+            GraphSelector::Named(_) if pattern.predicate.is_some() => ReadAccessPath::QvGpos,
+            GraphSelector::Named(_) => ReadAccessPath::SourceGspo,
+            GraphSelector::Union | GraphSelector::DefaultUnion if pattern.subject.is_some() => {
+                ReadAccessPath::QvSpog
+            }
+            GraphSelector::Union | GraphSelector::DefaultUnion if pattern.predicate.is_some() => {
+                ReadAccessPath::QvPosg
+            }
+            GraphSelector::Union | GraphSelector::DefaultUnion => ReadAccessPath::QvSpog,
+        }
+    }
+
+    fn forced_qv_access_path(selector: GraphSelector, pattern: QuadPattern) -> ReadAccessPath {
+        match selector {
+            GraphSelector::Named(_) if pattern.predicate.is_some() => ReadAccessPath::QvGpos,
+            GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::QvSpog,
+            GraphSelector::Named(_) => ReadAccessPath::QvGpos,
+            GraphSelector::Union | GraphSelector::DefaultUnion if pattern.subject.is_some() => {
+                ReadAccessPath::QvSpog
             }
             (None, Some(object)) => {
                 context.increment_index_seeks();

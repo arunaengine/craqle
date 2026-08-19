@@ -36,18 +36,64 @@ impl QueryCancellation {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadStatistics {
     pub index_seeks: u64,
+    pub qv_admission_checks: u64,
+    pub qv_header_reads: u64,
+    pub qv_counter_reads: u64,
+    pub qv_trusted: bool,
+    pub fallback_reason: Option<String>,
+    pub selected_access_paths: Vec<ReadAccessPath>,
+    pub source_keys_read: u64,
+    pub source_bytes_read: u64,
+    pub qv_keys_read: u64,
+    pub qv_bytes_read: u64,
     pub candidate_quads: u64,
     pub matching_quads: u64,
     pub graphs_considered: u64,
+    pub orphan_checks: u64,
+    pub duplicate_groups: u64,
+    pub duplicate_copies_skipped: u64,
     pub terms_decoded: u64,
+}
+
+/// Storage access selected for an RDF pattern scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum ReadAccessPath {
+    SourceGspo,
+    QvGpos,
+    QvSpog,
+    QvPosg,
+    Empty,
+}
+
+/// Test and benchmark control for Craqle's RDF read source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueryReadMode {
+    #[default]
+    Auto,
+    ForceSource,
+    ForceQv,
 }
 
 #[derive(Default)]
 struct ReadCounters {
     index_seeks: Cell<u64>,
+    qv_admission_checks: Cell<u64>,
+    qv_header_reads: Cell<u64>,
+    qv_counter_reads: Cell<u64>,
+    qv_trusted: Cell<bool>,
+    fallback_reason: RefCell<Option<String>>,
+    selected_access_paths: RefCell<Vec<ReadAccessPath>>,
+    source_keys_read: Cell<u64>,
+    source_bytes_read: Cell<u64>,
+    qv_keys_read: Cell<u64>,
+    qv_bytes_read: Cell<u64>,
     candidate_quads: Cell<u64>,
     matching_quads: Cell<u64>,
     graphs_considered: Cell<u64>,
+    orphan_checks: Cell<u64>,
+    duplicate_groups: Cell<u64>,
+    duplicate_copies_skipped: Cell<u64>,
     terms_decoded: Cell<u64>,
 }
 
@@ -56,12 +102,29 @@ impl ReadCounters {
         counter.set(counter.get().saturating_add(1));
     }
 
+    fn add(counter: &Cell<u64>, amount: u64) {
+        counter.set(counter.get().saturating_add(amount));
+    }
+
     fn snapshot(&self) -> ReadStatistics {
         ReadStatistics {
             index_seeks: self.index_seeks.get(),
+            qv_admission_checks: self.qv_admission_checks.get(),
+            qv_header_reads: self.qv_header_reads.get(),
+            qv_counter_reads: self.qv_counter_reads.get(),
+            qv_trusted: self.qv_trusted.get(),
+            fallback_reason: self.fallback_reason.borrow().clone(),
+            selected_access_paths: self.selected_access_paths.borrow().clone(),
+            source_keys_read: self.source_keys_read.get(),
+            source_bytes_read: self.source_bytes_read.get(),
+            qv_keys_read: self.qv_keys_read.get(),
+            qv_bytes_read: self.qv_bytes_read.get(),
             candidate_quads: self.candidate_quads.get(),
             matching_quads: self.matching_quads.get(),
             graphs_considered: self.graphs_considered.get(),
+            orphan_checks: self.orphan_checks.get(),
+            duplicate_groups: self.duplicate_groups.get(),
+            duplicate_copies_skipped: self.duplicate_copies_skipped.get(),
             terms_decoded: self.terms_decoded.get(),
         }
     }
@@ -77,7 +140,6 @@ pub(crate) enum GraphVisibility<'a> {
 pub(crate) struct ReadContext<'a> {
     cancellation: QueryCancellation,
     pub(crate) visibility: GraphVisibility<'a>,
-    exact_graphs: Option<Rc<Vec<TermId>>>,
     /// Validation is intentionally distinct from ordinary query visibility:
     /// it names the one proposed graph and keeps its rows observable even
     /// before the graph exists durably or diagnostics have been recomputed.
@@ -99,7 +161,6 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::All,
-            exact_graphs: None,
             validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -112,17 +173,13 @@ impl<'a> ReadContext<'a> {
         cancellation: QueryCancellation,
         graphs: impl IntoIterator<Item = GraphId>,
     ) -> Self {
-        let mut exact_graphs: Vec<_> = graphs
+        let exact_graphs = graphs
             .into_iter()
             .map(|graph| hash_term(&EncodedTerm::from_named_node(&graph.0)))
             .collect();
-        exact_graphs.sort_unstable();
-        exact_graphs.dedup();
-        let exact_graphs = Rc::new(exact_graphs);
         Self {
             cancellation,
-            visibility: GraphVisibility::Exact(exact_graphs.iter().copied().collect()),
-            exact_graphs: Some(exact_graphs),
+            visibility: GraphVisibility::Exact(exact_graphs),
             validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -138,7 +195,6 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::Predicate(visible),
-            exact_graphs: None,
             validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -155,7 +211,6 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::Exact(HashSet::from([graph])),
-            exact_graphs: Some(Rc::new(vec![graph])),
             validation_graph: Some(graph),
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -180,6 +235,49 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.index_seeks);
     }
 
+    pub(crate) fn record_qv_admission(
+        &self,
+        trusted: bool,
+        fallback_reason: Option<&'static str>,
+        header_reads: u64,
+        counter_reads: u64,
+    ) {
+        ReadCounters::increment(&self.counters.qv_admission_checks);
+        ReadCounters::add(&self.counters.qv_header_reads, header_reads);
+        ReadCounters::add(&self.counters.qv_counter_reads, counter_reads);
+        self.observe_qv_admission(trusted, fallback_reason);
+    }
+
+    pub(crate) fn observe_qv_admission(
+        &self,
+        trusted: bool,
+        fallback_reason: Option<&'static str>,
+    ) {
+        self.counters.qv_trusted.set(trusted);
+        if self.counters.fallback_reason.borrow().is_none()
+            && let Some(reason) = fallback_reason
+        {
+            *self.counters.fallback_reason.borrow_mut() = Some(reason.to_owned());
+        }
+    }
+
+    pub(crate) fn record_access_path(&self, path: ReadAccessPath) {
+        let mut paths = self.counters.selected_access_paths.borrow_mut();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+
+    pub(crate) fn record_source_read(&self, bytes: u64) {
+        ReadCounters::increment(&self.counters.source_keys_read);
+        ReadCounters::add(&self.counters.source_bytes_read, bytes);
+    }
+
+    pub(crate) fn record_qv_read(&self, bytes: u64) {
+        ReadCounters::increment(&self.counters.qv_keys_read);
+        ReadCounters::add(&self.counters.qv_bytes_read, bytes);
+    }
+
     pub(crate) fn increment_candidate_quads(&self) {
         ReadCounters::increment(&self.counters.candidate_quads);
     }
@@ -192,16 +290,24 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.graphs_considered);
     }
 
+    pub(crate) fn increment_orphan_checks(&self) {
+        ReadCounters::increment(&self.counters.orphan_checks);
+    }
+
+    pub(crate) fn increment_duplicate_groups(&self) {
+        ReadCounters::increment(&self.counters.duplicate_groups);
+    }
+
+    pub(crate) fn increment_duplicate_copies_skipped(&self) {
+        ReadCounters::increment(&self.counters.duplicate_copies_skipped);
+    }
+
     pub(crate) fn increment_terms_decoded(&self) {
         ReadCounters::increment(&self.counters.terms_decoded);
     }
 
     pub(crate) fn graph_visibility(&self, graph: TermId) -> Option<bool> {
         self.graph_visibility.borrow().get(&graph).copied()
-    }
-
-    pub(crate) fn exact_graphs(&self) -> Option<Rc<Vec<TermId>>> {
-        self.exact_graphs.clone()
     }
 
     pub(crate) fn remember_graph_visibility(&self, graph: TermId, visible: bool) {
