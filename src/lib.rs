@@ -1712,20 +1712,39 @@ impl CraqleNode {
     /// Visibility is decided lazily, once per graph the evaluation touches,
     /// rather than by materializing the whole visible set up front.
     ///
-    /// The predicate cannot report failure, so a read error must deny:
-    /// `ensure_graph_action` folds both "read failed" and "policy says no" into
-    /// `Err`, and `is_ok()` maps that to not-visible, never to visible (G8).
+    /// Persisted graph policy is read from the same durable snapshot as query
+    /// data. A policy read error or missing graph denies visibility (G8).
     pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
         Ok(self
             .sparql
-            .query_with_visibility(sparql, &|graph: &GraphId| {
-                self.ensure_graph_action(graph, auth, Action::Read).is_ok()
+            .query_with_snapshot_visibility(sparql, &|snapshot, graph: &GraphId| {
+                snapshot
+                    .graph_policy(&self.store, graph)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
             })?)
     }
 
     /// Execute a SPARQL query against an explicit set of local graphs.
     pub fn query_graphs(&self, graphs: &[GraphId], sparql: &str) -> Result<QueryResults> {
         Ok(self.sparql.query_with_graphs(sparql, graphs)?)
+    }
+
+    /// Execute a complete query with an explicit storage-read mode.
+    ///
+    /// This diagnostic entry point is intended for same-binary tests and
+    /// benchmarks. `ForceQv` returns an error when qv1 is not trusted.
+    #[doc(hidden)]
+    pub fn query_graphs_with_read_mode(
+        &self,
+        graphs: &[GraphId],
+        sparql: &str,
+        read_mode: QueryReadMode,
+    ) -> Result<(QueryResults, ReadStatistics)> {
+        Ok(self
+            .sparql
+            .query_with_graphs_read_mode(sparql, graphs, read_mode)?)
     }
 
     /// Execute a SPARQL query where graph visibility is decided by `visible`.
@@ -2556,6 +2575,172 @@ mod tests {
                 permission_paths: vec!["/t/x".to_string()],
             },
         )
+    }
+
+    #[test]
+    fn query_authorization_uses_the_data_snapshot_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            CraqleNode::open_with_options(
+                directory.path(),
+                CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+            )
+            .unwrap(),
+        );
+        let first = GraphId::new("urn:test:query-policy-snapshot:first");
+        let second = GraphId::new("urn:test:query-policy-snapshot:second");
+        let private = GraphPolicy {
+            public: false,
+            permission_paths: Vec::new(),
+        };
+        for graph in [&first, &second] {
+            node.store.set_graph_policy(graph, &private).unwrap();
+            seed_write(&node, graph);
+        }
+
+        let query = format!(
+            "ASK {{ GRAPH <{first}> {{ <{first}> <http://schema.org/keywords> \"race\" }} \
+             GRAPH <{second}> {{ <{second}> <http://schema.org/keywords> \"race\" }} }}",
+            first = first.as_str(),
+            second = second.as_str(),
+        );
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let node_for_query = Arc::clone(&node);
+        let query_thread = std::thread::spawn(move || {
+            let first_call = AtomicBool::new(true);
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let auth = move |graph: &GraphId, policy: &GraphPolicy, action: Action| {
+                if first_call.swap(false, Ordering::SeqCst) {
+                    reached_tx.send(graph.clone()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(PROGRESS_TIMEOUT)
+                        .expect("query authorization was never released");
+                    return Ok(());
+                }
+                if policy.public {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::PermissionDenied {
+                        action,
+                        graph: graph.as_str().to_owned(),
+                    })
+                }
+            };
+            node_for_query.query(&auth, &query).unwrap()
+        });
+
+        let reached = reached_rx
+            .recv_timeout(PROGRESS_TIMEOUT)
+            .expect("query never reached graph authorization");
+        let changed = if reached == first {
+            second
+        } else {
+            assert_eq!(reached, second);
+            first
+        };
+        let term = EncodedTerm::from_named_node(&changed.0);
+        let before = node.store.lookup_term(&term).unwrap().unwrap();
+        node.store.delete_graph(&changed).unwrap();
+        node.store.create_graph(&changed).unwrap();
+        node.store
+            .set_graph_policy(
+                &changed,
+                &GraphPolicy {
+                    public: true,
+                    permission_paths: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(before, node.store.lookup_term(&term).unwrap().unwrap());
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            query_thread.join().unwrap(),
+            QueryResults::Boolean(false)
+        ));
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn query_fts_reauthorizes_hits_after_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            CraqleNode::open_with_options(
+                directory.path(),
+                CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+            )
+            .unwrap(),
+        );
+        let graph = GraphId::new("urn:test:query-fts-policy");
+        node.store.create_graph(&graph).unwrap();
+        node.store
+            .set_graph_policy(
+                &graph,
+                &GraphPolicy {
+                    public: true,
+                    permission_paths: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let query = format!(
+            "SELECT ?s WHERE {{ SERVICE <urn:craqle:fts> {{ \
+             ?s fts:query \"secret\" ; fts:graph <{graph}> ; fts:limit 1 . }} }}",
+            graph = graph.as_str(),
+        );
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let node_for_query = Arc::clone(&node);
+        let query_thread = std::thread::spawn(move || {
+            let first_call = AtomicBool::new(true);
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let auth = move |graph: &GraphId, policy: &GraphPolicy, action: Action| {
+                if first_call.swap(false, Ordering::SeqCst) {
+                    reached_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(PROGRESS_TIMEOUT)
+                        .expect("query authorization was never released");
+                    return Ok(());
+                }
+                if policy.public {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::PermissionDenied {
+                        action,
+                        graph: graph.as_str().to_owned(),
+                    })
+                }
+            };
+            node_for_query.query(&auth, &query).unwrap()
+        });
+
+        reached_rx
+            .recv_timeout(PROGRESS_TIMEOUT)
+            .expect("query never reached FTS graph authorization");
+        node.store
+            .set_graph_policy(
+                &graph,
+                &GraphPolicy {
+                    public: false,
+                    permission_paths: Vec::new(),
+                },
+            )
+            .unwrap();
+        node.search
+            .index_resource(graph.as_str(), "urn:test:secret", Some("secret"))
+            .unwrap();
+        node.search.commit().unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            query_thread.join().unwrap(),
+            QueryResults::Solutions(rows) if rows.is_empty()
+        ));
     }
 
     /// Both node-level search entry points take a caller-supplied limit that

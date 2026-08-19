@@ -1,13 +1,13 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
-use crate::query_context::{QueryCancellation, ReadContext};
+use crate::query_context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
-use crate::store::{GraphStore, StoreError, TermId};
-use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
+use crate::store::{GraphStore, StoreError, StoreReadSnapshot, TermId};
+use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use spareval::{
     DeleteInsertQuad, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
     QueryableDataset,
@@ -48,6 +48,7 @@ pub(crate) struct SparqlEngine {
 }
 
 pub(crate) type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
+pub(crate) type SnapshotVisibleFn<'a> = dyn Fn(&StoreReadSnapshot, &GraphId) -> bool + 'a;
 
 /// Which graphs a query may see. `Predicate` defers the decision to a
 /// callback evaluated lazily per touched graph (memoized per query).
@@ -60,10 +61,9 @@ enum GraphScope<'a> {
     Predicate(&'a VisibleFn<'a>),
 }
 
-/// Visible-graph counts up to this limit are scoped through an explicit
-/// spareval dataset spec (planned as per-graph index lookups). Larger sets
-/// are evaluated once over a union view filtered by graph term id, since the
-/// dataset spec costs O(graphs) store reads and per-pattern iterator setup.
+/// Visible-graph counts up to this limit populate spareval's available named
+/// graph list. Larger sets avoid O(graphs) metadata reads and use the same
+/// union view filtered by graph term id.
 const EXPLICIT_DATASET_GRAPH_LIMIT: usize = 32;
 
 const COMMON_PREFIXES: &str = "\
@@ -118,12 +118,54 @@ impl SparqlEngine {
         self.run_query(sparql, GraphScope::List(graphs), planner_enabled())
     }
 
+    pub(crate) fn query_with_graphs_read_mode(
+        &self,
+        sparql: &str,
+        graphs: &[GraphId],
+        read_mode: QueryReadMode,
+    ) -> Result<(QueryResults, ReadStatistics)> {
+        self.run_query_with_read_mode(
+            sparql,
+            GraphScope::List(graphs),
+            planner_enabled(),
+            read_mode,
+        )
+    }
+
     pub(crate) fn query_with_visibility(
         &self,
         sparql: &str,
         visible: &VisibleFn<'_>,
     ) -> Result<QueryResults> {
         self.run_query(sparql, GraphScope::Predicate(visible), planner_enabled())
+    }
+
+    pub(crate) fn query_with_snapshot_visibility(
+        &self,
+        sparql: &str,
+        policy_visible: &SnapshotVisibleFn<'_>,
+    ) -> Result<QueryResults> {
+        let full = format!("{COMMON_PREFIXES}{sparql}");
+        let mut query = SparqlParser::new()
+            .parse_query(&full)
+            .map_err(|e| SparqlError::Parse(e.to_string()))?;
+        let view = StoreReadView::new(&self.store);
+        let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
+        let scope = GraphScope::Predicate(&visible);
+
+        rewrite_fts_query(
+            &mut query,
+            FtsRewriteCtx {
+                search: self.search.as_ref(),
+                scope,
+                post_raw_visibility: Some((self.store.as_ref(), policy_visible)),
+            },
+        )?;
+        if planner_enabled() {
+            crate::planner::optimize_query(&mut query, &self.store);
+            tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
+        }
+        self.execute_query(query, scope, &view)
     }
 
     /// Like [`SparqlEngine::query_with_visibility`] with explicit control over
@@ -143,6 +185,18 @@ impl SparqlEngine {
         scope: GraphScope<'_>,
         optimize: bool,
     ) -> Result<QueryResults> {
+        Ok(self
+            .run_query_with_read_mode(sparql, scope, optimize, QueryReadMode::Auto)?
+            .0)
+    }
+
+    fn run_query_with_read_mode(
+        &self,
+        sparql: &str,
+        scope: GraphScope<'_>,
+        optimize: bool,
+        read_mode: QueryReadMode,
+    ) -> Result<(QueryResults, ReadStatistics)> {
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let mut query = SparqlParser::new()
             .parse_query(&full)
@@ -153,6 +207,7 @@ impl SparqlEngine {
             FtsRewriteCtx {
                 search: self.search.as_ref(),
                 scope,
+                post_raw_visibility: None,
             },
         )?;
         if optimize {
@@ -160,24 +215,42 @@ impl SparqlEngine {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
 
+        let view = StoreReadView::with_read_mode(&self.store, read_mode);
+        self.execute_query_with_statistics(query, scope, &view)
+    }
+
+    fn execute_query(
+        &self,
+        query: Query,
+        scope: GraphScope<'_>,
+        view: &StoreReadView<'_>,
+    ) -> Result<QueryResults> {
+        Ok(self.execute_query_with_statistics(query, scope, view)?.0)
+    }
+
+    fn execute_query_with_statistics(
+        &self,
+        query: Query,
+        scope: GraphScope<'_>,
+        view: &StoreReadView<'_>,
+    ) -> Result<(QueryResults, ReadStatistics)> {
         let mut prepared = self.evaluator.prepare(&query);
-        let view = StoreReadView::new(&self.store);
+        let default_union_marker = BlankNode::default();
+        prepared
+            .dataset_mut()
+            .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
         let context = match scope {
             #[cfg(test)]
-            GraphScope::All => {
-                prepared.dataset_mut().set_default_graph_as_union();
-                ReadContext::new(QueryCancellation::new())
-            }
+            GraphScope::All => ReadContext::new(QueryCancellation::new()),
             GraphScope::Predicate(visible) => {
                 // Union view with lazy visibility: the predicate runs at most
                 // once per touched graph, so the per-query cost scales with
                 // the graphs evaluation actually reaches, not the corpus.
-                prepared.dataset_mut().set_default_graph_as_union();
                 ReadContext::with_graph_visibility(QueryCancellation::new(), visible)
             }
             GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
-                // Scope the dataset to the visible graph list so patterns are
-                // planned as graph-specific lookups instead of union scans.
+                // Restrict named-graph enumeration to the visible graph list;
+                // default-graph patterns still use the sentinel union view.
                 //
                 // Membership is decided by the *metadata* record, not by the
                 // term table: a deleted graph's IRI survives interning, so
@@ -187,15 +260,12 @@ impl SparqlEngine {
                 let mut seen = HashSet::with_capacity(graphs.len());
                 let mut names: Vec<NamedNode> = Vec::with_capacity(graphs.len());
                 for graph in graphs {
-                    if seen.insert(graph.as_str()) && self.store.contains_graph(graph)? {
+                    if seen.insert(graph.as_str()) && view.contains_graph(graph)? {
                         names.push(graph.0.clone());
                     }
                 }
-                let default_graphs: Vec<GraphName> =
-                    names.iter().cloned().map(Into::into).collect();
                 let named_graphs: Vec<NamedOrBlankNode> =
                     names.into_iter().map(Into::into).collect();
-                prepared.dataset_mut().set_default_graph(default_graphs);
                 prepared
                     .dataset_mut()
                     .set_available_named_graphs(named_graphs);
@@ -205,15 +275,19 @@ impl SparqlEngine {
                 // Large graph sets: evaluate once over the union view;
                 // the shared read context filters quads against the visible
                 // graph term ids in O(1) per candidate.
-                prepared.dataset_mut().set_default_graph_as_union();
                 ReadContext::with_visible_graphs(QueryCancellation::new(), graphs.iter().cloned())
             }
         };
         let results = prepared
-            .execute(StoreDataset::new(&view, &context))
+            .execute(StoreDataset::with_default_union_marker(
+                view,
+                &context,
+                default_union_marker,
+            ))
             .map_err(map_eval_error)?;
 
-        collect_query_results(results)
+        let results = collect_query_results(results)?;
+        Ok((results, context.snapshot()))
     }
 
     pub(crate) fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
@@ -248,11 +322,20 @@ impl SparqlEngine {
                         using.clone(),
                         pattern,
                     );
-                    prepared.dataset_mut().set_default_graph_as_union();
                     let view = StoreReadView::new(&self.store);
+                    let default_union_marker = BlankNode::default();
+                    prepared
+                        .dataset_mut()
+                        .set_default_graph(vec![GraphName::BlankNode(
+                            default_union_marker.clone(),
+                        )]);
                     let context = ReadContext::new(QueryCancellation::new());
                     let iter = prepared
-                        .execute(StoreDataset::new(&view, &context))
+                        .execute(StoreDataset::with_default_union_marker(
+                            &view,
+                            &context,
+                            default_union_marker,
+                        ))
                         .map_err(map_eval_error)?;
 
                     for quad in iter {
@@ -310,6 +393,7 @@ struct FtsServiceSpec {
 struct FtsRewriteCtx<'a> {
     search: &'a SearchIndex,
     scope: GraphScope<'a>,
+    post_raw_visibility: Option<(&'a GraphStore, &'a SnapshotVisibleFn<'a>)>,
 }
 
 fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
@@ -468,16 +552,31 @@ impl<'a> FtsGraphVisibility<'a> {
 /// Post-search filter applied to every hit tantivy returns.
 struct FtsHitFilter<'a> {
     visibility: &'a FtsGraphVisibility<'a>,
+    post_raw_visibility: Option<(&'a GraphStore, &'a SnapshotVisibleFn<'a>)>,
     /// Set when the SERVICE pinned its subject to a concrete IRI.
     subject: Option<&'a str>,
 }
 
 impl FtsHitFilter<'_> {
-    fn keeps(&self, hit: &crate::search::SearchHit) -> bool {
-        self.visibility.allows(&hit.graph_id)
-            && self
-                .subject
-                .is_none_or(|subject| hit.subject_iri == subject)
+    fn keeps(
+        &self,
+        hit: &crate::search::SearchHit,
+        current: Option<&StoreReadSnapshot>,
+        current_memo: &mut HashMap<String, bool>,
+    ) -> bool {
+        if !self.visibility.allows(&hit.graph_id) {
+            return false;
+        }
+        if let (Some((_, visible)), Some(current)) = (self.post_raw_visibility, current) {
+            let allowed = *current_memo
+                .entry(hit.graph_id.clone())
+                .or_insert_with(|| visible(current, &GraphId::new(&hit.graph_id)));
+            if !allowed {
+                return false;
+            }
+        }
+        self.subject
+            .is_none_or(|subject| hit.subject_iri == subject)
     }
 }
 
@@ -507,11 +606,20 @@ fn search_visible_hits(
             None => search.search(request.query, fetch)?,
         };
         let raw_len = raw.len();
+        let current = request
+            .filter
+            .post_raw_visibility
+            .map(|(store, _)| store.read_snapshot());
+        let mut current_memo = HashMap::new();
 
         let mut seen = crate::SeenHits::default();
         let mut kept = Vec::with_capacity(request.limit.min(raw_len));
         for hit in raw {
-            if !seen.admits(&hit) || !request.filter.keeps(&hit) {
+            if !seen.admits(&hit)
+                || !request
+                    .filter
+                    .keeps(&hit, current.as_ref(), &mut current_memo)
+            {
                 continue;
             }
             kept.push(hit);
