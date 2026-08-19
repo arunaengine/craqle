@@ -684,6 +684,7 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
             graph,
             filter: FtsHitFilter {
                 visibility: &visibility,
+                post_raw_visibility: cx.post_raw_visibility,
                 subject: match &spec.subject {
                     Some(FtsSubjectPattern::NamedNode(node)) => Some(node.as_str()),
                     _ => None,
@@ -877,6 +878,9 @@ fn ground_named_node(iri: &str) -> GroundTerm {
 enum StoreTerm {
     Existing(TermId),
     Missing(EncodedTerm),
+    /// Claimed exactly once while spareval encodes the per-execution default
+    /// graph marker. It is never a stored RDF term.
+    DefaultUnion,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -891,19 +895,41 @@ enum ResolvedPatternTerm {
     Any,
     Existing(TermId),
     Missing,
+    DefaultUnion,
 }
 
 struct StoreDataset<'store, 'context, 'visibility> {
     view: &'context StoreReadView<'store>,
     context: &'context ReadContext<'visibility>,
+    default_union_marker: Option<BlankNode>,
+    default_union_marker_pending: Cell<bool>,
 }
 
 impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> {
+    #[cfg(test)]
     fn new(
         view: &'context StoreReadView<'store>,
         context: &'context ReadContext<'visibility>,
     ) -> Self {
-        Self { view, context }
+        Self {
+            view,
+            context,
+            default_union_marker: None,
+            default_union_marker_pending: Cell::new(false),
+        }
+    }
+
+    fn with_default_union_marker(
+        view: &'context StoreReadView<'store>,
+        context: &'context ReadContext<'visibility>,
+        marker: BlankNode,
+    ) -> Self {
+        Self {
+            view,
+            context,
+            default_union_marker: Some(marker),
+            default_union_marker_pending: Cell::new(true),
+        }
     }
 
     fn resolve_pattern_term(&self, term: Option<&StoreTerm>) -> ResolvedPatternTerm {
@@ -911,6 +937,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             None => ResolvedPatternTerm::Any,
             Some(StoreTerm::Existing(id)) => ResolvedPatternTerm::Existing(*id),
             Some(StoreTerm::Missing(_)) => ResolvedPatternTerm::Missing,
+            Some(StoreTerm::DefaultUnion) => ResolvedPatternTerm::DefaultUnion,
         }
     }
 
@@ -938,6 +965,16 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
                 self.externalize_encoded_term(&decoded)
             }
             StoreTerm::Missing(term) => self.externalize_encoded_term(&term),
+            StoreTerm::DefaultUnion => self
+                .default_union_marker
+                .as_ref()
+                .cloned()
+                .map(Term::BlankNode)
+                .ok_or_else(|| {
+                    StoreDatasetError::InvalidTerm(
+                        "internal default-union marker escaped evaluation".to_owned(),
+                    )
+                }),
         }
     }
 }
@@ -969,6 +1006,9 @@ where
         if matches!(subject, ResolvedPatternTerm::Missing)
             || matches!(predicate, ResolvedPatternTerm::Missing)
             || matches!(object, ResolvedPatternTerm::Missing)
+            || matches!(subject, ResolvedPatternTerm::DefaultUnion)
+            || matches!(predicate, ResolvedPatternTerm::DefaultUnion)
+            || matches!(object, ResolvedPatternTerm::DefaultUnion)
         {
             return Box::new(std::iter::empty());
         }
@@ -976,7 +1016,9 @@ where
         let bound = |term: ResolvedPatternTerm| match term {
             ResolvedPatternTerm::Any => None,
             ResolvedPatternTerm::Existing(id) => Some(id),
-            ResolvedPatternTerm::Missing => unreachable!("missing terms short-circuit above"),
+            ResolvedPatternTerm::Missing | ResolvedPatternTerm::DefaultUnion => {
+                unreachable!("non-stored terms short-circuit above")
+            }
         };
         let pattern = QuadPattern {
             subject: bound(subject),
@@ -987,7 +1029,11 @@ where
         let selector = match graph_name {
             Some(Some(StoreTerm::Existing(graph))) => GraphSelector::Named(*graph),
             Some(Some(StoreTerm::Missing(_))) => return Box::new(std::iter::empty()),
-            Some(None) | None => GraphSelector::Union,
+            Some(Some(StoreTerm::DefaultUnion)) => GraphSelector::DefaultUnion,
+            // Compatibility callers use `Some(None)` for the distinct union
+            // default; the cursor owns its constant-state semantics.
+            Some(None) => GraphSelector::DefaultUnion,
+            None => GraphSelector::Union,
         };
         let quads = match self.view.scan(self.context, selector, pattern) {
             Ok(quads) => quads,
@@ -995,24 +1041,15 @@ where
         };
 
         match graph_name {
-            // Preserve the legacy direct default-union branch: it suppresses
-            // duplicate triples across named graph copies.
-            Some(None) => {
-                let mut seen = HashSet::new();
-                Box::new(quads.filter_map(move |quad| {
-                    let quad = match quad {
-                        Ok(quad) => quad,
-                        Err(error) => return Some(Err(error.into())),
-                    };
-                    let key = (quad.subject, quad.predicate, quad.object);
-                    seen.insert(key).then_some(Ok(InternalQuad {
-                        subject: StoreTerm::Existing(quad.subject),
-                        predicate: StoreTerm::Existing(quad.predicate),
-                        object: StoreTerm::Existing(quad.object),
-                        graph_name: None,
-                    }))
-                }))
-            }
+            Some(Some(StoreTerm::DefaultUnion)) => Box::new(quads.map(|quad| {
+                let quad = quad.map_err(StoreDatasetError::from)?;
+                Ok(InternalQuad {
+                    subject: StoreTerm::Existing(quad.subject),
+                    predicate: StoreTerm::Existing(quad.predicate),
+                    object: StoreTerm::Existing(quad.object),
+                    graph_name: None,
+                })
+            })),
             Some(Some(StoreTerm::Existing(_))) => Box::new(quads.map(|quad| {
                 let quad = quad.map_err(StoreDatasetError::from)?;
                 Ok(InternalQuad {

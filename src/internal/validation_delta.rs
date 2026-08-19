@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::query_context::ReadContext;
-use crate::query_cursor::{QueryCursor, RawQuadCandidate, RawQuadCursor};
+use crate::query_cursor::{CandidateStorage, QueryCursor, RawQuadCandidate, RawQuadCursor};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::{EncodedQuad, GraphStore, Result, StoreError, TermId, hash_term};
 
@@ -378,6 +378,8 @@ impl<'delta> DeltaQuadCursor<'delta> {
             // A deletion or a row already emitted from the base remains a
             // candidate for exact accounting, never a matching row.
             live: present && !self.base_live_delta_rows.contains(&key),
+            storage: CandidateStorage::Delta,
+            bytes_read: 0,
         }))
     }
 }
@@ -440,7 +442,12 @@ impl RdfReadView for DeltaReadView<'_, '_> {
     ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
         context.check_cancelled()?;
         let Some(pattern) = self.selected_pattern(selector, pattern) else {
-            return Ok(QueryCursor::empty(self.base.store(), context, pattern));
+            return Ok(QueryCursor::empty(
+                self.base.store(),
+                self.base.snapshot(),
+                context,
+                pattern,
+            ));
         };
         // One durable range plus one bounded in-memory delta range, each
         // counted exactly once when opened.
@@ -448,9 +455,13 @@ impl RdfReadView for DeltaReadView<'_, '_> {
         if !self.index.is_empty() {
             context.increment_index_seeks();
         }
-        let base = self.base.store().raw_quad_cursor(pattern);
+        let base = self
+            .base
+            .snapshot()
+            .raw_quad_cursor(self.base.store(), pattern);
         Ok(QueryCursor::delta(
             self.base.store(),
+            self.base.snapshot(),
             context,
             DeltaQuadCursor::new(base, self.index, pattern),
             pattern,

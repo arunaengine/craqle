@@ -551,10 +551,11 @@ fn orphaned_for_graph(
 
 pub(crate) fn quad_is_visible(
     store: &GraphStore,
+    snapshot: &StoreReadSnapshot,
     context: &ReadContext<'_>,
     quad: EncodedQuad,
 ) -> Result<bool> {
-    let visible = graph_is_visible(store, context, quad.graph)?;
+    let visible = graph_is_visible(store, snapshot, context, quad.graph)?;
     context.check_cancelled()?;
     if !visible {
         return Ok(false);
@@ -562,7 +563,8 @@ pub(crate) fn quad_is_visible(
     if context.validation_graph().is_some() {
         return Ok(true);
     }
-    let orphaned = orphaned_for_graph(store, context, quad.graph)?;
+    let orphaned = orphaned_for_graph(store, snapshot, context, quad.graph)?;
+    context.increment_orphan_checks();
     Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
 }
 
