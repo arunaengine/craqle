@@ -109,3 +109,8 @@ harness = false
 [[bench]]
 name = "read_path_memory"
 harness = false
+
+[[bench]]
+name = "shacl_external_baseline"
+harness = false
+required-features = ["shacl-core"]
