@@ -1060,6 +1060,15 @@ where
                 })
             })),
             Some(Some(StoreTerm::Missing(_))) => unreachable!("missing graph short-circuits above"),
+            Some(None) => Box::new(quads.map(|quad| {
+                let quad = quad.map_err(StoreDatasetError::from)?;
+                Ok(InternalQuad {
+                    subject: StoreTerm::Existing(quad.subject),
+                    predicate: StoreTerm::Existing(quad.predicate),
+                    object: StoreTerm::Existing(quad.object),
+                    graph_name: None,
+                })
+            })),
             None => Box::new(quads.map(|quad| {
                 let quad = quad.map_err(StoreDatasetError::from)?;
                 Ok(InternalQuad {
@@ -1079,11 +1088,15 @@ where
     {
         let view = self.view;
         let context = self.context;
-        Box::new(self.view.store().graph_term_id_iter().filter_map(
-            move |graph_id| match graph_id {
-                Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
-                    Ok(true) => Some(Ok(StoreTerm::Existing(graph_id))),
-                    Ok(false) => None,
+        Box::new(
+            self.view
+                .graph_term_id_iter()
+                .filter_map(move |graph_id| match graph_id {
+                    Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
+                        Ok(true) => Some(Ok(StoreTerm::Existing(graph_id))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error.into())),
+                    },
                     Err(error) => Some(Err(error.into())),
                 },
                 Err(error) => Some(Err(error.into())),
