@@ -2062,6 +2062,31 @@ impl CraqleNode {
         Ok(())
     }
 
+    /// Return the lifecycle state of the disposable persistent query indexes.
+    pub fn query_index_status(&self) -> Result<QueryIndexStatus> {
+        Ok(self.store.query_index_status()?)
+    }
+
+    /// Return qv1 readiness using metadata and exact counters only.
+    pub fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
+        Ok(self.store.query_index_status_fast()?)
+    }
+
+    /// Rebuild the disposable persistent query indexes from canonical CRDT quad state.
+    pub fn rebuild_query_indexes(&self) -> Result<QueryIndexStatus> {
+        self.store.rebuild_query_indexes()?;
+        self.persist_fjall()?;
+        self.query_index_status_fast()
+    }
+
+    /// Diagnose persistent query indexes without changing source or index data.
+    pub fn verify_query_indexes(
+        &self,
+        mode: impl Into<QueryIndexVerificationMode>,
+    ) -> Result<QueryIndexVerification> {
+        Ok(self.store.verify_query_indexes(mode.into())?)
+    }
+
     pub fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
         self.set_local_graph_policy(graph, policy.normalized())?;
