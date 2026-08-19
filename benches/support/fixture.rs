@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use craqle::{
     ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange,
-    QueryReadMode, QueryResults, ReadStatistics,
+    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryReadMode, QueryResults,
+    ReadStatistics,
 };
 use oxrdf::Term;
 
@@ -415,6 +416,36 @@ impl Fixture {
         self.node
             .query_graphs(&self.visible_graphs, &case.sparql)
             .unwrap_or_else(|_| panic!("{} query failed", case.label))
+    }
+
+    pub fn prepare_hot_path(&self, index: usize) -> PreparedQuery {
+        let case = self
+            .cases
+            .get(index)
+            .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"));
+        self.node
+            .prepare_query(&case.sparql)
+            .unwrap_or_else(|_| panic!("{} query preparation failed", case.label))
+    }
+
+    pub fn run_hot_path_with_statistics(&self, index: usize) -> QueryExecution {
+        let case = self
+            .cases
+            .get(index)
+            .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"));
+        self.node
+            .query_graphs_with_statistics(&self.visible_graphs, &case.sparql)
+            .unwrap_or_else(|_| panic!("{} diagnostic query failed", case.label))
+    }
+
+    pub fn run_prepared_hot_path(
+        &self,
+        prepared: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> QueryExecution {
+        self.node
+            .execute_prepared_graphs(&self.visible_graphs, prepared, options)
+            .unwrap_or_else(|_| panic!("prepared hot-path query failed"))
     }
 
     pub fn run_hot_path_with_read_mode(
