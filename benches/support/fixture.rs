@@ -273,6 +273,10 @@ impl Fixture {
             );
         }
         loader.finish();
+        for graph in &all_graphs {
+            node.rebuild_graph_diagnostics(graph)
+                .expect("rebuild benchmark graph diagnostics");
+        }
 
         assert_eq!(
             inserted_data_quads, config.corpus.quads,
@@ -292,9 +296,7 @@ impl Fixture {
             "each generated graph must have been loaded"
         );
 
-        // Do not rebuild graph diagnostics here. This synthetic corpus has no
-        // RO-Crate reachability scaffold, so rebuilding would classify linked
-        // synthetic subjects as orphans. Query benchmarks do not require it.
+        // Bulk loading defers diagnostics; settle them before query/index setup.
         node.ensure_query_indexes();
         node.flush_search_updates()
             .expect("settle search/index work before query timing");
