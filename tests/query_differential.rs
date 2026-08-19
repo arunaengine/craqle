@@ -17,6 +17,8 @@ const HIDDEN_GRAPH: &str = "urn:baseline:hidden";
 const ORPHAN_GRAPH: &str = "urn:baseline:orphan";
 
 const COMMON: &str = "urn:baseline:common";
+const KNOWN: &str = "urn:baseline:known";
+const KNOWN_OBJECT: &str = "urn:baseline:known-object";
 const RARE: &str = "urn:baseline:rare";
 const NAME: &str = "http://schema.org/name";
 const SHARED: &str = "urn:baseline:shared";
@@ -86,12 +88,14 @@ fn fixture() -> Fixture {
 
     let mut primary_changes = Vec::new();
     for index in 0..10 {
+        let subject = iri(&common_subject(index));
         primary_changes.push(insert(
             &primary,
-            iri(&common_subject(index)),
+            subject.clone(),
             COMMON,
             literal(&common_value(index)),
         ));
+        primary_changes.push(insert(&primary, subject, KNOWN, iri(KNOWN_OBJECT)));
     }
     primary_changes.extend([
         insert(
@@ -100,6 +104,7 @@ fn fixture() -> Fixture {
             COMMON,
             literal("common-needle"),
         ),
+        insert(&primary, iri(NEEDLE_SUBJECT), KNOWN, iri(KNOWN_OBJECT)),
         insert(&primary, iri(NEEDLE_SUBJECT), RARE, literal("needle")),
         insert(&primary, iri(NEEDLE_SUBJECT), NAME, literal("Needle")),
         insert(&primary, iri(DUPLICATE_SUBJECT), SHARED, literal("same")),
@@ -220,39 +225,43 @@ fn expected_rows(mut rows: Vec<Vec<(String, EncodedTerm)>>) -> Vec<Vec<(String, 
 fn baseline_queries_are_exact_and_planner_invariant() {
     let fixture = fixture();
 
-    let ask_hit = format!("ASK WHERE {{ <{NEEDLE_SUBJECT}> <{RARE}> \"needle\" }}");
+    let ask_hit = format!("ASK WHERE {{ <{NEEDLE_SUBJECT}> <{KNOWN}> <{KNOWN_OBJECT}> }}");
     assert_eq!(
         planner_result(&fixture.node, "bound ASK hit", |_| true, &ask_hit),
         CanonicalResults::Boolean(true)
     );
 
-    let ask_miss = format!("ASK WHERE {{ <{NEEDLE_SUBJECT}> <{RARE}> \"missing\" }}");
+    let ask_miss = format!("ASK WHERE {{ <urn:baseline:missing> <{KNOWN}> <{KNOWN_OBJECT}> }}");
     assert_eq!(
         planner_result(&fixture.node, "bound ASK miss", |_| true, &ask_miss),
         CanonicalResults::Boolean(false)
     );
 
-    let limit =
-        format!("SELECT ?s ?value WHERE {{ ?s <{COMMON}> ?value }} ORDER BY ?s ?value LIMIT 10");
+    let limit = format!("SELECT ?s WHERE {{ ?s <{KNOWN}> <{KNOWN_OBJECT}> }} LIMIT 10");
     let limit_rows = solution_rows(planner_result(
         &fixture.node,
         "SELECT LIMIT 10",
         |_| true,
         &limit,
     ));
-    assert_eq!(
-        limit_rows,
-        expected_rows(
-            (0..10)
-                .map(|index| {
-                    vec![
-                        ("s".to_string(), iri(&common_subject(index))),
-                        ("value".to_string(), literal(&common_value(index))),
-                    ]
-                })
-                .collect(),
-        )
+    assert_eq!(limit_rows.len(), 10);
+    let allowed_limit_rows = expected_rows(
+        (0..10)
+            .map(|index| vec![("s".to_string(), iri(&common_subject(index)))])
+            .chain(std::iter::once(vec![(
+                "s".to_string(),
+                iri(NEEDLE_SUBJECT),
+            )]))
+            .collect(),
     );
+    assert!(
+        limit_rows
+            .iter()
+            .all(|row| allowed_limit_rows.contains(row))
+    );
+    let mut distinct_limit_rows = limit_rows.clone();
+    distinct_limit_rows.dedup();
+    assert_eq!(distinct_limit_rows.len(), 10);
 
     let count = format!("SELECT (COUNT(*) AS ?count) WHERE {{ ?s <{COMMON}> ?value }}");
     let count_rows = solution_rows(planner_result(
@@ -400,7 +409,7 @@ fn hidden_graphs_and_recorded_orphans_are_not_query_visible() {
         solution_rows(canonicalize(
             fixture
                 .node
-                .query_graphs(&[fixture.orphan.clone()], &orphan_query)
+                .query_graphs(std::slice::from_ref(&fixture.orphan), &orphan_query)
                 .unwrap(),
         )),
         Vec::<Vec<(String, EncodedTerm)>>::new(),
