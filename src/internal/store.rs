@@ -12,6 +12,8 @@ use fjall::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("query cancelled")]
+    Cancelled,
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),
     #[error("postcard: {0}")]
