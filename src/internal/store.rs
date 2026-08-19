@@ -2339,6 +2339,221 @@ impl GraphStore {
                     snapshot,
                     dimension,
                     previous,
+                    count,
+                    source_epoch,
+                    report,
+                )?;
+                count = 0;
+            }
+            current = Some(terms);
+            count = count
+                .checked_add(1)
+                .ok_or(StoreError::QueryIndexVerificationFailed(
+                    "counter-count-overflow",
+                ))?;
+        }
+        if let Some(previous) = current {
+            self.verify_posg_counter_group(
+                snapshot,
+                dimension,
+                previous,
+                count,
+                source_epoch,
+                report,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn query_index_counter_has_rows(
+        &self,
+        snapshot: &Snapshot,
+        key: QueryIndexCounterKey,
+    ) -> Result<bool> {
+        let mut rows = match key {
+            QueryIndexCounterKey::Graph(graph) => {
+                snapshot.prefix(&self.qv1_gpos, query_index_prefix(&[graph]))
+            }
+            QueryIndexCounterKey::Predicate(predicate)
+            | QueryIndexCounterKey::PredicateMutationEpoch(predicate) => {
+                snapshot.prefix(&self.qv1_posg, query_index_prefix(&[predicate]))
+            }
+            QueryIndexCounterKey::GraphPredicate(graph, predicate) => {
+                snapshot.prefix(&self.qv1_gpos, query_index_prefix(&[graph, predicate]))
+            }
+            QueryIndexCounterKey::PredicateObject(predicate, object) => {
+                snapshot.prefix(&self.qv1_posg, query_index_prefix(&[predicate, object]))
+            }
+            QueryIndexCounterKey::GraphPredicateObject(graph, predicate, object) => snapshot
+                .prefix(
+                    &self.qv1_gpos,
+                    query_index_prefix(&[graph, predicate, object]),
+                ),
+            QueryIndexCounterKey::Total => return Ok(true),
+        };
+        match rows.next() {
+            Some(guard) => {
+                let _ = guard.into_inner()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn verify_query_index_meta_records(
+        &self,
+        snapshot: &Snapshot,
+        header: Option<&QueryIndexHeader>,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let mut headers = 0u64;
+        let mut totals = 0u64;
+        for guard in snapshot.iter(&self.qv1_meta) {
+            let (key, value) = guard.into_inner()?;
+            match decode_query_index_counter_key(key.as_ref()) {
+                QueryIndexCounterKeyRead::Header => {
+                    headers =
+                        headers
+                            .checked_add(1)
+                            .ok_or(StoreError::QueryIndexVerificationFailed(
+                                "metadata-count-overflow",
+                            ))?;
+                    if !matches!(
+                        decode_query_index_header(value.as_ref()),
+                        QueryIndexHeaderRead::Valid(_)
+                    ) {
+                        report.problem("meta-header-malformed");
+                    }
+                }
+                QueryIndexCounterKeyRead::Counter(counter) => {
+                    let Some(value) = decode_query_index_u64(value.as_ref()) else {
+                        report.problem("meta-counter-value-length");
+                        continue;
+                    };
+                    match counter {
+                        QueryIndexCounterKey::Total => {
+                            totals = totals.checked_add(1).ok_or(
+                                StoreError::QueryIndexVerificationFailed("metadata-count-overflow"),
+                            )?;
+                            match header {
+                                Some(header) if value == header.indexed_quads => {}
+                                Some(_) => report.problem("meta-total-mismatch"),
+                                None => report.problem("meta-total-without-header"),
+                            }
+                        }
+                        QueryIndexCounterKey::PredicateMutationEpoch(_) => {
+                            let source_epoch = header.map(|header| header.source_epoch);
+                            if value == 0 || source_epoch.is_none() || value > source_epoch.unwrap()
+                            {
+                                report.problem("mutation-epoch-invalid");
+                            }
+                            if !self.query_index_counter_has_rows(snapshot, counter)? {
+                                report.problem("meta-counter-orphan");
+                            }
+                        }
+                        _ => {
+                            if value == 0 {
+                                report.problem("meta-counter-zero");
+                            }
+                            if !self.query_index_counter_has_rows(snapshot, counter)? {
+                                report.problem("meta-counter-orphan");
+                            }
+                        }
+                    }
+                }
+                QueryIndexCounterKeyRead::UnknownTag => report.problem("meta-unknown-tag"),
+                QueryIndexCounterKeyRead::InvalidLength => {
+                    report.problem("meta-counter-key-length")
+                }
+            }
+        }
+        if headers != 1 {
+            report.problem("meta-header-count");
+        }
+        if totals != 1 {
+            report.problem("meta-total-count");
+        }
+        Ok(())
+    }
+
+    fn verify_query_index_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        full: bool,
+        expected_state: QueryIndexVerificationExpectation,
+    ) -> Result<QueryIndexVerification> {
+        #[cfg(test)]
+        self.query_index_verification_runs
+            .fetch_add(1, Ordering::Relaxed);
+        let header_read = self.query_index_header_from_snapshot(snapshot)?;
+        let snapshot_sequence = snapshot.seqno();
+        let header = match &header_read {
+            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        };
+        let mut report = QueryIndexVerificationBuilder::new(full);
+        self.verify_source_to_qv_rows(snapshot, full, &mut report)?;
+        let gpos_rows =
+            self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Gpos, full, &mut report)?;
+        let spog_rows =
+            self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Spog, full, &mut report)?;
+        let posg_rows =
+            self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Posg, full, &mut report)?;
+        report.report.indexed_quads = gpos_rows;
+        if gpos_rows != spog_rows || gpos_rows != posg_rows {
+            report.problem("qv-row-total-mismatch");
+        }
+
+        match header {
+            None => match header_read {
+                QueryIndexHeaderRead::Absent => report.problem("meta-header-missing"),
+                QueryIndexHeaderRead::Malformed => report.problem("meta-header-malformed"),
+                QueryIndexHeaderRead::Valid(_) => unreachable!("valid header was retained"),
+            },
+            Some(header) => {
+                let expected_state_matches = match expected_state {
+                    QueryIndexVerificationExpectation::Ready => {
+                        matches!(header.state, StoredQueryIndexState::Ready)
+                    }
+                    QueryIndexVerificationExpectation::BuildingCandidate => {
+                        matches!(header.state, StoredQueryIndexState::Building)
+                    }
+                };
+                if !expected_state_matches {
+                    report.problem("meta-state-mismatch");
+                }
+                if header.source_epoch != header.index_epoch {
+                    report.problem("meta-epoch-mismatch");
+                }
+                if header.source_epoch > snapshot_sequence || header.index_epoch > snapshot_sequence
+                {
+                    report.problem("meta-epoch-ahead-of-snapshot");
+                }
+                if header.last_build_sequence > snapshot_sequence {
+                    report.problem("meta-build-sequence-ahead-of-snapshot");
+                }
+                if header.source_live_quads != report.report.source_live_quads {
+                    report.problem("meta-source-total-mismatch");
+                }
+                if header.indexed_quads != report.report.indexed_quads {
+                    report.problem("meta-index-total-mismatch");
+                }
+                if header.source_live_quads != header.indexed_quads {
+                    report.problem("meta-header-total-mismatch");
+                }
+            }
+        }
+
+        if full {
+            self.verify_gpos_counter_dimension(snapshot, 1, &mut report)?;
+            self.verify_gpos_counter_dimension(snapshot, 2, &mut report)?;
+            self.verify_gpos_counter_dimension(snapshot, 3, &mut report)?;
+            let source_epoch = header.map(|header| header.source_epoch);
+            self.verify_posg_counter_dimension(snapshot, 1, source_epoch, &mut report)?;
+            self.verify_posg_counter_dimension(snapshot, 2, source_epoch, &mut report)?;
+            self.verify_query_index_meta_records(snapshot, header, &mut report)?;
+        }
+        Ok(report.finish())
     }
 
     fn pending_term_in_batch<'a>(
@@ -3305,59 +3520,6 @@ impl GraphStore {
         quads
     }
 
-    /// Graphs containing at least one quad matching (predicate, object), so
-    /// union readers can stream graph-at-a-time and short-circuit (ASK/LIMIT)
-    /// after checking visibility per graph instead of materializing the full
-    /// cross-corpus match set.
-    pub(crate) fn predicate_object_graphs(&self, predicate: TermId, object: TermId) -> Vec<TermId> {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .by_predicate_object
-                .get(&(predicate, object))
-                .map(|graphs| graphs.keys().copied().collect())
-                .unwrap_or_default()
-        })
-    }
-
-    pub(crate) fn predicate_object_subjects_snapshot(
-        &self,
-        graph: TermId,
-        predicate: TermId,
-        object: TermId,
-    ) -> Option<Arc<Vec<TermId>>> {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .by_predicate_object
-                .get(&(predicate, object))
-                .and_then(|graphs| graphs.get(&graph))
-                .cloned()
-        })
-    }
-
-    pub(crate) fn object_graphs(&self, object: TermId) -> Vec<TermId> {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .by_object
-                .get(&object)
-                .map(|graphs| graphs.keys().copied().collect())
-                .unwrap_or_default()
-        })
-    }
-
-    pub(crate) fn object_entries_snapshot(
-        &self,
-        graph: TermId,
-        object: TermId,
-    ) -> Option<ObjectEntries> {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .by_object
-                .get(&object)
-                .and_then(|graphs| graphs.get(&graph))
-                .cloned()
-        })
-    }
-
     /// Approximate corpus-wide quad counts used by the query planner. All are
     /// O(1) reads against the lazily built derived indexes; values count quad
     /// instances per graph (no cross-graph triple dedup), which is good
@@ -3402,19 +3564,6 @@ impl GraphStore {
         self.with_derived_indexes(|indexes| indexes.total_quads)
     }
 
-    /// Term ids of all graphs that currently hold at least one quad, from the
-    /// in-memory index (no store reads). Suitable for quad iteration; use
-    /// [`GraphStore::graph_term_id_iter`] when empty graphs must be included.
-    pub(crate) fn populated_graph_ids(&self) -> Vec<TermId> {
-        self.indexes
-            .read()
-            .unwrap()
-            .graph_subjects
-            .keys()
-            .copied()
-            .collect()
-    }
-
     pub(crate) fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
         if bytes.len() != 64 {
             return Err(StoreError::InvalidEncoding {
@@ -3427,6 +3576,21 @@ impl GraphStore {
             subject: decode_term_id(&bytes[16..32], "quad subject")?,
             predicate: decode_term_id(&bytes[32..48], "quad predicate")?,
             object: decode_term_id(&bytes[48..64], "quad object")?,
+        })
+    }
+
+    pub(crate) fn decode_query_index_key(
+        order: QueryIndexCursorOrder,
+        bytes: &[u8],
+    ) -> Result<EncodedQuad> {
+        let quad = match order {
+            QueryIndexCursorOrder::Gpos => decode_qv1_gpos_key(bytes),
+            QueryIndexCursorOrder::Spog => decode_qv1_spog_key(bytes),
+            QueryIndexCursorOrder::Posg => decode_qv1_posg_key(bytes),
+        };
+        quad.ok_or_else(|| StoreError::InvalidEncoding {
+            context: "qv1 query index key",
+            message: format!("expected 64 bytes, found {}", bytes.len()),
         })
     }
 
@@ -3611,10 +3775,15 @@ impl GraphStore {
             dirty_counter: AtomicU64::new(1),
             diagnostics_computed: AtomicU64::new(0),
             #[cfg(test)]
+            query_index_admission_probes: AtomicU64::new(0),
+            #[cfg(test)]
+            query_index_verification_runs: AtomicU64::new(0),
+            #[cfg(test)]
             persists: AtomicU64::new(0),
         };
 
         store.rebuild_indexes()?;
+        store.initialize_query_indexes_at_open()?;
         store.restore_dirty_counter()?;
         store.repair_graph_diagnostics_at_open()?;
         Ok(store)
@@ -3664,7 +3833,16 @@ impl GraphStore {
     /// fjall's `#[doc(hidden)]` `rotate_memtable_and_wait`.
     pub fn manual_compact(&self) -> Result<()> {
         self.db.persist(self.persist_mode)?;
-        for keyspace in [&self.terms, &self.quads, &self.graphs, &self.log] {
+        for keyspace in [
+            &self.terms,
+            &self.quads,
+            &self.graphs,
+            &self.log,
+            &self.qv1_gpos,
+            &self.qv1_spog,
+            &self.qv1_posg,
+            &self.qv1_meta,
+        ] {
             keyspace.rotate_memtable_and_wait()?;
             keyspace.major_compact()?;
         }
@@ -4387,7 +4565,8 @@ impl GraphStore {
             predicate,
             object,
         };
-        let mut cursor = self.raw_quad_cursor(pattern);
+        let snapshot = self.read_snapshot();
+        let mut cursor = snapshot.raw_quad_cursor(self, pattern);
         let mut quads = Vec::new();
         while let Some(candidate) = cursor.next_candidate() {
             let candidate = candidate?;
@@ -4398,58 +4577,77 @@ impl GraphStore {
         Ok(quads)
     }
 
-    /// Creates a stable quad cursor behind the index-publication barrier.
-    ///
-    /// A named predicate-object or object range clones the existing
-    /// copy-on-write index snapshot. Other patterns create a Fjall snapshot
-    /// while quad commits hold `indexes` write-locked until the durable and
-    /// in-memory halves agree. The returned cursor never retains that guard
-    /// across `next`.
-    pub(crate) fn raw_quad_cursor(
+    /// Returns an in-memory range only when it still describes `snapshot_seqno`.
+    /// A newer commit falls back to the caller-owned durable snapshot instead
+    /// of mixing two execution states.
+    fn current_derived_raw_cursor(
         &self,
+        snapshot_seqno: u64,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> crate::query_cursor::RawQuadCursor {
-        if let (Some(graph), None, Some(predicate), Some(object)) = (
-            pattern.graph,
-            pattern.subject,
-            pattern.predicate,
-            pattern.object,
-        ) {
-            return match self.predicate_object_subjects_snapshot(graph, predicate, object) {
-                Some(subjects) => crate::query_cursor::RawQuadCursor::predicate_object(
-                    subjects, graph, predicate, object,
-                ),
-                None => crate::query_cursor::RawQuadCursor::empty(),
-            };
+    ) -> Option<crate::query_cursor::RawQuadCursor> {
+        let uses_predicate_object = matches!(
+            (
+                pattern.graph,
+                pattern.subject,
+                pattern.predicate,
+                pattern.object
+            ),
+            (Some(_), None, Some(_), Some(_))
+        );
+        let uses_object = matches!(
+            (
+                pattern.graph,
+                pattern.subject,
+                pattern.predicate,
+                pattern.object
+            ),
+            (Some(_), None, None, Some(_))
+        );
+        if !uses_predicate_object && !uses_object {
+            return None;
         }
-        if let (Some(graph), None, None, Some(object)) = (
-            pattern.graph,
-            pattern.subject,
-            pattern.predicate,
-            pattern.object,
-        ) {
-            return match self.object_entries_snapshot(graph, object) {
-                Some(entries) => crate::query_cursor::RawQuadCursor::object(entries, graph, object),
-                None => crate::query_cursor::RawQuadCursor::empty(),
-            };
-        }
-        let _publication = self.indexes_read();
-        let snapshot = self.db.snapshot();
-        crate::query_cursor::RawQuadCursor::new(snapshot, &self.quads, pattern)
-    }
 
-    /// Point-probes a fully bound durable quad behind the same publication
-    /// barrier used by [`GraphStore::raw_quad_cursor`].
-    #[allow(dead_code)]
-    pub(crate) fn raw_quad_point(
-        &self,
-        quad: EncodedQuad,
-    ) -> Result<Option<crate::query_cursor::RawQuadCandidate>> {
-        let snapshot = {
-            let _publication = self.indexes_read();
-            self.db.snapshot()
-        };
-        crate::query_cursor::point_candidate(&snapshot, &self.quads, quad)
+        self.ensure_derived_indexes();
+        let indexes = self.indexes_read();
+        if self.db.snapshot().seqno() != snapshot_seqno {
+            return None;
+        }
+        let derived = indexes
+            .derived
+            .as_ref()
+            .expect("ensure_derived_indexes initialized the derived index");
+        match (
+            pattern.graph,
+            pattern.subject,
+            pattern.predicate,
+            pattern.object,
+        ) {
+            (Some(graph), None, Some(predicate), Some(object)) => Some(
+                derived
+                    .by_predicate_object
+                    .get(&(predicate, object))
+                    .and_then(|graphs| graphs.get(&graph))
+                    .cloned()
+                    .map(|subjects| {
+                        crate::query_cursor::RawQuadCursor::predicate_object(
+                            subjects, graph, predicate, object,
+                        )
+                    })
+                    .unwrap_or_else(crate::query_cursor::RawQuadCursor::empty),
+            ),
+            (Some(graph), None, None, Some(object)) => Some(
+                derived
+                    .by_object
+                    .get(&object)
+                    .and_then(|graphs| graphs.get(&graph))
+                    .cloned()
+                    .map(|entries| {
+                        crate::query_cursor::RawQuadCursor::object(entries, graph, object)
+                    })
+                    .unwrap_or_else(crate::query_cursor::RawQuadCursor::empty),
+            ),
+            _ => None,
+        }
     }
 
     pub fn for_each_quad_in_graph<E, F>(
@@ -5203,6 +5401,8 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_context::{QueryReadMode, ReadContext};
+    use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
     use crate::search_queue::{QueueBound, drain_upto};
 
     fn setup_store() -> (tempfile::TempDir, GraphStore) {
