@@ -414,3 +414,212 @@ fn assert_delete_contract(triples: &[Triple]) -> u64 {
     black_box(
         node.apply_changes_unchecked(&graph, changes)
             .expect("apply untimed delete contract"),
+    );
+    assert_row_count(&node, &graph, 0);
+    let bytes = settle_and_size(&node, &database);
+    println!(
+        "index_write_cost case=single_delete corpus_version={CORPUS_VERSION} seed={DEFAULT_SEED:#x} \
+         rows=0 db_bytes={bytes} setup_live_rows=1 search_storage=memory"
+    );
+    bytes
+}
+
+fn assert_concurrent_contract(triples: &[Triple]) -> u64 {
+    let fixture = concurrent_fixture(triples);
+    let ConcurrentFixture {
+        node,
+        database,
+        graph,
+        batches,
+    } = fixture;
+    let expected_rows = batches.len() * CONCURRENT_ROWS_PER_WRITER;
+    let start = Arc::new(Barrier::new(batches.len()));
+    std::thread::scope(|scope| {
+        for changes in batches {
+            let node = Arc::clone(&node);
+            let graph = graph.clone();
+            let start = Arc::clone(&start);
+            scope.spawn(move || {
+                start.wait();
+                node.apply_changes_bulk_unchecked(&graph, changes)
+                    .expect("apply untimed concurrent contract");
+            });
+        }
+    });
+    assert_row_count(&node, &graph, expected_rows);
+    let bytes = settle_and_size(&node, &database);
+    println!(
+        "index_write_cost case=concurrent_local_writes corpus_version={CORPUS_VERSION} \
+         seed={DEFAULT_SEED:#x} rows={expected_rows} writers={CONCURRENT_WRITERS} \
+         rows_per_writer={CONCURRENT_ROWS_PER_WRITER} db_bytes={bytes} search_storage=memory"
+    );
+    bytes
+}
+
+fn assert_merge_contract(triples: &[Triple]) -> u64 {
+    let fixture = merge_fixture(triples);
+    let MergeFixture {
+        cluster,
+        database,
+        graph,
+        expected_before,
+    } = fixture;
+    let moved = cluster
+        .sync_pair(0, 1)
+        .expect("apply untimed replicated merge contract");
+    assert!(moved > 0, "replicated merge must move the staged row");
+    cluster
+        .flush_search_updates()
+        .expect("settle merge search work");
+    assert_row_count(cluster.peer(1), &graph, expected_before + 1);
+    for peer in 0..2 {
+        cluster
+            .peer(peer)
+            .persist_fjall()
+            .expect("persist merge benchmark database");
+    }
+    let bytes = directory_bytes(&database.path().join("peer_0/store"))
+        + directory_bytes(&database.path().join("peer_1/store"));
+    println!(
+        "index_write_cost case=replicated_merge corpus_version={CORPUS_VERSION} \
+         seed={DEFAULT_SEED:#x} rows_added=1 db_bytes={bytes} peers=2 \
+         path=CraqleCluster::sync_pair"
+    );
+    bytes
+}
+
+fn env_duration(name: &str, default_seconds: u64) -> Duration {
+    match env::var(name) {
+        Ok(value) => Duration::from_secs(
+            value
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{name} must be an integer number of seconds")),
+        ),
+        Err(env::VarError::NotPresent) => Duration::from_secs(default_seconds),
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8"),
+    }
+}
+
+fn index_write_cost_benchmarks(c: &mut Criterion) {
+    let triples = write_corpus();
+    println!(
+        "index_write_cost metadata: corpus_version={CORPUS_VERSION} seed={DEFAULT_SEED:#x} \
+         rows={} local_cases=single_insert,single_delete,batch_100,batch_10000,\
+         concurrent_local_writes replicated_case=replicated_merge \
+         setup=iter_batched_per_iteration search_storage=memory",
+        triples.len()
+    );
+
+    // These are deliberately untimed. They prove the operation contracts and
+    // provide one comparable database-size sample for each case.
+    assert_local_contract(
+        "single_insert",
+        local_fixture(changes_for(
+            &GraphId::new(LOCAL_GRAPH),
+            &triples,
+            0..1,
+            true,
+        )),
+        1,
+        false,
+    );
+    assert_delete_contract(&triples);
+    assert_local_contract(
+        "batch_100",
+        local_fixture(changes_for(
+            &GraphId::new(LOCAL_GRAPH),
+            &triples,
+            0..100,
+            true,
+        )),
+        100,
+        true,
+    );
+    assert_local_contract(
+        "batch_10000",
+        local_fixture(changes_for(
+            &GraphId::new(LOCAL_GRAPH),
+            &triples,
+            0..10_000,
+            true,
+        )),
+        10_000,
+        true,
+    );
+    assert_concurrent_contract(&triples);
+    assert_merge_contract(&triples);
+
+    let mut group = c.benchmark_group("index_write_cost");
+    group.sample_size(10);
+    group.warm_up_time(env_duration("CRAQLE_BENCH_WARMUP_SECS", 1));
+    group.measurement_time(env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5));
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("single_insert", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture(changes_for(&graph, &triples, 0..1, true))
+            },
+            |fixture| apply_local_fixture(fixture, false),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("single_delete", |b| {
+        b.iter_batched(
+            || delete_fixture(&triples),
+            |fixture| apply_local_fixture(fixture, false),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("batch_100", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture(changes_for(&graph, &triples, 0..100, true))
+            },
+            |fixture| apply_local_fixture(fixture, true),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.throughput(Throughput::Elements(10_000));
+    group.bench_function("batch_10000", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture(changes_for(&graph, &triples, 0..10_000, true))
+            },
+            |fixture| apply_local_fixture(fixture, true),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.throughput(Throughput::Elements(
+        (CONCURRENT_WRITERS * CONCURRENT_ROWS_PER_WRITER) as u64,
+    ));
+    group.bench_function("concurrent_local_writes", |b| {
+        b.iter_batched(
+            || concurrent_fixture(&triples),
+            apply_concurrent_fixture,
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("replicated_merge", |b| {
+        b.iter_batched(
+            || merge_fixture(&triples),
+            apply_merge_fixture,
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(benches, index_write_cost_benchmarks);
+criterion_main!(benches);
