@@ -607,3 +607,352 @@ impl RdfReadView for DeltaReadView<'_, '_> {
         self.base.quad_is_visible(context, quad)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::core::{ActorId, Dot};
+    use crate::query_context::QueryCancellation;
+    use crate::store::{ClockUpdate, CounterKey, QuadAdd};
+
+    use super::*;
+
+    fn named(iri: &str) -> EncodedTerm {
+        EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(iri))
+    }
+
+    fn setup_store() -> (tempfile::TempDir, GraphStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(directory.path()).unwrap();
+        (directory, store)
+    }
+
+    fn add_quad(
+        store: &GraphStore,
+        graph: &GraphId,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> EncodedQuad {
+        if !store.contains_graph(graph).unwrap() {
+            store.create_graph(graph).unwrap();
+        }
+        let graph_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap();
+        let quad = EncodedQuad {
+            graph: graph_id,
+            subject: store.resolve_term(&named(subject)).unwrap(),
+            predicate: store.resolve_term(&named(predicate)).unwrap(),
+            object: store.resolve_term(&named(object)).unwrap(),
+        };
+        let _guard = store.graph_commit_guard(graph);
+        let actor = ActorId::random();
+        let mut batch = store.new_batch();
+        let counter = store
+            .next_counter(&mut batch, CounterKey { graph_id, actor })
+            .unwrap();
+        assert!(
+            store
+                .insert_quad(
+                    &mut batch,
+                    QuadAdd {
+                        quad,
+                        dot: Dot { actor, counter },
+                    },
+                )
+                .unwrap()
+        );
+        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        clock.advance(actor, counter);
+        store
+            .set_vector_clock(
+                &mut batch,
+                ClockUpdate {
+                    graph_id,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        quad
+    }
+
+    fn insert(
+        graph: &GraphId,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> MaterializedQuadChange {
+        MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: named(subject),
+            predicate: named(predicate),
+            object: named(object),
+        }
+    }
+
+    fn delete(
+        graph: &GraphId,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> MaterializedQuadChange {
+        MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: named(subject),
+            predicate: named(predicate),
+            object: named(object),
+        }
+    }
+
+    fn rows(view: &DeltaReadView<'_, '_>, context: &ReadContext<'_>) -> Vec<EncodedQuad> {
+        view.scan(
+            context,
+            GraphSelector::Named(view.graph()),
+            QuadPattern::default(),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    fn ids(
+        view: &DeltaReadView<'_, '_>,
+        context: &ReadContext<'_>,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> (TermId, TermId, TermId) {
+        (
+            view.lookup_term(context, &named(subject)).unwrap().unwrap(),
+            view.lookup_term(context, &named(predicate))
+                .unwrap()
+                .unwrap(),
+            view.lookup_term(context, &named(object)).unwrap().unwrap(),
+        )
+    }
+
+    #[test]
+    fn delta_only_insert_is_visible_without_store_mutation() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:delta-only");
+        let changes = vec![insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")];
+        assert!(store.lookup_term(&named("urn:test:s")).unwrap().is_none());
+        assert!(!store.contains_graph(&graph).unwrap());
+
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let (subject, predicate, object) =
+            ids(&view, &context, "urn:test:s", "urn:test:p", "urn:test:o");
+
+        assert_eq!(
+            rows(&view, &context),
+            vec![EncodedQuad {
+                graph: view.graph(),
+                subject,
+                predicate,
+                object,
+            }]
+        );
+        assert!(store.lookup_term(&named("urn:test:s")).unwrap().is_none());
+        assert!(store.lookup_term(&named("urn:test:p")).unwrap().is_none());
+        assert!(store.lookup_term(&named("urn:test:o")).unwrap().is_none());
+        assert!(!store.contains_graph(&graph).unwrap());
+    }
+
+    #[test]
+    fn deletes_and_reordered_changes_have_base_aware_final_state() {
+        for base_present in [false, true] {
+            let (_directory, store) = setup_store();
+            let graph = GraphId::new(if base_present {
+                "urn:test:lww:base"
+            } else {
+                "urn:test:lww:empty"
+            });
+            if base_present {
+                add_quad(&store, &graph, "urn:test:s", "urn:test:p", "urn:test:o");
+            }
+
+            let delete_insert = vec![
+                delete(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+                insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+            ];
+            let index = DeltaIndex::build(&store, &graph, &delete_insert).unwrap();
+            let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+            let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+            let (subject, predicate, object) =
+                ids(&view, &context, "urn:test:s", "urn:test:p", "urn:test:o");
+            assert!(
+                view.exists(
+                    &context,
+                    GraphSelector::Named(view.graph()),
+                    QuadPattern {
+                        subject: Some(subject),
+                        predicate: Some(predicate),
+                        object: Some(object),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap()
+            );
+            assert_eq!(1, context.snapshot().index_seeks);
+            assert_eq!(1, context.snapshot().candidate_quads);
+            assert_eq!(1, context.snapshot().matching_quads);
+
+            let insert_delete = vec![
+                insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+                delete(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+            ];
+            let index = DeltaIndex::build(&store, &graph, &insert_delete).unwrap();
+            let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+            let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+            let (subject, predicate, object) =
+                ids(&view, &context, "urn:test:s", "urn:test:p", "urn:test:o");
+            assert!(
+                !view
+                    .exists(
+                        &context,
+                        GraphSelector::Named(view.graph()),
+                        QuadPattern {
+                            subject: Some(subject),
+                            predicate: Some(predicate),
+                            object: Some(object),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap()
+            );
+            assert_eq!(1, context.snapshot().index_seeks);
+            assert_eq!(1, context.snapshot().candidate_quads);
+            assert_eq!(0, context.snapshot().matching_quads);
+        }
+    }
+
+    #[test]
+    fn repeated_operations_never_duplicate_or_underflow() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:repeated");
+        let inserts = vec![
+            insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+            insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+        ];
+        let index = DeltaIndex::build(&store, &graph, &inserts).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert_eq!(1, rows(&view, &context).len());
+
+        add_quad(&store, &graph, "urn:test:s", "urn:test:p", "urn:test:o");
+        let deletes = vec![
+            delete(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+            delete(&graph, "urn:test:s", "urn:test:p", "urn:test:o"),
+        ];
+        let index = DeltaIndex::build(&store, &graph, &deletes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert!(rows(&view, &context).is_empty());
+    }
+
+    #[test]
+    fn base_present_final_insert_is_emitted_once() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:base-present");
+        add_quad(&store, &graph, "urn:test:s", "urn:test:p", "urn:test:o");
+        let index = DeltaIndex::build(
+            &store,
+            &graph,
+            &[insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")],
+        )
+        .unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert_eq!(1, rows(&view, &context).len());
+        assert_eq!(1, context.snapshot().matching_quads);
+    }
+
+    #[test]
+    fn foreign_graph_changes_do_not_affect_the_selected_view_or_impact() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:selected");
+        let foreign = GraphId::new("urn:test:foreign");
+        let changes = vec![delete(&foreign, "urn:test:s", "urn:test:p", "urn:test:o")];
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        assert!(index.is_empty());
+        assert!(index.impact().changed_subjects.is_empty());
+        assert!(!index.impact().has_deletions);
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert!(rows(&view, &context).is_empty());
+    }
+
+    #[test]
+    fn impact_is_id_based_and_limited_to_the_selected_graph() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:impact");
+        let foreign = GraphId::new("urn:test:impact:foreign");
+        let changes = vec![
+            insert(
+                &graph,
+                "urn:test:impact:subject",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "urn:test:impact:type",
+            ),
+            delete(
+                &graph,
+                "urn:test:impact:subject",
+                "urn:test:impact:predicate",
+                "urn:test:impact:object",
+            ),
+            insert(
+                &foreign,
+                "urn:test:impact:foreign-subject",
+                "urn:test:impact:foreign-predicate",
+                "urn:test:impact:foreign-object",
+            ),
+        ];
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let impact = index.impact();
+        let subject = hash_term(&named("urn:test:impact:subject"));
+        let class = hash_term(&named("urn:test:impact:type"));
+        assert_eq!(HashSet::from([subject]), impact.changed_subjects);
+        assert!(
+            impact
+                .changed_objects
+                .contains(&hash_term(&named("urn:test:impact:object")))
+        );
+        assert!(
+            impact
+                .changed_predicates
+                .contains(&hash_term(&named("urn:test:impact:predicate")))
+        );
+        assert_eq!(HashSet::from([(subject, class)]), impact.changed_types);
+        assert!(impact.has_deletions);
+    }
+
+    #[test]
+    fn delta_terms_decode_and_collisions_fail_explicitly() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:delta-terms");
+        let changes = vec![insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")];
+        let mut index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let subject = named("urn:test:s");
+        let subject_id = view.lookup_term(&context, &subject).unwrap().unwrap();
+        assert_eq!(subject, view.decode_term(&context, subject_id).unwrap());
+        assert_eq!(1, context.snapshot().terms_decoded);
+        drop(view);
+
+        let attempted = named("urn:test:collision:attempted");
+        index
+            .terms
+            .insert(hash_term(&attempted), named("urn:test:collision:existing"));
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert!(matches!(
+            view.lookup_term(&context, &attempted),
+            Err(StoreError::TermCollision { .. })
+        ));
+    }
+
+}
