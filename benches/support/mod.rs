@@ -317,7 +317,7 @@ pub struct CorpusMetadata {
 impl CorpusMetadata {
     fn from_config(config: CorpusConfig) -> Self {
         let hidden_graphs = if config.graphs > 1 {
-            (config.graphs + 3) / 4
+            config.graphs.div_ceil(4)
         } else {
             0
         };
@@ -401,17 +401,18 @@ impl Iterator for CorpusIter {
         let ordinal = self.next;
         self.next += 1;
 
-        let graph = (ordinal % self.config.graphs) as u32;
         let duplicate = ordinal < self.duplicate_quads;
-        let source_ordinal = duplicate_source(
-            ordinal,
-            self.duplicate_quads,
-            self.config.quads,
-            self.config.graphs,
-            graph,
-        );
+        let source_ordinal = duplicate_source(ordinal, self.duplicate_quads, self.config.quads);
         let payload_ordinal = source_ordinal.unwrap_or(ordinal);
         let payload = payload(payload_ordinal, self.config.seed);
+        let graph = match source_ordinal {
+            Some(source) => duplicate_graph(
+                canonical_graph(source, self.config.graphs),
+                ordinal,
+                self.config.graphs,
+            ),
+            None => canonical_graph(ordinal, self.config.graphs),
+        };
 
         Some(QuadSpec {
             ordinal,
@@ -458,29 +459,42 @@ struct Payload {
 
 /// Pick a source from the non-duplicate suffix. It is always in another graph
 /// for the supported matrix, and the source is emitted as a canonical record.
-fn duplicate_source(
-    ordinal: usize,
-    duplicate_quads: usize,
-    quads: usize,
-    graphs: usize,
-    graph: u32,
-) -> Option<usize> {
+fn duplicate_source(ordinal: usize, duplicate_quads: usize, quads: usize) -> Option<usize> {
     if ordinal >= duplicate_quads {
         return None;
     }
 
     let canonical_count = quads - duplicate_quads;
-    let first_offset = ordinal % canonical_count;
-    let first = duplicate_quads + first_offset;
-    if (first % graphs) as u32 != graph {
-        return Some(first);
-    }
+    Some(duplicate_quads + ordinal % canonical_count)
+}
 
-    // The supported dimensions leave at least two canonical slots. Moving by
-    // one slot changes the graph modulo for the only collision case.
-    let second = duplicate_quads + (first_offset + 1) % canonical_count;
-    debug_assert_ne!((second % graphs) as u32, graph);
-    Some(second)
+/// Assign a canonical record to a graph while retaining the advertised
+/// locality. Every eight-edge star and every 48-edge chain segment is treated
+/// as one unit; the other workload records are independently distributed.
+fn canonical_graph(ordinal: usize, graphs: usize) -> u32 {
+    const BLOCK: usize = 128;
+    let local = ordinal % BLOCK;
+    let block = ordinal / BLOCK;
+    let group = if local < 48 {
+        block * 7 + local / 8
+    } else if local < 96 {
+        block * 7 + 6
+    } else {
+        return (ordinal % graphs) as u32;
+    };
+    (group % graphs) as u32
+}
+
+/// Rotate a duplicate into a deterministic destination distinct from its
+/// canonical source graph. The preferred graph cycles over every graph ID;
+/// only a collision with the source is advanced by one, preserving coverage.
+fn duplicate_graph(source_graph: u32, ordinal: usize, graphs: usize) -> u32 {
+    let preferred = (ordinal % graphs) as u32;
+    if preferred == source_graph {
+        (preferred + 1) % graphs as u32
+    } else {
+        preferred
+    }
 }
 
 /// Stable SplitMix-style integer mixing. It uses only wrapping operations, so
@@ -500,16 +514,16 @@ fn payload(ordinal: usize, seed: u64) -> Payload {
     const BLOCK: usize = 128;
     let local = ordinal % BLOCK;
     let block = ordinal / BLOCK;
-    let jitter = stable_id(seed, ordinal, 0x5041_594c_4f41_44);
+    let jitter = stable_id(seed, ordinal, 0x0050_4159_4c4f_4144);
 
     if local < 48 {
         // Six eight-edge stars per block. Their subjects repeat while their
         // predicates vary, making same-subject joins deterministic.
         let star = (block * 6 + local / 8) as u64;
         let subject = 0x1000_0000_0000_0000 | star;
-        let predicate = if local % 8 == 0 {
+        let predicate = if local.is_multiple_of(8) {
             PredicateKind::Type
-        } else if local % 3 == 0 {
+        } else if local.is_multiple_of(3) {
             PredicateKind::Rare((jitter % 8) as u8)
         } else {
             PredicateKind::Common((local % 4) as u8)
@@ -558,9 +572,9 @@ fn payload(ordinal: usize, seed: u64) -> Payload {
         return Payload {
             role: EntityRole::Linked,
             shape: CorpusShape::SkewedPredicateObject,
-            subject: 0x3000_0000_0000_0000 | stable_id(seed, ordinal, 0x534b_45),
+            subject: 0x3000_0000_0000_0000 | stable_id(seed, ordinal, 0x0053_4b45),
             predicate: PredicateKind::Common(0),
-            object: if local % 4 == 0 {
+            object: if local.is_multiple_of(4) {
                 ObjectSpec::Literal(jitter % 64 + 1)
             } else {
                 ObjectSpec::Literal(0)
