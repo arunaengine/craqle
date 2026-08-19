@@ -77,6 +77,10 @@ pub(crate) enum GraphVisibility<'a> {
 pub(crate) struct ReadContext<'a> {
     cancellation: QueryCancellation,
     pub(crate) visibility: GraphVisibility<'a>,
+    /// Validation is intentionally distinct from ordinary query visibility:
+    /// it names the one proposed graph and keeps its rows observable even
+    /// before the graph exists durably or diagnostics have been recomputed.
+    validation_graph: Option<TermId>,
     counters: ReadCounters,
     graph_visibility: RefCell<HashMap<TermId, bool>>,
     orphaned: RefCell<HashMap<TermId, Rc<HashSet<TermId>>>>,
@@ -94,6 +98,7 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::All,
+            validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
@@ -113,6 +118,7 @@ impl<'a> ReadContext<'a> {
                     .map(|graph| hash_term(&EncodedTerm::from_named_node(&graph.0)))
                     .collect(),
             ),
+            validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
@@ -127,6 +133,23 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::Predicate(visible),
+            validation_graph: None,
+            counters: ReadCounters::default(),
+            graph_visibility: RefCell::new(HashMap::new()),
+            orphaned: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Read the final state of exactly one graph while validating a candidate
+    /// write. This is crate-private so normal query reads retain their usual
+    /// graph and orphan filtering semantics.
+    #[must_use]
+    pub(crate) fn for_validation(cancellation: QueryCancellation, graph: &GraphId) -> Self {
+        let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
+        Self {
+            cancellation,
+            visibility: GraphVisibility::Exact(HashSet::from([graph])),
+            validation_graph: Some(graph),
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
@@ -180,5 +203,9 @@ impl<'a> ReadContext<'a> {
 
     pub(crate) fn remember_orphaned(&self, graph: TermId, orphaned: Rc<HashSet<TermId>>) {
         self.orphaned.borrow_mut().insert(graph, orphaned);
+    }
+
+    pub(crate) fn validation_graph(&self) -> Option<TermId> {
+        self.validation_graph
     }
 }
