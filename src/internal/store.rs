@@ -6155,6 +6155,457 @@ mod tests {
         commit_remove(&store, &graph, quad, &all_dots);
         assert_query_index_ready(&store, 0);
     }
+
+    #[test]
+    fn query_index_concurrent_cross_graph_writes_keep_exact_counters() {
+        let (_dir, store) = setup_store();
+        let graph_one = GraphId::new("urn:test:qv:cross-graph:one");
+        let graph_two = (0u64..)
+            .map(|index| {
+                let graph = format!("urn:test:qv:cross-graph:{index}");
+                GraphId::new(&graph)
+            })
+            .find(|graph| {
+                (hash_term(&EncodedTerm::from_named_node(&graph_one.0)).0 as usize)
+                    % COMMIT_LOCK_SHARDS
+                    != (hash_term(&EncodedTerm::from_named_node(&graph.0)).0 as usize)
+                        % COMMIT_LOCK_SHARDS
+            })
+            .unwrap();
+        store.create_graph(&graph_one).unwrap();
+        store.create_graph(&graph_two).unwrap();
+        let first = encode_quad(
+            &store,
+            &graph_one,
+            ("urn:test:s1", "urn:test:p", "urn:test:o"),
+        );
+        let second = encode_quad(
+            &store,
+            &graph_two,
+            ("urn:test:s2", "urn:test:p", "urn:test:o"),
+        );
+        let store = Arc::new(store);
+        let start = Arc::new(std::sync::Barrier::new(3));
+
+        let first_writer = {
+            let store = store.clone();
+            let graph = graph_one.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                commit_add(&store, &graph, first)
+            })
+        };
+        let second_writer = {
+            let store = store.clone();
+            let graph = graph_two.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                commit_add(&store, &graph, second)
+            })
+        };
+        start.wait();
+        first_writer.join().unwrap();
+        second_writer.join().unwrap();
+
+        assert_query_index_ready(&store, 2);
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(first.graph)),
+            Some(1)
+        );
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(second.graph)),
+            Some(1)
+        );
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Predicate(first.predicate)),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::PredicateObject(first.predicate, first.object)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::GraphPredicate(first.graph, first.predicate)
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::GraphPredicate(second.graph, second.predicate)
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn query_index_coalesces_repeated_crossings_in_one_batch() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:net-transition");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        let first = Dot {
+            actor: ActorId::random(),
+            counter: 1,
+        };
+        let second = Dot {
+            actor: ActorId::random(),
+            counter: 1,
+        };
+        {
+            let _guard = store.graph_commit_guard(&graph);
+            let mut batch = store.new_batch();
+            store
+                .insert_quad(&mut batch, QuadAdd { quad, dot: first })
+                .unwrap();
+            let mut first_only = VectorClock::new();
+            first_only.advance(first.actor, first.counter);
+            store
+                .remove_quad(
+                    &mut batch,
+                    QuadRemove {
+                        quad,
+                        witnessed: &first_only,
+                    },
+                )
+                .unwrap();
+            store
+                .insert_quad(&mut batch, QuadAdd { quad, dot: second })
+                .unwrap();
+            store.commit(batch).unwrap();
+        }
+        let header = query_index_header_for_test(&store);
+        assert_eq!(header.source_epoch, 1);
+        assert_query_index_ready(&store, 1);
+
+        {
+            let _guard = store.graph_commit_guard(&graph);
+            let mut batch = store.new_batch();
+            let mut second_only = VectorClock::new();
+            second_only.advance(second.actor, second.counter);
+            store
+                .remove_quad(
+                    &mut batch,
+                    QuadRemove {
+                        quad,
+                        witnessed: &second_only,
+                    },
+                )
+                .unwrap();
+            let third = Dot {
+                actor: ActorId::random(),
+                counter: 1,
+            };
+            store
+                .insert_quad(&mut batch, QuadAdd { quad, dot: third })
+                .unwrap();
+            store.commit(batch).unwrap();
+        }
+        assert_eq!(query_index_header_for_test(&store).source_epoch, 1);
+        assert_query_index_ready(&store, 1);
+    }
+
+    #[test]
+    fn query_index_tracks_exact_dimensions_and_removes_last_predicate_epoch() {
+        let (_dir, store) = setup_store();
+        let graph_one = GraphId::new("urn:test:qv:counters:one");
+        let graph_two = GraphId::new("urn:test:qv:counters:two");
+        store.create_graph(&graph_one).unwrap();
+        store.create_graph(&graph_two).unwrap();
+        let one = encode_quad(
+            &store,
+            &graph_one,
+            ("urn:test:s1", "urn:test:p1", "urn:test:o1"),
+        );
+        let two = encode_quad(
+            &store,
+            &graph_one,
+            ("urn:test:s2", "urn:test:p1", "urn:test:o1"),
+        );
+        let three = encode_quad(
+            &store,
+            &graph_one,
+            ("urn:test:s3", "urn:test:p2", "urn:test:o1"),
+        );
+        let four = encode_quad(
+            &store,
+            &graph_two,
+            ("urn:test:s4", "urn:test:p1", "urn:test:o2"),
+        );
+        commit_add(&store, &graph_one, one);
+        commit_add(&store, &graph_one, two);
+        let three_dot = commit_add(&store, &graph_one, three);
+        commit_add(&store, &graph_two, four);
+        assert_query_index_ready(&store, 4);
+
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
+            Some(4)
+        );
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(one.graph)),
+            Some(3)
+        );
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Predicate(one.predicate)),
+            Some(3)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::GraphPredicate(one.graph, one.predicate)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::PredicateObject(one.predicate, one.object)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::GraphPredicateObject(one.graph, one.predicate, one.object,)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::PredicateMutationEpoch(one.predicate)
+            ),
+            Some(query_index_header_for_test(&store).source_epoch)
+        );
+
+        let mut witnessed = VectorClock::new();
+        witnessed.advance(three_dot.actor, three_dot.counter);
+        commit_remove(&store, &graph_one, three, &witnessed);
+        assert_query_index_ready(&store, 3);
+        for key in [
+            QueryIndexCounterKey::Predicate(three.predicate),
+            QueryIndexCounterKey::GraphPredicate(three.graph, three.predicate),
+            QueryIndexCounterKey::PredicateObject(three.predicate, three.object),
+            QueryIndexCounterKey::GraphPredicateObject(three.graph, three.predicate, three.object),
+            QueryIndexCounterKey::PredicateMutationEpoch(three.predicate),
+        ] {
+            assert_eq!(query_index_counter_for_test(&store, key), None);
+        }
+    }
+
+    #[test]
+    fn query_index_removing_last_row_keeps_ready_and_removes_zero_dimensions() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:last-row");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        let dot = commit_add(&store, &graph, quad);
+
+        let mut witnessed = VectorClock::new();
+        witnessed.advance(dot.actor, dot.counter);
+        commit_remove(&store, &graph, quad, &witnessed);
+
+        assert_query_index_ready(&store, 0);
+        let header = query_index_header_for_test(&store);
+        assert_eq!(header.source_live_quads, 0);
+        assert_eq!(header.indexed_quads, 0);
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
+            Some(0)
+        );
+        for key in [
+            QueryIndexCounterKey::Graph(quad.graph),
+            QueryIndexCounterKey::Predicate(quad.predicate),
+            QueryIndexCounterKey::GraphPredicate(quad.graph, quad.predicate),
+            QueryIndexCounterKey::PredicateObject(quad.predicate, quad.object),
+            QueryIndexCounterKey::GraphPredicateObject(quad.graph, quad.predicate, quad.object),
+            QueryIndexCounterKey::PredicateMutationEpoch(quad.predicate),
+        ] {
+            assert_eq!(query_index_counter_for_test(&store, key), None);
+        }
+        let snapshot = store.db.snapshot();
+        for keyspace in [&store.qv1_gpos, &store.qv1_spog, &store.qv1_posg] {
+            assert!(snapshot.iter(keyspace).next().is_none());
+        }
+    }
+
+    #[test]
+    fn query_index_keys_are_fixed_order_and_empty() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:keys");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, quad);
+        let snapshot = store.db.snapshot();
+        for (keyspace, key) in [
+            (&store.qv1_gpos, qv1_gpos_key(quad)),
+            (&store.qv1_spog, qv1_spog_key(quad)),
+            (&store.qv1_posg, qv1_posg_key(quad)),
+        ] {
+            let value = snapshot.get(keyspace, key).unwrap().unwrap();
+            assert!(value.as_ref().is_empty());
+            let (stored_key, stored_value) = snapshot
+                .iter(keyspace)
+                .next()
+                .unwrap()
+                .into_inner()
+                .unwrap();
+            assert_eq!(stored_key.as_ref().len(), 64);
+            assert!(stored_value.as_ref().is_empty());
+        }
+    }
+
+    #[test]
+    fn query_index_status_rejects_mismatched_qv_rows_or_total() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:status-qv-rows");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, quad);
+
+        remove_query_index_key_for_test(&store, &store.qv1_spog, qv1_spog_key(quad));
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("ready-status-mismatch".to_owned())
+        );
+
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_spog,
+            qv1_spog_key(quad),
+            Vec::<u8>::new(),
+        );
+        stage_query_index_value_for_test(&store, &store.qv1_posg, qv1_posg_key(quad), vec![1]);
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("ready-status-mismatch".to_owned())
+        );
+
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_posg,
+            qv1_posg_key(quad),
+            Vec::<u8>::new(),
+        );
+        remove_query_index_key_for_test(&store, &store.qv1_spog, qv1_spog_key(quad));
+        stage_query_index_value_for_test(&store, &store.qv1_spog, vec![0; 63], Vec::<u8>::new());
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("ready-status-mismatch".to_owned())
+        );
+
+        remove_query_index_key_for_test(&store, &store.qv1_spog, vec![0; 63]);
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_spog,
+            qv1_spog_key(quad),
+            Vec::<u8>::new(),
+        );
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_meta,
+            QUERY_INDEX_TOTAL_KEY,
+            2u64.to_be_bytes(),
+        );
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("ready-status-mismatch".to_owned())
+        );
+    }
+
+    #[test]
+    fn query_index_fast_status_and_normal_reopen_skip_full_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:fast-status-reopen");
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, quad);
+            store.persist().unwrap();
+        }
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(0, reopened.query_index_verification_run_count());
+        let probes_before = reopened.query_index_admission_probe_count();
+        let status = reopened.query_index_status_fast().unwrap();
+        assert_eq!(QueryIndexState::Ready, status.state);
+        assert_eq!(1, status.source_live_quads);
+        assert_eq!(1, status.indexed_quads);
+        assert_eq!(
+            2,
+            reopened.query_index_admission_probe_count() - probes_before,
+            "fast status reads only the header and total counter"
+        );
+        assert_eq!(0, reopened.query_index_verification_run_count());
+
+        let sampled = reopened
+            .verify_query_indexes(QueryIndexVerificationMode::Sample)
+            .unwrap();
+        assert!(sampled.valid);
+        assert!(!sampled.full);
+        assert_eq!(1, reopened.query_index_verification_run_count());
+    }
+
+    #[test]
+    fn query_index_rebuild_after_restart_recovers_missing_and_advances_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:rebuild-restart");
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, quad);
+            remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+            store.persist().unwrap();
+        }
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            assert_eq!(
+                store.query_index_status().unwrap().state,
+                QueryIndexState::Missing
+            );
+            let before_rebuild_sequence = store.db.snapshot().seqno();
+            store.rebuild_query_indexes().unwrap();
+            let first = query_index_header_for_test(&store);
+            assert!(matches!(first.state, StoredQueryIndexState::Ready));
+            assert!(first.last_build_sequence >= before_rebuild_sequence);
+            assert!(first.source_epoch >= before_rebuild_sequence);
+            assert_eq!(first.source_live_quads, 1);
+            assert_eq!(first.indexed_quads, 1);
+            assert_query_index_ready(&store, 1);
+
+            store.rebuild_query_indexes().unwrap();
+            let second = query_index_header_for_test(&store);
+            assert!(second.last_build_sequence > first.last_build_sequence);
+            assert!(second.source_epoch > first.source_epoch);
+            store.persist().unwrap();
+        }
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_query_index_ready(&reopened, 1);
+    }
+
+    #[test]
+    fn query_index_interrupted_building_reopens_without_promoting_derived_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:interrupted-rebuild");
+        let quad = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
     }
 
     #[test]
