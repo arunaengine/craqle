@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod fixture;
+
 use std::fmt;
 
 /// Version of the deterministic generator. Bump this when its output contract

@@ -600,3 +600,275 @@ impl Fixture {
         }
     }
 }
+
+enum CheckValue {
+    Boolean(bool),
+    Rows(usize),
+    Count(usize),
+}
+
+struct GraphPartitionedLoader<'a> {
+    node: &'a CraqleNode,
+    graphs: &'a [GraphId],
+    partitions: Vec<Vec<MaterializedQuadChange>>,
+    pending_changes: usize,
+}
+
+impl<'a> GraphPartitionedLoader<'a> {
+    fn new(node: &'a CraqleNode, graphs: &'a [GraphId]) -> Self {
+        Self {
+            node,
+            graphs,
+            partitions: (0..graphs.len()).map(|_| Vec::new()).collect(),
+            pending_changes: 0,
+        }
+    }
+
+    fn push(&mut self, graph_index: usize, change: MaterializedQuadChange) {
+        self.partitions[graph_index].push(change);
+        self.pending_changes += 1;
+        if self.partitions[graph_index].len() >= LOAD_BATCH_SIZE
+            || self.pending_changes >= LOAD_BATCH_SIZE
+        {
+            self.flush_graph(graph_index);
+        }
+        assert!(
+            self.pending_changes < LOAD_BATCH_SIZE,
+            "the pending graph-partitioned loader buffer exceeded its fixed cap"
+        );
+    }
+
+    fn finish(&mut self) {
+        for graph_index in 0..self.partitions.len() {
+            self.flush_graph(graph_index);
+        }
+        assert_eq!(self.pending_changes, 0, "flush every graph partition");
+    }
+
+    fn flush_graph(&mut self, graph_index: usize) {
+        let changes = std::mem::take(&mut self.partitions[graph_index]);
+        if changes.is_empty() {
+            return;
+        }
+        self.pending_changes -= changes.len();
+        self.node
+            .apply_changes_bulk_unchecked(&self.graphs[graph_index], changes)
+            .expect("apply graph-scoped bounded benchmark batch");
+    }
+}
+
+fn query_cases(terms: &QueryTerms, count_graph: &GraphId) -> Vec<QueryCase> {
+    let type_predicate = predicate_term(PredicateKind::Type);
+    vec![
+        QueryCase {
+            label: "bound_ask_hit",
+            kind: QueryKind::AskHit,
+            sparql: format!(
+                "ASK WHERE {{ GRAPH <{}> {{ {} {} {} }} }}",
+                terms.graph.as_str(),
+                terms.subject.0,
+                terms.rare_predicate.0,
+                terms.rare_object.0
+            ),
+            expected: Expected::Boolean(true),
+        },
+        QueryCase {
+            label: "bound_ask_miss",
+            kind: QueryKind::AskMiss,
+            sparql: format!(
+                "ASK WHERE {{ GRAPH <{}> {{ <urn:craqle:bench:performance-corpus-v1:missing> {} {} }} }}",
+                terms.graph.as_str(),
+                terms.rare_predicate.0,
+                terms.rare_object.0
+            ),
+            expected: Expected::Boolean(false),
+        },
+        QueryCase {
+            label: "fixed_predicate_object_select_limit10",
+            kind: QueryKind::SelectLimit,
+            sparql: format!(
+                "SELECT ?s WHERE {{ ?s {} {} }} LIMIT {SELECT_LIMIT}",
+                terms.common_predicate.0, terms.common_object.0
+            ),
+            expected: Expected::Rows {
+                count: SELECT_LIMIT,
+                bindings: &["s"],
+            },
+        },
+        QueryCase {
+            label: "exact_count_common_predicate",
+            kind: QueryKind::Count,
+            sparql: format!(
+                "SELECT (COUNT(*) AS ?count) WHERE {{ GRAPH <{}> {{ ?s {} ?o }} }}",
+                count_graph.as_str(),
+                terms.common_predicate.0
+            ),
+            expected: Expected::Count { expected: 0 },
+        },
+        QueryCase {
+            label: "same_subject_property_star",
+            kind: QueryKind::PropertyStar,
+            sparql: format!(
+                "SELECT ?type ?common ?rare WHERE {{ GRAPH <{}> {{ {} {} ?type ; {} ?common ; {} ?rare }} }}",
+                terms.graph.as_str(),
+                terms.subject.0,
+                type_predicate.0,
+                terms.common_predicate.0,
+                terms.rare_predicate.0,
+            ),
+            expected: Expected::Rows {
+                count: 1,
+                bindings: &["type", "common", "rare"],
+            },
+        },
+        QueryCase {
+            label: "rare_to_common_join",
+            kind: QueryKind::RareToCommon,
+            sparql: format!(
+                "SELECT ?s ?common WHERE {{ GRAPH <{}> {{ ?s {} {} . ?s {} ?common }} }}",
+                terms.graph.as_str(),
+                terms.rare_predicate.0,
+                terms.rare_object.0,
+                terms.common_predicate.0,
+            ),
+            expected: Expected::Rows {
+                count: 1,
+                bindings: &["s", "common"],
+            },
+        },
+        QueryCase {
+            label: "common_to_rare_written_order",
+            kind: QueryKind::CommonToRare,
+            sparql: format!(
+                "SELECT ?s ?common WHERE {{ GRAPH <{}> {{ ?s {} ?common . ?s {} {} }} }}",
+                terms.graph.as_str(),
+                terms.common_predicate.0,
+                terms.rare_predicate.0,
+                terms.rare_object.0,
+            ),
+            expected: Expected::Rows {
+                count: 1,
+                bindings: &["s", "common"],
+            },
+        },
+    ]
+}
+
+fn graph_id(index: usize) -> GraphId {
+    GraphId::new(&format!(
+        "urn:craqle:bench:performance-corpus-v1:graph:{index}"
+    ))
+}
+
+fn subject_term(subject: u64) -> EncodedTerm {
+    EncodedTerm(format!(
+        "<urn:craqle:bench:performance-corpus-v1:subject:{subject:016x}>"
+    ))
+}
+
+fn predicate_term(predicate: PredicateKind) -> EncodedTerm {
+    match predicate {
+        PredicateKind::Type => {
+            EncodedTerm("<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_string())
+        }
+        PredicateKind::Common(index) => EncodedTerm(format!(
+            "<urn:craqle:bench:performance-corpus-v1:predicate:common:{index}>"
+        )),
+        PredicateKind::Rare(index) => EncodedTerm(format!(
+            "<urn:craqle:bench:performance-corpus-v1:predicate:rare:{index}>"
+        )),
+        PredicateKind::Chain => {
+            EncodedTerm("<urn:craqle:bench:performance-corpus-v1:predicate:chain>".to_string())
+        }
+    }
+}
+
+fn object_term(object: ObjectSpec) -> EncodedTerm {
+    match object {
+        ObjectSpec::Iri(value) => EncodedTerm(format!(
+            "<urn:craqle:bench:performance-corpus-v1:object:{value:016x}>"
+        )),
+        ObjectSpec::Literal(value) => EncodedTerm(format!("\"{value:016x}\"")),
+    }
+}
+
+fn count_value(results: QueryResults, label: &str) -> usize {
+    let QueryResults::Solutions(rows) = results else {
+        panic!("{label} must return a count solution row");
+    };
+    assert_eq!(rows.len(), 1, "{label} must return exactly one count row");
+    let term = rows[0]
+        .get("count")
+        .unwrap_or_else(|| panic!("{label} must bind ?count"));
+    match term.to_term() {
+        Some(Term::Literal(value)) => value
+            .value()
+            .parse()
+            .unwrap_or_else(|_| panic!("{label} must bind an integer count")),
+        _ => panic!("{label} must bind a literal count"),
+    }
+}
+
+fn directory_bytes_bounded(root: &Path) -> std::io::Result<DirectoryBytes> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+
+    while let Some(path) = paths.pop() {
+        for entry in fs::read_dir(path)? {
+            if entries == DIRECTORY_SIZE_ENTRY_LIMIT {
+                return Ok(DirectoryBytes {
+                    bytes,
+                    entries,
+                    complete: false,
+                });
+            }
+            let entry = entry?;
+            entries += 1;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                paths.push(entry.path());
+            } else if file_type.is_file() {
+                bytes = bytes.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+
+    Ok(DirectoryBytes {
+        bytes,
+        entries,
+        complete: true,
+    })
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be an unsigned integer")),
+        Err(env::VarError::NotPresent) => default,
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8"),
+    }
+}
+
+fn env_u8(name: &str, default: u8) -> u8 {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be an unsigned integer")),
+        Err(env::VarError::NotPresent) => default,
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8"),
+    }
+}
+
+fn env_duration(name: &str, default_seconds: u64) -> Duration {
+    let seconds = match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("{name} must be whole seconds")),
+        Err(env::VarError::NotPresent) => default_seconds,
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8"),
+    };
+    assert!(seconds > 0, "{name} must be greater than zero");
+    Duration::from_secs(seconds)
+}
