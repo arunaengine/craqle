@@ -205,15 +205,49 @@ known pre-PR0 defect; the intended union-default duplicate regression remains
 ignored until PR3 changes the read/index path. PR0 does not alter production
 query semantics.
 
-An external Rudof SHACL comparison cannot run against this dependency state.
-Two exact-version compatibility probes explain why: Rudof's RDF dependencies
-enable `oxrdf` RDF 1.2 terms, exposing unhandled `Term::Triple` cases in
-`ro-crate-rs v0.6.0`; separately, published `shacl 0.3.8` fails to compile with
-its default `sparql` feature disabled because several validator imports and
-implementations are not consistently feature-gated. PR 1 must land the
-smallest reviewed source adjustment while keeping the released versions and
-proving the `sparql` feature absent. Until then, no external validation result
-is fabricated here.
+The external Rudof SHACL comparison required two exact-release compatibility
+adjustments before it could run: Rudof's RDF dependencies enable `oxrdf` RDF
+1.2 terms, exposing unhandled `Term::Triple` cases in `ro-crate-rs v0.6.0`;
+separately, published `shacl 0.3.8` does not compile with its default `sparql`
+feature disabled because several validator imports and implementations are not
+consistently feature-gated. PR 1 retains the exact released versions, applies
+the reviewed local source adjustments documented in
+`DEPENDENCY_COMPATIBILITY.md`, and proves the `sparql` feature and
+`sparql_service` package are absent.
+
+## External Rudof SHACL baseline
+
+After those dependency-only compatibility adjustments, the lead-reviewed
+10,000-quad, 32-graph, 25%-duplicate comparison used:
+
+```sh
+CRAQLE_BENCH_QUADS=10000 CRAQLE_BENCH_GRAPHS=32 \
+CRAQLE_BENCH_DUPLICATE_PERCENT=25 CRAQLE_BENCH_WARMUP_SECS=1 \
+CRAQLE_BENCH_MEASUREMENT_SECS=1 \
+  cargo bench --locked --features shacl-core --bench shacl_external_baseline
+```
+
+The untimed pass exported and copied 5,971 visible unique triples into Rudof's
+in-memory graph, then produced exactly 291 expected violations. It recorded
+36.005 ms for Craqle export plus Rudof copy, 0.293 ms for shapes parsing and IR
+compilation, 4.936 ms for completed native validation, and 42.633 ms total.
+The Criterion intervals were:
+
+| Phase | Criterion interval |
+| --- | ---: |
+| Visible export and Rudof copy | 36.352-37.661 ms |
+| Shapes parse and IR compile | 82.751-84.971 us |
+| Retained-copy native validation | 2.6805-2.8187 ms |
+| Full export, copy, compile, and validation | 43.961-44.418 ms |
+
+Linux process samples were 6,463,488 bytes VmRSS / 7,634,944 bytes VmHWM
+before fixture construction, 326,369,280 / 335,142,912 after the fixture, and
+328,888,320 / 335,142,912 after validation. These are process-wide samples,
+not allocation attribution. Rudof Native returns only a completed report, so
+4.936 ms is explicitly a completed-validation duration and an upper bound for
+time to first violation, not a true first-violation measurement. This full
+data-graph copy exists only in the comparison benchmark and is forbidden from
+the later production validation and write paths.
 
 ## PR 0 verification
 
