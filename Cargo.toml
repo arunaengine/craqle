@@ -36,13 +36,19 @@ tracing = "0.1.44"
 tokio = "1.53.1"
 
 # RO-Crate implementation
-rocraters = { package = "ro-crate-rs", git = "https://github.com/intbio-ncl/ro-crate-rs.git", branch = "main", features = [
+rocraters = { package = "ro-crate-rs", git = "https://github.com/intbio-ncl/ro-crate-rs.git", tag = "v0.6.0", features = [
     "rdf",
 ] }
 
 # Testing
 proptest = "1.11.0"
 tempfile = "3.27.0"
+
+[patch."https://github.com/intbio-ncl/ro-crate-rs.git"]
+ro-crate-rs = { path = "vendor/ro-crate-rs-0.6.0" }
+
+[patch.crates-io]
+shacl = { path = "vendor/shacl-0.3.8" }
 
 [package]
 name = "craqle"
@@ -54,6 +60,7 @@ license = "MIT"
 default = ["search"]
 search = ["dep:tantivy"]
 iroh = ["irokle/iroh"]
+shacl-core = ["dep:shacl", "dep:rudof_rdf", "dep:rudof_iri"]
 
 [dependencies]
 blake3 = { workspace = true }
@@ -66,6 +73,9 @@ oxrdf = { workspace = true }
 oxjsonld = { workspace = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
+shacl = { version = "=0.3.8", default-features = false, optional = true }
+rudof_rdf = { version = "=0.3.8", default-features = false, optional = true }
+rudof_iri = { version = "=0.3.8", default-features = false, optional = true }
 serde_json = { workspace = true }
 spargebra = { workspace = true }
 spareval = { workspace = true }
