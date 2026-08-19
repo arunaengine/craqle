@@ -1909,6 +1909,436 @@ impl GraphStore {
         let (state, last_build_sequence) = match header {
             QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0),
             QueryIndexHeaderRead::Malformed => {
+                (QueryIndexState::Failed("metadata-malformed".to_owned()), 0)
+            }
+            QueryIndexHeaderRead::Valid(header) => {
+                let total_matches_header = matches!(
+                    self.query_index_counter_from_snapshot(&snapshot, QueryIndexCounterKey::Total)?,
+                    QueryIndexCounterRead::Value(total) if total == header.indexed_quads
+                );
+                let ready_matches_snapshot = header.ready_is_coherent()
+                    && header.is_not_ahead_of_snapshot(snapshot_sequence)
+                    && header.source_live_quads == source_live_quads
+                    && header.indexed_quads == indexed_quads
+                    && indexed_quads == spog_quads
+                    && indexed_quads == posg_quads
+                    && gpos_well_formed
+                    && spog_well_formed
+                    && posg_well_formed
+                    && total_matches_header;
+                if matches!(header.state, StoredQueryIndexState::Ready) && !ready_matches_snapshot {
+                    (
+                        QueryIndexState::Failed("ready-status-mismatch".to_owned()),
+                        header.last_build_sequence,
+                    )
+                } else {
+                    (header.state(), header.last_build_sequence)
+                }
+            }
+        };
+        Ok(QueryIndexStatus {
+            schema_version: QUERY_INDEX_SCHEMA_VERSION,
+            state,
+            source_live_quads,
+            indexed_quads,
+            last_build_sequence,
+        })
+    }
+
+    pub(crate) fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
+        let snapshot = self.query_index_snapshot();
+        let (state, source_live_quads, indexed_quads, last_build_sequence) = match self
+            .query_index_header_from_snapshot(&snapshot)?
+        {
+            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0),
+            QueryIndexHeaderRead::Malformed => (
+                QueryIndexState::Failed("metadata-malformed".to_owned()),
+                0,
+                0,
+                0,
+            ),
+            QueryIndexHeaderRead::Valid(header) => {
+                #[cfg(test)]
+                self.query_index_admission_probes
+                    .fetch_add(1, Ordering::Relaxed);
+                let admission = self.query_index_admission_for_header(&snapshot, &header)?;
+                let state =
+                    if matches!(header.state, StoredQueryIndexState::Ready) && !admission.trusted {
+                        QueryIndexState::Failed(
+                            admission
+                                .fallback_reason
+                                .unwrap_or("ready-metadata-mismatch")
+                                .to_owned(),
+                        )
+                    } else {
+                        header.state()
+                    };
+                (
+                    state,
+                    header.source_live_quads,
+                    header.indexed_quads,
+                    header.last_build_sequence,
+                )
+            }
+        };
+        Ok(QueryIndexStatus {
+            schema_version: QUERY_INDEX_SCHEMA_VERSION,
+            state,
+            source_live_quads,
+            indexed_quads,
+            last_build_sequence,
+        })
+    }
+
+    pub(crate) fn verify_query_indexes(
+        &self,
+        mode: impl Into<QueryIndexVerificationMode>,
+    ) -> Result<QueryIndexVerification> {
+        let snapshot = self.query_index_snapshot();
+        let mode = mode.into();
+        self.verify_query_index_snapshot(
+            &snapshot,
+            matches!(mode, QueryIndexVerificationMode::Full),
+            QueryIndexVerificationExpectation::Ready,
+        )
+    }
+
+    fn initialize_query_indexes_at_open(&self) -> Result<()> {
+        let _indexes = self.indexes_write();
+        let snapshot = self.db.snapshot();
+        match self.query_index_header_from_snapshot(&snapshot)? {
+            QueryIndexHeaderRead::Absent => {
+                let source_live_quads = self.count_live_source_rows(&snapshot)?;
+                if source_live_quads != 0 {
+                    return Ok(());
+                }
+                if !self.query_index_keyspaces_are_empty(&snapshot)? {
+                    let mut batch = self.buffered_batch();
+                    self.stage_query_index_failed(
+                        &mut batch,
+                        None,
+                        "metadata-missing-with-derived-residue",
+                    );
+                    return self.commit_fjall_batch(batch);
+                }
+                let mut batch = self.buffered_batch();
+                self.stage_query_index_header(&mut batch, &QueryIndexHeader::empty_ready());
+                batch.insert(&self.qv1_meta, QUERY_INDEX_TOTAL_KEY, 0u64.to_be_bytes());
+                self.commit_fjall_batch(batch)
+            }
+            QueryIndexHeaderRead::Malformed => {
+                let mut batch = self.buffered_batch();
+                self.stage_query_index_failed(&mut batch, None, "metadata-malformed");
+                self.commit_fjall_batch(batch)
+            }
+            QueryIndexHeaderRead::Valid(header) => {
+                if !matches!(header.state, StoredQueryIndexState::Ready) {
+                    return Ok(());
+                }
+                let admission = self.query_index_snapshot_admission(&snapshot)?;
+                if admission.trusted {
+                    return Ok(());
+                }
+                let mut batch = self.buffered_batch();
+                self.stage_query_index_failed(&mut batch, Some(&header), "open-admission-failed");
+                self.commit_fjall_batch(batch)
+            }
+        }
+    }
+
+    fn query_index_row_is_sampled(full: bool, checked: u64) -> bool {
+        full || checked < QUERY_INDEX_SAMPLE_ROWS
+    }
+
+    fn qv_row_is_present_and_empty(
+        &self,
+        snapshot: &Snapshot,
+        keyspace: &Keyspace,
+        key: QuadKey,
+    ) -> Result<bool> {
+        Ok(snapshot
+            .get(keyspace, key)?
+            .is_some_and(|value| value.as_ref().is_empty()))
+    }
+
+    fn verify_source_to_qv_rows(
+        &self,
+        snapshot: &Snapshot,
+        full: bool,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        for guard in snapshot.iter(&self.quads) {
+            let (key, value) = guard.into_inner()?;
+            if dot_payload_is_empty(value.as_ref()) {
+                continue;
+            }
+            report.report.source_live_quads =
+                report.report.source_live_quads.checked_add(1).ok_or(
+                    StoreError::QueryIndexVerificationFailed("source-row-count-overflow"),
+                )?;
+            let Some(quad) = decode_source_quad_key(key.as_ref()) else {
+                report.problem("source-key-length");
+                continue;
+            };
+            if !Self::query_index_row_is_sampled(full, report.report.checked_source_rows) {
+                continue;
+            }
+            report.report.checked_source_rows =
+                report.report.checked_source_rows.checked_add(1).ok_or(
+                    StoreError::QueryIndexVerificationFailed("source-check-count-overflow"),
+                )?;
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv1_gpos, qv1_gpos_key(quad))? {
+                report.problem("source-gpos-missing-or-nonempty");
+            }
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv1_spog, qv1_spog_key(quad))? {
+                report.problem("source-spog-missing-or-nonempty");
+            }
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv1_posg, qv1_posg_key(quad))? {
+                report.problem("source-posg-missing-or-nonempty");
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_qv_rows(
+        &self,
+        snapshot: &Snapshot,
+        order: QueryIndexKeyOrder,
+        full: bool,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<u64> {
+        let (keyspace, key_problem, value_problem, source_problem) = match order {
+            QueryIndexKeyOrder::Gpos => (
+                &self.qv1_gpos,
+                "qv-gpos-key-length",
+                "qv-gpos-value-nonempty",
+                "qv-gpos-source-missing",
+            ),
+            QueryIndexKeyOrder::Spog => (
+                &self.qv1_spog,
+                "qv-spog-key-length",
+                "qv-spog-value-nonempty",
+                "qv-spog-source-missing",
+            ),
+            QueryIndexKeyOrder::Posg => (
+                &self.qv1_posg,
+                "qv-posg-key-length",
+                "qv-posg-value-nonempty",
+                "qv-posg-source-missing",
+            ),
+        };
+        let mut rows = 0u64;
+        let mut checked_in_this_keyspace = 0u64;
+        for guard in snapshot.iter(keyspace) {
+            let (key, value) = guard.into_inner()?;
+            rows = rows
+                .checked_add(1)
+                .ok_or(StoreError::QueryIndexVerificationFailed(
+                    "index-row-count-overflow",
+                ))?;
+            if !Self::query_index_row_is_sampled(full, checked_in_this_keyspace) {
+                continue;
+            }
+            checked_in_this_keyspace = checked_in_this_keyspace.checked_add(1).ok_or(
+                StoreError::QueryIndexVerificationFailed("index-check-count-overflow"),
+            )?;
+            report.report.checked_index_rows =
+                report.report.checked_index_rows.checked_add(1).ok_or(
+                    StoreError::QueryIndexVerificationFailed("index-check-count-overflow"),
+                )?;
+            if !value.as_ref().is_empty() {
+                report.problem(value_problem);
+            }
+            let quad = match order {
+                QueryIndexKeyOrder::Gpos => decode_qv1_gpos_key(key.as_ref()),
+                QueryIndexKeyOrder::Spog => decode_qv1_spog_key(key.as_ref()),
+                QueryIndexKeyOrder::Posg => decode_qv1_posg_key(key.as_ref()),
+            };
+            let Some(quad) = quad else {
+                report.problem(key_problem);
+                continue;
+            };
+            let source_key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
+            let source_is_live = snapshot
+                .get(&self.quads, source_key)?
+                .is_some_and(|source| !dot_payload_is_empty(source.as_ref()));
+            if !source_is_live {
+                report.problem(source_problem);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn verify_expected_query_index_counter(
+        &self,
+        snapshot: &Snapshot,
+        key: QueryIndexCounterKey,
+        expected: u64,
+        missing_problem: &'static str,
+        mismatch_problem: &'static str,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        match snapshot.get(&self.qv1_meta, key.bytes())? {
+            None => report.problem(missing_problem),
+            Some(value) => match decode_query_index_u64(value.as_ref()) {
+                Some(actual) if actual == expected => {}
+                _ => report.problem(mismatch_problem),
+            },
+        }
+        Ok(())
+    }
+
+    fn verify_gpos_counter_group(
+        &self,
+        snapshot: &Snapshot,
+        dimension: usize,
+        terms: [TermId; 3],
+        expected: u64,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let (key, missing_problem, mismatch_problem) = match dimension {
+            1 => (
+                QueryIndexCounterKey::Graph(terms[0]),
+                "counter-g-missing",
+                "counter-g-mismatch",
+            ),
+            2 => (
+                QueryIndexCounterKey::GraphPredicate(terms[0], terms[1]),
+                "counter-gp-missing",
+                "counter-gp-mismatch",
+            ),
+            3 => (
+                QueryIndexCounterKey::GraphPredicateObject(terms[0], terms[1], terms[2]),
+                "counter-gpo-missing",
+                "counter-gpo-mismatch",
+            ),
+            _ => unreachable!("only GPOS counter dimensions are used"),
+        };
+        self.verify_expected_query_index_counter(
+            snapshot,
+            key,
+            expected,
+            missing_problem,
+            mismatch_problem,
+            report,
+        )
+    }
+
+    fn verify_gpos_counter_dimension(
+        &self,
+        snapshot: &Snapshot,
+        dimension: usize,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let mut current = None::<[TermId; 3]>;
+        let mut count = 0u64;
+        for guard in snapshot.iter(&self.qv1_gpos) {
+            let (key, _) = guard.into_inner()?;
+            let Some(quad) = decode_qv1_gpos_key(key.as_ref()) else {
+                continue;
+            };
+            let terms = [quad.graph, quad.predicate, quad.object];
+            if let Some(previous) = current
+                && previous[..dimension] != terms[..dimension]
+            {
+                self.verify_gpos_counter_group(snapshot, dimension, previous, count, report)?;
+                count = 0;
+            }
+            current = Some(terms);
+            count = count
+                .checked_add(1)
+                .ok_or(StoreError::QueryIndexVerificationFailed(
+                    "counter-count-overflow",
+                ))?;
+        }
+        if let Some(previous) = current {
+            self.verify_gpos_counter_group(snapshot, dimension, previous, count, report)?;
+        }
+        Ok(())
+    }
+
+    fn verify_predicate_mutation_epoch(
+        &self,
+        snapshot: &Snapshot,
+        predicate: TermId,
+        source_epoch: Option<u64>,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let Some(source_epoch) = source_epoch else {
+            report.problem("mutation-epoch-without-header");
+            return Ok(());
+        };
+        match snapshot.get(
+            &self.qv1_meta,
+            QueryIndexCounterKey::PredicateMutationEpoch(predicate).bytes(),
+        )? {
+            None => report.problem("mutation-epoch-missing"),
+            Some(value) => match decode_query_index_u64(value.as_ref()) {
+                Some(epoch) if epoch != 0 && epoch <= source_epoch => {}
+                _ => report.problem("mutation-epoch-invalid"),
+            },
+        }
+        Ok(())
+    }
+
+    fn verify_posg_counter_group(
+        &self,
+        snapshot: &Snapshot,
+        dimension: usize,
+        terms: [TermId; 2],
+        expected: u64,
+        source_epoch: Option<u64>,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let (key, missing_problem, mismatch_problem) = match dimension {
+            1 => (
+                QueryIndexCounterKey::Predicate(terms[0]),
+                "counter-p-missing",
+                "counter-p-mismatch",
+            ),
+            2 => (
+                QueryIndexCounterKey::PredicateObject(terms[0], terms[1]),
+                "counter-po-missing",
+                "counter-po-mismatch",
+            ),
+            _ => unreachable!("only POSG counter dimensions are used"),
+        };
+        self.verify_expected_query_index_counter(
+            snapshot,
+            key,
+            expected,
+            missing_problem,
+            mismatch_problem,
+            report,
+        )?;
+        if dimension == 1 {
+            self.verify_predicate_mutation_epoch(snapshot, terms[0], source_epoch, report)?;
+        }
+        Ok(())
+    }
+
+    fn verify_posg_counter_dimension(
+        &self,
+        snapshot: &Snapshot,
+        dimension: usize,
+        source_epoch: Option<u64>,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let mut current = None::<[TermId; 2]>;
+        let mut count = 0u64;
+        for guard in snapshot.iter(&self.qv1_posg) {
+            let (key, _) = guard.into_inner()?;
+            let Some(quad) = decode_qv1_posg_key(key.as_ref()) else {
+                continue;
+            };
+            let terms = [quad.predicate, quad.object];
+            if let Some(previous) = current
+                && previous[..dimension] != terms[..dimension]
+            {
+                self.verify_posg_counter_group(
+                    snapshot,
+                    dimension,
+                    previous,
     }
 
     fn pending_term_in_batch<'a>(

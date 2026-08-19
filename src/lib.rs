@@ -247,6 +247,20 @@ pub struct QueryIndexVerification {
     pub problems: Vec<String>,
 }
 
+/// Amount of persistent-query-index inspection requested by an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum QueryIndexVerificationMode {
+    Sample,
+    Full,
+}
+
+impl From<bool> for QueryIndexVerificationMode {
+    fn from(full: bool) -> Self {
+        if full { Self::Full } else { Self::Sample }
+    }
+}
+
 /// A supported RO-Crate specification version.
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
