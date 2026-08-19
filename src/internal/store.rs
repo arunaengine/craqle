@@ -1696,6 +1696,221 @@ impl GraphStore {
         self.indexes.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn query_index_header_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<QueryIndexHeaderRead> {
+        Ok(
+            match snapshot.get(&self.qv1_meta, QUERY_INDEX_HEADER_KEY)? {
+                Some(bytes) => decode_query_index_header(bytes.as_ref()),
+                None => QueryIndexHeaderRead::Absent,
+            },
+        )
+    }
+
+    fn stage_query_index_header(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        header: &QueryIndexHeader,
+    ) {
+        batch.insert(
+            &self.qv1_meta,
+            QUERY_INDEX_HEADER_KEY,
+            encode_query_index_header(header),
+        );
+    }
+
+    fn stage_query_index_failed(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        previous: Option<&QueryIndexHeader>,
+        reason: &'static str,
+    ) {
+        self.stage_query_index_header(batch, &QueryIndexHeader::failed_from(previous, reason));
+    }
+
+    fn count_live_source_rows(&self, snapshot: &Snapshot) -> Result<u64> {
+        let mut rows = 0u64;
+        for guard in snapshot.iter(&self.quads) {
+            let (_, value) = guard.into_inner()?;
+            if !dot_payload_is_empty(value.as_ref()) {
+                rows = rows
+                    .checked_add(1)
+                    .ok_or(StoreError::QueryIndexVerificationFailed(
+                        "source-row-count-overflow",
+                    ))?;
+            }
+        }
+        Ok(rows)
+    }
+
+    fn summarize_qv_rows(&self, snapshot: &Snapshot, keyspace: &Keyspace) -> Result<(u64, bool)> {
+        let mut rows = 0u64;
+        let mut well_formed = true;
+        for guard in snapshot.iter(keyspace) {
+            let (key, value) = guard.into_inner()?;
+            rows = rows
+                .checked_add(1)
+                .ok_or(StoreError::QueryIndexVerificationFailed(
+                    "index-row-count-overflow",
+                ))?;
+            well_formed &= key.as_ref().len() == 64 && value.as_ref().is_empty();
+        }
+        Ok((rows, well_formed))
+    }
+
+    fn query_index_keyspaces_are_empty(&self, snapshot: &Snapshot) -> Result<bool> {
+        for keyspace in [
+            &self.qv1_gpos,
+            &self.qv1_spog,
+            &self.qv1_posg,
+            &self.qv1_meta,
+        ] {
+            if let Some(guard) = snapshot.iter(keyspace).next() {
+                let _ = guard.into_inner()?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Captures one durable snapshot only after a concurrent commit has made
+    /// both its Fjall batch and in-memory publication visible. The returned
+    /// object never retains this lock across cursor iteration.
+    pub(crate) fn read_snapshot(&self) -> StoreReadSnapshot {
+        let _publication = self.indexes_read();
+        StoreReadSnapshot {
+            snapshot: self.db.snapshot(),
+        }
+    }
+
+    fn query_index_snapshot(&self) -> Snapshot {
+        self.read_snapshot().snapshot
+    }
+
+    /// O(1) qv1 eligibility gate for a single execution snapshot. Full source
+    /// and qv cross-checking belongs to open-time verification and explicit
+    /// maintenance checks; doing it here would erase the index's query value.
+    fn query_index_snapshot_admission(&self, snapshot: &Snapshot) -> Result<QueryIndexAdmission> {
+        #[cfg(test)]
+        self.query_index_admission_probes
+            .fetch_add(1, Ordering::Relaxed);
+        let header = match self.query_index_header_from_snapshot(snapshot)? {
+            QueryIndexHeaderRead::Absent => {
+                return Ok(QueryIndexAdmission {
+                    trusted: false,
+                    fallback_reason: Some("metadata-missing"),
+                    header_reads: 1,
+                    counter_reads: 0,
+                });
+            }
+            QueryIndexHeaderRead::Malformed => {
+                return Ok(QueryIndexAdmission {
+                    trusted: false,
+                    fallback_reason: Some("metadata-malformed"),
+                    header_reads: 1,
+                    counter_reads: 0,
+                });
+            }
+            QueryIndexHeaderRead::Valid(header) => header,
+        };
+        self.query_index_admission_for_header(snapshot, &header)
+    }
+
+    fn query_index_admission_for_header(
+        &self,
+        snapshot: &Snapshot,
+        header: &QueryIndexHeader,
+    ) -> Result<QueryIndexAdmission> {
+        let fallback_reason = match &header.state {
+            StoredQueryIndexState::Building => Some("index-building"),
+            StoredQueryIndexState::Failed(_) => Some("index-failed"),
+            StoredQueryIndexState::Ready if !header.ready_is_coherent() => {
+                Some("metadata-incoherent")
+            }
+            StoredQueryIndexState::Ready if !header.is_not_ahead_of_snapshot(snapshot.seqno()) => {
+                Some("metadata-ahead-of-snapshot")
+            }
+            StoredQueryIndexState::Ready => None,
+        };
+        if let Some(fallback_reason) = fallback_reason {
+            return Ok(QueryIndexAdmission {
+                trusted: false,
+                fallback_reason: Some(fallback_reason),
+                header_reads: 1,
+                counter_reads: 0,
+            });
+        }
+        #[cfg(test)]
+        self.query_index_admission_probes
+            .fetch_add(1, Ordering::Relaxed);
+        let (trusted, fallback_reason) = match self
+            .query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::Total)?
+        {
+            QueryIndexCounterRead::Value(total) if total == header.indexed_quads => (true, None),
+            QueryIndexCounterRead::Value(_) => (false, Some("total-counter-mismatch")),
+            QueryIndexCounterRead::Missing => (false, Some("total-counter-missing")),
+            QueryIndexCounterRead::Malformed => (false, Some("total-counter-malformed")),
+        };
+        Ok(QueryIndexAdmission {
+            trusted,
+            fallback_reason,
+            header_reads: 1,
+            counter_reads: 1,
+        })
+    }
+
+    fn query_index_range(
+        &self,
+        order: QueryIndexCursorOrder,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> (&Keyspace, Vec<u8>) {
+        let terms = match order {
+            QueryIndexCursorOrder::Gpos => match (pattern.graph, pattern.predicate, pattern.object)
+            {
+                (Some(graph), Some(predicate), Some(object)) => vec![graph, predicate, object],
+                (Some(graph), Some(predicate), None) => vec![graph, predicate],
+                (Some(graph), None, _) => vec![graph],
+                (None, _, _) => Vec::new(),
+            },
+            QueryIndexCursorOrder::Spog => {
+                match (pattern.subject, pattern.predicate, pattern.object) {
+                    (Some(subject), Some(predicate), Some(object)) => {
+                        vec![subject, predicate, object]
+                    }
+                    (Some(subject), Some(predicate), None) => vec![subject, predicate],
+                    (Some(subject), None, _) => vec![subject],
+                    (None, _, _) => Vec::new(),
+                }
+            }
+            QueryIndexCursorOrder::Posg => match (pattern.predicate, pattern.object) {
+                (Some(predicate), Some(object)) => vec![predicate, object],
+                (Some(predicate), None) => vec![predicate],
+                (None, _) => Vec::new(),
+            },
+        };
+        let keyspace = match order {
+            QueryIndexCursorOrder::Gpos => &self.qv1_gpos,
+            QueryIndexCursorOrder::Spog => &self.qv1_spog,
+            QueryIndexCursorOrder::Posg => &self.qv1_posg,
+        };
+        (keyspace, query_index_prefix(&terms))
+    }
+
+    pub(crate) fn query_index_status(&self) -> Result<QueryIndexStatus> {
+        let snapshot = self.query_index_snapshot();
+        let snapshot_sequence = snapshot.seqno();
+        let header = self.query_index_header_from_snapshot(&snapshot)?;
+        let source_live_quads = self.count_live_source_rows(&snapshot)?;
+        let (indexed_quads, gpos_well_formed) =
+            self.summarize_qv_rows(&snapshot, &self.qv1_gpos)?;
+        let (spog_quads, spog_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv1_spog)?;
+        let (posg_quads, posg_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv1_posg)?;
+        let (state, last_build_sequence) = match header {
+            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0),
+            QueryIndexHeaderRead::Malformed => {
+    }
+
     fn pending_term_in_batch<'a>(
         &self,
         batch: Option<&'a WriteBatch>,
@@ -2265,6 +2480,7 @@ impl GraphStore {
         publish: &PendingPublish,
     ) -> Result<bool> {
         let mut indexes = self.indexes_write();
+        self.stage_query_index_maintenance(&mut commit.batch, publish)?;
         self.commit_durable(commit)?;
         #[cfg(test)]
         self.stall_after_commit();
@@ -2315,6 +2531,29 @@ impl GraphStore {
     #[cfg(test)]
     pub(crate) fn diagnostics_compute_count(&self) -> u64 {
         self.diagnostics_computed.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_index_admission_probe_count(&self) -> u64 {
+        self.query_index_admission_probes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_index_verification_run_count(&self) -> u64 {
+        self.query_index_verification_runs.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_query_indexes_for_test(&self) {
+        let _indexes = self.indexes_write();
+        let snapshot = self.db.snapshot();
+        let previous = match self.query_index_header_from_snapshot(&snapshot).unwrap() {
+            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        };
+        let mut batch = self.buffered_batch();
+        self.stage_query_index_failed(&mut batch, previous.as_ref(), "test-failure");
+        self.commit_fjall_batch(batch).unwrap();
     }
 
     /// The vocabulary term ids orphan detection matches on.
@@ -2396,6 +2635,98 @@ impl GraphStore {
 
         data_entities.retain(|entity| !reachable.contains(entity));
         data_entities
+    }
+
+    /// Snapshot-only twin of [`GraphStore::orphaned_entity_ids`]. Reads use it
+    /// when the persisted diagnostic record is absent or tagged for another
+    /// clock, so visibility cannot mix qv/source rows from one commit with
+    /// orphan state from another. It intentionally does not persist or update
+    /// the global diagnostic cache.
+    fn snapshot_orphaned_entity_ids(
+        &self,
+        snapshot: &Snapshot,
+        context: &crate::query_context::ReadContext<'_>,
+        graph_id: TermId,
+        vocab: &OrphanVocab,
+    ) -> Result<HashSet<TermId>> {
+        let mut data_entities = HashSet::new();
+        let mut adjacency = HashMap::<TermId, Vec<TermId>>::new();
+        let mut work_since_check = 0usize;
+        context.check_cancelled()?;
+        context.increment_index_seeks();
+        for guard in snapshot.prefix(&self.quads, graph_id.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            context.increment_candidate_quads();
+            context.record_source_read((key.len() + value.len()) as u64);
+            work_since_check += 1;
+            if work_since_check == 1_024 {
+                work_since_check = 0;
+                context.check_cancelled()?;
+            }
+            if dot_payload_is_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = Self::decode_quad_key(key.as_ref())?;
+            if vocab.has_part == Some(quad.predicate) {
+                adjacency.entry(quad.subject).or_default().push(quad.object);
+                if quad.subject != graph_id {
+                    data_entities.insert(quad.subject);
+                }
+                if quad.object != graph_id {
+                    data_entities.insert(quad.object);
+                }
+            }
+            if vocab.rdf_type == Some(quad.predicate)
+                && quad.subject != graph_id
+                && vocab.data_types.contains(&Some(quad.object))
+            {
+                data_entities.insert(quad.subject);
+            }
+        }
+
+        if data_entities.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut reachable = HashSet::from([graph_id]);
+        let mut queue = VecDeque::from([graph_id]);
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in adjacency.get(&current).into_iter().flatten() {
+                work_since_check += 1;
+                if work_since_check == 1_024 {
+                    work_since_check = 0;
+                    context.check_cancelled()?;
+                }
+                if reachable.insert(neighbor) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        data_entities.retain(|entity| !reachable.contains(entity));
+        Ok(data_entities)
+    }
+
+    fn snapshot_stored_diagnostics(
+        &self,
+        snapshot: &Snapshot,
+        graph_id: TermId,
+    ) -> Result<Option<StoredDiagnostics>> {
+        snapshot
+            .get(&self.graphs, graph_diagnostics_key(graph_id))?
+            .map(|bytes| postcard::from_bytes(bytes.as_ref()))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn snapshot_vector_clock(&self, snapshot: &Snapshot, graph_id: TermId) -> Result<VectorClock> {
+        if let Some(bytes) = snapshot.get(&self.graphs, graph_clock_key(graph_id))? {
+            return Ok(postcard::from_bytes(bytes.as_ref())?);
+        }
+        Ok(snapshot
+            .get(&self.graphs, graph_meta_key(graph_id))?
+            .map(|bytes| postcard::from_bytes::<StoredGraphMeta>(bytes.as_ref()))
+            .transpose()?
+            .unwrap_or_default()
+            .clock)
     }
 
     fn compute_graph_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
