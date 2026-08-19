@@ -294,10 +294,15 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
                 if let Err(error) = context.check_cancelled() {
                     return Some(Err(error));
                 }
-                match crate::rdf_read::graph_is_visible(store, context, graph) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
+                let visible = match crate::rdf_read::graph_is_visible(store, context, graph) {
+                    Ok(visible) => visible,
                     Err(error) => return Some(Err(error)),
+                };
+                if let Err(error) = context.check_cancelled() {
+                    return Some(Err(error));
+                }
+                if !visible {
+                    continue;
                 }
                 context.increment_index_seeks();
                 *current = Some(store.raw_quad_cursor(QuadPattern {
