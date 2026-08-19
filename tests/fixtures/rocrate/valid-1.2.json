@@ -1,0 +1,18 @@
+{
+  "@context": "https://w3id.org/ro/crate/1.2/context",
+  "@graph": [
+    {
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+      "about": {"@id": "urn:fixture:rocrate:valid-1.2:root"}
+    },
+    {
+      "@id": "urn:fixture:rocrate:valid-1.2:root",
+      "@type": "Dataset",
+      "name": "Valid RO-Crate 1.2 fixture",
+      "description": "Minimal deterministic RO-Crate 1.2 document.",
+      "datePublished": "2026-08-19"
+    }
+  ]
+}
