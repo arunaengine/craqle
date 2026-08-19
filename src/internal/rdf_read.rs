@@ -174,27 +174,53 @@ impl<'store> StoreReadView<'store> {
             GraphSelector::Union | GraphSelector::DefaultUnion if pattern.subject.is_some() => {
                 ReadAccessPath::QvSpog
             }
-            (None, Some(object)) => {
-                context.increment_index_seeks();
-                Some(Rc::new(self.store.object_graphs(object)))
-            }
-            (_, None) => None,
-        };
-        let exact = context.exact_graphs();
-
-        match (exact, indexed) {
-            (Some(exact), Some(indexed)) if exact.len() <= indexed.len() => Some(exact),
-            (_, Some(indexed)) => Some(indexed),
-            (Some(exact), None) => Some(exact),
-            (None, None) => match &context.visibility {
-                GraphVisibility::Predicate(_) => {
-                    context.increment_index_seeks();
-                    Some(Rc::new(self.store.populated_graph_ids()))
-                }
-                GraphVisibility::All => None,
-                GraphVisibility::Exact(_) => unreachable!("exact graphs handled above"),
-            },
+            GraphSelector::Union | GraphSelector::DefaultUnion => ReadAccessPath::QvPosg,
         }
+    }
+
+    fn qv_admission(&self, context: &ReadContext<'_>) -> Result<QueryIndexAdmission> {
+        if let Some(admission) = self.qv_admission.get().copied() {
+            context.observe_qv_admission(admission.trusted, admission.fallback_reason);
+            return Ok(admission);
+        }
+        let admission = self.snapshot.query_index_admission(self.store)?;
+        context.record_qv_admission(
+            admission.trusted,
+            admission.fallback_reason,
+            admission.header_reads,
+            admission.counter_reads,
+        );
+        let _ = self.qv_admission.set(admission);
+        Ok(admission)
+    }
+
+    fn qv_order(path: ReadAccessPath) -> QueryIndexCursorOrder {
+        match path {
+            ReadAccessPath::QvGpos => QueryIndexCursorOrder::Gpos,
+            ReadAccessPath::QvSpog => QueryIndexCursorOrder::Spog,
+            ReadAccessPath::QvPosg => QueryIndexCursorOrder::Posg,
+            ReadAccessPath::SourceGspo | ReadAccessPath::Empty => {
+                unreachable!("only qv access paths have qv orders")
+            }
+        }
+    }
+
+    pub(crate) fn contains_graph_by_id(&self, graph: TermId) -> Result<bool> {
+        self.snapshot.contains_graph_by_id(self.store, graph)
+    }
+
+    pub(crate) fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
+        let Some(graph) = self
+            .snapshot
+            .lookup_term(self.store, &EncodedTerm::from_named_node(&graph.0))?
+        else {
+            return Ok(false);
+        };
+        self.contains_graph_by_id(graph)
+    }
+
+    pub(crate) fn graph_term_id_iter(&self) -> impl Iterator<Item = Result<TermId>> + '_ {
+        self.snapshot.graph_term_id_iter(self.store)
     }
 }
 
@@ -207,25 +233,110 @@ impl RdfReadView for StoreReadView<'_> {
     ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
         context.check_cancelled()?;
         let Some(pattern) = selector.apply(pattern) else {
-            return Ok(QueryCursor::empty(self.store, context, pattern));
+            context.record_access_path(ReadAccessPath::Empty);
+            return Ok(QueryCursor::empty(
+                self.store,
+                &self.snapshot,
+                context,
+                pattern,
+            ));
         };
         if let GraphSelector::Named(graph) = selector
             && !self.graph_is_visible(context, graph)?
         {
-            return Ok(QueryCursor::empty(self.store, context, pattern));
+            context.record_access_path(ReadAccessPath::Empty);
+            return Ok(QueryCursor::empty(
+                self.store,
+                &self.snapshot,
+                context,
+                pattern,
+            ));
         }
-        if matches!(selector, GraphSelector::Union)
-            && let Some(graphs) = self.union_graph_candidates(context, pattern)
+        if let (GraphSelector::Named(graph), Some(subject), Some(predicate), Some(object)) =
+            (selector, pattern.subject, pattern.predicate, pattern.object)
         {
-            return Ok(QueryCursor::graphs(self.store, context, graphs, pattern));
+            let quad = EncodedQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            };
+            context.record_access_path(ReadAccessPath::SourceGspo);
+            context.increment_index_seeks();
+            let candidate = self.snapshot.raw_quad_point(self.store, quad)?;
+            return Ok(QueryCursor::new(
+                self.store,
+                &self.snapshot,
+                context,
+                crate::query_cursor::RawQuadCursor::single(candidate),
+                pattern,
+            ));
         }
+
+        let requested = match self.read_mode {
+            QueryReadMode::Auto => Self::auto_access_path(selector, pattern),
+            QueryReadMode::ForceSource => ReadAccessPath::SourceGspo,
+            QueryReadMode::ForceQv => Self::forced_qv_access_path(selector, pattern),
+        };
+        if matches!(requested, ReadAccessPath::SourceGspo) {
+            if matches!(selector, GraphSelector::DefaultUnion) {
+                return Err(StoreError::QueryIndexUnavailable(
+                    "default-union-source-dedup-is-not-bounded",
+                ));
+            }
+            context.record_access_path(ReadAccessPath::SourceGspo);
+            context.increment_index_seeks();
+            return Ok(QueryCursor::new(
+                self.store,
+                &self.snapshot,
+                context,
+                self.snapshot.source_quad_cursor(self.store, pattern),
+                pattern,
+            ));
+        }
+
+        let admission = self.qv_admission(context)?;
+        if !admission.trusted {
+            if matches!(self.read_mode, QueryReadMode::ForceQv)
+                || matches!(selector, GraphSelector::DefaultUnion)
+            {
+                return Err(StoreError::QueryIndexUnavailable(
+                    admission.fallback_reason.unwrap_or("qv1-not-trusted"),
+                ));
+            }
+            context.record_access_path(ReadAccessPath::SourceGspo);
+            context.increment_index_seeks();
+            return Ok(QueryCursor::new(
+                self.store,
+                &self.snapshot,
+                context,
+                self.snapshot.source_quad_cursor(self.store, pattern),
+                pattern,
+            ));
+        }
+
+        context.record_access_path(requested);
         context.increment_index_seeks();
-        Ok(QueryCursor::new(
-            self.store,
-            context,
-            self.store.raw_quad_cursor(pattern),
-            pattern,
-        ))
+        let raw = self
+            .snapshot
+            .query_index_cursor(self.store, Self::qv_order(requested), pattern);
+        if matches!(selector, GraphSelector::DefaultUnion) {
+            Ok(QueryCursor::default_union(
+                self.store,
+                &self.snapshot,
+                context,
+                raw,
+                pattern,
+            ))
+        } else {
+            Ok(QueryCursor::new(
+                self.store,
+                &self.snapshot,
+                context,
+                raw,
+                pattern,
+            ))
+        }
     }
 
     fn exists(

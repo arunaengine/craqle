@@ -168,6 +168,33 @@ impl RawQuadCursor {
                 Some(Ok(RawQuadCandidate {
                     quad,
                     live: GraphStore::quad_value_is_live(value.as_ref()),
+                    storage: CandidateStorage::Source,
+                    bytes_read: (key.len() + value.len()) as u64,
+                }))
+            }
+            SourceIterator::QueryIndex {
+                iterator, order, ..
+            } => {
+                let guard = iterator.next()?;
+                let (key, value) = match guard.into_inner() {
+                    Ok(entry) => entry,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                if !value.as_ref().is_empty() {
+                    return Some(Err(crate::store::StoreError::InvalidEncoding {
+                        context: "qv1 query index value",
+                        message: format!("expected empty value, found {} bytes", value.len()),
+                    }));
+                }
+                let quad = match GraphStore::decode_query_index_key(*order, key.as_ref()) {
+                    Ok(quad) => quad,
+                    Err(error) => return Some(Err(error)),
+                };
+                Some(Ok(RawQuadCandidate {
+                    quad,
+                    live: true,
+                    storage: CandidateStorage::QueryIndex,
+                    bytes_read: (key.len() + value.len()) as u64,
                 }))
             }
             SourceIterator::PredicateObject {
@@ -187,6 +214,8 @@ impl RawQuadCursor {
                         object: *object,
                     },
                     live: true,
+                    storage: CandidateStorage::Source,
+                    bytes_read: 64,
                 }))
             }
             SourceIterator::Object {
@@ -209,6 +238,8 @@ impl RawQuadCursor {
                         object: *object,
                     },
                     live: true,
+                    storage: CandidateStorage::Source,
+                    bytes_read: 64,
                 }))
             }
             SourceIterator::Empty => None,
@@ -222,6 +253,7 @@ const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
 /// happen as each durable source candidate is consumed.
 pub(crate) struct QueryCursor<'store, 'context, 'visibility> {
     store: &'store GraphStore,
+    snapshot: &'store StoreReadSnapshot,
     context: &'context ReadContext<'visibility>,
     source: Option<QuerySource<'store>>,
     pattern: QuadPattern,
@@ -231,11 +263,10 @@ pub(crate) struct QueryCursor<'store, 'context, 'visibility> {
 
 enum QuerySource<'store> {
     Raw(RawQuadCursor),
-    Graphs {
-        graphs: Rc<Vec<TermId>>,
-        next_graph: usize,
-        current: Option<RawQuadCursor>,
-        pattern: QuadPattern,
+    DefaultUnion {
+        raw: RawQuadCursor,
+        current_group: Option<(TermId, TermId, TermId)>,
+        group_emitted: bool,
     },
     Delta(DeltaQuadCursor<'store>),
 }
@@ -243,12 +274,14 @@ enum QuerySource<'store> {
 impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
     pub(crate) fn new(
         store: &'store GraphStore,
+        snapshot: &'store StoreReadSnapshot,
         context: &'context ReadContext<'visibility>,
         raw: RawQuadCursor,
         pattern: QuadPattern,
     ) -> Self {
         Self {
             store,
+            snapshot,
             context,
             source: Some(QuerySource::Raw(raw)),
             pattern,
@@ -259,34 +292,15 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
 
     pub(crate) fn empty(
         store: &'store GraphStore,
+        snapshot: &'store StoreReadSnapshot,
         context: &'context ReadContext<'visibility>,
         pattern: QuadPattern,
     ) -> Self {
         Self {
             store,
+            snapshot,
             context,
             source: None,
-            pattern,
-            candidates_since_check: 0,
-            finished: false,
-        }
-    }
-
-    pub(crate) fn graphs(
-        store: &'store GraphStore,
-        context: &'context ReadContext<'visibility>,
-        graphs: Rc<Vec<TermId>>,
-        pattern: QuadPattern,
-    ) -> Self {
-        Self {
-            store,
-            context,
-            source: Some(QuerySource::Graphs {
-                graphs,
-                next_graph: 0,
-                current: None,
-                pattern,
-            }),
             pattern,
             candidates_since_check: 0,
             finished: false,
