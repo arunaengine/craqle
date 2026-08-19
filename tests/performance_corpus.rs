@@ -144,21 +144,70 @@ fn graph_coverage_visibility_and_orphan_metadata_are_available() {
 
 #[test]
 fn duplicate_percent_is_exact_and_cross_graph() {
-    for duplicate_percent in REQUIRED_DUPLICATE_PERCENTS {
-        let records: Vec<_> = corpus(config(10_000, 32, duplicate_percent, DEFAULT_SEED))
-            .into_iter()
-            .collect();
-        let expected = 10_000 * duplicate_percent as usize / 100;
-        let duplicate_records: Vec<_> = records.iter().filter(|record| record.duplicate).collect();
+    for graphs in [32, 1_000] {
+        for duplicate_percent in [0, 25, 90] {
+            let records: Vec<_> = corpus(config(10_000, graphs, duplicate_percent, DEFAULT_SEED))
+                .into_iter()
+                .collect();
+            let expected = 10_000 * duplicate_percent as usize / 100;
+            let duplicate_records: Vec<_> =
+                records.iter().filter(|record| record.duplicate).collect();
 
-        assert_eq!(duplicate_records.len(), expected);
-        for record in duplicate_records {
-            let source_ordinal = record
-                .source_ordinal
-                .expect("every duplicate must identify its canonical source");
-            let source = &records[source_ordinal];
-            assert_ne!(record.graph, source.graph);
-            assert_eq!(record.triple_key(), source.triple_key());
+            assert_eq!(duplicate_records.len(), expected);
+            for record in duplicate_records {
+                let source_ordinal = record
+                    .source_ordinal
+                    .expect("every duplicate must identify its canonical source");
+                let source = &records[source_ordinal];
+                assert_ne!(record.graph, source.graph);
+                assert_eq!(record.triple_key(), source.triple_key());
+            }
+        }
+    }
+}
+
+#[test]
+fn canonical_stars_and_chain_segments_stay_local() {
+    let records: Vec<_> = corpus(config(10_000, 1_000, 25, DEFAULT_SEED))
+        .into_iter()
+        .collect();
+
+    let mut star_graphs = BTreeMap::new();
+    let mut chain_graphs = BTreeMap::new();
+    for record in records.iter().filter(|record| !record.duplicate) {
+        match record.shape {
+            CorpusShape::SameSubjectStar => {
+                if let Some(previous) = star_graphs.insert(record.subject, record.graph) {
+                    assert_eq!(previous, record.graph, "star subject escaped its graph");
+                }
+            }
+            CorpusShape::LongChain => {
+                let segment = record.ordinal / 128;
+                if let Some(previous) = chain_graphs.insert(segment, record.graph) {
+                    assert_eq!(previous, record.graph, "chain segment escaped its graph");
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(!star_graphs.is_empty());
+    assert!(!chain_graphs.is_empty());
+}
+
+#[test]
+fn every_requested_10k_multigraph_configuration_covers_all_graphs() {
+    for graphs in [32, 1_000] {
+        let expected: BTreeSet<_> = (0..graphs as u32).collect();
+        for duplicate_percent in REQUIRED_DUPLICATE_PERCENTS {
+            let actual: BTreeSet<_> =
+                corpus(config(10_000, graphs, duplicate_percent, DEFAULT_SEED))
+                    .into_iter()
+                    .map(|record| record.graph)
+                    .collect();
+            assert_eq!(
+                actual, expected,
+                "missing graph for {graphs} / {duplicate_percent}%"
+            );
         }
     }
 }
