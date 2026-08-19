@@ -91,3 +91,7 @@ harness = false
 [[bench]]
 name = "large_rocrate_latency"
 harness = false
+
+[[bench]]
+name = "sparql_hot_path"
+harness = false
