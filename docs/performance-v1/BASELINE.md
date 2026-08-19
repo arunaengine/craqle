@@ -119,6 +119,62 @@ timings were:
 These are debug and small release smoke runs over the existing matrix, not the
 final deterministic corpus and not an SLO or release-performance claim.
 
+## Deterministic PR 0 harness
+
+PR 0 adds a fixed-seed streaming corpus generator for 10,000, 1,000,000, and
+10,000,000 quads; 1, 32, and 1,000 graphs; and 0%, 25%, and 90% cross-graph
+duplicate rates. The iterator has constant-sized state, large corpora are
+generated rather than committed, and focused tests pin exact counts, graph
+coverage, duplicate placement, property-star locality, chain locality, hidden
+graphs, and orphan metadata.
+
+The final lead-reviewed 10,000-quad, 32-graph, 25%-duplicate SPARQL smoke used:
+
+```sh
+CRAQLE_BENCH_WARMUP_SECS=1 CRAQLE_BENCH_MEASUREMENT_SECS=1 \
+  cargo bench --locked --bench sparql_hot_path
+```
+
+It recorded 10 rows for the bounded SELECT, 789 rows for COUNT, one unique
+property-star subject, and one unique join subject in both written orders.
+The observed intervals were:
+
+| Case | Criterion interval |
+| --- | ---: |
+| Bound ASK hit | 96.222-98.532 us |
+| Bound ASK miss | 93.711-96.587 us |
+| SELECT LIMIT 10 | 168.45-210.26 us |
+| Exact COUNT | 1.0523-1.2011 ms |
+| Same-subject property star | 135.74-142.98 us |
+| Rare-to-common join | 115.03-120.99 us |
+| Common-to-rare join | 117.24-120.97 us |
+
+These timings still measure fully collected public `QueryResults`. They do not
+claim time to first row or bounded underlying reads.
+
+The corresponding lead-run memory smoke used:
+
+```sh
+CRAQLE_BENCH_WARMUP_SECS=1 CRAQLE_BENCH_MEASUREMENT_SECS=1 \
+  cargo bench --locked --bench read_path_memory
+```
+
+The database occupied 67,869,510 bytes. Linux `/proc/self/status` samples were:
+
+| Phase/case | Result | VmRSS bytes | VmHWM bytes |
+| --- | ---: | ---: | ---: |
+| Before fixture | - | 6,201,344 | 6,803,456 |
+| After fixture | - | 261,709,824 | 268,898,304 |
+| Bound ASK hit | Boolean / 1 | 261,726,208 | 268,898,304 |
+| Fixed predicate-object LIMIT 10 | Solutions / 10 | 261,726,208 | 268,898,304 |
+| Broad visible union | Solutions / 7,496 | 261,963,776 | 268,898,304 |
+| Duplicate-heavy union | Solutions / 474 | 261,971,968 | 268,898,304 |
+
+VmRSS is coarse process-wide state and VmHWM is cumulative for the process;
+neither is a query-local allocator measurement. A no-default-feature smoke with
+`CRAQLE_MEMORY_BROAD_SCAN=0` also passed and explicitly reported the broad scan
+as skipped.
+
 ## Required metric capture
 
 No pre-instrumentation counters are inferred from elapsed time. A value is
@@ -126,20 +182,20 @@ listed only where the supplied run recorded it.
 
 | Required metric | Baseline value | Status / capture note |
 | --- | --- | --- |
-| Wall time | Debug fixture load `843.406222ms`; release fixture load `204.107551ms` | Partial; query p50s are above |
+| Wall time | Debug fixture load `843.406222ms`; release fixture load `204.107551ms`; deterministic query intervals above | Partial; completed-result time only |
 | First row / violation | — | Pending instrumentation |
 | Candidate quads | — | Pending instrumentation |
 | Matching quads | — | Pending instrumentation |
 | Index seeks | — | Pending instrumentation |
 | Graphs considered | — | Pending instrumentation; configured corpus graph counts are not a read-work counter |
 | Terms decoded | — | Pending instrumentation |
-| Rows emitted | Per-case counts in both timing tables | Captured |
+| Rows emitted | Per-case counts in the timing tables; memory cases report 1, 10, 7,496, and 474 | Captured for completed results |
 | Shape/focus pairs | — | Pending SHACL instrumentation |
 | Path edges | — | Pending instrumentation |
-| Allocated bytes | — | Pending instrumentation |
-| Peak RSS | — | Pending instrumentation |
+| Allocated bytes | — | No allocator instrumentation; encoded term payload bytes are not presented as allocations |
+| Peak RSS | Process VmHWM `268,898,304` bytes in the lead memory smoke | Coarse process-wide measurement |
 | Write p50 / p95 / p99 | — | Pending write harness/instrumentation |
-| Database bytes | — | Pending measurement harness |
+| Database bytes | `67,869,510` bytes for the final lead 10K memory smoke | Captured from the generated database directory |
 
 ## Known correctness and comparison gaps
 
@@ -150,8 +206,33 @@ ignored until PR3 changes the read/index path. PR0 does not alter production
 query semantics.
 
 An external Rudof SHACL comparison cannot run against this dependency state.
-It remains pending until the verified opt-in Rudof/SHACL dependencies land in
-PR1; no external validation result is fabricated here.
+Two exact-version compatibility probes explain why: Rudof's RDF dependencies
+enable `oxrdf` RDF 1.2 terms, exposing unhandled `Term::Triple` cases in
+`ro-crate-rs v0.6.0`; separately, published `shacl 0.3.8` fails to compile with
+its default `sparql` feature disabled because several validator imports and
+implementations are not consistently feature-gated. PR 1 must land the
+smallest reviewed source adjustment while keeping the released versions and
+proving the `sparql` feature absent. Until then, no external validation result
+is fabricated here.
+
+## PR 0 verification
+
+After every worker diff was read and the lead corrections landed, the
+integrated PR 0 tip passed:
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked --bench read_path_memory
+cargo check --locked --no-default-features --bench read_path_memory
+cargo clippy --locked --bench read_path_memory -- -D warnings
+cargo test --locked
+cargo test --locked --no-default-features
+```
+
+The two full test commands used the disk-backed lead target directory after
+disposable `/tmp` worktree build artifacts reached their filesystem quota. The
+initial quota failure occurred during linking and was not recorded as a test
+failure; both complete reruns passed.
 
 ## Ratio methodology
 
