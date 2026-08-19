@@ -945,6 +945,11 @@ impl CraqleNode {
         )?)
     }
 
+    /// Return the RO-Crate version from its live marker or retained context evidence.
+    pub fn crate_version(&self, graph: &GraphId) -> Result<RoCrateVersion> {
+        Ok(self.manager().crate_version(graph)?)
+    }
+
     /// Create a new RO-Crate graph.
     pub fn create_crate(
         &self,
@@ -952,6 +957,26 @@ impl CraqleNode {
         request: CreateCrateRequest,
     ) -> Result<Batch> {
         self.create_crate_with_durability(auth, request, CraqleRequestDurability::Durable)
+    }
+
+    /// Create a new RO-Crate graph with an explicit schema version and optional
+    /// license override.
+    pub fn create_crate_with_options(
+        &self,
+        auth: &dyn Authorizer,
+        mut request: CreateCrateRequest,
+        options: CreateCrateOptions,
+    ) -> Result<Batch> {
+        if let Some(license) = options.license {
+            request.license = Some(license);
+        }
+        self.create_crate_with_durability_as_version(
+            auth,
+            request,
+            CraqleRequestDurability::Durable,
+            None,
+            options.version,
+        )
     }
 
     /// Create a new RO-Crate graph with an explicit request durability policy.
@@ -975,6 +1000,24 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
         actor: Option<ActorId>,
     ) -> Result<Batch> {
+        self.create_crate_with_durability_as_version(
+            auth,
+            request,
+            durability,
+            actor,
+            RoCrateVersion::default(),
+        )
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
+    fn create_crate_with_durability_as_version(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+        version: RoCrateVersion,
+    ) -> Result<Batch> {
         let CreateCrateRequest {
             graph,
             name,
@@ -985,13 +1028,25 @@ impl CraqleNode {
         } = request;
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self.manager_with(durability, actor).create_crate(
-            graph.clone(),
-            &name,
-            &description,
-            &date_published,
-            license.as_deref(),
-        )?;
+        let manager = self.manager_with(durability, actor);
+        let batch = if version == RoCrateVersion::default() {
+            manager.create_crate(
+                graph.clone(),
+                &name,
+                &description,
+                &date_published,
+                license.as_deref(),
+            )?
+        } else {
+            manager.create_crate_with_version(
+                graph.clone(),
+                &name,
+                &description,
+                &date_published,
+                license.as_deref(),
+                version,
+            )?
+        };
         self.persist_graph_policy_with_durability(&graph, policy, durability)?;
         self.finish_batch_with_durability(&graph, batch, durability)
     }
