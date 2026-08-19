@@ -1226,6 +1226,358 @@ mod tests {
     }
 
     #[test]
+    fn dataset_cursor_stops_after_the_first_accepted_row() {
+        let (_dir, store, _search, _engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dataset:early-stop");
+        for index in 0..64 {
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:dataset:early-stop:{index:03}"),
+                "urn:test:dataset:early-stop:p",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                    index.to_string(),
+                ))),
+            );
+        }
+
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let dataset = StoreDataset::new(&view, &context);
+        let predicate = dataset
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(
+                "urn:test:dataset:early-stop:p",
+            )))
+            .unwrap();
+        let mut rows = dataset.internal_quads_for_pattern(None, Some(&predicate), None, None);
+        let row = rows.next().unwrap().unwrap();
+        assert!(matches!(
+            dataset.externalize_term(row.subject).unwrap(),
+            Term::NamedNode(_)
+        ));
+        drop(rows);
+
+        let statistics = context.snapshot();
+        assert_eq!(statistics.index_seeks, 1);
+        assert_eq!(statistics.matching_quads, 1);
+        assert_eq!(statistics.terms_decoded, 1);
+        assert!(
+            statistics.candidate_quads < 64,
+            "the first accepted row must not drain the matching range: {statistics:?}"
+        );
+    }
+
+    #[test]
+    fn named_dataset_cursor_is_lazy_and_matches_the_compatibility_collector() {
+        let (_dir, store, _search, _engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dataset:named");
+        for index in 0..24 {
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:dataset:named:{index:03}"),
+                "urn:test:dataset:named:p",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                    index.to_string(),
+                ))),
+            );
+        }
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:dataset:named:other",
+            "urn:test:dataset:named:other-p",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("other"))),
+        );
+
+        let graph_id = store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .unwrap();
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let dataset = StoreDataset::new(&view, &context);
+        let graph_term = dataset
+            .internalize_term(Term::NamedNode(graph.0.clone()))
+            .unwrap();
+        let subject = dataset
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(
+                "urn:test:dataset:named:004",
+            )))
+            .unwrap();
+        let predicate = dataset
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(
+                "urn:test:dataset:named:p",
+            )))
+            .unwrap();
+        let object = dataset
+            .internalize_term(Term::Literal(Literal::new_simple_literal("4")))
+            .unwrap();
+        let term_id = |term: Option<&StoreTerm>| match term {
+            Some(StoreTerm::Existing(id)) => Some(*id),
+            Some(StoreTerm::Missing(_)) => panic!("fixture term should be interned"),
+            None => None,
+        };
+
+        for (subject, predicate, object) in [
+            (None, None, None),
+            (Some(&subject), None, None),
+            (None, Some(&predicate), None),
+            (None, None, Some(&object)),
+            (None, Some(&predicate), Some(&object)),
+        ] {
+            let mut streamed: Vec<_> = dataset
+                .internal_quads_for_pattern(subject, predicate, object, Some(Some(&graph_term)))
+                .map(|quad| {
+                    let quad = quad.unwrap();
+                    let StoreTerm::Existing(subject) = quad.subject else {
+                        panic!("stored subject should be interned");
+                    };
+                    let StoreTerm::Existing(predicate) = quad.predicate else {
+                        panic!("stored predicate should be interned");
+                    };
+                    let StoreTerm::Existing(object) = quad.object else {
+                        panic!("stored object should be interned");
+                    };
+                    (subject, predicate, object)
+                })
+                .collect();
+            let mut collected: Vec<_> = store
+                .quads_for_pattern(
+                    Some(graph_id),
+                    term_id(subject),
+                    term_id(predicate),
+                    term_id(object),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|quad| (quad.subject, quad.predicate, quad.object))
+                .collect();
+            streamed.sort_unstable();
+            collected.sort_unstable();
+            assert_eq!(streamed, collected);
+        }
+        drop(dataset);
+
+        let context = ReadContext::default();
+        let dataset = StoreDataset::new(&view, &context);
+        let mut rows = dataset.internal_quads_for_pattern(
+            None,
+            Some(&predicate),
+            None,
+            Some(Some(&graph_term)),
+        );
+        assert!(rows.next().unwrap().is_ok());
+        drop(rows);
+        let statistics = context.snapshot();
+        assert_eq!(statistics.index_seeks, 1);
+        assert_eq!(statistics.matching_quads, 1);
+        assert!(
+            statistics.candidate_quads < 24,
+            "a named scan must not drain its matching range: {statistics:?}"
+        );
+    }
+
+    #[test]
+    fn shared_dataset_visibility_memoizes_and_hides_orphans() {
+        let (_dir, store, _search, _engine) = setup_engine();
+        let visible_graph = GraphId::new("urn:test:dataset:visible");
+        let hidden_graph = GraphId::new("urn:test:dataset:hidden");
+        let predicate = "urn:test:dataset:visibility:p";
+        let object = EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("shared")));
+        insert_quad(
+            &store,
+            &visible_graph,
+            "urn:test:dataset:visible:kept",
+            predicate,
+            object.clone(),
+        );
+        insert_quad(
+            &store,
+            &visible_graph,
+            "./data/orphan.txt",
+            predicate,
+            object.clone(),
+        );
+        insert_quad(
+            &store,
+            &hidden_graph,
+            "urn:test:dataset:hidden:row",
+            predicate,
+            object.clone(),
+        );
+        store
+            .set_graph_diagnostics(
+                &visible_graph,
+                &GraphDiagnostics::from_orphaned_entities(vec!["./data/orphan.txt".to_string()]),
+            )
+            .unwrap();
+
+        let calls: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+        let visible = |graph: &GraphId| {
+            *calls
+                .borrow_mut()
+                .entry(graph.as_str().to_string())
+                .or_insert(0) += 1;
+            graph == &visible_graph
+        };
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::with_graph_visibility(QueryCancellation::new(), &visible);
+        let dataset = StoreDataset::new(&view, &context);
+        let predicate = dataset
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(predicate)))
+            .unwrap();
+        let object = dataset
+            .internalize_term(Term::Literal(Literal::new_simple_literal("shared")))
+            .unwrap();
+        let rows: Vec<_> = dataset
+            .internal_quads_for_pattern(None, Some(&predicate), Some(&object), None)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let statistics = context.snapshot();
+        drop(dataset);
+        drop(context);
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.values().all(|&count| count == 1), "{calls:?}");
+        assert_eq!(statistics.graphs_considered, 2);
+        assert_eq!(statistics.matching_quads, 1);
+        assert_eq!(statistics.candidate_quads, 2);
+    }
+
+    #[test]
+    fn union_copy_multiplicity_and_direct_default_dedup_remain_distinct() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph1 = GraphId::new("urn:test:dataset:copies:1");
+        let graph2 = GraphId::new("urn:test:dataset:copies:2");
+        let object = EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("same")));
+        for graph in [&graph1, &graph2] {
+            insert_quad(
+                &store,
+                graph,
+                "urn:test:dataset:copy",
+                "urn:test:dataset:copy:p",
+                object.clone(),
+            );
+        }
+
+        let public_rows = solution_rows(
+            engine
+                .query("SELECT ?s WHERE { ?s <urn:test:dataset:copy:p> \"same\" }")
+                .unwrap(),
+        );
+        assert_eq!(public_rows.len(), 2);
+
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let dataset = StoreDataset::new(&view, &context);
+        let predicate = dataset
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(
+                "urn:test:dataset:copy:p",
+            )))
+            .unwrap();
+        let object = dataset
+            .internalize_term(Term::Literal(Literal::new_simple_literal("same")))
+            .unwrap();
+        let named_copies: Vec<_> = dataset
+            .internal_quads_for_pattern(None, Some(&predicate), Some(&object), None)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(named_copies.len(), 2);
+        assert!(named_copies.iter().all(|quad| quad.graph_name.is_some()));
+
+        let direct_default: Vec<_> = dataset
+            .internal_quads_for_pattern(None, Some(&predicate), Some(&object), Some(None))
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(direct_default.len(), 1);
+        assert!(direct_default.iter().all(|quad| quad.graph_name.is_none()));
+    }
+
+    #[test]
+    fn ask_hit_miss_and_limit_ten_remain_supported() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dataset:limit");
+        for index in 0..12 {
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:dataset:limit:{index:03}"),
+                "urn:test:dataset:limit:p",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                    index.to_string(),
+                ))),
+            );
+        }
+
+        assert_eq!(
+            engine
+                .query("ASK { ?s <urn:test:dataset:limit:p> ?o }")
+                .unwrap(),
+            QueryResults::Boolean(true)
+        );
+        assert_eq!(
+            engine
+                .query("ASK { <urn:test:dataset:missing> <urn:test:dataset:limit:p> ?o }")
+                .unwrap(),
+            QueryResults::Boolean(false)
+        );
+        assert_eq!(
+            solution_rows(
+                engine
+                    .query("SELECT ?s WHERE { ?s <urn:test:dataset:limit:p> ?o } LIMIT 10")
+                    .unwrap(),
+            )
+            .len(),
+            10
+        );
+
+        let ask = SparqlParser::new()
+            .parse_query(&format!(
+                "{COMMON_PREFIXES}ASK {{ ?s <urn:test:dataset:limit:p> ?o }}"
+            ))
+            .unwrap();
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let evaluator = QueryEvaluator::new();
+        let mut prepared = evaluator.prepare(&ask);
+        prepared.dataset_mut().set_default_graph_as_union();
+        assert!(matches!(
+            prepared
+                .execute(StoreDataset::new(&view, &context))
+                .unwrap(),
+            spareval::QueryResults::Boolean(true)
+        ));
+        let statistics = context.snapshot();
+        assert_eq!(statistics.index_seeks, 1);
+        assert_eq!(statistics.candidate_quads, 1);
+        assert_eq!(statistics.matching_quads, 1);
+
+        let limit = SparqlParser::new()
+            .parse_query(&format!(
+                "{COMMON_PREFIXES}SELECT ?s WHERE {{ ?s <urn:test:dataset:limit:p> ?o }} LIMIT 10"
+            ))
+            .unwrap();
+        let context = ReadContext::default();
+        let evaluator = QueryEvaluator::new();
+        let mut prepared = evaluator.prepare(&limit);
+        prepared.dataset_mut().set_default_graph_as_union();
+        let rows = collect_query_results(
+            prepared
+                .execute(StoreDataset::new(&view, &context))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(solution_rows(rows).len(), 10);
+        let statistics = context.snapshot();
+        assert_eq!(statistics.index_seeks, 1);
+        assert_eq!(statistics.candidate_quads, 10);
+        assert_eq!(statistics.matching_quads, 10);
+    }
+
+    #[test]
     fn select_queries_use_union_default_graph() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:g1");
