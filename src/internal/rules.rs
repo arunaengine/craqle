@@ -1456,4 +1456,283 @@ mod tests {
         }
     }
 
+    mod delta_differential {
+        use std::collections::BTreeSet;
+
+        use super::*;
+        use crate::core::{ActorId, Dot};
+        use crate::store::{ClockUpdate, CounterKey, QuadAdd};
+        use proptest::prelude::*;
+
+        type Triple = (EncodedTerm, EncodedTerm, EncodedTerm);
+
+        fn put(store: &GraphStore, graph: &GraphId, triple: &Triple) {
+            if !store.contains_graph(graph).unwrap() {
+                store.create_graph(graph).unwrap();
+            }
+            let graph_id = store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap();
+            let quad = crate::store::EncodedQuad {
+                graph: graph_id,
+                subject: store.resolve_term(&triple.0).unwrap(),
+                predicate: store.resolve_term(&triple.1).unwrap(),
+                object: store.resolve_term(&triple.2).unwrap(),
+            };
+            let _guard = store.graph_commit_guard(graph);
+            let actor = ActorId::random();
+            let mut batch = store.new_batch();
+            let counter = store
+                .next_counter(&mut batch, CounterKey { graph_id, actor })
+                .unwrap();
+            assert!(
+                store
+                    .insert_quad(
+                        &mut batch,
+                        QuadAdd {
+                            quad,
+                            dot: Dot { actor, counter },
+                        },
+                    )
+                    .unwrap()
+            );
+            let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+            clock.advance(actor, counter);
+            store
+                .set_vector_clock(
+                    &mut batch,
+                    ClockUpdate {
+                        graph_id,
+                        clock: &clock,
+                    },
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+        }
+
+        fn literal(value: &str) -> EncodedTerm {
+            EncodedTerm(format!("\"{value}\""))
+        }
+
+        fn valid_base(graph: &GraphId) -> Vec<Triple> {
+            let root = graph_root(graph);
+            let child = EncodedTerm("<urn:test:differential:child>".to_string());
+            vec![
+                (root.clone(), RDF_TYPE.clone(), SCHEMA_DATASET.clone()),
+                (root.clone(), SCHEMA_NAME.clone(), literal("base")),
+                (root.clone(), SCHEMA_DESCRIPTION.clone(), literal("base")),
+                (
+                    root.clone(),
+                    SCHEMA_DATE_PUBLISHED.clone(),
+                    literal("2026-01-01"),
+                ),
+                (
+                    METADATA_DESCRIPTOR.clone(),
+                    RDF_TYPE.clone(),
+                    SCHEMA_CREATIVE_WORK.clone(),
+                ),
+                (
+                    METADATA_DESCRIPTOR.clone(),
+                    SCHEMA_ABOUT.clone(),
+                    root.clone(),
+                ),
+                (root.clone(), SCHEMA_HAS_PART.clone(), child.clone()),
+                (child, RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+            ]
+        }
+
+        fn palette(graph: &GraphId) -> Vec<Triple> {
+            let root = graph_root(graph);
+            let child = EncodedTerm("<urn:test:differential:child>".to_string());
+            let extra = EncodedTerm("<urn:test:differential:extra>".to_string());
+            let untyped = EncodedTerm("<urn:test:differential:untyped>".to_string());
+            let mut triples = valid_base(graph);
+            triples.extend([
+                (root.clone(), SCHEMA_NAME.clone(), literal("other-name")),
+                (
+                    root.clone(),
+                    SCHEMA_DATE_PUBLISHED.clone(),
+                    literal("2026-02-02"),
+                ),
+                (extra.clone(), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+                (root.clone(), SCHEMA_HAS_PART.clone(), extra),
+                (untyped, SCHEMA_NAME.clone(), literal("untyped")),
+                (child, SCHEMA_NAME.clone(), literal("child")),
+            ]);
+            triples
+        }
+
+        fn materialize(graph: &GraphId, triple: Triple, inserted: bool) -> MaterializedQuadChange {
+            let (subject, predicate, object) = triple;
+            if inserted {
+                MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject,
+                    predicate,
+                    object,
+                }
+            } else {
+                MaterializedQuadChange::Delete {
+                    graph: graph.clone(),
+                    subject,
+                    predicate,
+                    object,
+                }
+            }
+        }
+
+        fn final_snapshot(
+            graph: &GraphId,
+            base: &[Triple],
+            changes: &[MaterializedQuadChange],
+        ) -> GraphSnapshot {
+            let mut triples: BTreeSet<Triple> = base.iter().cloned().collect();
+            for change in changes {
+                match change {
+                    MaterializedQuadChange::Insert {
+                        subject,
+                        predicate,
+                        object,
+                        ..
+                    } => {
+                        triples.insert((subject.clone(), predicate.clone(), object.clone()));
+                    }
+                    MaterializedQuadChange::Delete {
+                        subject,
+                        predicate,
+                        object,
+                        ..
+                    } => {
+                        triples.remove(&(subject.clone(), predicate.clone(), object.clone()));
+                    }
+                }
+            }
+            GraphSnapshot::new(graph.clone(), triples.into_iter().collect())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(32))]
+
+            /// The optimized candidate path must agree with a full, deterministic
+            /// post-state evaluation over duplicate, no-op, and reordered writes.
+            #[test]
+            fn candidate_rules_match_full_post_state(
+                operations in proptest::collection::vec((0usize..14, any::<bool>()), 0..24),
+            ) {
+                let directory = tempfile::tempdir().unwrap();
+                let store = GraphStore::open(directory.path()).unwrap();
+                let graph = GraphId::new("urn:test:delta-rule-differential");
+                let base = valid_base(&graph);
+                for triple in &base {
+                    put(&store, &graph, triple);
+                }
+                let palette = palette(&graph);
+                let changes: Vec<_> = operations
+                    .into_iter()
+                    .map(|(slot, inserted)| materialize(&graph, palette[slot % palette.len()].clone(), inserted))
+                    .collect();
+                let rules = default_rules();
+
+                let actual = match validate_change_set(
+                    &rules,
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &changes,
+                    },
+                ) {
+                    Ok(()) => Vec::new(),
+                    Err(RuleEvaluationError::Violations(violations)) => violations,
+                    Err(RuleEvaluationError::Store(error)) => panic!("unexpected store error: {error}"),
+                };
+                let snapshot = final_snapshot(&graph, &base, &changes);
+                let expected: Vec<_> = rules
+                    .iter()
+                    .filter_map(|rule| rule.check_post_state(&snapshot).err())
+                    .collect();
+                prop_assert_eq!(actual, expected);
+            }
+        }
+
+        struct ExplicitSnapshotRule {
+            marker: Triple,
+        }
+
+        impl Rule for ExplicitSnapshotRule {
+            fn check_candidate(&self, _: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
+                Ok(CandidateCheck::NeedSnapshot)
+            }
+
+            fn check_post_state(
+                &self,
+                post: &GraphSnapshot,
+            ) -> std::result::Result<(), CrateViolation> {
+                let (subject, predicate, object) = &self.marker;
+                if post.has_triple(EncodedTripleRef {
+                    subject,
+                    predicate,
+                    object,
+                }) {
+                    Ok(())
+                } else {
+                    Err(CrateViolation::missing_root(""))
+                }
+            }
+        }
+
+        #[test]
+        fn snapshot_fallback_applies_delta_but_normal_candidates_do_not_materialize() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(directory.path()).unwrap();
+            let graph = GraphId::new("urn:test:snapshot-fallback");
+            let base = valid_base(&graph);
+            for triple in &base {
+                put(&store, &graph, triple);
+            }
+
+            let root = graph_root(&graph);
+            let ordinary = MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: root.clone(),
+                predicate: SCHEMA_NAME.clone(),
+                object: literal("another-name"),
+            };
+            SNAPSHOT_READS.with(|reads| reads.set(0));
+            assert!(
+                validate_change_set(
+                    &default_rules(),
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &[ordinary],
+                    },
+                )
+                .is_ok()
+            );
+            assert_eq!(0, SNAPSHOT_READS.with(|reads| reads.get()));
+
+            let marker = (
+                root,
+                EncodedTerm("<urn:test:snapshot:predicate>".to_string()),
+                literal("marker"),
+            );
+            let delta = vec![materialize(&graph, marker.clone(), true)];
+            let rules: Vec<Box<dyn Rule>> = vec![Box::new(ExplicitSnapshotRule {
+                marker: marker.clone(),
+            })];
+            SNAPSHOT_READS.with(|reads| reads.set(0));
+            assert!(
+                validate_change_set(
+                    &rules,
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &delta,
+                    },
+                )
+                .is_ok()
+            );
+            assert_eq!(1, SNAPSHOT_READS.with(|reads| reads.get()));
+        }
+    }
 }
