@@ -2720,6 +2720,197 @@ impl GraphStore {
         Ok(())
     }
 
+    fn clear_query_index_keyspace(&self, keyspace: &Keyspace, retain_header: bool) -> Result<()> {
+        let snapshot = self.db.snapshot();
+        let mut batch = self.buffered_batch();
+        let mut pending = 0usize;
+        for guard in snapshot.iter(keyspace) {
+            let (key, _) = guard.into_inner()?;
+            if retain_header && key.as_ref() == QUERY_INDEX_HEADER_KEY {
+                continue;
+            }
+            batch.remove(keyspace, key);
+            pending += 1;
+            if pending == QUERY_INDEX_BUILD_CHUNK_ROWS {
+                self.commit_fjall_batch(batch)?;
+                batch = self.buffered_batch();
+                pending = 0;
+            }
+        }
+        if pending != 0 {
+            self.commit_fjall_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn clear_query_index_derived_data(&self) -> Result<()> {
+        self.clear_query_index_keyspace(&self.qv1_gpos, false)?;
+        self.clear_query_index_keyspace(&self.qv1_spog, false)?;
+        self.clear_query_index_keyspace(&self.qv1_posg, false)?;
+        self.clear_query_index_keyspace(&self.qv1_meta, true)
+    }
+
+    fn build_query_index_chunk(&self, quads: &[EncodedQuad], source_epoch: u64) -> Result<()> {
+        let mut increments = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, u64)>::new();
+        let mut predicates = BTreeSet::new();
+        let mut batch = self.buffered_batch();
+        for quad in quads {
+            batch.insert(&self.qv1_gpos, qv1_gpos_key(*quad), Vec::<u8>::new());
+            batch.insert(&self.qv1_spog, qv1_spog_key(*quad), Vec::<u8>::new());
+            batch.insert(&self.qv1_posg, qv1_posg_key(*quad), Vec::<u8>::new());
+            predicates.insert(quad.predicate);
+            for counter in query_index_live_counter_keys(*quad) {
+                let entry = increments.entry(counter.bytes()).or_insert((counter, 0));
+                entry.1 =
+                    entry
+                        .1
+                        .checked_add(1)
+                        .ok_or(StoreError::QueryIndexVerificationFailed(
+                            "rebuild-counter-overflow",
+                        ))?;
+            }
+        }
+        for (_, (counter, increment)) in increments {
+            let current = match self.qv1_meta.get(counter.bytes())? {
+                None => 0,
+                Some(value) => decode_query_index_u64(value.as_ref()).ok_or(
+                    StoreError::QueryIndexVerificationFailed("rebuild-counter-malformed"),
+                )?,
+            };
+            let next =
+                current
+                    .checked_add(increment)
+                    .ok_or(StoreError::QueryIndexVerificationFailed(
+                        "rebuild-counter-overflow",
+                    ))?;
+            batch.insert(&self.qv1_meta, counter.bytes(), next.to_be_bytes());
+        }
+        for predicate in predicates {
+            batch.insert(
+                &self.qv1_meta,
+                QueryIndexCounterKey::PredicateMutationEpoch(predicate).bytes(),
+                source_epoch.to_be_bytes(),
+            );
+        }
+        self.commit_fjall_batch(batch)
+    }
+
+    fn build_query_index_rows(&self, snapshot: &Snapshot, source_epoch: u64) -> Result<u64> {
+        let mut rows = 0u64;
+        let mut chunk = Vec::with_capacity(QUERY_INDEX_BUILD_CHUNK_ROWS);
+        for guard in snapshot.iter(&self.quads) {
+            let (key, value) = guard.into_inner()?;
+            if dot_payload_is_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = decode_source_quad_key(key.as_ref()).ok_or(
+                StoreError::QueryIndexVerificationFailed("rebuild-source-key-malformed"),
+            )?;
+            rows = rows
+                .checked_add(1)
+                .ok_or(StoreError::QueryIndexVerificationFailed(
+                    "rebuild-source-count-overflow",
+                ))?;
+            chunk.push(quad);
+            if chunk.len() == QUERY_INDEX_BUILD_CHUNK_ROWS {
+                self.build_query_index_chunk(&chunk, source_epoch)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            self.build_query_index_chunk(&chunk, source_epoch)?;
+        }
+        Ok(rows)
+    }
+
+    fn mark_query_index_rebuild_failed(&self, reason: &'static str) -> Result<()> {
+        let snapshot = self.db.snapshot();
+        let previous = match self.query_index_header_from_snapshot(&snapshot)? {
+            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        };
+        let mut batch = self.buffered_batch();
+        self.stage_query_index_failed(&mut batch, previous.as_ref(), reason);
+        self.commit_fjall_batch(batch)
+    }
+
+    pub(crate) fn rebuild_query_indexes(&self) -> Result<()> {
+        let _indexes = self.indexes_write();
+        let initial_snapshot = self.db.snapshot();
+        let previous = match self.query_index_header_from_snapshot(&initial_snapshot)? {
+            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        };
+        let mut building = previous
+            .clone()
+            .unwrap_or_else(QueryIndexHeader::empty_ready);
+        building.state = StoredQueryIndexState::Building;
+        {
+            let mut batch = self.buffered_batch();
+            self.stage_query_index_header(&mut batch, &building);
+            self.commit_fjall_batch(batch)?;
+        }
+
+        let result = (|| -> Result<()> {
+            self.clear_query_index_derived_data()?;
+            let source_snapshot = self.db.snapshot();
+            let source_sequence = source_snapshot.seqno();
+            let last_build_sequence = previous
+                .as_ref()
+                .filter(|header| header.last_build_sequence <= source_sequence)
+                .and_then(|header| header.last_build_sequence.checked_add(1))
+                .map(|next| next.max(source_sequence))
+                .unwrap_or(source_sequence);
+            let source_epoch = previous
+                .as_ref()
+                .filter(|header| {
+                    header.source_epoch <= source_sequence && header.index_epoch <= source_sequence
+                })
+                .map(|header| header.source_epoch.max(header.index_epoch))
+                .and_then(|prior| prior.max(source_sequence).checked_add(1))
+                .unwrap_or(source_sequence);
+            let source_live_quads = self.build_query_index_rows(&source_snapshot, source_epoch)?;
+            let candidate = QueryIndexHeader {
+                state: StoredQueryIndexState::Building,
+                source_epoch,
+                index_epoch: source_epoch,
+                source_live_quads,
+                indexed_quads: source_live_quads,
+                last_build_sequence,
+            };
+            {
+                let mut batch = self.buffered_batch();
+                batch.insert(
+                    &self.qv1_meta,
+                    QUERY_INDEX_TOTAL_KEY,
+                    source_live_quads.to_be_bytes(),
+                );
+                self.stage_query_index_header(&mut batch, &candidate);
+                self.commit_fjall_batch(batch)?;
+            }
+            let verification_snapshot = self.db.snapshot();
+            let report = self.verify_query_index_snapshot(
+                &verification_snapshot,
+                true,
+                QueryIndexVerificationExpectation::BuildingCandidate,
+            )?;
+            if !report.valid {
+                return Err(StoreError::QueryIndexVerificationFailed(
+                    "rebuild-verification-failed",
+                ));
+            }
+            let mut ready = candidate;
+            ready.state = StoredQueryIndexState::Ready;
+            let mut batch = self.buffered_batch();
+            self.stage_query_index_header(&mut batch, &ready);
+            self.commit_fjall_batch(batch)
+        })();
+        if result.is_err() {
+            let _ = self.mark_query_index_rebuild_failed("rebuild-failed");
+        }
+        result
+    }
+
     /// Commit a batch and publish its in-memory half.
     ///
     /// An [`IndexApply::Anomaly`] means the index drifted from the store, so it
