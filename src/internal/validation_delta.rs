@@ -955,4 +955,323 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn exists_and_bounded_count_stop_after_their_cap() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:early-stop");
+        for index in 0..3 {
+            add_quad(
+                &store,
+                &graph,
+                &format!("urn:test:s{index}"),
+                "urn:test:p",
+                &format!("urn:test:o{index}"),
+            );
+        }
+        let changes = vec![insert(
+            &graph,
+            "urn:test:overlay",
+            "urn:test:q",
+            "urn:test:r",
+        )];
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+
+        let point = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let (subject, predicate, object) =
+            ids(&view, &point, "urn:test:s0", "urn:test:p", "urn:test:o0");
+        assert!(
+            view.exists(
+                &point,
+                GraphSelector::Named(view.graph()),
+                QuadPattern {
+                    subject: Some(subject),
+                    predicate: Some(predicate),
+                    object: Some(object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(1, point.snapshot().index_seeks);
+        assert_eq!(1, point.snapshot().candidate_quads);
+        assert_eq!(1, point.snapshot().matching_quads);
+
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert!(
+            view.exists(
+                &context,
+                GraphSelector::Named(view.graph()),
+                QuadPattern::default(),
+            )
+            .unwrap()
+        );
+        assert_eq!(1, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().matching_quads);
+        assert_eq!(2, context.snapshot().index_seeks);
+
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert_eq!(
+            2,
+            view.count_up_to(
+                &context,
+                GraphSelector::Named(view.graph()),
+                QuadPattern::default(),
+                2,
+            )
+            .unwrap()
+        );
+        assert_eq!(2, context.snapshot().candidate_quads);
+        assert_eq!(2, context.snapshot().matching_quads);
+        assert_eq!(2, context.snapshot().index_seeks);
+
+        let zero = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert_eq!(
+            0,
+            view.count_up_to(
+                &zero,
+                GraphSelector::Named(view.graph()),
+                QuadPattern::default(),
+                0,
+            )
+            .unwrap()
+        );
+        assert_eq!(0, zero.snapshot().index_seeks);
+        assert_eq!(0, zero.snapshot().candidate_quads);
+    }
+
+    #[test]
+    fn overlay_ranges_stop_after_two_matching_count_forward_and_inverse_rows() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:overlay-ranges");
+        let forward_subject = "urn:test:forward:subject";
+        let forward_predicate = "urn:test:forward:predicate";
+        let inverse_predicate = "urn:test:inverse:predicate";
+        let inverse_object = "urn:test:inverse:object";
+        let mut changes: Vec<_> = (0..128)
+            .map(|index| {
+                insert(
+                    &graph,
+                    &format!("urn:test:unrelated:subject:{index}"),
+                    "urn:test:unrelated:predicate",
+                    &format!("urn:test:unrelated:object:{index}"),
+                )
+            })
+            .collect();
+        for index in 0..3 {
+            changes.push(insert(
+                &graph,
+                forward_subject,
+                forward_predicate,
+                &format!("urn:test:forward:object:{index}"),
+            ));
+            changes.push(insert(
+                &graph,
+                &format!("urn:test:inverse:subject:{index}"),
+                inverse_predicate,
+                inverse_object,
+            ));
+        }
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let lookup = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let forward_subject = view
+            .lookup_term(&lookup, &named(forward_subject))
+            .unwrap()
+            .unwrap();
+        let forward_predicate = view
+            .lookup_term(&lookup, &named(forward_predicate))
+            .unwrap()
+            .unwrap();
+        let inverse_predicate = view
+            .lookup_term(&lookup, &named(inverse_predicate))
+            .unwrap()
+            .unwrap();
+        let inverse_object = view
+            .lookup_term(&lookup, &named(inverse_object))
+            .unwrap()
+            .unwrap();
+
+        let count = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        assert_eq!(
+            2,
+            view.count_up_to(
+                &count,
+                GraphSelector::Named(view.graph()),
+                QuadPattern {
+                    subject: Some(forward_subject),
+                    ..QuadPattern::default()
+                },
+                2,
+            )
+            .unwrap()
+        );
+        assert_eq!(2, count.snapshot().candidate_quads);
+        assert_eq!(2, count.snapshot().matching_quads);
+
+        let forward = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let mut cursor = view
+            .forward_predicate(
+                &forward,
+                GraphSelector::Named(view.graph()),
+                forward_subject,
+                forward_predicate,
+            )
+            .unwrap();
+        assert!(cursor.next().unwrap().is_ok());
+        assert!(cursor.next().unwrap().is_ok());
+        assert_eq!(2, forward.snapshot().candidate_quads);
+        assert_eq!(2, forward.snapshot().matching_quads);
+
+        let inverse = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let mut cursor = view
+            .inverse_predicate(
+                &inverse,
+                GraphSelector::Named(view.graph()),
+                inverse_predicate,
+                inverse_object,
+            )
+            .unwrap();
+        assert!(cursor.next().unwrap().is_ok());
+        assert!(cursor.next().unwrap().is_ok());
+        assert_eq!(2, inverse.snapshot().candidate_quads);
+        assert_eq!(2, inverse.snapshot().matching_quads);
+        assert!(changes.len() > 2);
+    }
+
+    #[test]
+    fn cancellation_stops_a_large_overlay_scan() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:overlay-cancellation");
+        let changes: Vec<_> = (0..1_025)
+            .map(|index| {
+                insert(
+                    &graph,
+                    &format!("urn:test:s{index}"),
+                    "urn:test:p",
+                    &format!("urn:test:o{index}"),
+                )
+            })
+            .collect();
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let cancellation = QueryCancellation::new();
+        let context = ReadContext::for_validation(cancellation.clone(), &graph);
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(view.graph()),
+                QuadPattern::default(),
+            )
+            .unwrap();
+        for _ in 0..1_024 {
+            assert!(cursor.next().unwrap().is_ok());
+        }
+        cancellation.cancel();
+        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
+        assert_eq!(1_024, context.snapshot().candidate_quads);
+        assert!(cursor.next().is_none());
+    }
+
+    #[test]
+    fn final_forward_and_inverse_walks_include_the_overlay() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:walks");
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:root",
+            "urn:test:hasPart",
+            "urn:test:old",
+        );
+        let changes = vec![
+            delete(&graph, "urn:test:root", "urn:test:hasPart", "urn:test:old"),
+            insert(&graph, "urn:test:root", "urn:test:hasPart", "urn:test:new"),
+        ];
+        let index = DeltaIndex::build(&store, &graph, &changes).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let (root, predicate, new) = ids(
+            &view,
+            &context,
+            "urn:test:root",
+            "urn:test:hasPart",
+            "urn:test:new",
+        );
+        let forward: Vec<_> = view
+            .forward_predicate(
+                &context,
+                GraphSelector::Named(view.graph()),
+                root,
+                predicate,
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(1, forward.len());
+        assert_eq!(new, forward[0].object);
+
+        let inverse: Vec<_> = view
+            .inverse_predicate(&context, GraphSelector::Named(view.graph()), predicate, new)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(1, inverse.len());
+        assert_eq!(root, inverse[0].subject);
+    }
+
+    #[test]
+    fn validation_visibility_includes_orphans_without_weakening_normal_reads() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:validation-orphan");
+        let orphan = add_quad(
+            &store,
+            &graph,
+            "urn:test:orphan",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://schema.org/MediaObject",
+        );
+        assert!(store.graph_diagnostics(&graph).unwrap().has_orphans());
+        let view = StoreReadView::new(&store);
+
+        let normal = ReadContext::default();
+        let normal_rows: Vec<_> = view
+            .scan(
+                &normal,
+                GraphSelector::Named(orphan.graph),
+                QuadPattern::default(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert!(normal_rows.is_empty());
+
+        let validation = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let validation_rows: Vec<_> = view
+            .scan(
+                &validation,
+                GraphSelector::Named(orphan.graph),
+                QuadPattern::default(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(vec![orphan], validation_rows);
+
+        let proposed_graph = GraphId::new("urn:test:proposed-orphan");
+        let index = DeltaIndex::build(
+            &store,
+            &proposed_graph,
+            &[insert(
+                &proposed_graph,
+                "urn:test:proposed-orphan",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://schema.org/MediaObject",
+            )],
+        )
+        .unwrap();
+        let proposed = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let validation = ReadContext::for_validation(QueryCancellation::new(), &proposed_graph);
+        assert_eq!(1, rows(&proposed, &validation).len());
+    }
 }
