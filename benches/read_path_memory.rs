@@ -55,6 +55,13 @@ fn read_path_memory_benchmarks(c: &mut Criterion) {
         let summary = assert_untimed_case(case.kind, &result);
         let after_case = process_memory();
         print_case_sample(case.label, summary, after_case);
+        if matches!(case.kind, MemoryCaseKind::DuplicateHeavyUnion) {
+            println!(
+                "read_path_memory duplicate baseline: union_rows={} \
+                 (observed only; union cardinality is not asserted as intended semantics)",
+                summary.rows
+            );
+        }
         black_box(&result);
     }
 
