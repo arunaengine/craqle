@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
+use crate::query_context::{QueryCancellation, ReadContext};
+use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
 use crate::store::{GraphStore, StoreError, TermId};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
@@ -45,8 +46,6 @@ pub(crate) struct SparqlEngine {
     search: Arc<SearchIndex>,
     evaluator: QueryEvaluator,
 }
-
-type VisibleGraphSet = Option<HashSet<TermId>>;
 
 pub(crate) type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
 
@@ -162,18 +161,19 @@ impl SparqlEngine {
         }
 
         let mut prepared = self.evaluator.prepare(&query);
-        let dataset = match scope {
+        let view = StoreReadView::new(&self.store);
+        let context = match scope {
             #[cfg(test)]
             GraphScope::All => {
                 prepared.dataset_mut().set_default_graph_as_union();
-                StoreDataset::new(&self.store, None)
+                ReadContext::new(QueryCancellation::new())
             }
             GraphScope::Predicate(visible) => {
                 // Union view with lazy visibility: the predicate runs at most
                 // once per touched graph, so the per-query cost scales with
                 // the graphs evaluation actually reaches, not the corpus.
                 prepared.dataset_mut().set_default_graph_as_union();
-                StoreDataset::with_predicate(&self.store, visible)
+                ReadContext::with_graph_visibility(QueryCancellation::new(), visible)
             }
             GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
                 // Scope the dataset to the visible graph list so patterns are
@@ -199,17 +199,19 @@ impl SparqlEngine {
                 prepared
                     .dataset_mut()
                     .set_available_named_graphs(named_graphs);
-                StoreDataset::new(&self.store, Some(hash_graph_list(graphs)))
+                ReadContext::with_visible_graphs(QueryCancellation::new(), graphs.iter().cloned())
             }
             GraphScope::List(graphs) => {
                 // Large graph sets: evaluate once over the union view;
-                // StoreDataset filters quads against the visible graph term
-                // ids in O(1) per quad.
+                // the shared read context filters quads against the visible
+                // graph term ids in O(1) per candidate.
                 prepared.dataset_mut().set_default_graph_as_union();
-                StoreDataset::new(&self.store, Some(hash_graph_list(graphs)))
+                ReadContext::with_visible_graphs(QueryCancellation::new(), graphs.iter().cloned())
             }
         };
-        let results = prepared.execute(dataset).map_err(map_eval_error)?;
+        let results = prepared
+            .execute(StoreDataset::new(&view, &context))
+            .map_err(map_eval_error)?;
 
         collect_query_results(results)
     }
@@ -247,8 +249,10 @@ impl SparqlEngine {
                         pattern,
                     );
                     prepared.dataset_mut().set_default_graph_as_union();
+                    let view = StoreReadView::new(&self.store);
+                    let context = ReadContext::new(QueryCancellation::new());
                     let iter = prepared
-                        .execute(StoreDataset::new(&self.store, None))
+                        .execute(StoreDataset::new(&view, &context))
                         .map_err(map_eval_error)?;
 
                     for quad in iter {
@@ -277,13 +281,6 @@ impl SparqlEngine {
 
         Ok(changes)
     }
-}
-
-fn hash_graph_list(graphs: &[GraphId]) -> HashSet<TermId> {
-    graphs
-        .iter()
-        .map(|graph| crate::store::hash_term(&EncodedTerm::from_named_node(&graph.0)))
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -782,302 +779,23 @@ enum StoreDatasetError {
     InvalidTerm(String),
 }
 
-struct StoreDataset<'a> {
-    store: &'a GraphStore,
-    visibility: QuadVisibility<'a>,
-}
-
-/// How the union view decides graph visibility. `Predicate` resolves it
-/// lazily: the first quad touched in a graph decodes the graph IRI, asks the
-/// callback once, and memoizes the verdict by term id for the query.
-#[derive(Clone)]
-enum GraphFilter<'a> {
-    All,
-    Set {
-        members: Rc<HashSet<TermId>>,
-        ordered: Rc<Vec<TermId>>,
-    },
-    Predicate {
-        visible: &'a VisibleFn<'a>,
-        memo: Rc<RefCell<HashMap<TermId, bool>>>,
-    },
-}
-
-/// Cheap-to-clone visibility filter shared with lazy quad iterators, which
-/// must not borrow the dataset itself (`QueryableDataset` iterators may only
-/// capture `'a`).
-#[derive(Clone)]
-struct QuadVisibility<'a> {
-    store: &'a GraphStore,
-    filter: GraphFilter<'a>,
-    orphan_cache: Rc<RefCell<HashMap<TermId, Rc<HashSet<TermId>>>>>,
-}
-
-impl<'a> QuadVisibility<'a> {
-    fn graph_is_visible(&self, graph: TermId) -> std::result::Result<bool, StoreDatasetError> {
-        match &self.filter {
-            GraphFilter::All => Ok(true),
-            GraphFilter::Set { members, .. } => Ok(members.contains(&graph)),
-            GraphFilter::Predicate { visible, memo } => {
-                if let Some(&allowed) = memo.borrow().get(&graph) {
-                    return Ok(allowed);
-                }
-                let term = self.store.decode_term(graph)?;
-                // Non-IRI graph terms fail closed.
-                let allowed = if term.0.starts_with('<') && term.0.ends_with('>') {
-                    let mut iri = term.0;
-                    iri.pop();
-                    iri.remove(0);
-                    visible(&GraphId(NamedNode::new_unchecked(iri)))
-                } else {
-                    false
-                };
-                memo.borrow_mut().insert(graph, allowed);
-                Ok(allowed)
-            }
-        }
-    }
-
-    fn orphaned_subjects_for_graph(
-        &self,
-        graph: TermId,
-    ) -> std::result::Result<Rc<HashSet<TermId>>, StoreDatasetError> {
-        if let Some(cached) = self.orphan_cache.borrow().get(&graph) {
-            return Ok(cached.clone());
-        }
-
-        let diagnostics = self.store.graph_diagnostics_by_id(graph)?;
-        let mut orphaned = HashSet::with_capacity(diagnostics.orphaned_entities.len());
-        for entity_id in diagnostics.orphaned_entities {
-            // `from_subject_id`: diagnostics store a blank node as `_:b0`, and
-            // encoding that as the IRI `<_:b0>` makes `lookup_term` miss, which
-            // leaves the orphan visible to every query instead of erroring (G6).
-            let term = EncodedTerm::from_subject_id(&entity_id);
-            if let Some(term_id) = self.store.lookup_term(&term)? {
-                orphaned.insert(term_id);
-            }
-        }
-
-        let orphaned = Rc::new(orphaned);
-        self.orphan_cache
-            .borrow_mut()
-            .insert(graph, orphaned.clone());
-        Ok(orphaned)
-    }
-
-    fn quad_is_visible(
-        &self,
-        quad: &crate::store::EncodedQuad,
-    ) -> std::result::Result<bool, StoreDatasetError> {
-        if !self.graph_is_visible(quad.graph)? {
-            return Ok(false);
-        }
-        let orphaned = self.orphaned_subjects_for_graph(quad.graph)?;
-        Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
-    }
-}
-
 enum ResolvedPatternTerm {
     Any,
     Existing(TermId),
     Missing,
 }
 
-enum EitherIter<L, R> {
-    Left(L),
-    Right(R),
+struct StoreDataset<'store, 'context, 'visibility> {
+    view: &'context StoreReadView<'store>,
+    context: &'context ReadContext<'visibility>,
 }
 
-impl<L, R, T> Iterator for EitherIter<L, R>
-where
-    L: Iterator<Item = T>,
-    R: Iterator<Item = T>,
-{
-    type Item = T;
-
-    fn next(&mut self) -> Option<T> {
-        match self {
-            Self::Left(left) => left.next(),
-            Self::Right(right) => right.next(),
-        }
-    }
-}
-
-type QuadResultIter<'a> = Box<
-    dyn Iterator<Item = std::result::Result<crate::store::EncodedQuad, StoreDatasetError>> + 'a,
->;
-
-/// A triple pattern resolved to term ids; `None` in a slot means "any".
-#[derive(Clone, Copy)]
-struct PatternIds {
-    subject: Option<TermId>,
-    predicate: Option<TermId>,
-    object: Option<TermId>,
-}
-
-/// Graphs a union scan will visit for one pattern.
-enum GraphCandidates {
-    /// A candidate list produced by an index probe.
-    Indexed(Vec<TermId>),
-    /// The query's visible-graph list, shared by `Rc` instead of deep-copied
-    /// on every pattern evaluation.
-    Visible(Rc<Vec<TermId>>),
-    /// Nothing narrows the pattern down; fall back to one cross-graph scan.
-    Unbounded,
-}
-
-/// Walks a shared visible-graph list by cloning the `Rc`, never the `Vec`.
-struct VisibleGraphIter {
-    graphs: Rc<Vec<TermId>>,
-    next: usize,
-}
-
-impl Iterator for VisibleGraphIter {
-    type Item = TermId;
-
-    fn next(&mut self) -> Option<TermId> {
-        let graph = *self.graphs.get(self.next)?;
-        self.next += 1;
-        Some(graph)
-    }
-}
-
-/// Which graphs can hold a match for `pattern`.
-///
-/// A bound object narrows the corpus through the object indexes; a small
-/// visible set narrows it through the caller's authorization. Both are valid
-/// starting points — every visited graph is still probed through the same
-/// index, so the quads produced are identical — so we walk whichever side is
-/// shorter instead of always enumerating every corpus graph holding `(p, o)`.
-/// Visibility semantics are untouched: `graph_is_visible` still runs per graph
-/// and `quad_is_visible` still runs per quad.
-fn candidate_graphs(visibility: &QuadVisibility<'_>, pattern: PatternIds) -> GraphCandidates {
-    let store = visibility.store;
-    let indexed = match (pattern.predicate, pattern.object) {
-        (Some(predicate), Some(object)) => Some(store.predicate_object_graphs(predicate, object)),
-        (None, Some(object)) => Some(store.object_graphs(object)),
-        (_, None) => None,
-    };
-
-    match (&visibility.filter, indexed) {
-        (GraphFilter::Set { ordered, .. }, Some(graphs)) if ordered.len() <= graphs.len() => {
-            GraphCandidates::Visible(ordered.clone())
-        }
-        (_, Some(graphs)) => GraphCandidates::Indexed(graphs),
-        (GraphFilter::Set { ordered, .. }, None) => GraphCandidates::Visible(ordered.clone()),
-        (GraphFilter::Predicate { .. }, None) => {
-            GraphCandidates::Indexed(store.populated_graph_ids())
-        }
-        (GraphFilter::All, None) => GraphCandidates::Unbounded,
-    }
-}
-
-/// Quads of all visible graphs matching the pattern, evaluated lazily so that
-/// short-circuiting consumers (ASK, LIMIT) stop after a few graphs instead of
-/// materializing the whole union. Streams graph-at-a-time wherever an index
-/// can enumerate candidate graphs, checking visibility per graph before any
-/// per-quad work so the cost tracks the graphs evaluation actually consumes.
-fn union_quads_for_pattern<'a>(
-    visibility: &QuadVisibility<'a>,
-    pattern: PatternIds,
-) -> QuadResultIter<'a> {
-    let store = visibility.store;
-    let graphs = match pattern.subject {
-        Some(_) => None,
-        None => match candidate_graphs(visibility, pattern) {
-            GraphCandidates::Indexed(graphs) => Some(EitherIter::Left(graphs.into_iter())),
-            GraphCandidates::Visible(graphs) => {
-                Some(EitherIter::Right(VisibleGraphIter { graphs, next: 0 }))
-            }
-            GraphCandidates::Unbounded => None,
-        },
-    };
-
-    if let Some(graphs) = graphs {
-        let visibility = visibility.clone();
-        return Box::new(graphs.flat_map(move |graph| {
-            let visible = match visibility.graph_is_visible(graph) {
-                Ok(visible) => visible,
-                Err(error) => return EitherIter::Right(std::iter::once(Err(error))),
-            };
-            if !visible {
-                return EitherIter::Left(Vec::new().into_iter().map(Ok));
-            }
-            let quads = match (pattern.predicate, pattern.object) {
-                (Some(predicate), Some(object)) => store
-                    .predicate_object_subjects_in_graph(graph, predicate, object)
-                    .into_iter()
-                    .map(|subject| crate::store::EncodedQuad {
-                        graph,
-                        subject,
-                        predicate,
-                        object,
-                    })
-                    .collect::<Vec<_>>(),
-                (None, Some(object)) => store
-                    .object_entries_in_graph(graph, object)
-                    .into_iter()
-                    .map(|(subject, predicate)| crate::store::EncodedQuad {
-                        graph,
-                        subject,
-                        predicate,
-                        object,
-                    })
-                    .collect::<Vec<_>>(),
-                (_, None) => {
-                    match store.quads_for_pattern(Some(graph), None, pattern.predicate, None) {
-                        Ok(quads) => quads,
-                        Err(error) => {
-                            return EitherIter::Right(std::iter::once(Err(error.into())));
-                        }
-                    }
-                }
-            };
-            EitherIter::Left(quads.into_iter().map(Ok))
-        }));
-    }
-
-    match store.quads_for_pattern(None, pattern.subject, pattern.predicate, pattern.object) {
-        Ok(quads) => Box::new(quads.into_iter().map(Ok)),
-        Err(error) => Box::new(std::iter::once(Err(error.into()))),
-    }
-}
-
-impl<'a> StoreDataset<'a> {
-    fn new(store: &'a GraphStore, visible_graphs: VisibleGraphSet) -> Self {
-        let filter = match visible_graphs {
-            None => GraphFilter::All,
-            Some(members) => {
-                let mut ordered: Vec<TermId> = members.iter().copied().collect();
-                ordered.sort_unstable();
-                GraphFilter::Set {
-                    members: Rc::new(members),
-                    ordered: Rc::new(ordered),
-                }
-            }
-        };
-        Self::with_filter(store, filter)
-    }
-
-    fn with_predicate(store: &'a GraphStore, visible: &'a VisibleFn<'a>) -> Self {
-        Self::with_filter(
-            store,
-            GraphFilter::Predicate {
-                visible,
-                memo: Rc::new(RefCell::new(HashMap::new())),
-            },
-        )
-    }
-
-    fn with_filter(store: &'a GraphStore, filter: GraphFilter<'a>) -> Self {
-        Self {
-            store,
-            visibility: QuadVisibility {
-                store,
-                filter,
-                orphan_cache: Rc::new(RefCell::new(HashMap::new())),
-            },
-        }
+impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> {
+    fn new(
+        view: &'context StoreReadView<'store>,
+        context: &'context ReadContext<'visibility>,
+    ) -> Self {
+        Self { view, context }
     }
 
     fn resolve_pattern_term(&self, term: Option<&StoreTerm>) -> ResolvedPatternTerm {
@@ -1088,12 +806,10 @@ impl<'a> StoreDataset<'a> {
         }
     }
 
-    /// Decode through the store's global term cache: term ids are content
-    /// hashes of immutable bytes, so a decoded term never goes stale. Row
-    /// decoding is the hottest read in evaluation — one point read plus one
-    /// `String` allocation per variable reference per row without the cache.
     fn decode_term(&self, id: TermId) -> std::result::Result<Arc<EncodedTerm>, StoreDatasetError> {
-        self.store.decode_term_arc(id).map_err(Into::into)
+        self.view
+            .decode_term_arc(self.context, id)
+            .map_err(Into::into)
     }
 
     fn externalize_encoded_term(
@@ -1118,7 +834,12 @@ impl<'a> StoreDataset<'a> {
     }
 }
 
-impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
+impl<'store, 'context, 'visibility> QueryableDataset<'context>
+    for StoreDataset<'store, 'context, 'visibility>
+where
+    'store: 'context,
+    'visibility: 'context,
+{
     type InternalTerm = StoreTerm;
     type Error = StoreDatasetError;
 
@@ -1131,7 +852,7 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
         graph_name: Option<Option<&Self::InternalTerm>>,
     ) -> Box<
         dyn Iterator<Item = std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>
-            + 'a,
+            + 'context,
     > {
         let subject = self.resolve_pattern_term(subject);
         let predicate = self.resolve_pattern_term(predicate);
@@ -1149,108 +870,80 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             ResolvedPatternTerm::Existing(id) => Some(id),
             ResolvedPatternTerm::Missing => unreachable!("missing terms short-circuit above"),
         };
-        let pattern = PatternIds {
+        let pattern = QuadPattern {
             subject: bound(subject),
             predicate: bound(predicate),
             object: bound(object),
+            ..QuadPattern::default()
+        };
+        let selector = match graph_name {
+            Some(Some(StoreTerm::Existing(graph))) => GraphSelector::Named(*graph),
+            Some(Some(StoreTerm::Missing(_))) => return Box::new(std::iter::empty()),
+            Some(None) | None => GraphSelector::Union,
+        };
+        let quads = match self.view.scan(self.context, selector, pattern) {
+            Ok(quads) => quads,
+            Err(error) => return Box::new(std::iter::once(Err(error.into()))),
         };
 
-        let visibility = self.visibility.clone();
         match graph_name {
+            // Preserve the legacy direct default-union branch: it suppresses
+            // duplicate triples across named graph copies.
             Some(None) => {
-                let quads = union_quads_for_pattern(&visibility, pattern);
                 let mut seen = HashSet::new();
                 Box::new(quads.filter_map(move |quad| {
                     let quad = match quad {
                         Ok(quad) => quad,
-                        Err(error) => return Some(Err(error)),
+                        Err(error) => return Some(Err(error.into())),
                     };
-                    match visibility.quad_is_visible(&quad) {
-                        Ok(true) => {
-                            let key = (quad.subject, quad.predicate, quad.object);
-                            if seen.insert(key) {
-                                Some(Ok(InternalQuad {
-                                    subject: StoreTerm::Existing(quad.subject),
-                                    predicate: StoreTerm::Existing(quad.predicate),
-                                    object: StoreTerm::Existing(quad.object),
-                                    graph_name: None,
-                                }))
-                            } else {
-                                None
-                            }
-                        }
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error)),
-                    }
+                    let key = (quad.subject, quad.predicate, quad.object);
+                    seen.insert(key).then_some(Ok(InternalQuad {
+                        subject: StoreTerm::Existing(quad.subject),
+                        predicate: StoreTerm::Existing(quad.predicate),
+                        object: StoreTerm::Existing(quad.object),
+                        graph_name: None,
+                    }))
                 }))
             }
-            Some(Some(StoreTerm::Existing(graph))) => {
-                match visibility.graph_is_visible(*graph) {
-                    Ok(true) => {}
-                    Ok(false) => return Box::new(std::iter::empty()),
-                    Err(error) => return Box::new(std::iter::once(Err(error))),
-                }
-                match self.store.quads_for_pattern(
-                    Some(*graph),
-                    pattern.subject,
-                    pattern.predicate,
-                    pattern.object,
-                ) {
-                    Ok(quads) => Box::new(quads.into_iter().filter_map(move |quad| {
-                        match visibility.quad_is_visible(&quad) {
-                            Ok(true) => Some(Ok(InternalQuad {
-                                subject: StoreTerm::Existing(quad.subject),
-                                predicate: StoreTerm::Existing(quad.predicate),
-                                object: StoreTerm::Existing(quad.object),
-                                graph_name: Some(StoreTerm::Existing(quad.graph)),
-                            })),
-                            Ok(false) => None,
-                            Err(error) => Some(Err(error)),
-                        }
-                    })),
-                    Err(error) => Box::new(std::iter::once(Err(error.into()))),
-                }
-            }
-            Some(Some(StoreTerm::Missing(_))) => Box::new(std::iter::empty()),
-            None => {
-                let quads = union_quads_for_pattern(&visibility, pattern);
-                Box::new(quads.filter_map(move |quad| {
-                    let quad = match quad {
-                        Ok(quad) => quad,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    match visibility.quad_is_visible(&quad) {
-                        Ok(true) => Some(Ok(InternalQuad {
-                            subject: StoreTerm::Existing(quad.subject),
-                            predicate: StoreTerm::Existing(quad.predicate),
-                            object: StoreTerm::Existing(quad.object),
-                            graph_name: Some(StoreTerm::Existing(quad.graph)),
-                        })),
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error)),
-                    }
-                }))
-            }
+            Some(Some(StoreTerm::Existing(_))) => Box::new(quads.map(|quad| {
+                let quad = quad.map_err(StoreDatasetError::from)?;
+                Ok(InternalQuad {
+                    subject: StoreTerm::Existing(quad.subject),
+                    predicate: StoreTerm::Existing(quad.predicate),
+                    object: StoreTerm::Existing(quad.object),
+                    graph_name: Some(StoreTerm::Existing(quad.graph)),
+                })
+            })),
+            Some(Some(StoreTerm::Missing(_))) => unreachable!("missing graph short-circuits above"),
+            None => Box::new(quads.map(|quad| {
+                let quad = quad.map_err(StoreDatasetError::from)?;
+                Ok(InternalQuad {
+                    subject: StoreTerm::Existing(quad.subject),
+                    predicate: StoreTerm::Existing(quad.predicate),
+                    object: StoreTerm::Existing(quad.object),
+                    graph_name: Some(StoreTerm::Existing(quad.graph)),
+                })
+            })),
         }
     }
 
     #[allow(refining_impl_trait)]
     fn internal_named_graphs(
         &self,
-    ) -> Box<dyn Iterator<Item = std::result::Result<Self::InternalTerm, Self::Error>> + 'a> {
-        let visibility = self.visibility.clone();
-        Box::new(
-            self.store
-                .graph_term_id_iter()
-                .filter_map(move |graph_id| match graph_id {
-                    Ok(graph_id) => match visibility.graph_is_visible(graph_id) {
-                        Ok(true) => Some(Ok(StoreTerm::Existing(graph_id))),
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error)),
-                    },
+    ) -> Box<dyn Iterator<Item = std::result::Result<Self::InternalTerm, Self::Error>> + 'context>
+    {
+        let view = self.view;
+        let context = self.context;
+        Box::new(self.view.store().graph_term_id_iter().filter_map(
+            move |graph_id| match graph_id {
+                Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
+                    Ok(true) => Some(Ok(StoreTerm::Existing(graph_id))),
+                    Ok(false) => None,
                     Err(error) => Some(Err(error.into())),
-                }),
-        )
+                },
+                Err(error) => Some(Err(error.into())),
+            },
+        ))
     }
 
     /// Graph existence for `GRAPH <g> { ... }` (charter G9).
@@ -1268,12 +961,13 @@ impl<'a> QueryableDataset<'a> for StoreDataset<'a> {
             // The IRI is not even interned, so no graph was ever created for it.
             return Ok(false);
         };
-        Ok(self.store.contains_graph_by_id(*graph)? && self.visibility.graph_is_visible(*graph)?)
+        Ok(self.view.store().contains_graph_by_id(*graph)?
+            && self.view.graph_is_visible(self.context, *graph)?)
     }
 
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
         let encoded = EncodedTerm::from_term(&term);
-        Ok(match self.store.lookup_term(&encoded)? {
+        Ok(match self.view.lookup_term(self.context, &encoded)? {
             Some(id) => StoreTerm::Existing(id),
             None => StoreTerm::Missing(encoded),
         })
