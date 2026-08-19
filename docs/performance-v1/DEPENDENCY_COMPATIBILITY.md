@@ -128,14 +128,14 @@ upstream identities, and content hashes above are the source-of-truth proof.
 Use the normal disk-backed target directory and at most eight build jobs:
 
 ```text
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo fmt --all -- --check
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo check --locked
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo check --locked --no-default-features
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo check --locked --features shacl-core
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo check --locked --no-default-features --features shacl-core
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo tree --locked --features shacl-core -e features -i shacl
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo tree --locked --features shacl-core -e features -i rudof_rdf
-CARGO_TARGET_DIR=/tmp/craqle-perf-v1-pr1/target CARGO_BUILD_JOBS=8 cargo tree --locked --features shacl-core -i sparql_service
+CARGO_BUILD_JOBS=8 cargo fmt --all -- --check
+CARGO_BUILD_JOBS=8 cargo check --locked
+CARGO_BUILD_JOBS=8 cargo check --locked --no-default-features
+CARGO_BUILD_JOBS=8 cargo check --locked --features shacl-core
+CARGO_BUILD_JOBS=8 cargo check --locked --no-default-features --features shacl-core
+CARGO_BUILD_JOBS=8 cargo tree --locked --features shacl-core -e features -i shacl
+CARGO_BUILD_JOBS=8 cargo tree --locked --features shacl-core -e features -i rudof_rdf
+CARGO_BUILD_JOBS=8 cargo tree --locked --features shacl-core -i sparql_service
 git diff --check
 ```
 
