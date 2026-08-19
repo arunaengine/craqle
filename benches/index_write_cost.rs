@@ -140,6 +140,7 @@ fn local_fixture(changes: Vec<MaterializedQuadChange>) -> LocalFixture {
     assert_eq!(node.graph_snapshot(&graph).unwrap().quads.len(), 0);
     node.flush_search_updates()
         .expect("settle local fixture search work");
+    node.ensure_query_indexes();
     LocalFixture {
         node: Arc::new(node),
         database,
@@ -173,6 +174,7 @@ fn delete_fixture(triples: &[Triple]) -> LocalFixture {
         .node
         .flush_search_updates()
         .expect("settle delete benchmark setup");
+    fixture.node.ensure_query_indexes();
     fixture.changes = vec![triples[0].change(&fixture.graph, false)];
     fixture
 }
@@ -197,6 +199,7 @@ fn concurrent_fixture(triples: &[Triple]) -> ConcurrentFixture {
         .collect();
     node.flush_search_updates()
         .expect("settle concurrent fixture search work");
+    node.ensure_query_indexes();
     ConcurrentFixture {
         node,
         database,
@@ -283,6 +286,7 @@ fn merge_fixture(_triples: &[Triple]) -> MergeFixture {
             .peer(peer)
             .flush_search_updates()
             .expect("settle merge peer setup");
+        cluster.peer(peer).ensure_query_indexes();
     }
     assert_row_count(cluster.peer(0), &graph, expected_before + 1);
     assert_row_count(cluster.peer(1), &graph, expected_before);
