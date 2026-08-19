@@ -1561,6 +1561,107 @@ impl StoreReadSnapshot {
     pub(crate) fn contains_graph_by_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
         Ok(self
             .snapshot
+            .get(&store.graphs, graph_meta_key(graph))?
+            .is_some())
+    }
+
+    pub(crate) fn graph_term_id_iter<'a>(
+        &'a self,
+        store: &'a GraphStore,
+    ) -> impl Iterator<Item = Result<TermId>> + 'a {
+        self.snapshot
+            .prefix(&store.graphs, graph_meta_prefix())
+            .filter_map(|guard| match guard.into_inner() {
+                Ok((key, _)) if key.len() == 17 => {
+                    Some(decode_term_id(&key[1..17], "graph meta key"))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            })
+    }
+
+    pub(crate) fn lookup_term(
+        &self,
+        store: &GraphStore,
+        term: &EncodedTerm,
+    ) -> Result<Option<TermId>> {
+        let id = hash_term(term);
+        let Some(existing) = self.snapshot.get(&store.terms, id.to_be_bytes())? else {
+            return Ok(None);
+        };
+        if existing.as_ref() == term.0.as_bytes() {
+            return Ok(Some(id));
+        }
+        Err(StoreError::TermCollision {
+            attempted: term.0.clone(),
+            existing: decode_term_utf8(existing.as_ref())?,
+        })
+    }
+
+    pub(crate) fn graph_policy(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> Result<Option<GraphPolicy>> {
+        let Some(graph) = self.lookup_term(store, &EncodedTerm::from_named_node(&graph.0))? else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.snapshot.get(&store.graphs, graph_meta_key(graph))? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            postcard::from_bytes::<StoredGraphMeta>(bytes.as_ref())?.policy,
+        ))
+    }
+
+    /// Returns the orphan ids implied by this exact snapshot. A matching
+    /// persisted diagnostic record is cheap; stale or absent records are
+    /// recomputed from snapshot quads and are never persisted or globally
+    /// cached by reads.
+    pub(crate) fn orphaned_entity_ids(
+        &self,
+        store: &GraphStore,
+        context: &crate::query_context::ReadContext<'_>,
+        graph: TermId,
+    ) -> Result<HashSet<TermId>> {
+        if !self.contains_graph_by_id(store, graph)? {
+            return Ok(HashSet::new());
+        }
+        let clock = store.snapshot_vector_clock(&self.snapshot, graph)?;
+        if let Some(record) = store.snapshot_stored_diagnostics(&self.snapshot, graph)?
+            && record.at_clock == clock
+        {
+            let mut orphaned = HashSet::with_capacity(record.diagnostics.orphaned_entities.len());
+            context.check_cancelled()?;
+            for (index, entity) in record.diagnostics.orphaned_entities.into_iter().enumerate() {
+                if index != 0 && index % 1_024 == 0 {
+                    context.check_cancelled()?;
+                }
+                if let Some(term) =
+                    self.lookup_term(store, &EncodedTerm::from_subject_id(&entity))?
+                {
+                    orphaned.insert(term);
+                }
+            }
+            return Ok(orphaned);
+        }
+
+        store.diagnostics_computed.fetch_add(1, Ordering::Relaxed);
+        let id = |named_node: oxrdf::NamedNode| {
+            self.lookup_term(store, &EncodedTerm::from_named_node(&named_node))
+        };
+        let vocab = OrphanVocab {
+            rdf_type: id(crate::core::vocab::rdf_type())?,
+            data_types: [
+                id(crate::core::vocab::schema_dataset())?,
+                id(crate::core::vocab::schema_media_object())?,
+            ],
+            has_part: id(crate::core::vocab::schema_has_part())?,
+        };
+        store.snapshot_orphaned_entity_ids(&self.snapshot, context, graph, &vocab)
+    }
+}
+
 impl GraphStore {
     fn term_lock_index(&self, id: TermId) -> usize {
         (id.0 as usize) % self.term_locks.len()
@@ -1885,12 +1986,284 @@ impl GraphStore {
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
     }
 
+    fn query_index_counter_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        key: QueryIndexCounterKey,
+    ) -> Result<QueryIndexCounterRead> {
+        Ok(match snapshot.get(&self.qv1_meta, key.bytes())? {
+            None => QueryIndexCounterRead::Missing,
+            Some(value) => match decode_query_index_u64(value.as_ref()) {
+                Some(value) => QueryIndexCounterRead::Value(value),
+                None => QueryIndexCounterRead::Malformed,
+            },
+        })
+    }
+
+    fn adjusted_query_index_counter(current: u64, delta: i128) -> Option<u64> {
+        if delta >= 0 {
+            current.checked_add(u64::try_from(delta).ok()?)
+        } else {
+            current.checked_sub(u64::try_from(delta.checked_neg()?).ok()?)
+        }
+    }
+
+    fn plan_ready_query_index_maintenance(
+        &self,
+        snapshot: &Snapshot,
+        header: &QueryIndexHeader,
+        transitions: Vec<NetQuadTransition>,
+    ) -> Result<Option<QueryIndexMaintenancePlan>> {
+        let total =
+            match self.query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::Total)? {
+                QueryIndexCounterRead::Value(total) if total == header.indexed_quads => total,
+                QueryIndexCounterRead::Missing
+                | QueryIndexCounterRead::Malformed
+                | QueryIndexCounterRead::Value(_) => return Ok(None),
+            };
+
+        for transition in &transitions {
+            for (keyspace, key) in [
+                (&self.qv1_gpos, qv1_gpos_key(transition.quad)),
+                (&self.qv1_spog, qv1_spog_key(transition.quad)),
+                (&self.qv1_posg, qv1_posg_key(transition.quad)),
+            ] {
+                let current = snapshot.get(keyspace, key)?;
+                let expected = if transition.is_live {
+                    current.is_none()
+                } else {
+                    current.is_some_and(|value| value.as_ref().is_empty())
+                };
+                if !expected {
+                    return Ok(None);
+                }
+            }
+        }
+
+        if transitions.is_empty() {
+            return Ok(Some(QueryIndexMaintenancePlan {
+                transitions,
+                counters: Vec::new(),
+                header: None,
+            }));
+        }
+
+        let mut deltas = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, i128)>::new();
+        let mut touched_predicates = BTreeSet::new();
+        for transition in &transitions {
+            let delta = if transition.is_live { 1 } else { -1 };
+            touched_predicates.insert(transition.quad.predicate);
+            for counter in query_index_live_counter_keys(transition.quad) {
+                let entry = deltas.entry(counter.bytes()).or_insert((counter, 0));
+                let Some(next) = entry.1.checked_add(delta) else {
+                    return Ok(None);
+                };
+                entry.1 = next;
+            }
+        }
+
+        let mut current_values = BTreeMap::<Vec<u8>, u64>::new();
+        let mut counters = Vec::with_capacity(deltas.len() + touched_predicates.len());
+        for (bytes, (counter, delta)) in &deltas {
+            let has_rows = !matches!(counter, QueryIndexCounterKey::Total)
+                && self.query_index_counter_has_rows(snapshot, *counter)?;
+            let current = match self.query_index_counter_from_snapshot(snapshot, *counter)? {
+                QueryIndexCounterRead::Missing
+                    if !matches!(counter, QueryIndexCounterKey::Total) =>
+                {
+                    if has_rows {
+                        return Ok(None);
+                    }
+                    0
+                }
+                QueryIndexCounterRead::Value(value)
+                    if matches!(counter, QueryIndexCounterKey::Total)
+                        || (value != 0 && has_rows) =>
+                {
+                    value
+                }
+                QueryIndexCounterRead::Missing
+                | QueryIndexCounterRead::Malformed
+                | QueryIndexCounterRead::Value(_) => return Ok(None),
+            };
+            current_values.insert(bytes.clone(), current);
+            let Some(next) = Self::adjusted_query_index_counter(current, *delta) else {
+                return Ok(None);
+            };
+            counters.push(QueryIndexCounterUpdate {
+                key: *counter,
+                value: if matches!(counter, QueryIndexCounterKey::Total) || next != 0 {
+                    Some(next)
+                } else {
+                    None
+                },
+            });
+        }
+
+        let total_delta = deltas
+            .get(QUERY_INDEX_TOTAL_KEY.as_slice())
+            .map(|(_, delta)| *delta)
+            .unwrap_or(0);
+        let Some(source_live_quads) =
+            Self::adjusted_query_index_counter(header.source_live_quads, total_delta)
+        else {
+            return Ok(None);
+        };
+        let Some(indexed_quads) =
+            Self::adjusted_query_index_counter(header.indexed_quads, total_delta)
+        else {
+            return Ok(None);
+        };
+        let Some(source_epoch) = header.source_epoch.checked_add(1) else {
+            return Ok(None);
+        };
+
+        for predicate in touched_predicates {
+            let predicate_counter = QueryIndexCounterKey::Predicate(predicate);
+            let predicate_bytes = predicate_counter.bytes();
+            let Some(previous_predicate_rows) = current_values.get(&predicate_bytes).copied()
+            else {
+                return Ok(None);
+            };
+            match self.query_index_counter_from_snapshot(
+                snapshot,
+                QueryIndexCounterKey::PredicateMutationEpoch(predicate),
+            )? {
+                QueryIndexCounterRead::Value(epoch)
+                    if previous_predicate_rows != 0
+                        && epoch != 0
+                        && epoch <= header.source_epoch => {}
+                QueryIndexCounterRead::Missing if previous_predicate_rows == 0 => {}
+                QueryIndexCounterRead::Missing
+                | QueryIndexCounterRead::Malformed
+                | QueryIndexCounterRead::Value(_) => return Ok(None),
+            }
+            let Some(predicate_update) = counters
+                .iter()
+                .find(|update| update.key == predicate_counter)
+            else {
+                return Ok(None);
+            };
+            let next_predicate_rows = predicate_update.value.unwrap_or(0);
+            counters.push(QueryIndexCounterUpdate {
+                key: QueryIndexCounterKey::PredicateMutationEpoch(predicate),
+                value: (next_predicate_rows != 0).then_some(source_epoch),
+            });
+        }
+
+        let Some(updated_total) = counters
+            .iter()
+            .find(|update| matches!(update.key, QueryIndexCounterKey::Total))
+            .and_then(|update| update.value)
+        else {
+            return Ok(None);
+        };
+        if total != header.indexed_quads
+            || updated_total != indexed_quads
+            || source_live_quads != indexed_quads
+        {
+            return Ok(None);
+        }
+        Ok(Some(QueryIndexMaintenancePlan {
+            transitions,
+            counters,
+            header: Some(QueryIndexHeader {
+                state: StoredQueryIndexState::Ready,
+                source_epoch,
+                index_epoch: source_epoch,
+                source_live_quads,
+                indexed_quads,
+                last_build_sequence: header.last_build_sequence,
+            }),
+        }))
+    }
+
+    fn stage_query_index_maintenance_plan(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        plan: QueryIndexMaintenancePlan,
+    ) {
+        for transition in plan.transitions {
+            let keys = [
+                (&self.qv1_gpos, qv1_gpos_key(transition.quad)),
+                (&self.qv1_spog, qv1_spog_key(transition.quad)),
+                (&self.qv1_posg, qv1_posg_key(transition.quad)),
+            ];
+            for (keyspace, key) in keys {
+                if transition.is_live {
+                    batch.insert(keyspace, key, Vec::<u8>::new());
+                } else {
+                    batch.remove(keyspace, key);
+                }
+            }
+        }
+        for update in plan.counters {
+            match update.value {
+                Some(value) => {
+                    batch.insert(&self.qv1_meta, update.key.bytes(), value.to_be_bytes())
+                }
+                None => batch.remove(&self.qv1_meta, update.key.bytes()),
+            }
+        }
+        if let Some(header) = plan.header {
+            self.stage_query_index_header(batch, &header);
+        }
+    }
+
+    fn stage_query_index_maintenance(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        publish: &PendingPublish,
+    ) -> Result<()> {
+        let snapshot = self.db.snapshot();
+        match self.query_index_header_from_snapshot(&snapshot)? {
+            QueryIndexHeaderRead::Absent => Ok(()),
+            QueryIndexHeaderRead::Malformed => {
+                self.stage_query_index_failed(batch, None, "metadata-malformed");
+                Ok(())
+            }
+            QueryIndexHeaderRead::Valid(header) => match header.state {
+                StoredQueryIndexState::Building | StoredQueryIndexState::Failed(_) => Ok(()),
+                StoredQueryIndexState::Ready => {
+                    if !header.ready_is_coherent()
+                        || !header.is_not_ahead_of_snapshot(snapshot.seqno())
+                    {
+                        self.stage_query_index_failed(
+                            batch,
+                            Some(&header),
+                            "ready-metadata-inconsistent",
+                        );
+                        return Ok(());
+                    }
+                    let transitions = coalesced_query_index_transitions(&publish.quad_mutations);
+                    match self.plan_ready_query_index_maintenance(
+                        &snapshot,
+                        &header,
+                        transitions,
+                    )? {
+                        Some(plan) => self.stage_query_index_maintenance_plan(batch, plan),
+                        None => self.stage_query_index_failed(
+                            batch,
+                            Some(&header),
+                            "maintenance-anomaly",
+                        ),
+                    }
+                    Ok(())
+                }
+            },
+        }
+    }
+
     /// Publish the durable batch and the index together, reporting anomalies.
     /// A reader past the new clock never sees state predating it.
     ///
     /// Only the queue lock nests inside, and the fjall reads made here take no
     /// further lock, so the section cannot deadlock.
-    fn commit_with_index(&self, commit: DurableCommit, publish: &PendingPublish) -> Result<bool> {
+    fn commit_with_index(
+        &self,
+        mut commit: DurableCommit,
+        publish: &PendingPublish,
+    ) -> Result<bool> {
         let mut indexes = self.indexes_write();
         self.commit_durable(commit)?;
         #[cfg(test)]
