@@ -576,9 +576,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::core::{ActorId, Dot};
-    use crate::query_context::{QueryCancellation, ReadContext};
-    use crate::store::{ClockUpdate, CounterKey, QuadAdd, QuadRemove, StoreError};
+    use crate::core::{ActorId, Dot, GraphDiagnostics};
+    use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadContext};
+    use crate::store::{ClockUpdate, CounterKey, QuadAdd, QuadRemove, StoreError, hash_term};
 
     use super::*;
 
@@ -694,6 +694,86 @@ mod tests {
         graph_id
     }
 
+    fn add_same_subject_across_graphs(
+        store: &GraphStore,
+        graph_count: usize,
+    ) -> (GraphId, EncodedQuad) {
+        let target_iri = format!("urn:test:named-subject:target:{graph_count}");
+        let target = GraphId::new(&target_iri);
+        store.create_graph(&target).unwrap();
+        let target_id = store
+            .resolve_term(&EncodedTerm::from_named_node(&target.0))
+            .unwrap();
+        let subject = store
+            .resolve_term(&named("urn:test:named-subject:s"))
+            .unwrap();
+        let predicate = store
+            .resolve_term(&named("urn:test:named-subject:p"))
+            .unwrap();
+        let object = store
+            .resolve_term(&named("urn:test:named-subject:o"))
+            .unwrap();
+        let actor = ActorId::random();
+        let mut batch = store.new_batch();
+        let mut target_quad = None;
+        for index in 0..graph_count {
+            let graph = if index == 0 {
+                target_id
+            } else {
+                hash_term(&named(&format!("urn:test:named-subject:copy:{index}")))
+            };
+            let quad = EncodedQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            };
+            assert!(
+                store
+                    .insert_quad(
+                        &mut batch,
+                        QuadAdd {
+                            quad,
+                            dot: Dot {
+                                actor,
+                                counter: (index + 1) as u64,
+                            },
+                        },
+                    )
+                    .unwrap()
+            );
+            if index == 0 {
+                target_quad = Some(quad);
+            }
+        }
+        store.commit(batch).unwrap();
+        settle_diagnostics(store, &target);
+        (target, target_quad.unwrap())
+    }
+
+    fn settle_diagnostics(store: &GraphStore, graph: &GraphId) {
+        let diagnostics = store.graph_diagnostics(graph).unwrap();
+        store.set_graph_diagnostics(graph, &diagnostics).unwrap();
+    }
+
+    fn remove_quad(store: &GraphStore, graph: &GraphId, quad: EncodedQuad) {
+        let witnessed = store.get_vector_clock_by_id(quad.graph).unwrap();
+        let _guard = store.graph_commit_guard(graph);
+        let mut batch = store.new_batch();
+        assert!(
+            store
+                .remove_quad(
+                    &mut batch,
+                    QuadRemove {
+                        quad,
+                        witnessed: &witnessed,
+                    },
+                )
+                .unwrap()
+        );
+        store.commit(batch).unwrap();
+    }
+
     fn collect_rows(
         cursor: impl Iterator<Item = crate::store::Result<EncodedQuad>>,
     ) -> Vec<EncodedQuad> {
@@ -701,7 +781,8 @@ mod tests {
     }
 
     fn raw_rows(store: &GraphStore, pattern: QuadPattern) -> Vec<EncodedQuad> {
-        let mut cursor = store.raw_quad_cursor(pattern);
+        let snapshot = store.read_snapshot();
+        let mut cursor = snapshot.raw_quad_cursor(store, pattern);
         let mut rows = Vec::new();
         while let Some(candidate) = cursor.next_candidate() {
             let candidate = candidate.unwrap();
@@ -805,6 +886,7 @@ mod tests {
             "urn:test:early:p",
             "urn:test:early:o3",
         );
+        settle_diagnostics(&store, &graph);
 
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
@@ -840,6 +922,7 @@ mod tests {
             "urn:test:exists:p",
             "urn:test:exists:o2",
         );
+        settle_diagnostics(&store, &graph);
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
         let pattern = QuadPattern {
@@ -905,6 +988,7 @@ mod tests {
             "urn:test:count:p",
             "urn:test:count:o3",
         );
+        settle_diagnostics(&store, &graph);
         let view = StoreReadView::new(&store);
 
         let zero = ReadContext::default();
@@ -938,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_before_a_scan_and_after_1024_union_candidates() {
+    fn cancellation_stops_before_a_scan_and_after_a_bound_union_candidate() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:cancellation");
         let graph_id = add_many(&store, &graph, 1_025);
