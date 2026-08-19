@@ -3,7 +3,15 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
 use crate::core::{CrateViolation, EncodedTerm, GraphId, MaterializedQuadChange, QuadOp, vocab};
-use crate::store::{GraphStore, TermId};
+use crate::query_context::{QueryCancellation, ReadContext};
+use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
+use crate::store::GraphStore;
+use crate::validation_delta::{DeltaImpact, DeltaIndex, DeltaReadView};
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ── Constant term table ─────────────────────────────────────────────────────
 //
@@ -110,21 +118,37 @@ impl GraphSnapshot {
         }
     }
 
-    /// Build a snapshot by reading every quad for a graph from the store.
+    /// Build a snapshot by streaming the shared validation read interface.
     pub(crate) fn from_store(store: &GraphStore, graph: &GraphId) -> crate::store::Result<Self> {
+        let view = StoreReadView::new(store);
+        let context = ReadContext::for_validation(QueryCancellation::new(), graph);
+        Self::from_read_view(&view, &context, graph)
+    }
+
+    fn from_read_view(
+        view: &impl RdfReadView,
+        context: &ReadContext<'_>,
+        graph: &GraphId,
+    ) -> crate::store::Result<Self> {
+        #[cfg(test)]
+        SNAPSHOT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let graph_term = EncodedTerm::from_named_node(&graph.0);
-        let Some(graph_tid) = store.lookup_term(&graph_term)? else {
+        let Some(graph_tid) = view.lookup_term(context, &graph_term)? else {
             return Ok(Self::new(graph.clone(), Vec::new()));
         };
         let mut triples = Vec::new();
-        let mut term_cache = HashMap::new();
-        store.for_each_quad_in_graph::<crate::store::StoreError, _>(graph_tid, |q| {
-            let s = store.decode_term_cached(&mut term_cache, q.subject)?;
-            let p = store.decode_term_cached(&mut term_cache, q.predicate)?;
-            let o = store.decode_term_cached(&mut term_cache, q.object)?;
+        let cursor = view.scan(
+            context,
+            GraphSelector::Named(graph_tid),
+            QuadPattern::default(),
+        )?;
+        for quad in cursor {
+            let q = quad?;
+            let s = view.decode_term(context, q.subject)?;
+            let p = view.decode_term(context, q.predicate)?;
+            let o = view.decode_term(context, q.object)?;
             triples.push((s, p, o));
-            Ok(())
-        })?;
+        }
         Ok(Self::new(graph.clone(), triples))
     }
 
@@ -176,21 +200,149 @@ impl GraphSnapshot {
 /// Everything a candidate check may read: the post-delta view of the store plus
 /// the pre-computed summary of what the delta touches.
 pub(crate) struct RuleContext<'a> {
-    view: DeltaView<'a>,
+    view: DeltaReadView<'a, 'a>,
+    context: ReadContext<'a>,
+    graph: &'a GraphId,
+    impact: &'a DeltaImpact,
     summary: &'a DeltaSummary,
 }
 
 impl<'a> RuleContext<'a> {
-    fn new(view: DeltaView<'a>, summary: &'a DeltaSummary) -> Self {
-        Self { view, summary }
+    fn new(change_set: ChangeSet<'a>, index: &'a DeltaIndex, summary: &'a DeltaSummary) -> Self {
+        Self {
+            view: DeltaReadView::new(StoreReadView::new(change_set.store), index),
+            context: ReadContext::for_validation(QueryCancellation::new(), change_set.graph),
+            graph: change_set.graph,
+            impact: index.impact(),
+            summary,
+        }
     }
 
     fn root(&self) -> EncodedTerm {
-        graph_root(self.view.graph)
+        graph_root(self.graph)
     }
 
     fn delta_is_empty(&self) -> bool {
-        self.view.index.is_empty
+        self.impact.changed_subjects.is_empty()
+    }
+
+    fn triple_exists(&self, triple: EncodedTripleRef<'_>) -> crate::store::Result<bool> {
+        let (Some(subject), Some(predicate), Some(object)) = (
+            self.view.lookup_term(&self.context, triple.subject)?,
+            self.view.lookup_term(&self.context, triple.predicate)?,
+            self.view.lookup_term(&self.context, triple.object)?,
+        ) else {
+            return Ok(false);
+        };
+        self.view.exists(
+            &self.context,
+            GraphSelector::Named(self.view.graph()),
+            QuadPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                object: Some(object),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn has_subject_predicate(&self, key: SubjectPredicate<'_>) -> crate::store::Result<bool> {
+        let (Some(subject), Some(predicate)) = (
+            self.view.lookup_term(&self.context, key.subject)?,
+            self.view.lookup_term(&self.context, key.predicate)?,
+        ) else {
+            return Ok(false);
+        };
+        self.view.exists(
+            &self.context,
+            GraphSelector::Named(self.view.graph()),
+            QuadPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn count_sp(&self, key: SubjectPredicate<'_>) -> crate::store::Result<usize> {
+        let (Some(subject), Some(predicate)) = (
+            self.view.lookup_term(&self.context, key.subject)?,
+            self.view.lookup_term(&self.context, key.predicate)?,
+        ) else {
+            return Ok(0);
+        };
+        let count = self.view.count_up_to(
+            &self.context,
+            GraphSelector::Named(self.view.graph()),
+            QuadPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                ..QuadPattern::default()
+            },
+            u64::MAX,
+        )?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    fn subject_has_triples(&self, subject: &EncodedTerm) -> crate::store::Result<bool> {
+        let Some(subject) = self.view.lookup_term(&self.context, subject)? else {
+            return Ok(false);
+        };
+        self.view.exists(
+            &self.context,
+            GraphSelector::Named(self.view.graph()),
+            QuadPattern {
+                subject: Some(subject),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn subject_existed_before(&self, subject: &EncodedTerm) -> crate::store::Result<bool> {
+        let Some(subject) = self.view.lookup_term(&self.context, subject)? else {
+            return Ok(false);
+        };
+        self.view.base_subject_exists(&self.context, subject)
+    }
+
+    fn children(&self, subject: &EncodedTerm) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+        let (Some(subject), Some(predicate)) = (
+            self.view.lookup_term(&self.context, subject)?,
+            self.view.lookup_term(&self.context, &SCHEMA_HAS_PART)?,
+        ) else {
+            return Ok(BTreeSet::new());
+        };
+        let mut children = BTreeSet::new();
+        let cursor = self.view.forward_predicate(
+            &self.context,
+            GraphSelector::Named(self.view.graph()),
+            subject,
+            predicate,
+        )?;
+        for quad in cursor {
+            children.insert(self.view.decode_term(&self.context, quad?.object)?);
+        }
+        Ok(children)
+    }
+
+    fn parents(&self, object: &EncodedTerm) -> crate::store::Result<BTreeSet<EncodedTerm>> {
+        let (Some(predicate), Some(object)) = (
+            self.view.lookup_term(&self.context, &SCHEMA_HAS_PART)?,
+            self.view.lookup_term(&self.context, object)?,
+        ) else {
+            return Ok(BTreeSet::new());
+        };
+        let mut parents = BTreeSet::new();
+        let cursor = self.view.inverse_predicate(
+            &self.context,
+            GraphSelector::Named(self.view.graph()),
+            predicate,
+            object,
+        )?;
+        for quad in cursor {
+            parents.insert(self.view.decode_term(&self.context, quad?.subject)?);
+        }
+        Ok(parents)
     }
 }
 
@@ -388,282 +540,6 @@ pub(crate) fn summarize_ops(graph: &GraphId, ops: &[QuadOp]) -> DeltaSummary {
     )
 }
 
-// ── Delta index ─────────────────────────────────────────────────────────────
-
-/// Net effect of a change set, keyed for O(1) lookup.
-///
-/// Two fold shapes live here and must not be confused:
-///
-/// * **Last writer wins** — `PredicateDelta::objects` records the *final* entry
-///   for each triple, so `Delete` then `Insert` of the same triple leaves it
-///   present and `Insert` then `Delete` leaves it absent. Building it means
-///   iterating the delta in order and overwriting.
-/// * **Order-independent sums** — the `count` fields add `+1`/`-1` per matching
-///   change, so any ordering yields the same total. They deliberately do *not*
-///   deduplicate, matching the counts the store returns.
-#[derive(Debug, Default)]
-pub(crate) struct DeltaIndex {
-    subjects: HashMap<EncodedTerm, SubjectDelta>,
-    /// Reverse `hasPart` edge map: object → subject → final state.
-    has_part_parents: HashMap<EncodedTerm, HashMap<EncodedTerm, bool>>,
-    /// Whether the change set was empty. Several rules only make sense to check
-    /// against a delta, and fall back to the post-state snapshot without one.
-    is_empty: bool,
-}
-
-#[derive(Debug, Default)]
-struct SubjectDelta {
-    /// Net change in the subject's triple count.
-    triple_count: i64,
-    predicates: HashMap<EncodedTerm, PredicateDelta>,
-}
-
-#[derive(Debug, Default)]
-struct PredicateDelta {
-    /// Net change in the `(subject, predicate, *)` count.
-    count: i64,
-    /// Final state of every object touched for this `(subject, predicate)`.
-    objects: HashMap<EncodedTerm, bool>,
-}
-
-impl DeltaIndex {
-    /// Fold a change set into the index. Changes targeting another graph are
-    /// ignored, matching the per-change `change_graph == graph` filter every
-    /// delta helper used to apply.
-    pub(crate) fn build(graph: &GraphId, delta: &[MaterializedQuadChange]) -> Self {
-        let mut index = Self {
-            is_empty: delta.is_empty(),
-            ..Self::default()
-        };
-
-        for change in delta {
-            let (change_graph, subject, predicate, object, inserted) = match change {
-                MaterializedQuadChange::Insert {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                } => (graph, subject, predicate, object, true),
-                MaterializedQuadChange::Delete {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                } => (graph, subject, predicate, object, false),
-            };
-            if change_graph != graph {
-                continue;
-            }
-
-            let step = if inserted { 1 } else { -1 };
-            let subject_delta = index.subjects.entry(subject.clone()).or_default();
-            subject_delta.triple_count += step;
-            let predicate_delta = subject_delta
-                .predicates
-                .entry(predicate.clone())
-                .or_default();
-            predicate_delta.count += step;
-            // Last writer wins: a later entry for the same object overwrites.
-            predicate_delta.objects.insert(object.clone(), inserted);
-
-            if predicate == &*SCHEMA_HAS_PART {
-                index
-                    .has_part_parents
-                    .entry(object.clone())
-                    .or_default()
-                    .insert(subject.clone(), inserted);
-            }
-        }
-
-        index
-    }
-
-    fn predicate_delta(&self, key: SubjectPredicate<'_>) -> Option<&PredicateDelta> {
-        self.subjects
-            .get(key.subject)
-            .and_then(|subject| subject.predicates.get(key.predicate))
-    }
-
-    /// The delta's final verdict on one triple, or `None` when it says nothing.
-    fn triple_state(&self, triple: EncodedTripleRef<'_>) -> Option<bool> {
-        let key = SubjectPredicate {
-            subject: triple.subject,
-            predicate: triple.predicate,
-        };
-        self.predicate_delta(key)?
-            .objects
-            .get(triple.object)
-            .copied()
-    }
-
-    fn count_change(&self, key: SubjectPredicate<'_>) -> i64 {
-        self.predicate_delta(key).map_or(0, |entry| entry.count)
-    }
-
-    fn subject_count_change(&self, subject: &EncodedTerm) -> i64 {
-        self.subjects
-            .get(subject)
-            .map_or(0, |entry| entry.triple_count)
-    }
-
-    fn has_part_children(&self, subject: &EncodedTerm) -> Option<&HashMap<EncodedTerm, bool>> {
-        let key = SubjectPredicate {
-            subject,
-            predicate: &SCHEMA_HAS_PART,
-        };
-        self.predicate_delta(key).map(|entry| &entry.objects)
-    }
-
-    fn has_part_parents(&self, object: &EncodedTerm) -> Option<&HashMap<EncodedTerm, bool>> {
-        self.has_part_parents.get(object)
-    }
-}
-
-// ── Post-delta view of the store ────────────────────────────────────────────
-
-/// "The graph as it will be once this change set commits."
-///
-/// Every read is `store value` combined with the [`DeltaIndex`] entry, so a
-/// check costs one store probe plus a hash lookup instead of a full delta scan.
-pub(crate) struct DeltaView<'a> {
-    store: &'a GraphStore,
-    graph: &'a GraphId,
-    graph_id: Option<TermId>,
-    index: &'a DeltaIndex,
-}
-
-impl<'a> DeltaView<'a> {
-    fn new(change_set: ChangeSet<'a>, index: &'a DeltaIndex) -> crate::store::Result<Self> {
-        let graph_term = EncodedTerm::from_named_node(&change_set.graph.0);
-        Ok(Self {
-            store: change_set.store,
-            graph: change_set.graph,
-            graph_id: change_set.store.lookup_term(&graph_term)?,
-            index,
-        })
-    }
-
-    /// Does this triple exist after the change set applies?
-    fn triple_exists(&self, triple: EncodedTripleRef<'_>) -> crate::store::Result<bool> {
-        if let Some(present) = self.index.triple_state(triple) {
-            return Ok(present);
-        }
-        self.stored_triple_exists(triple)
-    }
-
-    /// How many objects does `(subject, predicate)` have afterwards?
-    fn count_sp(&self, key: SubjectPredicate<'_>) -> crate::store::Result<usize> {
-        let stored = self.store.count_objects_for_subject_predicate(
-            self.graph,
-            key.subject,
-            key.predicate,
-        )?;
-        Ok(saturating_total(stored, self.index.count_change(key)))
-    }
-
-    /// How many triples does `subject` have afterwards?
-    fn subject_triple_count(&self, subject: &EncodedTerm) -> crate::store::Result<usize> {
-        let stored = self.stored_subject_triple_count(subject)?;
-        Ok(saturating_total(
-            stored,
-            self.index.subject_count_change(subject),
-        ))
-    }
-
-    fn stored_subject_triple_count(&self, subject: &EncodedTerm) -> crate::store::Result<usize> {
-        let (Some(graph_id), Some(subject_id)) = (self.graph_id, self.store.lookup_term(subject)?)
-        else {
-            return Ok(0);
-        };
-        self.store.subject_triple_count_by_ids(graph_id, subject_id)
-    }
-
-    fn stored_triple_exists(&self, triple: EncodedTripleRef<'_>) -> crate::store::Result<bool> {
-        let (Some(graph_id), Some(subject_id), Some(predicate_id), Some(object_id)) = (
-            self.graph_id,
-            self.store.lookup_term(triple.subject)?,
-            self.store.lookup_term(triple.predicate)?,
-            self.store.lookup_term(triple.object)?,
-        ) else {
-            return Ok(false);
-        };
-        Ok(self.store.contains_quad(crate::store::EncodedQuad {
-            graph: graph_id,
-            subject: subject_id,
-            predicate: predicate_id,
-            object: object_id,
-        }))
-    }
-
-    /// `hasPart` children of `subject` afterwards.
-    fn children(&self, subject: &EncodedTerm) -> crate::store::Result<BTreeSet<EncodedTerm>> {
-        let mut children = self.stored_children(subject)?;
-        apply_edge_changes(&mut children, self.index.has_part_children(subject));
-        Ok(children)
-    }
-
-    /// Entities with a `hasPart` edge pointing at `entity` afterwards.
-    fn parents(&self, entity: &EncodedTerm) -> crate::store::Result<BTreeSet<EncodedTerm>> {
-        let mut parents = self.stored_parents(entity)?;
-        apply_edge_changes(&mut parents, self.index.has_part_parents(entity));
-        Ok(parents)
-    }
-
-    fn stored_children(
-        &self,
-        subject: &EncodedTerm,
-    ) -> crate::store::Result<BTreeSet<EncodedTerm>> {
-        let (Some(graph_id), Some(subject_id)) = (self.graph_id, self.store.lookup_term(subject)?)
-        else {
-            return Ok(BTreeSet::new());
-        };
-        Ok(self
-            .store
-            .triples_for_subject(graph_id, subject_id)?
-            .into_iter()
-            .filter_map(|(predicate, object)| (predicate == *SCHEMA_HAS_PART).then_some(object))
-            .collect())
-    }
-
-    fn stored_parents(&self, entity: &EncodedTerm) -> crate::store::Result<BTreeSet<EncodedTerm>> {
-        let (Some(graph_id), Some(predicate_id), Some(object_id)) = (
-            self.graph_id,
-            self.store.lookup_term(&SCHEMA_HAS_PART)?,
-            self.store.lookup_term(entity)?,
-        ) else {
-            return Ok(BTreeSet::new());
-        };
-
-        self.store
-            .quads_for_pattern(Some(graph_id), None, Some(predicate_id), Some(object_id))?
-            .into_iter()
-            .map(|quad| self.store.decode_term(quad.subject))
-            .collect()
-    }
-}
-
-/// `stored + change`, clamped at zero — a delta that deletes more than the
-/// store holds must not underflow into a huge count.
-fn saturating_total(stored: usize, change: i64) -> usize {
-    (stored as i64 + change).max(0) as usize
-}
-
-fn apply_edge_changes(
-    edges: &mut BTreeSet<EncodedTerm>,
-    changes: Option<&HashMap<EncodedTerm, bool>>,
-) {
-    let Some(changes) = changes else {
-        return;
-    };
-    for (peer, live) in changes {
-        if *live {
-            edges.insert(peer.clone());
-        } else {
-            edges.remove(peer);
-        }
-    }
-}
-
 // ── Orphan detection ────────────────────────────────────────────────────────
 
 pub(crate) fn orphaned_data_entities(snapshot: &GraphSnapshot) -> BTreeSet<EncodedTerm> {
@@ -720,7 +596,7 @@ pub(crate) fn orphaned_data_entities(snapshot: &GraphSnapshot) -> BTreeSet<Encod
 /// Owns the per-validation memos: children, parents, and settled reachability
 /// verdicts are reused across every candidate entity.
 struct ReachabilityWalk<'a> {
-    view: &'a DeltaView<'a>,
+    view: &'a RuleContext<'a>,
     root: EncodedTerm,
     children: HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
     parents: HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
@@ -744,7 +620,7 @@ struct ReachabilityFrame {
 }
 
 impl<'a> ReachabilityWalk<'a> {
-    fn new(view: &'a DeltaView<'a>) -> Self {
+    fn new(view: &'a RuleContext<'a>) -> Self {
         Self {
             view,
             root: graph_root(view.graph),
@@ -928,7 +804,7 @@ impl Rule for RootEntityRule {
         }
 
         let root = cx.root();
-        let exists = cx.view.triple_exists(EncodedTripleRef {
+        let exists = cx.triple_exists(EncodedTripleRef {
             subject: &root,
             predicate: &RDF_TYPE,
             object: &SCHEMA_DATASET,
@@ -963,12 +839,12 @@ impl Rule for MetadataDescriptorRule {
         }
 
         let root = cx.root();
-        let has_type = cx.view.triple_exists(EncodedTripleRef {
+        let has_type = cx.triple_exists(EncodedTripleRef {
             subject: &METADATA_DESCRIPTOR,
             predicate: &RDF_TYPE,
             object: &SCHEMA_CREATIVE_WORK,
         })?;
-        let has_about = cx.view.triple_exists(EncodedTripleRef {
+        let has_about = cx.triple_exists(EncodedTripleRef {
             subject: &METADATA_DESCRIPTOR,
             predicate: &SCHEMA_ABOUT,
             object: &root,
@@ -1021,9 +897,9 @@ impl Rule for RequiredRootPropertiesRule {
                 subject: &root,
                 predicate,
             };
-            if cx.view.count_sp(key)? < 1 {
+            if !cx.has_subject_predicate(key)? {
                 return Ok(CandidateCheck::Violation(CrateViolation::missing_property(
-                    cx.view.graph.as_str(),
+                    cx.graph.as_str(),
                     label,
                     "",
                 )));
@@ -1062,7 +938,7 @@ impl Rule for DatePublishedCardinalityRule {
         }
 
         let root = cx.root();
-        let count = cx.view.count_sp(SubjectPredicate {
+        let count = cx.count_sp(SubjectPredicate {
             subject: &root,
             predicate: &SCHEMA_DATE_PUBLISHED,
         })?;
@@ -1100,20 +976,20 @@ impl Rule for EntityTypeRule {
         // can newly be untyped.
         let mut candidates = cx.summary.type_changed_subjects.clone();
         for subject in &cx.summary.inserted_subjects {
-            if cx.view.stored_subject_triple_count(subject)? == 0 {
+            if !cx.subject_existed_before(subject)? {
                 candidates.insert(subject.clone());
             }
         }
 
         for subject in candidates {
-            if cx.view.subject_triple_count(&subject)? == 0 {
+            if !cx.subject_has_triples(&subject)? {
                 continue;
             }
             let key = SubjectPredicate {
                 subject: &subject,
                 predicate: &RDF_TYPE,
             };
-            if cx.view.count_sp(key)? == 0 {
+            if !cx.has_subject_predicate(key)? {
                 return Ok(CandidateCheck::Violation(CrateViolation::missing_type(
                     subject.0, "",
                 )));
@@ -1153,7 +1029,7 @@ impl Rule for ReachabilityRule {
             return Ok(CandidateCheck::Pass);
         }
 
-        let mut walk = ReachabilityWalk::new(&cx.view);
+        let mut walk = ReachabilityWalk::new(cx);
         Ok(match walk.first_orphan(cx.summary)? {
             Some(entity) => CandidateCheck::Violation(CrateViolation::orphaned(entity.0, "")),
             None => CandidateCheck::Pass,
@@ -1187,9 +1063,9 @@ pub(crate) fn validate_change_set(
     rules: &[Box<dyn Rule>],
     change_set: ChangeSet<'_>,
 ) -> std::result::Result<(), RuleEvaluationError> {
-    let index = DeltaIndex::build(change_set.graph, change_set.delta);
+    let index = DeltaIndex::build(change_set.store, change_set.graph, change_set.delta)?;
     let summary = summarize_delta(change_set.graph, change_set.delta);
-    let cx = RuleContext::new(DeltaView::new(change_set, &index)?, &summary);
+    let cx = RuleContext::new(change_set, &index, &summary);
 
     let mut violations = Vec::new();
     let mut post = None;
@@ -1199,16 +1075,8 @@ pub(crate) fn validate_change_set(
             CandidateCheck::Pass => {}
             CandidateCheck::Violation(violation) => violations.push(violation),
             CandidateCheck::NeedSnapshot => {
-                // Unreachable today: every rule that returns `NeedSnapshot`
-                // guards it behind an empty delta, and this entry point is only
-                // called with something to write. The fallback still applies the
-                // delta, so a future rule cannot silently validate the pre-state.
-                debug_assert!(
-                    change_set.delta.is_empty(),
-                    "a rule requested a snapshot for a non-empty change set",
-                );
                 if post.is_none() {
-                    post = Some(post_state_after(change_set)?);
+                    post = Some(post_state_after(&cx)?);
                 }
                 let post = post.as_ref().expect("post state materialized above");
                 if let Err(violation) = rule.check_post_state(post) {
@@ -1235,9 +1103,9 @@ pub(crate) fn post_merge_violations_from_store(
         graph,
         delta: &[],
     };
-    let index = DeltaIndex::build(graph, &[]);
+    let index = DeltaIndex::build(store, graph, &[])?;
     let summary = DeltaSummary::default();
-    let cx = RuleContext::new(DeltaView::new(change_set, &index)?, &summary);
+    let cx = RuleContext::new(change_set, &index, &summary);
 
     let mut violations = Vec::new();
     let mut snapshot = None;
@@ -1265,331 +1133,13 @@ pub(crate) fn post_merge_violations_from_store(
 ///
 /// Only used by the `NeedSnapshot` fallback in [`validate_change_set`]; the
 /// candidate checks never pay for this.
-fn post_state_after(change_set: ChangeSet<'_>) -> crate::store::Result<GraphSnapshot> {
-    let snapshot = GraphSnapshot::from_store(change_set.store, change_set.graph)?;
-    let mut triples: HashSet<(EncodedTerm, EncodedTerm, EncodedTerm)> =
-        snapshot.triples.into_iter().collect();
-
-    for change in change_set.delta {
-        match change {
-            MaterializedQuadChange::Insert {
-                graph,
-                subject,
-                predicate,
-                object,
-            } if graph == change_set.graph => {
-                triples.insert((subject.clone(), predicate.clone(), object.clone()));
-            }
-            MaterializedQuadChange::Delete {
-                graph,
-                subject,
-                predicate,
-                object,
-            } if graph == change_set.graph => {
-                triples.remove(&(subject.clone(), predicate.clone(), object.clone()));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(GraphSnapshot::new(
-        change_set.graph.clone(),
-        triples.into_iter().collect(),
-    ))
+fn post_state_after(cx: &RuleContext<'_>) -> crate::store::Result<GraphSnapshot> {
+    GraphSnapshot::from_read_view(&cx.view, &cx.context, cx.graph)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
-
-    /// The pre-`DeltaIndex` fold shapes, kept verbatim as an oracle. Each one
-    /// re-scans the whole delta, which is exactly what the index replaces.
-    mod naive {
-        use super::*;
-
-        pub(super) fn triple_exists_after(
-            base: bool,
-            key: EncodedTripleRef<'_>,
-            delta: &[Change],
-        ) -> bool {
-            let mut exists = base;
-            for change in delta {
-                if change.subject == *key.subject
-                    && change.predicate == *key.predicate
-                    && change.object == *key.object
-                {
-                    exists = change.inserted;
-                }
-            }
-            exists
-        }
-
-        pub(super) fn count_sp_after(
-            base: usize,
-            key: SubjectPredicate<'_>,
-            delta: &[Change],
-        ) -> usize {
-            let mut count = base as i64;
-            for change in delta {
-                if change.subject == *key.subject && change.predicate == *key.predicate {
-                    count += if change.inserted { 1 } else { -1 };
-                }
-            }
-            count.max(0) as usize
-        }
-
-        pub(super) fn subject_count_after(
-            base: usize,
-            subject: &EncodedTerm,
-            delta: &[Change],
-        ) -> usize {
-            let mut count = base as i64;
-            for change in delta {
-                if change.subject == *subject {
-                    count += if change.inserted { 1 } else { -1 };
-                }
-            }
-            count.max(0) as usize
-        }
-
-        pub(super) fn children_after(
-            base: &BTreeSet<EncodedTerm>,
-            subject: &EncodedTerm,
-            delta: &[Change],
-        ) -> BTreeSet<EncodedTerm> {
-            let mut children = base.clone();
-            for change in delta {
-                if change.subject != *subject || change.predicate != *SCHEMA_HAS_PART {
-                    continue;
-                }
-                if change.inserted {
-                    children.insert(change.object.clone());
-                } else {
-                    children.remove(&change.object);
-                }
-            }
-            children
-        }
-
-        pub(super) fn parents_after(
-            base: &BTreeSet<EncodedTerm>,
-            object: &EncodedTerm,
-            delta: &[Change],
-        ) -> BTreeSet<EncodedTerm> {
-            let mut parents = base.clone();
-            for change in delta {
-                if change.object != *object || change.predicate != *SCHEMA_HAS_PART {
-                    continue;
-                }
-                if change.inserted {
-                    parents.insert(change.subject.clone());
-                } else {
-                    parents.remove(&change.subject);
-                }
-            }
-            parents
-        }
-    }
-
-    /// A delta entry in the shape the oracles read.
-    #[derive(Clone, Debug)]
-    struct Change {
-        subject: EncodedTerm,
-        predicate: EncodedTerm,
-        object: EncodedTerm,
-        inserted: bool,
-    }
-
-    fn graph() -> GraphId {
-        GraphId::new("urn:test:delta-index")
-    }
-
-    fn term(kind: &str, index: u8) -> EncodedTerm {
-        EncodedTerm(format!("<urn:test:{kind}-{index}>"))
-    }
-
-    /// A small alphabet keeps duplicate and delete-then-reinsert cases dense.
-    fn change_strategy() -> impl Strategy<Value = Change> {
-        (0u8..3, 0u8..3, 0u8..3, any::<bool>(), any::<bool>()).prop_map(
-            |(s, p, o, has_part, inserted)| Change {
-                subject: term("s", s),
-                predicate: if has_part {
-                    SCHEMA_HAS_PART.clone()
-                } else {
-                    term("p", p)
-                },
-                object: term("o", o),
-                inserted,
-            },
-        )
-    }
-
-    fn to_materialized(changes: &[Change]) -> Vec<MaterializedQuadChange> {
-        let graph = graph();
-        changes
-            .iter()
-            .map(|change| {
-                let (subject, predicate, object) = (
-                    change.subject.clone(),
-                    change.predicate.clone(),
-                    change.object.clone(),
-                );
-                if change.inserted {
-                    MaterializedQuadChange::Insert {
-                        graph: graph.clone(),
-                        subject,
-                        predicate,
-                        object,
-                    }
-                } else {
-                    MaterializedQuadChange::Delete {
-                        graph: graph.clone(),
-                        subject,
-                        predicate,
-                        object,
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn alphabet() -> Vec<EncodedTerm> {
-        let mut terms: Vec<EncodedTerm> = (0..3).map(|i| term("s", i)).collect();
-        terms.extend((0..3).map(|i| term("o", i)));
-        terms
-    }
-
-    proptest! {
-        /// Triple state is last-writer-wins: the index must agree with a fold
-        /// that overwrites, not with one that counts.
-        #[test]
-        fn delta_matches_state(
-            changes in proptest::collection::vec(change_strategy(), 0..24),
-            base in any::<bool>(),
-        ) {
-            let index = DeltaIndex::build(&graph(), &to_materialized(&changes));
-            let predicates: Vec<EncodedTerm> =
-                std::iter::once(SCHEMA_HAS_PART.clone()).chain((0..3).map(|i| term("p", i))).collect();
-
-            for subject in alphabet() {
-                for predicate in &predicates {
-                    for object in alphabet() {
-                        let key = EncodedTripleRef { subject: &subject, predicate, object: &object };
-                        let expected = naive::triple_exists_after(base, key, &changes);
-                        let actual = index.triple_state(key).unwrap_or(base);
-                        prop_assert_eq!(actual, expected);
-                    }
-                }
-            }
-        }
-
-        /// Counts are order-independent sums, clamped at zero.
-        #[test]
-        fn delta_matches_counts(
-            changes in proptest::collection::vec(change_strategy(), 0..24),
-            base in 0usize..4,
-        ) {
-            let index = DeltaIndex::build(&graph(), &to_materialized(&changes));
-            let predicates: Vec<EncodedTerm> =
-                std::iter::once(SCHEMA_HAS_PART.clone()).chain((0..3).map(|i| term("p", i))).collect();
-
-            for subject in alphabet() {
-                prop_assert_eq!(
-                    saturating_total(base, index.subject_count_change(&subject)),
-                    naive::subject_count_after(base, &subject, &changes)
-                );
-                for predicate in &predicates {
-                    let key = SubjectPredicate { subject: &subject, predicate };
-                    prop_assert_eq!(
-                        saturating_total(base, index.count_change(key)),
-                        naive::count_sp_after(base, key, &changes)
-                    );
-                }
-            }
-        }
-
-        /// `hasPart` edges apply in delta order per edge, in both directions.
-        #[test]
-        fn delta_matches_edges(
-            changes in proptest::collection::vec(change_strategy(), 0..24),
-            base_index in 0usize..3,
-        ) {
-            let index = DeltaIndex::build(&graph(), &to_materialized(&changes));
-            let base: BTreeSet<EncodedTerm> = alphabet().into_iter().take(base_index).collect();
-
-            for entity in alphabet() {
-                let mut children = base.clone();
-                apply_edge_changes(&mut children, index.has_part_children(&entity));
-                prop_assert_eq!(children, naive::children_after(&base, &entity, &changes));
-
-                let mut parents = base.clone();
-                apply_edge_changes(&mut parents, index.has_part_parents(&entity));
-                prop_assert_eq!(parents, naive::parents_after(&base, &entity, &changes));
-            }
-        }
-    }
-
-    /// A delete followed by a re-insert of the same triple leaves it present;
-    /// the reverse leaves it absent. Pinning the LWW direction explicitly.
-    #[test]
-    fn delta_reinsert_lww() {
-        let graph = graph();
-        let (subject, predicate, object) = (term("s", 0), term("p", 0), term("o", 0));
-        let key = EncodedTripleRef {
-            subject: &subject,
-            predicate: &predicate,
-            object: &object,
-        };
-
-        let delete_then_insert = to_materialized(&[
-            Change {
-                subject: subject.clone(),
-                predicate: predicate.clone(),
-                object: object.clone(),
-                inserted: false,
-            },
-            Change {
-                subject: subject.clone(),
-                predicate: predicate.clone(),
-                object: object.clone(),
-                inserted: true,
-            },
-        ]);
-        let mut reversed = delete_then_insert.clone();
-        reversed.reverse();
-
-        assert_eq!(
-            DeltaIndex::build(&graph, &delete_then_insert).triple_state(key),
-            Some(true)
-        );
-        assert_eq!(
-            DeltaIndex::build(&graph, &reversed).triple_state(key),
-            Some(false)
-        );
-    }
-
-    /// Changes aimed at another graph never enter the index.
-    #[test]
-    fn delta_ignores_foreign() {
-        let (subject, predicate, object) = (term("s", 0), term("p", 0), term("o", 0));
-        let foreign = vec![MaterializedQuadChange::Insert {
-            graph: GraphId::new("urn:test:other"),
-            subject: subject.clone(),
-            predicate: predicate.clone(),
-            object: object.clone(),
-        }];
-        let index = DeltaIndex::build(&graph(), &foreign);
-        assert_eq!(
-            index.triple_state(EncodedTripleRef {
-                subject: &subject,
-                predicate: &predicate,
-                object: &object
-            }),
-            None
-        );
-    }
-
     /// W1 — the diagnostics fast path must agree with a full recompute.
     ///
     /// `ReplicationEngine::settle_diagnostics` skips the recompute whenever
@@ -1903,6 +1453,286 @@ mod tests {
             }
             assert_eq!(recomputed(&graph, &triples), observed);
             assert!(!observed.has_orphans());
+        }
+    }
+
+    mod delta_differential {
+        use std::collections::BTreeSet;
+
+        use super::*;
+        use crate::core::{ActorId, Dot};
+        use crate::store::{ClockUpdate, CounterKey, QuadAdd};
+        use proptest::prelude::*;
+
+        type Triple = (EncodedTerm, EncodedTerm, EncodedTerm);
+
+        fn put(store: &GraphStore, graph: &GraphId, triple: &Triple) {
+            if !store.contains_graph(graph).unwrap() {
+                store.create_graph(graph).unwrap();
+            }
+            let graph_id = store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap();
+            let quad = crate::store::EncodedQuad {
+                graph: graph_id,
+                subject: store.resolve_term(&triple.0).unwrap(),
+                predicate: store.resolve_term(&triple.1).unwrap(),
+                object: store.resolve_term(&triple.2).unwrap(),
+            };
+            let _guard = store.graph_commit_guard(graph);
+            let actor = ActorId::random();
+            let mut batch = store.new_batch();
+            let counter = store
+                .next_counter(&mut batch, CounterKey { graph_id, actor })
+                .unwrap();
+            assert!(
+                store
+                    .insert_quad(
+                        &mut batch,
+                        QuadAdd {
+                            quad,
+                            dot: Dot { actor, counter },
+                        },
+                    )
+                    .unwrap()
+            );
+            let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+            clock.advance(actor, counter);
+            store
+                .set_vector_clock(
+                    &mut batch,
+                    ClockUpdate {
+                        graph_id,
+                        clock: &clock,
+                    },
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+        }
+
+        fn literal(value: &str) -> EncodedTerm {
+            EncodedTerm(format!("\"{value}\""))
+        }
+
+        fn valid_base(graph: &GraphId) -> Vec<Triple> {
+            let root = graph_root(graph);
+            let child = EncodedTerm("<urn:test:differential:child>".to_string());
+            vec![
+                (root.clone(), RDF_TYPE.clone(), SCHEMA_DATASET.clone()),
+                (root.clone(), SCHEMA_NAME.clone(), literal("base")),
+                (root.clone(), SCHEMA_DESCRIPTION.clone(), literal("base")),
+                (
+                    root.clone(),
+                    SCHEMA_DATE_PUBLISHED.clone(),
+                    literal("2026-01-01"),
+                ),
+                (
+                    METADATA_DESCRIPTOR.clone(),
+                    RDF_TYPE.clone(),
+                    SCHEMA_CREATIVE_WORK.clone(),
+                ),
+                (
+                    METADATA_DESCRIPTOR.clone(),
+                    SCHEMA_ABOUT.clone(),
+                    root.clone(),
+                ),
+                (root.clone(), SCHEMA_HAS_PART.clone(), child.clone()),
+                (child, RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+            ]
+        }
+
+        fn palette(graph: &GraphId) -> Vec<Triple> {
+            let root = graph_root(graph);
+            let child = EncodedTerm("<urn:test:differential:child>".to_string());
+            let extra = EncodedTerm("<urn:test:differential:extra>".to_string());
+            let untyped = EncodedTerm("<urn:test:differential:untyped>".to_string());
+            let mut triples = valid_base(graph);
+            triples.extend([
+                (root.clone(), SCHEMA_NAME.clone(), literal("other-name")),
+                (
+                    root.clone(),
+                    SCHEMA_DATE_PUBLISHED.clone(),
+                    literal("2026-02-02"),
+                ),
+                (extra.clone(), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+                (root.clone(), SCHEMA_HAS_PART.clone(), extra),
+                (untyped, SCHEMA_NAME.clone(), literal("untyped")),
+                (child, SCHEMA_NAME.clone(), literal("child")),
+            ]);
+            triples
+        }
+
+        fn materialize(graph: &GraphId, triple: Triple, inserted: bool) -> MaterializedQuadChange {
+            let (subject, predicate, object) = triple;
+            if inserted {
+                MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject,
+                    predicate,
+                    object,
+                }
+            } else {
+                MaterializedQuadChange::Delete {
+                    graph: graph.clone(),
+                    subject,
+                    predicate,
+                    object,
+                }
+            }
+        }
+
+        fn final_snapshot(
+            graph: &GraphId,
+            base: &[Triple],
+            changes: &[MaterializedQuadChange],
+        ) -> GraphSnapshot {
+            let mut triples: BTreeSet<Triple> = base.iter().cloned().collect();
+            for change in changes {
+                match change {
+                    MaterializedQuadChange::Insert {
+                        subject,
+                        predicate,
+                        object,
+                        ..
+                    } => {
+                        triples.insert((subject.clone(), predicate.clone(), object.clone()));
+                    }
+                    MaterializedQuadChange::Delete {
+                        subject,
+                        predicate,
+                        object,
+                        ..
+                    } => {
+                        triples.remove(&(subject.clone(), predicate.clone(), object.clone()));
+                    }
+                }
+            }
+            GraphSnapshot::new(graph.clone(), triples.into_iter().collect())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(32))]
+
+            /// The optimized candidate path must agree with a full, deterministic
+            /// post-state evaluation over duplicate, no-op, and reordered writes.
+            #[test]
+            fn candidate_rules_match_full_post_state(
+                operations in proptest::collection::vec((0usize..14, any::<bool>()), 0..24),
+            ) {
+                let directory = tempfile::tempdir().unwrap();
+                let store = GraphStore::open(directory.path()).unwrap();
+                let graph = GraphId::new("urn:test:delta-rule-differential");
+                let base = valid_base(&graph);
+                for triple in &base {
+                    put(&store, &graph, triple);
+                }
+                let palette = palette(&graph);
+                let changes: Vec<_> = operations
+                    .into_iter()
+                    .map(|(slot, inserted)| materialize(&graph, palette[slot % palette.len()].clone(), inserted))
+                    .collect();
+                let rules = default_rules();
+
+                let actual = match validate_change_set(
+                    &rules,
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &changes,
+                    },
+                ) {
+                    Ok(()) => Vec::new(),
+                    Err(RuleEvaluationError::Violations(violations)) => violations,
+                    Err(RuleEvaluationError::Store(error)) => panic!("unexpected store error: {error}"),
+                };
+                let snapshot = final_snapshot(&graph, &base, &changes);
+                let expected: Vec<_> = rules
+                    .iter()
+                    .filter_map(|rule| rule.check_post_state(&snapshot).err())
+                    .collect();
+                prop_assert_eq!(actual, expected);
+            }
+        }
+
+        struct ExplicitSnapshotRule {
+            marker: Triple,
+        }
+
+        impl Rule for ExplicitSnapshotRule {
+            fn check_candidate(&self, _: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
+                Ok(CandidateCheck::NeedSnapshot)
+            }
+
+            fn check_post_state(
+                &self,
+                post: &GraphSnapshot,
+            ) -> std::result::Result<(), CrateViolation> {
+                let (subject, predicate, object) = &self.marker;
+                if post.has_triple(EncodedTripleRef {
+                    subject,
+                    predicate,
+                    object,
+                }) {
+                    Ok(())
+                } else {
+                    Err(CrateViolation::missing_root(""))
+                }
+            }
+        }
+
+        #[test]
+        fn snapshot_fallback_applies_delta_but_normal_candidates_do_not_materialize() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(directory.path()).unwrap();
+            let graph = GraphId::new("urn:test:snapshot-fallback");
+            let base = valid_base(&graph);
+            for triple in &base {
+                put(&store, &graph, triple);
+            }
+
+            let root = graph_root(&graph);
+            let ordinary = MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: root.clone(),
+                predicate: SCHEMA_NAME.clone(),
+                object: literal("another-name"),
+            };
+            SNAPSHOT_READS.with(|reads| reads.set(0));
+            assert!(
+                validate_change_set(
+                    &default_rules(),
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &[ordinary],
+                    },
+                )
+                .is_ok()
+            );
+            assert_eq!(0, SNAPSHOT_READS.with(|reads| reads.get()));
+
+            let marker = (
+                root,
+                EncodedTerm("<urn:test:snapshot:predicate>".to_string()),
+                literal("marker"),
+            );
+            let delta = vec![materialize(&graph, marker.clone(), true)];
+            let rules: Vec<Box<dyn Rule>> = vec![Box::new(ExplicitSnapshotRule {
+                marker: marker.clone(),
+            })];
+            SNAPSHOT_READS.with(|reads| reads.set(0));
+            assert!(
+                validate_change_set(
+                    &rules,
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &delta,
+                    },
+                )
+                .is_ok()
+            );
+            assert_eq!(1, SNAPSHOT_READS.with(|reads| reads.get()));
         }
     }
 }

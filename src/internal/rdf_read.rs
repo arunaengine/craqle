@@ -37,7 +37,7 @@ pub(crate) enum GraphSelector {
 }
 
 impl GraphSelector {
-    fn apply(self, mut pattern: QuadPattern) -> Option<QuadPattern> {
+    pub(crate) fn apply(self, mut pattern: QuadPattern) -> Option<QuadPattern> {
         if let Self::Named(graph) = self {
             if pattern.graph.is_some_and(|expected| expected != graph) {
                 return None;
@@ -114,6 +114,10 @@ pub(crate) struct StoreReadView<'store> {
 impl<'store> StoreReadView<'store> {
     pub(crate) fn new(store: &'store GraphStore) -> Self {
         Self { store }
+    }
+
+    pub(crate) fn store(&self) -> &'store GraphStore {
+        self.store
     }
 }
 
@@ -295,7 +299,9 @@ pub(crate) fn graph_is_visible(
     }
 
     context.increment_graphs_considered();
-    let visible = if !store.contains_graph_by_id(graph)? {
+    let visible = if let Some(validation_graph) = context.validation_graph() {
+        graph == validation_graph
+    } else if !store.contains_graph_by_id(graph)? {
         false
     } else {
         match &context.visibility {
@@ -343,6 +349,9 @@ pub(crate) fn quad_is_visible(
 ) -> Result<bool> {
     if !graph_is_visible(store, context, quad.graph)? {
         return Ok(false);
+    }
+    if context.validation_graph().is_some() {
+        return Ok(true);
     }
     let orphaned = orphaned_for_graph(store, context, quad.graph)?;
     Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))

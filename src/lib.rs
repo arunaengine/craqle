@@ -37,6 +37,8 @@ mod search_queue;
 mod sparql;
 #[path = "internal/store.rs"]
 mod store;
+#[path = "internal/validation_delta.rs"]
+mod validation_delta;
 
 mod auth;
 mod sync;

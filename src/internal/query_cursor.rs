@@ -5,6 +5,7 @@ use fjall::{Keyspace, Readable, Snapshot};
 use crate::query_context::ReadContext;
 use crate::rdf_read::QuadPattern;
 use crate::store::{EncodedQuad, GraphStore, Result, TermId};
+use crate::validation_delta::DeltaQuadCursor;
 
 enum SourceIterator {
     Durable {
@@ -35,15 +36,22 @@ pub(crate) struct RawQuadCursor {
 
 impl RawQuadCursor {
     pub(crate) fn new(snapshot: Snapshot, quads: &Keyspace, pattern: QuadPattern) -> Self {
-        let iterator = match (pattern.graph, pattern.subject) {
-            (Some(graph), Some(subject)) => {
+        let iterator = match (pattern.graph, pattern.subject, pattern.predicate) {
+            (Some(graph), Some(subject), Some(predicate)) => {
+                let mut prefix = [0u8; 48];
+                prefix[..16].copy_from_slice(&graph.to_be_bytes());
+                prefix[16..32].copy_from_slice(&subject.to_be_bytes());
+                prefix[32..].copy_from_slice(&predicate.to_be_bytes());
+                snapshot.prefix(quads, prefix)
+            }
+            (Some(graph), Some(subject), None) => {
                 let mut prefix = [0u8; 32];
                 prefix[..16].copy_from_slice(&graph.to_be_bytes());
                 prefix[16..].copy_from_slice(&subject.to_be_bytes());
                 snapshot.prefix(quads, prefix)
             }
-            (Some(graph), None) => snapshot.prefix(quads, graph.to_be_bytes()),
-            (None, _) => snapshot.iter(quads),
+            (Some(graph), None, _) => snapshot.prefix(quads, graph.to_be_bytes()),
+            (None, _, _) => snapshot.iter(quads),
         };
         Self {
             source: SourceIterator::Durable {
@@ -124,10 +132,15 @@ const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
 pub(crate) struct QueryCursor<'store, 'context, 'visibility> {
     store: &'store GraphStore,
     context: &'context ReadContext<'visibility>,
-    raw: Option<RawQuadCursor>,
+    source: Option<QuerySource<'store>>,
     pattern: QuadPattern,
     candidates_since_check: usize,
     finished: bool,
+}
+
+enum QuerySource<'store> {
+    Raw(RawQuadCursor),
+    Delta(DeltaQuadCursor<'store>),
 }
 
 impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
@@ -140,7 +153,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
         Self {
             store,
             context,
-            raw: Some(raw),
+            source: Some(QuerySource::Raw(raw)),
             pattern,
             candidates_since_check: 0,
             finished: false,
@@ -155,7 +168,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
         Self {
             store,
             context,
-            raw: None,
+            source: None,
             pattern,
             candidates_since_check: 0,
             finished: false,
@@ -165,6 +178,22 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
     fn fail(&mut self, error: crate::store::StoreError) -> Option<Result<EncodedQuad>> {
         self.finished = true;
         Some(Err(error))
+    }
+
+    pub(crate) fn delta(
+        store: &'store GraphStore,
+        context: &'context ReadContext<'visibility>,
+        delta: DeltaQuadCursor<'store>,
+        pattern: QuadPattern,
+    ) -> Self {
+        Self {
+            store,
+            context,
+            source: Some(QuerySource::Delta(delta)),
+            pattern,
+            candidates_since_check: 0,
+            finished: false,
+        }
     }
 }
 
@@ -180,11 +209,15 @@ impl Iterator for QueryCursor<'_, '_, '_> {
         }
 
         loop {
-            let Some(raw) = self.raw.as_mut() else {
+            let Some(source) = self.source.as_mut() else {
                 self.finished = true;
                 return None;
             };
-            let candidate = match raw.next_candidate() {
+            let next = match source {
+                QuerySource::Raw(raw) => raw.next_candidate(),
+                QuerySource::Delta(delta) => delta.next_candidate(),
+            };
+            let candidate = match next {
                 Some(Ok(candidate)) => candidate,
                 Some(Err(error)) => {
                     return self.fail(error);
