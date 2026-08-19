@@ -1739,9 +1739,78 @@ impl CraqleNode {
             })?)
     }
 
+    /// Parse a SPARQL query for repeated execution.
+    ///
+    /// The prepared value contains no store snapshot or authorization state;
+    /// both are acquired afresh on every execution.
+    pub fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
+        Ok(self.sparql.prepare_query(sparql)?)
+    }
+
+    /// Execute a SPARQL query and return its complete result with diagnostics.
+    pub fn query_with_statistics(
+        &self,
+        auth: &dyn Authorizer,
+        sparql: &str,
+    ) -> Result<QueryExecution> {
+        Ok(self.sparql.query_with_snapshot_visibility_statistics(
+            sparql,
+            &|snapshot, graph: &GraphId| {
+                snapshot
+                    .graph_policy(&self.store, graph)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
+            },
+        )?)
+    }
+
+    /// Execute a prepared query against a fresh authorized store snapshot.
+    pub fn execute_prepared(
+        &self,
+        auth: &dyn Authorizer,
+        query: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryExecution> {
+        Ok(self.sparql.execute_prepared_with_snapshot_visibility(
+            query,
+            &|snapshot, graph: &GraphId| {
+                snapshot
+                    .graph_policy(&self.store, graph)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
+            },
+            options,
+            Duration::ZERO,
+            true,
+        )?)
+    }
+
     /// Execute a SPARQL query against an explicit set of local graphs.
     pub fn query_graphs(&self, graphs: &[GraphId], sparql: &str) -> Result<QueryResults> {
         Ok(self.sparql.query_with_graphs(sparql, graphs)?)
+    }
+
+    /// Execute a complete query over explicit graphs with diagnostics.
+    pub fn query_graphs_with_statistics(
+        &self,
+        graphs: &[GraphId],
+        sparql: &str,
+    ) -> Result<QueryExecution> {
+        Ok(self.sparql.query_with_graphs_statistics(sparql, graphs)?)
+    }
+
+    /// Execute a prepared query over an explicit graph set.
+    pub fn execute_prepared_graphs(
+        &self,
+        graphs: &[GraphId],
+        query: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryExecution> {
+        Ok(self
+            .sparql
+            .execute_prepared_with_graphs(query, graphs, options)?)
     }
 
     /// Execute a complete query with an explicit storage-read mode.

@@ -125,7 +125,6 @@ pub struct QueryExecutionStatistics {
 pub(crate) struct SparqlEngine {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
-    evaluator: QueryEvaluator,
 }
 
 pub(crate) type VisibleFn<'a> = dyn Fn(&GraphId) -> bool + 'a;
@@ -179,16 +178,16 @@ const FTS_MIN_FETCH: usize = 64;
 
 impl SparqlEngine {
     pub(crate) fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
-        Self {
-            store,
-            search,
-            evaluator: QueryEvaluator::new(),
-        }
+        Self { store, search }
     }
 
     #[cfg(test)]
     pub(crate) fn query(&self, sparql: &str) -> Result<QueryResults> {
         self.run_query(sparql, GraphScope::All, planner_enabled())
+    }
+
+    pub(crate) fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
+        Ok(parse_prepared_query(sparql)?.0)
     }
 
     pub(crate) fn query_with_graphs(
@@ -213,6 +212,38 @@ impl SparqlEngine {
         )
     }
 
+    pub(crate) fn query_with_graphs_statistics(
+        &self,
+        sparql: &str,
+        graphs: &[GraphId],
+    ) -> Result<QueryExecution> {
+        let (prepared, parse_time) = parse_prepared_query(sparql)?;
+        self.execute_prepared_with_scope(
+            &prepared,
+            GraphScope::List(graphs),
+            &QueryExecutionOptions::default(),
+            parse_time,
+            true,
+        )
+        .map(|(execution, _)| execution)
+    }
+
+    pub(crate) fn execute_prepared_with_graphs(
+        &self,
+        prepared: &PreparedQuery,
+        graphs: &[GraphId],
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryExecution> {
+        self.execute_prepared_with_scope(
+            prepared,
+            GraphScope::List(graphs),
+            options,
+            Duration::ZERO,
+            true,
+        )
+        .map(|(execution, _)| execution)
+    }
+
     pub(crate) fn query_with_visibility(
         &self,
         sparql: &str,
@@ -226,14 +257,46 @@ impl SparqlEngine {
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryResults> {
-        let full = format!("{COMMON_PREFIXES}{sparql}");
-        let mut query = SparqlParser::new()
-            .parse_query(&full)
-            .map_err(|e| SparqlError::Parse(e.to_string()))?;
-        let view = StoreReadView::new(&self.store);
+        let (prepared, parse_time) = parse_prepared_query(sparql)?;
+        self.execute_prepared_with_snapshot_visibility(
+            &prepared,
+            policy_visible,
+            &QueryExecutionOptions::default(),
+            parse_time,
+            false,
+        )
+        .map(|execution| execution.results)
+    }
+
+    pub(crate) fn query_with_snapshot_visibility_statistics(
+        &self,
+        sparql: &str,
+        policy_visible: &SnapshotVisibleFn<'_>,
+    ) -> Result<QueryExecution> {
+        let (prepared, parse_time) = parse_prepared_query(sparql)?;
+        self.execute_prepared_with_snapshot_visibility(
+            &prepared,
+            policy_visible,
+            &QueryExecutionOptions::default(),
+            parse_time,
+            true,
+        )
+    }
+
+    pub(crate) fn execute_prepared_with_snapshot_visibility(
+        &self,
+        prepared: &PreparedQuery,
+        policy_visible: &SnapshotVisibleFn<'_>,
+        options: &QueryExecutionOptions,
+        parse_time: Duration,
+        collect_plan_statistics: bool,
+    ) -> Result<QueryExecution> {
+        let mut query = prepared.query.as_ref().clone();
+        let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
         let scope = GraphScope::Predicate(&visible);
 
+        let rewrite_started = Instant::now();
         rewrite_fts_query(
             &mut query,
             FtsRewriteCtx {
@@ -242,11 +305,28 @@ impl SparqlEngine {
                 post_raw_visibility: Some((self.store.as_ref(), policy_visible)),
             },
         )?;
-        if planner_enabled() {
+        let rewrite_time = rewrite_started.elapsed();
+        let planning_started = Instant::now();
+        if options.optimize {
             crate::planner::optimize_query(&mut query, &self.store);
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
-        self.execute_query(query, scope, &view)
+        let craqle_planning_time = planning_started.elapsed();
+        let plan_fingerprint = query_fingerprint(&query);
+        self.execute_query(
+            query,
+            scope,
+            &view,
+            options,
+            QueryStageStatistics {
+                parse_time,
+                rewrite_time,
+                craqle_planning_time,
+                plan_fingerprint,
+            },
+            collect_plan_statistics,
+        )
+        .map(|(execution, _)| execution)
     }
 
     /// Like [`SparqlEngine::query_with_visibility`] with explicit control over
@@ -278,11 +358,27 @@ impl SparqlEngine {
         optimize: bool,
         read_mode: QueryReadMode,
     ) -> Result<(QueryResults, ReadStatistics)> {
-        let full = format!("{COMMON_PREFIXES}{sparql}");
-        let mut query = SparqlParser::new()
-            .parse_query(&full)
-            .map_err(|e| SparqlError::Parse(e.to_string()))?;
+        let (prepared, parse_time) = parse_prepared_query(sparql)?;
+        let options = QueryExecutionOptions {
+            cancellation: QueryCancellation::new(),
+            read_mode,
+            optimize,
+        };
+        let (execution, read_statistics) =
+            self.execute_prepared_with_scope(&prepared, scope, &options, parse_time, false)?;
+        Ok((execution.results, read_statistics))
+    }
 
+    fn execute_prepared_with_scope(
+        &self,
+        prepared: &PreparedQuery,
+        scope: GraphScope<'_>,
+        options: &QueryExecutionOptions,
+        parse_time: Duration,
+        collect_plan_statistics: bool,
+    ) -> Result<(QueryExecution, ReadStatistics)> {
+        let mut query = prepared.query.as_ref().clone();
+        let rewrite_started = Instant::now();
         rewrite_fts_query(
             &mut query,
             FtsRewriteCtx {
@@ -291,13 +387,28 @@ impl SparqlEngine {
                 post_raw_visibility: None,
             },
         )?;
-        if optimize {
+        let rewrite_time = rewrite_started.elapsed();
+        let planning_started = Instant::now();
+        if options.optimize {
             crate::planner::optimize_query(&mut query, &self.store);
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
-
-        let view = StoreReadView::with_read_mode(&self.store, read_mode);
-        self.execute_query_with_statistics(query, scope, &view)
+        let craqle_planning_time = planning_started.elapsed();
+        let plan_fingerprint = query_fingerprint(&query);
+        let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
+        self.execute_query(
+            query,
+            scope,
+            &view,
+            options,
+            QueryStageStatistics {
+                parse_time,
+                rewrite_time,
+                craqle_planning_time,
+                plan_fingerprint,
+            },
+            collect_plan_statistics,
+        )
     }
 
     fn execute_query(
@@ -305,29 +416,28 @@ impl SparqlEngine {
         query: Query,
         scope: GraphScope<'_>,
         view: &StoreReadView<'_>,
-    ) -> Result<QueryResults> {
-        Ok(self.execute_query_with_statistics(query, scope, view)?.0)
-    }
-
-    fn execute_query_with_statistics(
-        &self,
-        query: Query,
-        scope: GraphScope<'_>,
-        view: &StoreReadView<'_>,
-    ) -> Result<(QueryResults, ReadStatistics)> {
-        let mut prepared = self.evaluator.prepare(&query);
+        options: &QueryExecutionOptions,
+        stages: QueryStageStatistics,
+        collect_plan_statistics: bool,
+    ) -> Result<(QueryExecution, ReadStatistics)> {
+        let mut evaluator =
+            QueryEvaluator::new().with_cancellation_token(options.cancellation.evaluator_token());
+        if collect_plan_statistics {
+            evaluator = evaluator.compute_statistics();
+        }
+        let mut prepared = evaluator.prepare(&query);
         let default_union_marker = BlankNode::default();
         prepared
             .dataset_mut()
             .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
         let context = match scope {
             #[cfg(test)]
-            GraphScope::All => ReadContext::new(QueryCancellation::new()),
+            GraphScope::All => ReadContext::new(options.cancellation.clone()),
             GraphScope::Predicate(visible) => {
                 // Union view with lazy visibility: the predicate runs at most
                 // once per touched graph, so the per-query cost scales with
                 // the graphs evaluation actually reaches, not the corpus.
-                ReadContext::with_graph_visibility(QueryCancellation::new(), visible)
+                ReadContext::with_graph_visibility(options.cancellation.clone(), visible)
             }
             GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
                 // Restrict named-graph enumeration to the visible graph list;
@@ -350,25 +460,50 @@ impl SparqlEngine {
                 prepared
                     .dataset_mut()
                     .set_available_named_graphs(named_graphs);
-                ReadContext::with_visible_graphs(QueryCancellation::new(), graphs.iter().cloned())
+                ReadContext::with_visible_graphs(
+                    options.cancellation.clone(),
+                    graphs.iter().cloned(),
+                )
             }
             GraphScope::List(graphs) => {
                 // Large graph sets: evaluate once over the union view;
                 // the shared read context filters quads against the visible
                 // graph term ids in O(1) per candidate.
-                ReadContext::with_visible_graphs(QueryCancellation::new(), graphs.iter().cloned())
+                ReadContext::with_visible_graphs(
+                    options.cancellation.clone(),
+                    graphs.iter().cloned(),
+                )
             }
         };
-        let results = prepared
-            .execute(StoreDataset::with_default_union_marker(
-                view,
-                &context,
-                default_union_marker,
-            ))
-            .map_err(map_eval_error)?;
-
-        let results = collect_query_results(results)?;
-        Ok((results, context.snapshot()))
+        let execution_started = Instant::now();
+        let (results, explanation) = prepared.explain(StoreDataset::with_default_union_marker(
+            view,
+            &context,
+            default_union_marker,
+        ));
+        let initial_execution_time = execution_started.elapsed();
+        let results = results.map_err(map_eval_error)?;
+        let (results, collection) = collect_query_results(results, execution_started)?;
+        let read_statistics = context.snapshot();
+        let explanation_metrics = if collect_plan_statistics {
+            read_explanation_metrics(&explanation)?
+        } else {
+            ExplanationMetrics::default()
+        };
+        let statistics = build_execution_statistics(
+            stages,
+            read_statistics.clone(),
+            initial_execution_time,
+            collection,
+            explanation_metrics,
+        );
+        Ok((
+            QueryExecution {
+                results,
+                statistics,
+            },
+            read_statistics,
+        ))
     }
 
     pub(crate) fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
@@ -396,7 +531,8 @@ impl SparqlEngine {
                     using,
                     pattern,
                 } => {
-                    let mut prepared = self.evaluator.prepare_delete_insert(
+                    let evaluator = QueryEvaluator::new();
+                    let mut prepared = evaluator.prepare_delete_insert(
                         delete.clone(),
                         insert.clone(),
                         None,
@@ -444,6 +580,134 @@ impl SparqlEngine {
         }
 
         Ok(changes)
+    }
+}
+
+struct QueryStageStatistics {
+    parse_time: Duration,
+    rewrite_time: Duration,
+    craqle_planning_time: Duration,
+    plan_fingerprint: String,
+}
+
+#[derive(Default)]
+struct ExplanationMetrics {
+    planning_time: Duration,
+    intermediate_rows: u64,
+}
+
+#[derive(Default)]
+struct CollectionMetrics {
+    execution_time: Duration,
+    collection_time: Duration,
+    time_to_first_internal_result: Option<Duration>,
+    result_rows: u64,
+    result_cells: u64,
+}
+
+fn parse_prepared_query(sparql: &str) -> Result<(PreparedQuery, Duration)> {
+    let started = Instant::now();
+    let full = format!("{COMMON_PREFIXES}{sparql}");
+    let query = SparqlParser::new()
+        .parse_query(&full)
+        .map_err(|error| SparqlError::Parse(error.to_string()))?;
+    Ok((
+        PreparedQuery {
+            query: Arc::new(query),
+        },
+        started.elapsed(),
+    ))
+}
+
+fn query_fingerprint(query: &Query) -> String {
+    blake3::hash(query.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn read_explanation_metrics(
+    explanation: &spareval::QueryExplanation,
+) -> Result<ExplanationMetrics> {
+    let mut output = Vec::new();
+    explanation
+        .write_in_json(&mut output)
+        .map_err(|error| SparqlError::Evaluation(error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|error| SparqlError::Evaluation(error.to_string()))?;
+    let planning_time = value
+        .get("planning duration in seconds")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or_default();
+    let intermediate_rows = value
+        .get("plan")
+        .map(|plan| explanation_descendant_rows(plan, true))
+        .unwrap_or_default();
+    Ok(ExplanationMetrics {
+        planning_time,
+        intermediate_rows,
+    })
+}
+
+fn explanation_descendant_rows(node: &serde_json::Value, root: bool) -> u64 {
+    let own = if root {
+        0
+    } else {
+        node.get("number of results")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+    };
+    node.get("children")
+        .and_then(serde_json::Value::as_array)
+        .map(|children| {
+            children.iter().fold(own, |total, child| {
+                total.saturating_add(explanation_descendant_rows(child, false))
+            })
+        })
+        .unwrap_or(own)
+}
+
+fn build_execution_statistics(
+    stages: QueryStageStatistics,
+    reads: ReadStatistics,
+    initial_execution_time: Duration,
+    collection: CollectionMetrics,
+    explanation: ExplanationMetrics,
+) -> QueryExecutionStatistics {
+    QueryExecutionStatistics {
+        parse_time: stages.parse_time,
+        rewrite_time: stages.rewrite_time,
+        planning_time: stages
+            .craqle_planning_time
+            .saturating_add(explanation.planning_time),
+        execution_time: initial_execution_time
+            .saturating_sub(explanation.planning_time)
+            .saturating_add(collection.execution_time),
+        result_collection_time: collection.collection_time,
+        time_to_first_internal_result: collection.time_to_first_internal_result,
+        selected_access_paths: reads.selected_access_paths,
+        plan_fingerprint: stages.plan_fingerprint,
+        index_seeks: reads.index_seeks,
+        qv_admission_checks: reads.qv_admission_checks,
+        qv_header_reads: reads.qv_header_reads,
+        qv_counter_reads: reads.qv_counter_reads,
+        qv_trusted: reads.qv_trusted,
+        fallback_reason: reads.fallback_reason,
+        source_keys_read: reads.source_keys_read,
+        source_bytes_read: reads.source_bytes_read,
+        qv_keys_read: reads.qv_keys_read,
+        qv_bytes_read: reads.qv_bytes_read,
+        candidate_quads: reads.candidate_quads,
+        matching_quads: reads.matching_quads,
+        graphs_considered: reads.graphs_considered,
+        orphan_checks: reads.orphan_checks,
+        duplicate_groups: reads.duplicate_groups,
+        duplicate_copies_skipped: reads.duplicate_copies_skipped,
+        terms_decoded: reads.terms_decoded,
+        intermediate_rows: explanation.intermediate_rows,
+        result_rows: collection.result_rows,
+        result_cells: collection.result_cells,
     }
 }
 
@@ -1255,40 +1519,83 @@ where
     }
 }
 
-fn collect_query_results(results: spareval::QueryResults<'_>) -> Result<QueryResults> {
+fn collect_query_results(
+    results: spareval::QueryResults<'_>,
+    execution_started: Instant,
+) -> Result<(QueryResults, CollectionMetrics)> {
     match results {
-        spareval::QueryResults::Solutions(solutions) => {
+        spareval::QueryResults::Solutions(mut solutions) => {
             // Each solution carries its own (variable, term) pairs and yields
             // only the bound ones, so building the row from them is exactly
             // the old "for every projected variable, look it up" loop without
             // the per-cell linear scan and per-cell name clone.
             let mut rows = Vec::new();
-            for solution in solutions {
+            let mut metrics = CollectionMetrics::default();
+            loop {
+                let execution = Instant::now();
+                let solution = solutions.next();
+                metrics.execution_time = metrics.execution_time.saturating_add(execution.elapsed());
+                let Some(solution) = solution else {
+                    break;
+                };
+                if metrics.time_to_first_internal_result.is_none() {
+                    metrics.time_to_first_internal_result = Some(execution_started.elapsed());
+                }
                 let solution = solution.map_err(map_eval_error)?;
+                let collecting = Instant::now();
                 let mut row = HashMap::with_capacity(solution.len());
                 for (variable, term) in solution.iter() {
                     row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term));
                 }
+                metrics.result_rows = metrics.result_rows.saturating_add(1);
+                metrics.result_cells = metrics
+                    .result_cells
+                    .saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX));
                 rows.push(row);
+                metrics.collection_time =
+                    metrics.collection_time.saturating_add(collecting.elapsed());
             }
-            Ok(QueryResults::Solutions(rows))
+            Ok((QueryResults::Solutions(rows), metrics))
         }
-        spareval::QueryResults::Boolean(value) => Ok(QueryResults::Boolean(value)),
-        spareval::QueryResults::Graph(triples) => {
+        spareval::QueryResults::Boolean(value) => Ok((
+            QueryResults::Boolean(value),
+            CollectionMetrics {
+                time_to_first_internal_result: Some(execution_started.elapsed()),
+                result_rows: 1,
+                result_cells: 1,
+                ..CollectionMetrics::default()
+            },
+        )),
+        spareval::QueryResults::Graph(mut triples) => {
             let mut graph = Vec::new();
-            for triple in triples {
+            let mut metrics = CollectionMetrics::default();
+            loop {
+                let execution = Instant::now();
+                let triple = triples.next();
+                metrics.execution_time = metrics.execution_time.saturating_add(execution.elapsed());
+                let Some(triple) = triple else {
+                    break;
+                };
+                if metrics.time_to_first_internal_result.is_none() {
+                    metrics.time_to_first_internal_result = Some(execution_started.elapsed());
+                }
                 let Triple {
                     subject,
                     predicate,
                     object,
                 } = triple.map_err(map_eval_error)?;
+                let collecting = Instant::now();
                 graph.push((
                     EncodedTerm::from(&subject),
                     EncodedTerm::from_named_node(&predicate),
                     EncodedTerm::from_term(&object),
                 ));
+                metrics.result_rows = metrics.result_rows.saturating_add(1);
+                metrics.result_cells = metrics.result_cells.saturating_add(3);
+                metrics.collection_time =
+                    metrics.collection_time.saturating_add(collecting.elapsed());
             }
-            Ok(QueryResults::Graph(graph))
+            Ok((QueryResults::Graph(graph), metrics))
         }
     }
 }
@@ -1971,8 +2278,10 @@ mod tests {
                     default_union_marker,
                 ))
                 .unwrap(),
+            Instant::now(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(solution_rows(rows).len(), 10);
         let statistics = context.snapshot();
         assert_eq!(statistics.index_seeks, 1);
