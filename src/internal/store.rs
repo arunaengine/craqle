@@ -1,14 +1,16 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::core::*;
 use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
-use crate::QueryIndexState;
+use crate::{
+    QueryIndexState, QueryIndexStatus, QueryIndexVerification, QueryIndexVerificationMode,
+};
 use fjall::{
-    CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, compaction::Leveled,
-    config::CompressionPolicy,
+    CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable, Snapshot,
+    compaction::Leveled, config::CompressionPolicy,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +32,10 @@ pub enum StoreError {
         context: &'static str,
         message: String,
     },
+    #[error("query index verification failed: {0}")]
+    QueryIndexVerificationFailed(&'static str),
+    #[error("query index unavailable: {0}")]
+    QueryIndexUnavailable(&'static str),
 }
 
 impl StoreError {
@@ -841,6 +847,11 @@ pub struct GraphStore {
     /// Tests use it to prove a reopen served the persisted record instead of
     /// recomputing, and that a stale record was repaired at open.
     diagnostics_computed: AtomicU64,
+    /// Metadata point reads performed by the O(1) qv1 admission gate.
+    #[cfg(test)]
+    query_index_admission_probes: AtomicU64,
+    #[cfg(test)]
+    query_index_verification_runs: AtomicU64,
     /// Explicit persists so far. Tests use it to pin a durability call that
     /// leaves no other trace inside one process.
     #[cfg(test)]
@@ -1150,6 +1161,406 @@ fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<TermId> {
     Ok(TermId::from_be_bytes(raw))
 }
 
+fn decode_query_index_u64(bytes: &[u8]) -> Option<u64> {
+    let raw: [u8; 8] = bytes.try_into().ok()?;
+    Some(u64::from_be_bytes(raw))
+}
+
+fn query_index_failure_code_is_valid(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= QUERY_INDEX_FAILURE_MAX_BYTES
+        && code.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn encode_query_index_header(header: &QueryIndexHeader) -> Vec<u8> {
+    let (state_tag, failure) = match &header.state {
+        StoredQueryIndexState::Building => (1, ""),
+        StoredQueryIndexState::Ready => (2, ""),
+        StoredQueryIndexState::Failed(reason) => (3, reason.as_str()),
+    };
+    let failure =
+        if query_index_failure_code_is_valid(failure) || (failure.is_empty() && state_tag != 3) {
+            failure
+        } else {
+            "metadata-malformed"
+        };
+    let mut bytes = Vec::with_capacity(QUERY_INDEX_HEADER_BASE_LEN + failure.len());
+    bytes.extend_from_slice(&QUERY_INDEX_HEADER_MAGIC);
+    bytes.extend_from_slice(&QUERY_INDEX_SCHEMA_VERSION.to_be_bytes());
+    bytes.push(state_tag);
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(&header.source_epoch.to_be_bytes());
+    bytes.extend_from_slice(&header.index_epoch.to_be_bytes());
+    bytes.extend_from_slice(&header.source_live_quads.to_be_bytes());
+    bytes.extend_from_slice(&header.indexed_quads.to_be_bytes());
+    bytes.extend_from_slice(&header.last_build_sequence.to_be_bytes());
+    bytes.extend_from_slice(&(failure.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(failure.as_bytes());
+    bytes
+}
+
+fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
+    if bytes.len() < QUERY_INDEX_HEADER_BASE_LEN
+        || bytes[0..4] != QUERY_INDEX_HEADER_MAGIC
+        || bytes[8] == 0
+        || bytes[9..12] != [0, 0, 0]
+    {
+        return QueryIndexHeaderRead::Malformed;
+    }
+    let schema_version = u32::from_be_bytes(
+        bytes[4..8]
+            .try_into()
+            .expect("fixed query-index header slice"),
+    );
+    if schema_version != QUERY_INDEX_SCHEMA_VERSION {
+        return QueryIndexHeaderRead::Malformed;
+    }
+    let Some(source_epoch) = decode_query_index_u64(&bytes[12..20]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
+    let Some(index_epoch) = decode_query_index_u64(&bytes[20..28]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
+    let Some(source_live_quads) = decode_query_index_u64(&bytes[28..36]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
+    let Some(indexed_quads) = decode_query_index_u64(&bytes[36..44]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
+    let Some(last_build_sequence) = decode_query_index_u64(&bytes[44..52]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
+    let failure_len = u16::from_be_bytes(
+        bytes[52..54]
+            .try_into()
+            .expect("fixed query-index header slice"),
+    ) as usize;
+    if failure_len > QUERY_INDEX_FAILURE_MAX_BYTES
+        || bytes.len() != QUERY_INDEX_HEADER_BASE_LEN + failure_len
+    {
+        return QueryIndexHeaderRead::Malformed;
+    }
+    let failure = std::str::from_utf8(&bytes[QUERY_INDEX_HEADER_BASE_LEN..]).ok();
+    let state = match (bytes[8], failure) {
+        (1, Some("")) => StoredQueryIndexState::Building,
+        (2, Some("")) => StoredQueryIndexState::Ready,
+        (3, Some(reason)) if query_index_failure_code_is_valid(reason) => {
+            StoredQueryIndexState::Failed(reason.to_owned())
+        }
+        _ => return QueryIndexHeaderRead::Malformed,
+    };
+    QueryIndexHeaderRead::Valid(QueryIndexHeader {
+        state,
+        source_epoch,
+        index_epoch,
+        source_live_quads,
+        indexed_quads,
+        last_build_sequence,
+    })
+}
+
+fn query_index_term_at(bytes: &[u8], offset: usize) -> TermId {
+    TermId::from_be_bytes(
+        bytes[offset..offset + 16]
+            .try_into()
+            .expect("fixed query-index term slice"),
+    )
+}
+
+fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
+    match bytes.first().copied() {
+        Some(b'H') if bytes.len() == 1 => QueryIndexCounterKeyRead::Header,
+        Some(b'H') => QueryIndexCounterKeyRead::InvalidLength,
+        Some(b'T') if bytes.len() == 1 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Total)
+        }
+        Some(b'T') => QueryIndexCounterKeyRead::InvalidLength,
+        Some(QUERY_INDEX_GRAPH_COUNT_TAG) if bytes.len() == 17 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Graph(query_index_term_at(
+                bytes, 1,
+            )))
+        }
+        Some(QUERY_INDEX_PREDICATE_COUNT_TAG) if bytes.len() == 17 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Predicate(query_index_term_at(
+                bytes, 1,
+            )))
+        }
+        Some(QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG) if bytes.len() == 17 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::PredicateMutationEpoch(
+                query_index_term_at(bytes, 1),
+            ))
+        }
+        Some(QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG) if bytes.len() == 33 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicate(
+                query_index_term_at(bytes, 1),
+                query_index_term_at(bytes, 17),
+            ))
+        }
+        Some(QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 33 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::PredicateObject(
+                query_index_term_at(bytes, 1),
+                query_index_term_at(bytes, 17),
+            ))
+        }
+        Some(QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 49 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicateObject(
+                query_index_term_at(bytes, 1),
+                query_index_term_at(bytes, 17),
+                query_index_term_at(bytes, 33),
+            ))
+        }
+        Some(
+            QUERY_INDEX_GRAPH_COUNT_TAG
+            | QUERY_INDEX_PREDICATE_COUNT_TAG
+            | QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG
+            | QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG
+            | QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG
+            | QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG,
+        ) => QueryIndexCounterKeyRead::InvalidLength,
+        Some(_) => QueryIndexCounterKeyRead::UnknownTag,
+        None => QueryIndexCounterKeyRead::InvalidLength,
+    }
+}
+
+fn query_index_key(parts: [TermId; 4]) -> QuadKey {
+    let mut key = [0u8; 64];
+    for (index, term) in parts.into_iter().enumerate() {
+        key[index * 16..(index + 1) * 16].copy_from_slice(&term.to_be_bytes());
+    }
+    key
+}
+
+fn query_index_prefix(parts: &[TermId]) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(parts.len() * 16);
+    for term in parts {
+        prefix.extend_from_slice(&term.to_be_bytes());
+    }
+    prefix
+}
+
+fn qv1_gpos_key(quad: EncodedQuad) -> QuadKey {
+    query_index_key([quad.graph, quad.predicate, quad.object, quad.subject])
+}
+
+fn qv1_spog_key(quad: EncodedQuad) -> QuadKey {
+    query_index_key([quad.subject, quad.predicate, quad.object, quad.graph])
+}
+
+fn qv1_posg_key(quad: EncodedQuad) -> QuadKey {
+    query_index_key([quad.predicate, quad.object, quad.subject, quad.graph])
+}
+
+fn decode_qv1_gpos_key(bytes: &[u8]) -> Option<EncodedQuad> {
+    (bytes.len() == 64).then(|| EncodedQuad {
+        graph: query_index_term_at(bytes, 0),
+        predicate: query_index_term_at(bytes, 16),
+        object: query_index_term_at(bytes, 32),
+        subject: query_index_term_at(bytes, 48),
+    })
+}
+
+fn decode_qv1_spog_key(bytes: &[u8]) -> Option<EncodedQuad> {
+    (bytes.len() == 64).then(|| EncodedQuad {
+        subject: query_index_term_at(bytes, 0),
+        predicate: query_index_term_at(bytes, 16),
+        object: query_index_term_at(bytes, 32),
+        graph: query_index_term_at(bytes, 48),
+    })
+}
+
+fn decode_qv1_posg_key(bytes: &[u8]) -> Option<EncodedQuad> {
+    (bytes.len() == 64).then(|| EncodedQuad {
+        predicate: query_index_term_at(bytes, 0),
+        object: query_index_term_at(bytes, 16),
+        subject: query_index_term_at(bytes, 32),
+        graph: query_index_term_at(bytes, 48),
+    })
+}
+
+fn decode_source_quad_key(bytes: &[u8]) -> Option<EncodedQuad> {
+    (bytes.len() == 64).then(|| EncodedQuad {
+        graph: query_index_term_at(bytes, 0),
+        subject: query_index_term_at(bytes, 16),
+        predicate: query_index_term_at(bytes, 32),
+        object: query_index_term_at(bytes, 48),
+    })
+}
+
+fn coalesced_query_index_transitions(mutations: &[QuadMutation]) -> Vec<NetQuadTransition> {
+    let mut transitions = BTreeMap::<QuadKey, NetQuadTransition>::new();
+    for mutation in mutations {
+        let (quad, is_live) = match mutation {
+            QuadMutation::Insert(quad) => (*quad, true),
+            QuadMutation::Remove(quad) => (*quad, false),
+        };
+        let key = GraphStore::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
+        if let Some(existing) = transitions.get_mut(&key) {
+            existing.is_live = is_live;
+        } else {
+            transitions.insert(
+                key,
+                NetQuadTransition {
+                    quad,
+                    was_live: !is_live,
+                    is_live,
+                },
+            );
+        }
+    }
+    transitions
+        .into_values()
+        .filter(|transition| transition.was_live != transition.is_live)
+        .collect()
+}
+
+fn query_index_live_counter_keys(quad: EncodedQuad) -> [QueryIndexCounterKey; 6] {
+    [
+        QueryIndexCounterKey::Total,
+        QueryIndexCounterKey::Graph(quad.graph),
+        QueryIndexCounterKey::Predicate(quad.predicate),
+        QueryIndexCounterKey::GraphPredicate(quad.graph, quad.predicate),
+        QueryIndexCounterKey::PredicateObject(quad.predicate, quad.object),
+        QueryIndexCounterKey::GraphPredicateObject(quad.graph, quad.predicate, quad.object),
+    ]
+}
+
+struct QueryIndexVerificationBuilder {
+    report: QueryIndexVerification,
+}
+
+#[derive(Clone, Copy)]
+enum QueryIndexVerificationExpectation {
+    Ready,
+    BuildingCandidate,
+}
+
+#[derive(Clone, Copy)]
+enum QueryIndexKeyOrder {
+    Gpos,
+    Spog,
+    Posg,
+}
+
+/// The physical order selected for one trusted qv1 range. This remains
+/// crate-private so query readers never learn Fjall keyspace details.
+#[derive(Clone, Copy)]
+pub(crate) enum QueryIndexCursorOrder {
+    Gpos,
+    Spog,
+    Posg,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryIndexAdmission {
+    pub(crate) trusted: bool,
+    pub(crate) fallback_reason: Option<&'static str>,
+    pub(crate) header_reads: u64,
+    pub(crate) counter_reads: u64,
+}
+
+/// One immutable, publication-coherent durable read view.
+///
+/// It deliberately owns only the Fjall snapshot. Callers receive opaque
+/// cursor and metadata operations rather than Fjall objects or keyspaces.
+pub(crate) struct StoreReadSnapshot {
+    snapshot: Snapshot,
+}
+
+impl QueryIndexVerificationBuilder {
+    fn new(full: bool) -> Self {
+        Self {
+            report: QueryIndexVerification {
+                full,
+                valid: true,
+                source_live_quads: 0,
+                indexed_quads: 0,
+                checked_source_rows: 0,
+                checked_index_rows: 0,
+                problems: Vec::new(),
+            },
+        }
+    }
+
+    fn problem(&mut self, problem: &'static str) {
+        self.report.valid = false;
+        if self.report.problems.len() < QUERY_INDEX_PROBLEM_LIMIT
+            && !self
+                .report
+                .problems
+                .iter()
+                .any(|current| current == problem)
+        {
+            self.report.problems.push(problem.to_owned());
+        }
+    }
+
+    fn finish(self) -> QueryIndexVerification {
+        self.report
+    }
+}
+
+impl StoreReadSnapshot {
+    #[must_use]
+    pub(crate) fn sequence(&self) -> u64 {
+        self.snapshot.seqno()
+    }
+
+    pub(crate) fn raw_quad_cursor(
+        &self,
+        store: &GraphStore,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> crate::query_cursor::RawQuadCursor {
+        store
+            .current_derived_raw_cursor(self.sequence(), pattern)
+            .unwrap_or_else(|| {
+                crate::query_cursor::RawQuadCursor::new(
+                    self.snapshot.clone(),
+                    &store.quads,
+                    pattern,
+                )
+            })
+    }
+
+    pub(crate) fn source_quad_cursor(
+        &self,
+        store: &GraphStore,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> crate::query_cursor::RawQuadCursor {
+        crate::query_cursor::RawQuadCursor::new(self.snapshot.clone(), &store.quads, pattern)
+    }
+
+    pub(crate) fn raw_quad_point(
+        &self,
+        store: &GraphStore,
+        quad: EncodedQuad,
+    ) -> Result<Option<crate::query_cursor::RawQuadCandidate>> {
+        crate::query_cursor::point_candidate(&self.snapshot, &store.quads, quad)
+    }
+
+    pub(crate) fn query_index_cursor(
+        &self,
+        store: &GraphStore,
+        order: QueryIndexCursorOrder,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> crate::query_cursor::RawQuadCursor {
+        let (keyspace, prefix) = store.query_index_range(order, pattern);
+        crate::query_cursor::RawQuadCursor::query_index(
+            self.snapshot.clone(),
+            keyspace,
+            order,
+            prefix,
+        )
+    }
+
+    pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
+        store.query_index_snapshot_admission(&self.snapshot)
+    }
+
+    pub(crate) fn contains_graph_by_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
+        Ok(self
+            .snapshot
 impl GraphStore {
     fn term_lock_index(&self, id: TermId) -> usize {
         (id.0 as usize) % self.term_locks.len()

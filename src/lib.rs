@@ -68,7 +68,7 @@ pub use crate::core::{
     MaterializedQuadChange, PredicateFilter, VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
-pub use crate::query_context::{QueryCancellation, ReadStatistics};
+pub use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
 pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{
     AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
