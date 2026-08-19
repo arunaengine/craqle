@@ -10,6 +10,15 @@
 mod core;
 #[path = "internal/planner.rs"]
 mod planner;
+#[allow(dead_code)]
+#[path = "internal/query_context.rs"]
+mod query_context;
+#[allow(dead_code)]
+#[path = "internal/query_cursor.rs"]
+mod query_cursor;
+#[allow(dead_code)]
+#[path = "internal/rdf_read.rs"]
+mod rdf_read;
 #[path = "internal/replication.rs"]
 mod replication;
 #[path = "internal/rocrate.rs"]
@@ -57,6 +66,7 @@ pub use crate::core::{
     MaterializedQuadChange, PredicateFilter, VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
+pub use crate::query_context::{QueryCancellation, ReadStatistics};
 pub use crate::replication::{MergeError, UpdateError};
 pub use crate::rocrate::{
     AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,

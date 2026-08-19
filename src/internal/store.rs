@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -12,6 +12,8 @@ use fjall::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("query cancelled")]
+    Cancelled,
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),
     #[error("postcard: {0}")]
@@ -620,6 +622,10 @@ pub struct GraphStore {
     /// widening a window that is otherwise microseconds wide.
     #[cfg(test)]
     commit_stall: Mutex<Option<std::time::Duration>>,
+    /// True while the test-only post-durable commit stall holds `indexes`
+    /// write-locked.
+    #[cfg(test)]
+    commit_stalled: std::sync::atomic::AtomicBool,
     /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
     /// between an acknowledgement's token read and its commit.
     #[cfg(test)]
@@ -1184,7 +1190,9 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(delay) = stall {
+            self.commit_stalled.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
+            self.commit_stalled.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1192,10 +1200,17 @@ impl GraphStore {
     /// apply. Test-only.
     #[cfg(test)]
     pub(crate) fn set_commit_stall(&self, delay: std::time::Duration) {
+        self.commit_stalled.store(false, Ordering::SeqCst);
         *self
             .commit_stall
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Whether a commit is inside its post-durable publication stall.
+    #[cfg(test)]
+    pub(crate) fn commit_stalled(&self) -> bool {
+        self.commit_stalled.load(Ordering::SeqCst)
     }
 
     /// Stall a rebuild between its scan and its install. Test-only.
@@ -1527,36 +1542,6 @@ impl GraphStore {
         self.lookup_term(&EncodedTerm::from_named_node(&graph.0))
     }
 
-    fn graph_subject_quads(
-        &self,
-        graph: TermId,
-        subject: TermId,
-        predicate: Option<TermId>,
-        object: Option<TermId>,
-    ) -> Vec<EncodedQuad> {
-        let indexes = self.indexes_read();
-        let Some(entries) = indexes.by_graph_subject.get(&(graph, subject)) else {
-            return Vec::new();
-        };
-
-        let mut quads = Vec::new();
-        for &(candidate_predicate, candidate_object) in entries {
-            if predicate.is_some_and(|expected| expected != candidate_predicate) {
-                continue;
-            }
-            if object.is_some_and(|expected| expected != candidate_object) {
-                continue;
-            }
-            quads.push(EncodedQuad {
-                graph,
-                subject,
-                predicate: candidate_predicate,
-                object: candidate_object,
-            });
-        }
-        quads
-    }
-
     fn graph_scan(
         &self,
         graph: TermId,
@@ -1589,72 +1574,6 @@ impl GraphStore {
             }
         }
         quads
-    }
-
-    fn cross_graph_subject_scan(
-        &self,
-        subject: TermId,
-        predicate: Option<TermId>,
-        object: Option<TermId>,
-    ) -> Vec<EncodedQuad> {
-        self.with_derived_indexes(|indexes| {
-            let Some(entries) = indexes.by_subject.get(&subject) else {
-                return Vec::new();
-            };
-
-            let mut quads = Vec::new();
-            for &(candidate_predicate, candidate_object, graph) in entries {
-                if predicate.is_some_and(|expected| expected != candidate_predicate) {
-                    continue;
-                }
-                if object.is_some_and(|expected| expected != candidate_object) {
-                    continue;
-                }
-                quads.push(EncodedQuad {
-                    graph,
-                    subject,
-                    predicate: candidate_predicate,
-                    object: candidate_object,
-                });
-            }
-            quads
-        })
-    }
-
-    fn predicate_object_scan(
-        &self,
-        graph: Option<TermId>,
-        predicate: TermId,
-        object: TermId,
-    ) -> Vec<EncodedQuad> {
-        self.with_derived_indexes(|indexes| {
-            let Some(graphs) = indexes.by_predicate_object.get(&(predicate, object)) else {
-                return Vec::new();
-            };
-
-            let mut quads = Vec::new();
-            let mut push_graph = |g: TermId, subjects: &HashSet<TermId>| {
-                quads.extend(subjects.iter().map(|&subject| EncodedQuad {
-                    graph: g,
-                    subject,
-                    predicate,
-                    object,
-                }));
-            };
-            match graph {
-                Some(g) => {
-                    if let Some(subjects) = graphs.get(&g) {
-                        push_graph(g, subjects);
-                    }
-                }
-                None => {
-                    for (&g, subjects) in graphs {
-                        push_graph(g, subjects);
-                    }
-                }
-            }
-            quads
-        })
     }
 
     /// Graphs containing at least one quad matching (predicate, object), so
@@ -1769,38 +1688,7 @@ impl GraphStore {
             .collect()
     }
 
-    fn object_scan(&self, graph: Option<TermId>, object: TermId) -> Vec<EncodedQuad> {
-        self.with_derived_indexes(|indexes| {
-            let Some(graphs) = indexes.by_object.get(&object) else {
-                return Vec::new();
-            };
-
-            let mut quads = Vec::new();
-            let mut push_graph = |g: TermId, entries: &HashSet<(TermId, TermId)>| {
-                quads.extend(entries.iter().map(|&(subject, predicate)| EncodedQuad {
-                    graph: g,
-                    subject,
-                    predicate,
-                    object,
-                }));
-            };
-            match graph {
-                Some(g) => {
-                    if let Some(entries) = graphs.get(&g) {
-                        push_graph(g, entries);
-                    }
-                }
-                None => {
-                    for (&g, entries) in graphs {
-                        push_graph(g, entries);
-                    }
-                }
-            }
-            quads
-        })
-    }
-
-    fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
+    pub(crate) fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
         if bytes.len() != 64 {
             return Err(StoreError::InvalidEncoding {
                 context: "quad key",
@@ -1815,13 +1703,22 @@ impl GraphStore {
         })
     }
 
-    fn quad_key(graph: TermId, subject: TermId, predicate: TermId, object: TermId) -> [u8; 64] {
+    pub(crate) fn quad_key(
+        graph: TermId,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> [u8; 64] {
         let mut key = [0u8; 64];
         key[0..16].copy_from_slice(&graph.to_be_bytes());
         key[16..32].copy_from_slice(&subject.to_be_bytes());
         key[32..48].copy_from_slice(&predicate.to_be_bytes());
         key[48..64].copy_from_slice(&object.to_be_bytes());
         key
+    }
+
+    pub(crate) fn quad_value_is_live(bytes: &[u8]) -> bool {
+        !dot_payload_is_empty(bytes)
     }
 
     fn count_objects_for_ids(&self, graph: TermId, subject: TermId, predicate: TermId) -> usize {
@@ -1967,6 +1864,8 @@ impl GraphStore {
             term_decode_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
+            #[cfg(test)]
+            commit_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fts_ack_stall: Mutex::new(None),
             #[cfg(test)]
@@ -2733,18 +2632,6 @@ impl GraphStore {
         })
     }
 
-    /// Graphs holding at least one quad with `predicate`, so a predicate-only
-    /// pattern scans those graphs instead of every subject in the corpus.
-    pub(crate) fn predicate_graphs(&self, predicate: TermId) -> Vec<TermId> {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .predicate_graph_counts
-                .get(&predicate)
-                .map(|graphs| graphs.keys().copied().collect())
-                .unwrap_or_default()
-        })
-    }
-
     /// The token the next FTS queue entry will receive, pinned under the queue
     /// lock so every entry below it is already durable.
     ///
@@ -2763,46 +2650,51 @@ impl GraphStore {
         predicate: Option<TermId>,
         object: Option<TermId>,
     ) -> Result<Vec<EncodedQuad>> {
-        Ok(match (graph, subject, predicate, object) {
-            (Some(graph), Some(subject), predicate, object) => {
-                self.graph_subject_quads(graph, subject, predicate, object)
+        let pattern = crate::rdf_read::QuadPattern {
+            graph,
+            subject,
+            predicate,
+            object,
+        };
+        let mut cursor = self.raw_quad_cursor(pattern);
+        let mut quads = Vec::new();
+        while let Some(candidate) = cursor.next_candidate() {
+            let candidate = candidate?;
+            if candidate.live && pattern.matches(candidate.quad) {
+                quads.push(candidate.quad);
             }
-            (Some(graph), None, Some(predicate), Some(object)) => {
-                self.predicate_object_scan(Some(graph), predicate, object)
-            }
-            (Some(graph), None, Some(predicate), None) => {
-                self.graph_scan(graph, Some(predicate), None)
-            }
-            (Some(graph), None, None, Some(object)) => self.object_scan(Some(graph), object),
-            (Some(graph), None, None, None) => self.graph_scan(graph, None, None),
-            (None, Some(subject), predicate, object) => {
-                self.cross_graph_subject_scan(subject, predicate, object)
-            }
-            (None, None, Some(predicate), Some(object)) => {
-                self.predicate_object_scan(None, predicate, object)
-            }
-            (None, None, None, Some(object)) => self.object_scan(None, object),
-            (None, None, Some(predicate), None) => {
-                let mut quads = Vec::new();
-                for graph in self.predicate_graphs(predicate) {
-                    quads.extend(self.graph_scan(graph, Some(predicate), None));
-                }
-                quads
-            }
-            (None, None, None, None) => {
-                let graph_ids = self
-                    .indexes_read()
-                    .graph_subjects
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                let mut quads = Vec::new();
-                for graph in graph_ids {
-                    quads.extend(self.graph_scan(graph, None, None));
-                }
-                quads
-            }
-        })
+        }
+        Ok(quads)
+    }
+
+    /// Creates a durable quad cursor behind the index-publication barrier.
+    ///
+    /// A Fjall batch makes its keys visible one at a time, while quad commits
+    /// hold `indexes` write-locked until the durable and in-memory halves agree.
+    /// Taking this short read lock before creating the snapshot prevents a
+    /// cursor from freezing a partial batch. The returned cursor owns only the
+    /// snapshot and iterator; it never retains this guard across `next`.
+    pub(crate) fn raw_quad_cursor(
+        &self,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> crate::query_cursor::RawQuadCursor {
+        let _publication = self.indexes_read();
+        let snapshot = self.db.snapshot();
+        crate::query_cursor::RawQuadCursor::new(snapshot, &self.quads, pattern)
+    }
+
+    /// Point-probes a fully bound durable quad behind the same publication
+    /// barrier used by [`GraphStore::raw_quad_cursor`].
+    #[allow(dead_code)]
+    pub(crate) fn raw_quad_point(
+        &self,
+        quad: EncodedQuad,
+    ) -> Result<Option<crate::query_cursor::RawQuadCandidate>> {
+        let snapshot = {
+            let _publication = self.indexes_read();
+            self.db.snapshot()
+        };
+        crate::query_cursor::point_candidate(&snapshot, &self.quads, quad)
     }
 
     pub fn for_each_quad_in_graph<E, F>(
