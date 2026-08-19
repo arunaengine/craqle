@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::ops::Bound::{Excluded, Unbounded};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use fjall::{Keyspace, Readable, Snapshot};
@@ -17,6 +20,12 @@ enum SourceIterator {
         next: usize,
         graph: TermId,
         predicate: TermId,
+        object: TermId,
+    },
+    Object {
+        entries: Arc<BTreeSet<(TermId, TermId)>>,
+        last: Option<(TermId, TermId)>,
+        graph: TermId,
         object: TermId,
     },
     Empty,
@@ -78,6 +87,21 @@ impl RawQuadCursor {
         }
     }
 
+    pub(crate) fn object(
+        entries: Arc<BTreeSet<(TermId, TermId)>>,
+        graph: TermId,
+        object: TermId,
+    ) -> Self {
+        Self {
+            source: SourceIterator::Object {
+                entries,
+                last: None,
+                graph,
+                object,
+            },
+        }
+    }
+
     pub(crate) fn empty() -> Self {
         Self {
             source: SourceIterator::Empty,
@@ -120,6 +144,28 @@ impl RawQuadCursor {
                     live: true,
                 }))
             }
+            SourceIterator::Object {
+                entries,
+                last,
+                graph,
+                object,
+            } => {
+                let next = match *last {
+                    Some(last) => entries.range((Excluded(last), Unbounded)).next(),
+                    None => entries.iter().next(),
+                };
+                let &(subject, predicate) = next?;
+                *last = Some((subject, predicate));
+                Some(Ok(RawQuadCandidate {
+                    quad: EncodedQuad {
+                        graph: *graph,
+                        subject,
+                        predicate,
+                        object: *object,
+                    },
+                    live: true,
+                }))
+            }
             SourceIterator::Empty => None,
         }
     }
@@ -140,6 +186,12 @@ pub(crate) struct QueryCursor<'store, 'context, 'visibility> {
 
 enum QuerySource<'store> {
     Raw(RawQuadCursor),
+    Graphs {
+        graphs: Rc<Vec<TermId>>,
+        next_graph: usize,
+        current: Option<RawQuadCursor>,
+        pattern: QuadPattern,
+    },
     Delta(DeltaQuadCursor<'store>),
 }
 
@@ -175,6 +227,27 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
         }
     }
 
+    pub(crate) fn graphs(
+        store: &'store GraphStore,
+        context: &'context ReadContext<'visibility>,
+        graphs: Rc<Vec<TermId>>,
+        pattern: QuadPattern,
+    ) -> Self {
+        Self {
+            store,
+            context,
+            source: Some(QuerySource::Graphs {
+                graphs,
+                next_graph: 0,
+                current: None,
+                pattern,
+            }),
+            pattern,
+            candidates_since_check: 0,
+            finished: false,
+        }
+    }
+
     fn fail(&mut self, error: crate::store::StoreError) -> Option<Result<EncodedQuad>> {
         self.finished = true;
         Some(Err(error))
@@ -195,6 +268,45 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
             finished: false,
         }
     }
+
+    fn next_source_candidate(&mut self) -> Option<Result<RawQuadCandidate>> {
+        let store = self.store;
+        let context = self.context;
+        let source = self.source.as_mut()?;
+        match source {
+            QuerySource::Raw(raw) => raw.next_candidate(),
+            QuerySource::Delta(delta) => delta.next_candidate(),
+            QuerySource::Graphs {
+                graphs,
+                next_graph,
+                current,
+                pattern,
+            } => loop {
+                if let Some(cursor) = current {
+                    if let Some(candidate) = cursor.next_candidate() {
+                        return Some(candidate);
+                    }
+                    *current = None;
+                }
+
+                let graph = *graphs.get(*next_graph)?;
+                *next_graph += 1;
+                if let Err(error) = context.check_cancelled() {
+                    return Some(Err(error));
+                }
+                match crate::rdf_read::graph_is_visible(store, context, graph) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => return Some(Err(error)),
+                }
+                context.increment_index_seeks();
+                *current = Some(store.raw_quad_cursor(QuadPattern {
+                    graph: Some(graph),
+                    ..*pattern
+                }));
+            },
+        }
+    }
 }
 
 impl Iterator for QueryCursor<'_, '_, '_> {
@@ -209,14 +321,11 @@ impl Iterator for QueryCursor<'_, '_, '_> {
         }
 
         loop {
-            let Some(source) = self.source.as_mut() else {
+            if self.source.is_none() {
                 self.finished = true;
                 return None;
             };
-            let next = match source {
-                QuerySource::Raw(raw) => raw.next_candidate(),
-                QuerySource::Delta(delta) => delta.next_candidate(),
-            };
+            let next = self.next_source_candidate();
             let candidate = match next {
                 Some(Ok(candidate)) => candidate,
                 Some(Err(error)) => {

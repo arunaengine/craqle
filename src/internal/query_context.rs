@@ -77,6 +77,7 @@ pub(crate) enum GraphVisibility<'a> {
 pub(crate) struct ReadContext<'a> {
     cancellation: QueryCancellation,
     pub(crate) visibility: GraphVisibility<'a>,
+    exact_graphs: Option<Rc<Vec<TermId>>>,
     /// Validation is intentionally distinct from ordinary query visibility:
     /// it names the one proposed graph and keeps its rows observable even
     /// before the graph exists durably or diagnostics have been recomputed.
@@ -98,6 +99,7 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::All,
+            exact_graphs: None,
             validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -110,14 +112,17 @@ impl<'a> ReadContext<'a> {
         cancellation: QueryCancellation,
         graphs: impl IntoIterator<Item = GraphId>,
     ) -> Self {
+        let mut exact_graphs: Vec<_> = graphs
+            .into_iter()
+            .map(|graph| hash_term(&EncodedTerm::from_named_node(&graph.0)))
+            .collect();
+        exact_graphs.sort_unstable();
+        exact_graphs.dedup();
+        let exact_graphs = Rc::new(exact_graphs);
         Self {
             cancellation,
-            visibility: GraphVisibility::Exact(
-                graphs
-                    .into_iter()
-                    .map(|graph| hash_term(&EncodedTerm::from_named_node(&graph.0)))
-                    .collect(),
-            ),
+            visibility: GraphVisibility::Exact(exact_graphs.iter().copied().collect()),
+            exact_graphs: Some(exact_graphs),
             validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -133,6 +138,7 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::Predicate(visible),
+            exact_graphs: None,
             validation_graph: None,
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -149,6 +155,7 @@ impl<'a> ReadContext<'a> {
         Self {
             cancellation,
             visibility: GraphVisibility::Exact(HashSet::from([graph])),
+            exact_graphs: Some(Rc::new(vec![graph])),
             validation_graph: Some(graph),
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
@@ -191,6 +198,10 @@ impl<'a> ReadContext<'a> {
 
     pub(crate) fn graph_visibility(&self, graph: TermId) -> Option<bool> {
         self.graph_visibility.borrow().get(&graph).copied()
+    }
+
+    pub(crate) fn exact_graphs(&self) -> Option<Rc<Vec<TermId>>> {
+        self.exact_graphs.clone()
     }
 
     pub(crate) fn remember_graph_visibility(&self, graph: TermId, visible: bool) {

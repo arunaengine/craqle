@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId};
 use crate::query_context::{GraphVisibility, ReadContext};
@@ -92,6 +93,10 @@ pub(crate) trait RdfReadView {
 
     fn decode_term(&self, context: &ReadContext<'_>, term: TermId) -> Result<EncodedTerm>;
 
+    fn decode_term_arc(&self, context: &ReadContext<'_>, term: TermId) -> Result<Arc<EncodedTerm>> {
+        Ok(Arc::new(self.decode_term(context, term)?))
+    }
+
     fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool>;
 
     fn compare_terms(
@@ -119,6 +124,45 @@ impl<'store> StoreReadView<'store> {
     pub(crate) fn store(&self) -> &'store GraphStore {
         self.store
     }
+
+    fn union_graph_candidates(
+        &self,
+        context: &ReadContext<'_>,
+        pattern: QuadPattern,
+    ) -> Option<Rc<Vec<TermId>>> {
+        if pattern.subject.is_some() {
+            return None;
+        }
+
+        let indexed = match (pattern.predicate, pattern.object) {
+            (Some(predicate), Some(object)) => {
+                context.increment_index_seeks();
+                Some(Rc::new(
+                    self.store.predicate_object_graphs(predicate, object),
+                ))
+            }
+            (None, Some(object)) => {
+                context.increment_index_seeks();
+                Some(Rc::new(self.store.object_graphs(object)))
+            }
+            (_, None) => None,
+        };
+        let exact = context.exact_graphs();
+
+        match (exact, indexed) {
+            (Some(exact), Some(indexed)) if exact.len() <= indexed.len() => Some(exact),
+            (_, Some(indexed)) => Some(indexed),
+            (Some(exact), None) => Some(exact),
+            (None, None) => match &context.visibility {
+                GraphVisibility::Predicate(_) => {
+                    context.increment_index_seeks();
+                    Some(Rc::new(self.store.populated_graph_ids()))
+                }
+                GraphVisibility::All => None,
+                GraphVisibility::Exact(_) => unreachable!("exact graphs handled above"),
+            },
+        }
+    }
 }
 
 impl RdfReadView for StoreReadView<'_> {
@@ -132,6 +176,16 @@ impl RdfReadView for StoreReadView<'_> {
         let Some(pattern) = selector.apply(pattern) else {
             return Ok(QueryCursor::empty(self.store, context, pattern));
         };
+        if let GraphSelector::Named(graph) = selector
+            && !self.graph_is_visible(context, graph)?
+        {
+            return Ok(QueryCursor::empty(self.store, context, pattern));
+        }
+        if matches!(selector, GraphSelector::Union)
+            && let Some(graphs) = self.union_graph_candidates(context, pattern)
+        {
+            return Ok(QueryCursor::graphs(self.store, context, graphs, pattern));
+        }
         context.increment_index_seeks();
         Ok(QueryCursor::new(
             self.store,
@@ -151,6 +205,11 @@ impl RdfReadView for StoreReadView<'_> {
         let Some(pattern) = selector.apply(pattern) else {
             return Ok(false);
         };
+        if let GraphSelector::Named(graph) = selector
+            && !self.graph_is_visible(context, graph)?
+        {
+            return Ok(false);
+        }
         if let (GraphSelector::Named(graph), Some(subject), Some(predicate), Some(object)) =
             (selector, pattern.subject, pattern.predicate, pattern.object)
         {
@@ -249,6 +308,13 @@ impl RdfReadView for StoreReadView<'_> {
     fn decode_term(&self, context: &ReadContext<'_>, term: TermId) -> Result<EncodedTerm> {
         context.check_cancelled()?;
         decode_term(self.store, context, term)
+    }
+
+    fn decode_term_arc(&self, context: &ReadContext<'_>, term: TermId) -> Result<Arc<EncodedTerm>> {
+        context.check_cancelled()?;
+        let decoded = self.store.decode_term_arc(term)?;
+        context.increment_terms_decoded();
+        Ok(decoded)
     }
 
     fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool> {
@@ -367,7 +433,7 @@ mod tests {
 
     use crate::core::{ActorId, Dot};
     use crate::query_context::{QueryCancellation, ReadContext};
-    use crate::store::{ClockUpdate, CounterKey, QuadAdd, StoreError};
+    use crate::store::{ClockUpdate, CounterKey, QuadAdd, QuadRemove, StoreError};
 
     use super::*;
 
@@ -727,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_before_a_scan_and_at_the_periodic_boundary() {
+    fn cancellation_stops_before_a_scan_and_at_the_periodic_union_boundary() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:cancellation");
         let graph_id = add_many(&store, &graph, 1_025);
@@ -755,6 +821,47 @@ mod tests {
             false
         };
         let context = ReadContext::with_graph_visibility(cancellation.clone(), &visibility);
+        let first_subject = (0..1_025)
+            .map(|index| {
+                store
+                    .lookup_term(&named(&format!("urn:test:read:s{index}")))
+                    .unwrap()
+                    .unwrap()
+            })
+            .min()
+            .unwrap();
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Union,
+                QuadPattern {
+                    subject: Some(first_subject),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
+        assert_eq!(1, calls.get());
+        assert_eq!(1, context.snapshot().index_seeks);
+        assert_eq!(1_024, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().graphs_considered);
+        assert_eq!(1, context.snapshot().terms_decoded);
+        assert!(cursor.next().is_none());
+    }
+
+    #[test]
+    fn hidden_named_graph_stops_before_ranges_and_point_probes() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:hidden-named");
+        let graph_id = add_many(&store, &graph, 1_025);
+        let view = StoreReadView::new(&store);
+
+        let range_calls = Cell::new(0);
+        let hidden = |_: &GraphId| {
+            range_calls.set(range_calls.get() + 1);
+            false
+        };
+        let context = ReadContext::with_graph_visibility(QueryCancellation::new(), &hidden);
         let mut cursor = view
             .scan(
                 &context,
@@ -762,12 +869,53 @@ mod tests {
                 QuadPattern::default(),
             )
             .unwrap();
-        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
-        assert_eq!(1, calls.get());
-        assert_eq!(1_024, context.snapshot().candidate_quads);
-        assert_eq!(1, context.snapshot().graphs_considered);
-        assert_eq!(1, context.snapshot().terms_decoded);
         assert!(cursor.next().is_none());
+        assert_eq!(1, range_calls.get());
+        let statistics = context.snapshot();
+        assert_eq!(1, statistics.graphs_considered);
+        assert_eq!(0, statistics.index_seeks);
+        assert_eq!(0, statistics.candidate_quads);
+
+        let point_calls = Cell::new(0);
+        let hidden = |_: &GraphId| {
+            point_calls.set(point_calls.get() + 1);
+            false
+        };
+        let context = ReadContext::with_graph_visibility(QueryCancellation::new(), &hidden);
+        assert!(
+            !view
+                .exists(
+                    &context,
+                    GraphSelector::Named(graph_id),
+                    QuadPattern {
+                        subject: Some(
+                            store
+                                .lookup_term(&named("urn:test:read:s0"))
+                                .unwrap()
+                                .unwrap(),
+                        ),
+                        predicate: Some(
+                            store
+                                .lookup_term(&named("urn:test:read:p"))
+                                .unwrap()
+                                .unwrap(),
+                        ),
+                        object: Some(
+                            store
+                                .lookup_term(&named("urn:test:read:o0"))
+                                .unwrap()
+                                .unwrap(),
+                        ),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(1, point_calls.get());
+        let statistics = context.snapshot();
+        assert_eq!(1, statistics.graphs_considered);
+        assert_eq!(0, statistics.index_seeks);
+        assert_eq!(0, statistics.candidate_quads);
     }
 
     #[test]
@@ -798,6 +946,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(vec![first], rows);
+        assert_eq!(1, context.snapshot().index_seeks);
 
         let calls = RefCell::new(HashMap::<String, usize>::new());
         let visibility = |graph: &GraphId| {
@@ -818,6 +967,59 @@ mod tests {
         assert_eq!(2, context.snapshot().graphs_considered);
         assert_eq!(2, context.snapshot().terms_decoded);
         assert_ne!(first.graph, second.graph);
+    }
+
+    #[test]
+    fn union_candidate_indexes_count_their_lookup_and_graph_range() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:union-candidate-index");
+        let quad = add_quad(
+            &store,
+            &graph,
+            "urn:test:union-candidate:s",
+            "urn:test:union-candidate:p",
+            "urn:test:union-candidate:o",
+        );
+        let view = StoreReadView::new(&store);
+
+        let context = ReadContext::default();
+        assert_eq!(
+            vec![quad],
+            collect_rows(
+                view.scan(
+                    &context,
+                    GraphSelector::Union,
+                    QuadPattern {
+                        predicate: Some(quad.predicate),
+                        object: Some(quad.object),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap(),
+            )
+        );
+        let statistics = context.snapshot();
+        assert_eq!(2, statistics.index_seeks);
+        assert_eq!(1, statistics.candidate_quads);
+
+        let context = ReadContext::default();
+        assert_eq!(
+            vec![quad],
+            collect_rows(
+                view.scan(
+                    &context,
+                    GraphSelector::Union,
+                    QuadPattern {
+                        object: Some(quad.object),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap(),
+            )
+        );
+        let statistics = context.snapshot();
+        assert_eq!(2, statistics.index_seeks);
+        assert_eq!(1, statistics.candidate_quads);
     }
 
     #[test]
@@ -1083,6 +1285,87 @@ mod tests {
                 )
                 .unwrap()
                 .len()
+        );
+    }
+
+    #[test]
+    fn object_cursor_is_lazy_and_copy_on_write_stable_across_add_and_remove() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:object-snapshot");
+        let first = add_quad(
+            &store,
+            &graph,
+            "urn:test:object:s1",
+            "urn:test:object:p1",
+            "urn:test:object:o",
+        );
+        let removed = add_quad(
+            &store,
+            &graph,
+            "urn:test:object:s2",
+            "urn:test:object:p2",
+            "urn:test:object:o",
+        );
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern {
+                    object: Some(first.object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+
+        let added = {
+            let (done, received) = mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let added = add_quad(
+                        &store,
+                        &graph,
+                        "urn:test:object:s3",
+                        "urn:test:object:p3",
+                        "urn:test:object:o",
+                    );
+                    let witnessed = store.get_vector_clock_by_id(removed.graph).unwrap();
+                    let _guard = store.graph_commit_guard(&graph);
+                    let mut batch = store.new_batch();
+                    assert!(
+                        store
+                            .remove_quad(
+                                &mut batch,
+                                QuadRemove {
+                                    quad: removed,
+                                    witnessed: &witnessed,
+                                },
+                            )
+                            .unwrap()
+                    );
+                    store.commit(batch).unwrap();
+                    done.send(added).unwrap();
+                });
+                received.recv_timeout(Duration::from_secs(2)).unwrap()
+            })
+        };
+
+        assert_eq!(sorted(vec![first, removed]), sorted(collect_rows(cursor)));
+        let fresh_context = ReadContext::default();
+        assert_eq!(
+            sorted(vec![first, added]),
+            sorted(collect_rows(
+                view.scan(
+                    &fresh_context,
+                    GraphSelector::Named(first.graph),
+                    QuadPattern {
+                        object: Some(first.object),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap(),
+            ))
         );
     }
 
