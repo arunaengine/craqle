@@ -1026,6 +1026,7 @@ mod tests {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:cancellation");
         let graph_id = add_many(&store, &graph, 1_025);
+        settle_diagnostics(&store, &graph);
         let view = StoreReadView::new(&store);
 
         let cancelled = QueryCancellation::new();
@@ -1073,9 +1074,59 @@ mod tests {
         assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
         assert_eq!(1, calls.get());
         assert_eq!(1, context.snapshot().index_seeks);
-        assert_eq!(1_024, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().candidate_quads);
         assert_eq!(1, context.snapshot().graphs_considered);
         assert_eq!(1, context.snapshot().terms_decoded);
+        assert!(cursor.next().is_none());
+    }
+
+    #[test]
+    fn default_union_cancellation_is_observed_at_1024_skipped_duplicate_copies() {
+        let (_directory, store) = setup_store();
+        let mut first = None;
+        for index in 0..1_025 {
+            let graph_name = format!("urn:test:default-union-cancel:{index}");
+            let graph = GraphId::new(&graph_name);
+            let quad = add_quad(
+                &store,
+                &graph,
+                "urn:test:default-union-cancel:s",
+                "urn:test:default-union-cancel:p",
+                "urn:test:default-union-cancel:o",
+            );
+            first.get_or_insert(quad);
+        }
+        let first = first.expect("the fixture has one duplicate group");
+        let view = StoreReadView::new(&store);
+        let cancellation = QueryCancellation::new();
+        let cancellation_in_visibility = cancellation.clone();
+        let calls = Cell::new(0);
+        let visibility = |_: &GraphId| {
+            let next = calls.get() + 1;
+            calls.set(next);
+            if next == 1_024 {
+                cancellation_in_visibility.cancel();
+            }
+            false
+        };
+        let context = ReadContext::with_graph_visibility(cancellation, &visibility);
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::DefaultUnion,
+                QuadPattern {
+                    predicate: Some(first.predicate),
+                    object: Some(first.object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
+        assert_eq!(1_024, calls.get());
+        assert_eq!(1, context.snapshot().index_seeks);
+        assert_eq!(1_024, context.snapshot().candidate_quads);
+        assert_eq!(0, context.snapshot().matching_quads);
         assert!(cursor.next().is_none());
     }
 
@@ -1222,7 +1273,7 @@ mod tests {
         assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
         assert_eq!(1, context.snapshot().graphs_considered);
         assert_eq!(1, context.snapshot().index_seeks);
-        assert_eq!(0, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().candidate_quads);
 
         let cancellation = QueryCancellation::new();
         let visible = |_: &GraphId| {
@@ -1266,6 +1317,8 @@ mod tests {
             "urn:test:visible:p",
             "urn:test:visible:o2",
         );
+        settle_diagnostics(&store, &first_graph);
+        settle_diagnostics(&store, &second_graph);
         let view = StoreReadView::new(&store);
 
         let context =
@@ -1299,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn union_candidate_indexes_count_their_lookup_and_graph_range() {
+    fn union_qv_ranges_use_one_boundary() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:union-candidate-index");
         let quad = add_quad(
@@ -1309,6 +1362,7 @@ mod tests {
             "urn:test:union-candidate:p",
             "urn:test:union-candidate:o",
         );
+        settle_diagnostics(&store, &graph);
         let view = StoreReadView::new(&store);
 
         let context = ReadContext::default();
@@ -1328,7 +1382,7 @@ mod tests {
             )
         );
         let statistics = context.snapshot();
-        assert_eq!(2, statistics.index_seeks);
+        assert_eq!(1, statistics.index_seeks);
         assert_eq!(1, statistics.candidate_quads);
 
         let context = ReadContext::default();
@@ -1347,7 +1401,7 @@ mod tests {
             )
         );
         let statistics = context.snapshot();
-        assert_eq!(2, statistics.index_seeks);
+        assert_eq!(1, statistics.index_seeks);
         assert_eq!(1, statistics.candidate_quads);
     }
 
