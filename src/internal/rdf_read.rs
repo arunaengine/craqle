@@ -48,6 +48,233 @@ impl GraphSelector {
     }
 }
 
+/// The shared behavior surface for durable RDF reads.
+pub(crate) trait RdfReadView {
+    fn scan<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>>;
+
+    fn exists(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<bool>;
+
+    fn count_up_to(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+        cap: u64,
+    ) -> Result<u64>;
+
+    fn forward_predicate<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        subject: TermId,
+        predicate: TermId,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>>;
+
+    fn inverse_predicate<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>>;
+
+    fn lookup_term(&self, context: &ReadContext<'_>, term: &EncodedTerm) -> Result<Option<TermId>>;
+
+    fn decode_term(&self, context: &ReadContext<'_>, term: TermId) -> Result<EncodedTerm>;
+
+    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool>;
+
+    fn compare_terms(
+        &self,
+        context: &ReadContext<'_>,
+        left: TermId,
+        right: TermId,
+    ) -> Result<Ordering>;
+
+    fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool>;
+
+    fn quad_is_visible(&self, context: &ReadContext<'_>, quad: EncodedQuad) -> Result<bool>;
+}
+
+/// Durable-source implementation of [`RdfReadView`].
+pub(crate) struct StoreReadView<'store> {
+    store: &'store GraphStore,
+}
+
+impl<'store> StoreReadView<'store> {
+    pub(crate) fn new(store: &'store GraphStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RdfReadView for StoreReadView<'_> {
+    fn scan<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
+        context.check_cancelled()?;
+        let Some(pattern) = selector.apply(pattern) else {
+            return Ok(QueryCursor::empty(self.store, context, pattern));
+        };
+        context.increment_index_seeks();
+        Ok(QueryCursor::new(
+            self.store,
+            context,
+            self.store.raw_quad_cursor(pattern),
+            pattern,
+        ))
+    }
+
+    fn exists(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<bool> {
+        context.check_cancelled()?;
+        let Some(pattern) = selector.apply(pattern) else {
+            return Ok(false);
+        };
+        if let (GraphSelector::Named(graph), Some(subject), Some(predicate), Some(object)) =
+            (selector, pattern.subject, pattern.predicate, pattern.object)
+        {
+            let quad = EncodedQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            };
+            context.increment_index_seeks();
+            let Some(candidate) = self.store.raw_quad_point(quad)? else {
+                return Ok(false);
+            };
+            context.increment_candidate_quads();
+            if !candidate.live || !pattern.matches(candidate.quad) {
+                return Ok(false);
+            }
+            if quad_is_visible(self.store, context, candidate.quad)? {
+                context.increment_matching_quads();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let mut cursor = self.scan(context, selector, pattern)?;
+        match cursor.next() {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(error)) => Err(error),
+            None => Ok(false),
+        }
+    }
+
+    fn count_up_to(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+        cap: u64,
+    ) -> Result<u64> {
+        if cap == 0 {
+            return Ok(0);
+        }
+        let mut cursor = self.scan(context, selector, pattern)?;
+        let mut count = 0;
+        while count < cap {
+            match cursor.next() {
+                Some(Ok(_)) => count += 1,
+                Some(Err(error)) => return Err(error),
+                None => break,
+            }
+        }
+        Ok(count)
+    }
+
+    fn forward_predicate<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        subject: TermId,
+        predicate: TermId,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
+        self.scan(
+            context,
+            selector,
+            QuadPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn inverse_predicate<'store, 'context, 'visibility>(
+        &'store self,
+        context: &'context ReadContext<'visibility>,
+        selector: GraphSelector,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<QueryCursor<'store, 'context, 'visibility>> {
+        self.scan(
+            context,
+            selector,
+            QuadPattern {
+                predicate: Some(predicate),
+                object: Some(object),
+                ..QuadPattern::default()
+            },
+        )
+    }
+
+    fn lookup_term(&self, context: &ReadContext<'_>, term: &EncodedTerm) -> Result<Option<TermId>> {
+        context.check_cancelled()?;
+        self.store.lookup_term(term)
+    }
+
+    fn decode_term(&self, context: &ReadContext<'_>, term: TermId) -> Result<EncodedTerm> {
+        context.check_cancelled()?;
+        decode_term(self.store, context, term)
+    }
+
+    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool> {
+        context.check_cancelled()?;
+        Ok(left == right)
+    }
+
+    fn compare_terms(
+        &self,
+        context: &ReadContext<'_>,
+        left: TermId,
+        right: TermId,
+    ) -> Result<Ordering> {
+        Ok(self
+            .decode_term(context, left)?
+            .0
+            .cmp(&self.decode_term(context, right)?.0))
+    }
+
+    fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
+        context.check_cancelled()?;
+        graph_is_visible(self.store, context, graph)
+    }
+
+    fn quad_is_visible(&self, context: &ReadContext<'_>, quad: EncodedQuad) -> Result<bool> {
+        context.check_cancelled()?;
+        quad_is_visible(self.store, context, quad)
+    }
+}
+
 pub(crate) fn decode_term(
     store: &GraphStore,
     context: &ReadContext<'_>,
