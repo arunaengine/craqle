@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Rw
 
 use crate::core::*;
 use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
+use crate::QueryIndexState;
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, compaction::Leveled,
     config::CompressionPolicy,
@@ -173,6 +174,170 @@ enum QuadMutation {
 
 /// Quad key bytes: `graph || subject || predicate || object`, 4 × 16 bytes.
 type QuadKey = [u8; 64];
+
+const QUERY_INDEX_SCHEMA_VERSION: u32 = 1;
+const QUERY_INDEX_HEADER_KEY: [u8; 1] = *b"H";
+const QUERY_INDEX_TOTAL_KEY: [u8; 1] = *b"T";
+const QUERY_INDEX_HEADER_MAGIC: [u8; 4] = *b"QVI1";
+const QUERY_INDEX_HEADER_BASE_LEN: usize = 54;
+const QUERY_INDEX_FAILURE_MAX_BYTES: usize = 256;
+const QUERY_INDEX_BUILD_CHUNK_ROWS: usize = 1_024;
+const QUERY_INDEX_SAMPLE_ROWS: u64 = 128;
+const QUERY_INDEX_PROBLEM_LIMIT: usize = 32;
+
+const QUERY_INDEX_GRAPH_COUNT_TAG: u8 = b'G';
+const QUERY_INDEX_PREDICATE_COUNT_TAG: u8 = b'P';
+const QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG: u8 = b'A';
+const QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG: u8 = b'O';
+const QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG: u8 = b'X';
+const QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG: u8 = b'M';
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredQueryIndexState {
+    Building,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryIndexHeader {
+    state: StoredQueryIndexState,
+    source_epoch: u64,
+    index_epoch: u64,
+    source_live_quads: u64,
+    indexed_quads: u64,
+    last_build_sequence: u64,
+}
+
+impl QueryIndexHeader {
+    fn empty_ready() -> Self {
+        Self {
+            state: StoredQueryIndexState::Ready,
+            source_epoch: 0,
+            index_epoch: 0,
+            source_live_quads: 0,
+            indexed_quads: 0,
+            last_build_sequence: 0,
+        }
+    }
+
+    fn failed_from(previous: Option<&Self>, reason: &'static str) -> Self {
+        let mut header = previous.cloned().unwrap_or_else(Self::empty_ready);
+        header.state = StoredQueryIndexState::Failed(reason.to_owned());
+        header
+    }
+
+    fn state(&self) -> QueryIndexState {
+        match &self.state {
+            StoredQueryIndexState::Building => QueryIndexState::Building,
+            StoredQueryIndexState::Ready => QueryIndexState::Ready,
+            StoredQueryIndexState::Failed(reason) => QueryIndexState::Failed(reason.clone()),
+        }
+    }
+
+    fn ready_is_coherent(&self) -> bool {
+        matches!(self.state, StoredQueryIndexState::Ready)
+            && self.source_epoch == self.index_epoch
+            && self.source_live_quads == self.indexed_quads
+    }
+
+    fn is_not_ahead_of_snapshot(&self, snapshot_sequence: u64) -> bool {
+        self.source_epoch <= snapshot_sequence
+            && self.index_epoch <= snapshot_sequence
+            && self.last_build_sequence <= snapshot_sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryIndexCounterKey {
+    Total,
+    Graph(TermId),
+    Predicate(TermId),
+    GraphPredicate(TermId, TermId),
+    PredicateObject(TermId, TermId),
+    GraphPredicateObject(TermId, TermId, TermId),
+    PredicateMutationEpoch(TermId),
+}
+
+impl QueryIndexCounterKey {
+    fn bytes(self) -> Vec<u8> {
+        let mut key = match self {
+            Self::Total => return QUERY_INDEX_TOTAL_KEY.to_vec(),
+            Self::Graph(_) | Self::Predicate(_) | Self::PredicateMutationEpoch(_) => vec![0; 17],
+            Self::GraphPredicate(_, _) | Self::PredicateObject(_, _) => vec![0; 33],
+            Self::GraphPredicateObject(_, _, _) => vec![0; 49],
+        };
+        match self {
+            Self::Graph(graph) => {
+                key[0] = QUERY_INDEX_GRAPH_COUNT_TAG;
+                key[1..17].copy_from_slice(&graph.to_be_bytes());
+            }
+            Self::Predicate(predicate) => {
+                key[0] = QUERY_INDEX_PREDICATE_COUNT_TAG;
+                key[1..17].copy_from_slice(&predicate.to_be_bytes());
+            }
+            Self::GraphPredicate(graph, predicate) => {
+                key[0] = QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG;
+                key[1..17].copy_from_slice(&graph.to_be_bytes());
+                key[17..33].copy_from_slice(&predicate.to_be_bytes());
+            }
+            Self::PredicateObject(predicate, object) => {
+                key[0] = QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG;
+                key[1..17].copy_from_slice(&predicate.to_be_bytes());
+                key[17..33].copy_from_slice(&object.to_be_bytes());
+            }
+            Self::GraphPredicateObject(graph, predicate, object) => {
+                key[0] = QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG;
+                key[1..17].copy_from_slice(&graph.to_be_bytes());
+                key[17..33].copy_from_slice(&predicate.to_be_bytes());
+                key[33..49].copy_from_slice(&object.to_be_bytes());
+            }
+            Self::PredicateMutationEpoch(predicate) => {
+                key[0] = QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG;
+                key[1..17].copy_from_slice(&predicate.to_be_bytes());
+            }
+            Self::Total => unreachable!("total counter returned before allocating a key"),
+        }
+        key
+    }
+}
+
+enum QueryIndexHeaderRead {
+    Absent,
+    Valid(QueryIndexHeader),
+    Malformed,
+}
+
+enum QueryIndexCounterKeyRead {
+    Header,
+    Counter(QueryIndexCounterKey),
+    UnknownTag,
+    InvalidLength,
+}
+
+#[derive(Clone, Copy)]
+struct NetQuadTransition {
+    quad: EncodedQuad,
+    was_live: bool,
+    is_live: bool,
+}
+
+struct QueryIndexCounterUpdate {
+    key: QueryIndexCounterKey,
+    value: Option<u64>,
+}
+
+struct QueryIndexMaintenancePlan {
+    transitions: Vec<NetQuadTransition>,
+    counters: Vec<QueryIndexCounterUpdate>,
+    header: Option<QueryIndexHeader>,
+}
+
+enum QueryIndexCounterRead {
+    Missing,
+    Value(u64),
+    Malformed,
+}
 
 /// A durable FTS queue key, minus the dirty token it is stamped with.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -620,6 +785,10 @@ pub struct GraphStore {
     quads: Keyspace,
     graphs: Keyspace,
     log: Keyspace,
+    qv1_gpos: Keyspace,
+    qv1_spog: Keyspace,
+    qv1_posg: Keyspace,
+    qv1_meta: Keyspace,
     /// Guards first-write-wins term interning, sharded by term id.
     term_locks: Vec<Mutex<()>>,
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
@@ -1868,6 +2037,10 @@ impl GraphStore {
             quads: db.keyspace("quads", write_heavy)?,
             graphs: db.keyspace("graphs", point_read_heavy)?,
             log: db.keyspace("log", write_heavy)?,
+            qv1_gpos: db.keyspace("qv1_gpos", write_heavy)?,
+            qv1_spog: db.keyspace("qv1_spog", write_heavy)?,
+            qv1_posg: db.keyspace("qv1_posg", write_heavy)?,
+            qv1_meta: db.keyspace("qv1_meta", point_read_heavy)?,
             db,
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),

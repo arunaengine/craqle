@@ -205,6 +205,48 @@ impl From<fjall::PersistMode> for CraqleFjallPersistMode {
     }
 }
 
+/// Lifecycle state of Craqle's disposable persistent query indexes.
+///
+/// The canonical CRDT quad state remains authoritative in every state. A
+/// non-ready state affects query-index availability only, never source reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum QueryIndexState {
+    Missing,
+    Building,
+    Ready,
+    Failed(String),
+}
+
+/// Persisted-query-index lifecycle and row-count summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct QueryIndexStatus {
+    pub schema_version: u32,
+    pub state: QueryIndexState,
+    /// Live canonical source rows in the coherent status snapshot.
+    pub source_live_quads: u64,
+    /// Indexed live rows in the same coherent snapshot.
+    pub indexed_quads: u64,
+    pub last_build_sequence: u64,
+}
+
+/// A bounded diagnostic report for persistent-query-index verification.
+///
+/// Problems are stable implementation identifiers only; no RDF term or value
+/// bytes are included.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct QueryIndexVerification {
+    pub full: bool,
+    pub valid: bool,
+    pub source_live_quads: u64,
+    pub indexed_quads: u64,
+    pub checked_source_rows: u64,
+    pub checked_index_rows: u64,
+    pub problems: Vec<String>,
+}
+
 /// A supported RO-Crate specification version.
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
