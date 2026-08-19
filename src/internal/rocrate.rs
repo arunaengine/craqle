@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 
+use crate::RoCrateVersion;
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
 use crate::replication::ReplicationEngine;
 use crate::store::{EncodedQuad, GraphSubjectPredicate, PageCursor, PageRequest, TermId};
@@ -21,14 +22,16 @@ use rocraters::ro_crate::root::RootDataEntity;
 
 const ROCRATE_1_1_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.1/context";
 const ROCRATE_1_2_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.2/context";
+const ROCRATE_1_3_CONTEXT_URL: &str = "https://w3id.org/ro/crate/1.3/context";
 const WORKFLOW_RUN_CONTEXT_URL: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const ROCRATE_1_1_SPEC_URL: &str = "https://w3id.org/ro/crate/1.1";
 const ROCRATE_1_2_SPEC_URL: &str = "https://w3id.org/ro/crate/1.2";
-const ROCRATE_CONTEXT_URL: &str = ROCRATE_1_2_CONTEXT_URL;
-const ROCRATE_SPEC_URL: &str = ROCRATE_1_2_SPEC_URL;
+const ROCRATE_1_3_SPEC_URL: &str = "https://w3id.org/ro/crate/1.3";
+const ROCRATE_CONTEXT_URL: &str = ROCRATE_1_3_CONTEXT_URL;
+#[cfg(test)]
+const ROCRATE_SPEC_URL: &str = ROCRATE_1_3_SPEC_URL;
+const ROCRATE_VERSION_FAMILY_PREFIX: &str = "https://w3id.org/ro/crate/";
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
-const ROCRATE_1_1_CONTEXT: &[u8] = include_bytes!("../resources/ro_crate_1_1.jsonld");
-const ROCRATE_1_2_CONTEXT: &[u8] = include_bytes!("../resources/ro_crate_1_2.jsonld");
 const WORKFLOW_RUN_CONTEXT: &[u8] = include_bytes!("../resources/workflow_run.jsonld");
 const XSD_BOOLEAN_IRI: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const XSD_DOUBLE_IRI: &str = "http://www.w3.org/2001/XMLSchema#double";
@@ -85,6 +88,15 @@ pub enum RoCrateError {
     UnsupportedTerm(String),
     #[error("invalid batch: {0}")]
     InvalidBatch(String),
+    #[error("RO-Crate version marker is missing")]
+    MissingVersion,
+    #[error("unknown RO-Crate version identifier: {0}")]
+    UnknownVersion(String),
+    #[error("RO-Crate version mismatch: {first:?} conflicts with {second:?}")]
+    VersionMismatch {
+        first: RoCrateVersion,
+        second: RoCrateVersion,
+    },
 }
 
 /// Cursor-style JSON-LD page export returned by partial RO-Crate export APIs.
@@ -111,10 +123,11 @@ pub fn canonicalize_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError
 pub fn validate_rocrate_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError> {
     let value: serde_json::Value = serde_json::from_str(jsonld)?;
     validate_jsonld_import(&value)?;
+    let context_version = detect_context_version(&value)?;
     let graph_id = GraphId::new(JSONLD_BASE_IRI);
     let target = jsonld_triples(&graph_id, &value)?;
     let pointers = SubmittedPointers::new(&value, &graph_id);
-    validate_crate_version(&graph_id, &target, &pointers)?;
+    validate_crate_version(&graph_id, &target, context_version)?;
     validate_complete_import_triples(&graph_id, &target, Some(&pointers))?;
     canonicalize_value(&value)
 }
@@ -240,6 +253,7 @@ struct ExportRender<'a> {
 struct ExportView<'a> {
     page_entities: &'a [EncodedTerm],
     ctx: &'a ContextTermMap,
+    version: RoCrateVersion,
 }
 
 /// Everything needed to render the root data entity of an export.
@@ -251,6 +265,7 @@ struct RootExportView<'a> {
     /// root, so an export that emits one without a link is not a valid crate.
     has_part: Vec<String>,
     ctx: &'a ContextTermMap,
+    version: RoCrateVersion,
 }
 
 /// The non-page entities a partial view emits.
@@ -269,6 +284,7 @@ struct MetadataExportView<'a> {
     graph_id: &'a GraphId,
     triples: Vec<(EncodedTerm, EncodedTerm)>,
     ctx: &'a ContextTermMap,
+    version: RoCrateVersion,
 }
 
 /// Description of one new entity to append during batch ingest.
@@ -298,6 +314,49 @@ impl RoCrateManager {
         Self { engine }
     }
 
+    pub(crate) fn crate_version(&self, graph_id: &GraphId) -> Result<RoCrateVersion, RoCrateError> {
+        let cx = self.crate_ctx(graph_id)?;
+        let mut versions = self.live_specification_versions(&cx)?;
+        if let Some(raw_context) = self.engine.store().graph_context(graph_id)? {
+            let context: serde_json::Value = serde_json::from_str(&raw_context)?;
+            if let Some(version) = detect_context_value_version(&context)? {
+                versions.push(version);
+            }
+        }
+        resolve_version_evidence(versions)
+    }
+
+    fn live_specification_versions(
+        &self,
+        cx: &CrateCtx,
+    ) -> Result<Vec<RoCrateVersion>, RoCrateError> {
+        let conforms_to = EncodedTerm::from_named_node(&crate_conforms_to());
+        let mut versions = Vec::new();
+
+        for subject_id in [METADATA_ID, cx.root_id()] {
+            for (predicate, object) in self.stored_subject_triples(cx, subject_id)? {
+                if predicate != conforms_to {
+                    continue;
+                }
+                if let Some(iri) = object.to_named_node()
+                    && let Some(version) = version_from_specification_url(iri.as_str())?
+                {
+                    versions.push(version);
+                }
+            }
+        }
+
+        Ok(versions)
+    }
+
+    fn metadata_has_conforms_to(&self, cx: &CrateCtx) -> Result<bool, RoCrateError> {
+        let conforms_to = EncodedTerm::from_named_node(&crate_conforms_to());
+        Ok(self
+            .stored_subject_triples(cx, METADATA_ID)?
+            .into_iter()
+            .any(|(predicate, _)| predicate == conforms_to))
+    }
+
     /// Create a new RO-Crate with its base entities.
     pub(crate) fn create_crate(
         &self,
@@ -306,6 +365,25 @@ impl RoCrateManager {
         description: &str,
         date_published: &str,
         license: Option<&str>,
+    ) -> Result<Batch, RoCrateError> {
+        self.create_crate_with_version(
+            graph_id,
+            name,
+            description,
+            date_published,
+            license,
+            RoCrateVersion::default(),
+        )
+    }
+
+    pub(crate) fn create_crate_with_version(
+        &self,
+        graph_id: GraphId,
+        name: &str,
+        description: &str,
+        date_published: &str,
+        license: Option<&str>,
+        version: RoCrateVersion,
     ) -> Result<Batch, RoCrateError> {
         let cx = self.crate_ctx(&graph_id)?;
         if self.graph_is_empty(&cx)? {
@@ -316,6 +394,7 @@ impl RoCrateManager {
                 description,
                 date_published,
                 license_value,
+                version,
             );
             return Ok(self.engine.local_apply_changes(&graph_id, changes)?);
         }
@@ -328,6 +407,7 @@ impl RoCrateManager {
                     description,
                     date_published,
                     license_from_str(license)?,
+                    version,
                 );
                 self.plan_rocrate_replacement(&cx, &mut rocrate)?
             }
@@ -339,6 +419,7 @@ impl RoCrateManager {
                         description,
                         date_published,
                         None,
+                        version,
                     ));
                 validate_complete_import_triples(&graph_id, &target, None)?;
                 diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
@@ -360,6 +441,25 @@ impl RoCrateManager {
         date_published: &str,
         license: Option<&str>,
     ) -> Result<Batch, RoCrateError> {
+        self.create_crate_prevalidated_with_version(
+            graph_id,
+            name,
+            description,
+            date_published,
+            license,
+            RoCrateVersion::default(),
+        )
+    }
+
+    pub(crate) fn create_crate_prevalidated_with_version(
+        &self,
+        graph_id: GraphId,
+        name: &str,
+        description: &str,
+        date_published: &str,
+        license: Option<&str>,
+        version: RoCrateVersion,
+    ) -> Result<Batch, RoCrateError> {
         let cx = self.crate_ctx(&graph_id)?;
         let is_replacement = !self.graph_is_empty(&cx)?;
         let changes = if is_replacement {
@@ -371,6 +471,7 @@ impl RoCrateManager {
                         description,
                         date_published,
                         license_from_str(license)?,
+                        version,
                     );
                     self.plan_rocrate_replacement(&cx, &mut rocrate)?
                 }
@@ -382,6 +483,7 @@ impl RoCrateManager {
                             description,
                             date_published,
                             None,
+                            version,
                         ));
                     diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
                 }
@@ -393,6 +495,7 @@ impl RoCrateManager {
                 description,
                 date_published,
                 license.map(encoded_license_value).transpose()?,
+                version,
             )
         };
         let batch = self
@@ -415,6 +518,25 @@ impl RoCrateManager {
         date_published: &str,
         license: Option<&str>,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        self.validate_create_crate_with_version(
+            graph_id,
+            name,
+            description,
+            date_published,
+            license,
+            RoCrateVersion::default(),
+        )
+    }
+
+    pub(crate) fn validate_create_crate_with_version(
+        &self,
+        graph_id: &GraphId,
+        name: &str,
+        description: &str,
+        date_published: &str,
+        license: Option<&str>,
+        version: RoCrateVersion,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let cx = self.crate_ctx(graph_id)?;
         if self.graph_is_empty(&cx)? {
             let changes = create_crate_scaffold_changes_with_license(
@@ -423,6 +545,7 @@ impl RoCrateManager {
                 description,
                 date_published,
                 license.map(encoded_license_value).transpose()?,
+                version,
             );
             let target = triples_from_insert_changes(&changes);
             validate_complete_import_triples(graph_id, &target, None)?;
@@ -437,6 +560,7 @@ impl RoCrateManager {
                     description,
                     date_published,
                     license_from_str(license)?,
+                    version,
                 );
                 normalize_rocrate(&mut rocrate);
                 rocrate_triples(&rocrate)?
@@ -447,6 +571,7 @@ impl RoCrateManager {
                 description,
                 date_published,
                 None,
+                version,
             )),
         };
         validate_complete_import_triples(graph_id, &target, None)?;
@@ -823,7 +948,9 @@ impl RoCrateManager {
         let context = extract_raw_context(&value);
         let license = extract_raw_license(&value);
         validate_jsonld_import(&value)?;
+        let context_version = detect_context_version(&value)?;
         let target = jsonld_triples(&graph_id, &value)?;
+        validate_crate_version(&graph_id, &target, context_version)?;
         let cx = self.crate_ctx(&graph_id)?;
         let changes = if self.graph_is_missing_or_empty(&graph_id)? {
             insert_changes(&graph_id, target)
@@ -1248,6 +1375,7 @@ impl RoCrateManager {
             graph_id: &cx.graph,
             triples: self.subject_triples(cx, METADATA_ID)?,
             ctx: view.ctx,
+            version: view.version,
         })?;
 
         let extra = self.collect_partial_view_entities(cx, view.page_entities)?;
@@ -1275,6 +1403,7 @@ impl RoCrateManager {
             triples: self.root_triples_excluding_has_part(cx)?,
             has_part,
             ctx: view.ctx,
+            version: view.version,
         })?;
 
         let mut graph = vec![
@@ -1298,7 +1427,7 @@ impl RoCrateManager {
         }
 
         Ok(RoCrate {
-            context: default_context(),
+            context: default_context(view.version),
             graph,
         })
     }
@@ -1312,6 +1441,8 @@ impl RoCrateManager {
         render: ExportRender<'_>,
     ) -> Result<String, RoCrateError> {
         let raw_context = self.engine.store().graph_context(&cx.graph)?;
+        let version = self.crate_version(&cx.graph)?;
+        let has_metadata_conforms_to = self.metadata_has_conforms_to(cx)?;
         let raw_license = match self.engine.store().graph_license(&cx.graph)? {
             Some((raw, digest)) if digest == self.graph_digest(cx)? => {
                 Some(serde_json::from_str(&raw)?)
@@ -1324,9 +1455,23 @@ impl RoCrateManager {
             ExportView {
                 page_entities: render.page_entities,
                 ctx: &ctx,
+                version,
             },
         )?;
         let mut document = serde_json::to_value(&rocrate)?;
+        if !has_metadata_conforms_to
+            && let Some(metadata) = document
+                .get_mut("@graph")
+                .and_then(serde_json::Value::as_array_mut)
+                .and_then(|entries| {
+                    entries.iter_mut().find(|entry| {
+                        entry.get("@id").and_then(serde_json::Value::as_str) == Some(METADATA_ID)
+                    })
+                })
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("conformsTo");
+        }
         let license_values = self
             .subject_triples(cx, cx.root_id())?
             .into_iter()
@@ -1388,7 +1533,9 @@ impl RoCrateManager {
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let graph_id = &cx.graph;
         validate_jsonld_import(&value)?;
+        let context_version = detect_context_version(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
+        validate_crate_version(graph_id, &target, context_version)?;
         let graph_exists = match cx.graph_tid {
             Some(graph_tid) => self.engine.store().contains_graph_by_id(graph_tid)?,
             None => false,
@@ -1412,9 +1559,10 @@ impl RoCrateManager {
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let graph_id = &cx.graph;
         validate_jsonld_import(&value)?;
+        let context_version = detect_context_version(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
         let pointers = SubmittedPointers::new(&value, graph_id);
-        validate_crate_version(graph_id, &target, &pointers)?;
+        validate_crate_version(graph_id, &target, context_version)?;
         validate_complete_import_triples(graph_id, &target, Some(&pointers))?;
         if self.graph_is_missing_or_empty(graph_id)? {
             return Ok(insert_changes(graph_id, target));
@@ -1449,7 +1597,9 @@ impl RoCrateManager {
         graph_id: &GraphId,
         value: serde_json::Value,
     ) -> Result<Batch, RoCrateError> {
+        let context_version = detect_context_version(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
+        validate_crate_version(graph_id, &target, context_version)?;
         let batch = self
             .engine
             .local_apply_changes_bulk_unchecked(graph_id, insert_changes(graph_id, target))?;
@@ -1471,6 +1621,21 @@ impl RoCrateManager {
         context: Option<String>,
         license: Option<String>,
     ) -> Result<(), RoCrateError> {
+        let context = match context {
+            Some(raw) => {
+                let value: serde_json::Value = serde_json::from_str(&raw)?;
+                if is_bare_rocrate_context(&value)
+                    && !self
+                        .live_specification_versions(&self.crate_ctx(graph_id)?)?
+                        .is_empty()
+                {
+                    None
+                } else {
+                    Some(raw)
+                }
+            }
+            None => None,
+        };
         let current = self.engine.store().graph_context(graph_id)?;
         // Built fresh, not from the caller's operation context: this runs after
         // the write, so the digest must describe the state the licence now
@@ -1806,6 +1971,7 @@ fn create_crate_scaffold_changes_with_license(
     description: &str,
     date_published: &str,
     license_value: Option<EncodedTerm>,
+    version: RoCrateVersion,
 ) -> Vec<MaterializedQuadChange> {
     let root_id = root_id(graph_id);
     let mut changes = vec![
@@ -1819,7 +1985,7 @@ fn create_crate_scaffold_changes_with_license(
             graph_id,
             METADATA_ID,
             &crate_conforms_to(),
-            encoded_identifier(ROCRATE_SPEC_URL),
+            encoded_identifier(version.specification_url()),
         ),
         insert_change(
             graph_id,
@@ -1869,15 +2035,16 @@ fn create_crate_rocrate_with_license(
     description: &str,
     date_published: &str,
     license: License,
+    version: RoCrateVersion,
 ) -> RoCrate {
     let root_id = root_id(graph_id);
     RoCrate {
-        context: default_context(),
+        context: default_context(version),
         graph: vec![
             GraphVector::MetadataDescriptor(MetadataDescriptor {
                 id: METADATA_ID.to_string(),
                 type_: DataType::Term("CreativeWork".to_string()),
-                conforms_to: Id::Id(ROCRATE_SPEC_URL.to_string()),
+                conforms_to: Id::Id(version.specification_url().to_string()),
                 about: Id::Id(root_id.to_string()),
                 dynamic_entity: Some(HashMap::new()),
             }),
@@ -2093,63 +2260,152 @@ fn violation_pointer(
     pointers.map_or_else(String::new, |pointers| pointers.property(entity, predicate))
 }
 
+fn version_from_context_url(url: &str) -> Result<Option<RoCrateVersion>, RoCrateError> {
+    match url {
+        ROCRATE_1_1_CONTEXT_URL => Ok(Some(RoCrateVersion::V1_1)),
+        ROCRATE_1_2_CONTEXT_URL => Ok(Some(RoCrateVersion::V1_2)),
+        ROCRATE_1_3_CONTEXT_URL => Ok(Some(RoCrateVersion::V1_3)),
+        _ if is_version_context_url(url) => Err(RoCrateError::UnknownVersion(url.to_string())),
+        _ => Ok(None),
+    }
+}
+
+fn is_supported_context_url(url: &str) -> bool {
+    matches!(
+        url,
+        ROCRATE_1_1_CONTEXT_URL | ROCRATE_1_2_CONTEXT_URL | ROCRATE_1_3_CONTEXT_URL
+    )
+}
+
+fn version_from_specification_url(url: &str) -> Result<Option<RoCrateVersion>, RoCrateError> {
+    match url {
+        ROCRATE_1_1_SPEC_URL => Ok(Some(RoCrateVersion::V1_1)),
+        ROCRATE_1_2_SPEC_URL => Ok(Some(RoCrateVersion::V1_2)),
+        ROCRATE_1_3_SPEC_URL => Ok(Some(RoCrateVersion::V1_3)),
+        _ if is_version_specification_url(url) => {
+            Err(RoCrateError::UnknownVersion(url.to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_version_context_url(url: &str) -> bool {
+    let Some(version) = url
+        .strip_prefix(ROCRATE_VERSION_FAMILY_PREFIX)
+        .and_then(|remainder| remainder.strip_suffix("/context"))
+    else {
+        return false;
+    };
+    !version.contains('/') && is_version_segment(version)
+}
+
+fn is_version_specification_url(url: &str) -> bool {
+    let Some(version) = url.strip_prefix(ROCRATE_VERSION_FAMILY_PREFIX) else {
+        return false;
+    };
+    !version.contains('/') && is_version_segment(version)
+}
+
+fn is_version_segment(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    [major, minor].into_iter().chain(parts).all(|part| {
+        let mut bytes = part.bytes();
+        bytes.next().is_some_and(|byte| byte.is_ascii_digit())
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+'))
+    })
+}
+
+fn resolve_version_evidence(
+    versions: impl IntoIterator<Item = RoCrateVersion>,
+) -> Result<RoCrateVersion, RoCrateError> {
+    let mut versions = versions.into_iter();
+    let Some(first) = versions.next() else {
+        return Err(RoCrateError::MissingVersion);
+    };
+    for second in versions {
+        if second != first {
+            return Err(RoCrateError::VersionMismatch { first, second });
+        }
+    }
+    Ok(first)
+}
+
+fn detect_context_version(
+    value: &serde_json::Value,
+) -> Result<Option<RoCrateVersion>, RoCrateError> {
+    value
+        .as_object()
+        .and_then(|object| object.get("@context"))
+        .map(detect_context_value_version)
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn detect_context_value_version(
+    context: &serde_json::Value,
+) -> Result<Option<RoCrateVersion>, RoCrateError> {
+    fn collect(
+        context: &serde_json::Value,
+        versions: &mut Vec<RoCrateVersion>,
+    ) -> Result<(), RoCrateError> {
+        match context {
+            serde_json::Value::String(url) => {
+                if let Some(version) = version_from_context_url(url)? {
+                    versions.push(version);
+                }
+            }
+            serde_json::Value::Array(entries) => {
+                for entry in entries {
+                    collect(entry, versions)?;
+                }
+            }
+            serde_json::Value::Object(entries) => {
+                if let Some(import) = entries.get("@import") {
+                    collect(import, versions)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut versions = Vec::new();
+    collect(context, &mut versions)?;
+    if versions.is_empty() {
+        Ok(None)
+    } else {
+        resolve_version_evidence(versions).map(Some)
+    }
+}
+
 fn validate_crate_version(
     graph_id: &GraphId,
     triples: &BTreeSet<TripleKey>,
-    pointers: &SubmittedPointers,
-) -> Result<(), RoCrateError> {
+    context_version: Option<RoCrateVersion>,
+) -> Result<RoCrateVersion, RoCrateError> {
     let metadata = EncodedTerm::from_named_node(&vocab::metadata_descriptor());
     let root = root_term(graph_id);
     let conforms_to = EncodedTerm::from_named_node(&crate_conforms_to());
-    let candidates = triples
-        .iter()
-        .filter(|(subject, predicate, _)| {
-            (subject == &metadata || subject == &root) && predicate == &conforms_to
-        })
-        .collect::<Vec<_>>();
-    if candidates.iter().any(|(_, _, object)| {
-        object.to_named_node().is_some_and(|version| {
-            matches!(
-                version.as_str(),
-                ROCRATE_1_1_SPEC_URL | ROCRATE_1_2_SPEC_URL
-            )
-        })
-    }) {
-        return Ok(());
+    let mut versions = context_version.into_iter().collect::<Vec<_>>();
+
+    for (subject, predicate, object) in triples {
+        if (subject != &metadata && subject != &root) || predicate != &conforms_to {
+            continue;
+        }
+        if let Some(version) = object.to_named_node()
+            && let Some(version) = version_from_specification_url(version.as_str())?
+        {
+            versions.push(version);
+        }
     }
 
-    let (version, entity, pointer) = candidates.first().map_or_else(
-        || {
-            let entity = if pointers.entities.contains_key(&metadata.0) {
-                metadata.clone()
-            } else {
-                root.clone()
-            };
-            (None, entity.clone(), pointers.entity(&entity))
-        },
-        |(subject, _, object)| {
-            (
-                object
-                    .to_named_node()
-                    .map(|version| version.as_str().to_string())
-                    .or_else(|| Some(object.0.clone())),
-                (*subject).clone(),
-                pointers.property(subject, &conforms_to),
-            )
-        },
-    );
-    let entity_id = entity
-        .to_named_node()
-        .map(|entity| entity.as_str().to_string());
-    Err(RoCrateError::Update(
-        crate::replication::UpdateError::ValidationFailed(vec![
-            crate::core::CrateViolation::unsupported_version(
-                version.as_deref(),
-                pointer,
-                entity_id,
-            ),
-        ]),
-    ))
+    resolve_version_evidence(versions)
 }
 
 fn validate_complete_import_triples(
@@ -2399,16 +2655,18 @@ fn load_context(
     url: &str,
 ) -> Result<JsonLdRemoteDocument, Box<dyn std::error::Error + Send + Sync>> {
     let document = match url {
-        ROCRATE_1_1_CONTEXT_URL => ROCRATE_1_1_CONTEXT,
-        ROCRATE_1_2_CONTEXT_URL => ROCRATE_1_2_CONTEXT,
         WORKFLOW_RUN_CONTEXT_URL => WORKFLOW_RUN_CONTEXT,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unresolved offline JSON-LD context `{url}`"),
-            )
-            .into());
-        }
+        _ => match version_from_context_url(url) {
+            Ok(Some(version)) => version.context_bytes(),
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("unresolved offline JSON-LD context `{url}`"),
+                )
+                .into());
+            }
+            Err(error) => return Err(Box::new(error)),
+        },
     };
     Ok(JsonLdRemoteDocument {
         document: document.to_vec(),
@@ -2702,7 +2960,8 @@ fn export_metadata_descriptor(
     Ok(MetadataDescriptor {
         id: METADATA_ID.to_string(),
         type_: data_type_from_terms(type_terms, "CreativeWork"),
-        conforms_to: conforms_to.unwrap_or_else(|| Id::Id(ROCRATE_SPEC_URL.to_string())),
+        conforms_to: conforms_to
+            .unwrap_or_else(|| Id::Id(view.version.specification_url().to_string())),
         about: about.unwrap_or_else(|| Id::Id(root_id(view.graph_id).to_string())),
         dynamic_entity: (!dynamic.is_empty()).then_some(dynamic),
     })
@@ -2757,7 +3016,8 @@ fn export_root_entity(view: RootExportView<'_>) -> Result<RootDataEntity, RoCrat
         date_published: date_published.ok_or_else(|| {
             RoCrateError::InvalidGraph("root entity missing datePublished".into())
         })?,
-        license: license.unwrap_or_else(|| License::Id(Id::Id(ROCRATE_SPEC_URL.to_string()))),
+        license: license
+            .unwrap_or_else(|| License::Id(Id::Id(view.version.specification_url().to_string()))),
         dynamic_entity: (!dynamic.is_empty()).then_some(dynamic),
     })
 }
@@ -3038,8 +3298,8 @@ fn literal_suffix(encoded: &str) -> Option<&str> {
     None
 }
 
-fn default_context() -> RoCrateContext {
-    RoCrateContext::ReferenceContext(ROCRATE_CONTEXT_URL.to_string())
+fn default_context(version: RoCrateVersion) -> RoCrateContext {
+    RoCrateContext::ReferenceContext(version.context_url().to_string())
 }
 
 /// Serialize an export view and replace its `@context` with the stored raw
@@ -3158,24 +3418,25 @@ fn collect_identifier_terms(context: &serde_json::Value, terms: &mut HashSet<Str
     }
 }
 
-/// Whether a submitted `@context` is equivalent to the bare default RO-Crate
-/// context (a plain reference string, or a single-element array of it).
-fn is_bare_default_context(context: &serde_json::Value) -> bool {
+/// Whether a submitted `@context` is a bare supported RO-Crate context (a
+/// plain reference string, or a single-element array of it).
+fn is_bare_rocrate_context(context: &serde_json::Value) -> bool {
     match context {
-        serde_json::Value::String(url) => url == ROCRATE_CONTEXT_URL,
+        serde_json::Value::String(url) => is_supported_context_url(url),
         serde_json::Value::Array(items) => {
             items.len() == 1
                 && items
                     .first()
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|url| url == ROCRATE_CONTEXT_URL)
+                    .is_some_and(is_supported_context_url)
         }
         _ => false,
     }
 }
 
 /// Serialize the submitted `@context` verbatim for storage, or `None` when it is
-/// absent, degenerate, or equivalent to the bare default RO-Crate context.
+/// absent or degenerate. Bare supported contexts are elided after import only
+/// when the live scaffold marker carries the same version evidence.
 ///
 /// Only strings, arrays, and objects can carry a usable JSON-LD context.
 /// Degenerate values (`null`, numbers, booleans) carry no mappings and are
@@ -3187,9 +3448,6 @@ fn extract_raw_context(value: &serde_json::Value) -> Option<String> {
         context,
         serde_json::Value::String(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_)
     ) {
-        return None;
-    }
-    if is_bare_default_context(context) {
         return None;
     }
     match serde_json::to_string(context) {
@@ -3270,7 +3528,7 @@ fn collect_context_terms(
 ) {
     match context {
         serde_json::Value::String(url) => {
-            if url != ROCRATE_CONTEXT_URL && warn {
+            if !is_supported_context_url(url) && warn {
                 tracing::warn!(
                     context = %url,
                     "ignoring non-RO-Crate reference @context for term expansion"
@@ -3323,11 +3581,15 @@ fn collect_context_terms(
 }
 
 fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateError> {
-    let rdf_graph = rocrate_to_rdf_with_options(
-        rocrate,
-        ContextResolverBuilder::default(),
-        ConversionOptions::AllowRelative,
-    )?;
+    let resolver = ContextResolverBuilder::default()
+        .with_context(
+            ROCRATE_1_3_CONTEXT_URL,
+            std::str::from_utf8(RoCrateVersion::V1_3.context_bytes())
+                .expect("embedded RO-Crate 1.3 context is UTF-8"),
+        )
+        .map_err(RdfError::from)?;
+    let rdf_graph =
+        rocrate_to_rdf_with_options(rocrate, resolver, ConversionOptions::AllowRelative)?;
 
     let mut triples = BTreeSet::new();
     for triple in rdf_graph {
@@ -3366,9 +3628,9 @@ fn normalize_metadata_descriptor(metadata: &mut MetadataDescriptor) {
     }
 
     if let Id::Id(id) = &metadata.conforms_to
-        && id == ROCRATE_CONTEXT_URL
+        && let Ok(Some(version)) = version_from_context_url(id)
     {
-        metadata.conforms_to = Id::Id(ROCRATE_SPEC_URL.to_string());
+        metadata.conforms_to = Id::Id(version.specification_url().to_string());
     }
 }
 
@@ -3383,7 +3645,7 @@ fn first_identifier(value: &EntityValue) -> Option<String> {
 
 fn preferred_identifier(ids: &[String]) -> Option<String> {
     ids.iter()
-        .find(|id| id.as_str() != ROCRATE_CONTEXT_URL)
+        .find(|id| !is_supported_context_url(id))
         .cloned()
         .or_else(|| ids.first().cloned())
 }
