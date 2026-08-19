@@ -1098,7 +1098,7 @@ mod tests {
             serde_json::from_str(&mgr.export_jsonld(&created).unwrap()).unwrap();
         assert_eq!(
             created_export["@context"],
-            serde_json::json!("https://w3id.org/ro/crate/1.2/context")
+            serde_json::json!("https://w3id.org/ro/crate/1.3/context")
         );
 
         // Importing a bare-context document also exports the plain URL string.
@@ -1278,7 +1278,7 @@ mod tests {
             serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
         assert_eq!(
             exported["@context"],
-            serde_json::json!("https://w3id.org/ro/crate/1.2/context"),
+            serde_json::json!("https://w3id.org/ro/crate/1.3/context"),
             "create_crate replacement must revert to the bare default context"
         );
     }
@@ -1327,7 +1327,7 @@ mod tests {
             serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
         assert_eq!(
             exported["@context"],
-            serde_json::json!("https://w3id.org/ro/crate/1.2/context"),
+            serde_json::json!("https://w3id.org/ro/crate/1.3/context"),
             "prevalidated create replacement must revert to the bare default context"
         );
     }

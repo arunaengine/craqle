@@ -193,6 +193,44 @@ impl From<fjall::PersistMode> for CraqleFjallPersistMode {
     }
 }
 
+/// A supported RO-Crate specification version.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum RoCrateVersion {
+    V1_1,
+    V1_2,
+    #[default]
+    V1_3,
+}
+
+impl RoCrateVersion {
+    pub(crate) const fn context_url(self) -> &'static str {
+        match self {
+            Self::V1_1 => "https://w3id.org/ro/crate/1.1/context",
+            Self::V1_2 => "https://w3id.org/ro/crate/1.2/context",
+            Self::V1_3 => "https://w3id.org/ro/crate/1.3/context",
+        }
+    }
+
+    pub(crate) const fn specification_url(self) -> &'static str {
+        match self {
+            Self::V1_1 => "https://w3id.org/ro/crate/1.1",
+            Self::V1_2 => "https://w3id.org/ro/crate/1.2",
+            Self::V1_3 => "https://w3id.org/ro/crate/1.3",
+        }
+    }
+
+    pub(crate) const fn context_bytes(self) -> &'static [u8] {
+        match self {
+            Self::V1_1 => include_bytes!("resources/ro_crate_1_1.jsonld"),
+            Self::V1_2 => include_bytes!("resources/ro_crate_1_2.jsonld"),
+            Self::V1_3 => include_bytes!("resources/ro_crate_1_3.jsonld"),
+        }
+    }
+}
+
 /// Input for creating a new RO-Crate graph.
 #[derive(Debug, Clone)]
 pub struct CreateCrateRequest {
@@ -202,6 +240,12 @@ pub struct CreateCrateRequest {
     pub date_published: String,
     pub license: Option<String>,
     pub policy: GraphPolicy,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateCrateOptions {
+    pub version: RoCrateVersion,
+    pub license: Option<String>,
 }
 
 impl CreateCrateRequest {
@@ -901,6 +945,11 @@ impl CraqleNode {
         )?)
     }
 
+    /// Return the RO-Crate version from its live marker or retained context evidence.
+    pub fn crate_version(&self, graph: &GraphId) -> Result<RoCrateVersion> {
+        Ok(self.manager().crate_version(graph)?)
+    }
+
     /// Create a new RO-Crate graph.
     pub fn create_crate(
         &self,
@@ -908,6 +957,26 @@ impl CraqleNode {
         request: CreateCrateRequest,
     ) -> Result<Batch> {
         self.create_crate_with_durability(auth, request, CraqleRequestDurability::Durable)
+    }
+
+    /// Create a new RO-Crate graph with an explicit schema version and optional
+    /// license override.
+    pub fn create_crate_with_options(
+        &self,
+        auth: &dyn Authorizer,
+        mut request: CreateCrateRequest,
+        options: CreateCrateOptions,
+    ) -> Result<Batch> {
+        if let Some(license) = options.license {
+            request.license = Some(license);
+        }
+        self.create_crate_with_durability_as_version(
+            auth,
+            request,
+            CraqleRequestDurability::Durable,
+            None,
+            options.version,
+        )
     }
 
     /// Create a new RO-Crate graph with an explicit request durability policy.
@@ -931,6 +1000,24 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
         actor: Option<ActorId>,
     ) -> Result<Batch> {
+        self.create_crate_with_durability_as_version(
+            auth,
+            request,
+            durability,
+            actor,
+            RoCrateVersion::default(),
+        )
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
+    fn create_crate_with_durability_as_version(
+        &self,
+        auth: &dyn Authorizer,
+        request: CreateCrateRequest,
+        durability: CraqleRequestDurability,
+        actor: Option<ActorId>,
+        version: RoCrateVersion,
+    ) -> Result<Batch> {
         let CreateCrateRequest {
             graph,
             name,
@@ -941,13 +1028,25 @@ impl CraqleNode {
         } = request;
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self.manager_with(durability, actor).create_crate(
-            graph.clone(),
-            &name,
-            &description,
-            &date_published,
-            license.as_deref(),
-        )?;
+        let manager = self.manager_with(durability, actor);
+        let batch = if version == RoCrateVersion::default() {
+            manager.create_crate(
+                graph.clone(),
+                &name,
+                &description,
+                &date_published,
+                license.as_deref(),
+            )?
+        } else {
+            manager.create_crate_with_version(
+                graph.clone(),
+                &name,
+                &description,
+                &date_published,
+                license.as_deref(),
+                version,
+            )?
+        };
         self.persist_graph_policy_with_durability(&graph, policy, durability)?;
         self.finish_batch_with_durability(&graph, batch, durability)
     }

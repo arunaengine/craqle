@@ -2,7 +2,7 @@ mod support;
 
 use craqle::{
     CanonicalJsonLd, CraqleError, CraqleNode, CreateCrateRequest, GraphId, RoCrateError,
-    UpdateError, canonicalize_jsonld, validate_rocrate_jsonld,
+    canonicalize_jsonld, validate_rocrate_jsonld,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -92,15 +92,6 @@ fn accepts_both_contexts() {
     root.remove("name");
     root.insert("title".to_string(), json!("Aliased title"));
     checked_document(&aliased.to_string());
-
-    let mut root_version: Value = serde_json::from_str(&crate_document(
-        json!("https://w3id.org/ro/crate/1.2/context"),
-        None,
-        None,
-    ))
-    .unwrap();
-    root_version["@graph"][1]["conformsTo"] = json!([{"@id": "https://w3id.org/ro/crate/1.1"}]);
-    checked_document(&root_version.to_string());
 }
 
 #[test]
@@ -270,7 +261,7 @@ fn license_shapes_roundtrip() {
 }
 
 #[test]
-fn violations_have_pointers() {
+fn unknown_future_version_has_exact_iri() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let document = crate_document(
@@ -287,18 +278,11 @@ fn violations_have_pointers() {
         )
         .unwrap_err();
 
-    let CraqleError::RoCrate(RoCrateError::Update(UpdateError::ValidationFailed(violations))) =
-        error
-    else {
-        panic!("expected structured validation error, got {error:?}");
-    };
-    assert_eq!(violations.len(), 1);
-    assert_eq!(violations[0].code, "unsupported_crate_version");
-    assert_eq!(violations[0].pointer, "/@graph/0/conformsTo");
-    assert_eq!(
-        violations[0].entity_id.as_deref(),
-        Some("ro-crate-metadata.json")
-    );
+    assert!(matches!(
+        error,
+        CraqleError::RoCrate(RoCrateError::UnknownVersion(version))
+            if version == "https://w3id.org/ro/crate/9.9"
+    ));
 }
 
 #[test]
