@@ -13,6 +13,12 @@ mod planner;
 #[allow(dead_code)]
 #[path = "internal/query_context.rs"]
 mod query_context;
+#[allow(dead_code)]
+#[path = "internal/query_cursor.rs"]
+mod query_cursor;
+#[allow(dead_code)]
+#[path = "internal/rdf_read.rs"]
+mod rdf_read;
 #[path = "internal/replication.rs"]
 mod replication;
 #[path = "internal/rocrate.rs"]

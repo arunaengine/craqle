@@ -1802,7 +1802,7 @@ impl GraphStore {
         })
     }
 
-    fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
+    pub(crate) fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
         if bytes.len() != 64 {
             return Err(StoreError::InvalidEncoding {
                 context: "quad key",
@@ -1817,13 +1817,22 @@ impl GraphStore {
         })
     }
 
-    fn quad_key(graph: TermId, subject: TermId, predicate: TermId, object: TermId) -> [u8; 64] {
+    pub(crate) fn quad_key(
+        graph: TermId,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> [u8; 64] {
         let mut key = [0u8; 64];
         key[0..16].copy_from_slice(&graph.to_be_bytes());
         key[16..32].copy_from_slice(&subject.to_be_bytes());
         key[32..48].copy_from_slice(&predicate.to_be_bytes());
         key[48..64].copy_from_slice(&object.to_be_bytes());
         key
+    }
+
+    pub(crate) fn quad_value_is_live(bytes: &[u8]) -> bool {
+        !dot_payload_is_empty(bytes)
     }
 
     fn count_objects_for_ids(&self, graph: TermId, subject: TermId, predicate: TermId) -> usize {
@@ -2805,6 +2814,29 @@ impl GraphStore {
                 quads
             }
         })
+    }
+
+    pub(crate) fn raw_quad_cursor(
+        &self,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> crate::query_cursor::RawQuadCursor {
+        let _publication = self.indexes_read();
+        let snapshot = self.db.snapshot();
+        crate::query_cursor::RawQuadCursor::new(snapshot, &self.quads, pattern)
+    }
+
+    /// Point-probes a fully bound durable quad behind the same publication
+    /// barrier used by [`GraphStore::raw_quad_cursor`].
+    #[allow(dead_code)]
+    pub(crate) fn raw_quad_point(
+        &self,
+        quad: EncodedQuad,
+    ) -> Result<Option<crate::query_cursor::RawQuadCandidate>> {
+        let snapshot = {
+            let _publication = self.indexes_read();
+            self.db.snapshot()
+        };
+        crate::query_cursor::point_candidate(&snapshot, &self.quads, quad)
     }
 
     pub fn for_each_quad_in_graph<E, F>(
