@@ -12,7 +12,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use craqle::{
-    ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange, QueryResults,
+    ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange,
+    QueryReadMode, QueryResults, ReadStatistics,
 };
 use oxrdf::Term;
 
@@ -416,6 +417,49 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{} query failed", case.label))
     }
 
+    pub fn run_hot_path_with_read_mode(
+        &self,
+        index: usize,
+        read_mode: QueryReadMode,
+    ) -> (QueryResults, ReadStatistics) {
+        let case = self
+            .cases
+            .get(index)
+            .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"));
+        self.node
+            .query_graphs_with_read_mode(&self.visible_graphs, &case.sparql, read_mode)
+            .unwrap_or_else(|_| panic!("{} query failed", case.label))
+    }
+
+    pub fn print_hot_path_read_work(&self) {
+        for index in 0..self.hot_path_count() {
+            let (results, statistics) =
+                self.run_hot_path_with_read_mode(index, QueryReadMode::Auto);
+            println!(
+                "sparql_hot_path work: case={} mode=Auto access_path={:?} qv_trusted={} \
+                 fallback_reason={} source_keys={} source_bytes={} qv_keys={} qv_bytes={} \
+                 candidate_quads={} matching_quads={} graph_checks={} orphan_checks={} \
+                 duplicate_groups={} duplicate_copies_skipped={} term_decodes={} result_rows={}",
+                self.hot_path_label(index),
+                statistics.selected_access_paths,
+                statistics.qv_trusted,
+                statistics.fallback_reason.as_deref().unwrap_or("none"),
+                statistics.source_keys_read,
+                statistics.source_bytes_read,
+                statistics.qv_keys_read,
+                statistics.qv_bytes_read,
+                statistics.candidate_quads,
+                statistics.matching_quads,
+                statistics.graphs_considered,
+                statistics.orphan_checks,
+                statistics.duplicate_groups,
+                statistics.duplicate_copies_skipped,
+                statistics.terms_decoded,
+                query_result_rows(&results),
+            );
+        }
+    }
+
     /// Runs a full public query call over the generated visible-graph scope.
     pub fn run_visible_query(&self, sparql: &str, label: &str) -> QueryResults {
         self.node
@@ -461,14 +505,13 @@ impl Fixture {
                 named_rows >= 2,
                 "named duplicate smoke must retain graph-specific multiplicity"
             );
-            let union_rows = self.solution_rows(
-                &self.all_graphs,
-                &duplicate.union,
-                "union duplicate baseline",
+            let union_rows =
+                self.solution_rows(&self.all_graphs, &duplicate.union, "union duplicate");
+            assert_eq!(
+                union_rows, 1,
+                "the default union must emit one row for graph copies of one triple"
             );
             report.named_duplicate_rows = Some(named_rows);
-            // Deliberately do not assert the union count: it is a known current
-            // baseline defect, so this number is evidence rather than a target.
             report.union_duplicate_rows = Some(union_rows);
         }
 
@@ -541,8 +584,8 @@ impl Fixture {
         );
         match (report.named_duplicate_rows, report.union_duplicate_rows) {
             (Some(named), Some(union)) => println!(
-                "sparql_hot_path duplicate baseline: named_rows={} union_rows={} \
-                 (observed only; union cardinality is not asserted as intended semantics)",
+                "sparql_hot_path duplicate semantics: named_rows={} union_rows={} \
+                 (named copies preserved; distinct default union asserted)",
                 named, union
             ),
             _ => println!(
@@ -826,6 +869,14 @@ fn count_value(results: QueryResults, label: &str) -> usize {
             .parse()
             .unwrap_or_else(|_| panic!("{label} must bind an integer count")),
         _ => panic!("{label} must bind a literal count"),
+    }
+}
+
+fn query_result_rows(results: &QueryResults) -> usize {
+    match results {
+        QueryResults::Solutions(rows) => rows.len(),
+        QueryResults::Boolean(_) => 1,
+        QueryResults::Graph(rows) => rows.len(),
     }
 }
 

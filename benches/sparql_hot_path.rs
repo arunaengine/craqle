@@ -12,6 +12,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     // completed-result path before Criterion begins collecting samples.
     let report = fixture.assert_semantics();
     fixture.print_report(&report);
+    fixture.print_hot_path_read_work();
 
     let config = fixture.config();
     let mut group = c.benchmark_group("sparql_hot_path");

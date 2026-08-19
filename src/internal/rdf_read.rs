@@ -1577,6 +1577,94 @@ mod tests {
         let (_directory, store) = setup_store();
         let first_graph = GraphId::new("urn:test:default-union:first");
         let second_graph = GraphId::new("urn:test:default-union:second");
+        let first = add_quad(
+            &store,
+            &first_graph,
+            "urn:test:default-union:s",
+            "urn:test:default-union:p",
+            "urn:test:default-union:o",
+        );
+        let second = add_quad(
+            &store,
+            &second_graph,
+            "urn:test:default-union:s",
+            "urn:test:default-union:p",
+            "urn:test:default-union:o",
+        );
+        settle_diagnostics(&store, &first_graph);
+        settle_diagnostics(&store, &second_graph);
+        let view = StoreReadView::new(&store);
+        let pattern = QuadPattern {
+            predicate: Some(first.predicate),
+            object: Some(first.object),
+            ..QuadPattern::default()
+        };
+
+        let default_context = ReadContext::default();
+        let default_rows = collect_rows(
+            view.scan(&default_context, GraphSelector::DefaultUnion, pattern)
+                .unwrap(),
+        );
+        assert_eq!(1, default_rows.len());
+        assert_eq!(first.subject, default_rows[0].subject);
+        assert_eq!(first.predicate, default_rows[0].predicate);
+        assert_eq!(first.object, default_rows[0].object);
+        assert_eq!(1, default_context.snapshot().matching_quads);
+        assert_eq!(2, default_context.snapshot().candidate_quads);
+
+        let named_context = ReadContext::default();
+        assert_eq!(
+            sorted(vec![first, second]),
+            sorted(collect_rows(
+                view.scan(&named_context, GraphSelector::Union, pattern)
+                    .unwrap(),
+            ))
+        );
+    }
+
+    #[test]
+    fn default_union_skips_hidden_and_orphaned_copies_before_emitting_one() {
+        let (_directory, store) = setup_store();
+        let orphan_graph = GraphId::new("urn:test:default-union:orphan");
+        let hidden_graph = GraphId::new("urn:test:default-union:hidden");
+        let visible_graph = GraphId::new("urn:test:default-union:visible");
+        let subject = "urn:test:default-union:filtered:s";
+        let predicate = "urn:test:default-union:filtered:p";
+        let object = "urn:test:default-union:filtered:o";
+        let orphan = add_quad(&store, &orphan_graph, subject, predicate, object);
+        add_quad(&store, &hidden_graph, subject, predicate, object);
+        let visible = add_quad(&store, &visible_graph, subject, predicate, object);
+        store
+            .set_graph_diagnostics(
+                &orphan_graph,
+                &GraphDiagnostics::from_orphaned_entities(vec![subject.to_owned()]),
+            )
+            .unwrap();
+        settle_diagnostics(&store, &hidden_graph);
+        settle_diagnostics(&store, &visible_graph);
+
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::with_visible_graphs(
+            QueryCancellation::new(),
+            vec![orphan_graph, visible_graph],
+        );
+        assert_eq!(
+            vec![visible],
+            collect_rows(
+                view.scan(
+                    &context,
+                    GraphSelector::DefaultUnion,
+                    QuadPattern {
+                        predicate: Some(orphan.predicate),
+                        object: Some(orphan.object),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap(),
+            )
+        );
+        assert_eq!(3, context.snapshot().candidate_quads);
+        assert_eq!(1, context.snapshot().matching_quads);
     }
 
     #[test]
@@ -1630,6 +1718,142 @@ mod tests {
             rows.iter()
                 .all(|quad| quad.subject != orphan_type.subject && quad.object != orphan_object)
         );
+    }
+
+    #[test]
+    fn captured_view_keeps_an_orphan_hidden_after_a_live_adoption() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:snapshot-orphan-adoption");
+        let entity = "urn:test:snapshot-orphan-adoption:entity";
+        let typed = add_quad(
+            &store,
+            &graph,
+            entity,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://schema.org/MediaObject",
+        );
+        let captured = StoreReadView::new(&store);
+
+        add_quad(
+            &store,
+            &graph,
+            graph.as_str(),
+            "http://schema.org/hasPart",
+            entity,
+        );
+
+        let captured_context = ReadContext::default();
+        assert!(
+            collect_rows(
+                captured
+                    .scan(
+                        &captured_context,
+                        GraphSelector::Named(typed.graph),
+                        QuadPattern {
+                            subject: Some(typed.subject),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+            .is_empty()
+        );
+
+        let fresh = StoreReadView::new(&store);
+        let fresh_context = ReadContext::default();
+        assert_eq!(
+            vec![typed],
+            collect_rows(
+                fresh
+                    .scan(
+                        &fresh_context,
+                        GraphSelector::Named(typed.graph),
+                        QuadPattern {
+                            subject: Some(typed.subject),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+        );
+    }
+
+    #[test]
+    fn captured_view_keeps_a_reachable_entity_visible_after_a_live_unlink() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:snapshot-orphan-unlink");
+        let entity = "urn:test:snapshot-orphan-unlink:entity";
+        let typed = add_quad(
+            &store,
+            &graph,
+            entity,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://schema.org/MediaObject",
+        );
+        let link = add_quad(
+            &store,
+            &graph,
+            graph.as_str(),
+            "http://schema.org/hasPart",
+            entity,
+        );
+        let captured = StoreReadView::new(&store);
+
+        remove_quad(&store, &graph, link);
+
+        let captured_context = ReadContext::default();
+        assert_eq!(
+            vec![typed],
+            collect_rows(
+                captured
+                    .scan(
+                        &captured_context,
+                        GraphSelector::Named(typed.graph),
+                        QuadPattern {
+                            subject: Some(typed.subject),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+        );
+
+        let fresh = StoreReadView::new(&store);
+        let fresh_context = ReadContext::default();
+        assert!(
+            collect_rows(
+                fresh
+                    .scan(
+                        &fresh_context,
+                        GraphSelector::Named(typed.graph),
+                        QuadPattern {
+                            subject: Some(typed.subject),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_orphan_recompute_stops_before_a_large_source_scan_when_cancelled() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:snapshot-orphan-cancel");
+        let graph_id = add_many(&store, &graph, 1_025);
+        let view = StoreReadView::new(&store);
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let context = ReadContext::new(cancellation);
+
+        assert!(matches!(
+            view.snapshot()
+                .orphaned_entity_ids(&store, &context, graph_id),
+            Err(StoreError::Cancelled)
+        ));
+        assert_eq!(0, context.snapshot().index_seeks);
+        assert_eq!(0, context.snapshot().candidate_quads);
     }
 
     #[test]
@@ -1800,6 +2024,7 @@ mod tests {
             "urn:test:predicate-object:p",
             "urn:test:predicate-object:o",
         );
+        settle_diagnostics(&store, &graph);
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
         let cursor = view
@@ -1910,18 +2135,20 @@ mod tests {
 
         assert_eq!(sorted(vec![first, removed]), sorted(collect_rows(cursor)));
         let fresh_context = ReadContext::default();
+        let fresh_view = StoreReadView::new(&store);
         assert_eq!(
             sorted(vec![first, added]),
             sorted(collect_rows(
-                view.scan(
-                    &fresh_context,
-                    GraphSelector::Named(first.graph),
-                    QuadPattern {
-                        object: Some(first.object),
-                        ..QuadPattern::default()
-                    },
-                )
-                .unwrap(),
+                fresh_view
+                    .scan(
+                        &fresh_context,
+                        GraphSelector::Named(first.graph),
+                        QuadPattern {
+                            object: Some(first.object),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap(),
             ))
         );
     }
