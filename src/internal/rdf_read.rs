@@ -280,8 +280,9 @@ pub(crate) fn decode_term(
     context: &ReadContext<'_>,
     term: TermId,
 ) -> Result<EncodedTerm> {
+    let decoded = store.decode_term(term)?;
     context.increment_terms_decoded();
-    store.decode_term(term)
+    Ok(decoded)
 }
 
 pub(crate) fn graph_is_visible(
@@ -976,6 +977,9 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(3, context.snapshot().terms_decoded);
+
+        assert!(view.decode_term(&context, TermId(u128::MAX)).is_err());
+        assert_eq!(3, context.snapshot().terms_decoded);
     }
 
     #[test]
@@ -1015,6 +1019,62 @@ mod tests {
         });
 
         assert_eq!(vec![first], collect_rows(cursor));
+    }
+
+    #[test]
+    fn predicate_object_cursor_is_lazy_and_copy_on_write_stable() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:predicate-object-snapshot");
+        let first = add_quad(
+            &store,
+            &graph,
+            "urn:test:predicate-object:s1",
+            "urn:test:predicate-object:p",
+            "urn:test:predicate-object:o",
+        );
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern {
+                    predicate: Some(first.predicate),
+                    object: Some(first.object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+
+        let (done, received) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                add_quad(
+                    &store,
+                    &graph,
+                    "urn:test:predicate-object:s2",
+                    "urn:test:predicate-object:p",
+                    "urn:test:predicate-object:o",
+                );
+                done.send(()).unwrap();
+            });
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+
+        assert_eq!(vec![first], collect_rows(cursor));
+        assert_eq!(1, context.snapshot().candidate_quads);
+        assert_eq!(
+            2,
+            store
+                .quads_for_pattern(
+                    Some(first.graph),
+                    None,
+                    Some(first.predicate),
+                    Some(first.object),
+                )
+                .unwrap()
+                .len()
+        );
     }
 
     #[test]

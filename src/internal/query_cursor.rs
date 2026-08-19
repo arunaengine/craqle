@@ -1,24 +1,36 @@
+use std::sync::Arc;
+
 use fjall::{Keyspace, Readable, Snapshot};
 
 use crate::query_context::ReadContext;
 use crate::rdf_read::QuadPattern;
-use crate::store::{EncodedQuad, GraphStore, Result};
+use crate::store::{EncodedQuad, GraphStore, Result, TermId};
 
 enum SourceIterator {
-    Iter(fjall::Iter),
+    Durable {
+        _snapshot: Snapshot,
+        iterator: fjall::Iter,
+    },
+    PredicateObject {
+        subjects: Arc<Vec<TermId>>,
+        next: usize,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    },
+    Empty,
 }
 
-/// One source-key read from the durable quad keyspace.
+/// One candidate read from a durable or immutable in-memory index snapshot.
 pub(crate) struct RawQuadCandidate {
     pub(crate) quad: EncodedQuad,
     pub(crate) live: bool,
 }
 
-/// Lazy durable source cursor. It owns the Fjall snapshot and iterator, but
-/// never an in-memory-index lock.
+/// Lazy source cursor. It owns either a Fjall snapshot or a copy-on-write
+/// in-memory range snapshot, but never an in-memory-index lock.
 pub(crate) struct RawQuadCursor {
-    _snapshot: Snapshot,
-    iterator: SourceIterator,
+    source: SourceIterator,
 }
 
 impl RawQuadCursor {
@@ -28,34 +40,80 @@ impl RawQuadCursor {
                 let mut prefix = [0u8; 32];
                 prefix[..16].copy_from_slice(&graph.to_be_bytes());
                 prefix[16..].copy_from_slice(&subject.to_be_bytes());
-                SourceIterator::Iter(snapshot.prefix(quads, prefix))
+                snapshot.prefix(quads, prefix)
             }
-            (Some(graph), None) => {
-                SourceIterator::Iter(snapshot.prefix(quads, graph.to_be_bytes()))
-            }
-            (None, _) => SourceIterator::Iter(snapshot.iter(quads)),
+            (Some(graph), None) => snapshot.prefix(quads, graph.to_be_bytes()),
+            (None, _) => snapshot.iter(quads),
         };
         Self {
-            _snapshot: snapshot,
-            iterator,
+            source: SourceIterator::Durable {
+                _snapshot: snapshot,
+                iterator,
+            },
+        }
+    }
+
+    pub(crate) fn predicate_object(
+        subjects: Arc<Vec<TermId>>,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Self {
+        Self {
+            source: SourceIterator::PredicateObject {
+                subjects,
+                next: 0,
+                graph,
+                predicate,
+                object,
+            },
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            source: SourceIterator::Empty,
         }
     }
 
     pub(crate) fn next_candidate(&mut self) -> Option<Result<RawQuadCandidate>> {
-        let SourceIterator::Iter(iterator) = &mut self.iterator;
-        let guard = iterator.next()?;
-        let (key, value) = match guard.into_inner() {
-            Ok(entry) => entry,
-            Err(error) => return Some(Err(error.into())),
-        };
-        let quad = match GraphStore::decode_quad_key(key.as_ref()) {
-            Ok(quad) => quad,
-            Err(error) => return Some(Err(error)),
-        };
-        Some(Ok(RawQuadCandidate {
-            quad,
-            live: GraphStore::quad_value_is_live(value.as_ref()),
-        }))
+        match &mut self.source {
+            SourceIterator::Durable { iterator, .. } => {
+                let guard = iterator.next()?;
+                let (key, value) = match guard.into_inner() {
+                    Ok(entry) => entry,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                let quad = match GraphStore::decode_quad_key(key.as_ref()) {
+                    Ok(quad) => quad,
+                    Err(error) => return Some(Err(error)),
+                };
+                Some(Ok(RawQuadCandidate {
+                    quad,
+                    live: GraphStore::quad_value_is_live(value.as_ref()),
+                }))
+            }
+            SourceIterator::PredicateObject {
+                subjects,
+                next,
+                graph,
+                predicate,
+                object,
+            } => {
+                let subject = *subjects.get(*next)?;
+                *next += 1;
+                Some(Ok(RawQuadCandidate {
+                    quad: EncodedQuad {
+                        graph: *graph,
+                        subject,
+                        predicate: *predicate,
+                        object: *object,
+                    },
+                    live: true,
+                }))
+            }
+            SourceIterator::Empty => None,
+        }
     }
 }
 
