@@ -474,6 +474,13 @@ fn context_only_and_specification_only_versions_survive_round_trips() {
     let specification_only_export = source
         .export_rocrate(&AllowAllAuthorizer, &specification_only_graph)
         .unwrap();
+    assert_eq!(
+        canonicalize_jsonld(&specification_only).unwrap().nquads,
+        canonicalize_jsonld(&specification_only_export)
+            .unwrap()
+            .nquads,
+        "retaining specification-only evidence must not synthesize RDF"
+    );
     let specification_only_value: Value = serde_json::from_str(&specification_only_export).unwrap();
     assert_eq!(
         specification_only_value["@context"],

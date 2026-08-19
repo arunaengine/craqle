@@ -415,23 +415,6 @@ impl CrateViolation {
             entity_id: Some(entity_id),
         }
     }
-
-    pub(crate) fn unsupported_version(
-        version: Option<&str>,
-        pointer: impl Into<String>,
-        entity_id: Option<String>,
-    ) -> Self {
-        let message = match version {
-            Some(version) => format!("unsupported RO-Crate version `{version}`"),
-            None => "missing RO-Crate 1.1 or 1.2 version declaration".to_string(),
-        };
-        Self {
-            code: "unsupported_crate_version",
-            message,
-            pointer: pointer.into(),
-            entity_id,
-        }
-    }
 }
 
 fn violation_entity_id(entity_id: &str) -> String {

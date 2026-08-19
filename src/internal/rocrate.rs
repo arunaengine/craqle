@@ -3581,15 +3581,11 @@ fn collect_context_terms(
 }
 
 fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateError> {
-    let resolver = ContextResolverBuilder::default()
-        .with_context(
-            ROCRATE_1_3_CONTEXT_URL,
-            std::str::from_utf8(RoCrateVersion::V1_3.context_bytes())
-                .expect("embedded RO-Crate 1.3 context is UTF-8"),
-        )
-        .map_err(RdfError::from)?;
-    let rdf_graph =
-        rocrate_to_rdf_with_options(rocrate, resolver, ConversionOptions::AllowRelative)?;
+    let rdf_graph = rocrate_to_rdf_with_options(
+        rocrate,
+        ContextResolverBuilder::default(),
+        ConversionOptions::AllowRelative,
+    )?;
 
     let mut triples = BTreeSet::new();
     for triple in rdf_graph {
