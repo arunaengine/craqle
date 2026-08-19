@@ -11,9 +11,25 @@ use crate::store::{Result, StoreError, TermId, hash_term};
 ///
 /// This deliberately belongs to Craqle rather than exposing an evaluator or
 /// storage cancellation primitive through the public API.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct QueryCancellation {
-    cancelled: Arc<AtomicBool>,
+    inner: Arc<QueryCancellationInner>,
+}
+
+struct QueryCancellationInner {
+    cancelled: AtomicBool,
+    evaluator: spareval::CancellationToken,
+}
+
+impl Default for QueryCancellation {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(QueryCancellationInner {
+                cancelled: AtomicBool::new(false),
+                evaluator: spareval::CancellationToken::new(),
+            }),
+        }
+    }
 }
 
 impl QueryCancellation {
@@ -23,12 +39,26 @@ impl QueryCancellation {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.evaluator.cancel();
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn evaluator_token(&self) -> spareval::CancellationToken {
+        self.inner.evaluator.clone()
+    }
+}
+
+impl std::fmt::Debug for QueryCancellation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
     }
 }
 

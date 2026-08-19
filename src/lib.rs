@@ -75,7 +75,9 @@ pub use crate::rocrate::{
     canonicalize_jsonld, validate_rocrate_jsonld,
 };
 pub use crate::search::SearchHit;
-pub use crate::sparql::QueryResults;
+pub use crate::sparql::{
+    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics, QueryResults,
+};
 pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
@@ -121,7 +123,9 @@ pub enum CraqleError {
     #[error("search: {0}")]
     Search(#[from] search::SearchError),
     #[error("sparql: {0}")]
-    Sparql(#[from] sparql::SparqlError),
+    Sparql(sparql::SparqlError),
+    #[error("SPARQL query cancelled")]
+    QueryCancelled,
     #[error("update: {0}")]
     Update(#[from] replication::UpdateError),
     #[error("merge: {0}")]
@@ -136,6 +140,15 @@ pub enum CraqleError {
     SearchWorker(String),
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
+}
+
+impl From<sparql::SparqlError> for CraqleError {
+    fn from(error: sparql::SparqlError) -> Self {
+        match error {
+            sparql::SparqlError::Cancelled => Self::QueryCancelled,
+            error => Self::Sparql(error),
+        }
+    }
 }
 
 impl CraqleError {

@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
 use crate::query_context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
@@ -22,6 +24,8 @@ pub enum SparqlError {
     Parse(String),
     #[error("evaluation error: {0}")]
     Evaluation(String),
+    #[error("SPARQL query cancelled")]
+    Cancelled,
     #[error("unsupported SPARQL feature: {0}")]
     Unsupported(String),
     #[error("invalid RDF term: {0}")]
@@ -39,6 +43,83 @@ pub enum QueryResults {
     Solutions(Vec<HashMap<String, EncodedTerm>>),
     Boolean(bool),
     Graph(Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>),
+}
+
+/// A parsed SPARQL query that can be executed repeatedly.
+///
+/// It contains no store snapshot, graph-visibility decision, or execution
+/// statistics. FTS rewriting and physical planning run against current state
+/// on every execution.
+#[derive(Clone)]
+pub struct PreparedQuery {
+    query: Arc<Query>,
+}
+
+impl fmt::Debug for PreparedQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedQuery")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-execution controls for a prepared SPARQL query.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct QueryExecutionOptions {
+    pub cancellation: QueryCancellation,
+    pub read_mode: QueryReadMode,
+    pub optimize: bool,
+}
+
+impl Default for QueryExecutionOptions {
+    fn default() -> Self {
+        Self {
+            cancellation: QueryCancellation::new(),
+            read_mode: QueryReadMode::Auto,
+            optimize: planner_enabled(),
+        }
+    }
+}
+
+/// Complete query output and diagnostics from the same execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryExecution {
+    pub results: QueryResults,
+    pub statistics: QueryExecutionStatistics,
+}
+
+/// Work and stage timings for one complete query execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryExecutionStatistics {
+    pub parse_time: Duration,
+    pub rewrite_time: Duration,
+    pub planning_time: Duration,
+    pub execution_time: Duration,
+    pub result_collection_time: Duration,
+    pub time_to_first_internal_result: Option<Duration>,
+    pub selected_access_paths: Vec<crate::query_context::ReadAccessPath>,
+    pub plan_fingerprint: String,
+    pub index_seeks: u64,
+    pub qv_admission_checks: u64,
+    pub qv_header_reads: u64,
+    pub qv_counter_reads: u64,
+    pub qv_trusted: bool,
+    pub fallback_reason: Option<String>,
+    pub source_keys_read: u64,
+    pub source_bytes_read: u64,
+    pub qv_keys_read: u64,
+    pub qv_bytes_read: u64,
+    pub candidate_quads: u64,
+    pub matching_quads: u64,
+    pub graphs_considered: u64,
+    pub orphan_checks: u64,
+    pub duplicate_groups: u64,
+    pub duplicate_copies_skipped: u64,
+    pub terms_decoded: u64,
+    pub intermediate_rows: u64,
+    pub result_rows: u64,
+    pub result_cells: u64,
 }
 
 pub(crate) struct SparqlEngine {
@@ -1213,7 +1294,19 @@ fn collect_query_results(results: spareval::QueryResults<'_>) -> Result<QueryRes
 }
 
 fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
-    SparqlError::Evaluation(error.to_string())
+    match error {
+        QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+        QueryEvaluationError::Dataset(error)
+            if error
+                .downcast_ref::<StoreDatasetError>()
+                .is_some_and(|error| {
+                    matches!(error, StoreDatasetError::Store(StoreError::Cancelled))
+                }) =>
+        {
+            SparqlError::Cancelled
+        }
+        error => SparqlError::Evaluation(error.to_string()),
+    }
 }
 
 fn quad_to_insert(quad: &spargebra::term::Quad) -> Result<MaterializedQuadChange> {
