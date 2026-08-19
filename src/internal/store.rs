@@ -5693,6 +5693,97 @@ mod tests {
         dot
     }
 
+    fn commit_remove(
+        store: &GraphStore,
+        graph: &GraphId,
+        quad: EncodedQuad,
+        witnessed: &VectorClock,
+    ) {
+        let _commit_guard = store.graph_commit_guard(graph);
+        let mut batch = store.new_batch();
+        store
+            .remove_quad(&mut batch, QuadRemove { quad, witnessed })
+            .unwrap();
+        store.commit(batch).unwrap();
+    }
+
+    fn query_index_header_for_test(store: &GraphStore) -> QueryIndexHeader {
+        let snapshot = store.db.snapshot();
+        match store.query_index_header_from_snapshot(&snapshot).unwrap() {
+            QueryIndexHeaderRead::Valid(header) => header,
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => {
+                panic!("query-index header must be present and valid")
+            }
+        }
+    }
+
+    fn query_index_counter_for_test(store: &GraphStore, key: QueryIndexCounterKey) -> Option<u64> {
+        let snapshot = store.db.snapshot();
+        snapshot
+            .get(&store.qv1_meta, key.bytes())
+            .unwrap()
+            .map(|value| decode_query_index_u64(value.as_ref()).unwrap())
+    }
+
+    fn assert_query_index_ready(store: &GraphStore, source_rows: u64) {
+        let status = store.query_index_status().unwrap();
+        assert_eq!(status.state, QueryIndexState::Ready);
+        assert_eq!(status.source_live_quads, source_rows);
+        assert_eq!(status.indexed_quads, source_rows);
+        assert!(store.verify_query_indexes(true).unwrap().valid);
+    }
+
+    fn assert_query_index_problem(report: &QueryIndexVerification, problem: &str) {
+        assert!(
+            report.problems.iter().any(|current| current == problem),
+            "expected query-index problem {problem}, got {:?}",
+            report.problems
+        );
+    }
+
+    fn stage_query_index_header_for_test(store: &GraphStore, header: &QueryIndexHeader) {
+        let mut batch = store.buffered_batch();
+        store.stage_query_index_header(&mut batch, header);
+        store.commit_fjall_batch(batch).unwrap();
+    }
+
+    fn stage_query_index_value_for_test(
+        store: &GraphStore,
+        keyspace: &Keyspace,
+        key: impl Into<fjall::UserKey>,
+        value: impl Into<fjall::UserValue>,
+    ) {
+        let mut batch = store.buffered_batch();
+        batch.insert(keyspace, key, value);
+        store.commit_fjall_batch(batch).unwrap();
+    }
+
+    fn remove_query_index_key_for_test(
+        store: &GraphStore,
+        keyspace: &Keyspace,
+        key: impl Into<fjall::UserKey>,
+    ) {
+        let mut batch = store.buffered_batch();
+        batch.remove(keyspace, key);
+        store.commit_fjall_batch(batch).unwrap();
+    }
+
+    fn read_rows_for_test(
+        store: &GraphStore,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Vec<EncodedQuad> {
+        let view = StoreReadView::new(store);
+        let context = ReadContext::default();
+        let mut rows = view
+            .scan(&context, selector, pattern)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        rows.sort_by_key(|quad| (quad.graph, quad.subject, quad.predicate, quad.object));
+        rows
+    }
+
     fn insert_quad(
         store: &GraphStore,
         graph: &GraphId,
@@ -5726,6 +5817,344 @@ mod tests {
         let id = store.encode_term(&term).unwrap();
         assert_eq!(Some(id), store.lookup_term(&term).unwrap());
         assert_eq!(term, store.decode_term(id).unwrap());
+    }
+
+    #[test]
+    fn query_index_fresh_empty_is_ready_and_old_source_without_header_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:old-source");
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            assert_query_index_ready(&store, 0);
+
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, quad);
+            assert_query_index_ready(&store, 1);
+
+            remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+            store.persist().unwrap();
+        }
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        let status = reopened.query_index_status().unwrap();
+        assert_eq!(status.state, QueryIndexState::Missing);
+        assert_eq!(status.source_live_quads, 1);
+        assert_eq!(status.indexed_quads, 1);
+        assert_eq!(
+            reopened
+                .quads_for_pattern(None, None, None, None)
+                .unwrap()
+                .len(),
+            1,
+            "Missing must leave canonical fallback reads available"
+        );
+    }
+
+    #[test]
+    fn qv_reads_fall_back_for_every_spo_binding_shape_when_metadata_is_untrusted() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:fallback-binding-shapes");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(
+            &store,
+            &graph,
+            ("urn:test:s1", "urn:test:p1", "urn:test:o1"),
+        );
+        let second = encode_quad(
+            &store,
+            &graph,
+            ("urn:test:s1", "urn:test:p1", "urn:test:o2"),
+        );
+        let third = encode_quad(
+            &store,
+            &graph,
+            ("urn:test:s2", "urn:test:p2", "urn:test:o1"),
+        );
+        commit_add(&store, &graph, first);
+        commit_add(&store, &graph, second);
+        commit_add(&store, &graph, third);
+        settle_diagnostics(&store, &graph);
+
+        let patterns: Vec<_> = (0..8)
+            .map(|bindings| QuadPattern {
+                subject: (bindings & 1 != 0).then_some(first.subject),
+                predicate: (bindings & 2 != 0).then_some(first.predicate),
+                object: (bindings & 4 != 0).then_some(first.object),
+                ..QuadPattern::default()
+            })
+            .collect();
+        let trusted: Vec<_> = patterns
+            .iter()
+            .copied()
+            .map(|pattern| read_rows_for_test(&store, GraphSelector::Named(first.graph), pattern))
+            .collect();
+        let ready = query_index_header_for_test(&store);
+
+        remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+        for (shape, expected) in patterns.iter().zip(&trusted) {
+            assert_eq!(
+                expected,
+                &read_rows_for_test(&store, GraphSelector::Named(first.graph), *shape),
+                "Missing changed binding shape {shape:?}"
+            );
+        }
+        stage_query_index_header_for_test(&store, &ready);
+
+        let mut building = ready.clone();
+        building.state = StoredQueryIndexState::Building;
+        stage_query_index_header_for_test(&store, &building);
+        for (shape, expected) in patterns.iter().zip(&trusted) {
+            assert_eq!(
+                expected,
+                &read_rows_for_test(&store, GraphSelector::Named(first.graph), *shape),
+                "Building changed binding shape {shape:?}"
+            );
+        }
+        stage_query_index_header_for_test(&store, &ready);
+
+        let mut failed = ready.clone();
+        failed.state = StoredQueryIndexState::Failed("test-failed".to_owned());
+        stage_query_index_header_for_test(&store, &failed);
+        for (shape, expected) in patterns.iter().zip(&trusted) {
+            assert_eq!(
+                expected,
+                &read_rows_for_test(&store, GraphSelector::Named(first.graph), *shape),
+                "Failed changed binding shape {shape:?}"
+            );
+        }
+        stage_query_index_header_for_test(&store, &ready);
+    }
+
+    #[test]
+    fn default_union_untrusted_states_fail_before_scanning_every_spo_binding_shape() {
+        let (_dir, store) = setup_store();
+        let first_graph = GraphId::new("urn:test:qv:default-fallback:first");
+        let second_graph = GraphId::new("urn:test:qv:default-fallback:second");
+        store.create_graph(&first_graph).unwrap();
+        store.create_graph(&second_graph).unwrap();
+        let shared = encode_quad(
+            &store,
+            &first_graph,
+            (
+                "urn:test:shared:s",
+                "urn:test:shared:p",
+                "urn:test:shared:o",
+            ),
+        );
+        let duplicate = encode_quad(
+            &store,
+            &second_graph,
+            (
+                "urn:test:shared:s",
+                "urn:test:shared:p",
+                "urn:test:shared:o",
+            ),
+        );
+        let unique = encode_quad(
+            &store,
+            &first_graph,
+            (
+                "urn:test:unique:s",
+                "urn:test:unique:p",
+                "urn:test:unique:o",
+            ),
+        );
+        commit_add(&store, &first_graph, shared);
+        commit_add(&store, &second_graph, duplicate);
+        commit_add(&store, &first_graph, unique);
+        settle_diagnostics(&store, &first_graph);
+        settle_diagnostics(&store, &second_graph);
+
+        let patterns: Vec<_> = (0..8)
+            .map(|bindings| QuadPattern {
+                subject: (bindings & 1 != 0).then_some(shared.subject),
+                predicate: (bindings & 2 != 0).then_some(shared.predicate),
+                object: (bindings & 4 != 0).then_some(shared.object),
+                ..QuadPattern::default()
+            })
+            .collect();
+        for pattern in &patterns {
+            let view = StoreReadView::new(&store);
+            let context = ReadContext::default();
+            assert!(
+                view.scan(&context, GraphSelector::DefaultUnion, *pattern)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .is_ok()
+            );
+        }
+        let ready = query_index_header_for_test(&store);
+
+        let assert_unavailable = |label: &str| {
+            for pattern in &patterns {
+                let view = StoreReadView::new(&store);
+                let context = ReadContext::default();
+                assert!(
+                    matches!(
+                        view.scan(&context, GraphSelector::DefaultUnion, *pattern),
+                        Err(StoreError::QueryIndexUnavailable(_))
+                    ),
+                    "{label} must reject unbounded default-union fallback for {pattern:?}"
+                );
+                let statistics = context.snapshot();
+                assert_eq!(0, statistics.source_keys_read);
+                assert_eq!(0, statistics.qv_keys_read);
+                assert_eq!(0, statistics.candidate_quads);
+            }
+        };
+
+        remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+        assert_unavailable("Missing");
+        stage_query_index_header_for_test(&store, &ready);
+
+        let mut building = ready.clone();
+        building.state = StoredQueryIndexState::Building;
+        stage_query_index_header_for_test(&store, &building);
+        assert_unavailable("Building");
+        stage_query_index_header_for_test(&store, &ready);
+
+        let mut failed = ready.clone();
+        failed.state = StoredQueryIndexState::Failed("test-failed".to_owned());
+        stage_query_index_header_for_test(&store, &failed);
+        assert_unavailable("Failed");
+        stage_query_index_header_for_test(&store, &ready);
+    }
+
+    #[test]
+    fn qv_malformed_and_stale_headers_fall_back_before_cursor_output() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:fallback-header");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, quad);
+        settle_diagnostics(&store, &graph);
+        let pattern = QuadPattern {
+            predicate: Some(quad.predicate),
+            object: Some(quad.object),
+            ..QuadPattern::default()
+        };
+        let expected = read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern);
+        let ready = query_index_header_for_test(&store);
+
+        stage_query_index_value_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY, [0_u8]);
+        assert_eq!(
+            expected,
+            read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern)
+        );
+        stage_query_index_header_for_test(&store, &ready);
+
+        let mut stale = ready.clone();
+        stale.index_epoch = stale.index_epoch.saturating_add(1);
+        stage_query_index_header_for_test(&store, &stale);
+        assert_eq!(
+            expected,
+            read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern)
+        );
+    }
+
+    #[test]
+    fn selected_qv_row_corruption_is_terminal_without_a_fallback_restart() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:terminal-corruption");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p1", "urn:test:o1"));
+        let second = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p2", "urn:test:o2"));
+        commit_add(&store, &graph, first);
+        commit_add(&store, &graph, second);
+        settle_diagnostics(&store, &graph);
+
+        let (first, corrupt) = if qv1_spog_key(first) < qv1_spog_key(second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        stage_query_index_value_for_test(&store, &store.qv1_spog, qv1_spog_key(corrupt), [1_u8]);
+
+        let view = StoreReadView::with_read_mode(&store, QueryReadMode::ForceQv);
+        let context = ReadContext::default();
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern {
+                    subject: Some(first.subject),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(cursor.next(), Some(Ok(quad)) if quad == first));
+        assert!(matches!(
+            cursor.next(),
+            Some(Err(StoreError::InvalidEncoding { .. }))
+        ));
+        assert!(
+            cursor.next().is_none(),
+            "a qv error must finish this cursor"
+        );
+    }
+
+    #[test]
+    fn query_index_insert_and_delete_survive_restart_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:restart");
+        let (quad, dot) = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            let dot = commit_add(&store, &graph, quad);
+            assert_query_index_ready(&store, 1);
+            store.persist().unwrap();
+            (quad, dot)
+        };
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            assert_query_index_ready(&store, 1);
+            let mut witnessed = VectorClock::new();
+            witnessed.advance(dot.actor, dot.counter);
+            commit_remove(&store, &graph, quad, &witnessed);
+            assert_query_index_ready(&store, 0);
+            store.persist().unwrap();
+        }
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_query_index_ready(&reopened, 0);
+    }
+
+    #[test]
+    fn query_index_coalesces_live_dot_transitions_and_last_dot_removal() {
+        let (_dir, store) = setup_store();
+        let store = Arc::new(store);
+        let graph = GraphId::new("urn:test:qv:dots");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+
+        let first = {
+            let store = store.clone();
+            let graph = graph.clone();
+            std::thread::spawn(move || commit_add(&store, &graph, quad))
+        };
+        let second = {
+            let store = store.clone();
+            let graph = graph.clone();
+            std::thread::spawn(move || commit_add(&store, &graph, quad))
+        };
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_query_index_ready(&store, 1);
+
+        let mut first_only = VectorClock::new();
+        first_only.advance(first.actor, first.counter);
+        commit_remove(&store, &graph, quad, &first_only);
+        assert_query_index_ready(&store, 1);
+
+        let mut all_dots = VectorClock::new();
+        all_dots.advance(first.actor, first.counter);
+        all_dots.advance(second.actor, second.counter);
+        commit_remove(&store, &graph, quad, &all_dots);
+        assert_query_index_ready(&store, 0);
+    }
     }
 
     #[test]
