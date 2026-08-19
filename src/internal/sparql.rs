@@ -1389,6 +1389,11 @@ mod tests {
         store.commit(batch).unwrap();
     }
 
+    fn settle_diagnostics(store: &GraphStore, graph: &GraphId) {
+        let diagnostics = store.graph_diagnostics(graph).unwrap();
+        store.set_graph_diagnostics(graph, &diagnostics).unwrap();
+    }
+
     fn solution_rows(results: QueryResults) -> Vec<HashMap<String, EncodedTerm>> {
         match results {
             QueryResults::Solutions(rows) => rows,
@@ -1411,6 +1416,7 @@ mod tests {
                 ))),
             );
         }
+        settle_diagnostics(&store, &graph);
 
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
@@ -1439,6 +1445,53 @@ mod tests {
     }
 
     #[test]
+    fn same_binary_read_modes_preserve_complete_named_query_results() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:read-mode");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:read-mode:s",
+            "urn:test:read-mode:p",
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:read-mode:o")),
+        );
+        settle_diagnostics(&store, &graph);
+        let query = format!(
+            "SELECT ?s WHERE {{ GRAPH <{}> {{ ?s <urn:test:read-mode:p> ?o }} }}",
+            graph.as_str()
+        );
+
+        let (auto_results, auto) = engine
+            .query_with_graphs_read_mode(&query, std::slice::from_ref(&graph), QueryReadMode::Auto)
+            .unwrap();
+        let (source_results, source) = engine
+            .query_with_graphs_read_mode(
+                &query,
+                std::slice::from_ref(&graph),
+                QueryReadMode::ForceSource,
+            )
+            .unwrap();
+        let (qv_results, qv) = engine
+            .query_with_graphs_read_mode(
+                &query,
+                std::slice::from_ref(&graph),
+                QueryReadMode::ForceQv,
+            )
+            .unwrap();
+
+        assert_eq!(auto_results, source_results);
+        assert_eq!(auto_results, qv_results);
+        assert_eq!(vec![ReadAccessPath::QvGpos], auto.selected_access_paths);
+        assert_eq!(
+            vec![ReadAccessPath::SourceGspo],
+            source.selected_access_paths
+        );
+        assert_eq!(vec![ReadAccessPath::QvGpos], qv.selected_access_paths);
+        assert_eq!(1, source.source_keys_read);
+        assert_eq!(1, qv.qv_keys_read);
+    }
+
+    #[test]
     fn named_dataset_cursor_is_lazy_and_matches_the_compatibility_collector() {
         let (_dir, store, _search, _engine) = setup_engine();
         let graph = GraphId::new("urn:test:dataset:named");
@@ -1460,6 +1513,7 @@ mod tests {
             "urn:test:dataset:named:other-p",
             EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("other"))),
         );
+        settle_diagnostics(&store, &graph);
 
         let graph_id = store
             .lookup_term(&EncodedTerm::from_named_node(&graph.0))
@@ -1486,7 +1540,9 @@ mod tests {
             .unwrap();
         let term_id = |term: Option<&StoreTerm>| match term {
             Some(StoreTerm::Existing(id)) => Some(*id),
-            Some(StoreTerm::Missing(_)) => panic!("fixture term should be interned"),
+            Some(StoreTerm::Missing(_) | StoreTerm::DefaultUnion) => {
+                panic!("fixture term should be interned")
+            }
             None => None,
         };
 
@@ -1615,7 +1671,7 @@ mod tests {
         assert!(calls.values().all(|&count| count == 1), "{calls:?}");
         assert_eq!(statistics.graphs_considered, 2);
         assert_eq!(statistics.matching_quads, 1);
-        assert_eq!(statistics.candidate_quads, 2);
+        assert_eq!(statistics.candidate_quads, 3);
     }
 
     #[test]
@@ -1639,7 +1695,7 @@ mod tests {
                 .query("SELECT ?s WHERE { ?s <urn:test:dataset:copy:p> \"same\" }")
                 .unwrap(),
         );
-        assert_eq!(public_rows.len(), 2);
+        assert_eq!(public_rows.len(), 1);
 
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
@@ -1665,6 +1721,74 @@ mod tests {
             .unwrap();
         assert_eq!(direct_default.len(), 1);
         assert!(direct_default.iter().all(|quad| quad.graph_name.is_none()));
+
+        let mixed_rows = solution_rows(
+            engine
+                .query(
+                    "SELECT ?s ?g WHERE { \
+                     ?s <urn:test:dataset:copy:p> \"same\" . \
+                     GRAPH ?g { ?s <urn:test:dataset:copy:p> \"same\" } \
+                     }",
+                )
+                .unwrap(),
+        );
+        assert_eq!(2, mixed_rows.len());
+        assert!(mixed_rows.iter().all(|row| {
+            matches!(
+                row.get("g").and_then(EncodedTerm::to_term),
+                Some(Term::NamedNode(ref graph))
+                    if graph == &graph1.0 || graph == &graph2.0
+            )
+        }));
+    }
+
+    #[test]
+    fn default_union_marker_is_claimed_once_but_never_becomes_a_named_graph() {
+        let (_dir, store, _search, _engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dataset:marker");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:dataset:marker:s",
+            "urn:test:dataset:marker:p",
+            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("marker"))),
+        );
+        let marker = BlankNode::default();
+        let marker_id = store
+            .encode_term(&EncodedTerm::from_term(&Term::BlankNode(marker.clone())))
+            .unwrap();
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let dataset = StoreDataset::with_default_union_marker(&view, &context, marker.clone());
+
+        assert!(matches!(
+            dataset
+                .internalize_term(Term::BlankNode(marker.clone()))
+                .unwrap(),
+            StoreTerm::DefaultUnion
+        ));
+        let stored_marker = dataset
+            .internalize_term(Term::BlankNode(marker.clone()))
+            .unwrap();
+        assert!(matches!(stored_marker, StoreTerm::Existing(id) if id == marker_id));
+        assert_eq!(
+            Term::BlankNode(marker.clone()),
+            dataset.externalize_term(StoreTerm::DefaultUnion).unwrap()
+        );
+        assert_eq!(
+            Term::BlankNode(marker),
+            dataset.externalize_term(stored_marker).unwrap()
+        );
+        assert!(
+            !dataset
+                .contains_internal_graph_name(&StoreTerm::DefaultUnion)
+                .unwrap()
+        );
+        assert!(
+            dataset
+                .internal_named_graphs()
+                .all(|graph| matches!(graph.unwrap(), StoreTerm::Existing(_)))
+        );
     }
 
     #[test]
@@ -1682,6 +1806,7 @@ mod tests {
                 ))),
             );
         }
+        settle_diagnostics(&store, &graph);
 
         assert_eq!(
             engine
@@ -1714,10 +1839,17 @@ mod tests {
         let context = ReadContext::default();
         let evaluator = QueryEvaluator::new();
         let mut prepared = evaluator.prepare(&ask);
-        prepared.dataset_mut().set_default_graph_as_union();
+        let default_union_marker = BlankNode::default();
+        prepared
+            .dataset_mut()
+            .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
         assert!(matches!(
             prepared
-                .execute(StoreDataset::new(&view, &context))
+                .execute(StoreDataset::with_default_union_marker(
+                    &view,
+                    &context,
+                    default_union_marker,
+                ))
                 .unwrap(),
             spareval::QueryResults::Boolean(true)
         ));
@@ -1734,10 +1866,17 @@ mod tests {
         let context = ReadContext::default();
         let evaluator = QueryEvaluator::new();
         let mut prepared = evaluator.prepare(&limit);
-        prepared.dataset_mut().set_default_graph_as_union();
+        let default_union_marker = BlankNode::default();
+        prepared
+            .dataset_mut()
+            .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
         let rows = collect_query_results(
             prepared
-                .execute(StoreDataset::new(&view, &context))
+                .execute(StoreDataset::with_default_union_marker(
+                    &view,
+                    &context,
+                    default_union_marker,
+                ))
                 .unwrap(),
         )
         .unwrap();
@@ -1828,6 +1967,122 @@ mod tests {
                 .unwrap(),
         );
         assert!(empty_rows.is_empty());
+    }
+
+    #[test]
+    fn explicit_graph_list_boundary_keeps_default_union_and_named_copy_semantics() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let mut graphs = Vec::new();
+        for index in 0..=EXPLICIT_DATASET_GRAPH_LIMIT {
+            let graph_name = format!("urn:test:dataset-boundary:{index:02}");
+            let graph = GraphId::new(&graph_name);
+            insert_quad(
+                &store,
+                &graph,
+                "urn:test:dataset-boundary:s",
+                "urn:test:dataset-boundary:p",
+                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("same"))),
+            );
+            graphs.push(graph);
+        }
+
+        for count in [
+            1,
+            2,
+            EXPLICIT_DATASET_GRAPH_LIMIT,
+            EXPLICIT_DATASET_GRAPH_LIMIT + 1,
+        ] {
+            let selected = &graphs[..count];
+            assert_eq!(
+                1,
+                solution_rows(
+                    engine
+                        .query_with_graphs(
+                            "SELECT ?s WHERE { ?s <urn:test:dataset-boundary:p> \"same\" }",
+                            selected,
+                        )
+                        .unwrap(),
+                )
+                .len(),
+                "default union must remain distinct for {count} graphs"
+            );
+            assert_eq!(
+                count,
+                solution_rows(
+                    engine
+                        .query_with_graphs(
+                            "SELECT ?g WHERE { GRAPH ?g { \
+                             ?s <urn:test:dataset-boundary:p> \"same\" } }",
+                            selected,
+                        )
+                        .unwrap(),
+                )
+                .len(),
+                "named graph copies must remain multiplicative for {count} graphs"
+            );
+        }
+    }
+
+    #[test]
+    fn default_union_marker_reaches_paths_describe_construct_and_update_where() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let first_graph = GraphId::new("urn:test:marker-seam:first");
+        let second_graph = GraphId::new("urn:test:marker-seam:second");
+        for graph in [&first_graph, &second_graph] {
+            insert_quad(
+                &store,
+                graph,
+                "urn:test:marker-seam:s",
+                "urn:test:marker-seam:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:marker-seam:m")),
+            );
+            insert_quad(
+                &store,
+                graph,
+                "urn:test:marker-seam:m",
+                "urn:test:marker-seam:q",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:marker-seam:o")),
+            );
+        }
+
+        assert_eq!(
+            1,
+            solution_rows(
+                engine
+                    .query(
+                        "SELECT ?o WHERE { \
+                         <urn:test:marker-seam:s> \
+                         <urn:test:marker-seam:p>/<urn:test:marker-seam:q> ?o }",
+                    )
+                    .unwrap(),
+            )
+            .len()
+        );
+        assert!(matches!(
+            engine.query("DESCRIBE <urn:test:marker-seam:s>").unwrap(),
+            QueryResults::Graph(ref triples) if triples.len() == 1
+        ));
+        assert!(matches!(
+            engine
+                .query(
+                    "CONSTRUCT { ?s ?p ?o } WHERE { \
+                     ?s ?p ?o FILTER(?s = <urn:test:marker-seam:s> || \
+                     ?s = <urn:test:marker-seam:m>) }",
+                )
+                .unwrap(),
+            QueryResults::Graph(ref triples) if triples.len() == 2
+        ));
+
+        let changes = engine
+            .evaluate_update(
+                "DELETE { GRAPH <urn:test:marker-seam:first> { \
+                 ?s <urn:test:marker-seam:p> ?o } } \
+                 INSERT { GRAPH <urn:test:marker-seam:first> { \
+                 ?s <urn:test:marker-seam:updated> ?o } } \
+                 WHERE { ?s <urn:test:marker-seam:p> ?o }",
+            )
+            .unwrap();
+        assert_eq!(2, changes.len());
     }
 
     #[test]

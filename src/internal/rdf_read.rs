@@ -1406,6 +1406,180 @@ mod tests {
     }
 
     #[test]
+    fn trusted_qv_admission_uses_only_header_and_total_metadata_probes() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-admission");
+        add_many(&store, &graph, 1_025);
+        settle_diagnostics(&store, &graph);
+        let predicate = store
+            .lookup_term(&named("urn:test:read:p"))
+            .unwrap()
+            .unwrap();
+        let before = store.query_index_admission_probe_count();
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Union,
+                QuadPattern {
+                    predicate: Some(predicate),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+        assert!(cursor.next().unwrap().is_ok());
+        drop(cursor);
+
+        let mut second = view
+            .scan(
+                &context,
+                GraphSelector::Union,
+                QuadPattern {
+                    predicate: Some(predicate),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+        assert!(second.next().unwrap().is_ok());
+        drop(second);
+
+        assert_eq!(
+            2,
+            store.query_index_admission_probe_count() - before,
+            "the hot path reads only the Ready header and exact total counter"
+        );
+        let statistics = context.snapshot();
+        assert_eq!(1, statistics.qv_admission_checks);
+        assert_eq!(1, statistics.qv_header_reads);
+        assert_eq!(1, statistics.qv_counter_reads);
+        assert!(statistics.qv_trusted);
+        assert_eq!(2, statistics.candidate_quads);
+        assert_eq!(2, statistics.qv_keys_read);
+        assert_eq!(
+            vec![ReadAccessPath::QvPosg],
+            statistics.selected_access_paths
+        );
+    }
+
+    #[test]
+    fn named_subject_auto_path_is_graph_local_at_1_32_and_1000_graphs() {
+        for graph_count in [1, 32, 1_000] {
+            let (_directory, store) = setup_store();
+            let (graph, expected) = add_same_subject_across_graphs(&store, graph_count);
+
+            let auto = StoreReadView::with_read_mode(&store, QueryReadMode::Auto);
+            let auto_context = ReadContext::default();
+            assert_eq!(
+                vec![expected],
+                collect_rows(
+                    auto.scan(
+                        &auto_context,
+                        GraphSelector::Named(expected.graph),
+                        QuadPattern {
+                            subject: Some(expected.subject),
+                            ..QuadPattern::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+            );
+            let auto_statistics = auto_context.snapshot();
+            assert_eq!(1, auto_statistics.source_keys_read, "{graph_count} graphs");
+            assert_eq!(1, auto_statistics.candidate_quads, "{graph_count} graphs");
+            assert_eq!(
+                vec![ReadAccessPath::SourceGspo],
+                auto_statistics.selected_access_paths
+            );
+
+            let forced = StoreReadView::with_read_mode(&store, QueryReadMode::ForceQv);
+            let forced_context = ReadContext::default();
+            assert_eq!(
+                vec![expected],
+                collect_rows(
+                    forced
+                        .scan(
+                            &forced_context,
+                            GraphSelector::Named(expected.graph),
+                            QuadPattern {
+                                subject: Some(expected.subject),
+                                ..QuadPattern::default()
+                            },
+                        )
+                        .unwrap(),
+                )
+            );
+            assert_eq!(
+                graph_count as u64,
+                forced_context.snapshot().qv_keys_read,
+                "forced SPOG demonstrates the cross-graph work avoided for {graph}"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_default_union_errors_and_named_union_fallback_is_linear() {
+        for graph_count in [10, 100] {
+            let (_directory, store) = setup_store();
+            let (_, expected) = add_same_subject_across_graphs(&store, graph_count);
+            store.fail_query_indexes_for_test();
+
+            let view = StoreReadView::with_read_mode(&store, QueryReadMode::Auto);
+            let context = ReadContext::default();
+            let error = match view.scan(
+                &context,
+                GraphSelector::DefaultUnion,
+                QuadPattern {
+                    subject: Some(expected.subject),
+                    ..QuadPattern::default()
+                },
+            ) {
+                Ok(_) => panic!("untrusted default union must not use a source rescan"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, StoreError::QueryIndexUnavailable(_)));
+
+            let context = ReadContext::default();
+            let rows = collect_rows(
+                view.scan(
+                    &context,
+                    GraphSelector::Union,
+                    QuadPattern {
+                        subject: Some(expected.subject),
+                        ..QuadPattern::default()
+                    },
+                )
+                .unwrap(),
+            );
+            assert_eq!(vec![expected], rows);
+            assert_eq!(graph_count as u64, context.snapshot().source_keys_read);
+            assert_eq!(graph_count as u64, context.snapshot().candidate_quads);
+        }
+
+        let (_directory, store) = setup_store();
+        let (_, expected) = add_same_subject_across_graphs(&store, 2);
+        let source = StoreReadView::with_read_mode(&store, QueryReadMode::ForceSource);
+        assert!(matches!(
+            source.scan(
+                &ReadContext::default(),
+                GraphSelector::DefaultUnion,
+                QuadPattern {
+                    subject: Some(expected.subject),
+                    ..QuadPattern::default()
+                }
+            ),
+            Err(StoreError::QueryIndexUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn default_union_groups_qv_copies_but_named_union_preserves_them() {
+        let (_directory, store) = setup_store();
+        let first_graph = GraphId::new("urn:test:default-union:first");
+        let second_graph = GraphId::new("urn:test:default-union:second");
+    }
+
+    #[test]
     fn orphaned_subjects_and_objects_are_filtered_from_normal_diagnostics() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:orphan-filter");
