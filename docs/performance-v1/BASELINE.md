@@ -2,7 +2,7 @@
 
 This is the pre-PR0 smoke baseline for the `perf-v1-rocrate13-shacl`
 integration branch. It is evidence for repeatable comparisons, not a release
-claim. The measurements below were supplied from the same host and should be
+claim. The measurements below were captured on the same host and should be
 repeated after the deterministic corpus and instrumentation land.
 
 ## Provenance and current state
@@ -66,24 +66,24 @@ cargo test --locked --test perf_query_matrix \
 
 Its fixture load was `843.406222ms`; the p50 query timings were:
 
-| Shape | Optimizer off | Optimizer on |
-| --- | ---: | ---: |
-| S01 ASK | 448.981us | 410.329us |
-| S02 LIMIT25 | 1.136872ms | 1.192234ms |
-| S03 selective-last BGP | 14.886215ms | 564.408us |
-| S04 selective-first | 489.377us | 628.408us |
-| S05 OPTIONAL | 1.716838ms | 1.861569ms |
-| S06 filter-eq | 21.038196ms | 601.107us |
-| S07 UNION | 1.983318ms | 2.044552ms |
-| S08 graph-var | 1.38685ms | 1.265132ms |
-| S09 EXISTS | 35.60399ms | 2.091771ms |
-| S10 NOT EXISTS | 34.00379ms | 2.081753ms |
-| S11 chain | 5.904979ms | 5.191221ms |
-| S12 anchored worst-order | 15.046225ms | 771.817us |
-| S13 DISTINCT | 1.084463ms | 1.145778ms |
-| S14 order selective | 656.601us | 727.363us |
-| S15 order corpus | 78.35113ms | 79.259824ms |
-| S16 contains | 20.783258ms | 20.334638ms |
+| Shape | Optimizer off | Optimizer on | Rows |
+| --- | ---: | ---: | ---: |
+| S01 ASK | 448.981us | 410.329us | 1 |
+| S02 LIMIT25 | 1.136872ms | 1.192234ms | 25 |
+| S03 selective-last BGP | 14.886215ms | 564.408us | 1 |
+| S04 selective-first | 489.377us | 628.408us | 1 |
+| S05 OPTIONAL | 1.716838ms | 1.861569ms | 25 |
+| S06 filter-eq | 21.038196ms | 601.107us | 1 |
+| S07 UNION | 1.983318ms | 2.044552ms | 50 |
+| S08 graph-var | 1.38685ms | 1.265132ms | 25 |
+| S09 EXISTS | 35.60399ms | 2.091771ms | 25 |
+| S10 NOT EXISTS | 34.00379ms | 2.081753ms | 25 |
+| S11 chain | 5.904979ms | 5.191221ms | 100 |
+| S12 anchored worst-order | 15.046225ms | 771.817us | 1 |
+| S13 DISTINCT | 1.084463ms | 1.145778ms | 25 |
+| S14 order selective | 656.601us | 727.363us | 1 |
+| S15 order corpus | 78.35113ms | 79.259824ms | 10 |
+| S16 contains | 20.783258ms | 20.334638ms | 2 |
 
 The supplied release smoke also passed:
 
@@ -97,24 +97,24 @@ cargo test --release --locked --test perf_query_matrix \
 It loaded 2,000 graphs / 1,960 live graphs in `204.107551ms`. The p50 query
 timings were:
 
-| Shape | Optimizer off | Optimizer on |
-| --- | ---: | ---: |
-| ASK | 25.628us | 23.424us |
-| LIMIT25 | 126.536us | 129.642us |
-| selective-last BGP | 4.982801ms | 34.224us |
-| selective-first | 27.732us | 33.632us |
-| property-ish OPTIONAL | 242.152us | 223.297us |
-| filter-eq | 5.390092ms | 27.522us |
-| UNION50 | 237.934us | 241.861us |
-| graph-var25 | 148.156us | 139.150us |
-| EXISTS | 7.852528ms | 269.213us |
-| NOT EXISTS | 10.268138ms | 317.132us |
-| chain100 | 884.231us | 769.997us |
-| anchored worst order | 5.298771ms | 65.462us |
-| DISTINCT25 | 120.835us | 126.045us |
-| ordered selective | 42.249us | 48.140us |
-| ordered corpus | 18.851651ms | 18.278481ms |
-| contains scan | 6.547322ms | 7.125381ms |
+| Shape | Optimizer off | Optimizer on | Rows |
+| --- | ---: | ---: | ---: |
+| ASK | 25.628us | 23.424us | 1 |
+| LIMIT25 | 126.536us | 129.642us | 25 |
+| selective-last BGP | 4.982801ms | 34.224us | 1 |
+| selective-first | 27.732us | 33.632us | 1 |
+| property-ish OPTIONAL | 242.152us | 223.297us | 25 |
+| filter-eq | 5.390092ms | 27.522us | 1 |
+| UNION50 | 237.934us | 241.861us | 50 |
+| graph-var25 | 148.156us | 139.150us | 25 |
+| EXISTS | 7.852528ms | 269.213us | 25 |
+| NOT EXISTS | 10.268138ms | 317.132us | 25 |
+| chain100 | 884.231us | 769.997us | 100 |
+| anchored worst order | 5.298771ms | 65.462us | 1 |
+| DISTINCT25 | 120.835us | 126.045us | 25 |
+| ordered selective | 42.249us | 48.140us | 1 |
+| ordered corpus | 18.851651ms | 18.278481ms | 10 |
+| contains scan | 6.547322ms | 7.125381ms | 2 |
 
 These are debug and small release smoke runs over the existing matrix, not the
 final deterministic corpus and not an SLO or release-performance claim.
@@ -130,11 +130,11 @@ listed only where the supplied run recorded it.
 | First row / violation | — | Pending instrumentation |
 | Candidate quads | — | Pending instrumentation |
 | Matching quads | — | Pending instrumentation |
-| Seeks | — | Pending instrumentation |
-| Graphs | Debug configured `1,000`; release `2,000` (`1,960` live supplied for release) | Partial; final corpus pending |
-| Decodes | — | Pending instrumentation |
-| Emitted rows | — | Pending instrumentation |
-| Shape/focus pairs | Existing S01–S16 labels only | Pending deterministic-corpus attribution |
+| Index seeks | — | Pending instrumentation |
+| Graphs considered | — | Pending instrumentation; configured corpus graph counts are not a read-work counter |
+| Terms decoded | — | Pending instrumentation |
+| Rows emitted | Per-case counts in both timing tables | Captured |
+| Shape/focus pairs | — | Pending SHACL instrumentation |
 | Path edges | — | Pending instrumentation |
 | Allocated bytes | — | Pending instrumentation |
 | Peak RSS | — | Pending instrumentation |
