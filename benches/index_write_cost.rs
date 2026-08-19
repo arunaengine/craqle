@@ -15,8 +15,9 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use craqle::{
-    ActorId, Batch, CraqleNode, CraqleOptions, CreateCrateRequest, EncodedTerm, GrantAuthorizer,
-    GraphId, GraphPolicy, MaterializedQuadChange, PermissionGrant, PermissionLevel, SearchStorage,
+    ActorId, Batch, CraqleFjallPersistMode, CraqleNode, CraqleOptions, CreateCrateRequest,
+    EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy, MaterializedQuadChange, PermissionGrant,
+    PermissionLevel, SearchStorage,
 };
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -120,6 +121,7 @@ fn node_options(actor_byte: u8) -> CraqleOptions {
     CraqleOptions::new()
         .with_actor(ActorId::from_bytes([actor_byte; 32]))
         .with_search_storage(SearchStorage::Memory)
+        .with_graph_store_persist_mode(CraqleFjallPersistMode::Buffer)
 }
 
 struct LocalFixture {
@@ -136,6 +138,8 @@ fn local_fixture(changes: Vec<MaterializedQuadChange>) -> LocalFixture {
         .expect("open local write benchmark node");
     let graph = GraphId::new(LOCAL_GRAPH);
     assert_eq!(node.graph_snapshot(&graph).unwrap().quads.len(), 0);
+    node.flush_search_updates()
+        .expect("settle local fixture search work");
     LocalFixture {
         node: Arc::new(node),
         database,
@@ -191,6 +195,8 @@ fn concurrent_fixture(triples: &[Triple]) -> ConcurrentFixture {
             )
         })
         .collect();
+    node.flush_search_updates()
+        .expect("settle concurrent fixture search work");
     ConcurrentFixture {
         node,
         database,
@@ -272,10 +278,12 @@ fn merge_fixture(_triples: &[Triple]) -> MergeFixture {
             )],
         )
         .expect("stage one remote merge row");
-    cluster
-        .peer(0)
-        .flush_search_updates()
-        .expect("settle merge benchmark setup");
+    for peer in 0..cluster.peer_count() {
+        cluster
+            .peer(peer)
+            .flush_search_updates()
+            .expect("settle merge peer setup");
+    }
     assert_row_count(cluster.peer(0), &graph, expected_before + 1);
     assert_row_count(cluster.peer(1), &graph, expected_before);
     MergeFixture {
@@ -305,6 +313,12 @@ fn apply_local_fixture(mut fixture: LocalFixture, bulk: bool) -> (LocalFixture, 
             .apply_changes_unchecked(&fixture.graph, changes)
     }
     .expect("apply local write benchmark changes");
+    if bulk {
+        fixture
+            .node
+            .rebuild_graph_diagnostics(&fixture.graph)
+            .expect("rebuild bulk local write diagnostics");
+    }
     (fixture, result)
 }
 
@@ -333,6 +347,8 @@ fn apply_concurrent_fixture(fixture: ConcurrentFixture) -> (ConcurrentFixture, V
             .map(|handle| handle.join().expect("join concurrent local write"))
             .collect()
     });
+    node.rebuild_graph_diagnostics(&graph)
+        .expect("rebuild concurrent local write diagnostics");
     (
         ConcurrentFixture {
             node,
@@ -393,12 +409,19 @@ fn assert_local_contract(
     }
     .expect("apply untimed local write contract");
     black_box(result);
+    if bulk {
+        node.rebuild_graph_diagnostics(&graph)
+            .expect("rebuild untimed bulk diagnostics");
+    }
     assert_row_count(&node, &graph, expected_rows);
     let bytes = settle_and_size(&node, &database);
     println!(
         "index_write_cost case={label} corpus_version={CORPUS_VERSION} seed={DEFAULT_SEED:#x} \
-         rows={expected_rows} db_bytes={bytes} search_storage=memory"
+         rows={expected_rows} db_bytes={bytes} persistence=buffer \
+         write_path=raw_unchecked_changes search_storage=memory"
     );
+    drop(node);
+    drop(database);
     bytes
 }
 
@@ -419,8 +442,11 @@ fn assert_delete_contract(triples: &[Triple]) -> u64 {
     let bytes = settle_and_size(&node, &database);
     println!(
         "index_write_cost case=single_delete corpus_version={CORPUS_VERSION} seed={DEFAULT_SEED:#x} \
-         rows=0 db_bytes={bytes} setup_live_rows=1 search_storage=memory"
+         rows=0 db_bytes={bytes} setup_live_rows=1 persistence=buffer \
+         write_path=raw_unchecked_changes search_storage=memory"
     );
+    drop(node);
+    drop(database);
     bytes
 }
 
@@ -446,13 +472,18 @@ fn assert_concurrent_contract(triples: &[Triple]) -> u64 {
             });
         }
     });
+    node.rebuild_graph_diagnostics(&graph)
+        .expect("rebuild untimed concurrent diagnostics");
     assert_row_count(&node, &graph, expected_rows);
     let bytes = settle_and_size(&node, &database);
     println!(
         "index_write_cost case=concurrent_local_writes corpus_version={CORPUS_VERSION} \
          seed={DEFAULT_SEED:#x} rows={expected_rows} writers={CONCURRENT_WRITERS} \
-         rows_per_writer={CONCURRENT_ROWS_PER_WRITER} db_bytes={bytes} search_storage=memory"
+         rows_per_writer={CONCURRENT_ROWS_PER_WRITER} db_bytes={bytes} persistence=buffer \
+         write_path=raw_unchecked_changes search_storage=memory"
     );
+    drop(node);
+    drop(database);
     bytes
 }
 
@@ -483,8 +514,10 @@ fn assert_merge_contract(triples: &[Triple]) -> u64 {
     println!(
         "index_write_cost case=replicated_merge corpus_version={CORPUS_VERSION} \
          seed={DEFAULT_SEED:#x} rows_added=1 db_bytes={bytes} peers=2 \
-         path=CraqleCluster::sync_pair"
+         persistence=buffer path=CraqleCluster::sync_pair search_storage=memory"
     );
+    drop(cluster);
+    drop(database);
     bytes
 }
 
@@ -500,13 +533,35 @@ fn env_duration(name: &str, default_seconds: u64) -> Duration {
     }
 }
 
+fn env_sample_size() -> usize {
+    match env::var("CRAQLE_BENCH_SAMPLE_SIZE") {
+        Ok(value) => {
+            let sample_size = value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("CRAQLE_BENCH_SAMPLE_SIZE must be an integer"));
+            assert!(
+                sample_size >= 10,
+                "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
+            );
+            sample_size
+        }
+        Err(env::VarError::NotPresent) => 10,
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("CRAQLE_BENCH_SAMPLE_SIZE must be valid UTF-8")
+        }
+    }
+}
+
 fn index_write_cost_benchmarks(c: &mut Criterion) {
     let triples = write_corpus();
+    let sample_size = env_sample_size();
     println!(
         "index_write_cost metadata: corpus_version={CORPUS_VERSION} seed={DEFAULT_SEED:#x} \
          rows={} local_cases=single_insert,single_delete,batch_100,batch_10000,\
          concurrent_local_writes replicated_case=replicated_merge \
-         setup=iter_batched_per_iteration search_storage=memory",
+         setup=iter_batched_per_iteration persistence=buffer \
+         local_write_path=raw_unchecked_changes replicated_path=CraqleCluster::sync_pair \
+         search_storage=memory sample_size={sample_size}",
         triples.len()
     );
 
@@ -550,7 +605,7 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
     assert_merge_contract(&triples);
 
     let mut group = c.benchmark_group("index_write_cost");
-    group.sample_size(10);
+    group.sample_size(sample_size);
     group.warm_up_time(env_duration("CRAQLE_BENCH_WARMUP_SECS", 1));
     group.measurement_time(env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5));
 
