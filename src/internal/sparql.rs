@@ -1098,10 +1098,8 @@ where
                         Err(error) => Some(Err(error.into())),
                     },
                     Err(error) => Some(Err(error.into())),
-                },
-                Err(error) => Some(Err(error.into())),
-            },
-        ))
+                }),
+        )
     }
 
     /// Graph existence for `GRAPH <g> { ... }` (charter G9).
@@ -1116,10 +1114,11 @@ where
         graph_name: &Self::InternalTerm,
     ) -> std::result::Result<bool, Self::Error> {
         let StoreTerm::Existing(graph) = graph_name else {
-            // The IRI is not even interned, so no graph was ever created for it.
+            // The marker is never a named graph, and a missing term was never
+            // a graph in this execution snapshot.
             return Ok(false);
         };
-        Ok(self.view.store().contains_graph_by_id(*graph)?
+        Ok(self.view.contains_graph_by_id(*graph)?
             && self.view.graph_is_visible(self.context, *graph)?)
     }
 
