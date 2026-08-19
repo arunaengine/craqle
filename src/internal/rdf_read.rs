@@ -336,7 +336,9 @@ impl RdfReadView for StoreReadView<'_> {
 
     fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
         context.check_cancelled()?;
-        graph_is_visible(self.store, context, graph)
+        let visible = graph_is_visible(self.store, context, graph)?;
+        context.check_cancelled()?;
+        Ok(visible)
     }
 
     fn quad_is_visible(&self, context: &ReadContext<'_>, quad: EncodedQuad) -> Result<bool> {
@@ -413,7 +415,9 @@ pub(crate) fn quad_is_visible(
     context: &ReadContext<'_>,
     quad: EncodedQuad,
 ) -> Result<bool> {
-    if !graph_is_visible(store, context, quad.graph)? {
+    let visible = graph_is_visible(store, context, quad.graph)?;
+    context.check_cancelled()?;
+    if !visible {
         return Ok(false);
     }
     if context.validation_graph().is_some() {
@@ -793,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_before_a_scan_and_at_the_periodic_union_boundary() {
+    fn cancellation_stops_before_a_scan_and_after_1024_union_candidates() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:cancellation");
         let graph_id = add_many(&store, &graph, 1_025);
@@ -821,21 +825,22 @@ mod tests {
             false
         };
         let context = ReadContext::with_graph_visibility(cancellation.clone(), &visibility);
-        let first_subject = (0..1_025)
+        let mut subjects: Vec<_> = (0..1_025)
             .map(|index| {
                 store
                     .lookup_term(&named(&format!("urn:test:read:s{index}")))
                     .unwrap()
                     .unwrap()
             })
-            .min()
-            .unwrap();
+            .collect();
+        subjects.sort_unstable();
+        let late_subject = subjects[1_023];
         let mut cursor = view
             .scan(
                 &context,
                 GraphSelector::Union,
                 QuadPattern {
-                    subject: Some(first_subject),
+                    subject: Some(late_subject),
                     ..QuadPattern::default()
                 },
             )
@@ -916,6 +921,105 @@ mod tests {
         assert_eq!(1, statistics.graphs_considered);
         assert_eq!(0, statistics.index_seeks);
         assert_eq!(0, statistics.candidate_quads);
+    }
+
+    #[test]
+    fn visibility_cancellation_stops_before_named_and_union_reads() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:visibility-cancellation");
+        let quad = add_quad(
+            &store,
+            &graph,
+            "urn:test:visibility-cancellation:s",
+            "urn:test:visibility-cancellation:p",
+            "urn:test:visibility-cancellation:o",
+        );
+        let view = StoreReadView::new(&store);
+
+        let cancellation = QueryCancellation::new();
+        let visible = |_: &GraphId| {
+            cancellation.cancel();
+            true
+        };
+        let context = ReadContext::with_graph_visibility(cancellation.clone(), &visible);
+        assert!(matches!(
+            view.scan(
+                &context,
+                GraphSelector::Named(quad.graph),
+                QuadPattern::default(),
+            ),
+            Err(StoreError::Cancelled)
+        ));
+        assert_eq!(1, context.snapshot().graphs_considered);
+        assert_eq!(0, context.snapshot().index_seeks);
+        assert_eq!(0, context.snapshot().candidate_quads);
+
+        let cancellation = QueryCancellation::new();
+        let visible = |_: &GraphId| {
+            cancellation.cancel();
+            true
+        };
+        let context = ReadContext::with_graph_visibility(cancellation.clone(), &visible);
+        assert!(matches!(
+            view.exists(
+                &context,
+                GraphSelector::Named(quad.graph),
+                QuadPattern {
+                    subject: Some(quad.subject),
+                    predicate: Some(quad.predicate),
+                    object: Some(quad.object),
+                    ..QuadPattern::default()
+                },
+            ),
+            Err(StoreError::Cancelled)
+        ));
+        assert_eq!(1, context.snapshot().graphs_considered);
+        assert_eq!(0, context.snapshot().index_seeks);
+        assert_eq!(0, context.snapshot().candidate_quads);
+
+        let cancellation = QueryCancellation::new();
+        let visible = |_: &GraphId| {
+            cancellation.cancel();
+            true
+        };
+        let context = ReadContext::with_graph_visibility(cancellation.clone(), &visible);
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Union,
+                QuadPattern {
+                    predicate: Some(quad.predicate),
+                    object: Some(quad.object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
+        assert_eq!(1, context.snapshot().graphs_considered);
+        assert_eq!(1, context.snapshot().index_seeks);
+        assert_eq!(0, context.snapshot().candidate_quads);
+
+        let cancellation = QueryCancellation::new();
+        let visible = |_: &GraphId| {
+            cancellation.cancel();
+            true
+        };
+        let context = ReadContext::with_graph_visibility(cancellation.clone(), &visible);
+        let mut cursor = view
+            .scan(
+                &context,
+                GraphSelector::Union,
+                QuadPattern {
+                    subject: Some(quad.subject),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
+        assert_eq!(1, context.snapshot().graphs_considered);
+        assert_eq!(1, context.snapshot().index_seeks);
+        assert_eq!(1, context.snapshot().candidate_quads);
+        assert_eq!(0, context.snapshot().matching_quads);
     }
 
     #[test]
