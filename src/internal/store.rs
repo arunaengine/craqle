@@ -6606,6 +6606,457 @@ mod tests {
         let quad = {
             let store = GraphStore::open(dir.path()).unwrap();
             store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, quad);
+            let mut header = query_index_header_for_test(&store);
+            header.state = StoredQueryIndexState::Building;
+            stage_query_index_header_for_test(&store, &header);
+            remove_query_index_key_for_test(&store, &store.qv1_posg, qv1_posg_key(quad));
+            store.persist().unwrap();
+            quad
+        };
+
+        {
+            let store = GraphStore::open(dir.path()).unwrap();
+            assert_eq!(
+                store.query_index_status().unwrap().state,
+                QueryIndexState::Building
+            );
+            assert_eq!(
+                store.quads_for_pattern(None, None, None, None).unwrap(),
+                vec![quad],
+                "Building must retain canonical fallback reads"
+            );
+            store.rebuild_query_indexes().unwrap();
+            assert_query_index_ready(&store, 1);
+            store.persist().unwrap();
+        }
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_query_index_ready(&reopened, 1);
+    }
+
+    #[test]
+    fn query_index_full_and_sample_verification_are_deterministic() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:verify-sample");
+        store.create_graph(&graph).unwrap();
+        let rows = QUERY_INDEX_SAMPLE_ROWS + 1;
+        {
+            let _guard = store.graph_commit_guard(&graph);
+            let mut batch = store.new_batch();
+            for index in 0..rows {
+                let subject = format!("urn:test:qv:sample:{index}");
+                let quad = encode_quad(&store, &graph, (&subject, "urn:test:p", "urn:test:o"));
+                store
+                    .insert_quad(
+                        &mut batch,
+                        QuadAdd {
+                            quad,
+                            dot: Dot {
+                                actor: ActorId::random(),
+                                counter: 1,
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+            store.commit(batch).unwrap();
+        }
+
+        let sample = store.verify_query_indexes(false).unwrap();
+        assert!(sample.valid);
+        assert!(!sample.full);
+        assert_eq!(sample.source_live_quads, rows);
+        assert_eq!(sample.indexed_quads, rows);
+        assert_eq!(sample.checked_source_rows, QUERY_INDEX_SAMPLE_ROWS);
+        assert_eq!(sample.checked_index_rows, QUERY_INDEX_SAMPLE_ROWS * 3);
+
+        let full = store.verify_query_indexes(true).unwrap();
+        assert!(full.valid);
+        assert!(full.full);
+        assert_eq!(full.source_live_quads, rows);
+        assert_eq!(full.indexed_quads, rows);
+        assert_eq!(full.checked_source_rows, rows);
+        assert_eq!(full.checked_index_rows, rows * 3);
+    }
+
+    #[test]
+    fn query_index_verification_detects_qv_and_metadata_corruption() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:verification-corruption");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, quad);
+        let extra = EncodedQuad {
+            subject: store
+                .resolve_term(&named("urn:test:qv:extra-subject"))
+                .unwrap(),
+            ..quad
+        };
+
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_gpos,
+            qv1_gpos_key(extra),
+            Vec::<u8>::new(),
+        );
+        stage_query_index_value_for_test(&store, &store.qv1_gpos, qv1_gpos_key(quad), vec![1]);
+        remove_query_index_key_for_test(&store, &store.qv1_spog, qv1_spog_key(quad));
+        stage_query_index_value_for_test(&store, &store.qv1_posg, vec![0; 63], Vec::<u8>::new());
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_meta,
+            QUERY_INDEX_TOTAL_KEY,
+            vec![0; 7],
+        );
+        stage_query_index_value_for_test(&store, &store.qv1_meta, vec![b'Z'], 0u64.to_be_bytes());
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_meta,
+            vec![b'G', 0],
+            0u64.to_be_bytes(),
+        );
+        let orphan_graph = store
+            .resolve_term(&named("urn:test:qv:orphan-counter-graph"))
+            .unwrap();
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_meta,
+            QueryIndexCounterKey::Graph(orphan_graph).bytes(),
+            1u64.to_be_bytes(),
+        );
+
+        let report = store.verify_query_indexes(true).unwrap();
+        assert!(!report.valid);
+        for problem in [
+            "source-gpos-missing-or-nonempty",
+            "source-spog-missing-or-nonempty",
+            "qv-gpos-value-nonempty",
+            "qv-gpos-source-missing",
+            "qv-posg-key-length",
+            "meta-counter-value-length",
+            "meta-unknown-tag",
+            "meta-counter-key-length",
+            "meta-counter-orphan",
+        ] {
+            assert_query_index_problem(&report, problem);
+        }
+    }
+
+    #[test]
+    fn query_index_maintenance_anomaly_commits_source_and_fails_derived_state() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:maintenance-anomaly");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, first);
+        remove_query_index_key_for_test(
+            &store,
+            &store.qv1_meta,
+            QueryIndexCounterKey::Predicate(first.predicate).bytes(),
+        );
+
+        let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, second);
+
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("maintenance-anomaly".to_owned())
+        );
+        assert_eq!(
+            store
+                .quads_for_pattern(None, None, None, None)
+                .unwrap()
+                .len(),
+            2,
+            "the canonical source commit must survive a derived-index anomaly"
+        );
+        let snapshot = store.db.snapshot();
+        assert_eq!(snapshot.iter(&store.qv1_gpos).count(), 1);
+        assert!(
+            snapshot
+                .get(&store.qv1_gpos, qv1_gpos_key(second))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn query_index_maintenance_rejects_ahead_header_without_losing_source_write() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:maintenance-ahead-header");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, first);
+        let mut header = query_index_header_for_test(&store);
+        let ahead = store.db.snapshot().seqno().checked_add(100).unwrap();
+        header.source_epoch = ahead;
+        header.index_epoch = ahead;
+        stage_query_index_header_for_test(&store, &header);
+
+        let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, second);
+
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("ready-metadata-inconsistent".to_owned())
+        );
+        assert_eq!(
+            store
+                .quads_for_pattern(None, None, None, None)
+                .unwrap()
+                .len(),
+            2,
+            "the canonical source write must survive an ahead metadata hint"
+        );
+        let snapshot = store.db.snapshot();
+        assert_eq!(snapshot.iter(&store.qv1_gpos).count(), 1);
+        assert!(
+            snapshot
+                .get(&store.qv1_gpos, qv1_gpos_key(second))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn query_index_maintenance_rejects_orphan_counter_without_losing_source_write() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:maintenance-orphan-counter");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p1", "urn:test:o"));
+        commit_add(&store, &graph, first);
+        let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p2", "urn:test:o"));
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_meta,
+            QueryIndexCounterKey::Predicate(second.predicate).bytes(),
+            1u64.to_be_bytes(),
+        );
+
+        commit_add(&store, &graph, second);
+
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("maintenance-anomaly".to_owned())
+        );
+        assert_eq!(
+            store
+                .quads_for_pattern(None, None, None, None)
+                .unwrap()
+                .len(),
+            2,
+            "the canonical source write must survive an orphan counter"
+        );
+        let snapshot = store.db.snapshot();
+        assert_eq!(snapshot.iter(&store.qv1_gpos).count(), 1);
+        assert!(
+            snapshot
+                .get(&store.qv1_gpos, qv1_gpos_key(second))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn query_index_malformed_metadata_or_counter_is_never_trusted_ready() {
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let metadata_graph = GraphId::new("urn:test:qv:malformed-metadata");
+        let metadata_quad = {
+            let store = GraphStore::open(metadata_dir.path()).unwrap();
+            store.create_graph(&metadata_graph).unwrap();
+            let quad = encode_quad(
+                &store,
+                &metadata_graph,
+                ("urn:test:s", "urn:test:p", "urn:test:o"),
+            );
+            commit_add(&store, &metadata_graph, quad);
+            stage_query_index_value_for_test(
+                &store,
+                &store.qv1_meta,
+                QUERY_INDEX_HEADER_KEY,
+                vec![0],
+            );
+            store.persist().unwrap();
+            quad
+        };
+        let metadata_reopened = GraphStore::open(metadata_dir.path()).unwrap();
+        assert_eq!(
+            metadata_reopened.query_index_status().unwrap().state,
+            QueryIndexState::Failed("metadata-malformed".to_owned())
+        );
+        assert_eq!(
+            metadata_reopened
+                .quads_for_pattern(None, None, None, None)
+                .unwrap(),
+            vec![metadata_quad]
+        );
+        drop(metadata_reopened);
+
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_graph = GraphId::new("urn:test:qv:malformed-counter");
+        let counter_quad = {
+            let store = GraphStore::open(counter_dir.path()).unwrap();
+            store.create_graph(&counter_graph).unwrap();
+            let quad = encode_quad(
+                &store,
+                &counter_graph,
+                ("urn:test:s", "urn:test:p", "urn:test:o"),
+            );
+            commit_add(&store, &counter_graph, quad);
+            stage_query_index_value_for_test(
+                &store,
+                &store.qv1_meta,
+                QUERY_INDEX_TOTAL_KEY,
+                vec![0; 7],
+            );
+            store.persist().unwrap();
+            quad
+        };
+        let counter_reopened = GraphStore::open(counter_dir.path()).unwrap();
+        assert_eq!(
+            counter_reopened.query_index_status().unwrap().state,
+            QueryIndexState::Failed("open-admission-failed".to_owned())
+        );
+        assert_eq!(
+            counter_reopened
+                .quads_for_pattern(None, None, None, None)
+                .unwrap(),
+            vec![counter_quad]
+        );
+    }
+
+    #[test]
+    fn query_index_epoch_mismatch_fails_open_and_explicit_rebuild_preserves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:epoch-mismatch");
+        let quad = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, quad);
+            let mut header = query_index_header_for_test(&store);
+            header.index_epoch = header.index_epoch.checked_add(1).unwrap();
+            stage_query_index_header_for_test(&store, &header);
+            store.persist().unwrap();
+            quad
+        };
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("open-admission-failed".to_owned())
+        );
+        let source_before_rebuild = store.quads_for_pattern(None, None, None, None).unwrap();
+        assert_eq!(source_before_rebuild, vec![quad]);
+        assert!(!store.verify_query_indexes(true).unwrap().valid);
+
+        store.rebuild_query_indexes().unwrap();
+        assert_query_index_ready(&store, 1);
+        assert_eq!(
+            store.quads_for_pattern(None, None, None, None).unwrap(),
+            source_before_rebuild,
+            "rebuild must never mutate canonical source rows"
+        );
+    }
+
+    #[test]
+    fn query_index_rebuild_discards_ahead_header_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:ahead-hints");
+        let first = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, first);
+            let mut header = query_index_header_for_test(&store);
+            header.source_epoch = u64::MAX;
+            header.index_epoch = u64::MAX;
+            header.last_build_sequence = u64::MAX;
+            stage_query_index_header_for_test(&store, &header);
+            store.persist().unwrap();
+            first
+        };
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.query_index_status().unwrap().state,
+            QueryIndexState::Failed("open-admission-failed".to_owned())
+        );
+        let failed_report = store.verify_query_indexes(true).unwrap();
+        assert!(!failed_report.valid);
+        assert_query_index_problem(&failed_report, "meta-epoch-ahead-of-snapshot");
+        assert_query_index_problem(&failed_report, "meta-build-sequence-ahead-of-snapshot");
+        assert_eq!(
+            store.quads_for_pattern(None, None, None, None).unwrap(),
+            vec![first]
+        );
+
+        store.rebuild_query_indexes().unwrap();
+        assert_query_index_ready(&store, 1);
+        let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, second);
+        assert_query_index_ready(&store, 2);
+        assert_eq!(
+            store
+                .quads_for_pattern(None, None, None, None)
+                .unwrap()
+                .len(),
+            2,
+            "rebuild and the later live write must leave canonical source rows intact"
+        );
+    }
+
+    #[test]
+    fn query_index_manual_compaction_preserves_all_keyspaces_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv:manual-compact");
+        let quad = {
+            let store = GraphStore::open(dir.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+            commit_add(&store, &graph, quad);
+            store.manual_compact().unwrap();
+            let snapshot = store.db.snapshot();
+            for (keyspace, key) in [
+                (&store.qv1_gpos, qv1_gpos_key(quad)),
+                (&store.qv1_spog, qv1_spog_key(quad)),
+                (&store.qv1_posg, qv1_posg_key(quad)),
+            ] {
+                assert!(
+                    snapshot
+                        .get(keyspace, key)
+                        .unwrap()
+                        .unwrap()
+                        .as_ref()
+                        .is_empty()
+                );
+            }
+            assert!(
+                snapshot
+                    .get(&store.qv1_meta, QUERY_INDEX_HEADER_KEY)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                snapshot
+                    .get(&store.qv1_meta, QUERY_INDEX_TOTAL_KEY)
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                &1u64.to_be_bytes()
+            );
+            store.persist().unwrap();
+            quad
+        };
+
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert_query_index_ready(&reopened, 1);
+        assert_eq!(
+            reopened.quads_for_pattern(None, None, None, None).unwrap(),
+            vec![quad]
+        );
     }
 
     #[test]
