@@ -414,6 +414,21 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{} query failed", case.label))
     }
 
+    /// Runs a full public query call over the generated visible-graph scope.
+    pub fn run_visible_query(&self, sparql: &str, label: &str) -> QueryResults {
+        self.node
+            .query_graphs(&self.visible_graphs, sparql)
+            .unwrap_or_else(|_| panic!("{label} query failed"))
+    }
+
+    /// Runs a full public query call over every generated graph, including the
+    /// corpus's deliberately hidden graphs for duplicate-baseline inspection.
+    pub fn run_all_graph_query(&self, sparql: &str, label: &str) -> QueryResults {
+        self.node
+            .query_graphs(&self.all_graphs, sparql)
+            .unwrap_or_else(|_| panic!("{label} query failed"))
+    }
+
     /// Untimed semantic sweep and deterministic cache warm-up.
     pub fn assert_semantics(&self) -> SemanticReport {
         let mut report = SemanticReport::default();
