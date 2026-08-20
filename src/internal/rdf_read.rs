@@ -119,11 +119,12 @@ pub(crate) trait RdfReadView {
 }
 
 /// Durable-source implementation of [`RdfReadView`].
+#[derive(Clone)]
 pub(crate) struct StoreReadView<'store> {
     store: &'store GraphStore,
     snapshot: StoreReadSnapshot,
     read_mode: QueryReadMode,
-    qv_admission: OnceCell<QueryIndexAdmission>,
+    qv_admission: Rc<OnceCell<QueryIndexAdmission>>,
 }
 
 impl<'store> StoreReadView<'store> {
@@ -132,7 +133,7 @@ impl<'store> StoreReadView<'store> {
             store,
             snapshot: store.read_snapshot(),
             read_mode: QueryReadMode::Auto,
-            qv_admission: OnceCell::new(),
+            qv_admission: Rc::new(OnceCell::new()),
         }
     }
 
@@ -141,7 +142,7 @@ impl<'store> StoreReadView<'store> {
             store,
             snapshot: store.read_snapshot(),
             read_mode,
-            qv_admission: OnceCell::new(),
+            qv_admission: Rc::new(OnceCell::new()),
         }
     }
 
@@ -1412,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_qv_admission_uses_only_header_and_total_metadata_probes() {
+    fn qv_admission_cached() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:qv-admission");
         add_many(&store, &graph, 1_025);
@@ -1423,6 +1424,7 @@ mod tests {
             .unwrap();
         let before = store.query_index_admission_probe_count();
         let view = StoreReadView::new(&store);
+        let second_view = view.clone();
         let context = ReadContext::default();
         let mut cursor = view
             .scan(
@@ -1437,7 +1439,7 @@ mod tests {
         assert!(cursor.next().unwrap().is_ok());
         drop(cursor);
 
-        let mut second = view
+        let mut second = second_view
             .scan(
                 &context,
                 GraphSelector::Union,

@@ -1547,6 +1547,7 @@ pub(crate) struct QueryIndexAdmission {
 ///
 /// It deliberately owns only the Fjall snapshot. Callers receive opaque
 /// cursor and metadata operations rather than Fjall objects or keyspaces.
+#[derive(Clone)]
 pub(crate) struct StoreReadSnapshot {
     snapshot: Snapshot,
 }

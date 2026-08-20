@@ -245,36 +245,59 @@ impl ShaclCompiler {
         changes: &[MaterializedQuadChange],
         options: &ShaclValidationOptions,
     ) -> Result<ShaclValidationReport> {
+        self.validate_delta_from(
+            StoreReadView::new(&self.store),
+            data_graph,
+            schema,
+            changes,
+            options,
+            None,
+        )
+    }
+
+    pub(crate) fn validate_delta_from(
+        &self,
+        base: StoreReadView<'_>,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        changes: &[MaterializedQuadChange],
+        options: &ShaclValidationOptions,
+        base_report: Option<ShaclValidationReport>,
+    ) -> Result<ShaclValidationReport> {
         if options.cancellation.is_cancelled() {
             return Err(ShaclError::ValidationCancelled.into());
         }
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
         let index = DeltaIndex::build(&self.store, data_graph, changes)?;
-        let base = StoreReadView::new(&self.store);
-        let base_cache_key = self.validation_cache_key(&base, data_graph, schema, options)?;
-        let base_report =
-            if let Some(report) = self.validation_cache().get(&base_cache_key).cloned() {
-                report
-            } else {
-                let report = match eval::validate_view(
-                    &base,
-                    resolved.clone(),
-                    data_graph,
-                    options,
-                    cache_hit,
-                    resolve_time,
-                    false,
-                    None,
-                    None,
-                ) {
-                    Err(CraqleError::Store(StoreError::Cancelled)) => {
-                        return Err(ShaclError::ValidationCancelled.into());
-                    }
-                    result => result?,
-                };
-                self.cache_validation(base_cache_key, report.clone());
-                report
-            };
+        let base_report = match base_report {
+            Some(report) => report,
+            None => {
+                let base_cache_key =
+                    self.validation_cache_key(&base, data_graph, schema, options)?;
+                if let Some(report) = self.validation_cache().get(&base_cache_key).cloned() {
+                    report
+                } else {
+                    let report = match eval::validate_view(
+                        &base,
+                        resolved.clone(),
+                        data_graph,
+                        options,
+                        cache_hit,
+                        resolve_time,
+                        false,
+                        None,
+                        None,
+                    ) {
+                        Err(CraqleError::Store(StoreError::Cancelled)) => {
+                            return Err(ShaclError::ValidationCancelled.into());
+                        }
+                        result => result?,
+                    };
+                    self.cache_validation(base_cache_key, report.clone());
+                    report
+                }
+            }
+        };
         let view = DeltaReadView::new(base, &index);
         let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
         let graph = hash_term(&EncodedTerm::from_named_node(&data_graph.0));
