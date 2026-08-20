@@ -118,3 +118,7 @@ required-features = ["shacl-core"]
 [[bench]]
 name = "index_write_cost"
 harness = false
+
+[[bench]]
+name = "query_result_collection"
+harness = false
