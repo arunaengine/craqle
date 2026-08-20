@@ -121,6 +121,17 @@ struct LocalCommit<'a> {
     validate_rules: bool,
 }
 
+#[cfg(feature = "shacl-core")]
+struct ShaclEvaluation {
+    binding: crate::ShaclBinding,
+    schema: Option<crate::CompiledShaclSchema>,
+    result: std::result::Result<crate::ShaclValidationReport, String>,
+    data_version: Option<[u8; 32]>,
+    shapes_version: [u8; 32],
+    schema_fingerprint: [u8; 32],
+    shape_versions: Vec<(GraphId, [u8; 32])>,
+}
+
 impl ReplicationEngine {
     #[cfg(any(not(feature = "shacl-core"), test))]
     pub(crate) fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
@@ -408,6 +419,191 @@ impl ReplicationEngine {
         }
     }
 
+    #[cfg(feature = "shacl-core")]
+    fn evaluate_enforce(
+        &self,
+        graph: &GraphId,
+        changes: &[MaterializedQuadChange],
+    ) -> Result<Vec<ShaclEvaluation>, UpdateError> {
+        let statuses = self.store.shacl_binding_statuses(graph)?;
+        let data_version = self.store.graph_version_digest(graph)?;
+        let mut evaluations = Vec::new();
+        let mut violations = Vec::new();
+        for status in statuses {
+            if status.binding.policy != crate::ValidationPolicy::Enforce {
+                continue;
+            }
+            let shapes_version = self
+                .store
+                .graph_version_digest(&status.binding.shapes_graph)
+                .unwrap_or([0; 32]);
+            let evaluated = self.evaluate_binding(status, data_version, shapes_version, changes);
+            match evaluated {
+                Ok((binding, schema, report)) => {
+                    if !report.conforms {
+                        violations.push(report.clone());
+                    }
+                    let schema_fingerprint = schema.plan_fingerprint();
+                    let shape_versions = schema.shape_versions().to_vec();
+                    evaluations.push(ShaclEvaluation {
+                        binding,
+                        schema: Some(schema),
+                        result: Ok(report),
+                        data_version: None,
+                        shapes_version,
+                        schema_fingerprint,
+                        shape_versions,
+                    });
+                }
+                Err(error) => return Err(map_update_error(error)),
+            }
+        }
+        if !violations.is_empty() {
+            return Err(UpdateError::ShaclValidationFailed(violations));
+        }
+        Ok(evaluations)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn evaluate_binding(
+        &self,
+        status: crate::ShaclBindingStatus,
+        data_version: [u8; 32],
+        shapes_version: [u8; 32],
+        changes: &[MaterializedQuadChange],
+    ) -> crate::Result<(
+        crate::ShaclBinding,
+        crate::CompiledShaclSchema,
+        crate::ShaclValidationReport,
+    )> {
+        let binding = status.binding;
+        let schema = self.shacl.compile(
+            &binding.shapes_graph,
+            &binding.validation_options.compile_options(),
+        )?;
+        if !changes.is_empty()
+            && schema
+                .shape_versions()
+                .iter()
+                .any(|(dependency, _)| dependency == &binding.data_graph)
+        {
+            return Err(crate::ShaclError::ShapesGraphMutationUnsupported {
+                graph: binding.data_graph.to_string(),
+            }
+            .into());
+        }
+        let options = binding.validation_options.validation_options();
+        if status.data_version == data_version
+            && status.shapes_version == shapes_version
+            && status.schema_fingerprint == schema.plan_fingerprint()
+            && let Some(report) = status.report
+        {
+            self.shacl.seed_validation_report(
+                &binding.data_graph,
+                &schema,
+                data_version,
+                &options,
+                report,
+            );
+        }
+        let report = self
+            .shacl
+            .validate_delta(&binding.data_graph, &schema, changes, &options)?;
+        if !self.shacl.versions_are_current(schema.shape_versions())? {
+            return Err(crate::ShaclError::SchemaChangedDuringValidation {
+                graph: binding.shapes_graph.to_string(),
+            }
+            .into());
+        }
+        Ok((binding, schema, report))
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn stamp_evaluations(
+        &self,
+        graph: &GraphId,
+        evaluations: &mut [ShaclEvaluation],
+    ) -> crate::store::Result<[u8; 32]> {
+        let data_version = self.store.graph_version_digest(graph)?;
+        for evaluation in evaluations {
+            evaluation.data_version = Some(data_version);
+        }
+        Ok(data_version)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn persist_shacl_evaluations(
+        &self,
+        graph: &GraphId,
+        evaluations: Vec<ShaclEvaluation>,
+    ) -> crate::store::Result<()> {
+        if evaluations.is_empty() {
+            return Ok(());
+        }
+        let _binding_guard = self.store.binding_guard();
+        let data_version = self.store.graph_version_digest(graph)?;
+        let current = self.store.shacl_binding_statuses(graph)?;
+        let mut batch = self.store.new_batch();
+        for evaluation in evaluations {
+            if !current
+                .iter()
+                .any(|status| status.binding == evaluation.binding)
+            {
+                continue;
+            }
+            let shapes_version = self
+                .store
+                .graph_version_digest(&evaluation.binding.shapes_graph)
+                .unwrap_or([0; 32]);
+            let mut status = crate::ShaclBindingStatus {
+                binding: evaluation.binding.clone(),
+                state: crate::ShaclValidationState::Pending,
+                report: None,
+                error: None,
+                data_version,
+                shapes_version,
+                schema_fingerprint: evaluation.schema_fingerprint,
+                shape_versions: evaluation.shape_versions,
+            };
+            if evaluation.data_version == Some(data_version)
+                && shapes_version == evaluation.shapes_version
+            {
+                match evaluation.result {
+                    Ok(report)
+                        if self
+                            .shacl
+                            .versions_are_current(&status.shape_versions)
+                            .unwrap_or(false) =>
+                    {
+                        status.state = if report.conforms {
+                            crate::ShaclValidationState::Valid
+                        } else {
+                            crate::ShaclValidationState::Invalid
+                        };
+                        if let Some(schema) = &evaluation.schema {
+                            let options =
+                                evaluation.binding.validation_options.validation_options();
+                            let _ = self.shacl.cache_current_report(
+                                graph,
+                                schema,
+                                &options,
+                                report.clone(),
+                            );
+                        }
+                        status.report = Some(report);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        status.state = crate::ShaclValidationState::Failed;
+                        status.error = Some(error);
+                    }
+                }
+            }
+            self.store.stage_binding_status(&mut batch, &status)?;
+        }
+        self.store.commit(batch)
+    }
+
     fn ensure_change_set_targets(
         &self,
         graph: &GraphId,
@@ -453,7 +649,8 @@ impl ReplicationEngine {
         } = commit;
 
         if let Some(sync) = &self.sync {
-            // Topic binding can take the graph commit guard itself.
+            // Topic binding may take the graph commit guard itself, so finish
+            // that idempotent step before acquiring either write guard.
             sync.ensure_graph_topic(&self.store, graph)?;
             // Orders this graph's publish against its own apply; see
             // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
@@ -468,20 +665,42 @@ impl ReplicationEngine {
             }
 
             let _commit_guard = self.store.graph_commit_guard(graph);
+            #[cfg(feature = "shacl-core")]
+            let binding_guard = self.store.binding_guard();
             if validate_rules {
                 self.validate(graph, &changes)?;
             }
+            #[cfg(feature = "shacl-core")]
+            let mut shacl_evaluations = if validate_rules {
+                self.evaluate_enforce(graph, &changes)?
+            } else {
+                Vec::new()
+            };
 
-            // Publish-first (G4): no local state changes until the event is
-            // durable in the topic.
+            // Publish-first (G4): no source state changes until the event is
+            // durable in the topic. A failed publish therefore leaves the
+            // validated candidate unapplied.
             let record = sync.publish_changes(&self.store, graph, changes)?;
             let Some(batch) = crate::sync::batch_from_owned(record)? else {
                 return Err(UpdateError::InvalidChangeSet(
                     "irokle changes publish did not return a quad-change record".to_string(),
                 ));
             };
-            self.apply_irokle_guarded(&batch, plan)
+            let _merged = self
+                .apply_irokle_guarded(&batch, plan)
                 .map_err(update_error_from_merge)?;
+            #[cfg(feature = "shacl-core")]
+            {
+                if _merged.applied {
+                    self.stamp_evaluations(graph, &mut shacl_evaluations)?;
+                }
+                drop(_commit_guard);
+                drop(binding_guard);
+                drop(_write_guard);
+                if _merged.applied {
+                    let _ = self.persist_shacl_evaluations(graph, shacl_evaluations);
+                }
+            }
             return Ok(batch);
         }
 
@@ -497,10 +716,18 @@ impl ReplicationEngine {
         // clock write, the FTS enqueue, the commit and the diagnostics refresh
         // (G1, G2, G5, G6).
         let _commit_guard = self.store.graph_commit_guard(graph);
+        #[cfg(feature = "shacl-core")]
+        let binding_guard = self.store.binding_guard();
 
         if validate_rules {
             self.validate(graph, &changes)?;
         }
+        #[cfg(feature = "shacl-core")]
+        let mut shacl_evaluations = if validate_rules {
+            self.evaluate_enforce(graph, &changes)?
+        } else {
+            Vec::new()
+        };
 
         // Captured before the write, under the guard, so it describes exactly
         // the state this commit starts from. Skipped entirely when the caller
@@ -630,11 +857,21 @@ impl ReplicationEngine {
                 subjects: &affected_subjects,
             },
         )?;
+        #[cfg(feature = "shacl-core")]
+        self.store.stage_pending_bindings(&mut batch, graph)?;
         self.store.commit(batch)?;
+        #[cfg(feature = "shacl-core")]
+        self.stamp_evaluations(graph, &mut shacl_evaluations)?;
 
         if let Some(pending) = &pending {
             self.settle_diagnostics(graph, pending)
                 .map_err(UpdateError::Store)?;
+        }
+        #[cfg(feature = "shacl-core")]
+        {
+            drop(_commit_guard);
+            drop(binding_guard);
+            let _ = self.persist_shacl_evaluations(graph, shacl_evaluations);
         }
 
         Ok(Batch {
@@ -702,6 +939,8 @@ impl ReplicationEngine {
         // then advances, or a concurrent commit can make one batch apply twice
         // or the clock lose an entry (G1, G2).
         let _commit_guard = self.store.graph_commit_guard(graph);
+        #[cfg(feature = "shacl-core")]
+        let _binding_guard = self.store.binding_guard();
 
         self.apply_irokle_guarded(incoming, plan)
     }
@@ -848,6 +1087,8 @@ impl ReplicationEngine {
                 subjects: &affected_subjects,
             },
         )?;
+        #[cfg(feature = "shacl-core")]
+        self.store.stage_pending_bindings(&mut batch, graph)?;
         self.store.commit(batch)?;
         Ok(())
     }
@@ -858,10 +1099,8 @@ impl ReplicationEngine {
     /// Re-stamps the previous verdict when the write cannot have moved the orphan
     /// set; otherwise recomputes.
     ///
-    /// "Validated, therefore orphan-free" is deliberately *not* a third case:
-    /// `validate` runs before the guard is taken, so two writes cutting one
-    /// parent each can both pass and jointly orphan an entity — and the lie would
-    /// persist under a matching clock tag that no reader corrects (G6).
+    /// Validation success is not an orphan verdict; only the dependency summary
+    /// proves when the previous set remains exact.
     fn settle_diagnostics(
         &self,
         graph: &GraphId,
@@ -986,6 +1225,15 @@ struct PendingDiagnostics {
 struct OrphanChange {
     previous: GraphDiagnostics,
     current: GraphDiagnostics,
+}
+
+#[cfg(feature = "shacl-core")]
+fn map_update_error(error: crate::CraqleError) -> UpdateError {
+    match error {
+        crate::CraqleError::Store(error) => UpdateError::Store(error),
+        crate::CraqleError::Shacl(error) => UpdateError::Shacl(error),
+        error => UpdateError::InvalidChangeSet(error.to_string()),
+    }
 }
 
 fn update_error_from_merge(error: MergeError) -> UpdateError {
