@@ -8,12 +8,12 @@ pub(crate) fn analyze(
     targets: &[TargetPlan],
     path: Option<&PathPlan>,
     constraints: &[ConstraintPlan],
-    property_shapes: &[ShapeId],
+    _property_shapes: &[ShapeId],
 ) -> ShapeDependencies {
     let mut forward = BTreeSet::new();
     let mut inverse = BTreeSet::new();
     let mut classes = BTreeSet::new();
-    let mut nested: BTreeSet<ShapeId> = property_shapes.iter().copied().collect();
+    let mut nested = BTreeSet::new();
     let mut reads_rdf_type = false;
     let mut reads_all_outgoing = false;
     let mut has_transitive_path = false;
@@ -68,6 +68,7 @@ pub(crate) fn analyze(
         }
     }
 
+    let requires_global_work = path.is_some_and(|path| !is_local_path(path)) || !nested.is_empty();
     ShapeDependencies {
         forward_predicates: forward.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         inverse_predicates: inverse.into_iter().collect::<Vec<_>>().into_boxed_slice(),
@@ -76,8 +77,13 @@ pub(crate) fn analyze(
         reads_rdf_type,
         reads_all_outgoing_predicates: reads_all_outgoing,
         has_transitive_path,
-        requires_global_work: false,
+        requires_global_work,
     }
+}
+
+fn is_local_path(path: &PathPlan) -> bool {
+    matches!(path, PathPlan::Predicate(_))
+        || matches!(path, PathPlan::Inverse(inner) if matches!(inner.as_ref(), PathPlan::Predicate(_)))
 }
 
 fn collect_path(
