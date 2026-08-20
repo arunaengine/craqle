@@ -17,11 +17,17 @@ pub struct QueryOptions {
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
     #[error("craqle: {0}")]
-    Craqle(#[from] CraqleError),
+    Craqle(#[source] Box<CraqleError>),
     #[error("irokle: {0}")]
     Irokle(#[from] irokle::Error),
     #[error("convergence failed: {0}")]
     ConvergenceFailed(String),
+}
+
+impl From<CraqleError> for SimulationError {
+    fn from(error: CraqleError) -> Self {
+        Self::Craqle(Box::new(error))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SimulationError>;
