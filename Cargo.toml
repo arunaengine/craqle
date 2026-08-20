@@ -131,6 +131,11 @@ harness = false
 required-features = ["shacl-core"]
 
 [[bench]]
+name = "shacl_incremental"
+harness = false
+required-features = ["shacl-core"]
+
+[[bench]]
 name = "index_write_cost"
 harness = false
 
