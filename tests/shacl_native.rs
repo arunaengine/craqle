@@ -1217,3 +1217,127 @@ fn native_logical_cycles_are_rejected_during_compilation() {
         CraqleError::Shacl(ShaclError::IllFormedShapes { .. })
     ));
 }
+
+#[test]
+fn native_blank_literal_empty_duplicate_and_closed_cases_match_rudof() {
+    let root = iri("urn:test:mixed:root");
+    let focus = iri("urn:test:mixed:focus");
+    let iri_shape = iri("urn:test:mixed:iri-shape");
+    let blank_shape = iri("urn:test:mixed:blank-shape");
+    let required_shape = iri("urn:test:mixed:required-shape");
+    let empty_shape = iri("urn:test:mixed:empty-shape");
+    let iri_path = iri("urn:test:mixed:iri");
+    let blank_path = iri("urn:test:mixed:blank");
+    let required_path = iri("urn:test:mixed:required");
+    let empty_path = iri("urn:test:mixed:empty");
+    let rejected = iri("urn:test:mixed:rejected");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} {iri_shape} .\n\
+         {root} {} {blank_shape} .\n\
+         {root} {} {required_shape} .\n\
+         {root} {} {empty_shape} .\n\
+         {root} {} \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n\
+         {root} {} _:ignored .\n\
+         _:ignored {RDF_FIRST} {RDF_TYPE} .\n\
+         _:ignored {RDF_REST} {RDF_NIL} .\n\
+         {iri_shape} {RDF_TYPE} {} .\n\
+         {iri_shape} {} {iri_path} .\n\
+         {iri_shape} {} {} .\n\
+         {blank_shape} {RDF_TYPE} {} .\n\
+         {blank_shape} {} {blank_path} .\n\
+         {blank_shape} {} {} .\n\
+         {required_shape} {RDF_TYPE} {} .\n\
+         {required_shape} {} {required_path} .\n\
+         {required_shape} {} {} .\n\
+         {empty_shape} {RDF_TYPE} {} .\n\
+         {empty_shape} {} {empty_path} .\n\
+         {empty_shape} {} {} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("closed"),
+        sh("ignoredProperties"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("nodeKind"),
+        sh("IRI"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("nodeKind"),
+        sh("IRI"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("hasValue"),
+        literal("required"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("minCount"),
+        integer(1),
+    );
+    let data_text = format!(
+        "{focus} {iri_path} {} .\n\
+         {focus} {iri_path} {} .\n\
+         {focus} {blank_path} _:value .\n\
+         {focus} {blank_path} _:value .\n\
+         {focus} {rejected} {} .\n",
+        iri("urn:test:mixed:good"),
+        literal("not-an-iri"),
+        literal("closed violation"),
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
+
+#[test]
+fn native_max_count_one_reads_at_most_two_values() {
+    let (_database, node) = node();
+    let shapes = GraphId::new("urn:test:shacl:native:max-count:shapes");
+    let data = GraphId::new("urn:test:shacl:native:max-count:data");
+    let focus = iri("urn:test:max-count:focus");
+    let predicate = iri("urn:test:max-count:value");
+    insert(
+        &node,
+        &shapes,
+        &[
+            ("_:shape", RDF_TYPE, &sh("NodeShape")),
+            ("_:shape", &sh("targetNode"), &focus),
+            ("_:shape", &sh("property"), "_:property"),
+            ("_:property", &sh("path"), &predicate),
+            ("_:property", &sh("maxCount"), &integer(1)),
+        ],
+    );
+    let values = (0..100)
+        .map(|index| {
+            (
+                focus.clone(),
+                predicate.clone(),
+                literal(&format!("value-{index:03}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let changes = values
+        .iter()
+        .map(
+            |(subject, predicate, object)| MaterializedQuadChange::Insert {
+                graph: data.clone(),
+                subject: EncodedTerm(subject.clone()),
+                predicate: EncodedTerm(predicate.clone()),
+                object: EncodedTerm(object.clone()),
+            },
+        )
+        .collect();
+    node.apply_changes_unchecked(&data, changes).unwrap();
+
+    let schema = node
+        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    let report = node
+        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    assert!(!report.conforms);
+    assert_eq!(report.statistics.path_candidate_quads, 2);
+}
