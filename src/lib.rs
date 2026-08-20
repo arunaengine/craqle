@@ -628,7 +628,7 @@ pub struct CraqleNode {
     _index_warmer: DerivedIndexWarmer,
     sparql: Arc<SparqlEngine>,
     #[cfg(feature = "shacl-core")]
-    shacl: ShaclCompiler,
+    shacl: Arc<ShaclCompiler>,
     replication: Arc<ReplicationEngine>,
     local_replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
@@ -812,9 +812,30 @@ impl CraqleNode {
         let search_worker = SearchUpdateWorker::start(store.clone(), search.clone());
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
         #[cfg(feature = "shacl-core")]
-        let shacl = ShaclCompiler::new(store.clone());
+        let shacl = Arc::new(ShaclCompiler::new(store.clone()));
+        #[cfg(feature = "shacl-core")]
+        let local_replication = Arc::new(ReplicationEngine::new_with_shacl(
+            store.clone(),
+            sparql.clone(),
+            actor,
+            shacl.clone(),
+        ));
+        #[cfg(not(feature = "shacl-core"))]
         let local_replication =
             Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
+        #[cfg(feature = "shacl-core")]
+        let replication = Arc::new(if sync.is_some() {
+            ReplicationEngine::new_sync_shacl(
+                store.clone(),
+                sparql.clone(),
+                actor,
+                sync.clone(),
+                shacl.clone(),
+            )
+        } else {
+            ReplicationEngine::new_with_shacl(store.clone(), sparql.clone(), actor, shacl.clone())
+        });
+        #[cfg(not(feature = "shacl-core"))]
         let replication = Arc::new(if sync.is_some() {
             ReplicationEngine::new_with_sync(store.clone(), sparql.clone(), actor, sync.clone())
         } else {
@@ -2763,11 +2784,19 @@ impl CraqleNode {
         match (durability.publishes_irokle(), actor) {
             (true, _) => self.manager(),
             (false, None) => RoCrateManager::new(self.local_replication.clone()),
-            (false, Some(actor)) => RoCrateManager::new(Arc::new(ReplicationEngine::new(
-                self.store.clone(),
-                self.sparql.clone(),
-                actor,
-            ))),
+            (false, Some(actor)) => {
+                #[cfg(feature = "shacl-core")]
+                let replication = ReplicationEngine::new_with_shacl(
+                    self.store.clone(),
+                    self.sparql.clone(),
+                    actor,
+                    self.shacl.clone(),
+                );
+                #[cfg(not(feature = "shacl-core"))]
+                let replication =
+                    ReplicationEngine::new(self.store.clone(), self.sparql.clone(), actor);
+                RoCrateManager::new(Arc::new(replication))
+            }
         }
     }
 

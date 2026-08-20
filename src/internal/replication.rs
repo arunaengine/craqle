@@ -16,6 +16,12 @@ pub enum UpdateError {
     Sparql(#[from] crate::sparql::SparqlError),
     #[error("validation failed: {0:?}")]
     ValidationFailed(Vec<CrateViolation>),
+    #[cfg(feature = "shacl-core")]
+    #[error("shacl: {0}")]
+    Shacl(#[from] crate::ShaclError),
+    #[cfg(feature = "shacl-core")]
+    #[error("SHACL validation failed for {} schema(s)", .0.len())]
+    ShaclValidationFailed(Vec<crate::ShaclValidationReport>),
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
     #[error("store: {0}")]
@@ -76,6 +82,8 @@ pub(crate) struct ReplicationEngine {
     rules: Vec<Box<dyn Rule>>,
     actor: ActorId,
     sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+    #[cfg(feature = "shacl-core")]
+    shacl: Arc<crate::shacl_impl::ShaclCompiler>,
     /// Set by a test to fail the next replicated apply with a store error,
     /// standing in for a transient fjall failure. Per-engine rather than global
     /// so concurrent tests cannot arm each other's nodes.
@@ -113,15 +121,62 @@ struct LocalCommit<'a> {
 }
 
 impl ReplicationEngine {
+    #[cfg(any(not(feature = "shacl-core"), test))]
     pub(crate) fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
-        Self::new_with_sync(store, sparql, actor, None)
+        #[cfg(feature = "shacl-core")]
+        {
+            let shacl = Arc::new(crate::shacl_impl::ShaclCompiler::new(store.clone()));
+            Self::new_sync_shacl(store, sparql, actor, None, shacl)
+        }
+        #[cfg(not(feature = "shacl-core"))]
+        {
+            Self::new_with_sync(store, sparql, actor, None)
+        }
     }
 
+    #[cfg(any(not(feature = "shacl-core"), test))]
     pub(crate) fn new_with_sync(
         store: Arc<GraphStore>,
         sparql: Arc<SparqlEngine>,
         actor: ActorId,
         sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+    ) -> Self {
+        #[cfg(feature = "shacl-core")]
+        {
+            let shacl = Arc::new(crate::shacl_impl::ShaclCompiler::new(store.clone()));
+            Self::new_sync_shacl(store, sparql, actor, sync, shacl)
+        }
+        #[cfg(not(feature = "shacl-core"))]
+        {
+            Self {
+                store,
+                sparql,
+                rules: crate::rules::default_rules(),
+                actor,
+                sync,
+                #[cfg(test)]
+                armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn new_with_shacl(
+        store: Arc<GraphStore>,
+        sparql: Arc<SparqlEngine>,
+        actor: ActorId,
+        shacl: Arc<crate::shacl_impl::ShaclCompiler>,
+    ) -> Self {
+        Self::new_sync_shacl(store, sparql, actor, None, shacl)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn new_sync_shacl(
+        store: Arc<GraphStore>,
+        sparql: Arc<SparqlEngine>,
+        actor: ActorId,
+        sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
+        shacl: Arc<crate::shacl_impl::ShaclCompiler>,
     ) -> Self {
         Self {
             store,
@@ -129,6 +184,7 @@ impl ReplicationEngine {
             rules: crate::rules::default_rules(),
             actor,
             sync,
+            shacl,
             #[cfg(test)]
             armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
         }
