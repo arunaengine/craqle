@@ -22,6 +22,7 @@ use super::model::{
     COMPILED_SHACL_FORMAT_VERSION, CompiledSchemaInner, CompiledShape, ConstraintPlan, MessagePlan,
     NodeKindPlan, PathPlan, SeverityPlan, ShapeId, ShapeKind, TargetPlan,
 };
+use super::resolve::{ResolvedSchema, resolve};
 
 const CACHE_CAPACITY: usize = 32;
 const EXTENSION_PROFILE: u32 = 0;
@@ -50,6 +51,7 @@ struct CacheKey {
 pub(crate) struct ShaclCompiler {
     store: Arc<GraphStore>,
     cache: Mutex<HashMap<CacheKey, Arc<CompiledSchemaInner>>>,
+    resolved_cache: Mutex<HashMap<[u8; 32], Arc<ResolvedSchema>>>,
 }
 
 impl ShaclCompiler {
@@ -57,6 +59,7 @@ impl ShaclCompiler {
         Self {
             store,
             cache: Mutex::new(HashMap::new()),
+            resolved_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -140,6 +143,28 @@ impl ShaclCompiler {
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        schema: &CompiledShaclSchema,
+    ) -> Result<(Arc<ResolvedSchema>, bool, std::time::Duration)> {
+        let fingerprint = schema.inner.plan_fingerprint();
+        let mut cache = self
+            .resolved_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(resolved) = cache.get(&fingerprint) {
+            return Ok((resolved.clone(), true, std::time::Duration::ZERO));
+        }
+        let start = Instant::now();
+        let resolved = Arc::new(resolve(&self.store, schema.inner.clone())?);
+        let resolve_time = start.elapsed();
+        if cache.len() >= CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(fingerprint, resolved.clone());
+        Ok((resolved, false, resolve_time))
     }
 }
 
