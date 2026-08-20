@@ -222,7 +222,7 @@ fn severity_term(severity: &Severity) -> String {
     format!("<{SH}{local}>")
 }
 
-fn assert_native_matches_rudof(shape_text: &str, data_text: &str) {
+fn native_matches_rudof(shape_text: &str, data_text: &str) {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:matrix:shapes");
     let data = GraphId::new("urn:test:shacl:native:matrix:data");
@@ -248,7 +248,7 @@ fn assert_native_matches_rudof(shape_text: &str, data_text: &str) {
 }
 
 #[test]
-fn native_cardinality_and_has_value_use_bounded_direct_reads() {
+fn native_bounded_reads() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:cardinality:shapes");
     let data = GraphId::new("urn:test:shacl:native:cardinality:data");
@@ -313,7 +313,7 @@ fn native_cardinality_and_has_value_use_bounded_direct_reads() {
 }
 
 #[test]
-fn native_value_constraints_emit_complete_deterministic_results() {
+fn native_value_results() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:values:shapes");
     let data = GraphId::new("urn:test:shacl:native:values:data");
@@ -369,7 +369,7 @@ fn native_value_constraints_emit_complete_deterministic_results() {
 }
 
 #[test]
-fn native_inverse_sequence_and_repeating_paths_enforce_budgets() {
+fn native_path_budgets() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:paths:shapes");
     let data = GraphId::new("urn:test:shacl:native:paths:data");
@@ -452,7 +452,7 @@ fn native_inverse_sequence_and_repeating_paths_enforce_budgets() {
 }
 
 #[test]
-fn native_validation_cancellation_and_result_limits_are_errors() {
+fn native_validation_limits() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:limits:shapes");
     let data = GraphId::new("urn:test:shacl:native:limits:data");
@@ -520,7 +520,7 @@ fn native_validation_cancellation_and_result_limits_are_errors() {
 }
 
 #[test]
-fn native_targets_and_closed_shapes_report_only_the_violating_terms() {
+fn native_target_violations() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:targets:shapes");
     let data = GraphId::new("urn:test:shacl:native:targets:data");
@@ -644,7 +644,7 @@ fn native_targets_and_closed_shapes_report_only_the_violating_terms() {
 }
 
 #[test]
-fn native_report_matches_rudof_for_supported_named_shape_fixture() {
+fn native_report_matches() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:differential:shapes");
     let data = GraphId::new("urn:test:shacl:native:differential:data");
@@ -703,7 +703,7 @@ fn native_report_matches_rudof_for_supported_named_shape_fixture() {
 }
 
 #[test]
-fn native_string_language_class_and_in_constraints_match_rudof() {
+fn native_string_constraints() {
     let root = iri("urn:test:matrix:root");
     let text_shape = iri("urn:test:matrix:text-shape");
     let language_shape = iri("urn:test:matrix:language-shape");
@@ -800,11 +800,11 @@ fn native_string_language_class_and_in_constraints_match_rudof() {
         iri("urn:test:matrix:untyped"),
         literal("three"),
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_numeric_boundaries_match_rudof() {
+fn native_numeric_bounds() {
     let root = iri("urn:test:numeric:root");
     let property = iri("urn:test:numeric:property-shape");
     let focus = iri("urn:test:numeric:focus");
@@ -841,11 +841,11 @@ fn native_numeric_boundaries_match_rudof() {
         integer(20),
         literal("not-an-integer"),
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_property_pair_constraints_match_rudof() {
+fn native_pair_constraints() {
     let root = iri("urn:test:pairs:root");
     let set_shape = iri("urn:test:pairs:set-shape");
     let less_shape = iri("urn:test:pairs:less-shape");
@@ -910,11 +910,11 @@ fn native_property_pair_constraints_match_rudof() {
         integer(3),
         integer(3),
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_logical_and_qualified_constraints_match_rudof() {
+fn native_logical_constraints() {
     let root = iri("urn:test:logical:root");
     let property = iri("urn:test:logical:property");
     let class_a_shape = iri("urn:test:logical:class-a-shape");
@@ -970,7 +970,7 @@ fn native_logical_and_qualified_constraints_match_rudof() {
         "{focus} {predicate} {value} .\n\
          {value} {RDF_TYPE} {class_a} .\n"
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 
     let qualified_root = iri("urn:test:qualified:root");
     let qualified_property = iri("urn:test:qualified:property");
@@ -1007,11 +1007,11 @@ fn native_logical_and_qualified_constraints_match_rudof() {
          {value} {RDF_TYPE} {class_a} .\n\
          {other_value} {RDF_TYPE} {class_b} .\n"
     );
-    assert_native_matches_rudof(&qualified_shape_text, &qualified_data_text);
+    native_matches_rudof(&qualified_shape_text, &qualified_data_text);
 }
 
 #[test]
-fn native_all_core_path_forms_match_rudof() {
+fn native_path_forms() {
     let root = iri("urn:test:paths:root");
     let focus = iri("urn:test:paths:focus");
     let inverse_shape = iri("urn:test:paths:inverse-shape");
@@ -1112,11 +1112,11 @@ fn native_all_core_path_forms_match_rudof() {
          {middle} {p2} {end} .\n\
          {focus} {p3} {alternative} .\n"
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_all_core_target_forms_match_rudof() {
+fn native_target_forms() {
     let required = iri("urn:test:targets:required");
     let class = iri("urn:test:targets:Class");
     let implicit_class = iri("urn:test:targets:ImplicitClass");
@@ -1172,11 +1172,11 @@ fn native_all_core_target_forms_match_rudof() {
          {node_focus} <urn:test:targets:present> {} .\n",
         literal("value")
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_deactivated_shapes_are_skipped() {
+fn skip_deactivated_shapes() {
     let root = iri("urn:test:deactivated:shape");
     let focus = iri("urn:test:deactivated:focus");
     let shape_text = format!(
@@ -1191,11 +1191,11 @@ fn native_deactivated_shapes_are_skipped() {
         iri("urn:test:deactivated:MissingClass"),
     );
     let data_text = format!("{focus} <urn:test:present> {} .\n", literal("value"));
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_logical_cycles_are_rejected_during_compilation() {
+fn reject_logical_cycles() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:cycle:shapes");
     let shape = iri("urn:test:cycle:shape");
@@ -1219,7 +1219,7 @@ fn native_logical_cycles_are_rejected_during_compilation() {
 }
 
 #[test]
-fn native_blank_literal_empty_duplicate_and_closed_cases_match_rudof() {
+fn native_edge_cases() {
     let root = iri("urn:test:mixed:root");
     let focus = iri("urn:test:mixed:focus");
     let iri_shape = iri("urn:test:mixed:iri-shape");
@@ -1289,11 +1289,11 @@ fn native_blank_literal_empty_duplicate_and_closed_cases_match_rudof() {
         literal("not-an-iri"),
         literal("closed violation"),
     );
-    assert_native_matches_rudof(&shape_text, &data_text);
+    native_matches_rudof(&shape_text, &data_text);
 }
 
 #[test]
-fn native_max_count_one_reads_at_most_two_values() {
+fn bounded_max_count() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:max-count:shapes");
     let data = GraphId::new("urn:test:shacl:native:max-count:data");
