@@ -5,6 +5,7 @@ resolver = "3"
 # RDF ecosystem
 oxrdf = { version = "0.3.3", features = ["serde"] }
 oxjsonld = "0.2.5"
+oxsdatatypes = "0.2.2"
 spargebra = "0.4.6"
 spareval = { version = "0.2.6", features = ["sep-0006"] }
 
@@ -27,6 +28,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 
 # Hashing
 blake3 = "1.8.6"
+regex = "1.13.1"
 
 # Error handling
 thiserror = "2.0.20"
@@ -60,7 +62,13 @@ license = "MIT"
 default = ["search"]
 search = ["dep:tantivy"]
 iroh = ["irokle/iroh"]
-shacl-core = ["dep:shacl", "dep:rudof_rdf", "dep:rudof_iri"]
+shacl-core = [
+    "dep:shacl",
+    "dep:rudof_rdf",
+    "dep:rudof_iri",
+    "dep:regex",
+    "dep:oxsdatatypes",
+]
 
 [dependencies]
 blake3 = { workspace = true }
@@ -71,8 +79,10 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", f
 ] }
 oxrdf = { workspace = true }
 oxjsonld = { workspace = true }
+oxsdatatypes = { workspace = true, optional = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
+regex = { workspace = true, optional = true }
 shacl = { version = "=0.3.8", default-features = false, optional = true }
 rudof_rdf = { version = "=0.3.8", default-features = false, optional = true }
 rudof_iri = { version = "=0.3.8", default-features = false, optional = true }
