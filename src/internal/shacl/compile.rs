@@ -635,7 +635,7 @@ impl ShaclCompiler {
         }
 
         let affected_shapes = affected.iter().filter(|affected| **affected).count() as u64;
-        let Some(data_quads) = base.qv_g_count(context, graph)? else {
+        let Some(base_quads) = base.qv_g_count(context, graph)? else {
             return Ok(ExecutionEstimate {
                 delta_work: u64::MAX,
                 full_work: u64::MAX,
@@ -644,7 +644,7 @@ impl ShaclCompiler {
                 full_required: true,
             });
         };
-        let data_quads = candidate_count(data_quads, changes, None, None);
+        let data_quads = candidate_count(base_quads, changes, None, None);
         let mut full_targets = vec![0u64; schema.portable.shapes.len()];
         for (index, shape) in schema.portable.shapes.iter().enumerate() {
             for target in &shape.targets {
@@ -677,6 +677,18 @@ impl ShaclCompiler {
                 break;
             }
         }
+        let broad_targets = schema
+            .portable
+            .shapes
+            .iter()
+            .flat_map(|shape| shape.targets.iter())
+            .filter(|target| !matches!(target, TargetPlan::Node(_)))
+            .count();
+        let broad_targets = u64::try_from(broad_targets).unwrap_or(u64::MAX);
+        let scan_work = base_quads
+            .checked_mul(broad_targets)
+            .and_then(|work| work.checked_add(SCAN_DIV.saturating_sub(1)))
+            .map_or(u64::MAX, |work| work / SCAN_DIV);
         let full_work = schema
             .portable
             .shapes
@@ -689,6 +701,7 @@ impl ShaclCompiler {
                     work.saturating_add(full_targets[index].saturating_mul(shape_work(shape)))
                 },
             )
+            .saturating_add(scan_work)
             .saturating_add((schema.portable.shapes.len() as u64).saturating_mul(FULL_SHAPE_WORK));
         let mut delta_work = (changes.len() as u64).saturating_mul(2).max(1);
         for (index, shape) in schema.portable.shapes.iter().enumerate() {
@@ -976,6 +989,7 @@ fn shape_work(shape: &CompiledShape) -> u64 {
 }
 
 const FULL_SHAPE_WORK: u64 = 20;
+const SCAN_DIV: u64 = 8;
 
 #[allow(clippy::too_many_arguments)]
 fn select_incremental_targets<V: RdfReadView>(

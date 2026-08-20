@@ -1,10 +1,10 @@
 #![cfg(feature = "shacl-core")]
 
 use craqle::{
-    ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
-    MaterializedQuadChange, ShaclBinding, ShaclBindingOptions, ShaclCompileOptions, ShaclError,
-    ShaclExecutionMode, ShaclValidationOptions, ShaclValidationState, UpdateError,
-    ValidationPolicy,
+    ActorId, AllowAllAuthorizer, CompiledShaclSchema, CraqleError, CraqleNode, CraqleOptions,
+    EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding, ShaclBindingOptions,
+    ShaclCompileOptions, ShaclError, ShaclExecutionMode, ShaclValidationOptions,
+    ShaclValidationState, UpdateError, ValidationPolicy,
 };
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
@@ -509,6 +509,137 @@ fn auto_selects_paths() {
         assert!(auto.statistics.estimated_delta_work > auto.statistics.estimated_full_work);
         assert_eq!(auto.results, full.results, "batch {count}");
     }
+}
+
+fn auto_graph(
+    label: &str,
+    rows: usize,
+) -> (tempfile::TempDir, CraqleNode, GraphId, CompiledShaclSchema) {
+    let (directory, node) = node();
+    let data = GraphId::new(&format!("urn:test:auto-size-{label}"));
+    let shapes = GraphId::new(&format!("urn:test:auto-size-{label}-shapes"));
+    insert_shapes(&node, &shapes);
+    let seed = (0..rows)
+        .map(|index| {
+            change(
+                &data,
+                true,
+                &format!("urn:test:auto-size-{label}-{index}"),
+                "urn:test:noise",
+                "urn:test:auto-noise",
+            )
+        })
+        .collect();
+    node.apply_changes_unchecked(&data, seed).unwrap();
+    let schema = node
+        .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    node.validate_shacl(&AUTH, &data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    (directory, node, data, schema)
+}
+
+#[test]
+fn auto_scales() {
+    let (_small_dir, small_node, small_data, small_schema) = auto_graph("small", 128);
+    let (_large_dir, large_node, large_data, large_schema) = auto_graph("large", 8_192);
+    let changes = |data: &GraphId, count: usize| {
+        (0..count)
+            .map(|index| {
+                change(
+                    data,
+                    true,
+                    &format!("urn:test:auto-change-{count}-{index}"),
+                    "urn:test:value",
+                    "urn:test:auto-value",
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let small = small_node
+        .validate_shacl_delta(
+            &AUTH,
+            &small_data,
+            &small_schema,
+            &changes(&small_data, 100),
+            &ShaclValidationOptions::default(),
+        )
+        .unwrap();
+    let large_delta = large_node
+        .validate_shacl_delta(
+            &AUTH,
+            &large_data,
+            &large_schema,
+            &changes(&large_data, 100),
+            &mode_options(ShaclExecutionMode::ForceDelta),
+        )
+        .unwrap();
+    let large_full = large_node
+        .validate_shacl_delta(
+            &AUTH,
+            &large_data,
+            &large_schema,
+            &changes(&large_data, 100),
+            &mode_options(ShaclExecutionMode::ForceFull),
+        )
+        .unwrap();
+    let large = large_node
+        .validate_shacl_delta(
+            &AUTH,
+            &large_data,
+            &large_schema,
+            &changes(&large_data, 100),
+            &ShaclValidationOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(large_delta.results, large_full.results);
+    assert_eq!(large_delta.conforms, large_full.conforms);
+    assert_eq!(large.results, large_delta.results);
+    assert_eq!(large.conforms, large_delta.conforms);
+    assert!(large.statistics.estimated_full_work > small.statistics.estimated_full_work);
+    assert_eq!(
+        large.statistics.selected_mode,
+        ShaclExecutionMode::ForceDelta
+    );
+
+    let batch = changes(&large_data, 1_000);
+    let large_batch_delta = large_node
+        .validate_shacl_delta(
+            &AUTH,
+            &large_data,
+            &large_schema,
+            &batch,
+            &mode_options(ShaclExecutionMode::ForceDelta),
+        )
+        .unwrap();
+    let large_batch_full = large_node
+        .validate_shacl_delta(
+            &AUTH,
+            &large_data,
+            &large_schema,
+            &batch,
+            &mode_options(ShaclExecutionMode::ForceFull),
+        )
+        .unwrap();
+    let large_batch = large_node
+        .validate_shacl_delta(
+            &AUTH,
+            &large_data,
+            &large_schema,
+            &batch,
+            &ShaclValidationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(large_batch_delta.results, large_batch_full.results);
+    assert_eq!(large_batch_delta.conforms, large_batch_full.conforms);
+    assert_eq!(large_batch.results, large_batch_delta.results);
+    assert_eq!(large_batch.conforms, large_batch_delta.conforms);
+    assert_eq!(
+        large_batch.statistics.selected_mode,
+        ShaclExecutionMode::ForceFull
+    );
 }
 
 #[test]
