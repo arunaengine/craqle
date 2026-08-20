@@ -825,13 +825,11 @@ impl<'a> GraphPartitionedLoader<'a> {
     fn push(&mut self, graph_index: usize, change: MaterializedQuadChange) {
         self.partitions[graph_index].push(change);
         self.pending_changes += 1;
-        if self.partitions[graph_index].len() >= LOAD_BATCH_SIZE
-            || self.pending_changes >= LOAD_BATCH_SIZE
-        {
+        if self.partitions[graph_index].len() >= LOAD_BATCH_SIZE {
             self.flush_graph(graph_index);
         }
         assert!(
-            self.pending_changes < LOAD_BATCH_SIZE,
+            self.pending_changes < LOAD_BATCH_SIZE * self.partitions.len(),
             "the pending graph-partitioned loader buffer exceeded its fixed cap"
         );
     }
