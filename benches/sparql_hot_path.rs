@@ -28,6 +28,7 @@ fn print_alloc(fixture: &Fixture, index: usize, mode: craqle::QueryReadMode) {
 
 fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     let fixture = Fixture::from_environment();
+    fixture.print_provenance("sparql_hot_path");
     // This untimed sweep checks every result and deterministically warms the
     // completed-result path before Criterion begins collecting samples.
     let report = fixture.assert_semantics();

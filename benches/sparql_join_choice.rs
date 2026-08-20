@@ -1,9 +1,10 @@
 use std::env;
 use std::hint::black_box;
-use std::time::Duration;
 
 #[path = "support/allocation.rs"]
 mod allocation;
+#[path = "support/mod.rs"]
+mod support;
 
 use allocation::AllocationInterval;
 use craqle::{
@@ -11,6 +12,7 @@ use craqle::{
     MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use support::fixture::{binary_blake3, env_duration, repository_commit};
 
 const LOAD_BATCH_SIZE: usize = 1_000;
 
@@ -204,10 +206,29 @@ fn sparql_join_choice(c: &mut Criterion) {
         sample_size >= 10,
         "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
     );
+    let warm_up = env_duration("CRAQLE_BENCH_WARMUP_SECS", 1);
+    let measurement = env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5);
+    let mut fixture_hasher = blake3::Hasher::new();
+    fixture_hasher.update(b"craqle-sparql-join-choice-v1");
+    fixture_hasher.update(&(rows as u64).to_le_bytes());
+    fixture_hasher.update(&(distinct_keys as u64).to_le_bytes());
+    fixture_hasher.update(&(LOAD_BATCH_SIZE as u64).to_le_bytes());
+    eprintln!(
+        "sparql_join_choice provenance: commit={} binary_blake3={} fixture_digest={} \
+         rows={} distinct_keys={} sample_size={} warmup_secs={} measurement_secs={}",
+        repository_commit(),
+        binary_blake3(),
+        fixture_hasher.finalize().to_hex(),
+        rows,
+        distinct_keys,
+        sample_size,
+        warm_up.as_secs(),
+        measurement.as_secs(),
+    );
     let mut group = c.benchmark_group("sparql_join_choice");
     group.sample_size(sample_size);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(5));
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
     group.throughput(Throughput::Elements(rows as u64));
     for (label, mode) in [
         ("forced_lateral", JoinMode::ForceLateral),

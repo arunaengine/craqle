@@ -127,6 +127,7 @@ fn assert_modes(fixture: &Fixture, case: &ScalingCase) {
 
 fn query_path_scaling(c: &mut Criterion) {
     let fixture = Fixture::from_environment();
+    fixture.print_provenance("sparql_access_path_scaling");
     let pattern = fixture.late_rare_pattern();
     let cases = [
         ScalingCase {

@@ -449,6 +449,26 @@ impl Fixture {
         &self.metrics.fixture_digest
     }
 
+    pub fn print_provenance(&self, benchmark: &str) {
+        let metadata = self.config.corpus.metadata();
+        println!(
+            "{benchmark} provenance: commit={} binary_blake3={} fixture_digest={} \
+             corpus_version={} seed={:#x} quads={} graphs={} duplicate_percent={} \
+             sample_size={} warmup_secs={} measurement_secs={}",
+            repository_commit(),
+            binary_blake3(),
+            self.fixture_digest(),
+            CORPUS_VERSION,
+            metadata.seed,
+            metadata.quads,
+            metadata.graphs,
+            metadata.duplicate_percent,
+            self.config.sample_size,
+            self.config.warm_up.as_secs(),
+            self.config.measurement.as_secs(),
+        );
+    }
+
     pub fn node(&self) -> &CraqleNode {
         &self.node
     }
@@ -1081,7 +1101,7 @@ fn retry_missing<T>(mut read: impl FnMut() -> std::io::Result<T>) -> std::io::Re
     Ok(None)
 }
 
-fn repository_commit() -> String {
+pub fn repository_commit() -> String {
     env::var("CRAQLE_GIT_COMMIT")
         .ok()
         .or_else(|| option_env!("CRAQLE_GIT_COMMIT").map(str::to_owned))
@@ -1097,6 +1117,14 @@ fn repository_commit() -> String {
         })
         .filter(|commit| !commit.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub fn binary_blake3() -> String {
+    env::current_exe()
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -1119,7 +1147,7 @@ fn env_u8(name: &str, default: u8) -> u8 {
     }
 }
 
-fn env_duration(name: &str, default_seconds: u64) -> Duration {
+pub fn env_duration(name: &str, default_seconds: u64) -> Duration {
     let seconds = match env::var(name) {
         Ok(value) => value
             .parse::<u64>()
