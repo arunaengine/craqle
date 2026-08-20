@@ -3,14 +3,10 @@
 //! Rewrites the spargebra AST before it is handed to spareval, using the
 //! store's real cardinality statistics instead of sparopt's static guesses:
 //!
-//! * Triple patterns inside each BGP are reordered by estimated cardinality
-//!   and emitted as an explicit left-deep `Lateral` chain. sparopt never
-//!   reorders across lateral boundaries, so the chain locks both the join
-//!   order and the for-loop (index nested loop) join strategy. This also
-//!   makes OPTIONAL bodies "fit" for sparopt's ForLoopLeftJoin conversion
-//!   (multi-pattern bodies otherwise stay hash joins that materialize their
-//!   full build side) and fixes EXISTS bodies, which sparopt never reorders
-//!   at all (they otherwise run as per-row cartesian products).
+//! * Triple patterns inside each BGP are reordered by estimated cardinality.
+//!   Selective outer inputs remain explicit `Lateral` chains; broad repeated
+//!   probes become hash joins. This also keeps OPTIONAL and EXISTS bodies
+//!   ordered using their already-bound outer variables.
 //! * `FILTER(?v = <iri>)`, `FILTER(?v = "string")` and `FILTER(sameTerm(...))`
 //!   over a BGP are folded into the patterns as bound terms (index lookups),
 //!   with an Extend re-binding the variable. Numeric/value equality is never
@@ -24,7 +20,7 @@
 //! property paths, sub-SELECTs, SERVICE bodies) is left untouched: the pass
 //! only recurses into those nodes, it never moves work across them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use oxrdf::vocab::xsd;
@@ -35,6 +31,47 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
 use crate::store::GraphStore;
+
+/// Test and benchmark control for connected BGP join selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JoinMode {
+    #[default]
+    Auto,
+    ForceLateral,
+    ForceHash,
+    ForcePropertyStar,
+}
+
+/// Physical join selected for one connected BGP edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum JoinKind {
+    IndexedLateral,
+    Hash,
+    PropertyStar,
+}
+
+/// Planner estimates recorded for one physical join decision.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlannedJoin {
+    pub physical_operator: JoinKind,
+    pub estimated_left_rows: u64,
+    pub estimated_right_rows: u64,
+    pub estimated_distinct_join_keys: u64,
+    pub estimated_output_rows: u64,
+    pub estimated_lateral_cost: u64,
+    pub estimated_hash_cost: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PlannerError {
+    #[error("forced join mode {0:?} cannot represent this query")]
+    ForcedModeUnavailable(JoinMode),
+}
+
+#[derive(Default)]
+pub(crate) struct PlannerTrace {
+    pub(crate) joins: Vec<PlannedJoin>,
+}
 
 /// State shared by one `optimize_query` pass.
 ///
@@ -50,13 +87,21 @@ use crate::store::GraphStore;
 struct PlanCtx<'a> {
     store: &'a GraphStore,
     term_ids: RefCell<HashMap<EncodedTerm, Option<u128>>>,
+    join_mode: JoinMode,
+    forced_mode_used: Cell<bool>,
+    error: RefCell<Option<PlannerError>>,
+    planned_joins: RefCell<Vec<PlannedJoin>>,
 }
 
 impl<'a> PlanCtx<'a> {
-    fn new(store: &'a GraphStore) -> Self {
+    fn new(store: &'a GraphStore, join_mode: JoinMode) -> Self {
         Self {
             store,
             term_ids: RefCell::new(HashMap::new()),
+            join_mode,
+            forced_mode_used: Cell::new(false),
+            error: RefCell::new(None),
+            planned_joins: RefCell::new(Vec::new()),
         }
     }
 }
@@ -71,8 +116,18 @@ const COST_CONST_P_BOUND_O: u64 = 4;
 const COST_BOUND_O: u64 = 8;
 const COST_BOUND_ONLY_P: u64 = 1 << 20;
 
+#[cfg(test)]
 pub(crate) fn optimize_query(query: &mut Query, store: &GraphStore) {
-    let cx = PlanCtx::new(store);
+    optimize_query_with_mode(query, store, JoinMode::Auto)
+        .expect("automatic join planning must always have a fallback");
+}
+
+pub(crate) fn optimize_query_with_mode(
+    query: &mut Query,
+    store: &GraphStore,
+    join_mode: JoinMode,
+) -> Result<PlannerTrace, PlannerError> {
+    let cx = PlanCtx::new(store, join_mode);
     match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
@@ -87,6 +142,15 @@ pub(crate) fn optimize_query(query: &mut Query, store: &GraphStore) {
             *pattern = optimize_pattern(current, &HashSet::new(), &cx);
         }
     }
+    if let Some(error) = cx.error.into_inner() {
+        return Err(error);
+    }
+    if !matches!(join_mode, JoinMode::Auto) && !cx.forced_mode_used.get() {
+        return Err(PlannerError::ForcedModeUnavailable(join_mode));
+    }
+    Ok(PlannerTrace {
+        joins: cx.planned_joins.into_inner(),
+    })
 }
 
 /// Variables and blank nodes share a key space; blank nodes in query position
@@ -233,10 +297,14 @@ fn optimize_pattern(
             left: Box::new(optimize_pattern(*left, bound, cx)),
             right: Box::new(optimize_pattern(*right, bound, cx)),
         },
-        GraphPattern::Graph { name, inner } => GraphPattern::Graph {
-            name,
-            inner: Box::new(optimize_pattern(*inner, bound, cx)),
-        },
+        GraphPattern::Graph { name, inner } => {
+            let mut inner_bound = bound.clone();
+            inner_bound.extend(predicate_var_key(&name));
+            GraphPattern::Graph {
+                name,
+                inner: Box::new(optimize_pattern(*inner, &inner_bound, cx)),
+            }
+        }
         GraphPattern::Extend {
             inner,
             variable,
@@ -698,22 +766,247 @@ fn estimate_pattern(
     })
 }
 
-fn lateral_chain(patterns: Vec<TriplePattern>) -> GraphPattern {
-    patterns
-        .into_iter()
-        .map(|pattern| GraphPattern::Bgp {
-            patterns: vec![pattern],
-        })
-        .reduce(|left, right| GraphPattern::Lateral {
-            left: Box::new(left),
-            right: Box::new(right),
-        })
-        .expect("non-empty pattern chain")
+const INDEXED_LOOKUP_COST: u64 = 8;
+const HASH_MIN_OUTER_ROWS: u64 = 256;
+
+fn pattern_variables(pattern: &TriplePattern) -> Option<Vec<oxrdf::Variable>> {
+    let mut variables = HashMap::new();
+    let mut insert_term = |term: &TermPattern| match term {
+        TermPattern::Variable(variable) => {
+            variables.insert(variable.as_str().to_owned(), variable.clone());
+            true
+        }
+        TermPattern::BlankNode(_) => false,
+        _ => true,
+    };
+    if !insert_term(&pattern.subject) || !insert_term(&pattern.object) {
+        return None;
+    }
+    if let NamedNodePattern::Variable(variable) = &pattern.predicate {
+        variables.insert(variable.as_str().to_owned(), variable.clone());
+    }
+    let mut variables: Vec<_> = variables.into_values().collect();
+    variables.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    Some(variables)
 }
 
-/// Stats-driven greedy ordering of a BGP, emitted as an explicit lateral
-/// chain per connected component (components joined by Join nodes so large
-/// disconnected products keep sparopt's hash/cartesian strategy).
+fn projected_pattern(pattern: TriplePattern, variables: Vec<oxrdf::Variable>) -> GraphPattern {
+    GraphPattern::Project {
+        inner: Box::new(GraphPattern::Bgp {
+            patterns: vec![pattern],
+        }),
+        variables,
+    }
+}
+
+fn projected_node(node: GraphPattern, mut variables: Vec<oxrdf::Variable>) -> GraphPattern {
+    variables.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    variables.dedup_by(|left, right| left.as_str() == right.as_str());
+    GraphPattern::Project {
+        inner: Box::new(node),
+        variables,
+    }
+}
+
+fn include_bound_variables(variables: &mut Vec<oxrdf::Variable>, bound: &HashSet<String>) {
+    variables.extend(
+        bound
+            .iter()
+            .filter_map(|name| oxrdf::Variable::new(name).ok()),
+    );
+    variables.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    variables.dedup_by(|left, right| left.as_str() == right.as_str());
+}
+
+fn estimate_variable_distinct(
+    pattern: &TriplePattern,
+    variable: &str,
+    rows: u64,
+    cx: &PlanCtx<'_>,
+) -> u64 {
+    let subject = term_var_key(&pattern.subject).is_some_and(|key| key == variable);
+    let object = term_var_key(&pattern.object).is_some_and(|key| key == variable);
+    let predicate = match &pattern.predicate {
+        NamedNodePattern::NamedNode(node) => {
+            match const_slot(cx, &EncodedTerm::from_named_node(node)) {
+                Slot::Const(Some(id)) => Some(crate::store::TermId(id)),
+                _ => None,
+            }
+        }
+        NamedNodePattern::Variable(_) => None,
+    };
+    let estimate = match (subject, object) {
+        (true, false) => predicate.map_or_else(
+            || cx.store.stat_distinct_subject_count(),
+            |predicate| cx.store.stat_predicate_distinct_subject_count(predicate),
+        ) as u64,
+        (false, true) => predicate.map_or_else(
+            || cx.store.stat_distinct_object_count(),
+            |predicate| cx.store.stat_predicate_distinct_object_count(predicate),
+        ) as u64,
+        _ => rows,
+    };
+    estimate.min(rows).max(u64::from(rows > 0))
+}
+
+fn ceil_div(left: u64, right: u64) -> u64 {
+    if left == 0 {
+        return 0;
+    }
+    left.saturating_add(right.saturating_sub(1)) / right.max(1)
+}
+
+fn join_estimate(
+    left_rows: u64,
+    right_rows: u64,
+    left_distinct: u64,
+    right_distinct: u64,
+) -> PlannedJoin {
+    let distinct_keys = left_distinct.min(left_rows).max(u64::from(left_rows > 0));
+    let right_per_key = ceil_div(right_rows, right_distinct.max(1));
+    let output_rows = left_rows.saturating_mul(right_per_key);
+    let lateral_cost = left_rows
+        .saturating_add(left_rows.saturating_mul(INDEXED_LOOKUP_COST))
+        .saturating_add(output_rows);
+    let hash_cost = left_rows
+        .saturating_add(right_rows)
+        .saturating_add(output_rows);
+    PlannedJoin {
+        physical_operator: if hash_cost < lateral_cost {
+            JoinKind::Hash
+        } else {
+            JoinKind::IndexedLateral
+        },
+        estimated_left_rows: left_rows,
+        estimated_right_rows: right_rows,
+        estimated_distinct_join_keys: distinct_keys,
+        estimated_output_rows: output_rows,
+        estimated_lateral_cost: lateral_cost,
+        estimated_hash_cost: hash_cost,
+    }
+}
+
+fn physical_chain(
+    patterns: Vec<TriplePattern>,
+    bound: &HashSet<String>,
+    cx: &PlanCtx<'_>,
+) -> GraphPattern {
+    let mut patterns = patterns.into_iter();
+    let first = patterns.next().expect("non-empty pattern chain");
+    let mut left_rows = estimate_pattern(&first, bound, cx).unwrap_or(u64::MAX);
+    let mut left_distinct = HashMap::new();
+    for key in triple_var_keys(&first) {
+        let estimate =
+            if matches!(cx.join_mode, JoinMode::ForceHash) || left_rows >= HASH_MIN_OUTER_ROWS {
+                estimate_variable_distinct(&first, &key, left_rows, cx)
+            } else {
+                left_rows
+            };
+        left_distinct.insert(key, estimate);
+    }
+    let mut left_variables = pattern_variables(&first).map(|mut variables| {
+        include_bound_variables(&mut variables, bound);
+        variables
+    });
+    let mut node = GraphPattern::Bgp {
+        patterns: vec![first],
+    };
+
+    for pattern in patterns {
+        let right_rows = estimate_pattern(&pattern, bound, cx).unwrap_or(u64::MAX);
+        let right_variables = pattern_variables(&pattern).map(|mut variables| {
+            include_bound_variables(&mut variables, bound);
+            variables
+        });
+        let right_keys: HashSet<_> = triple_var_keys(&pattern).into_iter().collect();
+        let join_keys: Vec<_> = right_keys
+            .iter()
+            .filter(|key| left_distinct.contains_key(*key))
+            .cloned()
+            .collect();
+        let left_key_count = join_keys
+            .iter()
+            .filter_map(|key| left_distinct.get(key).copied())
+            .min()
+            .unwrap_or(left_rows);
+        let consider_hash = matches!(cx.join_mode, JoinMode::ForceHash)
+            || (matches!(cx.join_mode, JoinMode::Auto) && left_rows >= HASH_MIN_OUTER_ROWS);
+        let right_key_count = if consider_hash {
+            join_keys
+                .iter()
+                .map(|key| estimate_variable_distinct(&pattern, key, right_rows, cx))
+                .min()
+                .unwrap_or(right_rows)
+        } else {
+            right_rows
+        };
+        let mut estimate = join_estimate(left_rows, right_rows, left_key_count, right_key_count);
+        let hash_eligible =
+            !join_keys.is_empty() && left_variables.is_some() && right_variables.is_some();
+        estimate.physical_operator = match cx.join_mode {
+            JoinMode::Auto if hash_eligible && consider_hash => estimate.physical_operator,
+            JoinMode::Auto => JoinKind::IndexedLateral,
+            JoinMode::ForceLateral => {
+                cx.forced_mode_used.set(true);
+                JoinKind::IndexedLateral
+            }
+            JoinMode::ForceHash if hash_eligible => {
+                cx.forced_mode_used.set(true);
+                JoinKind::Hash
+            }
+            JoinMode::ForceHash | JoinMode::ForcePropertyStar => {
+                *cx.error.borrow_mut() = Some(PlannerError::ForcedModeUnavailable(cx.join_mode));
+                JoinKind::IndexedLateral
+            }
+        };
+
+        let right_node = GraphPattern::Bgp {
+            patterns: vec![pattern.clone()],
+        };
+        node = match estimate.physical_operator {
+            JoinKind::IndexedLateral | JoinKind::PropertyStar => GraphPattern::Lateral {
+                left: Box::new(node),
+                right: Box::new(right_node),
+            },
+            JoinKind::Hash => {
+                let projected_left = projected_node(
+                    node,
+                    left_variables.clone().expect("checked hash variables"),
+                );
+                let projected_right = projected_pattern(
+                    pattern.clone(),
+                    right_variables.clone().expect("checked hash variables"),
+                );
+                GraphPattern::Join {
+                    left: Box::new(projected_left),
+                    right: Box::new(projected_right),
+                }
+            }
+        };
+        cx.planned_joins.borrow_mut().push(estimate.clone());
+        left_rows = estimate.estimated_output_rows;
+        for key in right_keys {
+            let right = if consider_hash {
+                estimate_variable_distinct(&pattern, &key, right_rows, cx)
+            } else {
+                right_rows
+            };
+            left_distinct
+                .entry(key)
+                .and_modify(|left| *left = (*left).min(right).min(left_rows))
+                .or_insert(right.min(left_rows));
+        }
+        if let (Some(left), Some(right)) = (&mut left_variables, right_variables) {
+            left.extend(right);
+            left.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            left.dedup_by(|a, b| a.as_str() == b.as_str());
+        }
+    }
+    node
+}
+
+/// Stats-driven greedy ordering of a BGP with one physical decision per
+/// connected edge. Disconnected components remain ordinary joins.
 fn reorder_bgp(
     patterns: Vec<TriplePattern>,
     bound: &HashSet<String>,
@@ -816,7 +1109,7 @@ fn reorder_bgp(
     chains.sort_by_key(|(cost, first_index, _)| (*cost, *first_index));
     chains
         .into_iter()
-        .map(|(_, _, chain)| lateral_chain(chain))
+        .map(|(_, _, chain)| physical_chain(chain, bound, cx))
         .reduce(|left, right| GraphPattern::Join {
             left: Box::new(left),
             right: Box::new(right),
@@ -1058,5 +1351,84 @@ mod tests {
             }
         }
         assert!(has_join(select_pattern(&query)));
+    }
+
+    #[test]
+    fn join_cost_matrix_keeps_selective_probes_and_hashes_repeated_work() {
+        for outer_rows in [1, 10, 1_000, 100_000] {
+            for distinct_keys in [1, 10, 1_000, 100_000] {
+                for right_rows in [100, 100_000, 10_000_000] {
+                    let estimate = join_estimate(
+                        outer_rows,
+                        right_rows,
+                        distinct_keys.min(outer_rows),
+                        right_rows.min(100_000),
+                    );
+                    assert!(estimate.estimated_hash_cost >= estimate.estimated_output_rows);
+                    assert!(estimate.estimated_lateral_cost >= estimate.estimated_output_rows);
+                }
+            }
+        }
+
+        assert_eq!(
+            join_estimate(10, 100_000, 10, 100_000).physical_operator,
+            JoinKind::IndexedLateral
+        );
+        assert_eq!(
+            join_estimate(100_000, 100_000, 100_000, 100_000).physical_operator,
+            JoinKind::Hash
+        );
+    }
+
+    #[test]
+    fn forced_hash_and_lateral_emit_distinct_physical_shapes() {
+        let (_dir, store) = seeded_store();
+        let text = "SELECT ?d ?n WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> ?n }";
+
+        let mut hash = parse(text);
+        let hash_trace = optimize_query_with_mode(&mut hash, &store, JoinMode::ForceHash).unwrap();
+        assert_eq!(hash_trace.joins.len(), 1);
+        assert_eq!(hash_trace.joins[0].physical_operator, JoinKind::Hash);
+        fn has_guarded_hash(pattern: &GraphPattern) -> bool {
+            match pattern {
+                GraphPattern::Join { left, right }
+                    if matches!(left.as_ref(), GraphPattern::Project { .. })
+                        && matches!(right.as_ref(), GraphPattern::Project { .. }) =>
+                {
+                    true
+                }
+                GraphPattern::Project { inner, .. } => has_guarded_hash(inner),
+                _ => false,
+            }
+        }
+        assert!(has_guarded_hash(select_pattern(&hash)));
+
+        let mut lateral = parse(text);
+        let lateral_trace =
+            optimize_query_with_mode(&mut lateral, &store, JoinMode::ForceLateral).unwrap();
+        assert_eq!(lateral_trace.joins.len(), 1);
+        assert_eq!(
+            lateral_trace.joins[0].physical_operator,
+            JoinKind::IndexedLateral
+        );
+        assert!(first_lateral_leaf(select_pattern(&lateral)).is_some());
+    }
+
+    #[test]
+    fn forced_join_mode_never_silently_falls_back() {
+        let (_dir, store) = seeded_store();
+        let mut query = parse("SELECT ?d WHERE { ?d a <http://schema.org/Dataset> }");
+        assert!(matches!(
+            optimize_query_with_mode(&mut query, &store, JoinMode::ForceHash),
+            Err(PlannerError::ForcedModeUnavailable(JoinMode::ForceHash))
+        ));
+
+        let mut blank_join = parse(
+            "SELECT * WHERE { _:d a <http://schema.org/Dataset> . _:d <http://schema.org/name> ?n }",
+        );
+        assert!(matches!(
+            optimize_query_with_mode(&mut blank_join, &store, JoinMode::ForceHash),
+            Err(PlannerError::ForcedModeUnavailable(JoinMode::ForceHash))
+        ));
     }
 }

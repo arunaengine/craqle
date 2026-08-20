@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
+use crate::planner::{JoinMode, PlannedJoin, PlannerTrace};
 use crate::query_context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
@@ -24,6 +25,8 @@ pub enum SparqlError {
     Parse(String),
     #[error("evaluation error: {0}")]
     Evaluation(String),
+    #[error("query planning error: {0}")]
+    Planning(String),
     #[error("SPARQL query cancelled")]
     Cancelled,
     #[error("unsupported SPARQL feature: {0}")]
@@ -70,6 +73,7 @@ pub struct QueryExecutionOptions {
     pub cancellation: QueryCancellation,
     pub read_mode: QueryReadMode,
     pub optimize: bool,
+    pub join_mode: JoinMode,
 }
 
 impl Default for QueryExecutionOptions {
@@ -78,6 +82,7 @@ impl Default for QueryExecutionOptions {
             cancellation: QueryCancellation::new(),
             read_mode: QueryReadMode::Auto,
             optimize: planner_enabled(),
+            join_mode: JoinMode::Auto,
         }
     }
 }
@@ -98,6 +103,7 @@ pub struct QueryExecutionStatistics {
     pub execution_time: Duration,
     pub result_collection_time: Duration,
     pub time_to_first_internal_result: Option<Duration>,
+    pub planned_joins: Vec<PlannedJoin>,
     pub selected_access_paths: Vec<crate::query_context::ReadAccessPath>,
     pub plan_fingerprint: String,
     pub index_seeks: u64,
@@ -307,8 +313,8 @@ impl SparqlEngine {
         )?;
         let rewrite_time = rewrite_started.elapsed();
         let planning_started = Instant::now();
+        let planner_trace = plan_query(&mut query, &self.store, options)?;
         if options.optimize {
-            crate::planner::optimize_query(&mut query, &self.store);
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
         let craqle_planning_time = planning_started.elapsed();
@@ -323,6 +329,7 @@ impl SparqlEngine {
                 rewrite_time,
                 craqle_planning_time,
                 plan_fingerprint,
+                planner_trace,
             },
             collect_plan_statistics,
         )
@@ -363,6 +370,7 @@ impl SparqlEngine {
             cancellation: QueryCancellation::new(),
             read_mode,
             optimize,
+            join_mode: JoinMode::Auto,
         };
         let (execution, read_statistics) =
             self.execute_prepared_with_scope(&prepared, scope, &options, parse_time, false)?;
@@ -389,8 +397,8 @@ impl SparqlEngine {
         )?;
         let rewrite_time = rewrite_started.elapsed();
         let planning_started = Instant::now();
+        let planner_trace = plan_query(&mut query, &self.store, options)?;
         if options.optimize {
-            crate::planner::optimize_query(&mut query, &self.store);
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
         let craqle_planning_time = planning_started.elapsed();
@@ -406,6 +414,7 @@ impl SparqlEngine {
                 rewrite_time,
                 craqle_planning_time,
                 plan_fingerprint,
+                planner_trace,
             },
             collect_plan_statistics,
         )
@@ -588,6 +597,7 @@ struct QueryStageStatistics {
     rewrite_time: Duration,
     craqle_planning_time: Duration,
     plan_fingerprint: String,
+    planner_trace: PlannerTrace,
 }
 
 #[derive(Default)]
@@ -623,6 +633,25 @@ fn query_fingerprint(query: &Query) -> String {
     blake3::hash(query.to_string().as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn plan_query(
+    query: &mut Query,
+    store: &GraphStore,
+    options: &QueryExecutionOptions,
+) -> Result<PlannerTrace> {
+    if !options.optimize {
+        return if matches!(options.join_mode, JoinMode::Auto) {
+            Ok(PlannerTrace::default())
+        } else {
+            Err(SparqlError::Planning(format!(
+                "forced join mode {:?} requires query optimization",
+                options.join_mode
+            )))
+        };
+    }
+    crate::planner::optimize_query_with_mode(query, store, options.join_mode)
+        .map_err(|error| SparqlError::Planning(error.to_string()))
 }
 
 fn read_explanation_metrics(
@@ -686,6 +715,7 @@ fn build_execution_statistics(
             .saturating_add(collection.execution_time),
         result_collection_time: collection.collection_time,
         time_to_first_internal_result: collection.time_to_first_internal_result,
+        planned_joins: stages.planner_trace.joins,
         selected_access_paths: reads.selected_access_paths,
         plan_fingerprint: stages.plan_fingerprint,
         index_seeks: reads.index_seeks,
