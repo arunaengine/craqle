@@ -253,3 +253,349 @@ fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
 }
+
+fn compile_model(
+    schema: &IRSchema,
+    schema_hash: [u8; 32],
+    rocrate_version: RoCrateVersion,
+) -> Result<CompiledSchemaInner> {
+    let mut entries = Vec::new();
+    for (_, shape) in schema.iter() {
+        entries.push((encoded_object(shape.id())?, shape));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let labels: HashMap<_, _> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (label, _))| (label.clone(), ShapeId(index as u32)))
+        .collect();
+
+    let mut shapes = Vec::with_capacity(entries.len());
+    for (label, shape) in entries {
+        let id = *labels.get(&label).expect("shape label indexed above");
+        let targets = shape
+            .targets()
+            .iter()
+            .map(|target| compile_target(&label, target))
+            .collect::<Result<Vec<_>>>()?;
+        let path = shape.path().map(compile_path).transpose()?;
+        let property_shapes = shape
+            .property_shapes()
+            .iter()
+            .map(|index| shape_id(schema, &labels, index))
+            .collect::<Result<Vec<_>>>()?;
+        let mut constraints = Vec::new();
+        for component in shape.components() {
+            if let Some(component) = compile_component(schema, &labels, &label, component)? {
+                constraints.push(component);
+            }
+        }
+        if shape.reifier_info().is_some() {
+            return Err(ShaclError::UnsupportedComponent {
+                shape: label.0.clone(),
+                component: "http://www.w3.org/ns/shacl#reifierShape".to_owned(),
+            }
+            .into());
+        }
+        let messages = compile_messages(shape);
+        let dependencies =
+            dependencies::analyze(&targets, path.as_ref(), &constraints, &property_shapes);
+        shapes.push(CompiledShape {
+            id,
+            label,
+            kind: match shape {
+                IRShape::NodeShape(_) => ShapeKind::Node,
+                IRShape::PropertyShape(_) => ShapeKind::Property,
+            },
+            targets: targets.into_boxed_slice(),
+            path,
+            constraints: constraints.into_boxed_slice(),
+            property_shapes: property_shapes.into_boxed_slice(),
+            severity: compile_severity(shape.severity()),
+            messages,
+            deactivated: shape.deactivated(),
+            dependencies,
+        });
+    }
+    Ok(CompiledSchemaInner {
+        format_version: COMPILED_SHACL_FORMAT_VERSION,
+        schema_hash,
+        rocrate_version,
+        shapes: shapes.into_boxed_slice(),
+    })
+}
+
+fn compile_target(shape: &EncodedTerm, target: &Target) -> Result<TargetPlan> {
+    match target {
+        Target::Node(node) => Ok(TargetPlan::Node(encoded_object(node)?)),
+        Target::Class(class) => Ok(TargetPlan::Class(encoded_object(class)?)),
+        Target::SubjectsOf(predicate) => Ok(TargetPlan::SubjectsOf(encoded_iri(predicate))),
+        Target::ObjectsOf(predicate) => Ok(TargetPlan::ObjectsOf(encoded_iri(predicate))),
+        Target::ImplicitClass(class) => Ok(TargetPlan::ImplicitClass(encoded_object(class)?)),
+        Target::WrongNode(_)
+        | Target::WrongClass(_)
+        | Target::WrongSubjectsOf(_)
+        | Target::WrongObjectsOf(_)
+        | Target::WrongImplicitClass(_) => Err(ShaclError::IllFormedShapes {
+            graph: shape.0.clone(),
+            message: format!("ill-formed target declaration: {target}"),
+        }
+        .into()),
+    }
+}
+
+fn compile_path(path: &SHACLPath) -> Result<PathPlan> {
+    Ok(match path {
+        SHACLPath::Predicate { pred } => PathPlan::Predicate(encoded_iri(pred)),
+        SHACLPath::Alternative { paths } => PathPlan::Alternative(
+            paths
+                .iter()
+                .map(compile_path)
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice(),
+        ),
+        SHACLPath::Sequence { paths } => PathPlan::Sequence(
+            paths
+                .iter()
+                .map(compile_path)
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice(),
+        ),
+        SHACLPath::Inverse { path } => PathPlan::Inverse(Box::new(compile_path(path)?)),
+        SHACLPath::ZeroOrMore { path } => PathPlan::ZeroOrMore(Box::new(compile_path(path)?)),
+        SHACLPath::OneOrMore { path } => PathPlan::OneOrMore(Box::new(compile_path(path)?)),
+        SHACLPath::ZeroOrOne { path } => PathPlan::ZeroOrOne(Box::new(compile_path(path)?)),
+    })
+}
+
+fn compile_component(
+    schema: &IRSchema,
+    labels: &HashMap<EncodedTerm, ShapeId>,
+    shape: &EncodedTerm,
+    component: &IRComponent,
+) -> Result<Option<ConstraintPlan>> {
+    let plan = match component {
+        IRComponent::Class(value) => ConstraintPlan::Class(encoded_object(value.class_rule())?),
+        IRComponent::Datatype(value) => ConstraintPlan::Datatype(encoded_iri(value.datatype())),
+        IRComponent::NodeKind(value) => ConstraintPlan::NodeKind(match value.node_kind() {
+            NodeKind::Iri => NodeKindPlan::Iri,
+            NodeKind::Lit => NodeKindPlan::Literal,
+            NodeKind::BNode => NodeKindPlan::BlankNode,
+            NodeKind::BNodeOrIri => NodeKindPlan::BlankNodeOrIri,
+            NodeKind::BNodeOrLit => NodeKindPlan::BlankNodeOrLiteral,
+            NodeKind::IriOrLit => NodeKindPlan::IriOrLiteral,
+        }),
+        IRComponent::MinCount(value) => ConstraintPlan::MinCount(value.min_count()),
+        IRComponent::MaxCount(value) => ConstraintPlan::MaxCount(value.max_count()),
+        IRComponent::MinExclusive(value) => {
+            ConstraintPlan::MinExclusive(encoded_literal(value.min_exclusive())?)
+        }
+        IRComponent::MaxExclusive(value) => {
+            ConstraintPlan::MaxExclusive(encoded_literal(value.max_exclusive())?)
+        }
+        IRComponent::MinInclusive(value) => {
+            ConstraintPlan::MinInclusive(encoded_literal(value.min_inclusive())?)
+        }
+        IRComponent::MaxInclusive(value) => {
+            ConstraintPlan::MaxInclusive(encoded_literal(value.max_inclusive())?)
+        }
+        IRComponent::MinLength(value) => {
+            ConstraintPlan::MinLength(nonnegative(shape, "sh:minLength", value.min_length())?)
+        }
+        IRComponent::MaxLength(value) => {
+            ConstraintPlan::MaxLength(nonnegative(shape, "sh:maxLength", value.max_length())?)
+        }
+        IRComponent::Pattern(value) => ConstraintPlan::Pattern {
+            pattern: value.pattern().clone(),
+            flags: value.flags().cloned(),
+        },
+        IRComponent::UniqueLang(value) => ConstraintPlan::UniqueLang(value.unique_lang()),
+        IRComponent::LanguageIn(value) => ConstraintPlan::LanguageIn(
+            value
+                .langs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        IRComponent::Equals(value) => ConstraintPlan::Equals(encoded_iri(value.iri())),
+        IRComponent::Disjoint(value) => ConstraintPlan::Disjoint(encoded_iri(value.iri())),
+        IRComponent::LessThan(value) => ConstraintPlan::LessThan(encoded_iri(value.iri())),
+        IRComponent::LessThanOrEquals(value) => {
+            ConstraintPlan::LessThanOrEquals(encoded_iri(value.iri()))
+        }
+        IRComponent::Or(value) => {
+            ConstraintPlan::Or(shape_ids(schema, labels, value.shapes())?.into_boxed_slice())
+        }
+        IRComponent::And(value) => {
+            ConstraintPlan::And(shape_ids(schema, labels, value.shapes())?.into_boxed_slice())
+        }
+        IRComponent::Not(value) => ConstraintPlan::Not(shape_id(schema, labels, value.shape())?),
+        IRComponent::Xone(value) => {
+            ConstraintPlan::Xone(shape_ids(schema, labels, value.shapes())?.into_boxed_slice())
+        }
+        IRComponent::Node(value) => ConstraintPlan::Node(shape_id(schema, labels, value.shape())?),
+        IRComponent::HasValue(value) => ConstraintPlan::HasValue(encoded_object(value.value())?),
+        IRComponent::In(value) => ConstraintPlan::In(
+            value
+                .values()
+                .iter()
+                .map(encoded_object)
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice(),
+        ),
+        IRComponent::QualifiedValueShape(value) => ConstraintPlan::QualifiedValueShape {
+            shape: shape_id(schema, labels, value.shape())?,
+            min_count: value
+                .qualified_min_count()
+                .map(|count| nonnegative(shape, "sh:qualifiedMinCount", count))
+                .transpose()?,
+            max_count: value
+                .qualified_max_count()
+                .map(|count| nonnegative(shape, "sh:qualifiedMaxCount", count))
+                .transpose()?,
+            disjoint: value.qualified_value_shapes_disjoint().unwrap_or(false),
+            siblings: shape_ids(schema, labels, value.siblings())?.into_boxed_slice(),
+        },
+        IRComponent::Closed(value) => {
+            if !value.is_closed() {
+                return Ok(None);
+            }
+            ConstraintPlan::Closed {
+                ignored_properties: value
+                    .ignored_properties()
+                    .iter()
+                    .map(encoded_iri)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            }
+        }
+        IRComponent::Deactivated(_) => return Ok(None),
+        IRComponent::BasicSparql(_) => {
+            return Err(ShaclError::UnsupportedComponent {
+                shape: shape.0.clone(),
+                component: "http://www.w3.org/ns/shacl#SPARQLConstraintComponent".to_owned(),
+            }
+            .into());
+        }
+    };
+    Ok(Some(plan))
+}
+
+fn shape_ids(
+    schema: &IRSchema,
+    labels: &HashMap<EncodedTerm, ShapeId>,
+    indexes: &[ShapeLabelIdx],
+) -> Result<Vec<ShapeId>> {
+    indexes
+        .iter()
+        .map(|index| shape_id(schema, labels, index))
+        .collect()
+}
+
+fn shape_id(
+    schema: &IRSchema,
+    labels: &HashMap<EncodedTerm, ShapeId>,
+    index: &ShapeLabelIdx,
+) -> Result<ShapeId> {
+    let shape = schema
+        .get_shape_from_idx(index)
+        .ok_or_else(|| ShaclError::IllFormedShapes {
+            graph: "compiled schema".to_owned(),
+            message: format!("shape index {index} is missing"),
+        })?;
+    let label = encoded_object(shape.id())?;
+    labels.get(&label).copied().ok_or_else(|| {
+        ShaclError::IllFormedShapes {
+            graph: "compiled schema".to_owned(),
+            message: format!("shape {} is missing from the compiled label map", label.0),
+        }
+        .into()
+    })
+}
+
+fn compile_severity(severity: &Severity) -> SeverityPlan {
+    match severity {
+        Severity::Trace => SeverityPlan::Trace,
+        Severity::Debug => SeverityPlan::Debug,
+        Severity::Info => SeverityPlan::Info,
+        Severity::Warning => SeverityPlan::Warning,
+        Severity::Violation => SeverityPlan::Violation,
+        Severity::Generic(iri) => SeverityPlan::Custom(encoded_iri(iri)),
+    }
+}
+
+fn compile_messages(shape: &IRShape) -> Box<[MessagePlan]> {
+    let mut messages = shape
+        .message()
+        .into_iter()
+        .flat_map(|messages| messages.iter())
+        .map(|(language, text)| MessagePlan {
+            language: language.as_ref().map(ToString::to_string),
+            text: text.clone(),
+        })
+        .collect::<Vec<_>>();
+    messages
+        .sort_by(|left, right| (&left.language, &left.text).cmp(&(&right.language, &right.text)));
+    messages.into_boxed_slice()
+}
+
+fn nonnegative(shape: &EncodedTerm, component: &str, value: isize) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        ShaclError::IllFormedShapes {
+            graph: shape.0.clone(),
+            message: format!("{component} must not be negative"),
+        }
+        .into()
+    })
+}
+
+fn encoded_iri(iri: &IriS) -> EncodedTerm {
+    EncodedTerm::from_named_node(&NamedNode::new_unchecked(iri.as_str()))
+}
+
+fn encoded_object(object: &Object) -> Result<EncodedTerm> {
+    match object {
+        Object::Iri(iri) => Ok(encoded_iri(iri)),
+        Object::BlankNode(label) => BlankNode::new(label.clone())
+            .map(|node| EncodedTerm::from_term(&Term::BlankNode(node)))
+            .map_err(|error| {
+                ShaclError::IllFormedShapes {
+                    graph: "Rudof term conversion".to_owned(),
+                    message: error.to_string(),
+                }
+                .into()
+            }),
+        Object::Literal(literal) => encoded_literal(literal),
+        Object::Triple { .. } => Err(ShaclError::UnsupportedRdfStarTerm {
+            term: object.to_string(),
+        }
+        .into()),
+    }
+}
+
+fn encoded_literal(
+    literal: &rudof_rdf::rdf_core::term::literal::ConcreteLiteral,
+) -> Result<EncodedTerm> {
+    let value = if let Some(language) = literal.lang() {
+        Literal::new_language_tagged_literal(literal.lexical_form(), language.to_string()).map_err(
+            |error| ShaclError::IllFormedShapes {
+                graph: "Rudof literal conversion".to_owned(),
+                message: error.to_string(),
+            },
+        )?
+    } else {
+        let datatype = literal.datatype();
+        let datatype = datatype
+            .get_iri()
+            .map_err(|error| ShaclError::IllFormedShapes {
+                graph: "Rudof literal conversion".to_owned(),
+                message: error.to_string(),
+            })?;
+        Literal::new_typed_literal(
+            literal.lexical_form(),
+            NamedNode::new_unchecked(datatype.as_str()),
+        )
+    };
+    Ok(EncodedTerm::from_term(&Term::Literal(value)))
+}
