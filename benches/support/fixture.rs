@@ -24,8 +24,7 @@ use super::{
     star_has_common,
 };
 
-/// Maximum buffered changes across every graph partition. A push that reaches
-/// this cap flushes its graph-scoped partition before another record is read.
+/// Maximum buffered changes in one graph partition.
 pub const LOAD_BATCH_SIZE: usize = 512;
 
 const SELECT_LIMIT: usize = 10;
