@@ -445,6 +445,9 @@ fn select_incremental_targets<V: RdfReadView>(
             if dependencies.reads_rdf_type && change.predicate == rdf_type {
                 candidates[index].insert(change.subject);
                 affected = true;
+                if shape.path.is_some() {
+                    global[index] = true;
+                }
             }
             if affected && (dependencies.requires_global_work || dependencies.has_transitive_path) {
                 global[index] = true;

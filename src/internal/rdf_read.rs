@@ -56,6 +56,8 @@ impl GraphSelector {
 
 /// The shared behavior surface for durable RDF reads.
 pub(crate) trait RdfReadView {
+    fn contains_graph(&self, graph: &GraphId) -> Result<bool>;
+
     fn scan<'store, 'context, 'visibility>(
         &'store self,
         context: &'context ReadContext<'visibility>,
@@ -225,6 +227,10 @@ impl<'store> StoreReadView<'store> {
 }
 
 impl RdfReadView for StoreReadView<'_> {
+    fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
+        StoreReadView::contains_graph(self, graph)
+    }
+
     fn scan<'store, 'context, 'visibility>(
         &'store self,
         context: &'context ReadContext<'visibility>,

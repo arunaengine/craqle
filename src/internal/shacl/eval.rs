@@ -46,7 +46,7 @@ pub(crate) fn validate_view<V: RdfReadView>(
     let graph = view
         .lookup_term(context, &graph_term)?
         .unwrap_or_else(|| hash_term(&graph_term));
-    if !view.graph_is_visible(context, graph)? {
+    if !view.contains_graph(data_graph)? || !view.graph_is_visible(context, graph)? {
         return Err(crate::shacl::ShaclError::DataGraphNotFound {
             graph: data_graph.to_string(),
         }
