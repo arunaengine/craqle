@@ -2042,6 +2042,19 @@ impl CraqleNode {
         self.finish_batch(graph, batch)
     }
 
+    /// Benchmark-only deferred bulk fixture loading.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn apply_bulk_deferred(
+        &self,
+        graph: &GraphId,
+        changes: Vec<CoreMaterializedQuadChange>,
+    ) -> Result<Batch> {
+        Ok(self
+            .replication
+            .local_apply_changes_bulk_unchecked(graph, changes)?)
+    }
+
     /// Rebuild graph diagnostics from the current visible graph state.
     pub fn rebuild_graph_diagnostics(&self, graph: &GraphId) -> Result<()> {
         self.replication.rebuild_graph_diagnostics(graph)?;

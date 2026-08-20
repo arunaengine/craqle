@@ -25,7 +25,7 @@ use super::{
 };
 
 /// Maximum buffered changes in one graph partition.
-pub const LOAD_BATCH_SIZE: usize = 4_096;
+pub const LOAD_BATCH_SIZE: usize = 16_384;
 
 const SELECT_LIMIT: usize = 10;
 const DIRECTORY_SIZE_ENTRY_LIMIT: usize = 100_000;
@@ -37,6 +37,7 @@ pub struct BenchConfig {
     pub measurement: Duration,
     pub sample_size: usize,
     pub load_batch: usize,
+    pub load_deferred: bool,
 }
 
 impl BenchConfig {
@@ -61,6 +62,13 @@ impl BenchConfig {
 
         let sample_size = env_usize("CRAQLE_BENCH_SAMPLE_SIZE", 10);
         let load_batch = env_usize("CRAQLE_BENCH_LOAD_BATCH", LOAD_BATCH_SIZE);
+        let load_deferred = if cfg!(feature = "bench-internals") {
+            let value = env_u8("CRAQLE_BENCH_DEFER_LOAD", 1);
+            assert!(value <= 1, "CRAQLE_BENCH_DEFER_LOAD must be zero or one");
+            value == 1
+        } else {
+            false
+        };
         assert!(
             sample_size >= 10,
             "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
@@ -73,6 +81,7 @@ impl BenchConfig {
             measurement: env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5),
             sample_size,
             load_batch,
+            load_deferred,
         }
     }
 }
@@ -200,7 +209,12 @@ impl Fixture {
             "the selected corpus configuration must expose a graph"
         );
 
-        let mut loader = GraphPartitionedLoader::new(&node, &all_graphs, config.load_batch);
+        let mut loader = GraphPartitionedLoader::new(
+            &node,
+            &all_graphs,
+            config.load_batch,
+            config.load_deferred,
+        );
         let mut graph_records = vec![0usize; config.corpus.graphs];
         let mut visible_common_records = 0usize;
         let mut inserted_data_quads = 0usize;
@@ -458,7 +472,7 @@ impl Fixture {
         println!(
             "{benchmark} provenance: commit={} binary_blake3={} fixture_digest={} \
              corpus_version={} seed={:#x} quads={} graphs={} duplicate_percent={} \
-             sample_size={} warmup_secs={} measurement_secs={} load_batch={}",
+             sample_size={} warmup_secs={} measurement_secs={} load_batch={} load_deferred={}",
             repository_commit(),
             binary_blake3(),
             self.fixture_digest(),
@@ -471,6 +485,7 @@ impl Fixture {
             self.config.warm_up.as_secs(),
             self.config.measurement.as_secs(),
             self.config.load_batch,
+            self.config.load_deferred,
         );
     }
 
@@ -835,16 +850,18 @@ struct GraphPartitionedLoader<'a> {
     partitions: Vec<Vec<MaterializedQuadChange>>,
     pending_changes: usize,
     batch_size: usize,
+    deferred: bool,
 }
 
 impl<'a> GraphPartitionedLoader<'a> {
-    fn new(node: &'a CraqleNode, graphs: &'a [GraphId], batch_size: usize) -> Self {
+    fn new(node: &'a CraqleNode, graphs: &'a [GraphId], batch_size: usize, deferred: bool) -> Self {
         Self {
             node,
             graphs,
             partitions: (0..graphs.len()).map(|_| Vec::new()).collect(),
             pending_changes: 0,
             batch_size,
+            deferred,
         }
     }
 
@@ -855,7 +872,7 @@ impl<'a> GraphPartitionedLoader<'a> {
             self.flush_graph(graph_index);
         }
         assert!(
-            self.pending_changes < self.batch_size * self.partitions.len(),
+            self.pending_changes < self.batch_size.saturating_mul(self.partitions.len()),
             "the pending graph-partitioned loader buffer exceeded its fixed cap"
         );
     }
@@ -873,9 +890,18 @@ impl<'a> GraphPartitionedLoader<'a> {
             return;
         }
         self.pending_changes -= changes.len();
-        self.node
-            .apply_changes_bulk_unchecked(&self.graphs[graph_index], changes)
-            .expect("apply graph-scoped bounded benchmark batch");
+        if self.deferred {
+            #[cfg(feature = "bench-internals")]
+            self.node
+                .apply_bulk_deferred(&self.graphs[graph_index], changes)
+                .expect("apply deferred benchmark batch");
+            #[cfg(not(feature = "bench-internals"))]
+            unreachable!("deferred fixture loading requires bench-internals");
+        } else {
+            self.node
+                .apply_changes_bulk_unchecked(&self.graphs[graph_index], changes)
+                .expect("apply graph-scoped bounded benchmark batch");
+        }
     }
 }
 
