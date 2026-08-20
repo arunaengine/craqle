@@ -38,7 +38,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
         let statistics = &execution.statistics;
         println!(
             "sparql_hot_path execution: fixture_digest={} case={} mode=Auto \
-             logical_operator={:?} physical_operator={:?} plan_fingerprint={} access_path={:?} \
+             logical_operator={:?} physical_operator={:?} fast_path={:?} plan_fingerprint={} access_path={:?} \
              estimated_rows={:?} actual_rows={:?} plan_candidates={} plan_output_rows={} \
              plan_elapsed_ns={} index_seeks={} qv_admission_checks={} qv_header_reads={} qv_counter_reads={} \
              qv_trusted={} fallback_reason={} source_keys={} source_bytes={} qv_keys={} \
@@ -50,6 +50,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
             fixture.hot_path_label(index),
             statistics.plan.root.logical_operator,
             statistics.plan.root.physical_operator,
+            statistics.fast_path,
             statistics.plan_fingerprint,
             statistics.selected_access_paths,
             statistics.plan.root.estimated_rows,

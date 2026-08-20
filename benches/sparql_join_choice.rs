@@ -135,7 +135,7 @@ fn sparql_join_choice(c: &mut Criterion) {
         let statistics = &execution.statistics;
         eprintln!(
             "sparql_join_choice rows={} distinct_keys={} mode={mode} logical_operator={:?} \
-             physical_operator={:?} join_operator={:?} plan_fingerprint={} access_path={:?} \
+             physical_operator={:?} join_operator={:?} fast_path={:?} plan_fingerprint={} access_path={:?} \
              estimated_rows={:?} actual_rows={:?} plan_candidates={} plan_output_rows={} \
              plan_elapsed_ns={} index_seeks={} qv_admission_checks={} qv_header_reads={} qv_counter_reads={} \
              qv_trusted={} fallback_reason={} source_keys={} source_bytes={} qv_keys={} \
@@ -149,6 +149,7 @@ fn sparql_join_choice(c: &mut Criterion) {
             statistics.plan.root.logical_operator,
             statistics.plan.root.physical_operator,
             statistics.planned_joins[0].physical_operator,
+            statistics.fast_path,
             statistics.plan_fingerprint,
             statistics.selected_access_paths,
             statistics.plan.root.estimated_rows,

@@ -42,7 +42,7 @@ fn print_work(
     let statistics = &execution.statistics;
     println!(
         "sparql_access_path_scaling fixture_digest={} case={label} mode={mode:?} \
-         logical_operator={:?} physical_operator={:?} plan_fingerprint={} access_path={:?} \
+         logical_operator={:?} physical_operator={:?} fast_path={:?} plan_fingerprint={} access_path={:?} \
          estimated_rows={:?} actual_rows={:?} plan_candidates={} plan_output_rows={} \
          plan_elapsed_ns={} index_seeks={} qv_admission_checks={} qv_header_reads={} qv_counter_reads={} \
          qv_trusted={} fallback_reason={} source_keys={} source_bytes={} qv_keys={} \
@@ -54,6 +54,7 @@ fn print_work(
         fixture.fixture_digest(),
         statistics.plan.root.logical_operator,
         statistics.plan.root.physical_operator,
+        statistics.fast_path,
         statistics.plan_fingerprint,
         statistics.selected_access_paths,
         statistics.plan.root.estimated_rows,
