@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -13,12 +13,18 @@ use rudof_rdf::rdf_core::SHACLPath;
 use rudof_rdf::rdf_core::term::Object;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 
+use crate::query_context::ReadContext;
+use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::shacl::{
     CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError,
     ShaclValidationOptions, ShaclValidationReport,
 };
-use crate::store::{GraphStore, StoreError};
-use crate::{CraqleError, EncodedTerm, GraphId, GraphReplicaSnapshot, Result, RoCrateVersion};
+use crate::store::{GraphStore, StoreError, TermId, hash_term};
+use crate::validation_delta::{DeltaIndex, DeltaReadView};
+use crate::{
+    CraqleError, EncodedTerm, GraphId, GraphReplicaSnapshot, MaterializedQuadChange, Result,
+    RoCrateVersion,
+};
 
 use super::dependencies;
 use super::eval;
@@ -26,7 +32,7 @@ use super::model::{
     COMPILED_SHACL_FORMAT_VERSION, CompiledSchemaInner, CompiledShape, ConstraintPlan, MessagePlan,
     NodeKindPlan, PathPlan, SeverityPlan, ShapeId, ShapeKind, TargetPlan,
 };
-use super::resolve::{ResolvedSchema, resolve};
+use super::resolve::{ResolvedSchema, ResolvedTarget, resolve};
 
 const CACHE_CAPACITY: usize = 32;
 const EXTENSION_PROFILE: u32 = 0;
@@ -52,10 +58,18 @@ struct CacheKey {
     extension_profile: u32,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ValidationCacheKey {
+    schema: [u8; 32],
+    data_graph: String,
+    data_version: [u8; 32],
+}
+
 pub(crate) struct ShaclCompiler {
     store: Arc<GraphStore>,
     cache: Mutex<HashMap<CacheKey, Arc<CompiledSchemaInner>>>,
     resolved_cache: Mutex<HashMap<[u8; 32], Arc<ResolvedSchema>>>,
+    validation_cache: Mutex<HashMap<ValidationCacheKey, ShaclValidationReport>>,
 }
 
 impl ShaclCompiler {
@@ -64,6 +78,7 @@ impl ShaclCompiler {
             store,
             cache: Mutex::new(HashMap::new()),
             resolved_cache: Mutex::new(HashMap::new()),
+            validation_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -179,21 +194,440 @@ impl ShaclCompiler {
         stop_after_first: bool,
     ) -> Result<ShaclValidationReport> {
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
-        match eval::validate(
-            &self.store,
+        let view = StoreReadView::new(&self.store);
+        let cache_key = self.validation_cache_key(&view, data_graph, schema)?;
+        let report = match eval::validate_view(
+            &view,
             resolved,
             data_graph,
             options,
             cache_hit,
             resolve_time,
             stop_after_first,
+            None,
+            None,
         ) {
             Err(CraqleError::Store(StoreError::Cancelled)) => {
-                Err(ShaclError::ValidationCancelled.into())
+                return Err(ShaclError::ValidationCancelled.into());
             }
-            result => result,
+            result => result?,
+        };
+        if !stop_after_first {
+            self.cache_validation(cache_key, report.clone());
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn validate_delta(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        changes: &[MaterializedQuadChange],
+        options: &ShaclValidationOptions,
+    ) -> Result<ShaclValidationReport> {
+        let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
+        let index = DeltaIndex::build(&self.store, data_graph, changes)?;
+        let base = StoreReadView::new(&self.store);
+        let base_cache_key = self.validation_cache_key(&base, data_graph, schema)?;
+        let base_report =
+            if let Some(report) = self.validation_cache().get(&base_cache_key).cloned() {
+                report
+            } else {
+                let report = match eval::validate_view(
+                    &base,
+                    resolved.clone(),
+                    data_graph,
+                    options,
+                    cache_hit,
+                    resolve_time,
+                    false,
+                    None,
+                    None,
+                ) {
+                    Err(CraqleError::Store(StoreError::Cancelled)) => {
+                        return Err(ShaclError::ValidationCancelled.into());
+                    }
+                    result => result?,
+                };
+                self.cache_validation(base_cache_key, report.clone());
+                report
+            };
+        let view = DeltaReadView::new(base, &index);
+        let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
+        let graph = hash_term(&EncodedTerm::from_named_node(&data_graph.0));
+        let rdf_type = hash_term(&EncodedTerm(RDF_TYPE.to_owned()));
+        let selection = match select_incremental_targets(
+            &view, &context, graph, rdf_type, &resolved, data_graph, changes,
+        ) {
+            Err(CraqleError::Store(StoreError::Cancelled)) => {
+                return Err(ShaclError::ValidationCancelled.into());
+            }
+            result => result?,
+        };
+        if selection.affected_pairs.is_empty() {
+            let mut report = base_report;
+            report.statistics = Default::default();
+            report.statistics.shape_compile_cache_hit = cache_hit;
+            report.statistics.shapes_considered = resolved.shapes.len() as u64;
+            report.statistics.shapes_skipped = resolved.shapes.len() as u64;
+            report.statistics.violations = report.results.len() as u64;
+            enforce_result_limit(&report, options)?;
+            return Ok(report);
+        }
+        let mut report = match eval::validate_view(
+            &view,
+            resolved.clone(),
+            data_graph,
+            options,
+            cache_hit,
+            resolve_time,
+            false,
+            Some(&context),
+            Some(selection.targets),
+        ) {
+            Err(CraqleError::Store(StoreError::Cancelled)) => {
+                return Err(ShaclError::ValidationCancelled.into());
+            }
+            result => result?,
+        };
+        report
+            .results
+            .extend(base_report.results.into_iter().filter(|result| {
+                !selection
+                    .affected_pairs
+                    .contains(&(result.source_shape.clone(), result.focus_node.clone()))
+            }));
+        report.results.sort();
+        report.conforms = report.results.is_empty();
+        report.statistics.violations = report.results.len() as u64;
+        report.statistics.full_graph_fallbacks = selection.full_graph_fallbacks;
+        enforce_result_limit(&report, options)?;
+        Ok(report)
+    }
+
+    fn validation_cache_key(
+        &self,
+        view: &StoreReadView<'_>,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+    ) -> Result<ValidationCacheKey> {
+        let graph = crate::store::hash_term(&EncodedTerm::from_named_node(&data_graph.0));
+        Ok(ValidationCacheKey {
+            schema: schema.inner.plan_fingerprint(),
+            data_graph: data_graph.to_string(),
+            data_version: view.snapshot().graph_version(&self.store, graph)?,
+        })
+    }
+
+    fn validation_cache(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ValidationCacheKey, ShaclValidationReport>> {
+        self.validation_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cache_validation(&self, key: ValidationCacheKey, report: ShaclValidationReport) {
+        let mut cache = self.validation_cache();
+        if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, report);
+    }
+
+    pub(crate) fn seed_validation_report(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        data_version: [u8; 32],
+        report: ShaclValidationReport,
+    ) {
+        self.cache_validation(
+            ValidationCacheKey {
+                schema: schema.inner.plan_fingerprint(),
+                data_graph: data_graph.to_string(),
+                data_version,
+            },
+            report,
+        );
+    }
+
+    pub(crate) fn cache_current_report(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        report: ShaclValidationReport,
+    ) -> Result<()> {
+        let view = StoreReadView::new(&self.store);
+        let key = self.validation_cache_key(&view, data_graph, schema)?;
+        self.cache_validation(key, report);
+        Ok(())
+    }
+}
+
+struct IncrementalSelection {
+    targets: Vec<BTreeSet<TermId>>,
+    affected_pairs: HashSet<(EncodedTerm, EncodedTerm)>,
+    full_graph_fallbacks: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ChangedQuadIds {
+    subject: TermId,
+    predicate: TermId,
+    object: TermId,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_incremental_targets<V: RdfReadView>(
+    view: &V,
+    context: &ReadContext<'_>,
+    graph: TermId,
+    rdf_type: TermId,
+    schema: &ResolvedSchema,
+    data_graph: &GraphId,
+    changes: &[MaterializedQuadChange],
+) -> Result<IncrementalSelection> {
+    let changed = changes
+        .iter()
+        .filter_map(|change| {
+            let (change_graph, subject, predicate, object) = match change {
+                MaterializedQuadChange::Insert {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                }
+                | MaterializedQuadChange::Delete {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                } => (graph, subject, predicate, object),
+            };
+            (change_graph == data_graph).then(|| ChangedQuadIds {
+                subject: hash_term(subject),
+                predicate: hash_term(predicate),
+                object: hash_term(object),
+            })
+        })
+        .collect::<Vec<_>>();
+    let shape_count = schema.shapes.len();
+    let mut candidates = vec![BTreeSet::new(); shape_count];
+    let mut global = vec![false; shape_count];
+
+    for (index, shape) in schema.portable.shapes.iter().enumerate() {
+        let dependencies = &shape.dependencies;
+        let forward = dependencies
+            .forward_predicates
+            .iter()
+            .map(hash_term)
+            .collect::<HashSet<_>>();
+        let inverse = dependencies
+            .inverse_predicates
+            .iter()
+            .map(hash_term)
+            .collect::<HashSet<_>>();
+        for change in &changed {
+            let mut affected = false;
+            if forward.contains(&change.predicate) {
+                candidates[index].insert(change.subject);
+                affected = true;
+            }
+            if inverse.contains(&change.predicate) {
+                candidates[index].insert(change.object);
+                affected = true;
+            }
+            if dependencies.reads_all_outgoing_predicates {
+                candidates[index].insert(change.subject);
+                affected = true;
+            }
+            if dependencies.reads_rdf_type && change.predicate == rdf_type {
+                candidates[index].insert(change.subject);
+                affected = true;
+            }
+            if affected && (dependencies.requires_global_work || dependencies.has_transitive_path) {
+                global[index] = true;
+            }
         }
     }
+
+    loop {
+        let mut changed_any = false;
+        for shape in &schema.portable.shapes {
+            let parent = shape.id.0 as usize;
+            for property in &shape.property_shapes {
+                let property = property.0 as usize;
+                let inherited = candidates[parent].clone();
+                let before = candidates[property].len();
+                candidates[property].extend(inherited);
+                changed_any |= candidates[property].len() != before;
+                if global[parent] && !global[property] {
+                    global[property] = true;
+                    changed_any = true;
+                }
+            }
+            if !shape.dependencies.nested_shapes.is_empty()
+                && shape.dependencies.nested_shapes.iter().any(|nested| {
+                    global[nested.0 as usize] || !candidates[nested.0 as usize].is_empty()
+                })
+                && !global[parent]
+            {
+                global[parent] = true;
+                changed_any = true;
+            }
+        }
+        if !changed_any {
+            break;
+        }
+    }
+
+    let parents = property_shape_parents(schema);
+    let mut targets = vec![BTreeSet::new(); shape_count];
+    let mut full_graph_fallbacks = 0u64;
+    if global.iter().any(|global| *global) {
+        let mut target_work = super::targets::TargetWork::default();
+        let all_targets = super::targets::resolve_targets(
+            view,
+            context,
+            graph,
+            rdf_type,
+            schema,
+            &mut target_work,
+        )?;
+        for index in 0..shape_count {
+            if global[index] {
+                targets[index] = all_targets[index].clone();
+                full_graph_fallbacks = full_graph_fallbacks.saturating_add(1);
+            }
+        }
+    }
+    for index in 0..shape_count {
+        if global[index] {
+            continue;
+        }
+        for focus in candidates[index].iter().copied() {
+            if focus_is_target(
+                view,
+                context,
+                graph,
+                rdf_type,
+                schema,
+                &parents,
+                index,
+                focus,
+                &mut HashSet::new(),
+            )? {
+                targets[index].insert(focus);
+            }
+        }
+    }
+
+    let mut affected_pairs = HashSet::new();
+    for index in 0..shape_count {
+        let mut affected_focus = candidates[index].clone();
+        if global[index] {
+            affected_focus.extend(targets[index].iter().copied());
+        }
+        for focus in affected_focus {
+            affected_pairs.insert((
+                schema.portable.shapes[index].label.clone(),
+                view.decode_term(context, focus)?,
+            ));
+        }
+    }
+    Ok(IncrementalSelection {
+        targets,
+        affected_pairs,
+        full_graph_fallbacks,
+    })
+}
+
+fn property_shape_parents(schema: &ResolvedSchema) -> Vec<Vec<usize>> {
+    let mut parents = vec![Vec::new(); schema.shapes.len()];
+    for shape in &schema.portable.shapes {
+        for property in &shape.property_shapes {
+            parents[property.0 as usize].push(shape.id.0 as usize);
+        }
+    }
+    parents
+}
+
+#[allow(clippy::too_many_arguments)]
+fn focus_is_target<V: RdfReadView>(
+    view: &V,
+    context: &ReadContext<'_>,
+    graph: TermId,
+    rdf_type: TermId,
+    schema: &ResolvedSchema,
+    parents: &[Vec<usize>],
+    shape: usize,
+    focus: TermId,
+    visiting: &mut HashSet<usize>,
+) -> Result<bool> {
+    if !visiting.insert(shape) {
+        return Ok(false);
+    }
+    for target in &schema.shapes[shape].targets {
+        let selected = match target {
+            ResolvedTarget::Node(node) => *node == focus,
+            ResolvedTarget::Class(class) | ResolvedTarget::ImplicitClass(class) => view.exists(
+                context,
+                GraphSelector::Named(graph),
+                QuadPattern {
+                    subject: Some(focus),
+                    predicate: Some(rdf_type),
+                    object: Some(*class),
+                    ..QuadPattern::default()
+                },
+            )?,
+            ResolvedTarget::SubjectsOf(predicate) => view.exists(
+                context,
+                GraphSelector::Named(graph),
+                QuadPattern {
+                    subject: Some(focus),
+                    predicate: Some(*predicate),
+                    ..QuadPattern::default()
+                },
+            )?,
+            ResolvedTarget::ObjectsOf(predicate) => view.exists(
+                context,
+                GraphSelector::Named(graph),
+                QuadPattern {
+                    predicate: Some(*predicate),
+                    object: Some(focus),
+                    ..QuadPattern::default()
+                },
+            )?,
+        };
+        if selected {
+            visiting.remove(&shape);
+            return Ok(true);
+        }
+    }
+    for parent in &parents[shape] {
+        if focus_is_target(
+            view, context, graph, rdf_type, schema, parents, *parent, focus, visiting,
+        )? {
+            visiting.remove(&shape);
+            return Ok(true);
+        }
+    }
+    visiting.remove(&shape);
+    Ok(false)
+}
+
+fn enforce_result_limit(
+    report: &ShaclValidationReport,
+    options: &ShaclValidationOptions,
+) -> Result<()> {
+    if report.results.len() > options.max_results {
+        return Err(ShaclError::ResultLimitExceeded {
+            limit: options.max_results,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 struct MaterializedShapes {

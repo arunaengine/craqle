@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::query_context::ReadContext;
-use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
+use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView};
 use crate::shacl::{ShaclValidationOptions, ShaclValidationReport, ShaclValidationStatistics};
-use crate::store::{GraphStore, TermId, hash_term};
+use crate::store::{TermId, hash_term};
 use crate::{EncodedTerm, GraphId, Result};
 
 use super::constraints::{TermMetaCache, language_matches};
@@ -28,40 +28,52 @@ enum CachedConformance {
     Violates,
 }
 
-pub(crate) fn validate(
-    store: &GraphStore,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_view<V: RdfReadView>(
+    view: &V,
     schema: Arc<ResolvedSchema>,
     data_graph: &GraphId,
     options: &ShaclValidationOptions,
     resolved_cache_hit: bool,
     resolve_time: Duration,
     stop_after_first: bool,
+    context: Option<&ReadContext<'_>>,
+    preset_targets: Option<Vec<BTreeSet<TermId>>>,
 ) -> Result<ShaclValidationReport> {
-    let view = StoreReadView::new(store);
-    if !view.contains_graph(data_graph)? {
+    let fallback_context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
+    let context = context.unwrap_or(&fallback_context);
+    let graph_term = EncodedTerm::from_named_node(&data_graph.0);
+    let graph = view
+        .lookup_term(context, &graph_term)?
+        .unwrap_or_else(|| hash_term(&graph_term));
+    if !view.graph_is_visible(context, graph)? {
         return Err(crate::shacl::ShaclError::DataGraphNotFound {
             graph: data_graph.to_string(),
         }
         .into());
     }
-    let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
-    let graph_term = EncodedTerm::from_named_node(&data_graph.0);
-    let graph = view
-        .lookup_term(&context, &graph_term)?
-        .unwrap_or_else(|| hash_term(&graph_term));
     let rdf_type_term = EncodedTerm(RDF_TYPE.to_owned());
     let rdf_type = view
-        .lookup_term(&context, &rdf_type_term)?
+        .lookup_term(context, &rdf_type_term)?
         .unwrap_or_else(|| hash_term(&rdf_type_term));
 
     let target_start = Instant::now();
     let mut target_work = TargetWork::default();
-    let targets = resolve_targets(&view, &context, graph, rdf_type, &schema, &mut target_work)?;
+    let targets = match preset_targets {
+        Some(targets) => {
+            target_work.candidates = targets
+                .iter()
+                .map(|focus_nodes| focus_nodes.len() as u64)
+                .sum();
+            targets
+        }
+        None => resolve_targets(view, context, graph, rdf_type, &schema, &mut target_work)?,
+    };
     let target_time = target_start.elapsed();
 
     let mut validator = Validator {
-        view: &view,
-        context: &context,
+        view,
+        context,
         graph,
         rdf_type,
         schema,
