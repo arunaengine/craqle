@@ -456,3 +456,431 @@ fn resolve_pattern_term(
         PatternTerm::Variable(_) => Ok(Some(None)),
     }
 }
+
+pub(crate) fn execute(
+    plan: &FastPathPlan,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+) -> Result<FastPathOutcome> {
+    let started = Instant::now();
+    match plan {
+        FastPathPlan::Ask(triple) => {
+            let value = match triple.resolve(view, context)? {
+                Some(triple) => view.exists(context, triple.selector, triple.pattern)?,
+                None => false,
+            };
+            Ok(FastPathOutcome {
+                results: QueryResults::Boolean(value),
+                kind: QueryFastPathKind::Ask,
+                execution_time: started.elapsed(),
+                collection_time: Duration::ZERO,
+                time_to_first_result: Some(started.elapsed()),
+                intermediate_rows: u64::from(value),
+                result_rows: 1,
+                result_cells: 1,
+            })
+        }
+        FastPathPlan::SelectLimit {
+            triple,
+            variables,
+            limit,
+        } => {
+            let mut rows = Vec::with_capacity(*limit);
+            let mut collection_time = Duration::ZERO;
+            let mut time_to_first_result = None;
+            if let Some(triple) = triple.resolve(view, context)? {
+                let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+                while rows.len() < *limit {
+                    let Some(quad) = cursor.next() else {
+                        break;
+                    };
+                    let quad = quad?;
+                    if time_to_first_result.is_none() {
+                        time_to_first_result = Some(started.elapsed());
+                    }
+                    let collecting = Instant::now();
+                    rows.push(collect_row(view, context, &triple, quad, variables)?);
+                    collection_time = collection_time.saturating_add(collecting.elapsed());
+                }
+            }
+            let result_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+            let result_cells = rows.iter().fold(0_u64, |total, row| {
+                total.saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX))
+            });
+            Ok(FastPathOutcome {
+                results: QueryResults::Solutions(rows),
+                kind: QueryFastPathKind::SelectLimit,
+                execution_time: started.elapsed().saturating_sub(collection_time),
+                collection_time,
+                time_to_first_result,
+                intermediate_rows: result_rows,
+                result_rows,
+                result_cells,
+            })
+        }
+        FastPathPlan::Count {
+            triple,
+            output,
+            distinct_subject,
+        } => {
+            let mut count = 0_u64;
+            let mut last_subject = None;
+            if let Some(triple) = triple.resolve(view, context)? {
+                let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+                for quad in &mut cursor {
+                    let quad = quad?;
+                    if !distinct_subject || last_subject != Some(quad.subject) {
+                        count = count.checked_add(1).ok_or_else(|| {
+                            crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                        })?;
+                        last_subject = Some(quad.subject);
+                    }
+                }
+            }
+            Ok(count_outcome(
+                output,
+                count,
+                if *distinct_subject {
+                    QueryFastPathKind::CountDistinctSubject
+                } else {
+                    match &triple.graph {
+                        PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
+                        PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
+                    }
+                },
+                count,
+                started,
+            ))
+        }
+        FastPathPlan::PropertyStar {
+            triples,
+            subject,
+            variables,
+            limit,
+        } => execute_property_star(triples, subject, variables, *limit, view, context, started),
+        FastPathPlan::HashJoinCount {
+            left,
+            right,
+            output,
+            join_variables,
+        } => execute_hash_join_count(left, right, output, join_variables, view, context, started),
+    }
+}
+
+fn execute_hash_join_count(
+    left: &TriplePlan,
+    right: &TriplePlan,
+    output: &str,
+    join_variables: &[String],
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    started: Instant,
+) -> Result<FastPathOutcome> {
+    let (Some(left_resolved), Some(right_resolved)) =
+        (left.resolve(view, context)?, right.resolve(view, context)?)
+    else {
+        return Ok(count_outcome(
+            output,
+            0,
+            QueryFastPathKind::HashJoinCount,
+            0,
+            started,
+        ));
+    };
+    let (build_plan, build, probe_plan, probe) =
+        if estimated_rows(view, left_resolved) <= estimated_rows(view, right_resolved) {
+            (left, left_resolved, right, right_resolved)
+        } else {
+            (right, right_resolved, left, left_resolved)
+        };
+    let mut table: HashMap<Vec<TermId>, u64> = HashMap::new();
+    let mut intermediate_rows = 0_u64;
+    let mut build_cursor = view.scan(context, build.selector, build.pattern)?;
+    for quad in &mut build_cursor {
+        let key = join_key(build_plan, quad?, join_variables);
+        let multiplicity = table.entry(key).or_default();
+        *multiplicity = multiplicity
+            .checked_add(1)
+            .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+        intermediate_rows = intermediate_rows.saturating_add(1);
+    }
+    let mut count = 0_u64;
+    let mut probe_cursor = view.scan(context, probe.selector, probe.pattern)?;
+    for quad in &mut probe_cursor {
+        let key = join_key(probe_plan, quad?, join_variables);
+        count = count
+            .checked_add(table.get(&key).copied().unwrap_or(0))
+            .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+        intermediate_rows = intermediate_rows.saturating_add(1);
+    }
+    Ok(count_outcome(
+        output,
+        count,
+        QueryFastPathKind::HashJoinCount,
+        intermediate_rows,
+        started,
+    ))
+}
+
+fn estimated_rows(view: &StoreReadView<'_>, triple: ResolvedTriple<'_>) -> usize {
+    if let (Some(predicate), Some(object)) = (triple.pattern.predicate, triple.pattern.object) {
+        view.store().stat_predicate_object_count(predicate, object)
+    } else if let Some(predicate) = triple.pattern.predicate {
+        view.store().stat_predicate_count(predicate)
+    } else {
+        view.store().stat_total_quads()
+    }
+}
+
+fn join_key(triple: &TriplePlan, quad: EncodedQuad, join_variables: &[String]) -> Vec<TermId> {
+    join_variables
+        .iter()
+        .map(|variable| {
+            if matches!(&triple.subject, PatternTerm::Variable(subject) if subject == variable) {
+                quad.subject
+            } else if matches!(&triple.predicate, PatternTerm::Variable(predicate) if predicate == variable)
+            {
+                quad.predicate
+            } else {
+                debug_assert!(
+                    matches!(&triple.object, PatternTerm::Variable(object) if object == variable)
+                );
+                quad.object
+            }
+        })
+        .collect()
+}
+
+fn count_outcome(
+    output: &str,
+    count: u64,
+    kind: QueryFastPathKind,
+    intermediate_rows: u64,
+    started: Instant,
+) -> FastPathOutcome {
+    let collecting = Instant::now();
+    let row = HashMap::from([(
+        output.to_owned(),
+        EncodedTerm::from_term(&Term::Literal(Literal::from(count))),
+    )]);
+    let collection_time = collecting.elapsed();
+    FastPathOutcome {
+        results: QueryResults::Solutions(vec![row]),
+        kind,
+        execution_time: started.elapsed().saturating_sub(collection_time),
+        collection_time,
+        time_to_first_result: Some(started.elapsed()),
+        intermediate_rows,
+        result_rows: 1,
+        result_cells: 1,
+    }
+}
+
+fn execute_property_star(
+    triples: &[TriplePlan],
+    subject_term: &PatternTerm,
+    projected: &[String],
+    limit: usize,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    started: Instant,
+) -> Result<FastPathOutcome> {
+    let mut resolved = Vec::with_capacity(triples.len());
+    for triple in triples {
+        let Some(triple) = triple.resolve(view, context)? else {
+            return Ok(empty_property_star(started));
+        };
+        resolved.push(triple);
+    }
+    if limit == 0 {
+        return Ok(empty_property_star(started));
+    }
+    let seed = resolved
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, triple)| {
+            if let (Some(predicate), Some(object)) =
+                (triple.pattern.predicate, triple.pattern.object)
+            {
+                view.store().stat_predicate_object_count(predicate, object)
+            } else if let Some(predicate) = triple.pattern.predicate {
+                view.store().stat_predicate_count(predicate)
+            } else {
+                usize::MAX
+            }
+        })
+        .map(|(index, _)| index)
+        .expect("a property star has at least two patterns");
+    let mut candidates = if resolved[0].pattern.subject.is_none() {
+        Some(view.scan(context, resolved[seed].selector, resolved[seed].pattern)?)
+    } else {
+        None
+    };
+    let mut fixed_subject = resolved[0].pattern.subject;
+    let mut visited = HashSet::new();
+    let mut rows = Vec::new();
+    let mut collection_time = Duration::ZERO;
+    let mut time_to_first_result = None;
+    let mut intermediate_rows = 0_u64;
+
+    while rows.len() < limit {
+        let subject = if let Some(subject) = fixed_subject.take() {
+            subject
+        } else {
+            let Some(candidate) = candidates.as_mut().and_then(|cursor| cursor.next()) else {
+                break;
+            };
+            candidate?.subject
+        };
+        if !visited.insert(subject) {
+            continue;
+        }
+        let mut binding = HashMap::new();
+        if let PatternTerm::Variable(subject_variable) = subject_term {
+            binding.insert(subject_variable.as_str(), subject);
+        }
+        let mut bindings = vec![binding];
+        for (plan, triple) in triples.iter().zip(&resolved) {
+            let mut pattern = triple.pattern;
+            pattern.subject = Some(subject);
+            let values = match &plan.object {
+                PatternTerm::Constant(_) => {
+                    if view.exists(context, triple.selector, pattern)? {
+                        vec![None]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                PatternTerm::Variable(_) => {
+                    let mut values = Vec::new();
+                    let mut cursor = view.scan(context, triple.selector, pattern)?;
+                    while values.len() < limit {
+                        let Some(quad) = cursor.next() else {
+                            break;
+                        };
+                        values.push(Some(quad?.object));
+                    }
+                    values
+                }
+            };
+            if values.is_empty() {
+                bindings.clear();
+                break;
+            }
+            let mut next = Vec::with_capacity(bindings.len().saturating_mul(values.len()));
+            for binding in bindings {
+                for value in &values {
+                    let mut binding = binding.clone();
+                    if let (PatternTerm::Variable(variable), Some(value)) = (&plan.object, value) {
+                        binding.insert(variable.as_str(), *value);
+                    }
+                    next.push(binding);
+                }
+            }
+            intermediate_rows =
+                intermediate_rows.saturating_add(u64::try_from(next.len()).unwrap_or(u64::MAX));
+            bindings = next;
+        }
+        for binding in bindings {
+            if rows.len() == limit {
+                break;
+            }
+            if time_to_first_result.is_none() {
+                time_to_first_result = Some(started.elapsed());
+            }
+            let collecting = Instant::now();
+            rows.push(decode_binding(view, context, &binding, projected)?);
+            collection_time = collection_time.saturating_add(collecting.elapsed());
+        }
+    }
+    let result_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    let result_cells = rows.iter().fold(0_u64, |total, row| {
+        total.saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX))
+    });
+    Ok(FastPathOutcome {
+        results: QueryResults::Solutions(rows),
+        kind: QueryFastPathKind::PropertyStar,
+        execution_time: started.elapsed().saturating_sub(collection_time),
+        collection_time,
+        time_to_first_result,
+        intermediate_rows,
+        result_rows,
+        result_cells,
+    })
+}
+
+fn empty_property_star(started: Instant) -> FastPathOutcome {
+    FastPathOutcome {
+        results: QueryResults::Solutions(Vec::new()),
+        kind: QueryFastPathKind::PropertyStar,
+        execution_time: started.elapsed(),
+        collection_time: Duration::ZERO,
+        time_to_first_result: None,
+        intermediate_rows: 0,
+        result_rows: 0,
+        result_cells: 0,
+    }
+}
+
+fn decode_binding(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    binding: &HashMap<&str, TermId>,
+    projected: &[String],
+) -> Result<HashMap<String, EncodedTerm>> {
+    let mut row = HashMap::with_capacity(projected.len());
+    for variable in projected {
+        if let Some(value) = binding.get(variable.as_str()) {
+            row.insert(variable.clone(), view.decode_term(context, *value)?);
+        }
+    }
+    Ok(row)
+}
+
+fn collect_row(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    triple: &ResolvedTriple<'_>,
+    quad: EncodedQuad,
+    projected: &[String],
+) -> Result<HashMap<String, EncodedTerm>> {
+    let mut bindings = HashMap::with_capacity(3);
+    for (term, value) in triple
+        .terms
+        .iter()
+        .zip([quad.subject, quad.predicate, quad.object])
+    {
+        if let PatternTerm::Variable(variable) = term {
+            bindings.insert(variable.as_str(), value);
+        }
+    }
+    let mut row = HashMap::with_capacity(projected.len());
+    for variable in projected {
+        if let Some(value) = bindings.get(variable.as_str()) {
+            row.insert(variable.clone(), view.decode_term(context, *value)?);
+        }
+    }
+    Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spargebra::SparqlParser;
+
+    #[test]
+    fn recognizes_guarded_algebra_shapes() {
+        for query in [
+            "ASK { <urn:s> <urn:p> <urn:o> }",
+            "SELECT ?s WHERE { ?s <urn:p> ?o } LIMIT 10",
+            "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o }",
+            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s <urn:p> <urn:o> }",
+            "SELECT ?s ?a ?b WHERE { ?s <urn:p> ?o ; <urn:a> ?a ; <urn:b> ?b }",
+            "SELECT ?a ?b WHERE { <urn:s> <urn:a> ?a ; <urn:b> ?b }",
+            "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?key . ?s <urn:q> ?key }",
+        ] {
+            let parsed = SparqlParser::new().parse_query(query).unwrap();
+            assert!(analyze(&parsed).is_some(), "{query}\n{parsed:#?}");
+        }
+    }
+}
