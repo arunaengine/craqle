@@ -25,7 +25,7 @@ use super::{
 };
 
 /// Maximum buffered changes in one graph partition.
-pub const LOAD_BATCH_SIZE: usize = 512;
+pub const LOAD_BATCH_SIZE: usize = 4_096;
 
 const SELECT_LIMIT: usize = 10;
 const DIRECTORY_SIZE_ENTRY_LIMIT: usize = 100_000;
@@ -36,6 +36,7 @@ pub struct BenchConfig {
     pub warm_up: Duration,
     pub measurement: Duration,
     pub sample_size: usize,
+    pub load_batch: usize,
 }
 
 impl BenchConfig {
@@ -59,16 +60,19 @@ impl BenchConfig {
         }
 
         let sample_size = env_usize("CRAQLE_BENCH_SAMPLE_SIZE", 10);
+        let load_batch = env_usize("CRAQLE_BENCH_LOAD_BATCH", LOAD_BATCH_SIZE);
         assert!(
             sample_size >= 10,
             "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
         );
+        assert!(load_batch > 0, "CRAQLE_BENCH_LOAD_BATCH must be positive");
 
         Self {
             corpus,
             warm_up: env_duration("CRAQLE_BENCH_WARMUP_SECS", 1),
             measurement: env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5),
             sample_size,
+            load_batch,
         }
     }
 }
@@ -196,7 +200,7 @@ impl Fixture {
             "the selected corpus configuration must expose a graph"
         );
 
-        let mut loader = GraphPartitionedLoader::new(&node, &all_graphs);
+        let mut loader = GraphPartitionedLoader::new(&node, &all_graphs, config.load_batch);
         let mut graph_records = vec![0usize; config.corpus.graphs];
         let mut visible_common_records = 0usize;
         let mut inserted_data_quads = 0usize;
@@ -454,7 +458,7 @@ impl Fixture {
         println!(
             "{benchmark} provenance: commit={} binary_blake3={} fixture_digest={} \
              corpus_version={} seed={:#x} quads={} graphs={} duplicate_percent={} \
-             sample_size={} warmup_secs={} measurement_secs={}",
+             sample_size={} warmup_secs={} measurement_secs={} load_batch={}",
             repository_commit(),
             binary_blake3(),
             self.fixture_digest(),
@@ -466,6 +470,7 @@ impl Fixture {
             self.config.sample_size,
             self.config.warm_up.as_secs(),
             self.config.measurement.as_secs(),
+            self.config.load_batch,
         );
     }
 
@@ -687,7 +692,7 @@ impl Fixture {
             metadata.visible_graphs,
             metadata.hidden_graphs,
             self.metrics.inserted_data_quads,
-            LOAD_BATCH_SIZE,
+            self.config.load_batch,
             craqle_commit,
         );
         println!(
@@ -829,26 +834,28 @@ struct GraphPartitionedLoader<'a> {
     graphs: &'a [GraphId],
     partitions: Vec<Vec<MaterializedQuadChange>>,
     pending_changes: usize,
+    batch_size: usize,
 }
 
 impl<'a> GraphPartitionedLoader<'a> {
-    fn new(node: &'a CraqleNode, graphs: &'a [GraphId]) -> Self {
+    fn new(node: &'a CraqleNode, graphs: &'a [GraphId], batch_size: usize) -> Self {
         Self {
             node,
             graphs,
             partitions: (0..graphs.len()).map(|_| Vec::new()).collect(),
             pending_changes: 0,
+            batch_size,
         }
     }
 
     fn push(&mut self, graph_index: usize, change: MaterializedQuadChange) {
         self.partitions[graph_index].push(change);
         self.pending_changes += 1;
-        if self.partitions[graph_index].len() >= LOAD_BATCH_SIZE {
+        if self.partitions[graph_index].len() >= self.batch_size {
             self.flush_graph(graph_index);
         }
         assert!(
-            self.pending_changes < LOAD_BATCH_SIZE * self.partitions.len(),
+            self.pending_changes < self.batch_size * self.partitions.len(),
             "the pending graph-partitioned loader buffer exceeded its fixed cap"
         );
     }
