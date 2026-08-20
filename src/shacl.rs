@@ -134,6 +134,7 @@ impl ShaclValidationReport {
 pub struct CompiledShaclSchema {
     pub(crate) inner: Arc<CompiledSchemaInner>,
     pub(crate) statistics: ShaclCompileStatistics,
+    pub(crate) shape_versions: Arc<[(crate::GraphId, [u8; 32])]>,
 }
 
 impl CompiledShaclSchema {
@@ -163,6 +164,10 @@ impl CompiledShaclSchema {
 
     pub fn statistics(&self) -> &ShaclCompileStatistics {
         &self.statistics
+    }
+
+    pub(crate) fn shape_versions(&self) -> &[(crate::GraphId, [u8; 32])] {
+        &self.shape_versions
     }
 }
 

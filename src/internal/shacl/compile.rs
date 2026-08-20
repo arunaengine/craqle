@@ -100,6 +100,7 @@ impl ShaclCompiler {
         if let Some(inner) = self.cache().get(&key).cloned() {
             return Ok(CompiledShaclSchema {
                 inner,
+                shape_versions: materialized.graph_versions.into(),
                 statistics: ShaclCompileStatistics {
                     cache_hit: true,
                     shape_graphs: materialized.graph_count,
@@ -150,6 +151,7 @@ impl ShaclCompiler {
         cache.insert(key, inner.clone());
         Ok(CompiledShaclSchema {
             inner,
+            shape_versions: materialized.graph_versions.into(),
             statistics: ShaclCompileStatistics {
                 cache_hit: false,
                 shape_graphs: materialized.graph_count,
@@ -186,6 +188,22 @@ impl ShaclCompiler {
         }
         cache.insert(fingerprint, resolved.clone());
         Ok((resolved, false, resolve_time))
+    }
+
+    pub(crate) fn versions_are_current(
+        &self,
+        versions: &[(GraphId, [u8; 32])],
+    ) -> Result<bool> {
+        let snapshot = self.store.read_snapshot();
+        for (graph, version) in versions {
+            let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
+            if !snapshot.contains_graph_by_id(&self.store, graph)?
+                || snapshot.graph_version(&self.store, graph)? != *version
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn validate(
@@ -650,6 +668,7 @@ struct MaterializedShapes {
     ntriples: String,
     graph_count: usize,
     triple_count: usize,
+    graph_versions: Vec<(GraphId, [u8; 32])>,
 }
 
 fn materialize_shapes(
@@ -660,6 +679,12 @@ fn materialize_shapes(
     let mut graphs = BTreeMap::new();
     let mut stack = Vec::new();
     visit_shape_graph(store, root, options, &mut graphs, &mut stack)?;
+
+    let mut graph_versions = Vec::with_capacity(graphs.len());
+    for snapshot in graphs.values() {
+        let clock = postcard::to_allocvec(&snapshot.clock).map_err(StoreError::from)?;
+        graph_versions.push((snapshot.graph.clone(), *blake3::hash(&clock).as_bytes()));
+    }
 
     let mut graph_union = Graph::new();
     let mut property_shapes = BTreeSet::new();
@@ -724,6 +749,7 @@ fn materialize_shapes(
         ntriples,
         graph_count: graphs.len(),
         triple_count: triples.len(),
+        graph_versions,
     })
 }
 
