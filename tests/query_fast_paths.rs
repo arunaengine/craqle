@@ -59,7 +59,7 @@ fn canonical(results: &QueryResults) -> Vec<Vec<(String, EncodedTerm)>> {
 }
 
 #[test]
-fn guarded_fast_paths_match_the_generic_evaluator() {
+fn fast_paths_match_generic() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let primary = GraphId::new("urn:test:fast:primary");
@@ -202,7 +202,7 @@ fn guarded_fast_paths_match_the_generic_evaluator() {
 }
 
 #[test]
-fn fast_paths_preserve_authorization_and_forced_modes_fail_closed() {
+fn fast_paths_fail_closed() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:private");
@@ -275,7 +275,7 @@ fn fast_paths_preserve_authorization_and_forced_modes_fail_closed() {
 }
 
 #[test]
-fn hash_count_follows_the_physical_join_choice_and_preserves_multiplicity() {
+fn hash_count_multiplicity() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:hash");
@@ -341,7 +341,7 @@ fn hash_count_follows_the_physical_join_choice_and_preserves_multiplicity() {
 }
 
 #[test]
-fn randomized_guarded_paths_match_the_generic_evaluator() {
+fn randomized_paths_match() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:randomized");

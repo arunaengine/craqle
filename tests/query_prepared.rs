@@ -18,7 +18,7 @@ fn insert(graph: &GraphId, subject: &str, object: &str) -> MaterializedQuadChang
 }
 
 #[test]
-fn prepared_queries_reuse_parsing_but_read_fresh_state() {
+fn prepared_reads_fresh() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:prepared:graph");
@@ -92,7 +92,7 @@ fn prepared_queries_reuse_parsing_but_read_fresh_state() {
 }
 
 #[test]
-fn prepared_query_cancellation_is_distinct() {
+fn prepared_cancellation() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:prepared:cancel");
@@ -114,7 +114,7 @@ fn prepared_query_cancellation_is_distinct() {
 }
 
 #[test]
-fn diagnostic_authorization_matches_the_existing_query_api() {
+fn diagnostic_access_matches() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:prepared:denied");
@@ -133,7 +133,7 @@ fn diagnostic_authorization_matches_the_existing_query_api() {
 }
 
 #[test]
-fn forced_hash_and_lateral_join_results_are_identical() {
+fn forced_join_results() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:prepared:joins");
