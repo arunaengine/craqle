@@ -843,3 +843,377 @@ fn native_numeric_boundaries_match_rudof() {
     );
     assert_native_matches_rudof(&shape_text, &data_text);
 }
+
+#[test]
+fn native_property_pair_constraints_match_rudof() {
+    let root = iri("urn:test:pairs:root");
+    let set_shape = iri("urn:test:pairs:set-shape");
+    let less_shape = iri("urn:test:pairs:less-shape");
+    let less_equal_shape = iri("urn:test:pairs:less-equal-shape");
+    let focus = iri("urn:test:pairs:focus");
+    let set = iri("urn:test:pairs:set");
+    let equals = iri("urn:test:pairs:equals");
+    let disjoint = iri("urn:test:pairs:disjoint");
+    let low = iri("urn:test:pairs:low");
+    let high = iri("urn:test:pairs:high");
+    let low_equal = iri("urn:test:pairs:low-equal");
+    let high_equal = iri("urn:test:pairs:high-equal");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} {set_shape} .\n\
+         {root} {} {less_shape} .\n\
+         {root} {} {less_equal_shape} .\n\
+         {set_shape} {RDF_TYPE} {} .\n\
+         {set_shape} {} {set} .\n\
+         {set_shape} {} {equals} .\n\
+         {set_shape} {} {disjoint} .\n\
+         {less_shape} {RDF_TYPE} {} .\n\
+         {less_shape} {} {low} .\n\
+         {less_shape} {} {high} .\n\
+         {less_equal_shape} {RDF_TYPE} {} .\n\
+         {less_equal_shape} {} {low_equal} .\n\
+         {less_equal_shape} {} {high_equal} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("equals"),
+        sh("disjoint"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("lessThan"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("lessThanOrEquals"),
+    );
+    let data_text = format!(
+        "{focus} {set} {} .\n\
+         {focus} {set} {} .\n\
+         {focus} {equals} {} .\n\
+         {focus} {equals} {} .\n\
+         {focus} {disjoint} {} .\n\
+         {focus} {low} {} .\n\
+         {focus} {high} {} .\n\
+         {focus} {low_equal} {} .\n\
+         {focus} {high_equal} {} .\n",
+        integer(1),
+        integer(2),
+        integer(2),
+        integer(3),
+        integer(2),
+        integer(5),
+        integer(3),
+        integer(3),
+        integer(3),
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
+
+#[test]
+fn native_logical_and_qualified_constraints_match_rudof() {
+    let root = iri("urn:test:logical:root");
+    let property = iri("urn:test:logical:property");
+    let class_a_shape = iri("urn:test:logical:class-a-shape");
+    let class_b_shape = iri("urn:test:logical:class-b-shape");
+    let focus = iri("urn:test:logical:focus");
+    let value = iri("urn:test:logical:value");
+    let predicate = iri("urn:test:logical:predicate");
+    let class_a = iri("urn:test:logical:ClassA");
+    let class_b = iri("urn:test:logical:ClassB");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} {property} .\n\
+         {property} {RDF_TYPE} {} .\n\
+         {property} {} {predicate} .\n\
+         {property} {} _:andList .\n\
+         {property} {} _:orList .\n\
+         {property} {} {class_a_shape} .\n\
+         {property} {} _:xoneList .\n\
+         {property} {} {class_a_shape} .\n\
+         _:andList {RDF_FIRST} {class_a_shape} .\n\
+         _:andList {RDF_REST} _:andTail .\n\
+         _:andTail {RDF_FIRST} {class_b_shape} .\n\
+         _:andTail {RDF_REST} {RDF_NIL} .\n\
+         _:orList {RDF_FIRST} {class_a_shape} .\n\
+         _:orList {RDF_REST} _:orTail .\n\
+         _:orTail {RDF_FIRST} {class_b_shape} .\n\
+         _:orTail {RDF_REST} {RDF_NIL} .\n\
+         _:xoneList {RDF_FIRST} {class_a_shape} .\n\
+         _:xoneList {RDF_REST} _:xoneTail .\n\
+         _:xoneTail {RDF_FIRST} {class_b_shape} .\n\
+         _:xoneTail {RDF_REST} {RDF_NIL} .\n\
+         {class_a_shape} {RDF_TYPE} {} .\n\
+         {class_a_shape} {} {class_a} .\n\
+         {class_b_shape} {RDF_TYPE} {} .\n\
+         {class_b_shape} {} {class_b} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("and"),
+        sh("or"),
+        sh("not"),
+        sh("xone"),
+        sh("node"),
+        sh("NodeShape"),
+        sh("class"),
+        sh("NodeShape"),
+        sh("class"),
+    );
+    let data_text = format!(
+        "{focus} {predicate} {value} .\n\
+         {value} {RDF_TYPE} {class_a} .\n"
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+
+    let qualified_root = iri("urn:test:qualified:root");
+    let qualified_property = iri("urn:test:qualified:property");
+    let qualified_focus = iri("urn:test:qualified:focus");
+    let qualified_predicate = iri("urn:test:qualified:value");
+    let qualified_shape_text = format!(
+        "{qualified_root} {RDF_TYPE} {} .\n\
+         {qualified_root} {} {qualified_focus} .\n\
+         {qualified_root} {} {qualified_property} .\n\
+         {qualified_property} {RDF_TYPE} {} .\n\
+         {qualified_property} {} {qualified_predicate} .\n\
+         {qualified_property} {} {class_a_shape} .\n\
+         {qualified_property} {} {} .\n\
+         {qualified_property} {} {} .\n\
+         {class_a_shape} {RDF_TYPE} {} .\n\
+         {class_a_shape} {} {class_a} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("qualifiedValueShape"),
+        sh("qualifiedMinCount"),
+        integer(2),
+        sh("qualifiedMaxCount"),
+        integer(2),
+        sh("NodeShape"),
+        sh("class"),
+    );
+    let other_value = iri("urn:test:qualified:other-value");
+    let qualified_data_text = format!(
+        "{qualified_focus} {qualified_predicate} {value} .\n\
+         {qualified_focus} {qualified_predicate} {other_value} .\n\
+         {value} {RDF_TYPE} {class_a} .\n\
+         {other_value} {RDF_TYPE} {class_b} .\n"
+    );
+    assert_native_matches_rudof(&qualified_shape_text, &qualified_data_text);
+}
+
+#[test]
+fn native_all_core_path_forms_match_rudof() {
+    let root = iri("urn:test:paths:root");
+    let focus = iri("urn:test:paths:focus");
+    let inverse_shape = iri("urn:test:paths:inverse-shape");
+    let sequence_shape = iri("urn:test:paths:sequence-shape");
+    let alternative_shape = iri("urn:test:paths:alternative-shape");
+    let zero_one_shape = iri("urn:test:paths:zero-one-shape");
+    let zero_more_shape = iri("urn:test:paths:zero-more-shape");
+    let one_more_shape = iri("urn:test:paths:one-more-shape");
+    let p1 = iri("urn:test:paths:p1");
+    let p2 = iri("urn:test:paths:p2");
+    let p3 = iri("urn:test:paths:p3");
+    let p4 = iri("urn:test:paths:p4");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} {inverse_shape} .\n\
+         {root} {} {sequence_shape} .\n\
+         {root} {} {alternative_shape} .\n\
+         {root} {} {zero_one_shape} .\n\
+         {root} {} {zero_more_shape} .\n\
+         {root} {} {one_more_shape} .\n\
+         {inverse_shape} {RDF_TYPE} {} .\n\
+         {inverse_shape} {} _:inversePath .\n\
+         _:inversePath {} {p1} .\n\
+         {inverse_shape} {} {} .\n\
+         {sequence_shape} {RDF_TYPE} {} .\n\
+         {sequence_shape} {} _:sequence .\n\
+         _:sequence {RDF_FIRST} {p1} .\n\
+         _:sequence {RDF_REST} _:sequenceTail .\n\
+         _:sequenceTail {RDF_FIRST} {p2} .\n\
+         _:sequenceTail {RDF_REST} {RDF_NIL} .\n\
+         {sequence_shape} {} {} .\n\
+         {alternative_shape} {RDF_TYPE} {} .\n\
+         {alternative_shape} {} _:alternativePath .\n\
+         _:alternativePath {} _:alternatives .\n\
+         _:alternatives {RDF_FIRST} {p3} .\n\
+         _:alternatives {RDF_REST} _:alternativeTail .\n\
+         _:alternativeTail {RDF_FIRST} {p4} .\n\
+         _:alternativeTail {RDF_REST} {RDF_NIL} .\n\
+         {alternative_shape} {} {} .\n\
+         {zero_one_shape} {RDF_TYPE} {} .\n\
+         {zero_one_shape} {} _:zeroOnePath .\n\
+         _:zeroOnePath {} {p4} .\n\
+         {zero_one_shape} {} {} .\n\
+         {zero_more_shape} {RDF_TYPE} {} .\n\
+         {zero_more_shape} {} _:zeroMorePath .\n\
+         _:zeroMorePath {} {p3} .\n\
+         {zero_more_shape} {} {} .\n\
+         {one_more_shape} {RDF_TYPE} {} .\n\
+         {one_more_shape} {} _:oneMorePath .\n\
+         _:oneMorePath {} {p3} .\n\
+         {one_more_shape} {} {} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("inversePath"),
+        sh("minCount"),
+        integer(2),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("minCount"),
+        integer(2),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("alternativePath"),
+        sh("minCount"),
+        integer(2),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("zeroOrOnePath"),
+        sh("minCount"),
+        integer(2),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("zeroOrMorePath"),
+        sh("maxCount"),
+        integer(1),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("oneOrMorePath"),
+        sh("minCount"),
+        integer(2),
+    );
+    let source = iri("urn:test:paths:source");
+    let middle = iri("urn:test:paths:middle");
+    let end = iri("urn:test:paths:end");
+    let alternative = iri("urn:test:paths:alternative");
+    let data_text = format!(
+        "{source} {p1} {focus} .\n\
+         {focus} {p1} {middle} .\n\
+         {middle} {p2} {end} .\n\
+         {focus} {p3} {alternative} .\n"
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
+
+#[test]
+fn native_all_core_target_forms_match_rudof() {
+    let required = iri("urn:test:targets:required");
+    let class = iri("urn:test:targets:Class");
+    let implicit_class = iri("urn:test:targets:ImplicitClass");
+    let relation = iri("urn:test:targets:relation");
+    let node_focus = iri("urn:test:targets:node-focus");
+    let class_focus = iri("urn:test:targets:class-focus");
+    let subject_focus = iri("urn:test:targets:subject-focus");
+    let object_focus = iri("urn:test:targets:object-focus");
+    let implicit_focus = iri("urn:test:targets:implicit-focus");
+    let mut shape_text = String::new();
+    for (index, target, target_value) in [
+        (0, sh("targetNode"), node_focus.clone()),
+        (1, sh("targetClass"), class.clone()),
+        (2, sh("targetSubjectsOf"), relation.clone()),
+        (3, sh("targetObjectsOf"), relation.clone()),
+    ] {
+        let shape = iri(&format!("urn:test:targets:shape-{index}"));
+        let property = iri(&format!("urn:test:targets:property-{index}"));
+        shape_text.push_str(&format!(
+            "{shape} {RDF_TYPE} {} .\n\
+             {shape} {target} {target_value} .\n\
+             {shape} {} {property} .\n\
+             {property} {RDF_TYPE} {} .\n\
+             {property} {} {required} .\n\
+             {property} {} {} .\n",
+            sh("NodeShape"),
+            sh("property"),
+            sh("PropertyShape"),
+            sh("path"),
+            sh("minCount"),
+            integer(1),
+        ));
+    }
+    let implicit_property = iri("urn:test:targets:implicit-property");
+    shape_text.push_str(&format!(
+        "{implicit_class} {RDF_TYPE} {} .\n\
+         {implicit_class} {RDF_TYPE} <http://www.w3.org/2000/01/rdf-schema#Class> .\n\
+         {implicit_class} {} {implicit_property} .\n\
+         {implicit_property} {RDF_TYPE} {} .\n\
+         {implicit_property} {} {required} .\n\
+         {implicit_property} {} {} .\n",
+        sh("NodeShape"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("minCount"),
+        integer(1),
+    ));
+    let data_text = format!(
+        "{class_focus} {RDF_TYPE} {class} .\n\
+         {subject_focus} {relation} {object_focus} .\n\
+         {implicit_focus} {RDF_TYPE} {implicit_class} .\n\
+         {node_focus} <urn:test:targets:present> {} .\n",
+        literal("value")
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
+
+#[test]
+fn native_deactivated_shapes_are_skipped() {
+    let root = iri("urn:test:deactivated:shape");
+    let focus = iri("urn:test:deactivated:focus");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n\
+         {root} {} {} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("deactivated"),
+        sh("class"),
+        iri("urn:test:deactivated:MissingClass"),
+    );
+    let data_text = format!("{focus} <urn:test:present> {} .\n", literal("value"));
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
+
+#[test]
+fn native_logical_cycles_are_rejected_during_compilation() {
+    let (_database, node) = node();
+    let shapes = GraphId::new("urn:test:shacl:native:cycle:shapes");
+    let shape = iri("urn:test:cycle:shape");
+    let focus = iri("urn:test:cycle:focus");
+    insert(
+        &node,
+        &shapes,
+        &[
+            (&shape, RDF_TYPE, &sh("NodeShape")),
+            (&shape, &sh("targetNode"), &focus),
+            (&shape, &sh("not"), &shape),
+        ],
+    );
+    let error = node
+        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CraqleError::Shacl(ShaclError::IllFormedShapes { .. })
+    ));
+}
