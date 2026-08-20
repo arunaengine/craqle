@@ -209,7 +209,7 @@ pub(crate) struct RuleContext<'a> {
     graph: &'a GraphId,
     impact: &'a DeltaImpact,
     summary: &'a DeltaSummary,
-    profile: OnceCell<RoCrateVersion>,
+    profile: OnceCell<Option<RoCrateVersion>>,
 }
 
 impl<'a> RuleContext<'a> {
@@ -232,7 +232,7 @@ impl<'a> RuleContext<'a> {
         self.impact.changed_subjects.is_empty()
     }
 
-    fn profile(&self) -> crate::store::Result<RoCrateVersion> {
+    fn profile(&self) -> crate::store::Result<Option<RoCrateVersion>> {
         if let Some(profile) = self.profile.get() {
             return Ok(*profile);
         }
@@ -402,7 +402,7 @@ fn rule_plan(version: RoCrateVersion) -> &'static [RuleId] {
     }
 }
 
-fn profile_from_view(cx: &RuleContext<'_>) -> crate::store::Result<RoCrateVersion> {
+fn profile_from_view(cx: &RuleContext<'_>) -> crate::store::Result<Option<RoCrateVersion>> {
     let mut selected = None;
     for subject in [METADATA_DESCRIPTOR.clone(), cx.root()] {
         for version in [
@@ -419,13 +419,13 @@ fn profile_from_view(cx: &RuleContext<'_>) -> crate::store::Result<RoCrateVersio
                 object: &object,
             })? {
                 if selected.is_some_and(|current| current != version) {
-                    return Ok(RoCrateVersion::default());
+                    return Ok(None);
                 }
                 selected = Some(version);
             }
         }
     }
-    Ok(selected.unwrap_or_default())
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1162,11 +1162,11 @@ pub(crate) fn validate_change_set(
     let index = DeltaIndex::build(change_set.store, change_set.graph, change_set.delta)?;
     let summary = summarize_delta(change_set.graph, change_set.delta);
     let cx = RuleContext::new(change_set, &index, &summary);
-    let plan = rules
-        .iter()
-        .any(|rule| rule.rule_id().is_some())
-        .then(|| cx.profile().map(rule_plan))
-        .transpose()?;
+    let plan = if rules.iter().any(|rule| rule.rule_id().is_some()) {
+        cx.profile()?.map(rule_plan)
+    } else {
+        None
+    };
 
     let mut violations = Vec::new();
     let mut post = None;
@@ -1213,13 +1213,16 @@ pub(crate) fn post_merge_violations_from_store(
     let index = DeltaIndex::build(store, graph, &[])?;
     let summary = DeltaSummary::default();
     let cx = RuleContext::new(change_set, &index, &summary);
-    let plan = rule_plan(cx.profile()?);
+    let plan = cx.profile()?.map(rule_plan);
 
     let mut violations = Vec::new();
     let mut snapshot = None;
 
     for rule in &rules {
-        if rule.rule_id().is_some_and(|id| !plan.contains(&id)) {
+        if rule
+            .rule_id()
+            .is_some_and(|id| plan.is_some_and(|plan| !plan.contains(&id)))
+        {
             continue;
         }
         match rule.check_candidate(&cx)? {
@@ -1691,7 +1694,7 @@ mod tests {
                     &index,
                     &summary,
                 );
-                assert_eq!(cx.profile().unwrap(), version);
+                assert_eq!(cx.profile().unwrap(), Some(version));
                 assert_eq!(rule_plan(version), ROCRATE_RULES.as_slice());
 
                 let violations = match validate_change_set(
@@ -1746,7 +1749,62 @@ mod tests {
                 &index,
                 &summary,
             );
-            assert_eq!(cx.profile().unwrap(), RoCrateVersion::V1_1);
+            assert_eq!(cx.profile().unwrap(), Some(RoCrateVersion::V1_1));
+            let statistics = cx.context.snapshot();
+            assert!(statistics.index_seeks <= 6);
+            assert_eq!(statistics.terms_decoded, 0);
+        }
+
+        #[test]
+        fn profile_rejects_conflict() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(directory.path()).unwrap();
+            let graph = GraphId::new("urn:test:rules-profile-conflict");
+            for triple in [
+                (
+                    METADATA_DESCRIPTOR.clone(),
+                    DCTERMS_CONFORMS_TO.clone(),
+                    version_iri(RoCrateVersion::V1_2),
+                ),
+                (
+                    graph_root(&graph),
+                    DCTERMS_CONFORMS_TO.clone(),
+                    version_iri(RoCrateVersion::V1_1),
+                ),
+            ] {
+                put(&store, &graph, &triple);
+            }
+            let index = DeltaIndex::build(&store, &graph, &[]).unwrap();
+            let summary = DeltaSummary::default();
+            let cx = RuleContext::new(
+                ChangeSet {
+                    store: &store,
+                    graph: &graph,
+                    delta: &[],
+                },
+                &index,
+                &summary,
+            );
+            assert_eq!(cx.profile().unwrap(), None);
+        }
+
+        #[test]
+        fn profile_is_absent() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(directory.path()).unwrap();
+            let graph = GraphId::new("urn:test:rules-profile-absent");
+            let index = DeltaIndex::build(&store, &graph, &[]).unwrap();
+            let summary = DeltaSummary::default();
+            let cx = RuleContext::new(
+                ChangeSet {
+                    store: &store,
+                    graph: &graph,
+                    delta: &[],
+                },
+                &index,
+                &summary,
+            );
+            assert_eq!(cx.profile().unwrap(), None);
         }
 
         fn palette(graph: &GraphId) -> Vec<Triple> {
