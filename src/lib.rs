@@ -35,6 +35,8 @@ mod search;
 mod search_queue;
 #[path = "internal/sparql.rs"]
 mod sparql;
+#[path = "internal/sparql_fast_path.rs"]
+mod sparql_fast_path;
 #[path = "internal/store.rs"]
 mod store;
 #[path = "internal/validation_delta.rs"]
