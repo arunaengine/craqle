@@ -89,6 +89,10 @@ const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
 const GRAPH_CLOCK_PREFIX: u8 = b'K';
 /// Persisted, clock-tagged graph diagnostics.
 const GRAPH_DIAGNOSTICS_PREFIX: u8 = b'O';
+#[cfg(feature = "shacl-core")]
+const SHACL_BINDING_PREFIX: u8 = b'S';
+#[cfg(feature = "shacl-core")]
+const SHACL_REVERSE_PREFIX: u8 = b's';
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
 /// Upper bound on the global term-decode cache. Term ids are content hashes so
@@ -842,6 +846,8 @@ pub struct GraphStore {
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
     /// [`GraphStore::graph_commit_guard`].
     commit_locks: Vec<Mutex<()>>,
+    #[cfg(feature = "shacl-core")]
+    binding_lock: Mutex<()>,
     indexes: RwLock<IndexState>,
     /// Memory mirror of the persisted `'O'` records; always carries the clock
     /// tag so a reader can tell a fresh entry from a stale one.
@@ -1127,6 +1133,41 @@ fn graph_diagnostics_key(graph: TermId) -> [u8; 17] {
     let mut key = [0u8; 17];
     key[0] = GRAPH_DIAGNOSTICS_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "shacl-core")]
+fn shacl_binding_key(data_graph: TermId, shapes_graph: TermId) -> [u8; 33] {
+    let mut key = [0u8; 33];
+    key[0] = SHACL_BINDING_PREFIX;
+    key[1..17].copy_from_slice(&data_graph.to_be_bytes());
+    key[17..33].copy_from_slice(&shapes_graph.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "shacl-core")]
+fn shacl_binding_prefix(data_graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = SHACL_BINDING_PREFIX;
+    key[1..17].copy_from_slice(&data_graph.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "shacl-core")]
+fn binding_reverse_key(dependency: TermId, data_graph: TermId, shapes_graph: TermId) -> [u8; 49] {
+    let mut key = [0u8; 49];
+    key[0] = SHACL_REVERSE_PREFIX;
+    key[1..17].copy_from_slice(&dependency.to_be_bytes());
+    key[17..33].copy_from_slice(&data_graph.to_be_bytes());
+    key[33..49].copy_from_slice(&shapes_graph.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "shacl-core")]
+fn binding_reverse_prefix(dependency: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = SHACL_REVERSE_PREFIX;
+    key[1..17].copy_from_slice(&dependency.to_be_bytes());
     key
 }
 
@@ -1607,6 +1648,12 @@ impl StoreReadSnapshot {
             .is_some())
     }
 
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn graph_version(&self, store: &GraphStore, graph: TermId) -> Result<[u8; 32]> {
+        let clock = store.snapshot_vector_clock(&self.snapshot, graph)?;
+        Ok(*blake3::hash(&postcard::to_allocvec(&clock)?).as_bytes())
+    }
+
     pub(crate) fn graph_term_id_iter<'a>(
         &'a self,
         store: &'a GraphStore,
@@ -1728,6 +1775,13 @@ impl GraphStore {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn binding_guard(&self) -> MutexGuard<'_, ()> {
+        self.binding_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn indexes_read(&self) -> RwLockReadGuard<'_, IndexState> {
@@ -4015,6 +4069,8 @@ impl GraphStore {
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            #[cfg(feature = "shacl-core")]
+            binding_lock: Mutex::new(()),
             indexes: RwLock::new(IndexState::default()),
             diagnostics_cache: RwLock::new(HashMap::new()),
             term_decode_cache: RwLock::new(HashMap::new()),
@@ -4231,10 +4287,184 @@ impl GraphStore {
         Ok(self.graphs.contains_key(graph_meta_key(graph_id))?)
     }
 
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn graph_version_digest(&self, graph: &GraphId) -> Result<[u8; 32]> {
+        let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
+        self.read_snapshot().graph_version(self, graph)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn shacl_binding_statuses(
+        &self,
+        data_graph: &GraphId,
+    ) -> Result<Vec<crate::shacl::ShaclBindingStatus>> {
+        let Some(data_graph_id) = self.graph_id_for(data_graph)? else {
+            return Ok(Vec::new());
+        };
+        let mut statuses = Vec::new();
+        for guard in self.graphs.prefix(shacl_binding_prefix(data_graph_id)) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 33 {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL binding key",
+                    message: format!("expected 33 bytes, found {}", key.len()),
+                });
+            }
+            statuses.push(postcard::from_bytes(value.as_ref())?);
+        }
+        statuses.sort_by(|left: &crate::shacl::ShaclBindingStatus, right| {
+            left.binding
+                .shapes_graph
+                .as_str()
+                .cmp(right.binding.shapes_graph.as_str())
+        });
+        Ok(statuses)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn stage_binding_status(
+        &self,
+        batch: &mut WriteBatch,
+        status: &crate::shacl::ShaclBindingStatus,
+    ) -> Result<()> {
+        let Some(data_graph) = self.graph_id_for(&status.binding.data_graph)? else {
+            return Err(StoreError::GraphNotFound(
+                status.binding.data_graph.to_string(),
+            ));
+        };
+        let Some(shapes_graph) = self.graph_id_for(&status.binding.shapes_graph)? else {
+            return Err(StoreError::GraphNotFound(
+                status.binding.shapes_graph.to_string(),
+            ));
+        };
+        let mut dependencies = Vec::with_capacity(status.shape_versions.len());
+        for (dependency, _) in &status.shape_versions {
+            let Some(dependency) = self.graph_id_for(dependency)? else {
+                return Err(StoreError::GraphNotFound(dependency.to_string()));
+            };
+            dependencies.push(dependency);
+        }
+        let binding_key = shacl_binding_key(data_graph, shapes_graph);
+        if let Some(value) = self.graphs.get(binding_key)? {
+            let previous: crate::shacl::ShaclBindingStatus =
+                postcard::from_bytes(value.as_ref())?;
+            for (dependency, _) in previous.shape_versions {
+                if let Some(dependency) = self.graph_id_for(&dependency)? {
+                    batch.remove(
+                        &self.graphs,
+                        binding_reverse_key(dependency, data_graph, shapes_graph),
+                    );
+                }
+            }
+        }
+        batch.insert(
+            &self.graphs,
+            binding_key,
+            postcard::to_allocvec(status)?,
+        );
+        for dependency in dependencies {
+            batch.insert(
+                &self.graphs,
+                binding_reverse_key(dependency, data_graph, shapes_graph),
+                [],
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn stage_binding_remove(
+        &self,
+        batch: &mut WriteBatch,
+        data_graph: &GraphId,
+        shapes_graph: &GraphId,
+    ) -> Result<()> {
+        let Some(data_graph) = self.graph_id_for(data_graph)? else {
+            return Ok(());
+        };
+        let Some(shapes_graph) = self.graph_id_for(shapes_graph)? else {
+            return Ok(());
+        };
+        let binding_key = shacl_binding_key(data_graph, shapes_graph);
+        if let Some(value) = self.graphs.get(binding_key)? {
+            let status: crate::shacl::ShaclBindingStatus =
+                postcard::from_bytes(value.as_ref())?;
+            for (dependency, _) in status.shape_versions {
+                if let Some(dependency) = self.graph_id_for(&dependency)? {
+                    batch.remove(
+                        &self.graphs,
+                        binding_reverse_key(dependency, data_graph, shapes_graph),
+                    );
+                }
+            }
+        }
+        batch.remove(&self.graphs, binding_key);
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn stage_pending_bindings(
+        &self,
+        batch: &mut WriteBatch,
+        changed_graph: &GraphId,
+    ) -> Result<()> {
+        let Some(changed_graph) = self.graph_id_for(changed_graph)? else {
+            return Ok(());
+        };
+        for key in self.binding_keys(changed_graph)? {
+            let Some(value) = self.graphs.get(key)? else {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL reverse binding key",
+                    message: "binding target is missing".to_owned(),
+                });
+            };
+            let mut status: crate::shacl::ShaclBindingStatus =
+                postcard::from_bytes(value.as_ref())?;
+            if status.binding.policy == crate::shacl::ValidationPolicy::Disabled {
+                continue;
+            }
+            status.state = crate::shacl::ShaclValidationState::Pending;
+            status.report = None;
+            status.error = None;
+            self.stage_binding_status(batch, &status)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn binding_keys(&self, changed_graph: TermId) -> Result<BTreeSet<[u8; 33]>> {
+        let mut binding_keys = BTreeSet::new();
+        for guard in self.graphs.prefix(shacl_binding_prefix(changed_graph)) {
+            let (key, _) = guard.into_inner()?;
+            let key: [u8; 33] = key.as_ref().try_into().map_err(|_| {
+                StoreError::InvalidEncoding {
+                    context: "SHACL binding key",
+                    message: format!("expected 33 bytes, found {}", key.len()),
+                }
+            })?;
+            binding_keys.insert(key);
+        }
+        for guard in self.graphs.prefix(binding_reverse_prefix(changed_graph)) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 49 || !value.is_empty() {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL reverse binding key",
+                    message: format!("expected 49-byte empty entry, found {} bytes", key.len()),
+                });
+            }
+            let data_graph = decode_term_id(&key[17..33], "SHACL reverse data graph")?;
+            let shapes_graph = decode_term_id(&key[33..49], "SHACL reverse shapes graph")?;
+            binding_keys.insert(shacl_binding_key(data_graph, shapes_graph));
+        }
+        Ok(binding_keys)
+    }
+
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn delete_graph(&self, graph: &GraphId) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
+        #[cfg(feature = "shacl-core")]
+        let _binding_guard = self.binding_guard();
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(());
         };
@@ -4254,6 +4484,30 @@ impl GraphStore {
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
             batch.remove(&self.graphs, key);
+        }
+
+        #[cfg(feature = "shacl-core")]
+        for key in self.binding_keys(graph_id)? {
+            let Some(value) = self.graphs.get(key)? else {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL reverse binding key",
+                    message: "binding target is missing".to_owned(),
+                });
+            };
+            let mut status: crate::shacl::ShaclBindingStatus =
+                postcard::from_bytes(value.as_ref())?;
+            if status.binding.data_graph == *graph {
+                self.stage_binding_remove(
+                    &mut batch,
+                    &status.binding.data_graph,
+                    &status.binding.shapes_graph,
+                )?;
+            } else if status.binding.policy != crate::shacl::ValidationPolicy::Disabled {
+                status.state = crate::shacl::ShaclValidationState::Pending;
+                status.report = None;
+                status.error = None;
+                self.stage_binding_status(&mut batch, &status)?;
+            }
         }
 
         let reindex_key = graph_reindex_key(graph_id);
