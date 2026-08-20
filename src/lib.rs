@@ -87,7 +87,9 @@ pub use crate::rocrate::{
 pub use crate::search::SearchHit;
 #[cfg(feature = "shacl-core")]
 pub use crate::shacl::{
-    CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclProfile,
+    CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclMessage,
+    ShaclProfile, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
+    ShaclValidationStatistics,
 };
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
