@@ -3,7 +3,7 @@ use std::hint::black_box;
 #[path = "support/mod.rs"]
 mod support;
 
-use craqle::QueryExecutionOptions;
+use craqle::{QueryExecutionOptions, QueryFastPathMode};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::Fixture;
 
@@ -25,6 +25,29 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
         let label = fixture.hot_path_label(index);
         group.bench_function(label, |b| {
             b.iter(|| black_box(fixture.run_hot_path(index)));
+        });
+    }
+    group.finish();
+
+    let mut fast_options = QueryExecutionOptions::default();
+    fast_options.fast_paths = QueryFastPathMode::Auto;
+    let mut generic_options = QueryExecutionOptions::default();
+    generic_options.fast_paths = QueryFastPathMode::Disabled;
+    let mut group = c.benchmark_group("sparql_fast_path_comparison");
+    group.sample_size(10);
+    group.warm_up_time(config.warm_up);
+    group.measurement_time(config.measurement);
+    for index in 0..5 {
+        let query = fixture.prepare_hot_path(index);
+        let fast = fixture.run_prepared_hot_path(&query, &fast_options);
+        let generic = fixture.run_prepared_hot_path(&query, &generic_options);
+        assert_eq!(fast.results, generic.results);
+        assert!(fast.statistics.fast_path.is_some());
+        group.bench_function(format!("{}/fast", fixture.hot_path_label(index)), |b| {
+            b.iter(|| black_box(fixture.run_prepared_hot_path(&query, &fast_options)));
+        });
+        group.bench_function(format!("{}/generic", fixture.hot_path_label(index)), |b| {
+            b.iter(|| black_box(fixture.run_prepared_hot_path(&query, &generic_options)));
         });
     }
     group.finish();

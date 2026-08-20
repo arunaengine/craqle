@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use craqle::{
     ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind, JoinMode,
-    MaterializedQuadChange, QueryExecution, QueryExecutionOptions,
+    MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -108,6 +108,14 @@ fn sparql_join_choice(c: &mut Criterion) {
     assert_eq!(
         automatic.statistics.planned_joins[0].physical_operator,
         JoinKind::Hash
+    );
+    assert_eq!(
+        hash.statistics.fast_path,
+        Some(QueryFastPathKind::HashJoinCount)
+    );
+    assert_eq!(
+        automatic.statistics.fast_path,
+        Some(QueryFastPathKind::HashJoinCount)
     );
     eprintln!(
         "sparql_join_choice rows={} distinct_keys={} lateral_ns={} hash_ns={} auto_ns={} lateral_seeks={} hash_seeks={} lateral_candidates={} hash_candidates={}",
