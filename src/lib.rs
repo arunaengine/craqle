@@ -46,6 +46,8 @@ mod store;
 mod validation_delta;
 
 mod auth;
+#[cfg(feature = "shacl-core")]
+pub mod shacl;
 mod sync;
 
 use std::cmp::Reverse;
@@ -81,6 +83,10 @@ pub use crate::rocrate::{
     canonicalize_jsonld, validate_rocrate_jsonld,
 };
 pub use crate::search::SearchHit;
+#[cfg(feature = "shacl-core")]
+pub use crate::shacl::{
+    CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclProfile,
+};
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
     QueryLogicalOperator, QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryResults,
