@@ -122,3 +122,7 @@ harness = false
 [[bench]]
 name = "query_result_collection"
 harness = false
+
+[[bench]]
+name = "sparql_join_choice"
+harness = false
