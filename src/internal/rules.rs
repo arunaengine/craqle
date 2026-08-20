@@ -7,6 +7,7 @@ use crate::query_context::{QueryCancellation, ReadContext};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::GraphStore;
 use crate::validation_delta::{DeltaImpact, DeltaIndex, DeltaReadView};
+use crate::RoCrateVersion;
 
 #[cfg(test)]
 thread_local! {
@@ -40,6 +41,9 @@ vocab_terms! {
     SCHEMA_DATE_PUBLISHED => vocab::schema_date_published,
     METADATA_DESCRIPTOR => vocab::metadata_descriptor,
 }
+
+static DCTERMS_CONFORMS_TO: LazyLock<EncodedTerm> =
+    LazyLock::new(|| EncodedTerm("<http://purl.org/dc/terms/conformsTo>".to_string()));
 
 /// The three properties RO-Crate requires on the root data entity, in the order
 /// they are reported. `DeltaSummary::touches_required_root_properties` is
@@ -205,6 +209,7 @@ pub(crate) struct RuleContext<'a> {
     graph: &'a GraphId,
     impact: &'a DeltaImpact,
     summary: &'a DeltaSummary,
+    profile: OnceCell<RoCrateVersion>,
 }
 
 impl<'a> RuleContext<'a> {
@@ -215,6 +220,7 @@ impl<'a> RuleContext<'a> {
             graph: change_set.graph,
             impact: index.impact(),
             summary,
+            profile: OnceCell::new(),
         }
     }
 
@@ -224,6 +230,15 @@ impl<'a> RuleContext<'a> {
 
     fn delta_is_empty(&self) -> bool {
         self.impact.changed_subjects.is_empty()
+    }
+
+    fn profile(&self) -> crate::store::Result<RoCrateVersion> {
+        if let Some(profile) = self.profile.get() {
+            return Ok(*profile);
+        }
+        let profile = profile_from_view(self)?;
+        let _ = self.profile.set(profile);
+        Ok(profile)
     }
 
     fn triple_exists(&self, triple: EncodedTripleRef<'_>) -> crate::store::Result<bool> {
@@ -347,6 +362,10 @@ impl<'a> RuleContext<'a> {
 }
 
 pub(crate) trait Rule: Send + Sync {
+    fn rule_id(&self) -> Option<RuleId> {
+        None
+    }
+
     /// Validate against the delta alone where possible. Returning
     /// [`CandidateCheck::NeedSnapshot`] falls back to materialising the whole
     /// post state.
@@ -354,6 +373,59 @@ pub(crate) trait Rule: Send + Sync {
 
     /// Validate the post-state snapshot. Return `Err` if a violation is found.
     fn check_post_state(&self, post: &GraphSnapshot) -> std::result::Result<(), CrateViolation>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuleId {
+    Root,
+    Descriptor,
+    RequiredProperties,
+    DatePublished,
+    EntityType,
+    Reachability,
+}
+
+static ROCRATE_RULES: [RuleId; 6] = [
+    RuleId::Root,
+    RuleId::Descriptor,
+    RuleId::RequiredProperties,
+    RuleId::DatePublished,
+    RuleId::EntityType,
+    RuleId::Reachability,
+];
+
+fn rule_plan(version: RoCrateVersion) -> &'static [RuleId] {
+    match version {
+        RoCrateVersion::V1_1 => &ROCRATE_RULES,
+        RoCrateVersion::V1_2 => &ROCRATE_RULES,
+        RoCrateVersion::V1_3 => &ROCRATE_RULES,
+    }
+}
+
+fn profile_from_view(cx: &RuleContext<'_>) -> crate::store::Result<RoCrateVersion> {
+    let mut selected = None;
+    for subject in [METADATA_DESCRIPTOR.clone(), cx.root()] {
+        for version in [
+            RoCrateVersion::V1_1,
+            RoCrateVersion::V1_2,
+            RoCrateVersion::V1_3,
+        ] {
+            let object = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                version.specification_url(),
+            ));
+            if cx.triple_exists(EncodedTripleRef {
+                subject: &subject,
+                predicate: &DCTERMS_CONFORMS_TO,
+                object: &object,
+            })? {
+                if selected.is_some_and(|current| current != version) {
+                    return Ok(RoCrateVersion::default());
+                }
+                selected = Some(version);
+            }
+        }
+    }
+    Ok(selected.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,6 +870,10 @@ impl<'a> ReachabilityWalk<'a> {
 pub(crate) struct RootEntityRule;
 
 impl Rule for RootEntityRule {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(RuleId::Root)
+    }
+
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
         if !cx.delta_is_empty() && !cx.summary.touches_root_dataset {
             return Ok(CandidateCheck::Pass);
@@ -833,6 +909,10 @@ impl Rule for RootEntityRule {
 pub(crate) struct MetadataDescriptorRule;
 
 impl Rule for MetadataDescriptorRule {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(RuleId::Descriptor)
+    }
+
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
         if !cx.delta_is_empty() && !cx.summary.touches_metadata_descriptor {
             return Ok(CandidateCheck::Pass);
@@ -880,6 +960,10 @@ impl Rule for MetadataDescriptorRule {
 pub(crate) struct RequiredRootPropertiesRule;
 
 impl Rule for RequiredRootPropertiesRule {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(RuleId::RequiredProperties)
+    }
+
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
         if !cx.delta_is_empty() && !cx.summary.touches_any_required_root_property() {
             return Ok(CandidateCheck::Pass);
@@ -931,6 +1015,10 @@ impl Rule for RequiredRootPropertiesRule {
 pub(crate) struct DatePublishedCardinalityRule;
 
 impl Rule for DatePublishedCardinalityRule {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(RuleId::DatePublished)
+    }
+
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
         let touched = cx.summary.touches_required_root_properties[DATE_PUBLISHED_SLOT];
         if !cx.delta_is_empty() && !touched {
@@ -967,6 +1055,10 @@ impl Rule for DatePublishedCardinalityRule {
 pub(crate) struct EntityTypeRule;
 
 impl Rule for EntityTypeRule {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(RuleId::EntityType)
+    }
+
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
         if cx.delta_is_empty() {
             return Ok(CandidateCheck::NeedSnapshot);
@@ -1021,6 +1113,10 @@ impl Rule for EntityTypeRule {
 pub(crate) struct ReachabilityRule;
 
 impl Rule for ReachabilityRule {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(RuleId::Reachability)
+    }
+
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
         if cx.delta_is_empty() {
             return Ok(CandidateCheck::NeedSnapshot);
@@ -1045,7 +1141,7 @@ impl Rule for ReachabilityRule {
     }
 }
 
-/// Create the default set of RO-Crate 1.2 rules.
+/// Create the default RO-Crate rule set for the supported versions.
 pub(crate) fn default_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(RootEntityRule),
@@ -1066,11 +1162,22 @@ pub(crate) fn validate_change_set(
     let index = DeltaIndex::build(change_set.store, change_set.graph, change_set.delta)?;
     let summary = summarize_delta(change_set.graph, change_set.delta);
     let cx = RuleContext::new(change_set, &index, &summary);
+    let plan = rules
+        .iter()
+        .any(|rule| rule.rule_id().is_some())
+        .then(|| cx.profile().map(rule_plan))
+        .transpose()?;
 
     let mut violations = Vec::new();
     let mut post = None;
 
     for rule in rules {
+        if rule
+            .rule_id()
+            .is_some_and(|id| plan.is_some_and(|plan| !plan.contains(&id)))
+        {
+            continue;
+        }
         match rule.check_candidate(&cx)? {
             CandidateCheck::Pass => {}
             CandidateCheck::Violation(violation) => violations.push(violation),
@@ -1106,11 +1213,15 @@ pub(crate) fn post_merge_violations_from_store(
     let index = DeltaIndex::build(store, graph, &[])?;
     let summary = DeltaSummary::default();
     let cx = RuleContext::new(change_set, &index, &summary);
+    let plan = rule_plan(cx.profile()?);
 
     let mut violations = Vec::new();
     let mut snapshot = None;
 
     for rule in &rules {
+        if rule.rule_id().is_some_and(|id| !plan.contains(&id)) {
+            continue;
+        }
         match rule.check_candidate(&cx)? {
             CandidateCheck::Pass => {}
             CandidateCheck::Violation(violation) => violations.push(violation),
@@ -1539,6 +1650,103 @@ mod tests {
                 (root.clone(), SCHEMA_HAS_PART.clone(), child.clone()),
                 (child, RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
             ]
+        }
+
+        fn version_iri(version: RoCrateVersion) -> EncodedTerm {
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(
+                version.specification_url(),
+            ))
+        }
+
+        #[test]
+        fn profiles_use_markers() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(directory.path()).unwrap();
+
+            for version in [
+                RoCrateVersion::V1_1,
+                RoCrateVersion::V1_2,
+                RoCrateVersion::V1_3,
+            ] {
+                let graph = GraphId::new(&format!("urn:test:rules-profile:{version:?}"));
+                let mut triples = valid_base(&graph);
+                triples.retain(|(_, predicate, _)| predicate != &*SCHEMA_NAME);
+                triples.push((
+                    METADATA_DESCRIPTOR.clone(),
+                    DCTERMS_CONFORMS_TO.clone(),
+                    version_iri(version),
+                ));
+                for triple in &triples {
+                    put(&store, &graph, triple);
+                }
+
+                let index = DeltaIndex::build(&store, &graph, &[]).unwrap();
+                let summary = DeltaSummary::default();
+                let cx = RuleContext::new(
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &[],
+                    },
+                    &index,
+                    &summary,
+                );
+                assert_eq!(cx.profile().unwrap(), version);
+                assert_eq!(rule_plan(version), ROCRATE_RULES.as_slice());
+
+                let violations = match validate_change_set(
+                    &default_rules(),
+                    ChangeSet {
+                        store: &store,
+                        graph: &graph,
+                        delta: &[],
+                    },
+                ) {
+                    Err(RuleEvaluationError::Violations(violations)) => violations,
+                    other => panic!("expected missing property violation, got {other:?}"),
+                };
+                assert_eq!(
+                    violations
+                        .iter()
+                        .map(|violation| violation.code)
+                        .collect::<Vec<_>>(),
+                    ["missing_required_property"]
+                );
+            }
+        }
+
+        #[test]
+        fn profile_uses_delta() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(directory.path()).unwrap();
+            let graph = GraphId::new("urn:test:rules-profile-delta");
+            let old = (
+                METADATA_DESCRIPTOR.clone(),
+                DCTERMS_CONFORMS_TO.clone(),
+                version_iri(RoCrateVersion::V1_2),
+            );
+            put(&store, &graph, &old);
+            let new = (
+                METADATA_DESCRIPTOR.clone(),
+                DCTERMS_CONFORMS_TO.clone(),
+                version_iri(RoCrateVersion::V1_1),
+            );
+            let delta = vec![
+                materialize(&graph, old, false),
+                materialize(&graph, new, true),
+            ];
+            let index = DeltaIndex::build(&store, &graph, &delta).unwrap();
+            let summary = summarize_delta(&graph, &delta);
+            let cx = RuleContext::new(
+                ChangeSet {
+                    store: &store,
+                    graph: &graph,
+                    delta: &delta,
+                },
+                &index,
+                &summary,
+            );
+            assert_eq!(cx.profile().unwrap(), RoCrateVersion::V1_1);
         }
 
         fn palette(graph: &GraphId) -> Vec<Triple> {
