@@ -328,7 +328,7 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.duplicate_groups);
     }
 
-    pub(crate) fn increment_duplicate_copies_skipped(&self) {
+    pub(crate) fn increment_skipped_copies(&self) {
         ReadCounters::increment(&self.counters.duplicate_copies_skipped);
     }
 

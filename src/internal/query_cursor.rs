@@ -415,7 +415,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
                         *group_emitted = false;
                         self.context.increment_duplicate_groups();
                     } else {
-                        self.context.increment_duplicate_copies_skipped();
+                        self.context.increment_skipped_copies();
                     }
                     *group_emitted
                 }

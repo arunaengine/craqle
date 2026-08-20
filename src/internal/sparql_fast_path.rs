@@ -286,7 +286,7 @@ fn count_plan(pattern: &GraphPattern) -> Option<FastPathPlan> {
             name: AggregateFunction::Count,
             expr: Expression::Variable(variable),
             distinct: true,
-        } if triple.distinct_subject_is_ordered(variable) => true,
+        } if triple.distinct_subject_order(variable) => true,
         _ => return None,
     };
     Some(FastPathPlan::Count {
@@ -419,7 +419,7 @@ struct ResolvedTriple<'a> {
 }
 
 impl TriplePlan {
-    fn distinct_subject_is_ordered(&self, variable: &Variable) -> bool {
+    fn distinct_subject_order(&self, variable: &Variable) -> bool {
         matches!(
             &self.subject,
             PatternTerm::Variable(subject) if subject == variable.as_str()
@@ -580,11 +580,11 @@ pub(crate) fn execute(
             right,
             output,
             join_variables,
-        } => execute_hash_join_count(left, right, output, join_variables, view, context, started),
+        } => hash_join_count(left, right, output, join_variables, view, context, started),
     }
 }
 
-fn execute_hash_join_count(
+fn hash_join_count(
     left: &TriplePlan,
     right: &TriplePlan,
     output: &str,

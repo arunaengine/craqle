@@ -251,7 +251,7 @@ impl SparqlEngine {
         graphs: &[GraphId],
         options: &QueryExecutionOptions,
     ) -> Result<QueryPlan> {
-        self.explain_prepared_with_scope(prepared, GraphScope::List(graphs), None, options)
+        self.explain_prepared_scope(prepared, GraphScope::List(graphs), None, options)
     }
 
     pub(crate) fn explain_prepared_with_snapshot_visibility(
@@ -262,7 +262,7 @@ impl SparqlEngine {
     ) -> Result<QueryPlan> {
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
-        self.explain_prepared_with_scope(
+        self.explain_prepared_scope(
             prepared,
             GraphScope::Predicate(&visible),
             Some((self.store.as_ref(), policy_visible)),
@@ -270,7 +270,7 @@ impl SparqlEngine {
         )
     }
 
-    fn explain_prepared_with_scope(
+    fn explain_prepared_scope(
         &self,
         prepared: &PreparedQuery,
         scope: GraphScope<'_>,
@@ -311,7 +311,7 @@ impl SparqlEngine {
         graphs: &[GraphId],
         read_mode: QueryReadMode,
     ) -> Result<(QueryResults, ReadStatistics)> {
-        self.run_query_with_read_mode(
+        self.run_query_mode(
             sparql,
             GraphScope::List(graphs),
             planner_enabled(),
@@ -325,7 +325,7 @@ impl SparqlEngine {
         graphs: &[GraphId],
     ) -> Result<QueryExecution> {
         let (prepared, parse_time) = parse_prepared_query(sparql)?;
-        self.execute_prepared_with_scope(
+        self.execute_prepared_scope(
             &prepared,
             GraphScope::List(graphs),
             &QueryExecutionOptions::default(),
@@ -341,7 +341,7 @@ impl SparqlEngine {
         graphs: &[GraphId],
         options: &QueryExecutionOptions,
     ) -> Result<QueryExecution> {
-        self.execute_prepared_with_scope(
+        self.execute_prepared_scope(
             prepared,
             GraphScope::List(graphs),
             options,
@@ -460,11 +460,11 @@ impl SparqlEngine {
         optimize: bool,
     ) -> Result<QueryResults> {
         Ok(self
-            .run_query_with_read_mode(sparql, scope, optimize, QueryReadMode::Auto)?
+            .run_query_mode(sparql, scope, optimize, QueryReadMode::Auto)?
             .0)
     }
 
-    fn run_query_with_read_mode(
+    fn run_query_mode(
         &self,
         sparql: &str,
         scope: GraphScope<'_>,
@@ -480,11 +480,11 @@ impl SparqlEngine {
             fast_paths: QueryFastPathMode::Auto,
         };
         let (execution, read_statistics) =
-            self.execute_prepared_with_scope(&prepared, scope, &options, parse_time, false)?;
+            self.execute_prepared_scope(&prepared, scope, &options, parse_time, false)?;
         Ok((execution.results, read_statistics))
     }
 
-    fn execute_prepared_with_scope(
+    fn execute_prepared_scope(
         &self,
         prepared: &PreparedQuery,
         scope: GraphScope<'_>,
@@ -542,7 +542,7 @@ impl SparqlEngine {
         collect_plan_statistics: bool,
     ) -> Result<(QueryExecution, ReadStatistics)> {
         let (context, named_graphs) =
-            read_context_for_scope(scope, view, options.cancellation.clone())?;
+            scope_read_context(scope, view, options.cancellation.clone())?;
         if let Some(plan) = stages.fast_path.take() {
             let outcome = crate::sparql_fast_path::execute(&plan, view, &context)?;
             let read_statistics = context.snapshot();
@@ -696,7 +696,7 @@ impl SparqlEngine {
     }
 }
 
-fn read_context_for_scope<'scope>(
+fn scope_read_context<'scope>(
     scope: GraphScope<'scope>,
     view: &StoreReadView<'_>,
     cancellation: QueryCancellation,
