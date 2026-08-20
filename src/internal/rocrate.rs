@@ -706,9 +706,7 @@ impl RoCrateManager {
 
         let change_count = changes.len();
         let entity_count = seen.len();
-        let batch = self
-            .engine
-            .local_apply_changes_bulk_unchecked(graph_id, changes)?;
+        let batch = self.engine.local_apply_bulk(graph_id, changes)?;
         // `additional_triples` may carry a `hasPart` edge that adopts an
         // existing orphan. That entity is never written, so only the orphan
         // record can return it to the search index (G7).
@@ -893,9 +891,9 @@ impl RoCrateManager {
 
     /// Import a JSON-LD RO-Crate metadata file into a named graph.
     ///
-    /// New or empty graphs use the trusted bootstrap fast path. Existing graphs
-    /// use a validated full-document replacement path that diffs against the
-    /// current graph state.
+    /// New or empty graphs avoid current-state diffing. Existing graphs use a
+    /// validated full-document replacement path. Both paths honor bound write
+    /// policies.
     pub(crate) fn import_jsonld(
         &self,
         graph_id: GraphId,
@@ -906,7 +904,10 @@ impl RoCrateManager {
         let license = extract_raw_license(&value);
         let cx = self.crate_ctx(&graph_id)?;
         let batch = if self.graph_is_missing_or_empty(&graph_id)? {
-            self.import_jsonld_into_empty_graph_trusted(&graph_id, value)?
+            let changes = self.plan_empty_import(&graph_id, value)?;
+            let batch = self.engine.local_apply_bulk(&graph_id, changes)?;
+            self.engine.rebuild_graph_diagnostics(&graph_id)?;
+            batch
         } else {
             self.replace_jsonld_in_existing_graph(&cx, value)?
         };
@@ -926,9 +927,7 @@ impl RoCrateManager {
         let license = extract_raw_license(&value);
         let cx = self.crate_ctx(&graph_id)?;
         let changes = self.plan_import_value_checked(&cx, value)?;
-        let batch = self
-            .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+        let batch = self.engine.local_apply_bulk(&graph_id, changes)?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
@@ -987,7 +986,11 @@ impl RoCrateManager {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         let context = extract_raw_context(&value);
         let license = extract_raw_license(&value);
-        let batch = self.import_jsonld_into_empty_graph_trusted(&graph_id, value)?;
+        let changes = self.plan_empty_import(&graph_id, value)?;
+        let batch = self
+            .engine
+            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+        self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
@@ -1585,26 +1588,20 @@ impl RoCrateManager {
     ) -> Result<Batch, RoCrateError> {
         let graph_id = &cx.graph;
         let changes = self.plan_import_value_checked(cx, value)?;
-        let batch = self
-            .engine
-            .local_apply_changes_bulk_unchecked(graph_id, changes)?;
+        let batch = self.engine.local_apply_bulk(graph_id, changes)?;
         self.engine.rebuild_graph_diagnostics(graph_id)?;
         Ok(batch)
     }
 
-    fn import_jsonld_into_empty_graph_trusted(
+    fn plan_empty_import(
         &self,
         graph_id: &GraphId,
         value: serde_json::Value,
-    ) -> Result<Batch, RoCrateError> {
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let context_version = detect_context_version(&value)?;
         let target = jsonld_triples(graph_id, &value)?;
         validate_crate_version(graph_id, &target, context_version)?;
-        let batch = self
-            .engine
-            .local_apply_changes_bulk_unchecked(graph_id, insert_changes(graph_id, target))?;
-        self.engine.rebuild_graph_diagnostics(graph_id)?;
-        Ok(batch)
+        Ok(insert_changes(graph_id, target))
     }
 
     /// Persist, and replicate when sync is configured, the render hints captured

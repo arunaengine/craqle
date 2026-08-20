@@ -118,6 +118,7 @@ struct LocalCommit<'a> {
     graph: &'a GraphId,
     changes: Vec<MaterializedQuadChange>,
     plan: DiagnosticsPlan,
+    validate_rules: bool,
 }
 
 impl ReplicationEngine {
@@ -269,7 +270,6 @@ impl ReplicationEngine {
             | MaterializedQuadChange::Delete { graph, .. } => graph.clone(),
         };
         self.ensure_change_set_targets(&graph, &changes)?;
-        self.validate(&graph, &changes)?;
 
         self.commit_changes(&graph, changes).map(Some)
     }
@@ -306,7 +306,6 @@ impl ReplicationEngine {
             return self.empty_batch(graph);
         }
 
-        self.validate(graph, &changes)?;
         self.commit_changes(graph, changes)
     }
 
@@ -329,6 +328,7 @@ impl ReplicationEngine {
             graph,
             changes,
             plan: DiagnosticsPlan::Immediate,
+            validate_rules: false,
         })
     }
 
@@ -349,6 +349,24 @@ impl ReplicationEngine {
             graph,
             changes,
             plan: DiagnosticsPlan::Deferred,
+            validate_rules: false,
+        })
+    }
+
+    pub(crate) fn local_apply_bulk(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+        if changes.is_empty() {
+            return self.empty_batch(graph);
+        }
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            plan: DiagnosticsPlan::Deferred,
+            validate_rules: true,
         })
     }
 
@@ -421,6 +439,7 @@ impl ReplicationEngine {
             graph,
             changes,
             plan: DiagnosticsPlan::Immediate,
+            validate_rules: true,
         })
     }
 
@@ -430,9 +449,12 @@ impl ReplicationEngine {
             graph,
             changes,
             plan,
+            validate_rules,
         } = commit;
 
         if let Some(sync) = &self.sync {
+            // Topic binding can take the graph commit guard itself.
+            sync.ensure_graph_topic(&self.store, graph)?;
             // Orders this graph's publish against its own apply; see
             // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
             let _write_guard = graph_write_guard(graph);
@@ -445,16 +467,20 @@ impl ReplicationEngine {
                 return self.empty_batch(graph);
             }
 
-            // Publish-first (G4): the event goes out before any local state
-            // changes, and outside the commit guard, because the publish may bind
-            // an irokle topic and that takes the guard itself.
+            let _commit_guard = self.store.graph_commit_guard(graph);
+            if validate_rules {
+                self.validate(graph, &changes)?;
+            }
+
+            // Publish-first (G4): no local state changes until the event is
+            // durable in the topic.
             let record = sync.publish_changes(&self.store, graph, changes)?;
             let Some(batch) = crate::sync::batch_from_owned(record)? else {
                 return Err(UpdateError::InvalidChangeSet(
                     "irokle changes publish did not return a quad-change record".to_string(),
                 ));
             };
-            self.apply_irokle_batch_with_plan(&batch, plan)
+            self.apply_irokle_guarded(&batch, plan)
                 .map_err(update_error_from_merge)?;
             return Ok(batch);
         }
@@ -471,6 +497,10 @@ impl ReplicationEngine {
         // clock write, the FTS enqueue, the commit and the diagnostics refresh
         // (G1, G2, G5, G6).
         let _commit_guard = self.store.graph_commit_guard(graph);
+
+        if validate_rules {
+            self.validate(graph, &changes)?;
+        }
 
         // Captured before the write, under the guard, so it describes exactly
         // the state this commit starts from. Skipped entirely when the caller
@@ -499,6 +529,7 @@ impl ReplicationEngine {
             counter,
         };
         let base_clock = vector_clock.clone();
+        vector_clock.advance(self.actor, counter);
 
         let mut ops = Vec::with_capacity(changes.len());
         let mut affected_subjects = HashSet::new();
@@ -585,7 +616,6 @@ impl ReplicationEngine {
             }
         }
 
-        vector_clock.advance(self.actor, counter);
         self.store.set_vector_clock(
             &mut batch,
             ClockUpdate {
@@ -672,6 +702,16 @@ impl ReplicationEngine {
         // then advances, or a concurrent commit can make one batch apply twice
         // or the clock lose an entry (G1, G2).
         let _commit_guard = self.store.graph_commit_guard(graph);
+
+        self.apply_irokle_guarded(incoming, plan)
+    }
+
+    fn apply_irokle_guarded(
+        &self,
+        incoming: &Batch,
+        plan: DiagnosticsPlan,
+    ) -> Result<MergeResult, MergeError> {
+        let graph = &incoming.graph;
 
         let mut vector_clock = self.store.get_vector_clock(graph)?;
         if vector_clock.contains(&Dot {
