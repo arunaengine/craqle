@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
-use crate::planner::{JoinMode, PlannedJoin, PlannerTrace};
+use crate::planner::{JoinKind, JoinMode, PlannedJoin, PlannerTrace};
 use crate::query_context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
+use crate::sparql_fast_path::{FastPathPlan, QueryFastPathKind, QueryFastPathMode};
 use crate::store::{GraphStore, StoreError, StoreReadSnapshot, TermId};
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use spareval::{
@@ -74,6 +75,7 @@ pub struct QueryExecutionOptions {
     pub read_mode: QueryReadMode,
     pub optimize: bool,
     pub join_mode: JoinMode,
+    pub fast_paths: QueryFastPathMode,
 }
 
 impl Default for QueryExecutionOptions {
@@ -83,6 +85,7 @@ impl Default for QueryExecutionOptions {
             read_mode: QueryReadMode::Auto,
             optimize: planner_enabled(),
             join_mode: JoinMode::Auto,
+            fast_paths: QueryFastPathMode::Auto,
         }
     }
 }
@@ -103,6 +106,7 @@ pub struct QueryExecutionStatistics {
     pub execution_time: Duration,
     pub result_collection_time: Duration,
     pub time_to_first_internal_result: Option<Duration>,
+    pub fast_path: Option<QueryFastPathKind>,
     pub planned_joins: Vec<PlannedJoin>,
     pub selected_access_paths: Vec<crate::query_context::ReadAccessPath>,
     pub plan_fingerprint: String,
@@ -312,8 +316,10 @@ impl SparqlEngine {
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
+        let fast_path = fast_path_plan(&query, options);
         let planning_started = Instant::now();
-        let planner_trace = plan_query(&mut query, &self.store, options)?;
+        let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
+        let fast_path = select_fast_path(fast_path, &planner_trace);
         if options.optimize {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
@@ -330,6 +336,7 @@ impl SparqlEngine {
                 craqle_planning_time,
                 plan_fingerprint,
                 planner_trace,
+                fast_path,
             },
             collect_plan_statistics,
         )
@@ -371,6 +378,7 @@ impl SparqlEngine {
             read_mode,
             optimize,
             join_mode: JoinMode::Auto,
+            fast_paths: QueryFastPathMode::Auto,
         };
         let (execution, read_statistics) =
             self.execute_prepared_with_scope(&prepared, scope, &options, parse_time, false)?;
@@ -396,8 +404,10 @@ impl SparqlEngine {
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
+        let fast_path = fast_path_plan(&query, options);
         let planning_started = Instant::now();
-        let planner_trace = plan_query(&mut query, &self.store, options)?;
+        let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
+        let fast_path = select_fast_path(fast_path, &planner_trace);
         if options.optimize {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
@@ -415,6 +425,7 @@ impl SparqlEngine {
                 craqle_planning_time,
                 plan_fingerprint,
                 planner_trace,
+                fast_path,
             },
             collect_plan_statistics,
         )
@@ -426,9 +437,40 @@ impl SparqlEngine {
         scope: GraphScope<'_>,
         view: &StoreReadView<'_>,
         options: &QueryExecutionOptions,
-        stages: QueryStageStatistics,
+        mut stages: QueryStageStatistics,
         collect_plan_statistics: bool,
     ) -> Result<(QueryExecution, ReadStatistics)> {
+        let (context, named_graphs) =
+            read_context_for_scope(scope, view, options.cancellation.clone())?;
+        if let Some(plan) = stages.fast_path.take() {
+            let outcome = crate::sparql_fast_path::execute(&plan, view, &context)?;
+            let read_statistics = context.snapshot();
+            let mut statistics = build_execution_statistics(
+                stages,
+                read_statistics.clone(),
+                outcome.execution_time,
+                CollectionMetrics {
+                    collection_time: outcome.collection_time,
+                    time_to_first_internal_result: outcome.time_to_first_result,
+                    result_rows: outcome.result_rows,
+                    result_cells: outcome.result_cells,
+                    ..CollectionMetrics::default()
+                },
+                ExplanationMetrics {
+                    intermediate_rows: outcome.intermediate_rows,
+                    ..ExplanationMetrics::default()
+                },
+            );
+            statistics.fast_path = Some(outcome.kind);
+            return Ok((
+                QueryExecution {
+                    results: outcome.results,
+                    statistics,
+                },
+                read_statistics,
+            ));
+        }
+
         let mut evaluator =
             QueryEvaluator::new().with_cancellation_token(options.cancellation.evaluator_token());
         if collect_plan_statistics {
@@ -439,51 +481,11 @@ impl SparqlEngine {
         prepared
             .dataset_mut()
             .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
-        let context = match scope {
-            #[cfg(test)]
-            GraphScope::All => ReadContext::new(options.cancellation.clone()),
-            GraphScope::Predicate(visible) => {
-                // Union view with lazy visibility: the predicate runs at most
-                // once per touched graph, so the per-query cost scales with
-                // the graphs evaluation actually reaches, not the corpus.
-                ReadContext::with_graph_visibility(options.cancellation.clone(), visible)
-            }
-            GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
-                // Restrict named-graph enumeration to the visible graph list;
-                // default-graph patterns still use the sentinel union view.
-                //
-                // Membership is decided by the *metadata* record, not by the
-                // term table: a deleted graph's IRI survives interning, so
-                // filtering on `lookup_term` would resurrect it here while the
-                // union regime (which reads graph metadata) rightly omits it.
-                // Both regimes must answer graph existence identically (G9).
-                let mut seen = HashSet::with_capacity(graphs.len());
-                let mut names: Vec<NamedNode> = Vec::with_capacity(graphs.len());
-                for graph in graphs {
-                    if seen.insert(graph.as_str()) && view.contains_graph(graph)? {
-                        names.push(graph.0.clone());
-                    }
-                }
-                let named_graphs: Vec<NamedOrBlankNode> =
-                    names.into_iter().map(Into::into).collect();
-                prepared
-                    .dataset_mut()
-                    .set_available_named_graphs(named_graphs);
-                ReadContext::with_visible_graphs(
-                    options.cancellation.clone(),
-                    graphs.iter().cloned(),
-                )
-            }
-            GraphScope::List(graphs) => {
-                // Large graph sets: evaluate once over the union view;
-                // the shared read context filters quads against the visible
-                // graph term ids in O(1) per candidate.
-                ReadContext::with_visible_graphs(
-                    options.cancellation.clone(),
-                    graphs.iter().cloned(),
-                )
-            }
-        };
+        if let Some(named_graphs) = named_graphs {
+            prepared
+                .dataset_mut()
+                .set_available_named_graphs(named_graphs);
+        }
         let execution_started = Instant::now();
         let (results, explanation) = prepared.explain(StoreDataset::with_default_union_marker(
             view,
@@ -592,12 +594,51 @@ impl SparqlEngine {
     }
 }
 
+fn read_context_for_scope<'scope>(
+    scope: GraphScope<'scope>,
+    view: &StoreReadView<'_>,
+    cancellation: QueryCancellation,
+) -> Result<(ReadContext<'scope>, Option<Vec<NamedOrBlankNode>>)> {
+    match scope {
+        #[cfg(test)]
+        GraphScope::All => Ok((ReadContext::new(cancellation), None)),
+        GraphScope::Predicate(visible) => {
+            // Union view with lazy visibility: the predicate runs at most once
+            // per touched graph.
+            Ok((
+                ReadContext::with_graph_visibility(cancellation, visible),
+                None,
+            ))
+        }
+        GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
+            // Named-graph enumeration uses the metadata record, while default
+            // patterns retain the sentinel union selected by the evaluator.
+            let mut seen = HashSet::with_capacity(graphs.len());
+            let mut names: Vec<NamedNode> = Vec::with_capacity(graphs.len());
+            for graph in graphs {
+                if seen.insert(graph.as_str()) && view.contains_graph(graph)? {
+                    names.push(graph.0.clone());
+                }
+            }
+            Ok((
+                ReadContext::with_visible_graphs(cancellation, graphs.iter().cloned()),
+                Some(names.into_iter().map(Into::into).collect()),
+            ))
+        }
+        GraphScope::List(graphs) => Ok((
+            ReadContext::with_visible_graphs(cancellation, graphs.iter().cloned()),
+            None,
+        )),
+    }
+}
+
 struct QueryStageStatistics {
     parse_time: Duration,
     rewrite_time: Duration,
     craqle_planning_time: Duration,
     plan_fingerprint: String,
     planner_trace: PlannerTrace,
+    fast_path: Option<FastPathPlan>,
 }
 
 #[derive(Default)]
@@ -639,7 +680,22 @@ fn plan_query(
     query: &mut Query,
     store: &GraphStore,
     options: &QueryExecutionOptions,
+    fast_path: Option<&FastPathPlan>,
 ) -> Result<PlannerTrace> {
+    if fast_path.is_some_and(|plan| !plan.is_hash_join())
+        && matches!(options.join_mode, JoinMode::Auto)
+    {
+        return Ok(PlannerTrace::default());
+    }
+    if matches!(options.join_mode, JoinMode::ForcePropertyStar) {
+        return if fast_path.is_some_and(FastPathPlan::is_property_star) {
+            Ok(PlannerTrace::default())
+        } else {
+            Err(SparqlError::Planning(
+                "forced join mode ForcePropertyStar cannot represent this query".to_owned(),
+            ))
+        };
+    }
     if !options.optimize {
         return if matches!(options.join_mode, JoinMode::Auto) {
             Ok(PlannerTrace::default())
@@ -652,6 +708,33 @@ fn plan_query(
     }
     crate::planner::optimize_query_with_mode(query, store, options.join_mode)
         .map_err(|error| SparqlError::Planning(error.to_string()))
+}
+
+fn fast_path_plan(query: &Query, options: &QueryExecutionOptions) -> Option<FastPathPlan> {
+    if matches!(options.fast_paths, QueryFastPathMode::Disabled) {
+        return None;
+    }
+    let plan = crate::sparql_fast_path::analyze(query)?;
+    match options.join_mode {
+        JoinMode::Auto => Some(plan),
+        JoinMode::ForceHash if plan.is_hash_join() => Some(plan),
+        JoinMode::ForcePropertyStar if plan.is_property_star() => Some(plan),
+        JoinMode::ForceLateral | JoinMode::ForceHash | JoinMode::ForcePropertyStar => None,
+    }
+}
+
+fn select_fast_path(
+    plan: Option<FastPathPlan>,
+    planner_trace: &PlannerTrace,
+) -> Option<FastPathPlan> {
+    match plan {
+        Some(plan) if plan.is_hash_join() => planner_trace
+            .joins
+            .iter()
+            .any(|join| join.physical_operator == JoinKind::Hash)
+            .then_some(plan),
+        plan => plan,
+    }
 }
 
 fn read_explanation_metrics(
@@ -715,6 +798,7 @@ fn build_execution_statistics(
             .saturating_add(collection.execution_time),
         result_collection_time: collection.collection_time,
         time_to_first_internal_result: collection.time_to_first_internal_result,
+        fast_path: None,
         planned_joins: stages.planner_trace.joins,
         selected_access_paths: reads.selected_access_paths,
         plan_fingerprint: stages.plan_fingerprint,

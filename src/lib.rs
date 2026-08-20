@@ -81,6 +81,7 @@ pub use crate::search::SearchHit;
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics, QueryResults,
 };
+pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
