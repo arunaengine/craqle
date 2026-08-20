@@ -279,6 +279,7 @@ impl Fixture {
                 && star_start >= config.corpus.duplicate_quads()
                 && visibility == GraphVisibility::Visible
                 && record.shape == CorpusShape::SameSubjectStar
+                && has_common_zero(star_start)
                 && record.predicate.is_rare();
             if is_visible_canonical_star {
                 if star_probe.is_none() {
@@ -851,6 +852,10 @@ impl<'a> GraphPartitionedLoader<'a> {
             .apply_changes_bulk_unchecked(&self.graphs[graph_index], changes)
             .expect("apply graph-scoped bounded benchmark batch");
     }
+}
+
+pub(crate) fn has_common_zero(star_start: usize) -> bool {
+    matches!(star_start % 128, 0 | 16 | 24 | 40)
 }
 
 fn query_cases(terms: &QueryTerms) -> Vec<QueryCase> {

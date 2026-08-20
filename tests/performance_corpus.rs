@@ -56,6 +56,14 @@ fn iterator_has_exact_count_and_constant_sized_state() {
 }
 
 #[test]
+fn star_probe_complete() {
+    assert!(corpus::fixture::has_common_zero(2_560));
+    assert!(corpus::fixture::has_common_zero(250_000));
+    assert!(!corpus::fixture::has_common_zero(2_500_000));
+    assert!(corpus::fixture::has_common_zero(2_500_008));
+}
+
+#[test]
 fn supported_dimensions_and_impossible_duplicates_are_rejected() {
     assert_eq!(
         CorpusConfig::new(9_999, 32, 0, DEFAULT_SEED),
