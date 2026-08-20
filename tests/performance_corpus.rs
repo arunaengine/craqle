@@ -57,10 +57,35 @@ fn iterator_has_exact_count_and_constant_sized_state() {
 
 #[test]
 fn star_probe_complete() {
-    assert!(corpus::fixture::has_common_zero(2_560));
-    assert!(corpus::fixture::has_common_zero(250_000));
-    assert!(!corpus::fixture::has_common_zero(2_500_000));
-    assert!(corpus::fixture::has_common_zero(2_500_008));
+    let config = config(10_000_000, 32, 25, DEFAULT_SEED);
+    let selected = corpus(config)
+        .into_iter()
+        .skip(config.duplicate_quads())
+        .find(|record| {
+            record.visibility == GraphVisibility::Visible
+                && record.shape == CorpusShape::SameSubjectStar
+                && corpus::star_has_common(record.ordinal, config.seed)
+                && record.predicate.is_rare()
+        })
+        .unwrap();
+    let star_start = selected.ordinal - selected.ordinal % 8;
+    let star: Vec<_> = corpus(config)
+        .into_iter()
+        .skip(star_start)
+        .take(8)
+        .collect();
+
+    assert!(star.iter().all(|record| record.graph == selected.graph));
+    assert!(star.iter().all(|record| record.subject == selected.subject));
+    assert!(
+        star.iter()
+            .any(|record| record.predicate == PredicateKind::Type)
+    );
+    assert!(
+        star.iter()
+            .any(|record| record.predicate == PredicateKind::Common(0))
+    );
+    assert!(star.iter().any(|record| record.predicate.is_rare()));
 }
 
 #[test]

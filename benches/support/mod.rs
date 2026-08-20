@@ -600,3 +600,9 @@ fn payload(ordinal: usize, seed: u64) -> Payload {
         object: ObjectSpec::Literal(jitter % 1024 + 1),
     }
 }
+
+pub fn star_has_common(ordinal: usize, seed: u64) -> bool {
+    let star_start = ordinal - ordinal % 8;
+    (star_start..star_start + 8)
+        .any(|ordinal| payload(ordinal, seed).predicate == PredicateKind::Common(0))
+}
