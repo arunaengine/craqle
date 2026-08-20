@@ -87,9 +87,10 @@ pub use crate::rocrate::{
 pub use crate::search::SearchHit;
 #[cfg(feature = "shacl-core")]
 pub use crate::shacl::{
-    CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclMessage,
-    ShaclProfile, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
-    ShaclValidationStatistics,
+    CompiledShaclSchema, ShaclBinding, ShaclBindingOptions, ShaclBindingStatus,
+    ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclMessage, ShaclProfile,
+    ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult, ShaclValidationState,
+    ShaclValidationStatistics, ValidationPolicy,
 };
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
@@ -859,6 +860,134 @@ impl CraqleNode {
         options: &ShaclValidationOptions,
     ) -> Result<ShaclValidationReport> {
         self.shacl.validate(data_graph, schema, options, false)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn validate_shacl_delta(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        changes: &[MaterializedQuadChange],
+        options: &ShaclValidationOptions,
+    ) -> Result<ShaclValidationReport> {
+        self.shacl
+            .validate_delta(data_graph, schema, changes, options)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn bind_shacl(&self, binding: &ShaclBinding) -> Result<ShaclBindingStatus> {
+        let _commit_guard = self.store.graph_commit_guard(&binding.data_graph);
+        let _binding_guard = self.store.binding_guard();
+        if !self.store.contains_graph(&binding.data_graph)? {
+            return Err(store::StoreError::GraphNotFound(binding.data_graph.to_string()).into());
+        }
+        if !self.store.contains_graph(&binding.shapes_graph)? {
+            return Err(store::StoreError::GraphNotFound(binding.shapes_graph.to_string()).into());
+        }
+        let status = if binding.policy == ValidationPolicy::Disabled {
+            let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
+            ShaclBindingStatus {
+                binding: binding.clone(),
+                state: ShaclValidationState::Pending,
+                report: None,
+                error: None,
+                data_version: self.store.graph_version_digest(&binding.data_graph)?,
+                shapes_version,
+                schema_fingerprint: [0; 32],
+                shape_versions: vec![(binding.shapes_graph.clone(), shapes_version)],
+            }
+        } else {
+            let mut completed = None;
+            for _ in 0..3 {
+                let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
+                let schema = self.shacl.compile(
+                    &binding.shapes_graph,
+                    &binding.validation_options.compile_options(),
+                )?;
+                let report = self.shacl.validate(
+                    &binding.data_graph,
+                    &schema,
+                    &binding.validation_options.validation_options(),
+                    false,
+                )?;
+                if self.store.graph_version_digest(&binding.shapes_graph)? == shapes_version
+                    && self.shacl.versions_are_current(schema.shape_versions())?
+                {
+                    completed = Some(ShaclBindingStatus {
+                        binding: binding.clone(),
+                        state: if report.conforms {
+                            ShaclValidationState::Valid
+                        } else {
+                            ShaclValidationState::Invalid
+                        },
+                        report: Some(report),
+                        error: None,
+                        data_version: self.store.graph_version_digest(&binding.data_graph)?,
+                        shapes_version,
+                        schema_fingerprint: schema.plan_fingerprint(),
+                        shape_versions: schema.shape_versions().to_vec(),
+                    });
+                    break;
+                }
+            }
+            completed.ok_or_else(|| ShaclError::SchemaChangedDuringValidation {
+                graph: binding.shapes_graph.to_string(),
+            })?
+        };
+        let mut batch = self.store.new_batch();
+        self.store.stage_binding_status(&mut batch, &status)?;
+        self.store.commit(batch)?;
+        self.persist_fjall()?;
+        Ok(status)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn unbind_shacl(&self, data_graph: &GraphId, shapes_graph: &GraphId) -> Result<()> {
+        let _commit_guard = self.store.graph_commit_guard(data_graph);
+        let _binding_guard = self.store.binding_guard();
+        let mut batch = self.store.new_batch();
+        self.store
+            .stage_binding_remove(&mut batch, data_graph, shapes_graph)?;
+        self.store.commit(batch)?;
+        self.persist_fjall()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn shacl_bindings(&self, data_graph: &GraphId) -> Result<Vec<ShaclBinding>> {
+        Ok(self
+            .shacl_binding_statuses(data_graph)?
+            .into_iter()
+            .map(|status| status.binding)
+            .collect())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn shacl_binding_statuses(&self, data_graph: &GraphId) -> Result<Vec<ShaclBindingStatus>> {
+        let _binding_guard = self.store.binding_guard();
+        let mut statuses = self.store.shacl_binding_statuses(data_graph)?;
+        for status in &mut statuses {
+            if matches!(
+                status.state,
+                ShaclValidationState::Valid | ShaclValidationState::Invalid
+            ) && (!self.store.contains_graph(&status.binding.data_graph)?
+                || !self.store.contains_graph(&status.binding.shapes_graph)?
+                || status.data_version
+                    != self
+                        .store
+                        .graph_version_digest(&status.binding.data_graph)?
+                || status.shapes_version
+                    != self
+                        .store
+                        .graph_version_digest(&status.binding.shapes_graph)?
+                || !self.shacl.versions_are_current(&status.shape_versions)?)
+            {
+                status.state = ShaclValidationState::Pending;
+                status.report = None;
+                status.error = None;
+            }
+        }
+        Ok(statuses)
     }
 
     #[cfg(feature = "shacl-core")]
