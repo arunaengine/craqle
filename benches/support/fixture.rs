@@ -249,7 +249,7 @@ impl Fixture {
                         object: object.clone(),
                     });
                 }
-                let order_key = source_subject_order_key(&subject);
+                let order_key = subject_order_key(&subject);
                 if late_rare_probe
                     .as_ref()
                     .is_none_or(|(current, _)| order_key > *current)
@@ -469,7 +469,7 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("benchmark query preparation failed"))
     }
 
-    pub fn run_hot_path_with_statistics(&self, index: usize) -> QueryExecution {
+    pub fn measure_hot_path(&self, index: usize) -> QueryExecution {
         let case = self
             .cases
             .get(index)
@@ -479,7 +479,7 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{} diagnostic query failed", case.label))
     }
 
-    pub fn run_prepared_hot_path(
+    pub fn run_hot_prepared(
         &self,
         prepared: &PreparedQuery,
         options: &QueryExecutionOptions,
@@ -489,7 +489,7 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("prepared hot-path query failed"))
     }
 
-    pub fn run_hot_path_with_read_mode(
+    pub fn run_hot_mode(
         &self,
         index: usize,
         read_mode: QueryReadMode,
@@ -503,10 +503,10 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{} query failed", case.label))
     }
 
-    pub fn print_hot_path_read_work(&self) {
+    pub fn print_hot_work(&self) {
         for index in 0..self.hot_path_count() {
             let (results, statistics) =
-                self.run_hot_path_with_read_mode(index, QueryReadMode::Auto);
+                self.run_hot_mode(index, QueryReadMode::Auto);
             println!(
                 "sparql_hot_path work: case={} mode=Auto access_path={:?} qv_trusted={} \
                  fallback_reason={} source_keys={} source_bytes={} qv_keys={} qv_bytes={} \
@@ -895,7 +895,7 @@ fn graph_id(index: usize) -> GraphId {
     ))
 }
 
-fn source_subject_order_key(subject: &EncodedTerm) -> u128 {
+fn subject_order_key(subject: &EncodedTerm) -> u128 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"craqle-term/v1\0");
     hasher.update(subject.0.as_bytes());

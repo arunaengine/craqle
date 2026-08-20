@@ -154,7 +154,7 @@ fn positional_to_compatibility(
     collect_current(&positional.variables, &positional.rows)
 }
 
-fn collect_positional_then_compatibility(
+fn collect_positional_compat(
     variables: &[String],
     source: &[Vec<Option<EncodedTerm>>],
 ) -> Vec<HashMap<String, EncodedTerm>> {
@@ -186,7 +186,7 @@ fn benchmark_result_collection(c: &mut Criterion) {
         let (positional_result, positional_allocations) =
             measure_allocations(|| collect_positional(&variables, &source));
         let (converted, converted_allocations) =
-            measure_allocations(|| collect_positional_then_compatibility(&variables, &source));
+            measure_allocations(|| collect_positional_compat(&variables, &source));
         let (conversion_only, conversion_only_allocations) =
             measure_allocations(|| positional_to_compatibility(&positional));
         assert_eq!(current, converted);
@@ -219,7 +219,7 @@ fn benchmark_result_collection(c: &mut Criterion) {
             BenchmarkId::new("positional_then_compatibility", row_count),
             &row_count,
             |b, _| {
-                b.iter(|| black_box(collect_positional_then_compatibility(&variables, &source)));
+                b.iter(|| black_box(collect_positional_compat(&variables, &source)));
             },
         );
         group.bench_with_input(

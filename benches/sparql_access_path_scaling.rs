@@ -15,7 +15,7 @@ struct ScalingCase {
 fn execute(fixture: &Fixture, query: &PreparedQuery, mode: QueryReadMode) -> QueryExecution {
     let mut options = QueryExecutionOptions::default();
     options.read_mode = mode;
-    fixture.run_prepared_hot_path(query, &options)
+    fixture.run_hot_prepared(query, &options)
 }
 
 fn print_work(label: &str, mode: QueryReadMode, execution: &QueryExecution) {
@@ -72,7 +72,7 @@ fn assert_modes(fixture: &Fixture, case: &ScalingCase) {
     }
 }
 
-fn sparql_access_path_scaling(c: &mut Criterion) {
+fn query_path_scaling(c: &mut Criterion) {
     let fixture = Fixture::from_environment();
     let pattern = fixture.late_rare_pattern();
     let cases = [
@@ -108,5 +108,5 @@ fn sparql_access_path_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, sparql_access_path_scaling);
+criterion_group!(benches, query_path_scaling);
 criterion_main!(benches);

@@ -13,7 +13,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     // completed-result path before Criterion begins collecting samples.
     let report = fixture.assert_semantics();
     fixture.print_report(&report);
-    fixture.print_hot_path_read_work();
+    fixture.print_hot_work();
 
     let config = fixture.config();
     let mut group = c.benchmark_group("sparql_hot_path");
@@ -39,23 +39,23 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     group.measurement_time(config.measurement);
     for index in 0..5 {
         let query = fixture.prepare_hot_path(index);
-        let fast = fixture.run_prepared_hot_path(&query, &fast_options);
-        let generic = fixture.run_prepared_hot_path(&query, &generic_options);
+        let fast = fixture.run_hot_prepared(&query, &fast_options);
+        let generic = fixture.run_hot_prepared(&query, &generic_options);
         assert_eq!(fast.results, generic.results);
         assert!(fast.statistics.fast_path.is_some());
         group.bench_function(format!("{}/fast", fixture.hot_path_label(index)), |b| {
-            b.iter(|| black_box(fixture.run_prepared_hot_path(&query, &fast_options)));
+            b.iter(|| black_box(fixture.run_hot_prepared(&query, &fast_options)));
         });
         group.bench_function(format!("{}/generic", fixture.hot_path_label(index)), |b| {
-            b.iter(|| black_box(fixture.run_prepared_hot_path(&query, &generic_options)));
+            b.iter(|| black_box(fixture.run_hot_prepared(&query, &generic_options)));
         });
     }
     group.finish();
 
     let prepared = fixture.prepare_hot_path(0);
     let options = QueryExecutionOptions::default();
-    let parsed_result = fixture.run_hot_path_with_statistics(0);
-    let prepared_result = fixture.run_prepared_hot_path(&prepared, &options);
+    let parsed_result = fixture.measure_hot_path(0);
+    let prepared_result = fixture.run_hot_prepared(&prepared, &options);
     assert_eq!(parsed_result.results, prepared_result.results);
 
     let config = fixture.config();
@@ -72,7 +72,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
             |b, &executions| {
                 b.iter(|| {
                     for _ in 0..executions {
-                        black_box(fixture.run_hot_path_with_statistics(0));
+                        black_box(fixture.measure_hot_path(0));
                     }
                 });
             },
@@ -83,7 +83,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
             |b, &executions| {
                 b.iter(|| {
                     for _ in 0..executions {
-                        black_box(fixture.run_prepared_hot_path(&prepared, &options));
+                        black_box(fixture.run_hot_prepared(&prepared, &options));
                     }
                 });
             },
