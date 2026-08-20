@@ -126,6 +126,11 @@ harness = false
 required-features = ["shacl-core"]
 
 [[bench]]
+name = "shacl_native_comparison"
+harness = false
+required-features = ["shacl-core"]
+
+[[bench]]
 name = "index_write_cost"
 harness = false
 

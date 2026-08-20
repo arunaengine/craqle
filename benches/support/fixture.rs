@@ -402,6 +402,10 @@ impl Fixture {
         self.config
     }
 
+    pub fn node(&self) -> &CraqleNode {
+        &self.node
+    }
+
     pub fn query_terms(&self) -> &QueryTerms {
         &self.terms
     }
