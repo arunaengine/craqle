@@ -117,9 +117,10 @@ fn shacl_native_comparison(c: &mut Criterion) {
     assert!(cached_report.statistics.shape_compile_cache_hit);
 
     println!(
-        "shacl_native_comparison corpus_quads={} graphs={} duplicate_percent={} data_graph={} \
+        "shacl_native_comparison fixture_digest={} corpus_quads={} graphs={} duplicate_percent={} data_graph={} \
          focus_nodes={} violations={} setup_copy_triples={} setup_copy_bytes={} \
          external_copy_triples={} external_copy_bytes={} data_hash={}",
+        fixture.fixture_digest(),
         config.corpus.quads,
         config.corpus.graphs,
         config.corpus.duplicate_percent,
@@ -133,7 +134,7 @@ fn shacl_native_comparison(c: &mut Criterion) {
         setup_hash,
     );
     println!(
-        "shacl_native_comparison external total_ns={} copy_ns={} parse_compile_ns={} \
+        "shacl_native_comparison external_report_parity=count_only total_ns={} copy_ns={} parse_compile_ns={} \
          validation_ns={} allocations={} allocated_bytes={} peak_live_delta_bytes={} \
          data_copy_bytes={}",
         external_duration.as_nanos(),
@@ -163,7 +164,7 @@ fn shacl_native_comparison(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("shacl_native_comparison");
-    group.sample_size(10);
+    group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
     group.measurement_time(config.measurement);
     group.bench_function("external_export_copy_parse_validate", |b| {

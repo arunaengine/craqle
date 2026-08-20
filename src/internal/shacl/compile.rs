@@ -461,7 +461,7 @@ impl ShaclCompiler {
                 }
             }
         };
-        let view = DeltaReadView::new(base, &index);
+        let view = DeltaReadView::new(base, index);
         let graph = hash_term(&EncodedTerm::from_named_node(&data_graph.0));
         let rdf_type = hash_term(&EncodedTerm(RDF_TYPE.to_owned()));
         let selection =

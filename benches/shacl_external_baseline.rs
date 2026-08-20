@@ -63,8 +63,9 @@ fn shacl_external_baseline(c: &mut Criterion) {
         );
     }
     println!(
-        "shacl_external_baseline corpus: version={} seed={:#x} quads={} graphs={} \
+        "shacl_external_baseline corpus: fixture_digest={} version={} seed={:#x} quads={} graphs={} \
          duplicate_percent={} visible_graphs={} hidden_graphs={}",
+        fixture.fixture_digest(),
         metadata.version,
         metadata.seed,
         metadata.quads,
@@ -96,7 +97,7 @@ fn shacl_external_baseline(c: &mut Criterion) {
     print_process_memory("after_native_validation", process_memory());
 
     println!(
-        "shacl_external_baseline phases: data_copy_export_ms={:.3} \
+        "shacl_external_baseline report_parity=count_only phases: data_copy_export_ms={:.3} \
          shapes_parse_ir_compile_ms={:.3} native_validation_completion_ms={:.3} \
          total_ms={:.3} exported_triples={} copied_unique_triples={} \
          serialized_ntriples_bytes={} expected_violations={} violations={} conforms={}",
@@ -118,7 +119,7 @@ fn shacl_external_baseline(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("shacl_external_baseline");
-    group.sample_size(10);
+    group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
     group.measurement_time(config.measurement);
     group.bench_function("visible_data_export_and_rudof_copy", |b| {
