@@ -542,7 +542,7 @@ fn auto_graph(
 #[test]
 fn auto_scales() {
     let (_small_dir, small_node, small_data, small_schema) = auto_graph("small", 128);
-    let (_large_dir, large_node, large_data, large_schema) = auto_graph("large", 8_192);
+    let (_large_dir, large_node, large_data, large_schema) = auto_graph("large", 16_384);
     let changes = |data: &GraphId, count: usize| {
         (0..count)
             .map(|index| {

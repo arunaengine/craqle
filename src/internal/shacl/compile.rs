@@ -989,7 +989,7 @@ fn shape_work(shape: &CompiledShape) -> u64 {
 }
 
 const FULL_SHAPE_WORK: u64 = 20;
-const SCAN_DIV: u64 = 8;
+const SCAN_DIV: u64 = 20;
 
 #[allow(clippy::too_many_arguments)]
 fn select_incremental_targets<V: RdfReadView>(
