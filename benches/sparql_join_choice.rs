@@ -127,31 +127,68 @@ fn sparql_join_choice(c: &mut Criterion) {
         automatic.statistics.fast_path,
         Some(QueryFastPathKind::HashJoinCount)
     );
-    eprintln!(
-        "sparql_join_choice rows={} distinct_keys={} lateral_ns={} hash_ns={} auto_ns={} \
-         lateral_seeks={} hash_seeks={} lateral_candidates={} hash_candidates={} \
-         lateral_allocations={} lateral_allocated_bytes={} lateral_peak_live_delta_bytes={} \
-         hash_allocations={} hash_allocated_bytes={} hash_peak_live_delta_bytes={} \
-         auto_allocations={} auto_allocated_bytes={} auto_peak_live_delta_bytes={}",
-        fixture.rows,
-        fixture.distinct_keys,
-        lateral.statistics.execution_time.as_nanos(),
-        hash.statistics.execution_time.as_nanos(),
-        automatic.statistics.execution_time.as_nanos(),
-        lateral.statistics.index_seeks,
-        hash.statistics.index_seeks,
-        lateral.statistics.candidate_quads,
-        hash.statistics.candidate_quads,
-        lateral_allocations.allocations,
-        lateral_allocations.allocated_bytes,
-        lateral_allocations.peak_live_delta_bytes,
-        hash_allocations.allocations,
-        hash_allocations.allocated_bytes,
-        hash_allocations.peak_live_delta_bytes,
-        automatic_allocations.allocations,
-        automatic_allocations.allocated_bytes,
-        automatic_allocations.peak_live_delta_bytes,
-    );
+    for (mode, execution, allocations) in [
+        ("ForceLateral", &lateral, lateral_allocations),
+        ("ForceHash", &hash, hash_allocations),
+        ("Auto", &automatic, automatic_allocations),
+    ] {
+        let statistics = &execution.statistics;
+        eprintln!(
+            "sparql_join_choice rows={} distinct_keys={} mode={mode} logical_operator={:?} \
+             physical_operator={:?} join_operator={:?} plan_fingerprint={} access_path={:?} \
+             estimated_rows={:?} actual_rows={:?} plan_candidates={} plan_output_rows={} \
+             plan_elapsed_ns={} index_seeks={} qv_admission_checks={} qv_header_reads={} qv_counter_reads={} \
+             qv_trusted={} fallback_reason={} source_keys={} source_bytes={} qv_keys={} \
+             qv_bytes={} candidate_quads={} matching_quads={} graph_checks={} orphan_checks={} \
+             duplicate_groups={} duplicate_copies_skipped={} term_decodes={} intermediate_rows={} \
+             result_rows={} result_cells={} parse_ns={} rewrite_ns={} planning_ns={} execution_ns={} \
+             collection_ns={} first_internal_ns={:?} allocations={} allocated_bytes={} \
+             peak_live_delta_bytes={}",
+            fixture.rows,
+            fixture.distinct_keys,
+            statistics.plan.root.logical_operator,
+            statistics.plan.root.physical_operator,
+            statistics.planned_joins[0].physical_operator,
+            statistics.plan_fingerprint,
+            statistics.selected_access_paths,
+            statistics.plan.root.estimated_rows,
+            statistics.plan.root.actual_rows,
+            statistics.plan.root.candidate_rows,
+            statistics.plan.root.output_rows,
+            statistics.plan.root.elapsed_time.as_nanos(),
+            statistics.index_seeks,
+            statistics.qv_admission_checks,
+            statistics.qv_header_reads,
+            statistics.qv_counter_reads,
+            statistics.qv_trusted,
+            statistics.fallback_reason.as_deref().unwrap_or("none"),
+            statistics.source_keys_read,
+            statistics.source_bytes_read,
+            statistics.qv_keys_read,
+            statistics.qv_bytes_read,
+            statistics.candidate_quads,
+            statistics.matching_quads,
+            statistics.graphs_considered,
+            statistics.orphan_checks,
+            statistics.duplicate_groups,
+            statistics.duplicate_copies_skipped,
+            statistics.terms_decoded,
+            statistics.intermediate_rows,
+            statistics.result_rows,
+            statistics.result_cells,
+            statistics.parse_time.as_nanos(),
+            statistics.rewrite_time.as_nanos(),
+            statistics.planning_time.as_nanos(),
+            statistics.execution_time.as_nanos(),
+            statistics.result_collection_time.as_nanos(),
+            statistics
+                .time_to_first_internal_result
+                .map(|duration| duration.as_nanos()),
+            allocations.allocations,
+            allocations.allocated_bytes,
+            allocations.peak_live_delta_bytes,
+        );
+    }
 
     let sample_size = match env::var("CRAQLE_BENCH_SAMPLE_SIZE") {
         Ok(value) => value

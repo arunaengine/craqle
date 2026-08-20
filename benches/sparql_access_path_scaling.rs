@@ -41,13 +41,30 @@ fn print_work(
 ) {
     let statistics = &execution.statistics;
     println!(
-        "sparql_access_path_scaling fixture_digest={} case={label} mode={mode:?} access_path={:?} \
+        "sparql_access_path_scaling fixture_digest={} case={label} mode={mode:?} \
+         logical_operator={:?} physical_operator={:?} plan_fingerprint={} access_path={:?} \
+         estimated_rows={:?} actual_rows={:?} plan_candidates={} plan_output_rows={} \
+         plan_elapsed_ns={} index_seeks={} qv_admission_checks={} qv_header_reads={} qv_counter_reads={} \
          qv_trusted={} fallback_reason={} source_keys={} source_bytes={} qv_keys={} \
          qv_bytes={} candidate_quads={} matching_quads={} graph_checks={} orphan_checks={} \
-         duplicate_groups={} duplicate_copies_skipped={} term_decodes={} result_rows={} \
-         allocations={} allocated_bytes={} peak_live_delta_bytes={}",
+         duplicate_groups={} duplicate_copies_skipped={} term_decodes={} intermediate_rows={} \
+         result_rows={} result_cells={} parse_ns={} rewrite_ns={} planning_ns={} execution_ns={} \
+         collection_ns={} first_internal_ns={:?} allocations={} allocated_bytes={} \
+         peak_live_delta_bytes={}",
         fixture.fixture_digest(),
+        statistics.plan.root.logical_operator,
+        statistics.plan.root.physical_operator,
+        statistics.plan_fingerprint,
         statistics.selected_access_paths,
+        statistics.plan.root.estimated_rows,
+        statistics.plan.root.actual_rows,
+        statistics.plan.root.candidate_rows,
+        statistics.plan.root.output_rows,
+        statistics.plan.root.elapsed_time.as_nanos(),
+        statistics.index_seeks,
+        statistics.qv_admission_checks,
+        statistics.qv_header_reads,
+        statistics.qv_counter_reads,
         statistics.qv_trusted,
         statistics.fallback_reason.as_deref().unwrap_or("none"),
         statistics.source_keys_read,
@@ -61,7 +78,17 @@ fn print_work(
         statistics.duplicate_groups,
         statistics.duplicate_copies_skipped,
         statistics.terms_decoded,
+        statistics.intermediate_rows,
         statistics.result_rows,
+        statistics.result_cells,
+        statistics.parse_time.as_nanos(),
+        statistics.rewrite_time.as_nanos(),
+        statistics.planning_time.as_nanos(),
+        statistics.execution_time.as_nanos(),
+        statistics.result_collection_time.as_nanos(),
+        statistics
+            .time_to_first_internal_result
+            .map(|duration| duration.as_nanos()),
         sample.allocations,
         sample.allocated_bytes,
         sample.peak_live_delta_bytes,
