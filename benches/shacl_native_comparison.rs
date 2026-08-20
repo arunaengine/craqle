@@ -81,11 +81,20 @@ fn shacl_native_comparison(c: &mut Criterion) {
     let native_allocations = AllocationInterval::begin();
     let native_schema = fixture
         .node()
-        .compile_shacl(&shapes_graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes_graph,
+            &ShaclCompileOptions::default(),
+        )
         .expect("compile native benchmark shapes");
     let native_report = fixture
         .node()
-        .validate_shacl(&data_graph, &native_schema, &validation_options)
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data_graph,
+            &native_schema,
+            &validation_options,
+        )
         .expect("run uncached native validation");
     let native_duration = native_start.elapsed();
     let native_allocations = native_allocations.finish();
@@ -95,7 +104,12 @@ fn shacl_native_comparison(c: &mut Criterion) {
     let cached_allocations = AllocationInterval::begin();
     let cached_report = fixture
         .node()
-        .validate_shacl(&data_graph, &native_schema, &validation_options)
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data_graph,
+            &native_schema,
+            &validation_options,
+        )
         .expect("run cached native validation");
     let cached_duration = cached_start.elapsed();
     let cached_allocations = cached_allocations.finish();
@@ -164,7 +178,12 @@ fn shacl_native_comparison(c: &mut Criterion) {
             black_box(
                 fixture
                     .node()
-                    .validate_shacl(&data_graph, &native_schema, &validation_options)
+                    .validate_shacl(
+                        &craqle::AllowAllAuthorizer,
+                        &data_graph,
+                        &native_schema,
+                        &validation_options,
+                    )
                     .expect("run cached native validation"),
             )
         })
@@ -173,12 +192,21 @@ fn shacl_native_comparison(c: &mut Criterion) {
         b.iter(|| {
             let schema = fixture
                 .node()
-                .compile_shacl(&shapes_graph, &ShaclCompileOptions::default())
+                .compile_shacl(
+                    &craqle::AllowAllAuthorizer,
+                    &shapes_graph,
+                    &ShaclCompileOptions::default(),
+                )
                 .expect("look up cached native shapes");
             black_box(
                 fixture
                     .node()
-                    .validate_shacl(&data_graph, &schema, &validation_options)
+                    .validate_shacl(
+                        &craqle::AllowAllAuthorizer,
+                        &data_graph,
+                        &schema,
+                        &validation_options,
+                    )
                     .expect("run native validation after compile-cache lookup"),
             )
         })

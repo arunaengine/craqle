@@ -207,6 +207,13 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         graph: &GraphId,
     ) -> SyncResult<irokle::TopicId>;
 
+    /// Caller holds the graph commit guard.
+    fn ensure_topic_guarded(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> SyncResult<irokle::TopicId>;
+
     fn bind_graph_topic(
         &self,
         store: &GraphStore,
@@ -346,19 +353,66 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
         memo.remove(graph);
     }
 
-    /// Persist a binding whose topic is known to exist, then memoize it.
-    ///
-    /// The store write comes first: the memo must never claim a binding the
-    /// durable record does not have.
-    fn bind_confirmed_topic(
+    fn bind_topic(
         &self,
         store: &GraphStore,
         binding: GraphTopic<'_>,
+        guarded: bool,
     ) -> SyncResult<irokle::TopicId> {
         let GraphTopic { graph, topic_id } = binding;
-        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        if guarded {
+            store.set_topic_guarded(graph, *topic_id.as_bytes())?;
+        } else {
+            store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        }
         self.remember_topic(graph, topic_id);
         Ok(topic_id)
+    }
+
+    fn ensure_topic(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        guarded: bool,
+    ) -> SyncResult<irokle::TopicId> {
+        if let Some(topic_id) = self.memoized_topic(graph)
+            && store.contains_graph(graph)?
+        {
+            return Ok(topic_id);
+        }
+        if let Some(topic_id) = self.graph_topic_id(store, graph)? {
+            self.remember_topic(graph, topic_id);
+            return Ok(topic_id);
+        }
+
+        let topic_id = graph_topic_id(graph);
+        let mut genesis_error = None;
+        for _ in 0..2 {
+            if let Some(state) = self.node.storage().topic_state(&topic_id)? {
+                if state.event_type_id != CraqleGraphEvent::TYPE_ID {
+                    return Err(CraqleSyncError::Irokle(irokle::Error::EventTypeMismatch {
+                        expected: CraqleGraphEvent::TYPE_ID.to_owned(),
+                        actual: state.event_type_id,
+                    }));
+                }
+                return self.bind_topic(store, GraphTopic { graph, topic_id }, guarded);
+            }
+
+            let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
+            let genesis = TopicGenesis {
+                event_type_id: CraqleGraphEvent::TYPE_ID.to_owned(),
+                initial_peers: self.options.initial_peers.clone(),
+                replication_policy: self.options.replication_policy.clone(),
+            };
+            let oplog = Oplog::with_storage(self.node.storage().clone());
+            match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
+                Ok(_) => return self.bind_topic(store, GraphTopic { graph, topic_id }, guarded),
+                Err(error) => genesis_error = Some(error),
+            }
+        }
+        Err(CraqleSyncError::Irokle(genesis_error.unwrap_or_else(
+            || irokle::Error::Storage(format!("failed to ensure craqle topic {topic_id}")),
+        )))
     }
 }
 
@@ -460,56 +514,15 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<irokle::TopicId> {
-        // Memo hit, confirmed against graph existence. The metadata record is
-        // where the binding lives, so a graph that no longer has one must fall
-        // through and re-bind; the probe is two key lookups against the decode
-        // of a metadata record that may carry a multi-kilobyte `@context`.
-        if let Some(topic_id) = self.memoized_topic(graph)
-            && store.contains_graph(graph)?
-        {
-            return Ok(topic_id);
-        }
+        self.ensure_topic(store, graph, false)
+    }
 
-        // An existing binding (e.g. from data created before deterministic
-        // topic ids) stays authoritative for its graph.
-        if let Some(topic_id) = self.graph_topic_id(store, graph)? {
-            self.remember_topic(graph, topic_id);
-            return Ok(topic_id);
-        }
-
-        let topic_id = graph_topic_id(graph);
-        let mut genesis_error = None;
-        for _ in 0..2 {
-            if let Some(state) = self.node.storage().topic_state(&topic_id)? {
-                if state.event_type_id != CraqleGraphEvent::TYPE_ID {
-                    return Err(CraqleSyncError::Irokle(irokle::Error::EventTypeMismatch {
-                        expected: CraqleGraphEvent::TYPE_ID.to_owned(),
-                        actual: state.event_type_id,
-                    }));
-                }
-                return self.bind_confirmed_topic(store, GraphTopic { graph, topic_id });
-            }
-
-            let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
-            let genesis = TopicGenesis {
-                event_type_id: CraqleGraphEvent::TYPE_ID.to_owned(),
-                initial_peers: self.options.initial_peers.clone(),
-                replication_policy: self.options.replication_policy.clone(),
-            };
-            let oplog = Oplog::with_storage(self.node.storage().clone());
-            match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
-                Ok(_) => {
-                    return self.bind_confirmed_topic(store, GraphTopic { graph, topic_id });
-                }
-                // A concurrent sync admission may create the topic between the
-                // state read and the genesis commit; re-check and reuse it. This
-                // is exactly why a *missing* binding is never memoized.
-                Err(error) => genesis_error = Some(error),
-            }
-        }
-        Err(CraqleSyncError::Irokle(genesis_error.unwrap_or_else(
-            || irokle::Error::Storage(format!("failed to ensure craqle topic {topic_id}")),
-        )))
+    fn ensure_topic_guarded(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+    ) -> SyncResult<irokle::TopicId> {
+        self.ensure_topic(store, graph, true)
     }
 
     fn bind_graph_topic(
@@ -529,7 +542,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             self.remember_topic(graph, existing);
             return Ok(());
         }
-        self.bind_confirmed_topic(store, GraphTopic { graph, topic_id })?;
+        self.bind_topic(store, GraphTopic { graph, topic_id }, false)?;
         Ok(())
     }
 

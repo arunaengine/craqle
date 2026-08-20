@@ -93,6 +93,9 @@ const GRAPH_DIAGNOSTICS_PREFIX: u8 = b'O';
 const SHACL_BINDING_PREFIX: u8 = b'S';
 #[cfg(feature = "shacl-core")]
 const SHACL_REVERSE_PREFIX: u8 = b's';
+/// Queued active SHACL data graphs awaiting settlement.
+#[cfg(feature = "shacl-core")]
+const SHACL_PENDING_PREFIX: u8 = b'V';
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
 /// Upper bound on the global term-decode cache. Term ids are content hashes so
@@ -864,6 +867,9 @@ pub struct GraphStore {
     /// write-locked.
     #[cfg(test)]
     commit_stalled: std::sync::atomic::AtomicBool,
+    /// Makes the next durable batch fail immediately before fjall commits.
+    #[cfg(test)]
+    commit_failure: std::sync::atomic::AtomicBool,
     /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
     /// between an acknowledgement's token read and its commit.
     #[cfg(test)]
@@ -1169,6 +1175,19 @@ fn binding_reverse_prefix(dependency: TermId) -> [u8; 17] {
     key[0] = SHACL_REVERSE_PREFIX;
     key[1..17].copy_from_slice(&dependency.to_be_bytes());
     key
+}
+
+#[cfg(feature = "shacl-core")]
+fn shacl_pending_key(data_graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = SHACL_PENDING_PREFIX;
+    key[1..17].copy_from_slice(&data_graph.to_be_bytes());
+    key
+}
+
+#[cfg(feature = "shacl-core")]
+fn shacl_pending_prefix() -> [u8; 1] {
+    [SHACL_PENDING_PREFIX]
 }
 
 fn topic_clock_key(topic_id: &[u8; 32]) -> [u8; 33] {
@@ -1640,6 +1659,54 @@ impl StoreReadSnapshot {
 
     pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
         store.snapshot_admission(&self.snapshot)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn qv_g_count(&self, store: &GraphStore, graph: TermId) -> Result<Option<u64>> {
+        self.qv_count(store, QueryIndexCounterKey::Graph(graph), false)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn qv_gp_count(
+        &self,
+        store: &GraphStore,
+        graph: TermId,
+        predicate: TermId,
+    ) -> Result<Option<u64>> {
+        self.qv_count(
+            store,
+            QueryIndexCounterKey::GraphPredicate(graph, predicate),
+            true,
+        )
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn qv_gpo_count(
+        &self,
+        store: &GraphStore,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<Option<u64>> {
+        self.qv_count(
+            store,
+            QueryIndexCounterKey::GraphPredicateObject(graph, predicate, object),
+            true,
+        )
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn qv_count(
+        &self,
+        store: &GraphStore,
+        key: QueryIndexCounterKey,
+        zero_missing: bool,
+    ) -> Result<Option<u64>> {
+        match store.query_index_counter_from_snapshot(&self.snapshot, key)? {
+            QueryIndexCounterRead::Value(count) => Ok(Some(count)),
+            QueryIndexCounterRead::Missing if zero_missing => Ok(Some(0)),
+            QueryIndexCounterRead::Missing | QueryIndexCounterRead::Malformed => Ok(None),
+        }
     }
 
     pub(crate) fn contains_graph_by_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
@@ -3057,6 +3124,17 @@ impl GraphStore {
         self.commit_stalled.load(Ordering::SeqCst)
     }
 
+    /// Make exactly the next durable batch commit fail. Test-only.
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn arm_commit_failure(&self) {
+        self.commit_failure.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_commit_failure(&self) -> bool {
+        self.commit_failure.swap(false, Ordering::SeqCst)
+    }
+
     /// Stall a rebuild between its scan and its install. Test-only.
     #[cfg(test)]
     fn stall_in_rebuild(&self) {
@@ -4080,6 +4158,8 @@ impl GraphStore {
             #[cfg(test)]
             commit_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            commit_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             fts_ack_stall: Mutex::new(None),
             #[cfg(test)]
             rebuild_stall: Mutex::new(None),
@@ -4276,6 +4356,20 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Stage graph creation into a caller-held graph commit batch.
+    pub(crate) fn stage_graph(&self, batch: &mut WriteBatch, graph: &GraphId) -> Result<TermId> {
+        let graph_id =
+            self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
+        if self.read_graph_meta_by_id(graph_id)?.is_none() {
+            batch.insert(
+                &self.graphs,
+                graph_meta_key(graph_id),
+                postcard::to_allocvec(&StoredGraphMeta::default())?,
+            );
+        }
+        Ok(graph_id)
+    }
+
     pub fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(false);
@@ -4322,6 +4416,79 @@ impl GraphStore {
         Ok(statuses)
     }
 
+    /// Queued graphs plus legacy Pending statuses for startup recovery.
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn pending_shacl_graphs(&self) -> Result<Vec<GraphId>> {
+        let mut graphs = Vec::new();
+        let mut terms = HashMap::new();
+        for guard in self.graphs.prefix(shacl_pending_prefix()) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 17 || !value.is_empty() {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL pending graph key",
+                    message: format!(
+                        "expected 17-byte empty entry, found {} bytes and {} value bytes",
+                        key.len(),
+                        value.len()
+                    ),
+                });
+            }
+            let graph = decode_term_id(&key[1..17], "SHACL pending data graph")?;
+            let graph = self
+                .decode_term_cached(&mut terms, graph)?
+                .to_named_node()
+                .map(GraphId)
+                .ok_or_else(|| StoreError::InvalidEncoding {
+                    context: "SHACL pending data graph",
+                    message: "data graph is not a named node".to_owned(),
+                })?;
+            graphs.push(graph);
+        }
+        // Recovery also finds legacy Pending records or a queue removal interrupted by a crash.
+        for guard in self.graphs.prefix([SHACL_BINDING_PREFIX]) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 33 {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL binding key",
+                    message: format!("expected 33 bytes, found {}", key.len()),
+                });
+            }
+            let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
+            if status.binding.policy != crate::shacl::ValidationPolicy::Disabled
+                && status.state == crate::shacl::ShaclValidationState::Pending
+            {
+                graphs.push(status.binding.data_graph);
+            }
+        }
+        graphs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        graphs.dedup();
+        Ok(graphs)
+    }
+
+    /// Active data graphs whose bindings depend on `changed_graph`.
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn affected_shacl_graphs(&self, changed_graph: &GraphId) -> Result<Vec<GraphId>> {
+        let Some(changed_graph) = self.graph_id_for(changed_graph)? else {
+            return Ok(Vec::new());
+        };
+        let mut graphs = Vec::new();
+        for key in self.binding_keys(changed_graph)? {
+            let Some(value) = self.graphs.get(key)? else {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL reverse binding key",
+                    message: "binding target is missing".to_owned(),
+                });
+            };
+            let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
+            if status.binding.policy != crate::shacl::ValidationPolicy::Disabled {
+                graphs.push(status.binding.data_graph);
+            }
+        }
+        graphs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        graphs.dedup();
+        Ok(graphs)
+    }
+
     #[cfg(feature = "shacl-core")]
     pub(crate) fn stage_binding_status(
         &self,
@@ -4347,8 +4514,7 @@ impl GraphStore {
         }
         let binding_key = shacl_binding_key(data_graph, shapes_graph);
         if let Some(value) = self.graphs.get(binding_key)? {
-            let previous: crate::shacl::ShaclBindingStatus =
-                postcard::from_bytes(value.as_ref())?;
+            let previous: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
             for (dependency, _) in previous.shape_versions {
                 if let Some(dependency) = self.graph_id_for(&dependency)? {
                     batch.remove(
@@ -4358,11 +4524,7 @@ impl GraphStore {
                 }
             }
         }
-        batch.insert(
-            &self.graphs,
-            binding_key,
-            postcard::to_allocvec(status)?,
-        );
+        batch.insert(&self.graphs, binding_key, postcard::to_allocvec(status)?);
         for dependency in dependencies {
             batch.insert(
                 &self.graphs,
@@ -4388,8 +4550,7 @@ impl GraphStore {
         };
         let binding_key = shacl_binding_key(data_graph, shapes_graph);
         if let Some(value) = self.graphs.get(binding_key)? {
-            let status: crate::shacl::ShaclBindingStatus =
-                postcard::from_bytes(value.as_ref())?;
+            let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
             for (dependency, _) in status.shape_versions {
                 if let Some(dependency) = self.graph_id_for(&dependency)? {
                     batch.remove(
@@ -4404,15 +4565,44 @@ impl GraphStore {
     }
 
     #[cfg(feature = "shacl-core")]
+    pub(crate) fn stage_binding_pending(
+        &self,
+        batch: &mut WriteBatch,
+        status: &crate::shacl::ShaclBindingStatus,
+    ) -> Result<()> {
+        let Some(data_graph) = self.graph_id_for(&status.binding.data_graph)? else {
+            return Err(StoreError::GraphNotFound(
+                status.binding.data_graph.to_string(),
+            ));
+        };
+        batch.insert(&self.graphs, shacl_pending_key(data_graph), []);
+        self.stage_binding_status(batch, status)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn stage_shacl_settled(
+        &self,
+        batch: &mut WriteBatch,
+        data_graph: &GraphId,
+    ) -> Result<()> {
+        let Some(data_graph) = self.graph_id_for(data_graph)? else {
+            return Ok(());
+        };
+        batch.remove(&self.graphs, shacl_pending_key(data_graph));
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
     pub(crate) fn stage_pending_bindings(
         &self,
         batch: &mut WriteBatch,
         changed_graph: &GraphId,
+        data_version: [u8; 32],
     ) -> Result<()> {
-        let Some(changed_graph) = self.graph_id_for(changed_graph)? else {
+        let Some(changed_graph_id) = self.graph_id_for(changed_graph)? else {
             return Ok(());
         };
-        for key in self.binding_keys(changed_graph)? {
+        for key in self.binding_keys(changed_graph_id)? {
             let Some(value) = self.graphs.get(key)? else {
                 return Err(StoreError::InvalidEncoding {
                     context: "SHACL reverse binding key",
@@ -4421,13 +4611,19 @@ impl GraphStore {
             };
             let mut status: crate::shacl::ShaclBindingStatus =
                 postcard::from_bytes(value.as_ref())?;
+            if status.binding.data_graph == *changed_graph {
+                status.data_version = data_version;
+            }
             if status.binding.policy == crate::shacl::ValidationPolicy::Disabled {
+                if status.binding.data_graph == *changed_graph {
+                    self.stage_binding_status(batch, &status)?;
+                }
                 continue;
             }
             status.state = crate::shacl::ShaclValidationState::Pending;
             status.report = None;
             status.error = None;
-            self.stage_binding_status(batch, &status)?;
+            self.stage_binding_pending(batch, &status)?;
         }
         Ok(())
     }
@@ -4437,12 +4633,13 @@ impl GraphStore {
         let mut binding_keys = BTreeSet::new();
         for guard in self.graphs.prefix(shacl_binding_prefix(changed_graph)) {
             let (key, _) = guard.into_inner()?;
-            let key: [u8; 33] = key.as_ref().try_into().map_err(|_| {
-                StoreError::InvalidEncoding {
-                    context: "SHACL binding key",
-                    message: format!("expected 33 bytes, found {}", key.len()),
-                }
-            })?;
+            let key: [u8; 33] =
+                key.as_ref()
+                    .try_into()
+                    .map_err(|_| StoreError::InvalidEncoding {
+                        context: "SHACL binding key",
+                        message: format!("expected 33 bytes, found {}", key.len()),
+                    })?;
             binding_keys.insert(key);
         }
         for guard in self.graphs.prefix(binding_reverse_prefix(changed_graph)) {
@@ -4463,14 +4660,28 @@ impl GraphStore {
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn delete_graph(&self, graph: &GraphId) -> Result<()> {
+        self.delete_graph_inner(graph, false)
+    }
+
+    /// Delete a graph and persist its tombstone in the same durable batch.
+    pub(crate) fn delete_graph_tombstoned(&self, graph: &GraphId) -> Result<()> {
+        self.delete_graph_inner(graph, true)
+    }
+
+    fn delete_graph_inner(&self, graph: &GraphId, tombstone: bool) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
         #[cfg(feature = "shacl-core")]
         let _binding_guard = self.binding_guard();
-        let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(());
-        };
-
         let mut batch = self.new_batch();
+        let graph_id = match self.graph_id_for(graph)? {
+            Some(graph_id) => graph_id,
+            None if tombstone => self
+                .encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?,
+            None => return Ok(()),
+        };
+        if tombstone {
+            batch.insert(&self.graphs, graph_tombstone_key(graph_id), []);
+        }
         self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
             self.write_quad_state(&mut batch, quad, Vec::new())?;
             Ok(())
@@ -4482,6 +4693,8 @@ impl GraphStore {
         batch.remove(&self.graphs, graph_clock_key(graph_id));
         batch.publish.clocks.insert(graph_id, None);
         batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
+        #[cfg(feature = "shacl-core")]
+        batch.remove(&self.graphs, shacl_pending_key(graph_id));
         for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
             let (key, _) = guard.into_inner()?;
             batch.remove(&self.graphs, key);
@@ -4507,7 +4720,7 @@ impl GraphStore {
                 status.state = crate::shacl::ShaclValidationState::Pending;
                 status.report = None;
                 status.error = None;
-                self.stage_binding_status(&mut batch, &status)?;
+                self.stage_binding_pending(&mut batch, &status)?;
             }
         }
 
@@ -4779,6 +4992,8 @@ impl GraphStore {
     /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
+        #[cfg(feature = "shacl-core")]
+        let _binding_guard = self.binding_guard();
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
@@ -4813,11 +5028,14 @@ impl GraphStore {
     }
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
-    /// while a commit guard is held (see [`GraphCommitGuard`]). In particular
-    /// `IrokleGraphSync::ensure_graph_topic` reaches this, so any publish that
-    /// may bind a topic must run *before* the caller takes its guard.
+    /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn set_irokle_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
+        self.set_topic_guarded(graph, topic_id)
+    }
+
+    /// Caller holds this graph's [`GraphCommitGuard`].
+    pub(crate) fn set_topic_guarded(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
@@ -5690,6 +5908,12 @@ impl GraphStore {
     }
 
     fn commit_fjall_batch(&self, batch: fjall::OwnedWriteBatch) -> Result<()> {
+        #[cfg(test)]
+        if self.take_commit_failure() {
+            return Err(StoreError::Fjall(fjall::Error::Io(std::io::Error::other(
+                "injected commit failure",
+            ))));
+        }
         batch.commit()?;
         Ok(())
     }
@@ -6067,36 +6291,18 @@ mod tests {
         commit_add(&store, &graph, second);
         commit_add(&store, &graph, third);
 
-        assert_eq!(
-            store.predicate_subject_count(first.predicate),
-            2
-        );
-        assert_eq!(
-            store.predicate_object_count(first.predicate),
-            2
-        );
+        assert_eq!(store.predicate_subject_count(first.predicate), 2);
+        assert_eq!(store.predicate_object_count(first.predicate), 2);
 
         let clock = store.get_vector_clock(&graph).unwrap();
         commit_remove(&store, &graph, third, &clock);
-        assert_eq!(
-            store.predicate_subject_count(first.predicate),
-            1
-        );
-        assert_eq!(
-            store.predicate_object_count(first.predicate),
-            2
-        );
+        assert_eq!(store.predicate_subject_count(first.predicate), 1);
+        assert_eq!(store.predicate_object_count(first.predicate), 2);
 
         let clock = store.get_vector_clock(&graph).unwrap();
         commit_remove(&store, &graph, first, &clock);
-        assert_eq!(
-            store.predicate_subject_count(first.predicate),
-            1
-        );
-        assert_eq!(
-            store.predicate_object_count(first.predicate),
-            1
-        );
+        assert_eq!(store.predicate_subject_count(first.predicate), 1);
+        assert_eq!(store.predicate_object_count(first.predicate), 1);
     }
 
     fn query_index_header_for_test(store: &GraphStore) -> QueryIndexHeader {
@@ -6241,6 +6447,62 @@ mod tests {
             1,
             "Missing must leave canonical fallback reads available"
         );
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn qv_counts_sparse() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:counts");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, quad);
+        let missing = store.resolve_term(&named("urn:test:missing")).unwrap();
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::default();
+        assert_eq!(Some(1), view.qv_g_count(&context, quad.graph).unwrap());
+        assert_eq!(
+            Some(1),
+            view.qv_gp_count(&context, quad.graph, quad.predicate)
+                .unwrap()
+        );
+        assert_eq!(
+            Some(0),
+            view.qv_gp_count(&context, quad.graph, missing).unwrap()
+        );
+        assert_eq!(
+            Some(0),
+            view.qv_gpo_count(&context, quad.graph, quad.predicate, missing)
+                .unwrap()
+        );
+        let stats = context.snapshot();
+        assert_eq!(1, stats.qv_admission_checks);
+        assert_eq!(5, stats.qv_counter_reads);
+
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv1_meta,
+            QueryIndexCounterKey::GraphPredicate(quad.graph, quad.predicate).bytes(),
+            [0_u8],
+        );
+        let view = StoreReadView::new(&store);
+        assert_eq!(
+            None,
+            view.qv_gp_count(&ReadContext::default(), quad.graph, quad.predicate)
+                .unwrap()
+        );
+
+        let mut failed = query_index_header_for_test(&store);
+        failed.state = StoredQueryIndexState::Failed("test-failed".to_owned());
+        stage_query_index_header_for_test(&store, &failed);
+        let context = ReadContext::default();
+        assert_eq!(
+            None,
+            StoreReadView::new(&store)
+                .qv_g_count(&context, quad.graph)
+                .unwrap()
+        );
+        assert!(!context.snapshot().qv_trusted);
     }
 
     #[test]

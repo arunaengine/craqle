@@ -71,7 +71,11 @@ fn setup() -> (
         ],
     );
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     (directory, node, data, schema)
 }
@@ -89,7 +93,12 @@ fn change(graph: &GraphId) -> MaterializedQuadChange {
 fn cache_cancelled() {
     let (_directory, node, data, schema) = setup();
     let baseline = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     assert!(!baseline.conforms);
 
@@ -97,6 +106,7 @@ fn cache_cancelled() {
     cancellation.cancel();
     let error = node
         .validate_shacl_delta(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &[],
@@ -116,13 +126,19 @@ fn cache_cancelled() {
 fn cache_limits() {
     let (_directory, node, data, schema) = setup();
     let baseline = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     assert!(!baseline.conforms);
     let changes = [change(&data)];
 
     let error = node
         .validate_shacl_delta(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &changes,
@@ -139,6 +155,7 @@ fn cache_limits() {
 
     let error = node
         .validate_shacl_delta(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &changes,

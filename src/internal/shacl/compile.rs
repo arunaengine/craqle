@@ -2,9 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ::shacl::ir::{IRComponent, IRSchema, IRShape, ShapeLabelIdx};
-use ::shacl::rdf::ShaclParser;
-use ::shacl::types::{NodeKind, Severity, Target};
 use oxrdf::graph::CanonicalizationAlgorithm;
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use rudof_iri::IriS;
@@ -12,12 +9,15 @@ use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_core::SHACLPath;
 use rudof_rdf::rdf_core::term::Object;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
+use shacl::ir::{IRComponent, IRSchema, IRShape, ShapeLabelIdx};
+use shacl::rdf::ShaclParser;
+use shacl::types::{NodeKind, Severity, Target};
 
 use crate::query_context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::shacl::{
     CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError,
-    ShaclValidationOptions, ShaclValidationReport,
+    ShaclExecutionMode, ShaclValidationOptions, ShaclValidationReport,
 };
 use crate::store::{GraphStore, StoreError, TermId, hash_term};
 use crate::validation_delta::{DeltaIndex, DeltaReadView};
@@ -190,10 +190,7 @@ impl ShaclCompiler {
         Ok((resolved, false, resolve_time))
     }
 
-    pub(crate) fn versions_are_current(
-        &self,
-        versions: &[(GraphId, [u8; 32])],
-    ) -> Result<bool> {
+    pub(crate) fn versions_are_current(&self, versions: &[(GraphId, [u8; 32])]) -> Result<bool> {
         let snapshot = self.store.read_snapshot();
         for (graph, version) in versions {
             let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
@@ -213,10 +210,56 @@ impl ShaclCompiler {
         options: &ShaclValidationOptions,
         stop_after_first: bool,
     ) -> Result<ShaclValidationReport> {
-        let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
+        self.validate_from(
+            StoreReadView::new(&self.store),
+            data_graph,
+            schema,
+            options,
+            stop_after_first,
+        )
+    }
+
+    pub(crate) fn validate_authorized<F>(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
+        stop_after_first: bool,
+        authorize: F,
+    ) -> Result<ShaclValidationReport>
+    where
+        F: FnOnce(&StoreReadView<'_>) -> Result<()>,
+    {
         let view = StoreReadView::new(&self.store);
+        authorize(&view)?;
+        self.validate_from(view, data_graph, schema, options, stop_after_first)
+    }
+
+    fn validate_from(
+        &self,
+        view: StoreReadView<'_>,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
+        stop_after_first: bool,
+    ) -> Result<ShaclValidationReport> {
+        if options.execution_mode == ShaclExecutionMode::ForceDelta {
+            return Err(ShaclError::DeltaExecutionUnavailable {
+                reason: "a candidate change set was not supplied".to_owned(),
+            }
+            .into());
+        }
+        self.ensure_schema_current(schema)?;
+        let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
+        let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
         let cache_key = self.validation_cache_key(&view, data_graph, schema, options)?;
-        let report = match eval::validate_view(
+        let estimate = match self.execution_estimate(&view, &context, data_graph, &resolved, &[]) {
+            Err(CraqleError::Store(StoreError::Cancelled)) => {
+                return Err(ShaclError::ValidationCancelled.into());
+            }
+            result => result?,
+        };
+        let mut report = match eval::validate_view(
             &view,
             resolved,
             data_graph,
@@ -224,7 +267,7 @@ impl ShaclCompiler {
             cache_hit,
             resolve_time,
             stop_after_first,
-            None,
+            Some(&context),
             None,
         ) {
             Err(CraqleError::Store(StoreError::Cancelled)) => {
@@ -232,6 +275,8 @@ impl ShaclCompiler {
             }
             result => result?,
         };
+        self.ensure_schema_current(schema)?;
+        stamp_execution(&mut report, ShaclExecutionMode::ForceFull, estimate);
         if !stop_after_first {
             self.cache_validation(cache_key, report.clone());
         }
@@ -255,6 +300,22 @@ impl ShaclCompiler {
         )
     }
 
+    pub(crate) fn validate_delta_authorized<F>(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        changes: &[MaterializedQuadChange],
+        options: &ShaclValidationOptions,
+        authorize: F,
+    ) -> Result<ShaclValidationReport>
+    where
+        F: FnOnce(&StoreReadView<'_>) -> Result<()>,
+    {
+        let view = StoreReadView::new(&self.store);
+        authorize(&view)?;
+        self.validate_delta_from(view, data_graph, schema, changes, options, None)
+    }
+
     pub(crate) fn validate_delta_from(
         &self,
         base: StoreReadView<'_>,
@@ -267,8 +328,101 @@ impl ShaclCompiler {
         if options.cancellation.is_cancelled() {
             return Err(ShaclError::ValidationCancelled.into());
         }
+        self.ensure_schema_current(schema)?;
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
+        if let Some(graph) = changed_schema(schema, changes) {
+            let error = if options.execution_mode == ShaclExecutionMode::ForceDelta {
+                ShaclError::DeltaExecutionUnavailable {
+                    reason: format!(
+                        "the candidate changes compiled shapes graph `{}`",
+                        graph.as_str()
+                    ),
+                }
+            } else {
+                ShaclError::ShapesGraphMutationUnsupported {
+                    graph: graph.to_string(),
+                }
+            };
+            return Err(error.into());
+        }
         let index = DeltaIndex::build(&self.store, data_graph, changes)?;
+        let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
+        let changed = match effective_changes(&base, &context, data_graph, changes) {
+            Err(CraqleError::Store(StoreError::Cancelled)) => {
+                return Err(ShaclError::ValidationCancelled.into());
+            }
+            result => result?,
+        };
+        let base_report = match base_report {
+            Some(report) => Some(report),
+            None => self
+                .validation_cache()
+                .get(&self.validation_cache_key(&base, data_graph, schema, options)?)
+                .cloned(),
+        };
+        let base_available = base_report.is_some();
+        let estimate =
+            match self.execution_estimate(&base, &context, data_graph, &resolved, &changed) {
+                Err(CraqleError::Store(StoreError::Cancelled)) => {
+                    return Err(ShaclError::ValidationCancelled.into());
+                }
+                result => result?,
+            };
+        let selected = match options.execution_mode {
+            ShaclExecutionMode::Auto if auto_delta(base_available, estimate) => {
+                ShaclExecutionMode::ForceDelta
+            }
+            ShaclExecutionMode::Auto | ShaclExecutionMode::ForceFull => {
+                ShaclExecutionMode::ForceFull
+            }
+            ShaclExecutionMode::ForceDelta => ShaclExecutionMode::ForceDelta,
+        };
+        let mut report = match selected {
+            ShaclExecutionMode::ForceDelta => self.validate_incremental(
+                base,
+                data_graph,
+                schema,
+                options,
+                base_report,
+                resolved,
+                cache_hit,
+                resolve_time,
+                &index,
+                &changed,
+                &context,
+            )?,
+            ShaclExecutionMode::ForceFull => self.validate_candidate_full(
+                base,
+                data_graph,
+                options,
+                resolved,
+                cache_hit,
+                resolve_time,
+                &index,
+                &context,
+            )?,
+            ShaclExecutionMode::Auto => unreachable!("auto always selects a concrete path"),
+        };
+        self.ensure_schema_current(schema)?;
+        stamp_execution(&mut report, selected, estimate);
+        Ok(report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_incremental(
+        &self,
+        base: StoreReadView<'_>,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
+        base_report: Option<ShaclValidationReport>,
+        resolved: Arc<ResolvedSchema>,
+        cache_hit: bool,
+        resolve_time: std::time::Duration,
+        index: &DeltaIndex,
+        changes: &[ChangedQuadIds],
+        context: &ReadContext<'_>,
+    ) -> Result<ShaclValidationReport> {
         let base_report = match base_report {
             Some(report) => report,
             None => {
@@ -285,11 +439,20 @@ impl ShaclCompiler {
                         cache_hit,
                         resolve_time,
                         false,
-                        None,
+                        Some(context),
                         None,
                     ) {
                         Err(CraqleError::Store(StoreError::Cancelled)) => {
                             return Err(ShaclError::ValidationCancelled.into());
+                        }
+                        Err(CraqleError::Shacl(ShaclError::ResultLimitExceeded { .. }))
+                            if options.execution_mode == ShaclExecutionMode::ForceDelta =>
+                        {
+                            return Err(ShaclError::DeltaExecutionUnavailable {
+                                reason: "the uncached base report exceeds the result limit"
+                                    .to_owned(),
+                            }
+                            .into());
                         }
                         result => result?,
                     };
@@ -299,17 +462,15 @@ impl ShaclCompiler {
             }
         };
         let view = DeltaReadView::new(base, &index);
-        let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
         let graph = hash_term(&EncodedTerm::from_named_node(&data_graph.0));
         let rdf_type = hash_term(&EncodedTerm(RDF_TYPE.to_owned()));
-        let selection = match select_incremental_targets(
-            &view, &context, graph, rdf_type, &resolved, data_graph, changes,
-        ) {
-            Err(CraqleError::Store(StoreError::Cancelled)) => {
-                return Err(ShaclError::ValidationCancelled.into());
-            }
-            result => result?,
-        };
+        let selection =
+            match select_incremental_targets(&view, context, graph, rdf_type, &resolved, changes) {
+                Err(CraqleError::Store(StoreError::Cancelled)) => {
+                    return Err(ShaclError::ValidationCancelled.into());
+                }
+                result => result?,
+            };
         if selection.affected_pairs.is_empty() {
             let mut report = base_report;
             report.statistics = Default::default();
@@ -317,6 +478,7 @@ impl ShaclCompiler {
             report.statistics.shapes_considered = resolved.shapes.len() as u64;
             report.statistics.shapes_skipped = resolved.shapes.len() as u64;
             report.statistics.violations = report.results.len() as u64;
+            report.statistics.read = context.snapshot();
             enforce_result_limit(&report, options)?;
             return Ok(report);
         }
@@ -328,7 +490,7 @@ impl ShaclCompiler {
             cache_hit,
             resolve_time,
             false,
-            Some(&context),
+            Some(context),
             Some(selection.targets),
         ) {
             Err(CraqleError::Store(StoreError::Cancelled)) => {
@@ -349,6 +511,250 @@ impl ShaclCompiler {
         report.statistics.full_graph_fallbacks = selection.full_graph_fallbacks;
         enforce_result_limit(&report, options)?;
         Ok(report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_candidate_full(
+        &self,
+        base: StoreReadView<'_>,
+        data_graph: &GraphId,
+        options: &ShaclValidationOptions,
+        resolved: Arc<ResolvedSchema>,
+        cache_hit: bool,
+        resolve_time: std::time::Duration,
+        index: &DeltaIndex,
+        context: &ReadContext<'_>,
+    ) -> Result<ShaclValidationReport> {
+        let view = DeltaReadView::new(base, index);
+        match eval::validate_view(
+            &view,
+            resolved,
+            data_graph,
+            options,
+            cache_hit,
+            resolve_time,
+            false,
+            Some(context),
+            None,
+        ) {
+            Err(CraqleError::Store(StoreError::Cancelled)) => {
+                Err(ShaclError::ValidationCancelled.into())
+            }
+            result => result,
+        }
+    }
+
+    fn execution_estimate(
+        &self,
+        base: &StoreReadView<'_>,
+        context: &ReadContext<'_>,
+        data_graph: &GraphId,
+        schema: &ResolvedSchema,
+        changes: &[ChangedQuadIds],
+    ) -> Result<ExecutionEstimate> {
+        context.check_cancelled()?;
+        let graph = hash_term(&EncodedTerm::from_named_node(&data_graph.0));
+        let possible_focus = changes
+            .iter()
+            .map(|change| change.subject)
+            .collect::<HashSet<_>>()
+            .len()
+            .saturating_add(
+                changes
+                    .iter()
+                    .map(|change| change.object)
+                    .collect::<HashSet<_>>()
+                    .len(),
+            ) as u64;
+        let rdf_type = hash_term(&EncodedTerm(RDF_TYPE.to_owned()));
+        let mut affected = vec![false; schema.portable.shapes.len()];
+        let mut global = vec![false; schema.portable.shapes.len()];
+        for (index, shape) in schema.portable.shapes.iter().enumerate() {
+            let dependencies = &shape.dependencies;
+            let forward = dependencies
+                .forward_predicates
+                .iter()
+                .map(hash_term)
+                .collect::<HashSet<_>>();
+            let inverse = dependencies
+                .inverse_predicates
+                .iter()
+                .map(hash_term)
+                .collect::<HashSet<_>>();
+            for change in changes {
+                let mut selected = forward.contains(&change.predicate);
+                selected |= inverse.contains(&change.predicate);
+                selected |= dependencies.reads_all_outgoing_predicates;
+                if dependencies.reads_rdf_type && change.predicate == rdf_type {
+                    selected = true;
+                    global[index] |= shape.path.is_some();
+                }
+                affected[index] |= selected;
+                if selected
+                    && (dependencies.requires_global_work || dependencies.has_transitive_path)
+                {
+                    global[index] = true;
+                }
+            }
+        }
+        loop {
+            let mut changed_any = false;
+            for shape in &schema.portable.shapes {
+                let parent = shape.id.0 as usize;
+                for property in &shape.property_shapes {
+                    let property = property.0 as usize;
+                    if affected[parent] && !affected[property] {
+                        affected[property] = true;
+                        changed_any = true;
+                    }
+                    if global[parent] && !global[property] {
+                        global[property] = true;
+                        changed_any = true;
+                    }
+                }
+                if !shape.dependencies.nested_shapes.is_empty()
+                    && shape
+                        .dependencies
+                        .nested_shapes
+                        .iter()
+                        .any(|nested| global[nested.0 as usize] || affected[nested.0 as usize])
+                {
+                    if !affected[parent] {
+                        affected[parent] = true;
+                        changed_any = true;
+                    }
+                    if !global[parent] {
+                        global[parent] = true;
+                        changed_any = true;
+                    }
+                }
+            }
+            if !changed_any {
+                break;
+            }
+        }
+
+        let affected_shapes = affected.iter().filter(|affected| **affected).count() as u64;
+        let Some(data_quads) = base.qv_g_count(context, graph)? else {
+            return Ok(ExecutionEstimate {
+                delta_work: u64::MAX,
+                full_work: u64::MAX,
+                affected_shapes,
+                focus_nodes: possible_focus,
+                full_required: true,
+            });
+        };
+        let data_quads = candidate_count(data_quads, changes, None, None);
+        let mut full_targets = vec![0u64; schema.portable.shapes.len()];
+        for (index, shape) in schema.portable.shapes.iter().enumerate() {
+            for target in &shape.targets {
+                let Some(target_count) =
+                    self.target_count(base, context, graph, target, changes, rdf_type, data_quads)?
+                else {
+                    return Ok(ExecutionEstimate {
+                        delta_work: u64::MAX,
+                        full_work: u64::MAX,
+                        affected_shapes,
+                        focus_nodes: possible_focus,
+                        full_required: true,
+                    });
+                };
+                full_targets[index] = full_targets[index].saturating_add(target_count);
+            }
+        }
+        loop {
+            let mut changed_any = false;
+            for shape in &schema.portable.shapes {
+                let parent = shape.id.0 as usize;
+                for property in &shape.property_shapes {
+                    let property = property.0 as usize;
+                    let next = full_targets[property].max(full_targets[parent]);
+                    changed_any |= next != full_targets[property];
+                    full_targets[property] = next;
+                }
+            }
+            if !changed_any {
+                break;
+            }
+        }
+        let full_work = schema
+            .portable
+            .shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, shape)| !shape.deactivated)
+            .fold(
+                (schema.portable.shapes.len() as u64).saturating_mul(FULL_SHAPE_WORK),
+                |work, (index, shape)| {
+                    work.saturating_add(full_targets[index].saturating_mul(shape_work(shape)))
+                },
+            )
+            .saturating_add((schema.portable.shapes.len() as u64).saturating_mul(FULL_SHAPE_WORK));
+        let mut delta_work = (changes.len() as u64).saturating_mul(2).max(1);
+        for (index, shape) in schema.portable.shapes.iter().enumerate() {
+            if affected[index] && !shape.deactivated {
+                let dependency_work = shape.dependencies.forward_predicates.len()
+                    + shape.dependencies.inverse_predicates.len()
+                    + usize::from(shape.dependencies.reads_rdf_type);
+                let focus_work = 1u64
+                    .saturating_add(shape.constraints.len() as u64)
+                    .saturating_add(dependency_work as u64);
+                delta_work =
+                    delta_work.saturating_add(possible_focus.max(1).saturating_mul(focus_work));
+            }
+        }
+        let full_required = global.iter().any(|global| *global);
+        if full_required {
+            delta_work = delta_work.max(full_work.saturating_add(1));
+        }
+        Ok(ExecutionEstimate {
+            delta_work,
+            full_work,
+            affected_shapes,
+            focus_nodes: possible_focus,
+            full_required,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn target_count(
+        &self,
+        base: &StoreReadView<'_>,
+        context: &ReadContext<'_>,
+        graph: TermId,
+        target: &TargetPlan,
+        changes: &[ChangedQuadIds],
+        rdf_type: TermId,
+        cap: u64,
+    ) -> Result<Option<u64>> {
+        let (predicate, object) = match target {
+            TargetPlan::Node(_) => return Ok(Some(1)),
+            TargetPlan::Class(class) | TargetPlan::ImplicitClass(class) => {
+                (Some(rdf_type), Some(hash_term(class)))
+            }
+            TargetPlan::SubjectsOf(predicate) | TargetPlan::ObjectsOf(predicate) => {
+                (Some(hash_term(predicate)), None)
+            }
+        };
+        let count = match object {
+            Some(object) => base.qv_gpo_count(context, graph, predicate.unwrap(), object)?,
+            None => base.qv_gp_count(context, graph, predicate.unwrap())?,
+        };
+        Ok(count.map(|count| candidate_count(count, changes, predicate, object).min(cap)))
+    }
+
+    fn ensure_schema_current(&self, schema: &CompiledShaclSchema) -> Result<()> {
+        if self.versions_are_current(schema.shape_versions())? {
+            return Ok(());
+        }
+        Err(ShaclError::SchemaChangedDuringValidation {
+            graph: schema
+                .shape_versions()
+                .first()
+                .map(|(graph, _)| graph.to_string())
+                .unwrap_or_else(|| "compiled schema".to_owned()),
+        }
+        .into())
     }
 
     fn validation_cache_key(
@@ -429,7 +835,147 @@ struct ChangedQuadIds {
     subject: TermId,
     predicate: TermId,
     object: TermId,
+    present: bool,
 }
+
+#[derive(Clone, Copy)]
+struct ExecutionEstimate {
+    delta_work: u64,
+    full_work: u64,
+    affected_shapes: u64,
+    focus_nodes: u64,
+    full_required: bool,
+}
+
+fn auto_delta(base_available: bool, estimate: ExecutionEstimate) -> bool {
+    base_available
+        && !estimate.full_required
+        && estimate.delta_work < u64::MAX
+        && estimate.full_work < u64::MAX
+        && estimate.delta_work <= estimate.full_work
+}
+
+fn stamp_execution(
+    report: &mut ShaclValidationReport,
+    selected: ShaclExecutionMode,
+    estimate: ExecutionEstimate,
+) {
+    report.statistics.selected_mode = selected;
+    report.statistics.estimated_delta_work = estimate.delta_work;
+    report.statistics.estimated_full_work = estimate.full_work;
+    report.statistics.estimated_affected_shapes = estimate.affected_shapes;
+    report.statistics.estimated_focus_nodes = estimate.focus_nodes;
+}
+
+fn change_graph(change: &MaterializedQuadChange) -> &GraphId {
+    match change {
+        MaterializedQuadChange::Insert { graph, .. }
+        | MaterializedQuadChange::Delete { graph, .. } => graph,
+    }
+}
+
+fn changed_schema<'a>(
+    schema: &CompiledShaclSchema,
+    changes: &'a [MaterializedQuadChange],
+) -> Option<&'a GraphId> {
+    changes.iter().map(change_graph).find(|graph| {
+        schema
+            .shape_versions()
+            .iter()
+            .any(|(dependency, _)| dependency == *graph)
+    })
+}
+
+fn changed_quad_ids(
+    data_graph: &GraphId,
+    changes: &[MaterializedQuadChange],
+) -> Vec<ChangedQuadIds> {
+    let mut states = BTreeMap::new();
+    for change in changes {
+        let (change_graph, subject, predicate, object, present) = match change {
+            MaterializedQuadChange::Insert {
+                graph,
+                subject,
+                predicate,
+                object,
+            } => (graph, subject, predicate, object, true),
+            MaterializedQuadChange::Delete {
+                graph,
+                subject,
+                predicate,
+                object,
+            } => (graph, subject, predicate, object, false),
+        };
+        if change_graph == data_graph {
+            let state = ChangedQuadIds {
+                subject: hash_term(subject),
+                predicate: hash_term(predicate),
+                object: hash_term(object),
+                present,
+            };
+            states.insert((state.subject, state.predicate, state.object), state);
+        }
+    }
+    states.into_values().collect()
+}
+
+fn effective_changes(
+    base: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    data_graph: &GraphId,
+    changes: &[MaterializedQuadChange],
+) -> Result<Vec<ChangedQuadIds>> {
+    let graph = hash_term(&EncodedTerm::from_named_node(&data_graph.0));
+    let mut effective = Vec::new();
+    for change in changed_quad_ids(data_graph, changes) {
+        let base_present = base.exists(
+            context,
+            GraphSelector::Named(graph),
+            QuadPattern {
+                subject: Some(change.subject),
+                predicate: Some(change.predicate),
+                object: Some(change.object),
+                ..QuadPattern::default()
+            },
+        )?;
+        if base_present != change.present {
+            effective.push(change);
+        }
+    }
+    Ok(effective)
+}
+
+fn candidate_count(
+    base: u64,
+    changes: &[ChangedQuadIds],
+    predicate: Option<TermId>,
+    object: Option<TermId>,
+) -> u64 {
+    let delta = changes.iter().fold(0i64, |delta, change| {
+        if predicate.is_some_and(|expected| change.predicate != expected)
+            || object.is_some_and(|expected| change.object != expected)
+        {
+            delta
+        } else if change.present {
+            delta.saturating_add(1)
+        } else {
+            delta.saturating_sub(1)
+        }
+    });
+    if delta.is_negative() {
+        base.saturating_sub(delta.unsigned_abs())
+    } else {
+        base.saturating_add(delta as u64)
+    }
+}
+
+fn shape_work(shape: &CompiledShape) -> u64 {
+    1u64.saturating_add(shape.constraints.len() as u64)
+        .saturating_add(u64::from(shape.path.is_some()))
+        .saturating_add(shape.dependencies.nested_shapes.len() as u64)
+}
+
+const FULL_SHAPE_WORK: u64 = 20;
 
 #[allow(clippy::too_many_arguments)]
 fn select_incremental_targets<V: RdfReadView>(
@@ -438,33 +984,8 @@ fn select_incremental_targets<V: RdfReadView>(
     graph: TermId,
     rdf_type: TermId,
     schema: &ResolvedSchema,
-    data_graph: &GraphId,
-    changes: &[MaterializedQuadChange],
+    changes: &[ChangedQuadIds],
 ) -> Result<IncrementalSelection> {
-    let changed = changes
-        .iter()
-        .filter_map(|change| {
-            let (change_graph, subject, predicate, object) = match change {
-                MaterializedQuadChange::Insert {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                }
-                | MaterializedQuadChange::Delete {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                } => (graph, subject, predicate, object),
-            };
-            (change_graph == data_graph).then(|| ChangedQuadIds {
-                subject: hash_term(subject),
-                predicate: hash_term(predicate),
-                object: hash_term(object),
-            })
-        })
-        .collect::<Vec<_>>();
     let shape_count = schema.shapes.len();
     let mut candidates = vec![BTreeSet::new(); shape_count];
     let mut global = vec![false; shape_count];
@@ -481,7 +1002,7 @@ fn select_incremental_targets<V: RdfReadView>(
             .iter()
             .map(hash_term)
             .collect::<HashSet<_>>();
-        for change in &changed {
+        for change in changes {
             let mut affected = false;
             if forward.contains(&change.predicate) {
                 candidates[index].insert(change.subject);
@@ -1254,4 +1775,28 @@ fn encoded_literal(
         )
     };
     Ok(EncodedTerm::from_term(&Term::Literal(value)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutionEstimate, auto_delta};
+
+    #[test]
+    fn auto_tie_guard() {
+        let saturated = ExecutionEstimate {
+            delta_work: u64::MAX,
+            full_work: u64::MAX,
+            affected_shapes: 0,
+            focus_nodes: 0,
+            full_required: false,
+        };
+        assert!(!auto_delta(true, saturated));
+
+        let finite = ExecutionEstimate {
+            delta_work: 4,
+            full_work: 4,
+            ..saturated
+        };
+        assert!(auto_delta(true, finite));
+    }
 }

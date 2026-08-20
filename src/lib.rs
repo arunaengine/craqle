@@ -63,6 +63,8 @@ use std::time::Duration;
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
 };
+#[cfg(feature = "shacl-core")]
+use crate::rdf_read::StoreReadView;
 use crate::replication::ReplicationEngine;
 use crate::rocrate::RoCrateManager;
 use crate::search::SearchIndex;
@@ -88,9 +90,9 @@ pub use crate::search::SearchHit;
 #[cfg(feature = "shacl-core")]
 pub use crate::shacl::{
     CompiledShaclSchema, ShaclBinding, ShaclBindingOptions, ShaclBindingStatus,
-    ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclMessage, ShaclProfile,
-    ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult, ShaclValidationState,
-    ShaclValidationStatistics, ValidationPolicy,
+    ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclExecutionMode, ShaclMessage,
+    ShaclProfile, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
+    ShaclValidationState, ShaclValidationStatistics, ValidationPolicy,
 };
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
@@ -794,6 +796,8 @@ impl CraqleNode {
             search.needs_rebuild() || search_storage == SearchStorage::Memory;
         let node = Self::from_store_and_search(store, search.clone(), options);
         reconcile_at_open(&node)?;
+        #[cfg(feature = "shacl-core")]
+        node.replication.replay_pending_bindings()?;
         if search_needs_rebuild {
             node.schedule_full_search_reindex()?;
         }
@@ -867,38 +871,59 @@ impl CraqleNode {
     #[cfg(feature = "shacl-core")]
     pub fn compile_shacl(
         &self,
+        auth: &dyn Authorizer,
         shapes_graph: &GraphId,
         options: &ShaclCompileOptions,
     ) -> Result<CompiledShaclSchema> {
-        self.shacl.compile(shapes_graph, options)
+        let _binding_guard = self.store.binding_guard();
+        self.authorize_shape_graphs(auth, shapes_graph)?;
+        let schema = self.shacl.compile(shapes_graph, options)?;
+        self.authorize_shape_versions(auth, schema.shape_versions())?;
+        Ok(schema)
     }
 
     #[cfg(feature = "shacl-core")]
     pub fn validate_shacl(
         &self,
+        auth: &dyn Authorizer,
         data_graph: &GraphId,
         schema: &CompiledShaclSchema,
         options: &ShaclValidationOptions,
     ) -> Result<ShaclValidationReport> {
-        self.shacl.validate(data_graph, schema, options, false)
+        self.shacl
+            .validate_authorized(data_graph, schema, options, false, |view| {
+                self.authorize_view_schema(view, auth, data_graph, schema)
+            })
     }
 
     #[cfg(feature = "shacl-core")]
     pub fn validate_shacl_delta(
         &self,
+        auth: &dyn Authorizer,
         data_graph: &GraphId,
         schema: &CompiledShaclSchema,
         changes: &[MaterializedQuadChange],
         options: &ShaclValidationOptions,
     ) -> Result<ShaclValidationReport> {
         self.shacl
-            .validate_delta(data_graph, schema, changes, options)
+            .validate_delta_authorized(data_graph, schema, changes, options, |view| {
+                self.authorize_view_schema(view, auth, data_graph, schema)
+            })
     }
 
     #[cfg(feature = "shacl-core")]
-    pub fn bind_shacl(&self, binding: &ShaclBinding) -> Result<ShaclBindingStatus> {
+    pub fn bind_shacl(
+        &self,
+        auth: &dyn Authorizer,
+        binding: &ShaclBinding,
+    ) -> Result<ShaclBindingStatus> {
         let _commit_guard = self.store.graph_commit_guard(&binding.data_graph);
+        self.ensure_graph_action(&binding.data_graph, auth, Action::Write)?;
+        if binding.policy != ValidationPolicy::Disabled {
+            self.ensure_graph_action(&binding.data_graph, auth, Action::Read)?;
+        }
         let _binding_guard = self.store.binding_guard();
+        self.authorize_shape_graphs(auth, &binding.shapes_graph)?;
         if !self.store.contains_graph(&binding.data_graph)? {
             return Err(store::StoreError::GraphNotFound(binding.data_graph.to_string()).into());
         }
@@ -925,6 +950,7 @@ impl CraqleNode {
                     &binding.shapes_graph,
                     &binding.validation_options.compile_options(),
                 )?;
+                self.authorize_shape_versions(auth, schema.shape_versions())?;
                 let report = self.shacl.validate(
                     &binding.data_graph,
                     &schema,
@@ -963,8 +989,14 @@ impl CraqleNode {
     }
 
     #[cfg(feature = "shacl-core")]
-    pub fn unbind_shacl(&self, data_graph: &GraphId, shapes_graph: &GraphId) -> Result<()> {
+    pub fn unbind_shacl(
+        &self,
+        auth: &dyn Authorizer,
+        data_graph: &GraphId,
+        shapes_graph: &GraphId,
+    ) -> Result<()> {
         let _commit_guard = self.store.graph_commit_guard(data_graph);
+        self.ensure_graph_action(data_graph, auth, Action::Write)?;
         let _binding_guard = self.store.binding_guard();
         let mut batch = self.store.new_batch();
         self.store
@@ -975,34 +1007,68 @@ impl CraqleNode {
     }
 
     #[cfg(feature = "shacl-core")]
-    pub fn shacl_bindings(&self, data_graph: &GraphId) -> Result<Vec<ShaclBinding>> {
+    pub fn shacl_bindings(
+        &self,
+        auth: &dyn Authorizer,
+        data_graph: &GraphId,
+    ) -> Result<Vec<ShaclBinding>> {
         Ok(self
-            .shacl_binding_statuses(data_graph)?
+            .shacl_binding_statuses(auth, data_graph)?
             .into_iter()
             .map(|status| status.binding)
             .collect())
     }
 
     #[cfg(feature = "shacl-core")]
-    pub fn shacl_binding_statuses(&self, data_graph: &GraphId) -> Result<Vec<ShaclBindingStatus>> {
+    pub fn shacl_binding_statuses(
+        &self,
+        auth: &dyn Authorizer,
+        data_graph: &GraphId,
+    ) -> Result<Vec<ShaclBindingStatus>> {
+        let _commit_guard = self.store.graph_commit_guard(data_graph);
+        self.ensure_graph_action(data_graph, auth, Action::Read)?;
         let _binding_guard = self.store.binding_guard();
         let mut statuses = self.store.shacl_binding_statuses(data_graph)?;
         for status in &mut statuses {
-            if matches!(
-                status.state,
-                ShaclValidationState::Valid | ShaclValidationState::Invalid
-            ) && (!self.store.contains_graph(&status.binding.data_graph)?
-                || !self.store.contains_graph(&status.binding.shapes_graph)?
-                || status.data_version
-                    != self
+            self.authorize_shape_graphs(auth, &status.binding.shapes_graph)?;
+            if status.binding.policy == ValidationPolicy::Disabled {
+                if matches!(
+                    status.state,
+                    ShaclValidationState::Valid | ShaclValidationState::Invalid
+                ) {
+                    status.state = ShaclValidationState::Pending;
+                    status.report = None;
+                    status.error = None;
+                }
+                continue;
+            }
+            let schema = match self.shacl.compile(
+                &status.binding.shapes_graph,
+                &status.binding.validation_options.compile_options(),
+            ) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    status.state = ShaclValidationState::Failed;
+                    status.report = None;
+                    status.error = Some(error.to_string());
+                    continue;
+                }
+            };
+            self.authorize_shape_versions(auth, schema.shape_versions())?;
+            let current = self.store.contains_graph(&status.binding.data_graph)?
+                && self.store.contains_graph(&status.binding.shapes_graph)?
+                && status.data_version
+                    == self
                         .store
                         .graph_version_digest(&status.binding.data_graph)?
-                || status.shapes_version
-                    != self
+                && status.shapes_version
+                    == self
                         .store
                         .graph_version_digest(&status.binding.shapes_graph)?
-                || !self.shacl.versions_are_current(&status.shape_versions)?)
-            {
+                && status.schema_fingerprint == schema.plan_fingerprint()
+                && status.shape_versions.as_slice() == schema.shape_versions()
+                && self.shacl.versions_are_current(schema.shape_versions())?;
+            if !current {
                 status.state = ShaclValidationState::Pending;
                 status.report = None;
                 status.error = None;
@@ -1014,14 +1080,90 @@ impl CraqleNode {
     #[cfg(feature = "shacl-core")]
     pub fn conforms_shacl(
         &self,
+        auth: &dyn Authorizer,
         data_graph: &GraphId,
         schema: &CompiledShaclSchema,
         options: &ShaclValidationOptions,
     ) -> Result<bool> {
         Ok(self
             .shacl
-            .validate(data_graph, schema, options, true)?
+            .validate_authorized(data_graph, schema, options, true, |view| {
+                self.authorize_view_schema(view, auth, data_graph, schema)
+            })?
             .conforms)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn authorize_view_schema(
+        &self,
+        view: &StoreReadView<'_>,
+        auth: &dyn Authorizer,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+    ) -> Result<()> {
+        self.authorize_view_action(view, auth, data_graph, Action::Read)?;
+        for (graph, _) in schema.shape_versions() {
+            self.authorize_view_action(view, auth, graph, Action::Read)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn authorize_view_action(
+        &self,
+        view: &StoreReadView<'_>,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        action: Action,
+    ) -> Result<()> {
+        let policy = view
+            .snapshot()
+            .graph_policy(view.store(), graph)?
+            .unwrap_or_default();
+        auth.authorize(graph, &policy, action)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn authorize_shape_versions(
+        &self,
+        auth: &dyn Authorizer,
+        shape_versions: &[(GraphId, [u8; 32])],
+    ) -> Result<()> {
+        for (graph, _) in shape_versions {
+            self.ensure_graph_action(graph, auth, Action::Read)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn authorize_shape_graphs(&self, auth: &dyn Authorizer, shapes_graph: &GraphId) -> Result<()> {
+        const OWL_IMPORTS: &str = "<http://www.w3.org/2002/07/owl#imports>";
+
+        let mut pending = vec![shapes_graph.clone()];
+        let mut visited = HashSet::new();
+        while let Some(graph) = pending.pop() {
+            if !visited.insert(graph.to_string()) {
+                continue;
+            }
+            self.ensure_graph_action(&graph, auth, Action::Read)?;
+            if !self.store.contains_graph(&graph)? {
+                continue;
+            }
+            for quad in self.store.graph_snapshot(&graph)?.quads {
+                if quad.predicate.0 != OWL_IMPORTS {
+                    continue;
+                }
+                let Some(import) = quad.object.to_named_node() else {
+                    continue;
+                };
+                let imported = GraphId::new(import.as_str());
+                if self.store.contains_graph(&imported)? {
+                    pending.push(imported);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Return the Fjall persistence mode used for explicit graph-store persists.
@@ -2488,8 +2630,7 @@ impl CraqleNode {
             self.apply_irokle_record_locked(&record)?;
             return self.persist_fjall();
         }
-        self.store.set_graph_tombstone(graph)?;
-        self.store.delete_graph(graph)?;
+        self.store.delete_graph_tombstoned(graph)?;
         self.schedule_search_update();
         self.persist_fjall()
     }
@@ -2707,16 +2848,16 @@ impl CraqleNode {
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
     ) -> Result<bool> {
+        if let CraqleGraphEvent::GraphDeleted { graph } = &record.event {
+            self.store.delete_graph_tombstoned(graph)?;
+            self.schedule_search_update();
+            return Ok(true);
+        }
         if self.store.graph_tombstoned(record.event.graph())? {
             return Ok(false);
         }
         match &record.event {
-            CraqleGraphEvent::GraphDeleted { graph } => {
-                self.store.set_graph_tombstone(graph)?;
-                self.store.delete_graph(graph)?;
-                self.schedule_search_update();
-                Ok(true)
-            }
+            CraqleGraphEvent::GraphDeleted { .. } => unreachable!(),
             CraqleGraphEvent::Policy { graph, policy } => {
                 let policy = policy.clone().normalized();
                 if self.store.graph_policy(graph)? == policy {
@@ -4053,6 +4194,79 @@ mod tests {
                 "round {round} resurrected a tombstoned graph"
             );
         }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn delete_replays() {
+        let pair = replica_pair();
+        let data = GraphId::new("urn:test:delete-replay-data");
+        let shapes = GraphId::new("urn:test:delete-replay-shapes");
+        let focus = EncodedTerm("<urn:test:delete-replay-focus>".to_owned());
+        pair.origin
+            .apply_changes_unchecked(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: focus.clone(),
+                    predicate: EncodedTerm("<urn:test:delete-replay-value>".to_owned()),
+                    object: EncodedTerm("<urn:test:delete-replay-object>".to_owned()),
+                }],
+            )
+            .unwrap();
+        pair.origin
+            .apply_changes_unchecked(
+                &shapes,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: EncodedTerm("<urn:test:delete-replay-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm("<http://www.w3.org/ns/shacl#NodeShape>".to_owned()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: EncodedTerm("<urn:test:delete-replay-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/ns/shacl#targetNode>".to_owned(),
+                        ),
+                        object: focus,
+                    },
+                ],
+            )
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        pair.replica
+            .bind_shacl(
+                &AllowAllAuthorizer,
+                &ShaclBinding {
+                    data_graph: data.clone(),
+                    shapes_graph: shapes.clone(),
+                    policy: ValidationPolicy::Advisory,
+                    validation_options: ShaclBindingOptions::default(),
+                },
+            )
+            .unwrap();
+
+        pair.origin.delete_graph_unchecked(&shapes).unwrap();
+        pair.replica.store.set_graph_tombstone(&shapes).unwrap();
+        pair.replica.store.arm_commit_failure();
+        assert!(pair.replica.reconcile_irokle().is_err());
+        assert!(pair.replica.contains_graph(&shapes).unwrap());
+
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(pair.replica.store.graph_tombstoned(&shapes).unwrap());
+        assert!(!pair.replica.contains_graph(&shapes).unwrap());
+        assert_eq!(
+            pair.replica.store.shacl_binding_statuses(&data).unwrap()[0].state,
+            ShaclValidationState::Pending
+        );
+        assert_eq!(
+            pair.replica.store.pending_shacl_graphs().unwrap(),
+            vec![data]
+        );
     }
 
     /// A bare quad write, skipping the crate-structure rules these tests are

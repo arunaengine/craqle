@@ -49,6 +49,19 @@ fn insert(node: &CraqleNode, graph: &GraphId, triples: &[(&str, &str, &str)]) {
     .unwrap();
 }
 
+fn remove(node: &CraqleNode, graph: &GraphId, subject: &str, predicate: &str, object: &str) {
+    node.apply_changes_unchecked(
+        graph,
+        vec![MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: EncodedTerm(subject.to_owned()),
+            predicate: EncodedTerm(predicate.to_owned()),
+            object: EncodedTerm(object.to_owned()),
+        }],
+    )
+    .unwrap();
+}
+
 #[test]
 fn compile_shape_cache() {
     let (_database, node) = node();
@@ -77,10 +90,18 @@ fn compile_shape_cache() {
     );
 
     let first = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let second = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     assert_eq!(first.shape_count(), 2);
     assert!(!first.statistics().cache_hit);
@@ -90,6 +111,7 @@ fn compile_shape_cache() {
 
     let versioned = node
         .compile_shacl(
+            &craqle::AllowAllAuthorizer,
             &graph,
             &ShaclCompileOptions {
                 rocrate_version: RoCrateVersion::V1_2,
@@ -113,7 +135,11 @@ fn compile_shape_cache() {
         )],
     );
     let changed = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     assert!(!changed.statistics().cache_hit);
     assert_ne!(first.schema_hash(), changed.schema_hash());
@@ -149,10 +175,18 @@ fn canonical_digest() {
     );
 
     let first = node
-        .compile_shacl(&first_graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &first_graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let second = node
-        .compile_shacl(&second_graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &second_graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     assert_eq!(first.schema_hash(), second.schema_hash());
     assert_eq!(first.plan_fingerprint(), second.plan_fingerprint());
@@ -193,7 +227,11 @@ fn compile_path_variants() {
     );
 
     let schema = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     assert_eq!(schema.shape_count(), 3);
 }
@@ -223,7 +261,11 @@ fn compile_logical_lists() {
     );
 
     let schema = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     assert_eq!(schema.shape_count(), 3);
 }
@@ -245,7 +287,11 @@ fn reject_sparql() {
     );
 
     let error = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -267,7 +313,11 @@ fn reject_custom_constraints() {
     );
 
     let error = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -285,7 +335,11 @@ fn reject_pathless_shape() {
     insert(&node, &graph, &[(&shape, RDF_TYPE, &property_shape)]);
 
     let error = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -311,7 +365,11 @@ fn reject_multiple_paths() {
     );
 
     let error = node
-        .compile_shacl(&graph, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -355,6 +413,7 @@ fn local_import_completes_shape() {
 
     let schema = node
         .compile_shacl(
+            &craqle::AllowAllAuthorizer,
             &root,
             &ShaclCompileOptions {
                 allow_local_imports: true,
@@ -385,7 +444,11 @@ fn local_import_cache() {
     );
 
     let disabled = node
-        .compile_shacl(&root, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &root,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(
         disabled,
@@ -396,16 +459,116 @@ fn local_import_cache() {
         allow_local_imports: true,
         ..ShaclCompileOptions::default()
     };
-    let compiled = node.compile_shacl(&root, &options).unwrap();
+    let compiled = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
     assert_eq!(compiled.shape_count(), 1);
     assert_eq!(compiled.statistics().shape_graphs, 2);
 
     let second_shape = iri("urn:test:second-imported-shape");
     insert(&node, &imported, &[(&second_shape, RDF_TYPE, &node_shape)]);
-    let changed = node.compile_shacl(&root, &options).unwrap();
+    let changed = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
     assert!(!changed.statistics().cache_hit);
     assert_eq!(changed.shape_count(), 2);
     assert_ne!(compiled.schema_hash(), changed.schema_hash());
+}
+
+#[test]
+fn import_topology_fence() {
+    let (_database, node) = node();
+    let root = GraphId::new("urn:test:shacl:topology-root");
+    let imported = GraphId::new("urn:test:shacl:topology-imported");
+    let replacement = GraphId::new("urn:test:shacl:topology-replacement");
+    let data = GraphId::new("urn:test:shacl:topology-data");
+    let owl_imports = iri("http://www.w3.org/2002/07/owl#imports");
+    let ontology = iri("urn:test:topology-ontology");
+    let shape = iri("urn:test:topology-shape");
+    let node_shape = sh("NodeShape");
+
+    insert(&node, &imported, &[(&shape, RDF_TYPE, &node_shape)]);
+    insert(
+        &node,
+        &root,
+        &[(&ontology, &owl_imports, &iri(imported.as_str()))],
+    );
+    insert(
+        &node,
+        &data,
+        &[(
+            &iri("urn:test:topology-focus"),
+            RDF_TYPE,
+            &iri("urn:test:topology-type"),
+        )],
+    );
+
+    let options = ShaclCompileOptions {
+        allow_local_imports: true,
+        ..ShaclCompileOptions::default()
+    };
+    let compiled = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
+    assert_eq!(compiled.statistics().shape_graphs, 2);
+    assert!(!compiled.statistics().cache_hit);
+    let cached = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
+    assert!(cached.statistics().cache_hit);
+    assert_eq!(compiled.plan_fingerprint(), cached.plan_fingerprint());
+
+    node.delete_graph_unchecked(&imported).unwrap();
+    assert!(!node.contains_graph(&imported).unwrap());
+
+    let missing = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        CraqleError::Shacl(ShaclError::ImportNotLocal { import, .. })
+            if import == imported.as_str()
+    ));
+    let stale = node
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &compiled,
+            &craqle::ShaclValidationOptions::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        CraqleError::Shacl(ShaclError::SchemaChangedDuringValidation { .. })
+    ));
+
+    insert(&node, &replacement, &[(&shape, RDF_TYPE, &node_shape)]);
+    remove(
+        &node,
+        &root,
+        &ontology,
+        &owl_imports,
+        &iri(imported.as_str()),
+    );
+    insert(
+        &node,
+        &root,
+        &[(&ontology, &owl_imports, &iri(replacement.as_str()))],
+    );
+    let recreated = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
+    assert!(!recreated.statistics().cache_hit);
+    assert_eq!(recreated.statistics().shape_graphs, 2);
+    assert_ne!(compiled.plan_fingerprint(), recreated.plan_fingerprint());
+    let recreated_cached = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
+    assert!(recreated_cached.statistics().cache_hit);
+    assert_eq!(
+        recreated.plan_fingerprint(),
+        recreated_cached.plan_fingerprint()
+    );
 }
 
 #[test]
@@ -439,7 +602,9 @@ fn imported_nodes_local() {
         ..ShaclCompileOptions::default()
     };
 
-    let schema = node.compile_shacl(&root, &options).unwrap();
+    let schema = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &root, &options)
+        .unwrap();
     assert_eq!(schema.shape_count(), 2);
     assert_eq!(schema.statistics().shape_graphs, 3);
 }
@@ -465,7 +630,9 @@ fn reject_import_cycle() {
         ..ShaclCompileOptions::default()
     };
 
-    let error = node.compile_shacl(&first, &options).unwrap_err();
+    let error = node
+        .compile_shacl(&craqle::AllowAllAuthorizer, &first, &options)
+        .unwrap_err();
     assert!(matches!(
         error,
         CraqleError::Shacl(ShaclError::ImportCycle { .. })

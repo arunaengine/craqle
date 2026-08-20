@@ -12,6 +12,17 @@ pub enum ShaclProfile {
     CraqleFastV1,
 }
 
+/// Execution path requested for a complete native SHACL validation.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ShaclExecutionMode {
+    #[default]
+    Auto,
+    ForceDelta,
+    ForceFull,
+}
+
 /// Policy applied to local writes for one data/shapes graph binding.
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
@@ -61,6 +72,7 @@ impl ShaclBindingOptions {
             max_results: self.max_results,
             max_path_edges: self.max_path_edges,
             max_path_depth: self.max_path_depth,
+            execution_mode: ShaclExecutionMode::Auto,
         }
     }
 }
@@ -121,6 +133,7 @@ pub struct ShaclValidationOptions {
     pub max_results: usize,
     pub max_path_edges: u64,
     pub max_path_depth: usize,
+    pub execution_mode: ShaclExecutionMode,
 }
 
 impl Default for ShaclValidationOptions {
@@ -130,6 +143,7 @@ impl Default for ShaclValidationOptions {
             max_results: 10_000,
             max_path_edges: 1_000_000,
             max_path_depth: 128,
+            execution_mode: ShaclExecutionMode::Auto,
         }
     }
 }
@@ -137,6 +151,12 @@ impl Default for ShaclValidationOptions {
 /// Work performed by one native SHACL validation.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclValidationStatistics {
+    /// Concrete path that completed this validation.
+    pub selected_mode: ShaclExecutionMode,
+    pub estimated_delta_work: u64,
+    pub estimated_full_work: u64,
+    pub estimated_affected_shapes: u64,
+    pub estimated_focus_nodes: u64,
     pub shape_compile_cache_hit: bool,
     pub shapes_considered: u64,
     pub shapes_executed: u64,
@@ -289,6 +309,8 @@ pub enum ShaclError {
     CyclicShapeEvaluation { shape: String, focus: String },
     #[error("SHACL validation result limit {limit} was exceeded")]
     ResultLimitExceeded { limit: usize },
+    #[error("SHACL delta validation cannot run: {reason}")]
+    DeltaExecutionUnavailable { reason: String },
     #[error("invalid sh:pattern `{pattern}` with flags `{flags}` on shape `{shape}`: {message}")]
     InvalidPattern {
         shape: String,

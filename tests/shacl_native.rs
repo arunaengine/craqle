@@ -229,10 +229,19 @@ fn native_matches_rudof(shape_text: &str, data_text: &str) {
     insert_ntriples(&node, &shapes, shape_text);
     insert_ntriples(&node, &data, data_text);
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let native = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     let rudof = rudof_validate(shape_text, data_text);
     assert_eq!(native.conforms, rudof.conforms());
@@ -285,10 +294,19 @@ fn native_bounded_reads() {
     );
 
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let report = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     assert!(!report.conforms);
     assert_eq!(report.results.len(), 2);
@@ -307,7 +325,12 @@ fn native_bounded_reads() {
 
     assert!(
         !node
-            .conforms_shacl(&data, &schema, &ShaclValidationOptions::default())
+            .conforms_shacl(
+                &craqle::AllowAllAuthorizer,
+                &data,
+                &schema,
+                &ShaclValidationOptions::default()
+            )
             .unwrap()
     );
 }
@@ -354,13 +377,27 @@ fn native_value_results() {
     );
 
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let first = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     let second = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     assert_eq!(first.results, second.results);
     assert_eq!(first.results.len(), 5);
@@ -413,15 +450,25 @@ fn native_path_budgets() {
     );
 
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     assert!(
-        node.conforms_shacl(&data, &schema, &ShaclValidationOptions::default())
-            .unwrap()
+        node.conforms_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default()
+        )
+        .unwrap()
     );
 
     let error = node
         .validate_shacl(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &ShaclValidationOptions {
@@ -437,6 +484,7 @@ fn native_path_budgets() {
 
     let error = node
         .validate_shacl(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &ShaclValidationOptions {
@@ -483,11 +531,16 @@ fn native_validation_limits() {
         &[(&focus, &iri("urn:test:present"), &literal("value"))],
     );
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
 
     let error = node
         .validate_shacl(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &ShaclValidationOptions {
@@ -505,6 +558,7 @@ fn native_validation_limits() {
     cancellation.cancel();
     let error = node
         .validate_shacl(
+            &craqle::AllowAllAuthorizer,
             &data,
             &schema,
             &ShaclValidationOptions {
@@ -572,10 +626,19 @@ fn native_target_violations() {
     );
 
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let report = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     let focus_nodes = report
         .results
@@ -627,10 +690,19 @@ fn native_target_violations() {
         ],
     );
     let schema = node
-        .compile_shacl(&closed_shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &closed_shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let report = node
-        .validate_shacl(&closed_data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &closed_data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     assert_eq!(report.results.len(), 1);
     assert_eq!(
@@ -677,10 +749,19 @@ fn native_report_matches() {
     );
     insert(&node, &data, &[(&focus, &predicate, &literal("only one"))]);
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let native = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
 
     let shape_text = format!(
@@ -1210,7 +1291,11 @@ fn reject_logical_cycles() {
         ],
     );
     let error = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -1333,10 +1418,19 @@ fn bounded_max_count() {
     node.apply_changes_unchecked(&data, changes).unwrap();
 
     let schema = node
-        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &shapes,
+            &ShaclCompileOptions::default(),
+        )
         .unwrap();
     let report = node
-        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .validate_shacl(
+            &craqle::AllowAllAuthorizer,
+            &data,
+            &schema,
+            &ShaclValidationOptions::default(),
+        )
         .unwrap();
     assert!(!report.conforms);
     assert_eq!(report.statistics.path_candidate_quads, 2);

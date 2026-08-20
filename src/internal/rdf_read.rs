@@ -225,6 +225,54 @@ impl<'store> StoreReadView<'store> {
     pub(crate) fn graph_term_id_iter(&self) -> impl Iterator<Item = Result<TermId>> + '_ {
         self.snapshot.graph_term_id_iter(self.store)
     }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn qv_g_count(
+        &self,
+        context: &ReadContext<'_>,
+        graph: TermId,
+    ) -> Result<Option<u64>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot.qv_g_count(self.store, graph)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn qv_gp_count(
+        &self,
+        context: &ReadContext<'_>,
+        graph: TermId,
+        predicate: TermId,
+    ) -> Result<Option<u64>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot.qv_gp_count(self.store, graph, predicate)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn qv_gpo_count(
+        &self,
+        context: &ReadContext<'_>,
+        graph: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<Option<u64>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot
+            .qv_gpo_count(self.store, graph, predicate, object)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn qv_ready(&self, context: &ReadContext<'_>) -> Result<bool> {
+        Ok(self.qv_admission(context)?.trusted)
+    }
 }
 
 impl RdfReadView for StoreReadView<'_> {

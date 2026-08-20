@@ -94,15 +94,21 @@ fn remote_violation_converges() {
         validation_options: ShaclBindingOptions::default(),
     };
     assert_eq!(
-        net.peer(0).bind_shacl(&enforce).unwrap().state,
+        net.peer(0)
+            .bind_shacl(&craqle::AllowAllAuthorizer, &enforce)
+            .unwrap()
+            .state,
         ShaclValidationState::Valid
     );
     assert_eq!(
         net.peer(1)
-            .bind_shacl(&ShaclBinding {
-                policy: ValidationPolicy::Advisory,
-                ..enforce.clone()
-            })
+            .bind_shacl(
+                &craqle::AllowAllAuthorizer,
+                &ShaclBinding {
+                    policy: ValidationPolicy::Advisory,
+                    ..enforce.clone()
+                }
+            )
             .unwrap()
             .state,
         ShaclValidationState::Valid
@@ -129,8 +135,14 @@ fn remote_violation_converges() {
         net.peer(0).graph_snapshot(&data).unwrap(),
         net.peer(1).graph_snapshot(&data).unwrap()
     );
-    let left = net.peer(0).shacl_binding_statuses(&data).unwrap();
-    let right = net.peer(1).shacl_binding_statuses(&data).unwrap();
+    let left = net
+        .peer(0)
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
+    let right = net
+        .peer(1)
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(right.len(), 1);
     assert_eq!(left[0].binding.policy, ValidationPolicy::Enforce);
@@ -223,8 +235,12 @@ fn remove_keeps_dot() {
         policy: ValidationPolicy::Advisory,
         validation_options: ShaclBindingOptions::default(),
     };
-    net.peer(0).bind_shacl(&binding).unwrap();
-    net.peer(1).bind_shacl(&binding).unwrap();
+    net.peer(0)
+        .bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+        .unwrap();
+    net.peer(1)
+        .bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+        .unwrap();
 
     net.partition(0, 1);
     net.peer(0)
@@ -266,8 +282,14 @@ fn remove_keeps_dot() {
         .unwrap();
     assert_eq!(quad.dots.len(), 1);
 
-    let left = net.peer(0).shacl_binding_statuses(&data).unwrap();
-    let right = net.peer(1).shacl_binding_statuses(&data).unwrap();
+    let left = net
+        .peer(0)
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
+    let right = net
+        .peer(1)
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(right.len(), 1);
     assert_eq!(left[0].state, ShaclValidationState::Valid);
@@ -279,4 +301,127 @@ fn remove_keeps_dot() {
     assert!(left_report.conforms);
     assert!(right_report.conforms);
     assert_eq!(left_report.results, right_report.results);
+}
+
+#[test]
+fn import_change_settles() {
+    let (_directory, net) = setup_network(2);
+    let data = GraphId::new("urn:test:import-settles-data");
+    let shapes = GraphId::new("urn:test:import-settles-shapes");
+    let imported = GraphId::new("urn:test:import-settles-imported");
+    let add = |graph: &GraphId, subject: &str, predicate: &str, object: &str| {
+        MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: EncodedTerm(subject.to_string()),
+            predicate: EncodedTerm(predicate.to_string()),
+            object: EncodedTerm(object.to_string()),
+        }
+    };
+
+    net.peer(0)
+        .apply_changes_unchecked(
+            &shapes,
+            vec![add(
+                &shapes,
+                "<urn:test:import-settles-ontology>",
+                "<http://www.w3.org/2002/07/owl#imports>",
+                &format!("<{}>", imported.as_str()),
+            )],
+        )
+        .unwrap();
+    net.peer(0)
+        .apply_changes_unchecked(
+            &imported,
+            vec![
+                add(
+                    &imported,
+                    "<urn:test:import-settles-shape>",
+                    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+                    "<http://www.w3.org/ns/shacl#NodeShape>",
+                ),
+                add(
+                    &imported,
+                    "<urn:test:import-settles-shape>",
+                    "<http://www.w3.org/ns/shacl#targetNode>",
+                    "<urn:test:import-settles-focus>",
+                ),
+                add(
+                    &imported,
+                    "<urn:test:import-settles-shape>",
+                    "<http://www.w3.org/ns/shacl#property>",
+                    "<urn:test:import-settles-property>",
+                ),
+                add(
+                    &imported,
+                    "<urn:test:import-settles-property>",
+                    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+                    "<http://www.w3.org/ns/shacl#PropertyShape>",
+                ),
+                add(
+                    &imported,
+                    "<urn:test:import-settles-property>",
+                    "<http://www.w3.org/ns/shacl#path>",
+                    "<urn:test:import-settles-value>",
+                ),
+                add(
+                    &imported,
+                    "<urn:test:import-settles-property>",
+                    "<http://www.w3.org/ns/shacl#minCount>",
+                    "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+                ),
+            ],
+        )
+        .unwrap();
+    net.peer(0)
+        .apply_changes_unchecked(
+            &data,
+            vec![add(
+                &data,
+                "<urn:test:import-settles-focus>",
+                "<urn:test:import-settles-value>",
+                "<urn:test:import-settles-object>",
+            )],
+        )
+        .unwrap();
+    net.sync_until_converged(10).unwrap();
+
+    let binding = ShaclBinding {
+        data_graph: data.clone(),
+        shapes_graph: shapes.clone(),
+        policy: ValidationPolicy::Advisory,
+        validation_options: ShaclBindingOptions {
+            allow_local_imports: true,
+            ..ShaclBindingOptions::default()
+        },
+    };
+    assert_eq!(
+        net.peer(1)
+            .bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+            .unwrap()
+            .state,
+        ShaclValidationState::Valid
+    );
+
+    net.peer(0)
+        .apply_changes_unchecked(
+            &imported,
+            vec![add(
+                &imported,
+                "<urn:test:import-settles-property>",
+                "<http://www.w3.org/ns/shacl#maxCount>",
+                "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            )],
+        )
+        .unwrap();
+    net.sync_until_converged(10).unwrap();
+
+    let status = net
+        .peer(1)
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(status.state, ShaclValidationState::Invalid);
+    assert!(status.error.is_none());
+    assert!(!status.report.unwrap().conforms);
 }

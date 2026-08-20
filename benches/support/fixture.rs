@@ -505,8 +505,7 @@ impl Fixture {
 
     pub fn print_hot_work(&self) {
         for index in 0..self.hot_path_count() {
-            let (results, statistics) =
-                self.run_hot_mode(index, QueryReadMode::Auto);
+            let (results, statistics) = self.run_hot_mode(index, QueryReadMode::Auto);
             println!(
                 "sparql_hot_path work: case={} mode=Auto access_path={:?} qv_trusted={} \
                  fallback_reason={} source_keys={} source_bytes={} qv_keys={} qv_bytes={} \

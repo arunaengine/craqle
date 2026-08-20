@@ -63,7 +63,7 @@ fn del(
 }
 
 #[test]
-fn imports_mark_pending() {
+fn imports_settle_invalid() {
     let (_directory, node) = node();
     let data = GraphId::new("urn:test:binding-data");
     let root = GraphId::new("urn:test:binding-root");
@@ -119,7 +119,9 @@ fn imports_mark_pending() {
         },
     };
     assert_eq!(
-        node.bind_shacl(&binding).unwrap().state,
+        node.bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+            .unwrap()
+            .state,
         ShaclValidationState::Valid
     );
 
@@ -135,9 +137,11 @@ fn imports_mark_pending() {
     )
     .unwrap();
 
-    let statuses = node.shacl_binding_statuses(&data).unwrap();
+    let statuses = node
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
     assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].state, ShaclValidationState::Pending);
+    assert_eq!(statuses[0].state, ShaclValidationState::Invalid);
 
     node.apply_changes(
         &data,
@@ -149,7 +153,9 @@ fn imports_mark_pending() {
         )],
     )
     .unwrap();
-    let statuses = node.shacl_binding_statuses(&data).unwrap();
+    let statuses = node
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].state, ShaclValidationState::Invalid);
     assert_eq!(statuses[0].report.as_ref().unwrap().results.len(), 1);
@@ -208,12 +214,16 @@ fn deleted_shapes_block() {
             },
         };
         assert_eq!(
-            node.bind_shacl(&binding).unwrap().state,
+            node.bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+                .unwrap()
+                .state,
             ShaclValidationState::Valid
         );
 
         node.delete_graph_unchecked(shapes).unwrap();
-        let statuses = node.shacl_binding_statuses(&data).unwrap();
+        let statuses = node
+            .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+            .unwrap();
         assert_eq!(statuses.len(), 1);
         assert!(matches!(
             statuses[0].state,
@@ -232,7 +242,9 @@ fn deleted_shapes_block() {
             )
             .is_err()
         );
-        let statuses = node.shacl_binding_statuses(&data).unwrap();
+        let statuses = node
+            .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+            .unwrap();
         assert_eq!(statuses.len(), 1);
         assert!(matches!(
             statuses[0].state,
@@ -242,7 +254,7 @@ fn deleted_shapes_block() {
 }
 
 #[test]
-fn import_data_pending() {
+fn import_data_settles() {
     let (_directory, node) = node();
     let data = GraphId::new("urn:test:import-data");
     let root = GraphId::new("urn:test:import-root");
@@ -296,7 +308,9 @@ fn import_data_pending() {
         },
     };
     assert_eq!(
-        node.bind_shacl(&binding).unwrap().state,
+        node.bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+            .unwrap()
+            .state,
         ShaclValidationState::Valid
     );
 
@@ -310,9 +324,11 @@ fn import_data_pending() {
         )],
     )
     .unwrap();
-    let statuses = node.shacl_binding_statuses(&data).unwrap();
+    let statuses = node
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
     assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].state, ShaclValidationState::Pending);
+    assert_eq!(statuses[0].state, ShaclValidationState::Valid);
 
     assert!(
         node.apply_changes(
@@ -326,8 +342,124 @@ fn import_data_pending() {
         )
         .is_err()
     );
-    let statuses = node.shacl_binding_statuses(&data).unwrap();
+    let statuses = node
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
     assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].state, ShaclValidationState::Pending);
-    assert!(statuses[0].report.is_none());
+    assert_eq!(statuses[0].state, ShaclValidationState::Valid);
+    assert!(statuses[0].report.is_some());
+}
+
+#[test]
+fn data_binding_cleanup() {
+    let (directory, node) = node();
+    let data = GraphId::new("urn:test:delete-binding-data");
+    let root = GraphId::new("urn:test:delete-binding-root");
+    let imported = GraphId::new("urn:test:delete-binding-import");
+    let focus = "urn:test:delete-binding-focus";
+    let value = "urn:test:delete-binding-value";
+    let shape = "urn:test:delete-binding-shape";
+    let property = "urn:test:delete-binding-property";
+
+    node.apply_changes_unchecked(
+        &root,
+        vec![add(
+            &root,
+            "urn:test:delete-binding-ontology",
+            OWL_IMPORTS,
+            iri(imported.as_str()),
+        )],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &imported,
+        vec![
+            add(&imported, shape, RDF_TYPE, iri(SH_NODE)),
+            add(&imported, shape, SH_TARGET, iri(focus)),
+            add(&imported, shape, SH_PROPERTY, iri(property)),
+            add(&imported, property, RDF_TYPE, iri(SH_PROP)),
+            add(&imported, property, SH_PATH, iri(value)),
+            add(&imported, property, SH_MAX, int(0)),
+        ],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &data,
+        vec![add(
+            &data,
+            focus,
+            value,
+            iri("urn:test:delete-binding-value"),
+        )],
+    )
+    .unwrap();
+    let binding = ShaclBinding {
+        data_graph: data.clone(),
+        shapes_graph: root.clone(),
+        policy: ValidationPolicy::Advisory,
+        validation_options: ShaclBindingOptions {
+            allow_local_imports: true,
+            ..ShaclBindingOptions::default()
+        },
+    };
+    let old = node
+        .bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+        .unwrap();
+    assert_eq!(old.state, ShaclValidationState::Invalid);
+    assert!(old.report.as_ref().is_some_and(|report| !report.conforms));
+
+    node.delete_graph_unchecked(&data).unwrap();
+    assert!(!node.contains_graph(&data).unwrap());
+    drop(node);
+
+    let node = CraqleNode::open_with_options(
+        directory.path(),
+        CraqleOptions::new().with_actor(ActorId::from_bytes([0x75; 32])),
+    )
+    .unwrap();
+    // Each dependency write would find a dangling reverse record if deletion
+    // had left one behind. Reopening also proves the deleted queue cannot replay.
+    node.apply_changes_unchecked(
+        &root,
+        vec![add(
+            &root,
+            "urn:test:delete-binding-root-note",
+            "urn:test:delete-binding-note",
+            iri("urn:test:delete-binding-root-value"),
+        )],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &imported,
+        vec![add(
+            &imported,
+            "urn:test:delete-binding-import-note",
+            "urn:test:delete-binding-note",
+            iri("urn:test:delete-binding-import-value"),
+        )],
+    )
+    .unwrap();
+
+    node.apply_changes_unchecked(
+        &data,
+        vec![add(
+            &data,
+            "urn:test:delete-binding-recreated",
+            "urn:test:delete-binding-note",
+            iri("urn:test:delete-binding-recreated-value"),
+        )],
+    )
+    .unwrap();
+    assert!(node.contains_graph(&data).unwrap());
+    assert!(
+        node.shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+            .unwrap()
+            .is_empty()
+    );
+
+    let fresh = node
+        .bind_shacl(&craqle::AllowAllAuthorizer, &binding)
+        .unwrap();
+    assert_eq!(fresh.state, ShaclValidationState::Valid);
+    assert!(fresh.report.as_ref().is_some_and(|report| report.conforms));
 }

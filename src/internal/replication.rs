@@ -91,6 +91,9 @@ pub(crate) struct ReplicationEngine {
     /// so concurrent tests cannot arm each other's nodes.
     #[cfg(test)]
     armed_apply_failure: std::sync::atomic::AtomicBool,
+    /// Test-only failure after the source commit and before SHACL settlement.
+    #[cfg(all(test, feature = "shacl-core"))]
+    armed_settle_failure: std::sync::atomic::AtomicBool,
 }
 
 /// How a write should leave the graph's persisted diagnostics record.
@@ -132,6 +135,7 @@ struct ShaclEvaluation {
     shapes_version: [u8; 32],
     schema_fingerprint: [u8; 32],
     shape_versions: Vec<(GraphId, [u8; 32])>,
+    refresh_dependencies: bool,
 }
 
 #[cfg(feature = "shacl-core")]
@@ -177,6 +181,8 @@ impl ReplicationEngine {
                 sync,
                 #[cfg(test)]
                 armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(all(test, feature = "shacl-core"))]
+                armed_settle_failure: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -208,6 +214,8 @@ impl ReplicationEngine {
             shacl,
             #[cfg(test)]
             armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            armed_settle_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -226,6 +234,19 @@ impl ReplicationEngine {
     #[cfg(test)]
     pub(crate) fn take_apply_failure(&self) -> bool {
         self.armed_apply_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make the next SHACL settlement fail after the source commit. Test-only.
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn arm_settle_failure(&self) {
+        self.armed_settle_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(test, feature = "shacl-core"))]
+    fn take_settle_failure(&self) -> bool {
+        self.armed_settle_failure
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -444,8 +465,7 @@ impl ReplicationEngine {
             }
             let shapes_version = self
                 .store
-                .graph_version_digest(&status.binding.shapes_graph)
-                .unwrap_or([0; 32]);
+                .graph_version_digest(&status.binding.shapes_graph)?;
             let evaluated = self.evaluate_binding(status, data_version, shapes_version, changes);
             match evaluated {
                 Ok((binding, schema, report)) => {
@@ -462,6 +482,7 @@ impl ReplicationEngine {
                         shapes_version,
                         schema_fingerprint,
                         shape_versions,
+                        refresh_dependencies: false,
                     });
                 }
                 Err(error) => return Err(map_update_error(error)),
@@ -507,10 +528,7 @@ impl ReplicationEngine {
             let previous_versions = status.shape_versions.clone();
             let binding = status.binding.clone();
             let shapes_graph = binding.shapes_graph.to_string();
-            let shapes_version = self
-                .store
-                .graph_version_digest(&binding.shapes_graph)
-                .unwrap_or([0; 32]);
+            let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
             let result = self
                 .shacl
                 .compile(
@@ -551,6 +569,7 @@ impl ReplicationEngine {
                         shapes_version,
                         schema_fingerprint,
                         shape_versions,
+                        refresh_dependencies: false,
                     });
                 }
                 Ok(_) => evaluations.push(ShaclEvaluation {
@@ -564,17 +583,27 @@ impl ReplicationEngine {
                     shapes_version,
                     schema_fingerprint: previous_schema,
                     shape_versions: previous_versions.clone(),
+                    refresh_dependencies: false,
                 }),
                 Err(crate::CraqleError::Store(error)) => return Err(error),
-                Err(error) => evaluations.push(ShaclEvaluation {
-                    binding,
-                    schema: None,
-                    result: Err(error.to_string()),
-                    data_version: Some(data_version),
-                    shapes_version,
-                    schema_fingerprint: previous_schema,
-                    shape_versions: previous_versions,
-                }),
+                Err(error) => {
+                    let refresh_dependencies = stable_error(&error);
+                    let shape_versions = if refresh_dependencies {
+                        self.error_versions(&binding, &previous_versions)?
+                    } else {
+                        previous_versions
+                    };
+                    evaluations.push(ShaclEvaluation {
+                        binding,
+                        schema: None,
+                        result: Err(error.to_string()),
+                        data_version: Some(data_version),
+                        shapes_version,
+                        schema_fingerprint: previous_schema,
+                        shape_versions,
+                        refresh_dependencies,
+                    });
+                }
             }
         }
         Ok(evaluations)
@@ -602,10 +631,7 @@ impl ReplicationEngine {
             if binding.policy == crate::ValidationPolicy::Disabled {
                 continue;
             }
-            let shapes_version = self
-                .store
-                .graph_version_digest(&binding.shapes_graph)
-                .unwrap_or([0; 32]);
+            let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
             let result = self
                 .shacl
                 .compile(
@@ -639,6 +665,7 @@ impl ReplicationEngine {
                         shapes_version,
                         schema_fingerprint,
                         shape_versions,
+                        refresh_dependencies: false,
                     });
                 }
                 Ok(_) => evaluations.push(ShaclEvaluation {
@@ -652,19 +679,76 @@ impl ReplicationEngine {
                     shapes_version,
                     schema_fingerprint: previous_schema,
                     shape_versions: previous_versions.clone(),
+                    refresh_dependencies: false,
                 }),
-                Err(error) => evaluations.push(ShaclEvaluation {
-                    binding,
-                    schema: None,
-                    result: Err(error.to_string()),
-                    data_version,
-                    shapes_version,
-                    schema_fingerprint: previous_schema,
-                    shape_versions: previous_versions,
-                }),
+                Err(crate::CraqleError::Store(error)) => return Err(error),
+                Err(error) => {
+                    let refresh_dependencies = stable_error(&error);
+                    let shape_versions = if refresh_dependencies {
+                        self.error_versions(&binding, &previous_versions)?
+                    } else {
+                        previous_versions
+                    };
+                    evaluations.push(ShaclEvaluation {
+                        binding,
+                        schema: None,
+                        result: Err(error.to_string()),
+                        data_version,
+                        shapes_version,
+                        schema_fingerprint: previous_schema,
+                        shape_versions,
+                        refresh_dependencies,
+                    });
+                }
             }
         }
         Ok(evaluations)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn error_versions(
+        &self,
+        binding: &crate::ShaclBinding,
+        previous: &[(GraphId, [u8; 32])],
+    ) -> crate::store::Result<Vec<(GraphId, [u8; 32])>> {
+        let imports = EncodedTerm("<http://www.w3.org/2002/07/owl#imports>".to_owned());
+        let mut graphs: Vec<GraphId> = previous.iter().map(|(graph, _)| graph.clone()).collect();
+        if !graphs.iter().any(|graph| graph == &binding.shapes_graph) {
+            graphs.push(binding.shapes_graph.clone());
+        }
+        let mut next = vec![binding.shapes_graph.clone()];
+        let mut visited = Vec::new();
+        while let Some(graph) = next.pop() {
+            if visited.iter().any(|known| known == &graph) {
+                continue;
+            }
+            visited.push(graph.clone());
+            if !self.store.contains_graph(&graph)? {
+                continue;
+            }
+            for quad in self.store.graph_snapshot(&graph)?.quads {
+                if quad.predicate != imports {
+                    continue;
+                }
+                let Some(import) = quad.object.to_named_node().map(GraphId) else {
+                    continue;
+                };
+                if !graphs.iter().any(|known| known == &import) {
+                    graphs.push(import.clone());
+                }
+                next.push(import);
+            }
+        }
+        let mut versions = graphs
+            .into_iter()
+            .map(|graph| {
+                self.store
+                    .graph_version_digest(&graph)
+                    .map(|version| (graph, version))
+            })
+            .collect::<crate::store::Result<Vec<_>>>()?;
+        versions.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        Ok(versions)
     }
 
     #[cfg(feature = "shacl-core")]
@@ -740,24 +824,51 @@ impl ReplicationEngine {
         graph: &GraphId,
         evaluations: Vec<ShaclEvaluation>,
     ) -> crate::store::Result<()> {
-        if evaluations.is_empty() {
-            return Ok(());
-        }
         let _binding_guard = self.store.binding_guard();
         let data_version = self.store.graph_version_digest(graph)?;
-        let current = self.store.shacl_binding_statuses(graph)?;
+        let mut current = self.store.shacl_binding_statuses(graph)?;
         let mut batch = self.store.new_batch();
         for evaluation in evaluations {
-            if !current
-                .iter()
-                .any(|status| status.binding == evaluation.binding)
+            let Some(existing) = current
+                .iter_mut()
+                .find(|status| status.binding == evaluation.binding)
+            else {
+                continue;
+            };
+            let shapes_version = self
+                .store
+                .graph_version_digest(&evaluation.binding.shapes_graph)?;
+            // Pending is staged before its source mutation releases the binding guard.
+            // An older evaluation must not overwrite its versions or report.
+            let versions_current = self
+                .shacl
+                .versions_are_current(&evaluation.shape_versions)
+                .map_err(map_store_error)?;
+            if existing.state != crate::ShaclValidationState::Pending
+                || evaluation.data_version != Some(data_version)
+                || shapes_version != evaluation.shapes_version
             {
                 continue;
             }
-            let shapes_version = self
-                .store
-                .graph_version_digest(&evaluation.binding.shapes_graph)
-                .unwrap_or([0; 32]);
+            if !versions_current {
+                if evaluation.refresh_dependencies {
+                    let shape_versions =
+                        self.error_versions(&evaluation.binding, &existing.shape_versions)?;
+                    let status = crate::ShaclBindingStatus {
+                        binding: evaluation.binding.clone(),
+                        state: crate::ShaclValidationState::Pending,
+                        report: None,
+                        error: None,
+                        data_version,
+                        shapes_version,
+                        schema_fingerprint: existing.schema_fingerprint,
+                        shape_versions,
+                    };
+                    *existing = status.clone();
+                    self.store.stage_binding_pending(&mut batch, &status)?;
+                }
+                continue;
+            }
             let mut status = crate::ShaclBindingStatus {
                 binding: evaluation.binding.clone(),
                 state: crate::ShaclValidationState::Pending,
@@ -768,41 +879,37 @@ impl ReplicationEngine {
                 schema_fingerprint: evaluation.schema_fingerprint,
                 shape_versions: evaluation.shape_versions,
             };
-            if evaluation.data_version == Some(data_version)
-                && shapes_version == evaluation.shapes_version
-            {
-                match evaluation.result {
-                    Ok(report)
-                        if self
-                            .shacl
-                            .versions_are_current(&status.shape_versions)
-                            .unwrap_or(false) =>
-                    {
-                        status.state = if report.conforms {
-                            crate::ShaclValidationState::Valid
-                        } else {
-                            crate::ShaclValidationState::Invalid
-                        };
-                        if let Some(schema) = &evaluation.schema {
-                            let options =
-                                evaluation.binding.validation_options.validation_options();
-                            let _ = self.shacl.cache_current_report(
-                                graph,
-                                schema,
-                                &options,
-                                report.clone(),
-                            );
-                        }
-                        status.report = Some(report);
+            match evaluation.result {
+                Ok(report) => {
+                    status.state = if report.conforms {
+                        crate::ShaclValidationState::Valid
+                    } else {
+                        crate::ShaclValidationState::Invalid
+                    };
+                    if let Some(schema) = &evaluation.schema {
+                        let options = evaluation.binding.validation_options.validation_options();
+                        let _ = self.shacl.cache_current_report(
+                            graph,
+                            schema,
+                            &options,
+                            report.clone(),
+                        );
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        status.state = crate::ShaclValidationState::Failed;
-                        status.error = Some(error);
-                    }
+                    status.report = Some(report);
+                }
+                Err(error) => {
+                    status.state = crate::ShaclValidationState::Failed;
+                    status.error = Some(error);
                 }
             }
+            *existing = status.clone();
             self.store.stage_binding_status(&mut batch, &status)?;
+        }
+        if !current.iter().any(|status| {
+            status.binding.policy != crate::ValidationPolicy::Disabled
+                && status.state == crate::ShaclValidationState::Pending
+        }) {
+            self.store.stage_shacl_settled(&mut batch, graph)?;
         }
         self.store.commit(batch)
     }
@@ -811,6 +918,26 @@ impl ReplicationEngine {
     fn settle_current(&self, graph: &GraphId) -> crate::store::Result<()> {
         let evaluations = self.evaluate_current_bindings(graph)?;
         self.persist_shacl_evaluations(graph, evaluations)
+    }
+
+    /// Re-run data graphs queued with invalidating source mutations.
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn replay_pending_bindings(&self) -> crate::store::Result<()> {
+        self.settle_shacl_graphs(&self.store.pending_shacl_graphs()?)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn settle_shacl_graphs(&self, graphs: &[GraphId]) -> crate::store::Result<()> {
+        #[cfg(test)]
+        if self.take_settle_failure() {
+            return Err(crate::store::StoreError::Fjall(fjall::Error::Io(
+                std::io::Error::other("injected settlement failure"),
+            )));
+        }
+        for graph in graphs {
+            self.settle_current(graph)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "shacl-core")]
@@ -882,19 +1009,16 @@ impl ReplicationEngine {
                 return self.empty_batch(graph);
             }
 
-            // Topic binding may take the graph commit guard itself, so finish
-            // that idempotent step before acquiring the commit guard.
-            sync.ensure_graph_topic(&self.store, graph)?;
-
             // Validation and publication are serialized with every local CRDT
-            // mutation of this graph. Topic binding is already complete, so the
-            // publish path cannot re-enter this non-reentrant guard.
+            // mutation of this graph.
             let _commit_guard = self.store.graph_commit_guard(graph);
             #[cfg(feature = "shacl-core")]
             let binding_guard = self.store.binding_guard();
             if validate_rules {
                 self.validate(graph, &changes)?;
             }
+            #[cfg(feature = "shacl-core")]
+            let pending_graphs = self.store.affected_shacl_graphs(graph)?;
             #[cfg(feature = "shacl-core")]
             let advisory_work = {
                 let work = self.binding_work(graph, &[crate::ValidationPolicy::Advisory])?;
@@ -908,6 +1032,8 @@ impl ReplicationEngine {
             } else {
                 Vec::new()
             };
+
+            sync.ensure_topic_guarded(&self.store, graph)?;
 
             // Publish-first (G4): no source state changes until the event is
             // durable in the topic. A failed publish therefore leaves the
@@ -937,16 +1063,10 @@ impl ReplicationEngine {
                     {
                         let _ = self.settle_bindings(graph, &changes, data_version, work);
                     }
+                    let _ = self.settle_shacl_graphs(&pending_graphs);
                 }
             }
             return Ok(batch);
-        }
-
-        // `create_graph` is self-guarding, so the graph must exist *before* the
-        // commit guard is taken; the guard is not reentrant. (The sync branch
-        // leaves this to the apply, which does the same thing before its guard.)
-        if !self.store.contains_graph(graph)? {
-            self.store.create_graph(graph)?;
         }
 
         // Guards the whole read→write cycle of this graph's CRDT state: the
@@ -960,6 +1080,8 @@ impl ReplicationEngine {
         if validate_rules {
             self.validate(graph, &changes)?;
         }
+        #[cfg(feature = "shacl-core")]
+        let pending_graphs = self.store.affected_shacl_graphs(graph)?;
         #[cfg(feature = "shacl-core")]
         let advisory_work = {
             let work = self.binding_work(graph, &[crate::ValidationPolicy::Advisory])?;
@@ -986,9 +1108,7 @@ impl ReplicationEngine {
 
         let mut batch = self.store.new_batch();
         let mut vector_clock = self.store.get_vector_clock(graph)?;
-        let graph_id = self
-            .store
-            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
+        let graph_id = self.store.stage_graph(&mut batch, graph)?;
         let counter = self.store.next_counter(
             &mut batch,
             CounterKey {
@@ -1103,7 +1223,8 @@ impl ReplicationEngine {
             },
         )?;
         #[cfg(feature = "shacl-core")]
-        self.store.stage_pending_bindings(&mut batch, graph)?;
+        self.store
+            .stage_pending_bindings(&mut batch, graph, clock_digest(&vector_clock)?)?;
         self.store.commit(batch)?;
         #[cfg(feature = "shacl-core")]
         let data_version = self.stamp_evaluations(graph, &mut shacl_evaluations)?;
@@ -1120,6 +1241,7 @@ impl ReplicationEngine {
             if let (Some(work), Some(changes)) = (advisory_work, advisory_changes) {
                 let _ = self.settle_bindings(graph, &changes, data_version, work);
             }
+            let _ = self.settle_shacl_graphs(&pending_graphs);
         }
 
         Ok(Batch {
@@ -1187,9 +1309,10 @@ impl ReplicationEngine {
         // then advances, or a concurrent commit can make one batch apply twice
         // or the clock lose an entry (G1, G2).
         #[cfg(feature = "shacl-core")]
-        let (merged, binding_work, binding_changes, data_version) = {
+        let (merged, binding_work, binding_changes, data_version, pending_graphs) = {
             let _commit_guard = self.store.graph_commit_guard(graph);
             let _binding_guard = self.store.binding_guard();
+            let pending_graphs = self.store.affected_shacl_graphs(graph)?;
             let binding_work = {
                 let work = self.binding_work(
                     graph,
@@ -1209,7 +1332,13 @@ impl ReplicationEngine {
                 .applied
                 .then(|| self.store.graph_version_digest(graph))
                 .transpose()?;
-            (merged, binding_work, binding_changes, data_version)
+            (
+                merged,
+                binding_work,
+                binding_changes,
+                data_version,
+                pending_graphs,
+            )
         };
         #[cfg(not(feature = "shacl-core"))]
         let merged = {
@@ -1226,6 +1355,8 @@ impl ReplicationEngine {
         } else {
             self.settle_current(graph)?;
         }
+        #[cfg(feature = "shacl-core")]
+        self.settle_shacl_graphs(&pending_graphs)?;
         Ok(merged)
     }
 
@@ -1372,7 +1503,8 @@ impl ReplicationEngine {
             },
         )?;
         #[cfg(feature = "shacl-core")]
-        self.store.stage_pending_bindings(&mut batch, graph)?;
+        self.store
+            .stage_pending_bindings(&mut batch, graph, clock_digest(vector_clock)?)?;
         self.store.commit(batch)?;
         Ok(())
     }
@@ -1604,6 +1736,26 @@ fn map_store_error(error: crate::CraqleError) -> crate::store::StoreError {
 }
 
 #[cfg(feature = "shacl-core")]
+fn clock_digest(clock: &VectorClock) -> crate::store::Result<[u8; 32]> {
+    Ok(*blake3::hash(&postcard::to_allocvec(clock)?).as_bytes())
+}
+
+#[cfg(feature = "shacl-core")]
+fn stable_error(error: &crate::CraqleError) -> bool {
+    matches!(
+        error,
+        crate::CraqleError::Shacl(error)
+            if !matches!(
+                error,
+                crate::ShaclError::DataGraphNotFound { .. }
+                    | crate::ShaclError::SchemaChangedDuringValidation { .. }
+                    | crate::ShaclError::ShapesGraphNotFound { .. }
+                    | crate::ShaclError::ValidationCancelled
+            )
+    )
+}
+
+#[cfg(feature = "shacl-core")]
 fn map_update_error(error: crate::CraqleError) -> UpdateError {
     match error {
         crate::CraqleError::Store(error) => UpdateError::Store(error),
@@ -1616,5 +1768,969 @@ fn update_error_from_merge(error: MergeError) -> UpdateError {
     match error {
         MergeError::Store(error) => UpdateError::Store(error),
         MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
+    }
+}
+
+#[cfg(all(test, feature = "shacl-core"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::search::SearchIndex;
+    use crate::sync::{CraqleGraphSync, CraqleIrokleOptions, IrokleGraphSync};
+    use crate::{ShaclBinding, ShaclBindingOptions, ValidationPolicy};
+
+    fn engine_at(dir: &std::path::Path) -> (Arc<GraphStore>, ReplicationEngine) {
+        let store = Arc::new(GraphStore::open(dir).unwrap());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let sparql = Arc::new(SparqlEngine::new(store.clone(), search));
+        let engine = ReplicationEngine::new(store.clone(), sparql, ActorId::random());
+        (store, engine)
+    }
+
+    fn pending_engine(
+        dir: &std::path::Path,
+        policy: ValidationPolicy,
+    ) -> (Arc<GraphStore>, ReplicationEngine, GraphId, ShaclBinding) {
+        let (store, engine) = engine_at(dir);
+        let data = GraphId::new("urn:test:pending-data");
+        let shapes = GraphId::new("urn:test:pending-shapes");
+        let focus = EncodedTerm("<urn:test:pending-focus>".to_owned());
+        engine
+            .local_apply_changes_unchecked(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: focus.clone(),
+                    predicate: EncodedTerm("<urn:test:pending-value>".to_owned()),
+                    object: EncodedTerm("<urn:test:pending-object>".to_owned()),
+                }],
+            )
+            .unwrap();
+        engine
+            .local_apply_changes_unchecked(
+                &shapes,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: EncodedTerm("<urn:test:pending-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm("<http://www.w3.org/ns/shacl#NodeShape>".to_owned()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: EncodedTerm("<urn:test:pending-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/ns/shacl#targetNode>".to_owned(),
+                        ),
+                        object: focus,
+                    },
+                ],
+            )
+            .unwrap();
+        let binding = ShaclBinding {
+            data_graph: data.clone(),
+            shapes_graph: shapes.clone(),
+            policy,
+            validation_options: ShaclBindingOptions::default(),
+        };
+        let shapes_version = store.graph_version_digest(&shapes).unwrap();
+        let status = crate::ShaclBindingStatus {
+            binding: binding.clone(),
+            state: crate::ShaclValidationState::Pending,
+            report: None,
+            error: None,
+            data_version: store.graph_version_digest(&data).unwrap(),
+            shapes_version,
+            schema_fingerprint: [0; 32],
+            shape_versions: vec![(shapes, shapes_version)],
+        };
+        let mut batch = store.new_batch();
+        store.stage_binding_status(&mut batch, &status).unwrap();
+        store.commit(batch).unwrap();
+        let mut batch = store.new_batch();
+        store
+            .stage_pending_bindings(
+                &mut batch,
+                &data,
+                store.graph_version_digest(&data).unwrap(),
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        (store, engine, data, binding)
+    }
+
+    fn report(conforms: bool) -> crate::ShaclValidationReport {
+        crate::ShaclValidationReport {
+            conforms,
+            results: Vec::new(),
+            statistics: crate::ShaclValidationStatistics::default(),
+        }
+    }
+
+    #[test]
+    fn queue_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (store, engine, _data, _binding) =
+                pending_engine(dir.path(), ValidationPolicy::Advisory);
+            store.persist().unwrap();
+            drop(engine);
+            drop(store);
+        }
+        let (store, engine) = engine_at(dir.path());
+        engine.replay_pending_bindings().unwrap();
+        let status = store
+            .shacl_binding_statuses(&GraphId::new("urn:test:pending-data"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Valid);
+        assert!(status.report.unwrap().conforms);
+        assert!(store.pending_shacl_graphs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn settle_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine, data, _binding) =
+            pending_engine(dir.path(), ValidationPolicy::Advisory);
+        let before = store.graph_snapshot(&data).unwrap();
+
+        engine.arm_settle_failure();
+        assert!(engine.replay_pending_bindings().is_err());
+        assert_eq!(store.graph_snapshot(&data).unwrap(), before);
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Pending
+        );
+        assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
+
+        store.arm_commit_failure();
+        assert!(engine.replay_pending_bindings().is_err());
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Pending
+        );
+        assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
+
+        engine.replay_pending_bindings().unwrap();
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Valid
+        );
+    }
+
+    #[test]
+    fn open_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let data = {
+            let (store, engine, data, _binding) =
+                pending_engine(&store_path, ValidationPolicy::Advisory);
+            store.persist().unwrap();
+            drop(engine);
+            drop(store);
+            data
+        };
+
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let status = node
+            .shacl_binding_statuses(&crate::AllowAllAuthorizer, &data)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Valid);
+        assert!(status.report.unwrap().conforms);
+        assert!(node.store.pending_shacl_graphs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_retry() {
+        let sender_dir = tempfile::tempdir().unwrap();
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let (_sender_store, sender) = engine_at(sender_dir.path());
+        let (store, receiver, data, _binding) =
+            pending_engine(receiver_dir.path(), ValidationPolicy::Advisory);
+        receiver.replay_pending_bindings().unwrap();
+        let shapes = GraphId::new("urn:test:pending-shapes");
+        let batch = sender
+            .local_apply_changes_unchecked(
+                &shapes,
+                vec![MaterializedQuadChange::Insert {
+                    graph: shapes.clone(),
+                    subject: EncodedTerm("<urn:test:remote-subject>".to_owned()),
+                    predicate: EncodedTerm("<urn:test:remote-predicate>".to_owned()),
+                    object: EncodedTerm("<urn:test:remote-object>".to_owned()),
+                }],
+            )
+            .unwrap();
+
+        receiver.arm_settle_failure();
+        assert!(receiver.apply_irokle_batch(batch.clone()).is_err());
+        let source = store.graph_snapshot(&shapes).unwrap();
+        assert!(
+            source
+                .quads
+                .iter()
+                .any(|quad| quad.subject == EncodedTerm("<urn:test:remote-subject>".to_owned()))
+        );
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Pending
+        );
+        assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
+
+        receiver.apply_irokle_batch(batch).unwrap();
+        assert_eq!(store.graph_snapshot(&shapes).unwrap(), source);
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Valid
+        );
+        assert!(store.pending_shacl_graphs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_reopens() {
+        let sender_dir = tempfile::tempdir().unwrap();
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let (_sender_store, sender) = engine_at(sender_dir.path());
+        let store_path = receiver_dir.path().join("store");
+        let (source, data, shapes) = {
+            let (store, receiver, data, _binding) =
+                pending_engine(&store_path, ValidationPolicy::Advisory);
+            receiver.replay_pending_bindings().unwrap();
+            let shapes = GraphId::new("urn:test:pending-shapes");
+            let batch = sender
+                .local_apply_changes_unchecked(
+                    &shapes,
+                    vec![
+                        MaterializedQuadChange::Insert {
+                            graph: shapes.clone(),
+                            subject: EncodedTerm("<urn:test:pending-shape>".to_owned()),
+                            predicate: EncodedTerm(
+                                "<http://www.w3.org/ns/shacl#property>".to_owned(),
+                            ),
+                            object: EncodedTerm("<urn:test:pending-property>".to_owned()),
+                        },
+                        MaterializedQuadChange::Insert {
+                            graph: shapes.clone(),
+                            subject: EncodedTerm("<urn:test:pending-property>".to_owned()),
+                            predicate: EncodedTerm(
+                                "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                            ),
+                            object: EncodedTerm(
+                                "<http://www.w3.org/ns/shacl#PropertyShape>".to_owned(),
+                            ),
+                        },
+                        MaterializedQuadChange::Insert {
+                            graph: shapes.clone(),
+                            subject: EncodedTerm("<urn:test:pending-property>".to_owned()),
+                            predicate: EncodedTerm("<http://www.w3.org/ns/shacl#path>".to_owned()),
+                            object: EncodedTerm("<urn:test:pending-value>".to_owned()),
+                        },
+                        MaterializedQuadChange::Insert {
+                            graph: shapes.clone(),
+                            subject: EncodedTerm("<urn:test:pending-property>".to_owned()),
+                            predicate: EncodedTerm(
+                                "<http://www.w3.org/ns/shacl#maxCount>".to_owned(),
+                            ),
+                            object: EncodedTerm(
+                                "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned(),
+                            ),
+                        },
+                    ],
+                )
+                .unwrap();
+
+            receiver.arm_settle_failure();
+            assert!(receiver.apply_irokle_batch(batch).is_err());
+            let source = store.graph_snapshot(&shapes).unwrap();
+            assert_eq!(
+                store.shacl_binding_statuses(&data).unwrap()[0].state,
+                crate::ShaclValidationState::Pending
+            );
+            assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
+            store.persist().unwrap();
+            drop(receiver);
+            drop(store);
+            (source, data, shapes)
+        };
+
+        let node = crate::CraqleNode::open(receiver_dir.path()).unwrap();
+        assert_eq!(node.graph_snapshot(&shapes).unwrap(), source);
+        let status = node
+            .shacl_binding_statuses(&crate::AllowAllAuthorizer, &data)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Invalid);
+        assert_eq!(
+            status.data_version,
+            node.store.graph_version_digest(&data).unwrap()
+        );
+        assert_eq!(
+            status.shapes_version,
+            node.store.graph_version_digest(&shapes).unwrap()
+        );
+        let report = status.report.unwrap();
+        assert!(!report.conforms);
+        assert_eq!(report.results.len(), 1);
+        assert!(node.store.pending_shacl_graphs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabled_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine, data, _binding) =
+            pending_engine(dir.path(), ValidationPolicy::Disabled);
+        let before = store.graph_version_digest(&data).unwrap();
+
+        engine
+            .local_apply_changes_unchecked(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: EncodedTerm("<urn:test:disabled-subject>".to_owned()),
+                    predicate: EncodedTerm("<urn:test:disabled-predicate>".to_owned()),
+                    object: EncodedTerm("<urn:test:disabled-object>".to_owned()),
+                }],
+            )
+            .unwrap();
+
+        let status = store.shacl_binding_statuses(&data).unwrap().pop().unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Pending);
+        assert!(status.report.is_none());
+        assert_ne!(status.data_version, before);
+        assert_eq!(
+            status.data_version,
+            store.graph_version_digest(&data).unwrap()
+        );
+    }
+
+    #[test]
+    fn commit_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine, data, _binding) = pending_engine(dir.path(), ValidationPolicy::Enforce);
+        engine.replay_pending_bindings().unwrap();
+        let before = (
+            store.graph_snapshot(&data).unwrap(),
+            store.get_vector_clock(&data).unwrap(),
+            store.query_index_status_fast().unwrap(),
+            store.shacl_binding_statuses(&data).unwrap(),
+        );
+
+        store.arm_commit_failure();
+        let error = engine
+            .local_apply_changes(
+                &data,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: data.clone(),
+                        subject: EncodedTerm("<urn:test:commit-subject>".to_owned()),
+                        predicate: EncodedTerm("<urn:test:commit-predicate>".to_owned()),
+                        object: EncodedTerm("<urn:test:commit-object>".to_owned()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: data.clone(),
+                        subject: EncodedTerm("<urn:test:commit-subject>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm("<urn:test:commit-class>".to_owned()),
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(error, UpdateError::Store(_)), "{error:?}");
+
+        assert_eq!(store.graph_snapshot(&data).unwrap(), before.0);
+        assert_eq!(store.get_vector_clock(&data).unwrap(), before.1);
+        assert_eq!(store.query_index_status_fast().unwrap(), before.2);
+        assert_eq!(store.shacl_binding_statuses(&data).unwrap(), before.3);
+    }
+
+    #[test]
+    fn sync_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, setup, data, binding) = pending_engine(dir.path(), ValidationPolicy::Enforce);
+        let shapes = binding.shapes_graph.clone();
+        let shape = EncodedTerm("<urn:test:pending-shape>".to_owned());
+        let property = EncodedTerm("<urn:test:pending-property>".to_owned());
+        setup
+            .local_apply_changes_unchecked(
+                &shapes,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: shape.clone(),
+                        predicate: EncodedTerm("<http://www.w3.org/ns/shacl#property>".to_owned()),
+                        object: property.clone(),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: property.clone(),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm(
+                            "<http://www.w3.org/ns/shacl#PropertyShape>".to_owned(),
+                        ),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: property.clone(),
+                        predicate: EncodedTerm("<http://www.w3.org/ns/shacl#path>".to_owned()),
+                        object: EncodedTerm("<urn:test:pending-value>".to_owned()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: property,
+                        predicate: EncodedTerm("<http://www.w3.org/ns/shacl#maxCount>".to_owned()),
+                        object: EncodedTerm(
+                            "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned(),
+                        ),
+                    },
+                ],
+            )
+            .unwrap();
+        setup
+            .local_apply_changes_unchecked(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: EncodedTerm("<urn:test:pending-focus>".to_owned()),
+                    predicate: EncodedTerm(
+                        "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                    ),
+                    object: EncodedTerm("<urn:test:pending-class>".to_owned()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Valid
+        );
+        store.clear_fts_queue().unwrap();
+
+        let irokle = irokle::Irokle::builder().build().unwrap();
+        let sync: Arc<dyn CraqleGraphSync> =
+            Arc::new(IrokleGraphSync::new(irokle, CraqleIrokleOptions::new()));
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let sparql = Arc::new(SparqlEngine::new(store.clone(), search));
+        let engine = ReplicationEngine::new_sync_shacl(
+            store.clone(),
+            sparql,
+            ActorId::random(),
+            Some(sync.clone()),
+            Arc::new(crate::shacl_impl::ShaclCompiler::new(store.clone())),
+        );
+        let before = (
+            store.graph_snapshot(&data).unwrap(),
+            store.get_vector_clock(&data).unwrap(),
+            store.query_index_status_fast().unwrap(),
+            store.shacl_binding_statuses(&data).unwrap(),
+        );
+
+        assert!(matches!(
+            engine.local_apply_changes(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: EncodedTerm("<urn:test:pending-focus>".to_owned()),
+                    predicate: EncodedTerm("<urn:test:pending-value>".to_owned()),
+                    object: EncodedTerm("<urn:test:pending-second>".to_owned()),
+                }],
+            ),
+            Err(UpdateError::ShaclValidationFailed(_))
+        ));
+
+        assert_eq!(store.graph_snapshot(&data).unwrap(), before.0);
+        assert_eq!(store.get_vector_clock(&data).unwrap(), before.1);
+        assert_eq!(store.query_index_status_fast().unwrap(), before.2);
+        assert_eq!(store.shacl_binding_statuses(&data).unwrap(), before.3);
+        assert!(store.drain_fts_queue(usize::MAX).unwrap().is_empty());
+        assert!(sync.graph_topic_id(&store, &data).unwrap().is_none());
+        assert!(
+            !sync
+                .craqle_topic_ids()
+                .unwrap()
+                .contains(&crate::sync::graph_topic_id(&data))
+        );
+    }
+
+    #[test]
+    fn import_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let data = GraphId::new("urn:test:arrive-data");
+        let root = GraphId::new("urn:test:arrive-root");
+        let imported = GraphId::new("urn:test:arrive-import");
+        let focus = EncodedTerm("<urn:test:arrive-focus>".to_owned());
+        engine
+            .local_apply_changes_unchecked(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: focus.clone(),
+                    predicate: EncodedTerm("<urn:test:arrive-value>".to_owned()),
+                    object: EncodedTerm("<urn:test:arrive-object>".to_owned()),
+                }],
+            )
+            .unwrap();
+        engine
+            .local_apply_changes_unchecked(
+                &root,
+                vec![MaterializedQuadChange::Insert {
+                    graph: root.clone(),
+                    subject: EncodedTerm("<urn:test:arrive-ontology>".to_owned()),
+                    predicate: EncodedTerm("<http://www.w3.org/2002/07/owl#imports>".to_owned()),
+                    object: EncodedTerm(format!("<{}>", imported.as_str())),
+                }],
+            )
+            .unwrap();
+        let root_version = store.graph_version_digest(&root).unwrap();
+        let binding = ShaclBinding {
+            data_graph: data.clone(),
+            shapes_graph: root.clone(),
+            policy: ValidationPolicy::Advisory,
+            validation_options: ShaclBindingOptions {
+                allow_local_imports: true,
+                ..ShaclBindingOptions::default()
+            },
+        };
+        let mut batch = store.new_batch();
+        store
+            .stage_binding_status(
+                &mut batch,
+                &crate::ShaclBindingStatus {
+                    binding,
+                    state: crate::ShaclValidationState::Pending,
+                    report: None,
+                    error: None,
+                    data_version: store.graph_version_digest(&data).unwrap(),
+                    shapes_version: root_version,
+                    schema_fingerprint: [0; 32],
+                    shape_versions: vec![(root, root_version)],
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        let mut batch = store.new_batch();
+        store
+            .stage_pending_bindings(
+                &mut batch,
+                &data,
+                store.graph_version_digest(&data).unwrap(),
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        engine.replay_pending_bindings().unwrap();
+        assert_eq!(
+            store.shacl_binding_statuses(&data).unwrap()[0].state,
+            crate::ShaclValidationState::Pending
+        );
+        assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
+
+        engine
+            .local_apply_changes_unchecked(
+                &imported,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: imported.clone(),
+                        subject: EncodedTerm("<urn:test:arrive-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm("<http://www.w3.org/ns/shacl#NodeShape>".to_owned()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: imported.clone(),
+                        subject: EncodedTerm("<urn:test:arrive-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/ns/shacl#targetNode>".to_owned(),
+                        ),
+                        object: focus,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let status = store.shacl_binding_statuses(&data).unwrap().pop().unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Valid);
+        assert!(status.report.unwrap().conforms);
+        assert!(store.pending_shacl_graphs().unwrap().is_empty());
+        assert_eq!(store.affected_shacl_graphs(&imported).unwrap(), vec![data]);
+    }
+
+    #[test]
+    fn stale_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let data = GraphId::new("urn:test:stale-deps-data");
+        let root = GraphId::new("urn:test:stale-deps-root");
+        let first = GraphId::new("urn:test:stale-deps-first");
+        let nested = GraphId::new("urn:test:stale-deps-nested");
+        let second = GraphId::new("urn:test:stale-deps-second");
+        let focus = EncodedTerm("<urn:test:stale-deps-focus>".to_owned());
+        let imports = EncodedTerm("<http://www.w3.org/2002/07/owl#imports>".to_owned());
+        engine
+            .local_apply_changes_unchecked(
+                &data,
+                vec![MaterializedQuadChange::Insert {
+                    graph: data.clone(),
+                    subject: focus.clone(),
+                    predicate: EncodedTerm("<urn:test:stale-deps-value>".to_owned()),
+                    object: EncodedTerm("<urn:test:stale-deps-object>".to_owned()),
+                }],
+            )
+            .unwrap();
+        for (graph, import) in [(&root, &first), (&first, &nested)] {
+            engine
+                .local_apply_changes_unchecked(
+                    graph,
+                    vec![MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: EncodedTerm("<urn:test:stale-deps-ontology>".to_owned()),
+                        predicate: imports.clone(),
+                        object: EncodedTerm(format!("<{}>", import.as_str())),
+                    }],
+                )
+                .unwrap();
+        }
+        let old_nested = store.graph_version_digest(&nested).unwrap();
+        engine
+            .local_apply_changes_unchecked(
+                &nested,
+                vec![MaterializedQuadChange::Insert {
+                    graph: nested.clone(),
+                    subject: EncodedTerm("<urn:test:stale-deps-ontology>".to_owned()),
+                    predicate: imports,
+                    object: EncodedTerm(format!("<{}>", second.as_str())),
+                }],
+            )
+            .unwrap();
+
+        let data_version = store.graph_version_digest(&data).unwrap();
+        let root_version = store.graph_version_digest(&root).unwrap();
+        let first_version = store.graph_version_digest(&first).unwrap();
+        let nested_version = store.graph_version_digest(&nested).unwrap();
+        let second_version = store.graph_version_digest(&second).unwrap();
+        let binding = ShaclBinding {
+            data_graph: data.clone(),
+            shapes_graph: root.clone(),
+            policy: ValidationPolicy::Advisory,
+            validation_options: ShaclBindingOptions {
+                allow_local_imports: true,
+                ..ShaclBindingOptions::default()
+            },
+        };
+        let current_versions = vec![
+            (root.clone(), root_version),
+            (first.clone(), first_version),
+            (nested.clone(), nested_version),
+            (second.clone(), second_version),
+        ];
+        let mut batch = store.new_batch();
+        store
+            .stage_binding_status(
+                &mut batch,
+                &crate::ShaclBindingStatus {
+                    binding: binding.clone(),
+                    state: crate::ShaclValidationState::Pending,
+                    report: None,
+                    error: None,
+                    data_version,
+                    shapes_version: root_version,
+                    schema_fingerprint: [9; 32],
+                    shape_versions: current_versions,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        engine
+            .persist_shacl_evaluations(
+                &data,
+                vec![ShaclEvaluation {
+                    binding,
+                    schema: None,
+                    result: Err("missing nested import".to_owned()),
+                    data_version: Some(data_version),
+                    shapes_version: root_version,
+                    schema_fingerprint: [1; 32],
+                    shape_versions: vec![
+                        (root.clone(), root_version),
+                        (first.clone(), first_version),
+                        (nested.clone(), old_nested),
+                    ],
+                    refresh_dependencies: true,
+                }],
+            )
+            .unwrap();
+
+        let status = store.shacl_binding_statuses(&data).unwrap().pop().unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Pending);
+        assert_eq!(status.schema_fingerprint, [9; 32]);
+        assert!(
+            status
+                .shape_versions
+                .iter()
+                .any(|(graph, _)| graph == &second)
+        );
+        assert_eq!(
+            store.affected_shacl_graphs(&second).unwrap(),
+            vec![data.clone()]
+        );
+
+        engine
+            .local_apply_changes_unchecked(
+                &second,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: second.clone(),
+                        subject: EncodedTerm("<urn:test:stale-deps-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm("<http://www.w3.org/ns/shacl#NodeShape>".to_owned()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: second.clone(),
+                        subject: EncodedTerm("<urn:test:stale-deps-shape>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/ns/shacl#targetNode>".to_owned(),
+                        ),
+                        object: focus,
+                    },
+                ],
+            )
+            .unwrap();
+        let status = store.shacl_binding_statuses(&data).unwrap().pop().unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Valid);
+        assert!(status.report.unwrap().conforms);
+    }
+
+    #[test]
+    fn error_deps() {
+        for imported in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, engine) = engine_at(dir.path());
+            let data = GraphId::new("urn:test:error-data");
+            let root = GraphId::new("urn:test:error-root");
+            let import = GraphId::new("urn:test:error-import");
+            let shapes = if imported { &import } else { &root };
+            let focus = EncodedTerm("<urn:test:error-focus>".to_owned());
+            engine
+                .local_apply_changes_unchecked(
+                    &data,
+                    vec![MaterializedQuadChange::Insert {
+                        graph: data.clone(),
+                        subject: focus.clone(),
+                        predicate: EncodedTerm("<urn:test:error-value>".to_owned()),
+                        object: EncodedTerm("<urn:test:error-object>".to_owned()),
+                    }],
+                )
+                .unwrap();
+            if imported {
+                engine
+                    .local_apply_changes_unchecked(
+                        &root,
+                        vec![MaterializedQuadChange::Insert {
+                            graph: root.clone(),
+                            subject: EncodedTerm("<urn:test:error-ontology>".to_owned()),
+                            predicate: EncodedTerm(
+                                "<http://www.w3.org/2002/07/owl#imports>".to_owned(),
+                            ),
+                            object: EncodedTerm(format!("<{}>", import.as_str())),
+                        }],
+                    )
+                    .unwrap();
+            }
+            engine
+                .local_apply_changes_unchecked(
+                    shapes,
+                    vec![
+                        MaterializedQuadChange::Insert {
+                            graph: shapes.clone(),
+                            subject: EncodedTerm("<urn:test:error-shape>".to_owned()),
+                            predicate: EncodedTerm(
+                                "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                            ),
+                            object: EncodedTerm(
+                                "<http://www.w3.org/ns/shacl#NodeShape>".to_owned(),
+                            ),
+                        },
+                        MaterializedQuadChange::Insert {
+                            graph: shapes.clone(),
+                            subject: EncodedTerm("<urn:test:error-shape>".to_owned()),
+                            predicate: EncodedTerm(
+                                "<http://www.w3.org/ns/shacl#targetNode>".to_owned(),
+                            ),
+                            object: focus,
+                        },
+                    ],
+                )
+                .unwrap();
+            let root_version = store.graph_version_digest(&root).unwrap();
+            let mut shape_versions = vec![(root.clone(), root_version)];
+            if imported {
+                shape_versions.push((import.clone(), store.graph_version_digest(&import).unwrap()));
+            }
+            let binding = ShaclBinding {
+                data_graph: data.clone(),
+                shapes_graph: root.clone(),
+                policy: ValidationPolicy::Advisory,
+                validation_options: ShaclBindingOptions {
+                    allow_local_imports: imported,
+                    ..ShaclBindingOptions::default()
+                },
+            };
+            let mut batch = store.new_batch();
+            store
+                .stage_binding_status(
+                    &mut batch,
+                    &crate::ShaclBindingStatus {
+                        binding,
+                        state: crate::ShaclValidationState::Pending,
+                        report: None,
+                        error: None,
+                        data_version: store.graph_version_digest(&data).unwrap(),
+                        shapes_version: root_version,
+                        schema_fingerprint: [0; 32],
+                        shape_versions,
+                    },
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+            let mut batch = store.new_batch();
+            store
+                .stage_pending_bindings(
+                    &mut batch,
+                    &data,
+                    store.graph_version_digest(&data).unwrap(),
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+            engine.replay_pending_bindings().unwrap();
+
+            engine
+                .local_apply_changes_unchecked(
+                    shapes,
+                    vec![MaterializedQuadChange::Insert {
+                        graph: shapes.clone(),
+                        subject: EncodedTerm("<urn:test:error-property>".to_owned()),
+                        predicate: EncodedTerm(
+                            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+                        ),
+                        object: EncodedTerm(
+                            "<http://www.w3.org/ns/shacl#PropertyShape>".to_owned(),
+                        ),
+                    }],
+                )
+                .unwrap();
+
+            let status = store.shacl_binding_statuses(&data).unwrap().pop().unwrap();
+            assert_eq!(status.state, crate::ShaclValidationState::Failed);
+            assert!(status.error.unwrap().contains("ill-formed SHACL"));
+            assert!(
+                status
+                    .shape_versions
+                    .iter()
+                    .any(|(graph, _)| graph == &root)
+            );
+            if imported {
+                assert!(
+                    status
+                        .shape_versions
+                        .iter()
+                        .any(|(graph, _)| graph == &import)
+                );
+            }
+            assert_eq!(store.affected_shacl_graphs(shapes).unwrap(), vec![data]);
+        }
+    }
+
+    #[test]
+    fn stale_eval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let data = GraphId::new("urn:test:stale-data");
+        let shapes = GraphId::new("urn:test:stale-shapes");
+        let imported = GraphId::new("urn:test:stale-import");
+        for graph in [&data, &shapes, &imported] {
+            store.create_graph(graph).unwrap();
+        }
+        let data_version = store.graph_version_digest(&data).unwrap();
+        let shapes_version = store.graph_version_digest(&shapes).unwrap();
+        let imported_version = store.graph_version_digest(&imported).unwrap();
+        let binding = ShaclBinding {
+            data_graph: data.clone(),
+            shapes_graph: shapes.clone(),
+            policy: ValidationPolicy::Advisory,
+            validation_options: ShaclBindingOptions::default(),
+        };
+        let old_versions = vec![(shapes.clone(), shapes_version)];
+        let mut batch = store.new_batch();
+        store
+            .stage_binding_status(
+                &mut batch,
+                &crate::ShaclBindingStatus {
+                    binding: binding.clone(),
+                    state: crate::ShaclValidationState::Pending,
+                    report: None,
+                    error: None,
+                    data_version,
+                    shapes_version,
+                    schema_fingerprint: [1; 32],
+                    shape_versions: old_versions.clone(),
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+
+        let new_versions = vec![
+            (shapes.clone(), shapes_version),
+            (imported.clone(), imported_version),
+        ];
+        engine
+            .persist_shacl_evaluations(
+                &data,
+                vec![ShaclEvaluation {
+                    binding: binding.clone(),
+                    schema: None,
+                    result: Ok(report(false)),
+                    data_version: Some(data_version),
+                    shapes_version,
+                    schema_fingerprint: [2; 32],
+                    shape_versions: new_versions.clone(),
+                    refresh_dependencies: false,
+                }],
+            )
+            .unwrap();
+        engine
+            .persist_shacl_evaluations(
+                &data,
+                vec![ShaclEvaluation {
+                    binding,
+                    schema: None,
+                    result: Ok(report(true)),
+                    data_version: Some(data_version),
+                    shapes_version,
+                    schema_fingerprint: [1; 32],
+                    shape_versions: old_versions,
+                    refresh_dependencies: false,
+                }],
+            )
+            .unwrap();
+
+        let status = store.shacl_binding_statuses(&data).unwrap().pop().unwrap();
+        assert_eq!(status.state, crate::ShaclValidationState::Invalid);
+        assert!(!status.report.unwrap().conforms);
+        assert_eq!(status.schema_fingerprint, [2; 32]);
+        assert_eq!(status.shape_versions, new_versions);
     }
 }

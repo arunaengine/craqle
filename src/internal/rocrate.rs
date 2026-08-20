@@ -3791,6 +3791,14 @@ mod tests {
             self.inner.ensure_graph_topic(store, graph)
         }
 
+        fn ensure_topic_guarded(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+        ) -> SyncResult<irokle::TopicId> {
+            self.inner.ensure_topic_guarded(store, graph)
+        }
+
         fn bind_graph_topic(
             &self,
             store: &crate::store::GraphStore,

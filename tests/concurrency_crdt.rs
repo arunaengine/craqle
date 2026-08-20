@@ -413,13 +413,10 @@ mod tests {
         orphans
     }
 
-    /// F2 — two validated writes race, each cutting one of an entity's two
-    /// parents. Validation runs before the commit guard, so both can pass and
-    /// the entity ends up unreachable; the persisted diagnostics must describe
-    /// the orphan they left behind rather than the clean graph each writer was
-    /// promised (G6).
+    /// F2 — checked writers serialize validation and commit per graph. Racing
+    /// parent-edge deletes cannot both commit against the same stale state.
     #[test]
-    fn deletes_record_orphans() {
+    fn deletes_preserve_reachability() {
         let dir = tempfile::tempdir().unwrap();
         let node = standalone_node(&dir);
         let graph = GraphId::new("urn:test:f2-orphan-race");
@@ -484,8 +481,8 @@ mod tests {
 
         let expected = expected_orphans(&node, &graph);
         assert!(
-            !expected.is_empty(),
-            "no round interleaved validation with a commit, so this run proved nothing"
+            expected.is_empty(),
+            "serialized checked writes must preserve at least one parent edge"
         );
         let recorded: BTreeSet<String> = node
             .graph_diagnostics(&graph)

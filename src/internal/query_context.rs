@@ -278,6 +278,10 @@ impl<'a> ReadContext<'a> {
         self.observe_qv_admission(trusted, fallback_reason);
     }
 
+    pub(crate) fn record_qv_meta(&self) {
+        ReadCounters::increment(&self.counters.qv_counter_reads);
+    }
+
     pub(crate) fn observe_qv_admission(
         &self,
         trusted: bool,

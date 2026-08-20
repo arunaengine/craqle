@@ -3,9 +3,9 @@
 mod support;
 
 use craqle::{
-    CraqleError, CreateCrateRequest, EncodedTerm, GraphId, MaterializedQuadChange, NewDataEntity,
-    RoCrateError, ShaclBinding, ShaclBindingOptions, ShaclValidationState, UpdateError,
-    ValidationPolicy,
+    CraqleError, CraqleNode, CreateCrateRequest, EncodedTerm, GraphId, MaterializedQuadChange,
+    NewDataEntity, RoCrateError, ShaclBinding, ShaclBindingOptions, ShaclValidationState,
+    UpdateError, ValidationPolicy, vocab,
 };
 
 use crate::support::{benchmark_rocrate_document, public_policy, setup_network, writer_auth};
@@ -21,6 +21,45 @@ fn add(graph: &GraphId, subject: &str, predicate: &str, object: &str) -> Materia
         predicate: EncodedTerm(predicate.to_string()),
         object: EncodedTerm(object.to_string()),
     }
+}
+
+fn zero_cardinality_shape(node: &CraqleNode, shapes: &GraphId) {
+    node.apply_changes_unchecked(
+        shapes,
+        vec![
+            add(
+                shapes,
+                "<urn:test:bulk-shape>",
+                RDF_TYPE,
+                &format!("{SHACL}NodeShape>"),
+            ),
+            add(
+                shapes,
+                "<urn:test:bulk-shape>",
+                &format!("{SHACL}targetSubjectsOf>"),
+                HAS_PART,
+            ),
+            add(
+                shapes,
+                "<urn:test:bulk-shape>",
+                &format!("{SHACL}property>"),
+                "<urn:test:bulk-property>",
+            ),
+            add(
+                shapes,
+                "<urn:test:bulk-property>",
+                &format!("{SHACL}path>"),
+                HAS_PART,
+            ),
+            add(
+                shapes,
+                "<urn:test:bulk-property>",
+                &format!("{SHACL}maxCount>"),
+                "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            ),
+        ],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -80,12 +119,15 @@ fn checked_bulk_enforces() {
     )
     .unwrap();
     assert_eq!(
-        node.bind_shacl(&ShaclBinding {
-            data_graph: data.clone(),
-            shapes_graph: shapes,
-            policy: ValidationPolicy::Enforce,
-            validation_options: ShaclBindingOptions::default(),
-        })
+        node.bind_shacl(
+            &craqle::AllowAllAuthorizer,
+            &ShaclBinding {
+                data_graph: data.clone(),
+                shapes_graph: shapes,
+                policy: ValidationPolicy::Enforce,
+                validation_options: ShaclBindingOptions::default(),
+            },
+        )
         .unwrap()
         .state,
         ShaclValidationState::Valid
@@ -118,6 +160,74 @@ fn checked_bulk_enforces() {
     assert_eq!(node.graph_snapshot(&data).unwrap(), snapshot);
     assert_eq!(node.vector_clock(&data).unwrap(), clock);
     assert_eq!(node.query_index_status_fast().unwrap(), index);
+}
+
+#[test]
+fn unchecked_bulk_invalid() {
+    let (_directory, net) = setup_network(1);
+    let node = net.peer(0);
+    let data = GraphId::new("urn:test:bulk-unchecked-data");
+    let shapes = GraphId::new("urn:test:bulk-unchecked-shapes");
+    let writer = writer_auth();
+
+    node.create_crate(
+        &writer,
+        CreateCrateRequest::new(
+            data.clone(),
+            "Unchecked bulk policy",
+            "Explicitly unchecked writes are trusted bypasses.",
+            "2026-08-20",
+            None,
+            public_policy(),
+        ),
+    )
+    .unwrap();
+    zero_cardinality_shape(node, &shapes);
+    assert_eq!(
+        node.bind_shacl(
+            &craqle::AllowAllAuthorizer,
+            &ShaclBinding {
+                data_graph: data.clone(),
+                shapes_graph: shapes,
+                policy: ValidationPolicy::Enforce,
+                validation_options: ShaclBindingOptions::default(),
+            },
+        )
+        .unwrap()
+        .state,
+        ShaclValidationState::Valid
+    );
+
+    let child = "<urn:test:unchecked-child>";
+    node.apply_changes_bulk_unchecked(
+        &data,
+        vec![add(&data, &format!("<{}>", data.as_str()), HAS_PART, child)],
+    )
+    .unwrap();
+    node.rebuild_graph_diagnostics(&data).unwrap();
+
+    assert!(
+        node.graph_snapshot(&data)
+            .unwrap()
+            .quads
+            .iter()
+            .any(|quad| {
+                quad.subject == EncodedTerm::from_named_node(&data.0)
+                    && quad.predicate == EncodedTerm::from_named_node(&vocab::schema_has_part())
+                    && quad.object == EncodedTerm(child.to_string())
+            })
+    );
+    let statuses = node
+        .shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        .unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, ShaclValidationState::Invalid);
+    assert!(
+        statuses[0]
+            .report
+            .as_ref()
+            .is_some_and(|report| !report.conforms)
+    );
 }
 
 #[test]
@@ -186,12 +296,15 @@ fn import_enforce_empty() {
     )
     .unwrap();
     assert_eq!(
-        node.bind_shacl(&ShaclBinding {
-            data_graph: data.clone(),
-            shapes_graph: shapes,
-            policy: ValidationPolicy::Enforce,
-            validation_options: ShaclBindingOptions::default(),
-        })
+        node.bind_shacl(
+            &craqle::AllowAllAuthorizer,
+            &ShaclBinding {
+                data_graph: data.clone(),
+                shapes_graph: shapes,
+                policy: ValidationPolicy::Enforce,
+                validation_options: ShaclBindingOptions::default(),
+            }
+        )
         .unwrap()
         .state,
         ShaclValidationState::Valid
