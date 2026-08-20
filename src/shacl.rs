@@ -7,9 +7,94 @@ use crate::shacl_impl::model::CompiledSchemaInner;
 use crate::{CrateViolation, EncodedTerm, QueryCancellation, ReadStatistics, RoCrateVersion};
 
 /// SHACL feature profile implemented by Craqle's native validator.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ShaclProfile {
     CraqleFastV1,
+}
+
+/// Policy applied to local writes for one data/shapes graph binding.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum ValidationPolicy {
+    Enforce,
+    Advisory,
+    #[default]
+    Disabled,
+}
+
+/// Persistable limits and compiler options for one SHACL binding.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShaclBindingOptions {
+    pub rocrate_version: RoCrateVersion,
+    pub allow_local_imports: bool,
+    pub max_results: usize,
+    pub max_path_edges: u64,
+    pub max_path_depth: usize,
+}
+
+impl Default for ShaclBindingOptions {
+    fn default() -> Self {
+        let validation = ShaclValidationOptions::default();
+        Self {
+            rocrate_version: RoCrateVersion::default(),
+            allow_local_imports: false,
+            max_results: validation.max_results,
+            max_path_edges: validation.max_path_edges,
+            max_path_depth: validation.max_path_depth,
+        }
+    }
+}
+
+impl ShaclBindingOptions {
+    pub(crate) fn compile_options(&self) -> ShaclCompileOptions {
+        ShaclCompileOptions {
+            rocrate_version: self.rocrate_version,
+            allow_local_imports: self.allow_local_imports,
+        }
+    }
+
+    pub(crate) fn validation_options(&self) -> ShaclValidationOptions {
+        ShaclValidationOptions {
+            cancellation: QueryCancellation::new(),
+            max_results: self.max_results,
+            max_path_edges: self.max_path_edges,
+            max_path_depth: self.max_path_depth,
+        }
+    }
+}
+
+/// A persisted association between one data graph and one shapes graph.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShaclBinding {
+    pub data_graph: crate::GraphId,
+    pub shapes_graph: crate::GraphId,
+    pub policy: ValidationPolicy,
+    pub validation_options: ShaclBindingOptions,
+}
+
+/// Latest known advisory state for a persisted binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum ShaclValidationState {
+    Pending,
+    Valid,
+    Invalid,
+    Failed,
+}
+
+/// Persisted complete report, or an explicit pending/failed state.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShaclBindingStatus {
+    pub binding: ShaclBinding,
+    pub state: ShaclValidationState,
+    pub report: Option<ShaclValidationReport>,
+    pub error: Option<String>,
+    pub data_version: [u8; 32],
+    pub shapes_version: [u8; 32],
+    pub schema_fingerprint: [u8; 32],
+    pub(crate) shape_versions: Vec<(crate::GraphId, [u8; 32])>,
 }
 
 /// Options used while compiling a shapes graph.
@@ -50,7 +135,7 @@ impl Default for ShaclValidationOptions {
 }
 
 /// Work performed by one native SHACL validation.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclValidationStatistics {
     pub shape_compile_cache_hit: bool,
     pub shapes_considered: u64,
@@ -74,14 +159,14 @@ pub struct ShaclValidationStatistics {
 }
 
 /// One localized SHACL validation message.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct ShaclMessage {
     pub language: Option<String>,
     pub text: String,
 }
 
 /// One deterministic native SHACL validation result.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct ShaclValidationResult {
     pub focus_node: EncodedTerm,
     pub value: Option<EncodedTerm>,
@@ -93,7 +178,7 @@ pub struct ShaclValidationResult {
 }
 
 /// Complete native SHACL validation report.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclValidationReport {
     pub conforms: bool,
     pub results: Vec<ShaclValidationResult>,
@@ -190,6 +275,10 @@ pub enum ShaclError {
     UnsupportedRdfStarTerm { term: String },
     #[error("SHACL data graph `{graph}` does not exist")]
     DataGraphNotFound { graph: String },
+    #[error("SHACL shapes graph `{graph}` changed repeatedly during validation")]
+    SchemaChangedDuringValidation { graph: String },
+    #[error("a graph cannot be validated against shapes changed by the same write: `{graph}`")]
+    ShapesGraphMutationUnsupported { graph: String },
     #[error("SHACL validation was cancelled")]
     ValidationCancelled,
     #[error("SHACL path edge budget {limit} was exhausted")]

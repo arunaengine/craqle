@@ -63,7 +63,7 @@ impl std::fmt::Debug for QueryCancellation {
 }
 
 /// Counters collected during one RDF read execution.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReadStatistics {
     pub index_seeks: u64,
     pub qv_admission_checks: u64,
