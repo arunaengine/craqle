@@ -2,12 +2,12 @@ use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
+use crate::RoCrateVersion;
 use crate::core::{CrateViolation, EncodedTerm, GraphId, MaterializedQuadChange, QuadOp, vocab};
 use crate::query_context::{QueryCancellation, ReadContext};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::GraphStore;
 use crate::validation_delta::{DeltaImpact, DeltaIndex, DeltaReadView};
-use crate::RoCrateVersion;
 
 #[cfg(test)]
 thread_local! {
