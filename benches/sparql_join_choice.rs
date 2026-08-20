@@ -2,6 +2,10 @@ use std::env;
 use std::hint::black_box;
 use std::time::Duration;
 
+#[path = "support/allocation.rs"]
+mod allocation;
+
+use allocation::AllocationInterval;
 use craqle::{
     ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind, JoinMode,
     MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
@@ -92,9 +96,15 @@ fn sparql_join_choice(c: &mut Criterion) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
     let fixture = JoinFixture::new(rows, distinct_keys);
+    let lateral_interval = AllocationInterval::begin();
     let lateral = fixture.run(JoinMode::ForceLateral);
+    let lateral_allocations = lateral_interval.finish();
+    let hash_interval = AllocationInterval::begin();
     let hash = fixture.run(JoinMode::ForceHash);
+    let hash_allocations = hash_interval.finish();
+    let automatic_interval = AllocationInterval::begin();
     let automatic = fixture.run(JoinMode::Auto);
+    let automatic_allocations = automatic_interval.finish();
     assert_eq!(lateral.results, hash.results);
     assert_eq!(hash.results, automatic.results);
     assert_eq!(
@@ -118,7 +128,11 @@ fn sparql_join_choice(c: &mut Criterion) {
         Some(QueryFastPathKind::HashJoinCount)
     );
     eprintln!(
-        "sparql_join_choice rows={} distinct_keys={} lateral_ns={} hash_ns={} auto_ns={} lateral_seeks={} hash_seeks={} lateral_candidates={} hash_candidates={}",
+        "sparql_join_choice rows={} distinct_keys={} lateral_ns={} hash_ns={} auto_ns={} \
+         lateral_seeks={} hash_seeks={} lateral_candidates={} hash_candidates={} \
+         lateral_allocations={} lateral_allocated_bytes={} lateral_peak_live_delta_bytes={} \
+         hash_allocations={} hash_allocated_bytes={} hash_peak_live_delta_bytes={} \
+         auto_allocations={} auto_allocated_bytes={} auto_peak_live_delta_bytes={}",
         fixture.rows,
         fixture.distinct_keys,
         lateral.statistics.execution_time.as_nanos(),
@@ -128,10 +142,32 @@ fn sparql_join_choice(c: &mut Criterion) {
         hash.statistics.index_seeks,
         lateral.statistics.candidate_quads,
         hash.statistics.candidate_quads,
+        lateral_allocations.allocations,
+        lateral_allocations.allocated_bytes,
+        lateral_allocations.peak_live_delta_bytes,
+        hash_allocations.allocations,
+        hash_allocations.allocated_bytes,
+        hash_allocations.peak_live_delta_bytes,
+        automatic_allocations.allocations,
+        automatic_allocations.allocated_bytes,
+        automatic_allocations.peak_live_delta_bytes,
     );
 
+    let sample_size = match env::var("CRAQLE_BENCH_SAMPLE_SIZE") {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("CRAQLE_BENCH_SAMPLE_SIZE must be an integer")),
+        Err(env::VarError::NotPresent) => 10,
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("CRAQLE_BENCH_SAMPLE_SIZE must be valid UTF-8")
+        }
+    };
+    assert!(
+        sample_size >= 10,
+        "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
+    );
     let mut group = c.benchmark_group("sparql_join_choice");
-    group.sample_size(10);
+    group.sample_size(sample_size);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(rows as u64));

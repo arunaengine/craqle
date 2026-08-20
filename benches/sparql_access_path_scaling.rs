@@ -1,8 +1,11 @@
 use std::hint::black_box;
 
+#[path = "support/allocation.rs"]
+mod allocation;
 #[path = "support/mod.rs"]
 mod support;
 
+use allocation::{AllocationInterval, AllocationSample};
 use craqle::{PreparedQuery, QueryExecution, QueryExecutionOptions, QueryReadMode};
 use criterion::{Criterion, criterion_group, criterion_main};
 use support::{QUADS_1M, fixture::Fixture};
@@ -18,13 +21,32 @@ fn execute(fixture: &Fixture, query: &PreparedQuery, mode: QueryReadMode) -> Que
     fixture.run_hot_prepared(query, &options)
 }
 
-fn print_work(label: &str, mode: QueryReadMode, execution: &QueryExecution) {
+fn sample_alloc(
+    fixture: &Fixture,
+    query: &PreparedQuery,
+    mode: QueryReadMode,
+) -> (QueryExecution, AllocationSample) {
+    let interval = AllocationInterval::begin();
+    let execution = execute(fixture, query, mode);
+    let sample = interval.finish();
+    (execution, sample)
+}
+
+fn print_work(
+    fixture: &Fixture,
+    label: &str,
+    mode: QueryReadMode,
+    execution: &QueryExecution,
+    sample: AllocationSample,
+) {
     let statistics = &execution.statistics;
     println!(
-        "sparql_access_path_scaling case={label} mode={mode:?} access_path={:?} \
+        "sparql_access_path_scaling fixture_digest={} case={label} mode={mode:?} access_path={:?} \
          qv_trusted={} fallback_reason={} source_keys={} source_bytes={} qv_keys={} \
          qv_bytes={} candidate_quads={} matching_quads={} graph_checks={} orphan_checks={} \
-         duplicate_groups={} duplicate_copies_skipped={} term_decodes={} result_rows={}",
+         duplicate_groups={} duplicate_copies_skipped={} term_decodes={} result_rows={} \
+         allocations={} allocated_bytes={} peak_live_delta_bytes={}",
+        fixture.fixture_digest(),
         statistics.selected_access_paths,
         statistics.qv_trusted,
         statistics.fallback_reason.as_deref().unwrap_or("none"),
@@ -40,13 +62,16 @@ fn print_work(label: &str, mode: QueryReadMode, execution: &QueryExecution) {
         statistics.duplicate_copies_skipped,
         statistics.terms_decoded,
         statistics.result_rows,
+        sample.allocations,
+        sample.allocated_bytes,
+        sample.peak_live_delta_bytes,
     );
 }
 
 fn assert_modes(fixture: &Fixture, case: &ScalingCase) {
-    let automatic = execute(fixture, &case.query, QueryReadMode::Auto);
-    let source = execute(fixture, &case.query, QueryReadMode::ForceSource);
-    let qv = execute(fixture, &case.query, QueryReadMode::ForceQv);
+    let (automatic, automatic_alloc) = sample_alloc(fixture, &case.query, QueryReadMode::Auto);
+    let (source, source_alloc) = sample_alloc(fixture, &case.query, QueryReadMode::ForceSource);
+    let (qv, qv_alloc) = sample_alloc(fixture, &case.query, QueryReadMode::ForceQv);
     assert_eq!(automatic.results, source.results);
     assert_eq!(source.results, qv.results);
     assert!(automatic.statistics.qv_trusted);
@@ -63,12 +88,12 @@ fn assert_modes(fixture: &Fixture, case: &ScalingCase) {
             qv.statistics.qv_keys_read,
         );
     }
-    for (mode, execution) in [
-        (QueryReadMode::Auto, automatic),
-        (QueryReadMode::ForceSource, source),
-        (QueryReadMode::ForceQv, qv),
+    for (mode, execution, sample) in [
+        (QueryReadMode::Auto, automatic, automatic_alloc),
+        (QueryReadMode::ForceSource, source, source_alloc),
+        (QueryReadMode::ForceQv, qv, qv_alloc),
     ] {
-        print_work(case.label, mode, &execution);
+        print_work(fixture, case.label, mode, &execution, sample);
     }
 }
 
@@ -91,7 +116,7 @@ fn query_path_scaling(c: &mut Criterion) {
 
     let config = fixture.config();
     let mut group = c.benchmark_group("sparql_access_path_scaling");
-    group.sample_size(10);
+    group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
     group.measurement_time(config.measurement);
     for case in &cases {

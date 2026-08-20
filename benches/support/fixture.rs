@@ -35,6 +35,7 @@ pub struct BenchConfig {
     pub corpus: CorpusConfig,
     pub warm_up: Duration,
     pub measurement: Duration,
+    pub sample_size: usize,
 }
 
 impl BenchConfig {
@@ -57,10 +58,17 @@ impl BenchConfig {
             );
         }
 
+        let sample_size = env_usize("CRAQLE_BENCH_SAMPLE_SIZE", 10);
+        assert!(
+            sample_size >= 10,
+            "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
+        );
+
         Self {
             corpus,
             warm_up: env_duration("CRAQLE_BENCH_WARMUP_SECS", 1),
             measurement: env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5),
+            sample_size,
         }
     }
 }
@@ -138,6 +146,7 @@ struct FixtureMetrics {
     inserted_data_quads: usize,
     encoded_terms_constructed: usize,
     encoded_term_payload_bytes: usize,
+    fixture_digest: String,
     database: DirectoryBytes,
 }
 
@@ -193,6 +202,29 @@ impl Fixture {
         let mut inserted_data_quads = 0usize;
         let mut encoded_terms_constructed = 0usize;
         let mut encoded_term_payload_bytes = 0usize;
+        let mut fixture_hasher = blake3::Hasher::new();
+        hash_frame(&mut fixture_hasher, b"domain", b"craqle-fixture/v1");
+        hash_frame(&mut fixture_hasher, b"version", CORPUS_VERSION.as_bytes());
+        hash_frame(
+            &mut fixture_hasher,
+            b"seed",
+            &config.corpus.seed.to_be_bytes(),
+        );
+        hash_frame(
+            &mut fixture_hasher,
+            b"quads",
+            &(config.corpus.quads as u64).to_be_bytes(),
+        );
+        hash_frame(
+            &mut fixture_hasher,
+            b"graphs",
+            &(config.corpus.graphs as u64).to_be_bytes(),
+        );
+        hash_frame(
+            &mut fixture_hasher,
+            b"duplicates",
+            &[config.corpus.duplicate_percent],
+        );
         let mut star_probe = None;
         let mut late_rare_probe: Option<(u128, Probe)> = None;
         let mut duplicate_probe = None;
@@ -217,6 +249,14 @@ impl Fixture {
             let subject = subject_term(record.subject);
             let predicate = predicate_term(record.predicate);
             let object = object_term(record.object);
+            hash_frame(
+                &mut fixture_hasher,
+                b"graph",
+                all_graphs[graph_index].as_str().as_bytes(),
+            );
+            hash_frame(&mut fixture_hasher, b"subject", subject.0.as_bytes());
+            hash_frame(&mut fixture_hasher, b"predicate", predicate.0.as_bytes());
+            hash_frame(&mut fixture_hasher, b"object", object.0.as_bytes());
             encoded_terms_constructed += 3;
             encoded_term_payload_bytes += subject.0.len() + predicate.0.len() + object.0.len();
 
@@ -377,6 +417,7 @@ impl Fixture {
         });
         let database_bytes = directory_bytes_bounded(database.path())
             .expect("measure bounded benchmark database directory size");
+        let fixture_digest = fixture_hasher.finalize().to_hex().to_string();
 
         Self {
             node,
@@ -393,6 +434,7 @@ impl Fixture {
                 inserted_data_quads,
                 encoded_terms_constructed,
                 encoded_term_payload_bytes,
+                fixture_digest,
                 database: database_bytes,
             },
         }
@@ -400,6 +442,10 @@ impl Fixture {
 
     pub fn config(&self) -> BenchConfig {
         self.config
+    }
+
+    pub fn fixture_digest(&self) -> &str {
+        &self.metrics.fixture_digest
     }
 
     pub fn node(&self) -> &CraqleNode {
@@ -623,6 +669,10 @@ impl Fixture {
             LOAD_BATCH_SIZE,
             craqle_commit,
         );
+        println!(
+            "sparql_hot_path fixture: fixture_digest={}",
+            self.fixture_digest()
+        );
         if self.metrics.database.complete {
             println!(
                 "sparql_hot_path fixture: database_directory_bytes={} entries={}",
@@ -630,8 +680,8 @@ impl Fixture {
             );
         } else {
             println!(
-                "sparql_hot_path fixture: database_directory_bytes_at_least={} entries_scanned={} \
-                 walk_entry_cap={}",
+                "sparql_hot_path fixture: database_directory_partial_bytes={} entries_scanned={} \
+                 walk_entry_cap={} walk_complete=false",
                 self.metrics.database.bytes,
                 self.metrics.database.entries,
                 DIRECTORY_SIZE_ENTRY_LIMIT,
@@ -901,6 +951,13 @@ fn subject_order_key(subject: &EncodedTerm) -> u128 {
     u128::from_be_bytes(hasher.finalize().as_bytes()[..16].try_into().unwrap())
 }
 
+fn hash_frame(hasher: &mut blake3::Hasher, domain: &[u8], value: &[u8]) {
+    hasher.update(&(domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
 fn subject_term(subject: u64) -> EncodedTerm {
     EncodedTerm(format!(
         "<urn:craqle:bench:performance-corpus-v1:subject:{subject:016x}>"
@@ -962,9 +1019,19 @@ fn directory_bytes_bounded(root: &Path) -> std::io::Result<DirectoryBytes> {
     let mut paths = vec![root.to_path_buf()];
     let mut entries = 0usize;
     let mut bytes = 0u64;
+    let mut complete = true;
 
     while let Some(path) = paths.pop() {
-        for entry in fs::read_dir(path)? {
+        let read_dir = if path == root {
+            Some(fs::read_dir(&path)?)
+        } else {
+            retry_missing(|| fs::read_dir(&path))?
+        };
+        let Some(read_dir) = read_dir else {
+            complete = false;
+            continue;
+        };
+        for entry in read_dir {
             if entries == DIRECTORY_SIZE_ENTRY_LIMIT {
                 return Ok(DirectoryBytes {
                     bytes,
@@ -972,13 +1039,27 @@ fn directory_bytes_bounded(root: &Path) -> std::io::Result<DirectoryBytes> {
                     complete: false,
                 });
             }
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    complete = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             entries += 1;
-            let file_type = entry.file_type()?;
+            let Some(file_type) = retry_missing(|| entry.file_type())? else {
+                complete = false;
+                continue;
+            };
             if file_type.is_dir() {
                 paths.push(entry.path());
             } else if file_type.is_file() {
-                bytes = bytes.saturating_add(entry.metadata()?.len());
+                let Some(metadata) = retry_missing(|| entry.metadata())? else {
+                    complete = false;
+                    continue;
+                };
+                bytes = bytes.saturating_add(metadata.len());
             }
         }
     }
@@ -986,8 +1067,19 @@ fn directory_bytes_bounded(root: &Path) -> std::io::Result<DirectoryBytes> {
     Ok(DirectoryBytes {
         bytes,
         entries,
-        complete: true,
+        complete,
     })
+}
+
+fn retry_missing<T>(mut read: impl FnMut() -> std::io::Result<T>) -> std::io::Result<Option<T>> {
+    for _ in 0..3 {
+        match read() {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 fn repository_commit() -> String {

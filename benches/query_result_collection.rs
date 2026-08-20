@@ -161,6 +161,25 @@ fn collect_positional_compat(
     positional_to_compatibility(&collect_positional(variables, source))
 }
 
+fn env_sample_size() -> usize {
+    match std::env::var("CRAQLE_BENCH_SAMPLE_SIZE") {
+        Ok(value) => {
+            let sample_size = value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("CRAQLE_BENCH_SAMPLE_SIZE must be an integer"));
+            assert!(
+                sample_size >= 10,
+                "CRAQLE_BENCH_SAMPLE_SIZE must be at least 10"
+            );
+            sample_size
+        }
+        Err(std::env::VarError::NotPresent) => 10,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("CRAQLE_BENCH_SAMPLE_SIZE must be valid UTF-8")
+        }
+    }
+}
+
 fn benchmark_result_collection(c: &mut Criterion) {
     let warm_up = std::env::var("CRAQLE_BENCH_WARMUP_SECS")
         .ok()
@@ -172,8 +191,9 @@ fn benchmark_result_collection(c: &mut Criterion) {
         .and_then(|value| value.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(3));
+    let sample_size = env_sample_size();
     let mut group = c.benchmark_group("query_result_collection");
-    group.sample_size(10);
+    group.sample_size(sample_size);
     group.warm_up_time(warm_up);
     group.measurement_time(measurement);
 

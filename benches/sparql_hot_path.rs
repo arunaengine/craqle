@@ -1,11 +1,30 @@
 use std::hint::black_box;
 
+#[path = "support/allocation.rs"]
+mod allocation;
 #[path = "support/mod.rs"]
 mod support;
 
+use allocation::AllocationInterval;
 use craqle::{QueryExecutionOptions, QueryFastPathMode};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::Fixture;
+
+fn print_alloc(fixture: &Fixture, index: usize, mode: craqle::QueryReadMode) {
+    let interval = AllocationInterval::begin();
+    let (results, _) = fixture.run_hot_mode(index, mode);
+    let sample = interval.finish();
+    println!(
+        "sparql_hot_path allocation: fixture_digest={} case={} mode={mode:?} \
+         allocations={} allocated_bytes={} peak_live_delta_bytes={}",
+        fixture.fixture_digest(),
+        fixture.hot_path_label(index),
+        sample.allocations,
+        sample.allocated_bytes,
+        sample.peak_live_delta_bytes,
+    );
+    std::hint::black_box(results);
+}
 
 fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     let fixture = Fixture::from_environment();
@@ -14,10 +33,13 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     let report = fixture.assert_semantics();
     fixture.print_report(&report);
     fixture.print_hot_work();
+    for index in 0..fixture.hot_path_count() {
+        print_alloc(&fixture, index, craqle::QueryReadMode::Auto);
+    }
 
     let config = fixture.config();
     let mut group = c.benchmark_group("sparql_hot_path");
-    group.sample_size(10);
+    group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
     group.measurement_time(config.measurement);
 
@@ -34,7 +56,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     let mut generic_options = QueryExecutionOptions::default();
     generic_options.fast_paths = QueryFastPathMode::Disabled;
     let mut group = c.benchmark_group("sparql_fast_path_comparison");
-    group.sample_size(10);
+    group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
     group.measurement_time(config.measurement);
     for index in 0..5 {
@@ -60,7 +82,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
 
     let config = fixture.config();
     let mut group = c.benchmark_group("sparql_repeated_execution");
-    group.sample_size(10);
+    group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
     group.measurement_time(config.measurement);
 
