@@ -33,6 +33,9 @@ mod search;
 mod search;
 #[path = "internal/search_queue.rs"]
 mod search_queue;
+#[cfg(feature = "shacl-core")]
+#[path = "internal/shacl/mod.rs"]
+mod shacl_impl;
 #[path = "internal/sparql.rs"]
 mod sparql;
 #[path = "internal/sparql_fast_path.rs"]
