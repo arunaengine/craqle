@@ -63,6 +63,8 @@ struct ValidationCacheKey {
     schema: [u8; 32],
     data_graph: String,
     data_version: [u8; 32],
+    max_path_edges: u64,
+    max_path_depth: usize,
 }
 
 pub(crate) struct ShaclCompiler {
@@ -195,7 +197,7 @@ impl ShaclCompiler {
     ) -> Result<ShaclValidationReport> {
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
         let view = StoreReadView::new(&self.store);
-        let cache_key = self.validation_cache_key(&view, data_graph, schema)?;
+        let cache_key = self.validation_cache_key(&view, data_graph, schema, options)?;
         let report = match eval::validate_view(
             &view,
             resolved,
@@ -225,10 +227,13 @@ impl ShaclCompiler {
         changes: &[MaterializedQuadChange],
         options: &ShaclValidationOptions,
     ) -> Result<ShaclValidationReport> {
+        if options.cancellation.is_cancelled() {
+            return Err(ShaclError::ValidationCancelled.into());
+        }
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
         let index = DeltaIndex::build(&self.store, data_graph, changes)?;
         let base = StoreReadView::new(&self.store);
-        let base_cache_key = self.validation_cache_key(&base, data_graph, schema)?;
+        let base_cache_key = self.validation_cache_key(&base, data_graph, schema, options)?;
         let base_report =
             if let Some(report) = self.validation_cache().get(&base_cache_key).cloned() {
                 report
@@ -310,12 +315,15 @@ impl ShaclCompiler {
         view: &StoreReadView<'_>,
         data_graph: &GraphId,
         schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
     ) -> Result<ValidationCacheKey> {
         let graph = crate::store::hash_term(&EncodedTerm::from_named_node(&data_graph.0));
         Ok(ValidationCacheKey {
             schema: schema.inner.plan_fingerprint(),
             data_graph: data_graph.to_string(),
             data_version: view.snapshot().graph_version(&self.store, graph)?,
+            max_path_edges: options.max_path_edges,
+            max_path_depth: options.max_path_depth,
         })
     }
 
@@ -340,6 +348,7 @@ impl ShaclCompiler {
         data_graph: &GraphId,
         schema: &CompiledShaclSchema,
         data_version: [u8; 32],
+        options: &ShaclValidationOptions,
         report: ShaclValidationReport,
     ) {
         self.cache_validation(
@@ -347,6 +356,8 @@ impl ShaclCompiler {
                 schema: schema.inner.plan_fingerprint(),
                 data_graph: data_graph.to_string(),
                 data_version,
+                max_path_edges: options.max_path_edges,
+                max_path_depth: options.max_path_depth,
             },
             report,
         );
@@ -356,10 +367,11 @@ impl ShaclCompiler {
         &self,
         data_graph: &GraphId,
         schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
         report: ShaclValidationReport,
     ) -> Result<()> {
         let view = StoreReadView::new(&self.store);
-        let key = self.validation_cache_key(&view, data_graph, schema)?;
+        let key = self.validation_cache_key(&view, data_graph, schema, options)?;
         self.cache_validation(key, report);
         Ok(())
     }
