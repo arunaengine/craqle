@@ -74,13 +74,7 @@ fn assert_modes(fixture: &Fixture, case: &ScalingCase) {
 
 fn sparql_access_path_scaling(c: &mut Criterion) {
     let fixture = Fixture::from_environment();
-    let terms = fixture.query_terms();
-    let pattern = format!(
-        "GRAPH <{}> {{ ?s {} {} }}",
-        terms.graph.as_str(),
-        terms.rare_predicate.0,
-        terms.rare_object.0,
-    );
+    let pattern = fixture.late_rare_pattern();
     let cases = [
         ScalingCase {
             label: "named_predicate_object_ask",

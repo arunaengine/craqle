@@ -73,6 +73,7 @@ pub struct Fixture {
     all_graphs: Vec<GraphId>,
     visible_graphs: Vec<GraphId>,
     terms: QueryTerms,
+    late_rare_probe: Probe,
     cases: Vec<QueryCase>,
     duplicate_queries: Option<DuplicateQueries>,
     hidden_query: Option<String>,
@@ -193,6 +194,7 @@ impl Fixture {
         let mut encoded_terms_constructed = 0usize;
         let mut encoded_term_payload_bytes = 0usize;
         let mut star_probe = None;
+        let mut late_rare_probe: Option<(u128, Probe)> = None;
         let mut duplicate_probe = None;
         let mut hidden_probe = None;
         let mut visible_hot_pair_records = 0usize;
@@ -233,19 +235,35 @@ impl Fixture {
             // A star selected after the duplicate prefix is wholly canonical:
             // its seven sibling records share the canonical graph locality.
             let star_start = record.ordinal - record.ordinal % 8;
-            if star_probe.is_none()
-                && !record.duplicate
+            let is_visible_canonical_star = !record.duplicate
                 && star_start >= config.corpus.duplicate_quads()
                 && visibility == GraphVisibility::Visible
                 && record.shape == CorpusShape::SameSubjectStar
-                && record.predicate.is_rare()
-            {
-                star_probe = Some(Probe {
-                    graph: all_graphs[graph_index].clone(),
-                    subject: subject.clone(),
-                    predicate: predicate.clone(),
-                    object: object.clone(),
-                });
+                && record.predicate.is_rare();
+            if is_visible_canonical_star {
+                if star_probe.is_none() {
+                    star_probe = Some(Probe {
+                        graph: all_graphs[graph_index].clone(),
+                        subject: subject.clone(),
+                        predicate: predicate.clone(),
+                        object: object.clone(),
+                    });
+                }
+                let order_key = source_subject_order_key(&subject);
+                if late_rare_probe
+                    .as_ref()
+                    .is_none_or(|(current, _)| order_key > *current)
+                {
+                    late_rare_probe = Some((
+                        order_key,
+                        Probe {
+                            graph: all_graphs[graph_index].clone(),
+                            subject: subject.clone(),
+                            predicate: predicate.clone(),
+                            object: object.clone(),
+                        },
+                    ));
+                }
             }
             if duplicate_probe.is_none() && record.duplicate {
                 duplicate_probe = Some(Probe {
@@ -305,6 +323,9 @@ impl Fixture {
         node.persist_fjall().expect("persist benchmark fixture");
 
         let star_probe = star_probe.expect("find a complete visible canonical star");
+        let late_rare_probe = late_rare_probe
+            .expect("find a late complete visible canonical star")
+            .1;
         let common_predicate = predicate_term(PredicateKind::Common(0));
         let common_object = object_term(ObjectSpec::Literal(0));
         assert!(
@@ -364,6 +385,7 @@ impl Fixture {
             all_graphs,
             visible_graphs,
             terms,
+            late_rare_probe,
             cases,
             duplicate_queries,
             hidden_query,
@@ -382,6 +404,15 @@ impl Fixture {
 
     pub fn query_terms(&self) -> &QueryTerms {
         &self.terms
+    }
+
+    pub fn late_rare_pattern(&self) -> String {
+        format!(
+            "GRAPH <{}> {{ ?s {} {} }}",
+            self.late_rare_probe.graph.as_str(),
+            self.late_rare_probe.predicate.0,
+            self.late_rare_probe.object.0,
+        )
     }
 
     /// Visibility comes only from the generated graph-id index, never from
@@ -858,6 +889,13 @@ fn graph_id(index: usize) -> GraphId {
     GraphId::new(&format!(
         "urn:craqle:bench:performance-corpus-v1:graph:{index}"
     ))
+}
+
+fn source_subject_order_key(subject: &EncodedTerm) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"craqle-term/v1\0");
+    hasher.update(subject.0.as_bytes());
+    u128::from_be_bytes(hasher.finalize().as_bytes()[..16].try_into().unwrap())
 }
 
 fn subject_term(subject: u64) -> EncodedTerm {
