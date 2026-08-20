@@ -50,7 +50,7 @@ fn insert(node: &CraqleNode, graph: &GraphId, triples: &[(&str, &str, &str)]) {
 }
 
 #[test]
-fn compiles_node_and_blank_property_shape_and_caches_by_digest() {
+fn compile_shape_cache() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:compile");
     let shape = iri("urn:test:shape");
@@ -120,7 +120,7 @@ fn compiles_node_and_blank_property_shape_and_caches_by_digest() {
 }
 
 #[test]
-fn canonical_digest_ignores_blank_node_labels_and_graph_identity() {
+fn canonical_digest() {
     let (_database, node) = node();
     let first_graph = GraphId::new("urn:test:shacl:canonical:first");
     let second_graph = GraphId::new("urn:test:shacl:canonical:second");
@@ -160,7 +160,7 @@ fn canonical_digest_ignores_blank_node_labels_and_graph_identity() {
 }
 
 #[test]
-fn compiles_inverse_sequence_and_alternative_paths() {
+fn compile_path_variants() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:paths");
     let property_shape = sh("PropertyShape");
@@ -199,7 +199,7 @@ fn compiles_inverse_sequence_and_alternative_paths() {
 }
 
 #[test]
-fn compiles_logical_shape_lists() {
+fn compile_logical_lists() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:logical");
     let root = iri("urn:test:logical-root");
@@ -229,7 +229,7 @@ fn compiles_logical_shape_lists() {
 }
 
 #[test]
-fn rejects_unsupported_sparql_before_compilation() {
+fn reject_sparql() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:sparql");
     let shape = iri("urn:test:sparql-shape");
@@ -255,7 +255,7 @@ fn rejects_unsupported_sparql_before_compilation() {
 }
 
 #[test]
-fn rejects_declared_custom_constraint_components() {
+fn reject_custom_constraints() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:custom-component");
     let component = iri("urn:test:custom-component");
@@ -277,7 +277,7 @@ fn rejects_declared_custom_constraint_components() {
 }
 
 #[test]
-fn rejects_property_shape_without_a_path() {
+fn reject_pathless_shape() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:ill-formed");
     let shape = iri("urn:test:property-without-path");
@@ -294,7 +294,7 @@ fn rejects_property_shape_without_a_path() {
 }
 
 #[test]
-fn rejects_property_shape_with_multiple_paths() {
+fn reject_multiple_paths() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:multiple-paths");
     let shape = iri("urn:test:property-with-multiple-paths");
@@ -320,7 +320,7 @@ fn rejects_property_shape_with_multiple_paths() {
 }
 
 #[test]
-fn property_shape_definition_may_be_completed_by_a_local_import() {
+fn local_import_completes_shape() {
     let (_database, node) = node();
     let root = GraphId::new("urn:test:shacl:split-property-root");
     let imported = GraphId::new("urn:test:shacl:split-property-import");
@@ -366,7 +366,7 @@ fn property_shape_definition_may_be_completed_by_a_local_import() {
 }
 
 #[test]
-fn local_imports_are_explicit_and_part_of_the_cache_key() {
+fn local_import_cache() {
     let (_database, node) = node();
     let root = GraphId::new("urn:test:shacl:root");
     let imported = GraphId::new("urn:test:shacl:imported");
@@ -409,7 +409,7 @@ fn local_imports_are_explicit_and_part_of_the_cache_key() {
 }
 
 #[test]
-fn imported_blank_nodes_keep_graph_local_scope() {
+fn imported_nodes_local() {
     let (_database, node) = node();
     let root = GraphId::new("urn:test:shacl:scoped-root");
     let first = GraphId::new("urn:test:shacl:scoped-first");
@@ -445,7 +445,7 @@ fn imported_blank_nodes_keep_graph_local_scope() {
 }
 
 #[test]
-fn local_import_cycle_is_rejected() {
+fn reject_import_cycle() {
     let (_database, node) = node();
     let first = GraphId::new("urn:test:shacl:cycle:first");
     let second = GraphId::new("urn:test:shacl:cycle:second");
