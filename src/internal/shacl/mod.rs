@@ -1,6 +1,7 @@
 pub(crate) mod compile;
 pub(crate) mod constraints;
 pub(crate) mod dependencies;
+pub(crate) mod eval;
 pub(crate) mod model;
 pub(crate) mod paths;
 pub(crate) mod report;
