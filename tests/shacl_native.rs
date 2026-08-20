@@ -450,3 +450,396 @@ fn native_inverse_sequence_and_repeating_paths_enforce_budgets() {
         CraqleError::Shacl(ShaclError::PathDepthExceeded { limit: 1 })
     ));
 }
+
+#[test]
+fn native_validation_cancellation_and_result_limits_are_errors() {
+    let (_database, node) = node();
+    let shapes = GraphId::new("urn:test:shacl:native:limits:shapes");
+    let data = GraphId::new("urn:test:shacl:native:limits:data");
+    let focus = iri("urn:test:limit-focus");
+    let predicate = iri("urn:test:required");
+    let node_shape = sh("NodeShape");
+    let target_node = sh("targetNode");
+    let property = sh("property");
+    let path = sh("path");
+    let min_count = sh("minCount");
+    insert(
+        &node,
+        &shapes,
+        &[
+            ("_:node", RDF_TYPE, &node_shape),
+            ("_:node", &target_node, &focus),
+            ("_:node", &property, "_:first"),
+            ("_:node", &property, "_:second"),
+            ("_:first", &path, &predicate),
+            ("_:first", &min_count, &integer(1)),
+            ("_:second", &path, &iri("urn:test:also-required")),
+            ("_:second", &min_count, &integer(1)),
+        ],
+    );
+    insert(
+        &node,
+        &data,
+        &[(&focus, &iri("urn:test:present"), &literal("value"))],
+    );
+    let schema = node
+        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .unwrap();
+
+    let error = node
+        .validate_shacl(
+            &data,
+            &schema,
+            &ShaclValidationOptions {
+                max_results: 1,
+                ..ShaclValidationOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CraqleError::Shacl(ShaclError::ResultLimitExceeded { limit: 1 })
+    ));
+
+    let cancellation = QueryCancellation::new();
+    cancellation.cancel();
+    let error = node
+        .validate_shacl(
+            &data,
+            &schema,
+            &ShaclValidationOptions {
+                cancellation,
+                ..ShaclValidationOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CraqleError::Shacl(ShaclError::ValidationCancelled)
+    ));
+}
+
+#[test]
+fn native_targets_and_closed_shapes_report_only_the_violating_terms() {
+    let (_database, node) = node();
+    let shapes = GraphId::new("urn:test:shacl:native:targets:shapes");
+    let data = GraphId::new("urn:test:shacl:native:targets:data");
+    let class = iri("urn:test:TargetClass");
+    let class_focus = iri("urn:test:class-focus");
+    let subject_focus = iri("urn:test:subject-focus");
+    let object_focus = iri("urn:test:object-focus");
+    let target_predicate = iri("urn:test:target-predicate");
+    let required = iri("urn:test:required-property");
+    let node_shape = sh("NodeShape");
+    let target_class = sh("targetClass");
+    let target_subjects = sh("targetSubjectsOf");
+    let target_objects = sh("targetObjectsOf");
+    let property = sh("property");
+    let path = sh("path");
+    let min_count = sh("minCount");
+    for (shape, target, target_value) in [
+        ("_:classShape", target_class.as_str(), class.as_str()),
+        (
+            "_:subjectShape",
+            target_subjects.as_str(),
+            target_predicate.as_str(),
+        ),
+        (
+            "_:objectShape",
+            target_objects.as_str(),
+            target_predicate.as_str(),
+        ),
+    ] {
+        insert(
+            &node,
+            &shapes,
+            &[
+                (shape, RDF_TYPE, &node_shape),
+                (shape, target, target_value),
+                (shape, &property, &format!("{shape}Property")),
+                (&format!("{shape}Property"), &path, &required),
+                (&format!("{shape}Property"), &min_count, &integer(1)),
+            ],
+        );
+    }
+    insert(
+        &node,
+        &data,
+        &[
+            (&class_focus, RDF_TYPE, &class),
+            (&subject_focus, &target_predicate, &object_focus),
+        ],
+    );
+
+    let schema = node
+        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    let report = node
+        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    let focus_nodes = report
+        .results
+        .iter()
+        .map(|result| result.focus_node.0.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        focus_nodes,
+        std::collections::BTreeSet::from([
+            class_focus.as_str(),
+            subject_focus.as_str(),
+            object_focus.as_str(),
+        ])
+    );
+
+    let closed_shapes = GraphId::new("urn:test:shacl:native:closed:shapes");
+    let closed_data = GraphId::new("urn:test:shacl:native:closed:data");
+    let focus = iri("urn:test:closed-focus");
+    let allowed = iri("urn:test:allowed");
+    let rejected = iri("urn:test:rejected");
+    let target_node = sh("targetNode");
+    let closed = sh("closed");
+    let ignored = sh("ignoredProperties");
+    insert(
+        &node,
+        &closed_shapes,
+        &[
+            ("_:shape", RDF_TYPE, &node_shape),
+            ("_:shape", &target_node, &focus),
+            (
+                "_:shape",
+                &closed,
+                "\"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>",
+            ),
+            ("_:shape", &ignored, "_:ignored"),
+            ("_:ignored", RDF_FIRST, RDF_TYPE),
+            ("_:ignored", RDF_REST, RDF_NIL),
+            ("_:shape", &property, "_:allowedProperty"),
+            ("_:allowedProperty", &path, &allowed),
+        ],
+    );
+    insert(
+        &node,
+        &closed_data,
+        &[
+            (&focus, RDF_TYPE, &class),
+            (&focus, &allowed, &literal("kept")),
+            (&focus, &rejected, &literal("reported")),
+        ],
+    );
+    let schema = node
+        .compile_shacl(&closed_shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    let report = node
+        .validate_shacl(&closed_data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(
+        report.results[0].result_path.as_deref(),
+        Some(rejected.as_str())
+    );
+    assert_eq!(
+        report.results[0].value.as_ref().unwrap().0,
+        literal("reported")
+    );
+}
+
+#[test]
+fn native_report_matches_rudof_for_supported_named_shape_fixture() {
+    let (_database, node) = node();
+    let shapes = GraphId::new("urn:test:shacl:native:differential:shapes");
+    let data = GraphId::new("urn:test:shacl:native:differential:data");
+    let node_shape = iri("urn:test:differential-node-shape");
+    let property_shape = iri("urn:test:differential-property-shape");
+    let focus = iri("urn:test:differential-focus");
+    let predicate = iri("urn:test:differential-value");
+    let node_shape_type = sh("NodeShape");
+    let property_shape_type = sh("PropertyShape");
+    let target_node = sh("targetNode");
+    let property = sh("property");
+    let path = sh("path");
+    let min_count = sh("minCount");
+    let severity = sh("severity");
+    let warning = sh("Warning");
+    let message = sh("message");
+    insert(
+        &node,
+        &shapes,
+        &[
+            (&node_shape, RDF_TYPE, &node_shape_type),
+            (&node_shape, &target_node, &focus),
+            (&node_shape, &property, &property_shape),
+            (&property_shape, RDF_TYPE, &property_shape_type),
+            (&property_shape, &path, &predicate),
+            (&property_shape, &min_count, &integer(2)),
+            (&property_shape, &severity, &warning),
+            (&property_shape, &message, &literal("at least two values")),
+        ],
+    );
+    insert(&node, &data, &[(&focus, &predicate, &literal("only one"))]);
+    let schema = node
+        .compile_shacl(&shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    let native = node
+        .validate_shacl(&data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+
+    let shape_text = format!(
+        "{node_shape} {RDF_TYPE} {node_shape_type} .\n\
+         {node_shape} {target_node} {focus} .\n\
+         {node_shape} {property} {property_shape} .\n\
+         {property_shape} {RDF_TYPE} {property_shape_type} .\n\
+         {property_shape} {path} {predicate} .\n\
+         {property_shape} {min_count} {} .\n\
+         {property_shape} {severity} {warning} .\n\
+         {property_shape} {message} {} .\n",
+        integer(2),
+        literal("at least two values")
+    );
+    let data_text = format!("{focus} {predicate} {} .\n", literal("only one"));
+    let rudof = rudof_validate(&shape_text, &data_text);
+
+    assert_eq!(native.conforms, rudof.conforms());
+    assert_eq!(normalize_native(&native), normalize_rudof(&rudof));
+}
+
+#[test]
+fn native_string_language_class_and_in_constraints_match_rudof() {
+    let root = iri("urn:test:matrix:root");
+    let text_shape = iri("urn:test:matrix:text-shape");
+    let language_shape = iri("urn:test:matrix:language-shape");
+    let class_shape = iri("urn:test:matrix:class-shape");
+    let in_shape = iri("urn:test:matrix:in-shape");
+    let focus = iri("urn:test:matrix:focus");
+    let text = iri("urn:test:matrix:text");
+    let language = iri("urn:test:matrix:language");
+    let reference = iri("urn:test:matrix:reference");
+    let choice = iri("urn:test:matrix:choice");
+    let class = iri("urn:test:matrix:Class");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} {text_shape} .\n\
+         {root} {} {language_shape} .\n\
+         {root} {} {class_shape} .\n\
+         {root} {} {in_shape} .\n\
+         {text_shape} {RDF_TYPE} {} .\n\
+         {text_shape} {} {text} .\n\
+         {text_shape} {} {} .\n\
+         {text_shape} {} {} .\n\
+         {text_shape} {} {} .\n\
+         {text_shape} {} {} .\n\
+         {text_shape} {} {} .\n\
+         {language_shape} {RDF_TYPE} {} .\n\
+         {language_shape} {} {language} .\n\
+         {language_shape} {} {} .\n\
+         {language_shape} {} _:languages .\n\
+         _:languages {RDF_FIRST} {} .\n\
+         _:languages {RDF_REST} {RDF_NIL} .\n\
+         {class_shape} {RDF_TYPE} {} .\n\
+         {class_shape} {} {reference} .\n\
+         {class_shape} {} {class} .\n\
+         {in_shape} {RDF_TYPE} {} .\n\
+         {in_shape} {} {choice} .\n\
+         {in_shape} {} _:choices .\n\
+         _:choices {RDF_FIRST} {} .\n\
+         _:choices {RDF_REST} _:choiceTail .\n\
+         _:choiceTail {RDF_FIRST} {} .\n\
+         _:choiceTail {RDF_REST} {RDF_NIL} .\n\
+         {text_shape} {} {} .\n\
+         {language_shape} {} {} .\n\
+         {class_shape} {} {} .\n\
+         {in_shape} {} {} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("nodeKind"),
+        sh("Literal"),
+        sh("minLength"),
+        integer(4),
+        sh("maxLength"),
+        integer(6),
+        sh("pattern"),
+        literal("^A"),
+        sh("flags"),
+        literal("i"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("uniqueLang"),
+        "\"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>",
+        sh("languageIn"),
+        literal("en"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("class"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("in"),
+        literal("one"),
+        literal("two"),
+        sh("message"),
+        literal("text constraint"),
+        sh("message"),
+        literal("language constraint"),
+        sh("message"),
+        literal("class constraint"),
+        sh("message"),
+        literal("in constraint"),
+    );
+    let data_text = format!(
+        "{focus} {text} {} .\n\
+         {focus} {language} \"first\"@en .\n\
+         {focus} {language} \"second\"@EN .\n\
+         {focus} {reference} {} .\n\
+         {focus} {choice} {} .\n",
+        literal("xy"),
+        iri("urn:test:matrix:untyped"),
+        literal("three"),
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
+
+#[test]
+fn native_numeric_boundaries_match_rudof() {
+    let root = iri("urn:test:numeric:root");
+    let property = iri("urn:test:numeric:property-shape");
+    let focus = iri("urn:test:numeric:focus");
+    let predicate = iri("urn:test:numeric:value");
+    let shape_text = format!(
+        "{root} {RDF_TYPE} {} .\n\
+         {root} {} {focus} .\n\
+         {root} {} {property} .\n\
+         {property} {RDF_TYPE} {} .\n\
+         {property} {} {predicate} .\n\
+         {property} {} {} .\n\
+         {property} {} {} .\n\
+         {property} {} {} .\n\
+         {property} {} {} .\n",
+        sh("NodeShape"),
+        sh("targetNode"),
+        sh("property"),
+        sh("PropertyShape"),
+        sh("path"),
+        sh("datatype"),
+        iri("http://www.w3.org/2001/XMLSchema#integer"),
+        sh("minInclusive"),
+        integer(10),
+        sh("maxExclusive"),
+        integer(20),
+        sh("message"),
+        literal("numeric constraint"),
+    );
+    let data_text = format!(
+        "{focus} {predicate} {} .\n\
+         {focus} {predicate} {} .\n\
+         {focus} {predicate} {} .\n",
+        integer(9),
+        integer(20),
+        literal("not-an-integer"),
+    );
+    assert_native_matches_rudof(&shape_text, &data_text);
+}
