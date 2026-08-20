@@ -837,12 +837,12 @@ fn estimate_variable_distinct(
     };
     let estimate = match (subject, object) {
         (true, false) => predicate.map_or_else(
-            || cx.store.stat_distinct_subject_count(),
-            |predicate| cx.store.stat_predicate_distinct_subject_count(predicate),
+            || cx.store.distinct_subject_count(),
+            |predicate| cx.store.predicate_subject_count(predicate),
         ) as u64,
         (false, true) => predicate.map_or_else(
-            || cx.store.stat_distinct_object_count(),
-            |predicate| cx.store.stat_predicate_distinct_object_count(predicate),
+            || cx.store.distinct_object_count(),
+            |predicate| cx.store.predicate_object_count(predicate),
         ) as u64,
         _ => rows,
     };
@@ -1354,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn join_cost_matrix_keeps_selective_probes_and_hashes_repeated_work() {
+    fn compare_join_costs() {
         for outer_rows in [1, 10, 1_000, 100_000] {
             for distinct_keys in [1, 10, 1_000, 100_000] {
                 for right_rows in [100, 100_000, 10_000_000] {
@@ -1381,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_hash_and_lateral_emit_distinct_physical_shapes() {
+    fn forced_join_shapes() {
         let (_dir, store) = seeded_store();
         let text = "SELECT ?d ?n WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> ?n }";
 
@@ -1415,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_join_mode_never_silently_falls_back() {
+    fn forced_join_fallback() {
         let (_dir, store) = seeded_store();
         let mut query = parse("SELECT ?d WHERE { ?d a <http://schema.org/Dataset> }");
         assert!(matches!(

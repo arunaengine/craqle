@@ -1639,7 +1639,7 @@ impl StoreReadSnapshot {
     }
 
     pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
-        store.query_index_snapshot_admission(&self.snapshot)
+        store.snapshot_admission(&self.snapshot)
     }
 
     pub(crate) fn contains_graph_by_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
@@ -1888,7 +1888,7 @@ impl GraphStore {
     /// O(1) qv1 eligibility gate for a single execution snapshot. Full source
     /// and qv cross-checking belongs to open-time verification and explicit
     /// maintenance checks; doing it here would erase the index's query value.
-    fn query_index_snapshot_admission(&self, snapshot: &Snapshot) -> Result<QueryIndexAdmission> {
+    fn snapshot_admission(&self, snapshot: &Snapshot) -> Result<QueryIndexAdmission> {
         #[cfg(test)]
         self.query_index_admission_probes
             .fetch_add(1, Ordering::Relaxed);
@@ -1911,10 +1911,10 @@ impl GraphStore {
             }
             QueryIndexHeaderRead::Valid(header) => header,
         };
-        self.query_index_admission_for_header(snapshot, &header)
+        self.header_admission(snapshot, &header)
     }
 
-    fn query_index_admission_for_header(
+    fn header_admission(
         &self,
         snapshot: &Snapshot,
         header: &QueryIndexHeader,
@@ -2058,7 +2058,7 @@ impl GraphStore {
                 #[cfg(test)]
                 self.query_index_admission_probes
                     .fetch_add(1, Ordering::Relaxed);
-                let admission = self.query_index_admission_for_header(&snapshot, &header)?;
+                let admission = self.header_admission(&snapshot, &header)?;
                 let state =
                     if matches!(header.state, StoredQueryIndexState::Ready) && !admission.trusted {
                         QueryIndexState::Failed(
@@ -2132,7 +2132,7 @@ impl GraphStore {
                 if !matches!(header.state, StoredQueryIndexState::Ready) {
                     return Ok(());
                 }
-                let admission = self.query_index_snapshot_admission(&snapshot)?;
+                let admission = self.snapshot_admission(&snapshot)?;
                 if admission.trusted {
                     return Ok(());
                 }
@@ -3472,12 +3472,12 @@ impl GraphStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn query_index_verification_run_count(&self) -> u64 {
+    pub(crate) fn index_verify_count(&self) -> u64 {
         self.query_index_verification_runs.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_query_indexes_for_test(&self) {
+    pub(crate) fn fail_test_indexes(&self) {
         let _indexes = self.indexes_write();
         let snapshot = self.db.snapshot();
         let previous = match self.query_index_header_from_snapshot(&snapshot).unwrap() {
@@ -3832,7 +3832,7 @@ impl GraphStore {
         })
     }
 
-    pub(crate) fn stat_predicate_distinct_subject_count(&self, predicate: TermId) -> usize {
+    pub(crate) fn predicate_subject_count(&self, predicate: TermId) -> usize {
         self.with_derived_indexes(|indexes| {
             indexes
                 .predicate_subject_term_counts
@@ -3842,7 +3842,7 @@ impl GraphStore {
         })
     }
 
-    pub(crate) fn stat_predicate_distinct_object_count(&self, predicate: TermId) -> usize {
+    pub(crate) fn predicate_object_count(&self, predicate: TermId) -> usize {
         self.with_derived_indexes(|indexes| {
             indexes
                 .predicate_object_term_counts
@@ -3868,11 +3868,11 @@ impl GraphStore {
         })
     }
 
-    pub(crate) fn stat_distinct_subject_count(&self) -> usize {
+    pub(crate) fn distinct_subject_count(&self) -> usize {
         self.with_derived_indexes(|indexes| indexes.by_subject.len())
     }
 
-    pub(crate) fn stat_distinct_object_count(&self) -> usize {
+    pub(crate) fn distinct_object_count(&self) -> usize {
         self.with_derived_indexes(|indexes| indexes.object_counts.len())
     }
 
@@ -6033,7 +6033,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_predicate_distinct_counts_track_live_rows() {
+    fn planner_distinct_counts() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:planner-distinct");
         store.create_graph(&graph).unwrap();
@@ -6045,33 +6045,33 @@ mod tests {
         commit_add(&store, &graph, third);
 
         assert_eq!(
-            store.stat_predicate_distinct_subject_count(first.predicate),
+            store.predicate_subject_count(first.predicate),
             2
         );
         assert_eq!(
-            store.stat_predicate_distinct_object_count(first.predicate),
+            store.predicate_object_count(first.predicate),
             2
         );
 
         let clock = store.get_vector_clock(&graph).unwrap();
         commit_remove(&store, &graph, third, &clock);
         assert_eq!(
-            store.stat_predicate_distinct_subject_count(first.predicate),
+            store.predicate_subject_count(first.predicate),
             1
         );
         assert_eq!(
-            store.stat_predicate_distinct_object_count(first.predicate),
+            store.predicate_object_count(first.predicate),
             2
         );
 
         let clock = store.get_vector_clock(&graph).unwrap();
         commit_remove(&store, &graph, first, &clock);
         assert_eq!(
-            store.stat_predicate_distinct_subject_count(first.predicate),
+            store.predicate_subject_count(first.predicate),
             1
         );
         assert_eq!(
-            store.stat_predicate_distinct_object_count(first.predicate),
+            store.predicate_object_count(first.predicate),
             1
         );
     }
@@ -6296,7 +6296,7 @@ mod tests {
     }
 
     #[test]
-    fn default_union_untrusted_states_fail_before_scanning_every_spo_binding_shape() {
+    fn union_untrusted_fails() {
         let (_dir, store) = setup_store();
         let first_graph = GraphId::new("urn:test:qv:default-fallback:first");
         let second_graph = GraphId::new("urn:test:qv:default-fallback:second");
@@ -6895,7 +6895,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_fast_status_and_normal_reopen_skip_full_verification() {
+    fn index_status_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:fast-status-reopen");
         {
@@ -6907,7 +6907,7 @@ mod tests {
         }
 
         let reopened = GraphStore::open(dir.path()).unwrap();
-        assert_eq!(0, reopened.query_index_verification_run_count());
+        assert_eq!(0, reopened.index_verify_count());
         let probes_before = reopened.query_index_admission_probe_count();
         let status = reopened.query_index_status_fast().unwrap();
         assert_eq!(QueryIndexState::Ready, status.state);
@@ -6918,14 +6918,14 @@ mod tests {
             reopened.query_index_admission_probe_count() - probes_before,
             "fast status reads only the header and total counter"
         );
-        assert_eq!(0, reopened.query_index_verification_run_count());
+        assert_eq!(0, reopened.index_verify_count());
 
         let sampled = reopened
             .verify_query_indexes(QueryIndexVerificationMode::Sample)
             .unwrap();
         assert!(sampled.valid);
         assert!(!sampled.full);
-        assert_eq!(1, reopened.query_index_verification_run_count());
+        assert_eq!(1, reopened.index_verify_count());
     }
 
     #[test]

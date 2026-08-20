@@ -169,7 +169,7 @@ impl<'store> StoreReadView<'store> {
         }
     }
 
-    fn forced_qv_access_path(selector: GraphSelector, pattern: QuadPattern) -> ReadAccessPath {
+    fn force_qv_path(selector: GraphSelector, pattern: QuadPattern) -> ReadAccessPath {
         match selector {
             GraphSelector::Named(_) if pattern.predicate.is_some() => ReadAccessPath::QvGpos,
             GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::QvSpog,
@@ -283,7 +283,7 @@ impl RdfReadView for StoreReadView<'_> {
         let requested = match self.read_mode {
             QueryReadMode::Auto => Self::auto_access_path(selector, pattern),
             QueryReadMode::ForceSource => ReadAccessPath::SourceGspo,
-            QueryReadMode::ForceQv => Self::forced_qv_access_path(selector, pattern),
+            QueryReadMode::ForceQv => Self::force_qv_path(selector, pattern),
         };
         if matches!(requested, ReadAccessPath::SourceGspo) {
             if matches!(selector, GraphSelector::DefaultUnion) {
@@ -701,10 +701,7 @@ mod tests {
         graph_id
     }
 
-    fn add_same_subject_across_graphs(
-        store: &GraphStore,
-        graph_count: usize,
-    ) -> (GraphId, EncodedQuad) {
+    fn add_subject_graphs(store: &GraphStore, graph_count: usize) -> (GraphId, EncodedQuad) {
         let target_iri = format!("urn:test:named-subject:target:{graph_count}");
         let target = GraphId::new(&target_iri);
         store.create_graph(&target).unwrap();
@@ -1471,10 +1468,10 @@ mod tests {
     }
 
     #[test]
-    fn named_subject_auto_path_is_graph_local_at_1_32_and_1000_graphs() {
+    fn named_subject_scaling() {
         for graph_count in [1, 32, 1_000] {
             let (_directory, store) = setup_store();
-            let (graph, expected) = add_same_subject_across_graphs(&store, graph_count);
+            let (graph, expected) = add_subject_graphs(&store, graph_count);
 
             let auto = StoreReadView::with_read_mode(&store, QueryReadMode::Auto);
             let auto_context = ReadContext::default();
@@ -1526,11 +1523,11 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_default_union_errors_and_named_union_fallback_is_linear() {
+    fn union_fallback_linear() {
         for graph_count in [10, 100] {
             let (_directory, store) = setup_store();
-            let (_, expected) = add_same_subject_across_graphs(&store, graph_count);
-            store.fail_query_indexes_for_test();
+            let (_, expected) = add_subject_graphs(&store, graph_count);
+            store.fail_test_indexes();
 
             let view = StoreReadView::with_read_mode(&store, QueryReadMode::Auto);
             let context = ReadContext::default();
@@ -1565,7 +1562,7 @@ mod tests {
         }
 
         let (_directory, store) = setup_store();
-        let (_, expected) = add_same_subject_across_graphs(&store, 2);
+        let (_, expected) = add_subject_graphs(&store, 2);
         let source = StoreReadView::with_read_mode(&store, QueryReadMode::ForceSource);
         assert!(matches!(
             source.scan(
