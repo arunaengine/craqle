@@ -5046,6 +5046,29 @@ impl GraphStore {
         self.write_quad_state(batch, quad, dots)
     }
 
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn quad_dots(
+        &self,
+        graph: &GraphId,
+        subject: &EncodedTerm,
+        predicate: &EncodedTerm,
+        object: &EncodedTerm,
+    ) -> Result<Vec<Dot>> {
+        let Some(graph) = self.graph_id_for(graph)? else {
+            return Ok(Vec::new());
+        };
+        let Some(subject) = self.lookup_term(subject)? else {
+            return Ok(Vec::new());
+        };
+        let Some(predicate) = self.lookup_term(predicate)? else {
+            return Ok(Vec::new());
+        };
+        let Some(object) = self.lookup_term(object)? else {
+            return Ok(Vec::new());
+        };
+        self.read_quad_dots(&Self::quad_key(graph, subject, predicate, object))
+    }
+
     /// Is this exact quad live? O(1) against the derived indexes, committed
     /// state only — uncommitted batch state is invisible here.
     pub fn contains_quad(&self, quad: EncodedQuad) -> bool {
