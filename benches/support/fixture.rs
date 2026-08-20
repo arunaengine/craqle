@@ -428,6 +428,12 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{} query preparation failed", case.label))
     }
 
+    pub fn prepare_query(&self, sparql: &str) -> PreparedQuery {
+        self.node
+            .prepare_query(sparql)
+            .unwrap_or_else(|_| panic!("benchmark query preparation failed"))
+    }
+
     pub fn run_hot_path_with_statistics(&self, index: usize) -> QueryExecution {
         let case = self
             .cases

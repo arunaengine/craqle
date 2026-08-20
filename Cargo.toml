@@ -126,3 +126,7 @@ harness = false
 [[bench]]
 name = "sparql_join_choice"
 harness = false
+
+[[bench]]
+name = "sparql_access_path_scaling"
+harness = false
