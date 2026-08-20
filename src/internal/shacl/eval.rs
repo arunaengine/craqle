@@ -45,6 +45,451 @@ struct Validator<'view, 'context, 'options, V> {
 }
 
 impl<V: RdfReadView> Validator<'_, '_, '_, V> {
+    fn evaluate_shape(&mut self, shape_id: ShapeId, focus: TermId, emit: bool) -> Result<bool> {
+        let schema = self.schema.clone();
+        let index = shape_id.0 as usize;
+        let portable = &schema.portable.shapes[index];
+        if portable.deactivated {
+            return Ok(true);
+        }
+        if !emit {
+            match self.conformance_cache.get(&(shape_id, focus)).copied() {
+                Some(CachedConformance::Conforms) => return Ok(true),
+                Some(CachedConformance::Violates) => return Ok(false),
+                Some(CachedConformance::InProgress) => {
+                    return Err(crate::shacl::ShaclError::CyclicShapeEvaluation {
+                        shape: portable.label.0.clone(),
+                        focus: format!("{:032x}", focus.0),
+                    }
+                    .into());
+                }
+                None => {}
+            }
+            self.conformance_cache
+                .insert((shape_id, focus), CachedConformance::InProgress);
+        }
+
+        let mut conforms = true;
+        for constraint in &schema.shapes[index].constraints {
+            self.statistics.constraints_evaluated =
+                self.statistics.constraints_evaluated.saturating_add(1);
+            if !self.evaluate_constraint(shape_id, focus, constraint, emit)? {
+                conforms = false;
+                if !emit || self.halted {
+                    break;
+                }
+            }
+        }
+        if !emit {
+            self.conformance_cache.insert(
+                (shape_id, focus),
+                if conforms {
+                    CachedConformance::Conforms
+                } else {
+                    CachedConformance::Violates
+                },
+            );
+        }
+        Ok(conforms)
+    }
+
+    fn evaluate_constraint(
+        &mut self,
+        shape_id: ShapeId,
+        focus: TermId,
+        constraint: &ResolvedConstraint,
+        emit: bool,
+    ) -> Result<bool> {
+        match constraint {
+            ResolvedConstraint::MinCount(minimum) => {
+                let values = self.shape_values(shape_id, focus, Some(*minimum))?;
+                let conforms = values.len() >= *minimum;
+                if !conforms {
+                    self.violate(shape_id, constraint, focus, None, None, None, emit)?;
+                }
+                Ok(conforms)
+            }
+            ResolvedConstraint::MaxCount(maximum) => {
+                let cap = maximum.checked_add(1);
+                let values = self.shape_values(shape_id, focus, cap)?;
+                let conforms = values.len() <= *maximum;
+                if !conforms {
+                    self.violate(shape_id, constraint, focus, None, None, None, emit)?;
+                }
+                Ok(conforms)
+            }
+            ResolvedConstraint::HasValue(expected) => {
+                let conforms = self.has_value(shape_id, focus, *expected)?;
+                if !conforms {
+                    self.violate(shape_id, constraint, focus, None, None, None, emit)?;
+                }
+                Ok(conforms)
+            }
+            ResolvedConstraint::Closed { ignored_properties } => {
+                self.evaluate_closed(shape_id, focus, constraint, ignored_properties, emit)
+            }
+            ResolvedConstraint::QualifiedValueShape {
+                shape,
+                min_count,
+                max_count,
+                disjoint,
+                siblings,
+            } => {
+                let values = self.shape_values(shape_id, focus, None)?;
+                let mut count = 0usize;
+                for value in values.iter().copied() {
+                    if !self.evaluate_shape(*shape, value, false)? {
+                        continue;
+                    }
+                    if *disjoint {
+                        let mut sibling_match = false;
+                        for sibling in siblings {
+                            if self.evaluate_shape(*sibling, value, false)? {
+                                sibling_match = true;
+                                break;
+                            }
+                        }
+                        if sibling_match {
+                            continue;
+                        }
+                    }
+                    count = count.saturating_add(1);
+                }
+                let mut conforms = true;
+                if min_count.is_some_and(|minimum| count < minimum) {
+                    conforms = false;
+                    self.violate(
+                        shape_id,
+                        constraint,
+                        focus,
+                        None,
+                        None,
+                        Some(QUALIFIED_MIN),
+                        emit,
+                    )?;
+                }
+                if max_count.is_some_and(|maximum| count > maximum) {
+                    conforms = false;
+                    self.violate(
+                        shape_id,
+                        constraint,
+                        focus,
+                        None,
+                        None,
+                        Some(QUALIFIED_MAX),
+                        emit,
+                    )?;
+                }
+                Ok(conforms)
+            }
+            _ => self.evaluate_value_constraint(shape_id, focus, constraint, emit),
+        }
+    }
+
+    fn evaluate_value_constraint(
+        &mut self,
+        shape_id: ShapeId,
+        focus: TermId,
+        constraint: &ResolvedConstraint,
+        emit: bool,
+    ) -> Result<bool> {
+        let values = self.shape_values(shape_id, focus, None)?;
+        let mut conforms = true;
+        match constraint {
+            ResolvedConstraint::Class(class) => {
+                for value in values.iter().copied() {
+                    if !self.view.exists(
+                        self.context,
+                        GraphSelector::Named(self.graph),
+                        QuadPattern {
+                            subject: Some(value),
+                            predicate: Some(self.rdf_type),
+                            object: Some(*class),
+                            ..QuadPattern::default()
+                        },
+                    )? {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::Datatype(datatype) => {
+                for value in values.iter().copied() {
+                    let meta = self.term_meta.get(self.view, self.context, value)?.cloned();
+                    if meta.as_ref().and_then(|meta| meta.datatype) != Some(*datatype) {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::NodeKind(kind) => {
+                for value in values.iter().copied() {
+                    let actual = self
+                        .term_meta
+                        .get(self.view, self.context, value)?
+                        .map(|meta| meta.kind);
+                    if !node_kind_matches(*kind, actual) {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::MinExclusive(boundary)
+            | ResolvedConstraint::MaxExclusive(boundary)
+            | ResolvedConstraint::MinInclusive(boundary)
+            | ResolvedConstraint::MaxInclusive(boundary) => {
+                for value in values.iter().copied() {
+                    let comparison = self
+                        .term_meta
+                        .get(self.view, self.context, value)?
+                        .and_then(|meta| meta.partial_cmp(boundary));
+                    let valid = match constraint {
+                        ResolvedConstraint::MinExclusive(_) => {
+                            comparison == Some(Ordering::Greater)
+                        }
+                        ResolvedConstraint::MaxExclusive(_) => comparison == Some(Ordering::Less),
+                        ResolvedConstraint::MinInclusive(_) => {
+                            matches!(comparison, Some(Ordering::Greater | Ordering::Equal))
+                        }
+                        ResolvedConstraint::MaxInclusive(_) => {
+                            matches!(comparison, Some(Ordering::Less | Ordering::Equal))
+                        }
+                        _ => unreachable!(),
+                    };
+                    if !valid {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::MinLength(minimum) | ResolvedConstraint::MaxLength(minimum) => {
+                for value in values.iter().copied() {
+                    let length = self
+                        .term_meta
+                        .get(self.view, self.context, value)?
+                        .filter(|meta| meta.lexical.is_some())
+                        .map(|meta| meta.lexical_length);
+                    let valid = match constraint {
+                        ResolvedConstraint::MinLength(_) => {
+                            length.is_some_and(|length| length >= *minimum)
+                        }
+                        ResolvedConstraint::MaxLength(_) => {
+                            length.is_some_and(|length| length <= *minimum)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if !valid {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::Pattern(pattern) => {
+                for value in values.iter().copied() {
+                    let matches = self
+                        .term_meta
+                        .get(self.view, self.context, value)?
+                        .and_then(|meta| meta.lexical.as_deref())
+                        .is_some_and(|lexical| pattern.is_match(lexical));
+                    if !matches {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::UniqueLang(required) => {
+                if *required {
+                    let mut seen = HashMap::new();
+                    let mut reported = BTreeSet::new();
+                    for value in values.iter().copied() {
+                        let language = self
+                            .term_meta
+                            .get(self.view, self.context, value)?
+                            .and_then(|meta| meta.language.clone());
+                        if let Some(language) = language
+                            && seen.insert(language.clone(), value).is_some()
+                            && reported.insert(language)
+                        {
+                            conforms = false;
+                            self.violate(shape_id, constraint, focus, None, None, None, emit)?;
+                            if self.halted || !emit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::LanguageIn(ranges) => {
+                for value in values.iter().copied() {
+                    let valid = self
+                        .term_meta
+                        .get(self.view, self.context, value)?
+                        .and_then(|meta| meta.language.as_deref())
+                        .is_some_and(|language| language_matches(language, ranges));
+                    if !valid {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::In(allowed) => {
+                for value in values.iter().copied() {
+                    if !allowed.contains(&value) {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::Equals(predicate) => {
+                let other = self.predicate_values(focus, *predicate)?;
+                for value in values.symmetric_difference(&other).copied() {
+                    conforms = false;
+                    self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                    if self.halted || !emit {
+                        break;
+                    }
+                }
+            }
+            ResolvedConstraint::Disjoint(predicate) => {
+                let other = self.predicate_values(focus, *predicate)?;
+                for value in values.intersection(&other).copied() {
+                    conforms = false;
+                    self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                    if self.halted || !emit {
+                        break;
+                    }
+                }
+            }
+            ResolvedConstraint::LessThan(predicate)
+            | ResolvedConstraint::LessThanOrEquals(predicate) => {
+                let other = self.predicate_values(focus, *predicate)?;
+                for value in values.iter().copied() {
+                    let left = self.term_meta.get(self.view, self.context, value)?.cloned();
+                    let mut valid = left.is_some();
+                    if let Some(left) = left {
+                        for right in &other {
+                            let comparison = self
+                                .term_meta
+                                .get(self.view, self.context, *right)?
+                                .and_then(|right| left.partial_cmp(right));
+                            let ordered = match constraint {
+                                ResolvedConstraint::LessThan(_) => {
+                                    comparison == Some(Ordering::Less)
+                                }
+                                ResolvedConstraint::LessThanOrEquals(_) => {
+                                    matches!(comparison, Some(Ordering::Less | Ordering::Equal))
+                                }
+                                _ => unreachable!(),
+                            };
+                            if !ordered {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::Node(shape) => {
+                for value in values.iter().copied() {
+                    if !self.evaluate_shape(*shape, value, false)? {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::Not(shape) => {
+                for value in values.iter().copied() {
+                    if self.evaluate_shape(*shape, value, false)? {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::And(shapes) | ResolvedConstraint::Or(shapes) => {
+                for value in values.iter().copied() {
+                    let mut matches = 0usize;
+                    for shape in shapes {
+                        if self.evaluate_shape(*shape, value, false)? {
+                            matches += 1;
+                        }
+                    }
+                    let valid = match constraint {
+                        ResolvedConstraint::And(_) => matches == shapes.len(),
+                        ResolvedConstraint::Or(_) => matches > 0,
+                        _ => unreachable!(),
+                    };
+                    if !valid {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::Xone(shapes) => {
+                for value in values.iter().copied() {
+                    let mut matches = 0usize;
+                    for shape in shapes {
+                        if self.evaluate_shape(*shape, value, false)? {
+                            matches += 1;
+                        }
+                    }
+                    if matches != 1 {
+                        conforms = false;
+                        self.violate(shape_id, constraint, focus, Some(value), None, None, emit)?;
+                        if self.halted || !emit {
+                            break;
+                        }
+                    }
+                }
+            }
+            ResolvedConstraint::MinCount(_)
+            | ResolvedConstraint::MaxCount(_)
+            | ResolvedConstraint::HasValue(_)
+            | ResolvedConstraint::QualifiedValueShape { .. }
+            | ResolvedConstraint::Closed { .. } => unreachable!(),
+        }
+        Ok(conforms)
+    }
+
     fn shape_values(
         &mut self,
         shape_id: ShapeId,
