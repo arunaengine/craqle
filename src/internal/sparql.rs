@@ -97,6 +97,50 @@ pub struct QueryExecution {
     pub statistics: QueryExecutionStatistics,
 }
 
+/// Serializable logical and physical plan for one prepared query.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueryPlan {
+    pub fingerprint: String,
+    pub root: QueryPlanNode,
+}
+
+/// One operator in a Craqle query plan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueryPlanNode {
+    pub logical_operator: QueryLogicalOperator,
+    pub physical_operator: QueryPhysicalOperator,
+    pub access_paths: Vec<crate::query_context::ReadAccessPath>,
+    pub estimated_rows: Option<u64>,
+    pub actual_rows: Option<u64>,
+    pub index_seeks: u64,
+    pub candidate_rows: u64,
+    pub output_rows: u64,
+    pub elapsed_time: Duration,
+    pub children: Vec<QueryPlanNode>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum QueryLogicalOperator {
+    Ask,
+    #[default]
+    Select,
+    Construct,
+    Describe,
+    Join,
+    Evaluation,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum QueryPhysicalOperator {
+    #[default]
+    Generic,
+    FastPath(QueryFastPathKind),
+    PlannedJoin(JoinKind),
+    Evaluator(String),
+}
+
 /// Work and stage timings for one complete query execution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryExecutionStatistics {
@@ -130,6 +174,7 @@ pub struct QueryExecutionStatistics {
     pub intermediate_rows: u64,
     pub result_rows: u64,
     pub result_cells: u64,
+    pub plan: QueryPlan,
 }
 
 pub(crate) struct SparqlEngine {
@@ -198,6 +243,58 @@ impl SparqlEngine {
 
     pub(crate) fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
         Ok(parse_prepared_query(sparql)?.0)
+    }
+
+    pub(crate) fn explain_prepared_with_graphs(
+        &self,
+        prepared: &PreparedQuery,
+        graphs: &[GraphId],
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        self.explain_prepared_with_scope(prepared, GraphScope::List(graphs), None, options)
+    }
+
+    pub(crate) fn explain_prepared_with_snapshot_visibility(
+        &self,
+        prepared: &PreparedQuery,
+        policy_visible: &SnapshotVisibleFn<'_>,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
+        let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
+        self.explain_prepared_with_scope(
+            prepared,
+            GraphScope::Predicate(&visible),
+            Some((self.store.as_ref(), policy_visible)),
+            options,
+        )
+    }
+
+    fn explain_prepared_with_scope(
+        &self,
+        prepared: &PreparedQuery,
+        scope: GraphScope<'_>,
+        post_raw_visibility: Option<(&GraphStore, &SnapshotVisibleFn<'_>)>,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        let mut query = prepared.query.as_ref().clone();
+        rewrite_fts_query(
+            &mut query,
+            FtsRewriteCtx {
+                search: self.search.as_ref(),
+                scope,
+                post_raw_visibility,
+            },
+        )?;
+        let fast_path = fast_path_plan(&query, options);
+        let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
+        let fast_path = select_fast_path(fast_path, &planner_trace);
+        Ok(explain_query_plan(
+            &query,
+            query_fingerprint(&query),
+            &planner_trace,
+            fast_path.as_ref(),
+        ))
     }
 
     pub(crate) fn query_with_graphs(
@@ -325,6 +422,7 @@ impl SparqlEngine {
         }
         let craqle_planning_time = planning_started.elapsed();
         let plan_fingerprint = query_fingerprint(&query);
+        let logical_operator = query_logical_operator(&query);
         self.execute_query(
             query,
             scope,
@@ -337,6 +435,7 @@ impl SparqlEngine {
                 plan_fingerprint,
                 planner_trace,
                 fast_path,
+                logical_operator,
             },
             collect_plan_statistics,
         )
@@ -413,6 +512,7 @@ impl SparqlEngine {
         }
         let craqle_planning_time = planning_started.elapsed();
         let plan_fingerprint = query_fingerprint(&query);
+        let logical_operator = query_logical_operator(&query);
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         self.execute_query(
             query,
@@ -426,6 +526,7 @@ impl SparqlEngine {
                 plan_fingerprint,
                 planner_trace,
                 fast_path,
+                logical_operator,
             },
             collect_plan_statistics,
         )
@@ -462,6 +563,7 @@ impl SparqlEngine {
                 },
             );
             statistics.fast_path = Some(outcome.kind);
+            statistics.plan.root.physical_operator = QueryPhysicalOperator::FastPath(outcome.kind);
             return Ok((
                 QueryExecution {
                     results: outcome.results,
@@ -639,12 +741,14 @@ struct QueryStageStatistics {
     plan_fingerprint: String,
     planner_trace: PlannerTrace,
     fast_path: Option<FastPathPlan>,
+    logical_operator: QueryLogicalOperator,
 }
 
 #[derive(Default)]
 struct ExplanationMetrics {
     planning_time: Duration,
     intermediate_rows: u64,
+    plan: Option<QueryPlanNode>,
 }
 
 #[derive(Default)]
@@ -756,10 +860,42 @@ fn read_explanation_metrics(
         .get("plan")
         .map(|plan| explanation_descendant_rows(plan, true))
         .unwrap_or_default();
+    let plan = value.get("plan").map(explanation_plan_node);
     Ok(ExplanationMetrics {
         planning_time,
         intermediate_rows,
+        plan,
     })
+}
+
+fn explanation_plan_node(node: &serde_json::Value) -> QueryPlanNode {
+    let actual_rows = node
+        .get("number of results")
+        .and_then(serde_json::Value::as_u64);
+    let elapsed_time = node
+        .get("duration in seconds")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or_default();
+    QueryPlanNode {
+        logical_operator: QueryLogicalOperator::Evaluation,
+        physical_operator: QueryPhysicalOperator::Evaluator(
+            node.get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        ),
+        actual_rows,
+        output_rows: actual_rows.unwrap_or_default(),
+        elapsed_time,
+        children: node
+            .get("children")
+            .and_then(serde_json::Value::as_array)
+            .map(|children| children.iter().map(explanation_plan_node).collect())
+            .unwrap_or_default(),
+        ..QueryPlanNode::default()
+    }
 }
 
 fn explanation_descendant_rows(node: &serde_json::Value, root: bool) -> u64 {
@@ -787,15 +923,45 @@ fn build_execution_statistics(
     collection: CollectionMetrics,
     explanation: ExplanationMetrics,
 ) -> QueryExecutionStatistics {
+    let execution_time = initial_execution_time
+        .saturating_sub(explanation.planning_time)
+        .saturating_add(collection.execution_time);
+    let estimated_rows = stages
+        .planner_trace
+        .joins
+        .last()
+        .map(|join| join.estimated_output_rows);
+    let mut plan_children: Vec<_> = stages
+        .planner_trace
+        .joins
+        .iter()
+        .map(planned_join_node)
+        .collect();
+    if let Some(plan) = explanation.plan {
+        plan_children.push(plan);
+    }
+    let plan = QueryPlan {
+        fingerprint: stages.plan_fingerprint.clone(),
+        root: QueryPlanNode {
+            logical_operator: stages.logical_operator,
+            physical_operator: QueryPhysicalOperator::Generic,
+            access_paths: reads.selected_access_paths.clone(),
+            estimated_rows,
+            actual_rows: Some(collection.result_rows),
+            index_seeks: reads.index_seeks,
+            candidate_rows: reads.candidate_quads,
+            output_rows: collection.result_rows,
+            elapsed_time: execution_time.saturating_add(collection.collection_time),
+            children: plan_children,
+        },
+    };
     QueryExecutionStatistics {
         parse_time: stages.parse_time,
         rewrite_time: stages.rewrite_time,
         planning_time: stages
             .craqle_planning_time
             .saturating_add(explanation.planning_time),
-        execution_time: initial_execution_time
-            .saturating_sub(explanation.planning_time)
-            .saturating_add(collection.execution_time),
+        execution_time,
         result_collection_time: collection.collection_time,
         time_to_first_internal_result: collection.time_to_first_internal_result,
         fast_path: None,
@@ -822,6 +988,48 @@ fn build_execution_statistics(
         intermediate_rows: explanation.intermediate_rows,
         result_rows: collection.result_rows,
         result_cells: collection.result_cells,
+        plan,
+    }
+}
+
+fn query_logical_operator(query: &Query) -> QueryLogicalOperator {
+    match query {
+        Query::Ask { .. } => QueryLogicalOperator::Ask,
+        Query::Select { .. } => QueryLogicalOperator::Select,
+        Query::Construct { .. } => QueryLogicalOperator::Construct,
+        Query::Describe { .. } => QueryLogicalOperator::Describe,
+    }
+}
+
+fn explain_query_plan(
+    query: &Query,
+    fingerprint: String,
+    planner_trace: &PlannerTrace,
+    fast_path: Option<&FastPathPlan>,
+) -> QueryPlan {
+    QueryPlan {
+        fingerprint,
+        root: QueryPlanNode {
+            logical_operator: query_logical_operator(query),
+            physical_operator: fast_path.map_or(QueryPhysicalOperator::Generic, |plan| {
+                QueryPhysicalOperator::FastPath(plan.kind())
+            }),
+            estimated_rows: planner_trace
+                .joins
+                .last()
+                .map(|join| join.estimated_output_rows),
+            children: planner_trace.joins.iter().map(planned_join_node).collect(),
+            ..QueryPlanNode::default()
+        },
+    }
+}
+
+fn planned_join_node(join: &PlannedJoin) -> QueryPlanNode {
+    QueryPlanNode {
+        logical_operator: QueryLogicalOperator::Join,
+        physical_operator: QueryPhysicalOperator::PlannedJoin(join.physical_operator),
+        estimated_rows: Some(join.estimated_output_rows),
+        ..QueryPlanNode::default()
     }
 }
 

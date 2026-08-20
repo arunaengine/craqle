@@ -21,7 +21,7 @@ pub enum QueryFastPathMode {
 }
 
 /// Guarded executor used for a complete query result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum QueryFastPathKind {
     Ask,
     SelectLimit,
@@ -80,6 +80,23 @@ pub(crate) enum FastPathPlan {
 }
 
 impl FastPathPlan {
+    pub(crate) fn kind(&self) -> QueryFastPathKind {
+        match self {
+            Self::Ask(_) => QueryFastPathKind::Ask,
+            Self::SelectLimit { .. } => QueryFastPathKind::SelectLimit,
+            Self::Count {
+                distinct_subject: true,
+                ..
+            } => QueryFastPathKind::CountDistinctSubject,
+            Self::Count { triple, .. } => match &triple.graph {
+                PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
+                PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
+            },
+            Self::PropertyStar { .. } => QueryFastPathKind::PropertyStar,
+            Self::HashJoinCount { .. } => QueryFastPathKind::HashJoinCount,
+        }
+    }
+
     pub(crate) fn is_property_star(&self) -> bool {
         matches!(self, Self::PropertyStar { .. })
     }

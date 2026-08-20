@@ -79,7 +79,8 @@ pub use crate::rocrate::{
 };
 pub use crate::search::SearchHit;
 pub use crate::sparql::{
-    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics, QueryResults,
+    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
+    QueryLogicalOperator, QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryResults,
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
@@ -1791,6 +1792,36 @@ impl CraqleNode {
         )?)
     }
 
+    /// Inspect the current logical and physical plan without executing it.
+    pub fn explain_prepared(
+        &self,
+        auth: &dyn Authorizer,
+        query: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        Ok(self.sparql.explain_prepared_with_snapshot_visibility(
+            query,
+            &|snapshot, graph: &GraphId| {
+                snapshot
+                    .graph_policy(&self.store, graph)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
+            },
+            options,
+        )?)
+    }
+
+    /// Execute a prepared query completely and return its measured plan.
+    pub fn analyze_prepared(
+        &self,
+        auth: &dyn Authorizer,
+        query: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        Ok(self.execute_prepared(auth, query, options)?.statistics.plan)
+    }
+
     /// Execute a SPARQL query against an explicit set of local graphs.
     pub fn query_graphs(&self, graphs: &[GraphId], sparql: &str) -> Result<QueryResults> {
         Ok(self.sparql.query_with_graphs(sparql, graphs)?)
@@ -1815,6 +1846,31 @@ impl CraqleNode {
         Ok(self
             .sparql
             .execute_prepared_with_graphs(query, graphs, options)?)
+    }
+
+    /// Inspect a prepared plan for an explicit graph set without executing it.
+    pub fn explain_prepared_graphs(
+        &self,
+        graphs: &[GraphId],
+        query: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        Ok(self
+            .sparql
+            .explain_prepared_with_graphs(query, graphs, options)?)
+    }
+
+    /// Execute over explicit graphs completely and return the measured plan.
+    pub fn analyze_prepared_graphs(
+        &self,
+        graphs: &[GraphId],
+        query: &PreparedQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryPlan> {
+        Ok(self
+            .execute_prepared_graphs(graphs, query, options)?
+            .statistics
+            .plan)
     }
 
     /// Execute a complete query with an explicit storage-read mode.

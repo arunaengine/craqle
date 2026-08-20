@@ -1,6 +1,7 @@
 use craqle::{
     CraqleError, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId, JoinKind, JoinMode,
-    MaterializedQuadChange, QueryExecutionOptions, QueryResults,
+    MaterializedQuadChange, QueryExecutionOptions, QueryLogicalOperator, QueryPhysicalOperator,
+    QueryPlan, QueryResults,
 };
 
 fn iri(value: &str) -> EncodedTerm {
@@ -174,6 +175,36 @@ fn forced_hash_and_lateral_join_results_are_identical() {
         hash.statistics.planned_joins[0].physical_operator,
         JoinKind::Hash
     );
+    let explained = node
+        .explain_prepared_graphs(std::slice::from_ref(&graph), &prepared, &hash_options)
+        .unwrap();
+    assert_eq!(
+        explained.root.logical_operator,
+        QueryLogicalOperator::Select
+    );
+    assert_eq!(
+        explained.root.physical_operator,
+        QueryPhysicalOperator::Generic
+    );
+    assert!(explained.root.actual_rows.is_none());
+    assert!(explained.root.children.iter().any(|node| {
+        node.physical_operator == QueryPhysicalOperator::PlannedJoin(JoinKind::Hash)
+    }));
+    let serialized = serde_json::to_string(&explained).unwrap();
+    assert_eq!(
+        serde_json::from_str::<QueryPlan>(&serialized).unwrap(),
+        explained
+    );
+
+    let analyzed = node
+        .analyze_prepared_graphs(std::slice::from_ref(&graph), &prepared, &hash_options)
+        .unwrap();
+    assert_eq!(analyzed.root.actual_rows, Some(1));
+    assert_eq!(analyzed.root.output_rows, 1);
+    assert!(analyzed.root.index_seeks > 0);
+    assert!(analyzed.root.candidate_rows > 0);
+    assert!(!analyzed.root.access_paths.is_empty());
+    assert!(analyzed.root.elapsed_time > std::time::Duration::ZERO);
 
     let graph_query = node
         .prepare_query(
