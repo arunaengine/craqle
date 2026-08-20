@@ -13,11 +13,15 @@ use rudof_rdf::rdf_core::SHACLPath;
 use rudof_rdf::rdf_core::term::Object;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 
-use crate::shacl::{CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError};
-use crate::store::GraphStore;
-use crate::{EncodedTerm, GraphId, GraphReplicaSnapshot, Result, RoCrateVersion};
+use crate::shacl::{
+    CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError,
+    ShaclValidationOptions, ShaclValidationReport,
+};
+use crate::store::{GraphStore, StoreError};
+use crate::{CraqleError, EncodedTerm, GraphId, GraphReplicaSnapshot, Result, RoCrateVersion};
 
 use super::dependencies;
+use super::eval;
 use super::model::{
     COMPILED_SHACL_FORMAT_VERSION, CompiledSchemaInner, CompiledShape, ConstraintPlan, MessagePlan,
     NodeKindPlan, PathPlan, SeverityPlan, ShapeId, ShapeKind, TargetPlan,
@@ -165,6 +169,30 @@ impl ShaclCompiler {
         }
         cache.insert(fingerprint, resolved.clone());
         Ok((resolved, false, resolve_time))
+    }
+
+    pub(crate) fn validate(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
+        stop_after_first: bool,
+    ) -> Result<ShaclValidationReport> {
+        let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
+        match eval::validate(
+            &self.store,
+            resolved,
+            data_graph,
+            options,
+            cache_hit,
+            resolve_time,
+            stop_after_first,
+        ) {
+            Err(CraqleError::Store(StoreError::Cancelled)) => {
+                Err(ShaclError::ValidationCancelled.into())
+            }
+            result => result,
+        }
     }
 }
 

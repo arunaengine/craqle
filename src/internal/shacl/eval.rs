@@ -28,6 +28,93 @@ enum CachedConformance {
     Violates,
 }
 
+pub(crate) fn validate(
+    store: &GraphStore,
+    schema: Arc<ResolvedSchema>,
+    data_graph: &GraphId,
+    options: &ShaclValidationOptions,
+    resolved_cache_hit: bool,
+    resolve_time: Duration,
+    stop_after_first: bool,
+) -> Result<ShaclValidationReport> {
+    let view = StoreReadView::new(store);
+    if !view.contains_graph(data_graph)? {
+        return Err(crate::shacl::ShaclError::DataGraphNotFound {
+            graph: data_graph.to_string(),
+        }
+        .into());
+    }
+    let context = ReadContext::for_validation(options.cancellation.clone(), data_graph);
+    let graph_term = EncodedTerm::from_named_node(&data_graph.0);
+    let graph = view
+        .lookup_term(&context, &graph_term)?
+        .unwrap_or_else(|| hash_term(&graph_term));
+    let rdf_type_term = EncodedTerm(RDF_TYPE.to_owned());
+    let rdf_type = view
+        .lookup_term(&context, &rdf_type_term)?
+        .unwrap_or_else(|| hash_term(&rdf_type_term));
+
+    let target_start = Instant::now();
+    let mut target_work = TargetWork::default();
+    let targets = resolve_targets(&view, &context, graph, rdf_type, &schema, &mut target_work)?;
+    let target_time = target_start.elapsed();
+
+    let mut validator = Validator {
+        view: &view,
+        context: &context,
+        graph,
+        rdf_type,
+        schema,
+        options,
+        report: ReportBuilder::new(options.max_results, stop_after_first),
+        statistics: ShaclValidationStatistics {
+            shape_compile_cache_hit: resolved_cache_hit,
+            shapes_considered: targets.len() as u64,
+            target_candidates: target_work.candidates,
+            compile_time: resolve_time,
+            target_time,
+            ..ShaclValidationStatistics::default()
+        },
+        term_meta: TermMetaCache::default(),
+        path_work: PathWork::default(),
+        path_cache: HashMap::new(),
+        conformance_cache: HashMap::new(),
+        halted: false,
+    };
+
+    let constraint_start = Instant::now();
+    for (shape_index, focus_nodes) in targets.iter().enumerate() {
+        let shape_id = ShapeId(shape_index as u32);
+        if validator.schema.portable.shapes[shape_index].deactivated {
+            validator.statistics.shapes_skipped =
+                validator.statistics.shapes_skipped.saturating_add(1);
+            continue;
+        }
+        if focus_nodes.is_empty() {
+            validator.statistics.shapes_skipped =
+                validator.statistics.shapes_skipped.saturating_add(1);
+            continue;
+        }
+        validator.statistics.shapes_executed =
+            validator.statistics.shapes_executed.saturating_add(1);
+        for focus in focus_nodes {
+            validator.statistics.focus_nodes = validator.statistics.focus_nodes.saturating_add(1);
+            let _ = validator.evaluate_shape(shape_id, *focus, true)?;
+            if validator.halted {
+                validator.statistics.stopped_early = true;
+                break;
+            }
+        }
+        if validator.halted {
+            break;
+        }
+    }
+    validator.statistics.constraint_time = constraint_start.elapsed();
+    validator
+        .report
+        .finish(validator.view, validator.context, validator.statistics)
+}
+
 struct Validator<'view, 'context, 'options, V> {
     view: &'view V,
     context: &'context ReadContext<'context>,

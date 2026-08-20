@@ -851,6 +851,29 @@ impl CraqleNode {
         self.shacl.compile(shapes_graph, options)
     }
 
+    #[cfg(feature = "shacl-core")]
+    pub fn validate_shacl(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
+    ) -> Result<ShaclValidationReport> {
+        self.shacl.validate(data_graph, schema, options, false)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn conforms_shacl(
+        &self,
+        data_graph: &GraphId,
+        schema: &CompiledShaclSchema,
+        options: &ShaclValidationOptions,
+    ) -> Result<bool> {
+        Ok(self
+            .shacl
+            .validate(data_graph, schema, options, true)?
+            .conforms)
+    }
+
     /// Return the Fjall persistence mode used for explicit graph-store persists.
     pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
         self.store.persist_mode().into()
