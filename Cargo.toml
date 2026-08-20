@@ -27,7 +27,7 @@ uuid = { version = "1.24.1", features = ["v4", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # Hashing
-blake3 = "1.8.6"
+blake3 = "=1.8.7"
 regex = "1.13.1"
 
 # Error handling
