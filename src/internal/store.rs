@@ -630,6 +630,8 @@ struct DerivedIndexState {
     // instances are counted per graph (no cross-graph triple dedup).
     predicate_object_counts: HashMap<(TermId, TermId), usize>,
     predicate_counts: HashMap<TermId, usize>,
+    predicate_subject_term_counts: HashMap<TermId, HashMap<TermId, usize>>,
+    predicate_object_term_counts: HashMap<TermId, HashMap<TermId, usize>>,
     object_counts: HashMap<TermId, usize>,
     total_quads: usize,
 }
@@ -667,6 +669,18 @@ impl DerivedIndexState {
                 .entry((quad.predicate, quad.object))
                 .or_default() += 1;
             *self.predicate_counts.entry(quad.predicate).or_default() += 1;
+            *self
+                .predicate_subject_term_counts
+                .entry(quad.predicate)
+                .or_default()
+                .entry(quad.subject)
+                .or_default() += 1;
+            *self
+                .predicate_object_term_counts
+                .entry(quad.predicate)
+                .or_default()
+                .entry(quad.object)
+                .or_default() += 1;
             *self.object_counts.entry(quad.object).or_default() += 1;
             *self
                 .predicate_graph_counts
@@ -704,6 +718,16 @@ impl DerivedIndexState {
                     count.remove();
                 }
             }
+            decrement_nested_count(
+                &mut self.predicate_subject_term_counts,
+                quad.predicate,
+                quad.subject,
+            );
+            decrement_nested_count(
+                &mut self.predicate_object_term_counts,
+                quad.predicate,
+                quad.object,
+            );
             if let Entry::Occupied(mut count) = self.object_counts.entry(quad.object) {
                 *count.get_mut() = count.get().saturating_sub(1);
                 if *count.get() == 0 {
@@ -756,6 +780,24 @@ impl DerivedIndexState {
             if entry.get().is_empty() {
                 entry.remove();
             }
+        }
+    }
+}
+
+fn decrement_nested_count(
+    counts: &mut HashMap<TermId, HashMap<TermId, usize>>,
+    outer: TermId,
+    inner: TermId,
+) {
+    if let Entry::Occupied(mut outer_entry) = counts.entry(outer) {
+        if let Entry::Occupied(mut count) = outer_entry.get_mut().entry(inner) {
+            *count.get_mut() = count.get().saturating_sub(1);
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+        if outer_entry.get().is_empty() {
+            outer_entry.remove();
         }
     }
 }
@@ -3735,6 +3777,26 @@ impl GraphStore {
         })
     }
 
+    pub(crate) fn stat_predicate_distinct_subject_count(&self, predicate: TermId) -> usize {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .predicate_subject_term_counts
+                .get(&predicate)
+                .map(HashMap::len)
+                .unwrap_or(0)
+        })
+    }
+
+    pub(crate) fn stat_predicate_distinct_object_count(&self, predicate: TermId) -> usize {
+        self.with_derived_indexes(|indexes| {
+            indexes
+                .predicate_object_term_counts
+                .get(&predicate)
+                .map(HashMap::len)
+                .unwrap_or(0)
+        })
+    }
+
     pub(crate) fn stat_object_count(&self, object: TermId) -> usize {
         self.with_derived_indexes(|indexes| {
             indexes.object_counts.get(&object).copied().unwrap_or(0)
@@ -3749,6 +3811,14 @@ impl GraphStore {
                 .map(HashSet::len)
                 .unwrap_or(0)
         })
+    }
+
+    pub(crate) fn stat_distinct_subject_count(&self) -> usize {
+        self.with_derived_indexes(|indexes| indexes.by_subject.len())
+    }
+
+    pub(crate) fn stat_distinct_object_count(&self) -> usize {
+        self.with_derived_indexes(|indexes| indexes.object_counts.len())
     }
 
     pub(crate) fn stat_total_quads(&self) -> usize {
@@ -5705,6 +5775,50 @@ mod tests {
             .remove_quad(&mut batch, QuadRemove { quad, witnessed })
             .unwrap();
         store.commit(batch).unwrap();
+    }
+
+    #[test]
+    fn planner_predicate_distinct_counts_track_live_rows() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:planner-distinct");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o:1"));
+        let second = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o:2"));
+        let third = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o:1"));
+        commit_add(&store, &graph, first);
+        commit_add(&store, &graph, second);
+        commit_add(&store, &graph, third);
+
+        assert_eq!(
+            store.stat_predicate_distinct_subject_count(first.predicate),
+            2
+        );
+        assert_eq!(
+            store.stat_predicate_distinct_object_count(first.predicate),
+            2
+        );
+
+        let clock = store.get_vector_clock(&graph).unwrap();
+        commit_remove(&store, &graph, third, &clock);
+        assert_eq!(
+            store.stat_predicate_distinct_subject_count(first.predicate),
+            1
+        );
+        assert_eq!(
+            store.stat_predicate_distinct_object_count(first.predicate),
+            2
+        );
+
+        let clock = store.get_vector_clock(&graph).unwrap();
+        commit_remove(&store, &graph, first, &clock);
+        assert_eq!(
+            store.stat_predicate_distinct_subject_count(first.predicate),
+            1
+        );
+        assert_eq!(
+            store.stat_predicate_distinct_object_count(first.predicate),
+            1
+        );
     }
 
     fn query_index_header_for_test(store: &GraphStore) -> QueryIndexHeader {
