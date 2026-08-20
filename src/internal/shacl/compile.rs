@@ -38,6 +38,111 @@ const SH_RULE: &str = "<http://www.w3.org/ns/shacl#rule>";
 const SH_EXPRESSION: &str = "<http://www.w3.org/ns/shacl#expression>";
 const SH_JS_PREFIX: &str = "<http://www.w3.org/ns/shacl#js";
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    digest: [u8; 32],
+    model_version: u32,
+    rudof_version: &'static str,
+    rocrate_version: RoCrateVersion,
+    extension_profile: u32,
+}
+
+pub(crate) struct ShaclCompiler {
+    store: Arc<GraphStore>,
+    cache: Mutex<HashMap<CacheKey, Arc<CompiledSchemaInner>>>,
+}
+
+impl ShaclCompiler {
+    pub(crate) fn new(store: Arc<GraphStore>) -> Self {
+        Self {
+            store,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn compile(
+        &self,
+        shapes_graph: &GraphId,
+        options: &ShaclCompileOptions,
+    ) -> Result<CompiledShaclSchema> {
+        let materialized = materialize_shapes(&self.store, shapes_graph, options)?;
+        let key = CacheKey {
+            digest: materialized.digest,
+            model_version: COMPILED_SHACL_FORMAT_VERSION,
+            rudof_version: RUDOF_VERSION,
+            rocrate_version: options.rocrate_version,
+            extension_profile: EXTENSION_PROFILE,
+        };
+        if let Some(inner) = self.cache().get(&key).cloned() {
+            return Ok(CompiledShaclSchema {
+                inner,
+                statistics: ShaclCompileStatistics {
+                    cache_hit: true,
+                    shape_graphs: materialized.graph_count,
+                    shape_triples: materialized.triple_count,
+                    ..ShaclCompileStatistics::default()
+                },
+            });
+        }
+
+        let parse_start = Instant::now();
+        let graph = OxigraphInMemory::from_str(
+            &materialized.ntriples,
+            &RDFFormat::NTriples,
+            None,
+            &ReaderMode::Strict,
+        )
+        .map_err(|error| ShaclError::IllFormedShapes {
+            graph: shapes_graph.to_string(),
+            message: error.to_string(),
+        })?;
+        let mut parser = ShaclParser::new(graph);
+        let ast = parser
+            .parse()
+            .map_err(|error| ShaclError::IllFormedShapes {
+                graph: shapes_graph.to_string(),
+                message: error.to_string(),
+            })?;
+        let parse_time = parse_start.elapsed();
+
+        let compile_start = Instant::now();
+        let ir: IRSchema = ast.try_into().map_err(|error: ::shacl::error::IRError| {
+            ShaclError::IllFormedShapes {
+                graph: shapes_graph.to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        let inner = Arc::new(compile_model(
+            &ir,
+            materialized.digest,
+            options.rocrate_version,
+        )?);
+        let compile_time = compile_start.elapsed();
+
+        let mut cache = self.cache();
+        if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, inner.clone());
+        Ok(CompiledShaclSchema {
+            inner,
+            statistics: ShaclCompileStatistics {
+                cache_hit: false,
+                shape_graphs: materialized.graph_count,
+                shape_triples: materialized.triple_count,
+                parse_time,
+                compile_time,
+            },
+        })
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, Arc<CompiledSchemaInner>>> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 struct MaterializedShapes {
     digest: [u8; 32],
     ntriples: String,

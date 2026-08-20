@@ -66,6 +66,8 @@ use crate::core::{
 use crate::replication::ReplicationEngine;
 use crate::rocrate::RoCrateManager;
 use crate::search::SearchIndex;
+#[cfg(feature = "shacl-core")]
+use crate::shacl_impl::ShaclCompiler;
 use crate::sparql::SparqlEngine;
 use crate::store::GraphStore;
 use oxrdf::{NamedNode, Term};
@@ -146,6 +148,9 @@ pub enum CraqleError {
     Merge(#[from] replication::MergeError),
     #[error("rocrate: {0}")]
     RoCrate(#[from] rocrate::RoCrateError),
+    #[cfg(feature = "shacl-core")]
+    #[error("shacl: {0}")]
+    Shacl(#[from] ShaclError),
     #[error("sync input rejected: {0}")]
     SyncInputRejected(String),
     #[error("sync: {0}")]
@@ -619,6 +624,8 @@ pub struct CraqleNode {
     search_worker: SearchUpdateWorker,
     _index_warmer: DerivedIndexWarmer,
     sparql: Arc<SparqlEngine>,
+    #[cfg(feature = "shacl-core")]
+    shacl: ShaclCompiler,
     replication: Arc<ReplicationEngine>,
     local_replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
@@ -801,6 +808,8 @@ impl CraqleNode {
         let index_warmer = DerivedIndexWarmer::start(&store);
         let search_worker = SearchUpdateWorker::start(store.clone(), search.clone());
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
+        #[cfg(feature = "shacl-core")]
+        let shacl = ShaclCompiler::new(store.clone());
         let local_replication =
             Arc::new(ReplicationEngine::new(store.clone(), sparql.clone(), actor));
         let replication = Arc::new(if sync.is_some() {
@@ -816,6 +825,8 @@ impl CraqleNode {
             search_worker,
             _index_warmer: index_warmer,
             sparql,
+            #[cfg(feature = "shacl-core")]
+            shacl,
             replication,
             local_replication,
             sync,
@@ -827,6 +838,15 @@ impl CraqleNode {
     /// Return the local actor id used for authored replication batches.
     pub fn actor(&self) -> ActorId {
         self.actor
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn compile_shacl(
+        &self,
+        shapes_graph: &GraphId,
+        options: &ShaclCompileOptions,
+    ) -> Result<CompiledShaclSchema> {
+        self.shacl.compile(shapes_graph, options)
     }
 
     /// Return the Fjall persistence mode used for explicit graph-store persists.
