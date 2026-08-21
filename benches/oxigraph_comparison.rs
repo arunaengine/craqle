@@ -1,9 +1,10 @@
 //! Focused same-corpus Craqle versus Oxigraph SPARQL comparison.
 //!
-//! Oxigraph 0.5.9 runs in memory, which favors Oxigraph relative to Craqle's
-//! durable Fjall store. The comparison therefore covers warm, fully consumed
-//! query execution only; it does not claim database-size or durable-load
-//! parity. Ten million quads are deliberately rejected by this executable.
+//! The default mode runs Oxigraph 0.5.9 in memory. The explicit persistent mode
+//! below uses RocksDB and Craqle `SyncAll`. Both modes cover warm, fully
+//! consumed query execution only; they do not claim database-size or
+//! durable-load parity. Ten million quads are deliberately rejected by this
+//! executable.
 //!
 //! Persistent comparison mode is explicit and benchmark-only:
 //! `RUSTFLAGS="--cfg oxigraph_persistent" cargo bench --bench
@@ -23,7 +24,9 @@ use oxigraph::sparql::{PreparedSparqlQuery, QueryResults as OxigraphResults, Spa
 use oxigraph::store::Store;
 
 use support::fixture::{BenchConfig, Fixture, graph_id, object_term, predicate_term, subject_term};
-use support::{DEFAULT_SEED, DeterministicCorpus, QUADS_1M, QUADS_10K, QuadSpec};
+use support::{
+    DEFAULT_SEED, DeterministicCorpus, ObjectSpec, PredicateKind, QUADS_1M, QUADS_10K, QuadSpec,
+};
 
 const DEFAULT_GRAPHS: usize = 32;
 const DEFAULT_SAMPLES: usize = 10;
@@ -103,6 +106,65 @@ fn main() {
     for index in 0..fixture.hot_path_count() {
         compare_case(&fixture, &oxigraph.store, index, samples);
     }
+    for (label, query, unordered_limit) in expanded_query_cases(&fixture) {
+        compare_query(
+            &fixture,
+            &oxigraph.store,
+            label,
+            &query,
+            unordered_limit,
+            samples,
+        );
+    }
+}
+
+fn expanded_query_cases(fixture: &Fixture) -> Vec<(&'static str, String, bool)> {
+    let terms = fixture.query_terms();
+    let chain_subject = subject_term(0x2000_0000_0000_0000);
+    let chain_predicate = predicate_term(PredicateKind::Chain);
+    let chain_object = object_term(ObjectSpec::Iri(0x2000_0000_0000_0001));
+    vec![
+        (
+            "object_bound_variable_predicate_limit10",
+            format!(
+                "SELECT ?s ?p WHERE {{ ?s ?p {} }} LIMIT 10",
+                terms.rare_object.0
+            ),
+            true,
+        ),
+        (
+            "object_bound_fixed_predicate",
+            format!(
+                "SELECT ?s WHERE {{ ?s {} {} }}",
+                terms.rare_predicate.0, terms.rare_object.0
+            ),
+            false,
+        ),
+        (
+            "one_or_more_path",
+            format!(
+                "SELECT ?end WHERE {{ {} {}+ ?end }}",
+                chain_subject.0, chain_predicate.0
+            ),
+            false,
+        ),
+        (
+            "fixed_predicate_triangle_ask_miss",
+            format!(
+                "ASK WHERE {{ ?a {0} ?b . ?b {0} ?c . ?c {0} ?a }}",
+                chain_predicate.0
+            ),
+            false,
+        ),
+        (
+            "fixed_predicate_inverse_lookup",
+            format!(
+                "SELECT ?s WHERE {{ ?s {} {} }}",
+                chain_predicate.0, chain_object.0
+            ),
+            false,
+        ),
+    ]
 }
 
 fn load_oxigraph(corpus: support::CorpusConfig) -> OxigraphFixture {
@@ -162,10 +224,28 @@ fn oxigraph_quad(record: QuadSpec) -> Quad {
 fn compare_case(fixture: &Fixture, oxigraph: &Store, index: usize, samples: usize) {
     let label = fixture.hot_path_label(index);
     let query = fixture.hot_path_query(index);
-    let craqle_prepared = fixture.prepare_hot_path(index);
+    compare_query(
+        fixture,
+        oxigraph,
+        label,
+        query,
+        fixture.hot_path_is_unordered_limit(index),
+        samples,
+    );
+}
+
+fn compare_query(
+    fixture: &Fixture,
+    oxigraph: &Store,
+    label: &str,
+    query: &str,
+    unordered_limit: bool,
+    samples: usize,
+) {
+    let craqle_prepared = fixture.prepare_query(query);
     let oxigraph_prepared = prepare_oxigraph(query, fixture);
 
-    let craqle_canonical = canonicalize_craqle(fixture.run_hot_path(index));
+    let craqle_canonical = canonicalize_craqle(fixture.run_visible_query(query, label));
     let oxigraph_canonical = canonicalize_oxigraph(
         oxigraph_prepared
             .clone()
@@ -173,7 +253,7 @@ fn compare_case(fixture: &Fixture, oxigraph: &Store, index: usize, samples: usiz
             .execute()
             .unwrap_or_else(|error| panic!("{label}: Oxigraph parity query failed: {error}")),
     );
-    let parity = if fixture.hot_path_is_unordered_limit(index) {
+    let parity = if unordered_limit {
         assert_eq!(
             result_work_canonical(&craqle_canonical),
             result_work_canonical(&oxigraph_canonical),
