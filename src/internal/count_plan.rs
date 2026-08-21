@@ -4,7 +4,7 @@
 use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
 
 use crate::sparql_fast_path::{
-    FastPathPlan, same_subject_triples, single_triple, two_joined_triples,
+    FastPathPlan, optional_subject_triples, same_subject_triples, single_triple, two_joined_triples,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +53,13 @@ pub(crate) fn analyze(pattern: &GraphPattern) -> Option<FastPathPlan> {
         aggregate,
         AggregateExpression::CountSolutions { distinct: false }
     );
+    if count_all && let Some((mandatory, optional)) = optional_subject_triples(inner) {
+        return Some(FastPathPlan::OptionalSubjectStarCount {
+            mandatory,
+            optional,
+            output: output.as_str().to_owned(),
+        });
+    }
     if count_all
         && let Some((_, triples)) = same_subject_triples(inner)
         && triples.len() > 2

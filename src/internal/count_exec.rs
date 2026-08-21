@@ -501,6 +501,79 @@ pub(crate) fn subject_star_count(
     Ok(Some((count, intermediate_rows)))
 }
 
+pub(crate) fn optional_subject_star_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    mandatory: &[(GraphSelector, QuadPattern)],
+    optional: &[(GraphSelector, QuadPattern)],
+) -> Result<Option<(ScalarCount, u64)>> {
+    let mut relations = Vec::with_capacity(mandatory.len() + optional.len());
+    let mut intermediate_rows = 0_u64;
+    for &(selector, pattern) in mandatory.iter().chain(optional) {
+        let mut relation = SubjectKeySet::default();
+        if for_each_join_key(
+            view,
+            context,
+            selector,
+            pattern,
+            JoinKeyDomain::Subject,
+            |subject| {
+                intermediate_rows = intermediate_rows.saturating_add(1);
+                relation.observe(subject)
+            },
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        relations.push(relation);
+    }
+
+    let (mandatory_relations, optional_relations) = relations.split_at(mandatory.len());
+    let Some((base_index, base)) = mandatory_relations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, relation)| relation.multiplicities.len())
+    else {
+        unreachable!("optional subject-star plans have a mandatory relation")
+    };
+    let mut count = ScalarCount::default();
+    for (subject, multiplicity) in &base.multiplicities {
+        if mandatory_relations
+            .iter()
+            .enumerate()
+            .any(|(index, relation)| index != base_index && relation.multiplicity(*subject) == 0)
+        {
+            continue;
+        }
+        let mut mandatory_product = *multiplicity;
+        for (index, relation) in mandatory_relations.iter().enumerate() {
+            if index != base_index {
+                mandatory_product = mandatory_product
+                    .checked_mul(relation.multiplicity(*subject))
+                    .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+            }
+        }
+        let mut optional_product = 1_u64;
+        if optional_relations
+            .iter()
+            .all(|relation| relation.multiplicity(*subject) != 0)
+        {
+            for relation in optional_relations {
+                optional_product = optional_product
+                    .checked_mul(relation.multiplicity(*subject))
+                    .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+            }
+        }
+        count.add(
+            mandatory_product
+                .checked_mul(optional_product)
+                .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?,
+        )?;
+    }
+    Ok(Some((count, intermediate_rows)))
+}
+
 #[derive(Clone, Copy)]
 enum JoinKeyDomain {
     Subject,

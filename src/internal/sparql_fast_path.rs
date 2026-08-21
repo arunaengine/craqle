@@ -71,6 +71,11 @@ pub(crate) enum FastPathPlan {
         triples: Vec<TriplePlan>,
         output: String,
     },
+    OptionalSubjectStarCount {
+        mandatory: Vec<TriplePlan>,
+        optional: Vec<TriplePlan>,
+        output: String,
+    },
     PropertyStar {
         triples: Vec<TriplePlan>,
         subject: PatternTerm,
@@ -102,7 +107,9 @@ impl FastPathPlan {
                 PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
                 PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
             },
-            Self::SubjectStarCount { .. } => QueryFastPathKind::SubjectStarCount,
+            Self::SubjectStarCount { .. } | Self::OptionalSubjectStarCount { .. } => {
+                QueryFastPathKind::SubjectStarCount
+            }
             Self::PropertyStar { .. } => QueryFastPathKind::PropertyStar,
             Self::HashJoinCount { .. } => QueryFastPathKind::HashJoinCount,
         }
@@ -248,6 +255,59 @@ pub(crate) fn same_subject_triples(
         triples.push(triple_plan(graph.clone(), pattern)?);
     }
     Some((subject, triples))
+}
+
+pub(crate) fn optional_subject_triples(
+    pattern: &GraphPattern,
+) -> Option<(Vec<TriplePlan>, Vec<TriplePlan>)> {
+    let (graph, inner) = match pattern {
+        GraphPattern::Graph {
+            name: NamedNodePattern::NamedNode(graph),
+            inner,
+        } => (
+            PatternGraph::Named(EncodedTerm::from_named_node(graph)),
+            inner.as_ref(),
+        ),
+        pattern => (PatternGraph::DefaultUnion, pattern),
+    };
+    let GraphPattern::LeftJoin {
+        left,
+        right,
+        expression: None,
+    } = inner
+    else {
+        return None;
+    };
+    let (GraphPattern::Bgp { patterns: left }, GraphPattern::Bgp { patterns: right }) =
+        (left.as_ref(), right.as_ref())
+    else {
+        return None;
+    };
+    let first = left.first()?;
+    if right.is_empty() {
+        return None;
+    }
+    let subject = pattern_term(&first.subject)?;
+    let mut object_variables = HashSet::new();
+    let mut build = |patterns: &[TriplePattern]| {
+        let mut triples = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            if pattern_term(&pattern.subject).as_ref() != Some(&subject)
+                || !matches!(&pattern.predicate, NamedNodePattern::NamedNode(_))
+            {
+                return None;
+            }
+            if let TermPattern::Variable(variable) = &pattern.object
+                && (matches!(&subject, PatternTerm::Variable(subject) if variable.as_str() == subject)
+                    || !object_variables.insert(variable.as_str().to_owned()))
+            {
+                return None;
+            }
+            triples.push(triple_plan(graph.clone(), pattern)?);
+        }
+        Some(triples)
+    };
+    Some((build(left)?, build(right)?))
 }
 
 pub(crate) fn two_joined_triples(
@@ -569,6 +629,11 @@ pub(crate) fn execute(
         FastPathPlan::SubjectStarCount { triples, output } => {
             subject_star_count(triples, output, view, context, started)
         }
+        FastPathPlan::OptionalSubjectStarCount {
+            mandatory,
+            optional,
+            output,
+        } => optional_subject_star_count(mandatory, optional, output, view, context, started),
         FastPathPlan::PropertyStar {
             triples,
             subject,
@@ -655,6 +720,125 @@ fn subject_star_count(
         }
         count = count
             .checked_add(product)
+            .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+    }
+    Ok(count_outcome(
+        output,
+        count,
+        QueryFastPathKind::SubjectStarCount,
+        intermediate_rows,
+        started,
+    ))
+}
+
+fn optional_subject_star_count(
+    mandatory: &[TriplePlan],
+    optional: &[TriplePlan],
+    output: &str,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    started: Instant,
+) -> Result<FastPathOutcome> {
+    let mut resolved = Vec::with_capacity(mandatory.len() + optional.len());
+    for triple in mandatory {
+        let Some(triple) = triple.resolve(view, context)? else {
+            return Ok(count_outcome(
+                output,
+                0,
+                QueryFastPathKind::SubjectStarCount,
+                0,
+                started,
+            ));
+        };
+        resolved.push(triple);
+    }
+    for triple in optional {
+        let Some(triple) = triple.resolve(view, context)? else {
+            return subject_star_count(mandatory, output, view, context, started);
+        };
+        resolved.push(triple);
+    }
+    let patterns: Vec<_> = resolved
+        .iter()
+        .map(|triple| (triple.selector, triple.pattern))
+        .collect();
+    if let Some((count, intermediate_rows)) = crate::count_exec::optional_subject_star_count(
+        view,
+        context,
+        &patterns[..mandatory.len()],
+        &patterns[mandatory.len()..],
+    )? {
+        return Ok(count_outcome(
+            output,
+            count.get(),
+            QueryFastPathKind::SubjectStarCount,
+            intermediate_rows,
+            started,
+        ));
+    }
+
+    let mut relations = Vec::with_capacity(resolved.len());
+    let mut intermediate_rows = 0_u64;
+    for triple in resolved {
+        let mut relation = HashMap::<TermId, u64>::new();
+        let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+        for quad in &mut cursor {
+            let count = relation.entry(quad?.subject).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+            })?;
+            intermediate_rows = intermediate_rows.saturating_add(1);
+        }
+        relations.push(relation);
+    }
+    let (mandatory_relations, optional_relations) = relations.split_at(mandatory.len());
+    let Some((base_index, base)) = mandatory_relations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, relation)| relation.len())
+    else {
+        unreachable!("optional subject-star plans have a mandatory relation")
+    };
+    let mut count = 0_u64;
+    for (subject, multiplicity) in base {
+        if mandatory_relations
+            .iter()
+            .enumerate()
+            .any(|(index, relation)| index != base_index && !relation.contains_key(subject))
+        {
+            continue;
+        }
+        let mut mandatory_product = *multiplicity;
+        for (index, relation) in mandatory_relations.iter().enumerate() {
+            if index != base_index {
+                mandatory_product = mandatory_product
+                    .checked_mul(relation.get(subject).copied().unwrap_or(0))
+                    .ok_or_else(|| {
+                        crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                    })?;
+            }
+        }
+        let mut optional_product = 1_u64;
+        if optional_relations
+            .iter()
+            .all(|relation| relation.contains_key(subject))
+        {
+            for relation in optional_relations {
+                optional_product = optional_product
+                    .checked_mul(relation.get(subject).copied().unwrap_or(0))
+                    .ok_or_else(|| {
+                        crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                    })?;
+            }
+        }
+        count = count
+            .checked_add(
+                mandatory_product
+                    .checked_mul(optional_product)
+                    .ok_or_else(|| {
+                        crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                    })?,
+            )
             .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
     }
     Ok(count_outcome(

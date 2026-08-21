@@ -470,6 +470,74 @@ fn subject_star_count_preserves_multiplicity() {
 }
 
 #[test]
+fn optional_subject_star_count_preserves_left_join_multiplicity() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:fast:optional-star");
+    let duplicate = GraphId::new("urn:test:fast:optional-star-duplicate");
+    node.apply_changes_unchecked(
+        &graph,
+        vec![
+            insert(&graph, "urn:s:1", "urn:p", iri("urn:left:1")),
+            insert(&graph, "urn:s:1", "urn:p", iri("urn:left:2")),
+            insert(&graph, "urn:s:1", "urn:q", iri("urn:right:1")),
+            insert(&graph, "urn:s:1", "urn:q", iri("urn:right:2")),
+            insert(&graph, "urn:s:1", "urn:q", iri("urn:right:3")),
+            insert(&graph, "urn:s:1", "urn:m", iri("urn:mandatory:1")),
+            insert(&graph, "urn:s:1", "urn:r", iri("urn:extra:1")),
+            insert(&graph, "urn:s:1", "urn:r", iri("urn:extra:2")),
+            insert(&graph, "urn:s:2", "urn:p", iri("urn:left:3")),
+            insert(&graph, "urn:s:2", "urn:m", iri("urn:mandatory:2")),
+        ],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &duplicate,
+        vec![insert(&duplicate, "urn:s:1", "urn:p", iri("urn:left:1"))],
+    )
+    .unwrap();
+    node.rebuild_graph_diagnostics(&graph).unwrap();
+    node.ensure_query_indexes();
+    let graphs = vec![graph.clone(), duplicate];
+
+    for query in [
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?left OPTIONAL { ?s <urn:q> ?right } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:optional-star> { \
+         ?s <urn:p> ?left OPTIONAL { ?s <urn:q> ?right } } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?left OPTIONAL { ?s <urn:missing> ?right } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?left ; <urn:m> ?mandatory \
+         OPTIONAL { ?s <urn:q> ?right ; <urn:r> ?extra } }",
+    ] {
+        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
+        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(
+            fast.statistics.fast_path,
+            Some(QueryFastPathKind::SubjectStarCount),
+            "{query}"
+        );
+        assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
+        assert_eq!(fast.statistics.authoritative_terms_decoded, 0, "{query}");
+    }
+
+    for query in [
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?value OPTIONAL { ?s <urn:q> ?value } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?left OPTIONAL { ?s <urn:q> ?right \
+         FILTER(?right = <urn:right:1>) } }",
+    ] {
+        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
+        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(fast.statistics.fast_path, None, "{query}");
+    }
+}
+
+#[test]
 fn linear_chain_count_uses_explicit_cross_domains() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
