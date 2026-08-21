@@ -362,20 +362,24 @@ struct ResolvedTriple<'a> {
 }
 
 impl TriplePlan {
+    pub(crate) fn binds(&self, variable: &Variable) -> bool {
+        [&self.subject, &self.predicate, &self.object]
+            .into_iter()
+            .any(|term| matches!(term, PatternTerm::Variable(bound) if bound == variable.as_str()))
+    }
+
     pub(crate) fn distinct_subject_order(&self, variable: &Variable) -> bool {
         matches!(
             &self.subject,
             PatternTerm::Variable(subject) if subject == variable.as_str()
-        ) && matches!(&self.predicate, PatternTerm::Constant(_))
-            && matches!(&self.object, PatternTerm::Constant(_))
+        ) && matches!(&self.object, PatternTerm::Constant(_))
     }
 
     pub(crate) fn distinct_object_order(&self, variable: &Variable) -> bool {
         matches!(
             &self.object,
             PatternTerm::Variable(object) if object == variable.as_str()
-        ) && matches!(&self.subject, PatternTerm::Constant(_))
-            && matches!(&self.predicate, PatternTerm::Constant(_))
+        ) && matches!(&self.predicate, PatternTerm::Constant(_))
     }
 
     fn count_value_domain(&self, variable: &str) -> Option<crate::count_plan::CountValueDomain> {
@@ -911,6 +915,7 @@ mod tests {
             "SELECT ?s WHERE { ?s <urn:p> ?o } LIMIT 10",
             "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o }",
             "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s <urn:p> <urn:o> }",
+            "SELECT (COUNT(?s) AS ?count) WHERE { ?s <urn:p> ?o }",
             "SELECT ?s ?a ?b WHERE { ?s <urn:p> ?o ; <urn:a> ?a ; <urn:b> ?b }",
             "SELECT ?a ?b WHERE { <urn:s> <urn:a> ?a ; <urn:b> ?b }",
             "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?key . ?s <urn:q> ?key }",

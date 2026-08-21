@@ -172,7 +172,15 @@ fn fast_paths_match_generic() {
             QueryFastPathKind::CountDistinctSubject,
         ),
         (
+            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s ?p <urn:test:fast:o:shared> }",
+            QueryFastPathKind::CountDistinctSubject,
+        ),
+        (
             "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { <urn:test:fast:shared> <urn:test:fast:p> ?o }",
+            QueryFastPathKind::CountDistinctObject,
+        ),
+        (
+            "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s <urn:test:fast:p> ?o }",
             QueryFastPathKind::CountDistinctObject,
         ),
         (
@@ -311,6 +319,63 @@ fn fast_paths_fail_closed() {
     );
     assert_eq!(bounded.statistics.result_rows, 2);
     assert!(bounded.statistics.candidate_quads <= 4);
+}
+
+#[test]
+fn count_fast_path_matches_every_triple_binding_shape() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:fast:count-bindings");
+    node.apply_changes_unchecked(
+        &graph,
+        vec![
+            insert(&graph, "urn:s", "urn:p", iri("urn:o")),
+            insert(&graph, "urn:s", "urn:q", iri("urn:x")),
+            insert(&graph, "urn:t", "urn:p", iri("urn:o")),
+        ],
+    )
+    .unwrap();
+    node.rebuild_graph_diagnostics(&graph).unwrap();
+    node.ensure_query_indexes();
+
+    for triple in [
+        "?s ?p ?o",
+        "<urn:s> ?p ?o",
+        "?s <urn:p> ?o",
+        "?s ?p <urn:o>",
+        "<urn:s> <urn:p> ?o",
+        "<urn:s> ?p <urn:o>",
+        "?s <urn:p> <urn:o>",
+        "<urn:s> <urn:p> <urn:o>",
+    ] {
+        for body in [
+            format!("{{ {triple} }}"),
+            format!("{{ GRAPH <{}> {{ {triple} }} }}", graph.as_str()),
+        ] {
+            for aggregate in ["COUNT(*)", "COUNT(?s)"] {
+                if aggregate == "COUNT(?s)" && !triple.contains("?s") {
+                    continue;
+                }
+                let query = format!("SELECT ({aggregate} AS ?count) WHERE {body}");
+                let fast = run(
+                    &node,
+                    std::slice::from_ref(&graph),
+                    &query,
+                    QueryFastPathMode::Auto,
+                );
+                let generic = run(
+                    &node,
+                    std::slice::from_ref(&graph),
+                    &query,
+                    QueryFastPathMode::Disabled,
+                );
+                assert_eq!(fast.results, generic.results, "{query}");
+                assert!(fast.statistics.fast_path.is_some(), "{query}");
+                assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
+                assert_eq!(fast.statistics.authoritative_terms_decoded, 0, "{query}");
+            }
+        }
+    }
 }
 
 #[test]

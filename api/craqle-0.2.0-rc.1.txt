@@ -339,8 +339,8 @@ pub craqle::QuadOp::Remove::subject: craqle::EncodedTerm
 pub craqle::QuadOp::Remove::witnessed: craqle::VectorClock
 pub enum craqle::QueryFastPathKind
 pub craqle::QueryFastPathKind::Ask
-pub craqle::QueryFastPathKind::CountDistinctSubject
 pub craqle::QueryFastPathKind::CountDistinctObject
+pub craqle::QueryFastPathKind::CountDistinctSubject
 pub craqle::QueryFastPathKind::HashJoinCount
 pub craqle::QueryFastPathKind::NamedCount
 pub craqle::QueryFastPathKind::PropertyStar

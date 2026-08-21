@@ -65,6 +65,11 @@ pub(crate) fn analyze(pattern: &GraphPattern) -> Option<FastPathPlan> {
         AggregateExpression::FunctionCall {
             name: AggregateFunction::Count,
             expr: Expression::Variable(variable),
+            distinct: false,
+        } if triple.binds(variable) => CountValueDomain::Scalar,
+        AggregateExpression::FunctionCall {
+            name: AggregateFunction::Count,
+            expr: Expression::Variable(variable),
             distinct: true,
         } if triple.distinct_subject_order(variable) => CountValueDomain::Subject,
         AggregateExpression::FunctionCall {
