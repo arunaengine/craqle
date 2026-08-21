@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
@@ -29,7 +30,7 @@ pub enum SparqlError {
     Evaluation(String),
     #[error("query planning error: {0}")]
     Planning(String),
-    #[error("query limit exceeded: {resource} is limited to {limit} entries")]
+    #[error("query limit exceeded: {resource} limit is {limit}")]
     QueryLimit {
         resource: &'static str,
         limit: usize,
@@ -81,6 +82,7 @@ pub enum QueryResults {
 #[derive(Clone)]
 pub struct PreparedQuery {
     query: Arc<Query>,
+    query_bytes: usize,
 }
 
 impl fmt::Debug for PreparedQuery {
@@ -95,14 +97,420 @@ impl fmt::Debug for PreparedQuery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct QueryLimits {
-    /// Maximum distinct keys retained by a guarded hash-based query operator.
+    pub max_query_bytes: usize,
+    pub max_result_rows: usize,
+    pub max_result_cells: usize,
+    pub max_result_bytes: usize,
+    pub max_graph_triples: usize,
+    pub max_intermediate_rows: usize,
     pub max_hash_entries: usize,
+    pub max_hash_bytes: usize,
+    pub max_property_path_edges: usize,
+    pub max_property_path_depth: usize,
+    pub deadline: Option<Duration>,
+}
+
+impl QueryLimits {
+    pub fn production() -> Self {
+        Self {
+            max_query_bytes: 1_048_576,
+            max_result_rows: 100_000,
+            max_result_cells: 1_000_000,
+            max_result_bytes: 64 * 1_048_576,
+            max_graph_triples: 100_000,
+            max_intermediate_rows: 1_000_000,
+            max_hash_entries: 1_000_000,
+            max_hash_bytes: 128 * 1_048_576,
+            max_property_path_edges: 1_000_000,
+            max_property_path_depth: 64,
+            deadline: Some(Duration::from_secs(30)),
+        }
+    }
 }
 
 impl Default for QueryLimits {
     fn default() -> Self {
-        Self {
-            max_hash_entries: 1_000_000,
+        Self::production()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueryFeatures {
+    property_path: bool,
+    property_path_depth: usize,
+    guarded_hash: bool,
+    static_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("{resource} exceeds limit {limit}")]
+pub(crate) struct QueryLimitExceeded {
+    resource: &'static str,
+    limit: usize,
+}
+
+impl From<QueryLimitExceeded> for SparqlError {
+    fn from(error: QueryLimitExceeded) -> Self {
+        Self::QueryLimit {
+            resource: error.resource,
+            limit: error.limit,
+        }
+    }
+}
+
+pub(crate) struct QueryBudget {
+    limits: QueryLimits,
+    started: Instant,
+    features: QueryFeatures,
+    intermediate_rows: AtomicUsize,
+    property_path_edges: AtomicUsize,
+    result_rows: AtomicUsize,
+    result_cells: AtomicUsize,
+    result_bytes: AtomicUsize,
+    graph_triples: AtomicUsize,
+}
+
+impl QueryBudget {
+    fn new(query: &Query, limits: QueryLimits) -> std::result::Result<Self, QueryLimitExceeded> {
+        let features = query_features(query);
+        if features.property_path_depth > limits.max_property_path_depth {
+            return Err(QueryLimitExceeded {
+                resource: "property path depth",
+                limit: limits.max_property_path_depth,
+            });
+        }
+        let budget = Self {
+            limits,
+            started: Instant::now(),
+            features,
+            intermediate_rows: AtomicUsize::new(0),
+            property_path_edges: AtomicUsize::new(0),
+            result_rows: AtomicUsize::new(0),
+            result_cells: AtomicUsize::new(0),
+            result_bytes: AtomicUsize::new(0),
+            graph_triples: AtomicUsize::new(0),
+        };
+        budget.observe_intermediate(features.static_rows)?;
+        Ok(budget)
+    }
+
+    pub(crate) fn check(&self) -> std::result::Result<(), QueryLimitExceeded> {
+        if self
+            .limits
+            .deadline
+            .is_some_and(|deadline| self.started.elapsed() >= deadline)
+        {
+            return Err(QueryLimitExceeded {
+                resource: "query deadline",
+                limit: 0,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_intermediate(
+        &self,
+        rows: usize,
+    ) -> std::result::Result<(), QueryLimitExceeded> {
+        self.check()?;
+        let total = add_limited(
+            &self.intermediate_rows,
+            rows,
+            self.limits.max_intermediate_rows,
+            "intermediate rows",
+        )?;
+        if self.features.guarded_hash {
+            if total > self.limits.max_hash_entries {
+                return Err(QueryLimitExceeded {
+                    resource: "hash entries",
+                    limit: self.limits.max_hash_entries,
+                });
+            }
+            let bytes = total.saturating_mul(128);
+            if bytes > self.limits.max_hash_bytes {
+                return Err(QueryLimitExceeded {
+                    resource: "hash bytes",
+                    limit: self.limits.max_hash_bytes,
+                });
+            }
+        }
+        if self.features.property_path {
+            add_limited(
+                &self.property_path_edges,
+                rows,
+                self.limits.max_property_path_edges,
+                "property path edges",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_hash(
+        &self,
+        entries: usize,
+        bytes: usize,
+    ) -> std::result::Result<(), QueryLimitExceeded> {
+        self.check()?;
+        if entries > self.limits.max_hash_entries {
+            return Err(QueryLimitExceeded {
+                resource: "hash entries",
+                limit: self.limits.max_hash_entries,
+            });
+        }
+        if bytes > self.limits.max_hash_bytes {
+            return Err(QueryLimitExceeded {
+                resource: "hash bytes",
+                limit: self.limits.max_hash_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_solution(
+        &self,
+        row: &HashMap<String, EncodedTerm>,
+    ) -> std::result::Result<(), QueryLimitExceeded> {
+        self.observe_result(
+            row.len(),
+            row.iter().fold(0usize, |bytes, (variable, term)| {
+                bytes
+                    .saturating_add(variable.len())
+                    .saturating_add(term.0.len())
+            }),
+        )
+    }
+
+    fn observe_graph_triple(
+        &self,
+        triple: &(EncodedTerm, EncodedTerm, EncodedTerm),
+    ) -> std::result::Result<(), QueryLimitExceeded> {
+        add_limited(
+            &self.graph_triples,
+            1,
+            self.limits.max_graph_triples,
+            "graph triples",
+        )?;
+        self.observe_result(
+            3,
+            triple
+                .0
+                .0
+                .len()
+                .saturating_add(triple.1.0.len())
+                .saturating_add(triple.2.0.len()),
+        )
+    }
+
+    pub(crate) fn observe_boolean(&self) -> std::result::Result<(), QueryLimitExceeded> {
+        self.observe_result(1, 1)
+    }
+
+    fn observe_result(
+        &self,
+        cells: usize,
+        bytes: usize,
+    ) -> std::result::Result<(), QueryLimitExceeded> {
+        self.check()?;
+        add_limited(
+            &self.result_rows,
+            1,
+            self.limits.max_result_rows,
+            "result rows",
+        )?;
+        add_limited(
+            &self.result_cells,
+            cells,
+            self.limits.max_result_cells,
+            "result cells",
+        )?;
+        add_limited(
+            &self.result_bytes,
+            bytes,
+            self.limits.max_result_bytes,
+            "result bytes",
+        )?;
+        Ok(())
+    }
+}
+
+fn add_limited(
+    counter: &AtomicUsize,
+    amount: usize,
+    limit: usize,
+    resource: &'static str,
+) -> std::result::Result<usize, QueryLimitExceeded> {
+    let previous = counter.fetch_add(amount, Ordering::Relaxed);
+    let total = previous.saturating_add(amount);
+    if total > limit {
+        return Err(QueryLimitExceeded { resource, limit });
+    }
+    Ok(total)
+}
+
+fn query_features(query: &Query) -> QueryFeatures {
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    pattern_features(pattern)
+}
+
+fn merge_features(left: QueryFeatures, right: QueryFeatures) -> QueryFeatures {
+    QueryFeatures {
+        property_path: left.property_path || right.property_path,
+        property_path_depth: left.property_path_depth.max(right.property_path_depth),
+        guarded_hash: left.guarded_hash || right.guarded_hash,
+        static_rows: left.static_rows.saturating_add(right.static_rows),
+    }
+}
+
+fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
+    match pattern {
+        GraphPattern::Bgp { patterns } => QueryFeatures {
+            guarded_hash: patterns.len() > 1,
+            ..QueryFeatures::default()
+        },
+        GraphPattern::Path { path, .. } => QueryFeatures {
+            property_path: true,
+            property_path_depth: property_path_depth(path),
+            guarded_hash: true,
+            ..QueryFeatures::default()
+        },
+        GraphPattern::Join { left, right }
+        | GraphPattern::Lateral { left, right }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Minus { left, right } => {
+            let mut features = merge_features(pattern_features(left), pattern_features(right));
+            features.guarded_hash = true;
+            if let GraphPattern::LeftJoin {
+                expression: Some(expression),
+                ..
+            } = pattern
+            {
+                features = merge_features(features, expression_features(expression));
+            }
+            features
+        }
+        GraphPattern::Union { left, right } => {
+            merge_features(pattern_features(left), pattern_features(right))
+        }
+        GraphPattern::Filter { expr, inner } => {
+            merge_features(pattern_features(inner), expression_features(expr))
+        }
+        GraphPattern::Graph { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Service { inner, .. } => pattern_features(inner),
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => merge_features(pattern_features(inner), expression_features(expression)),
+        GraphPattern::Values { bindings, .. } => QueryFeatures {
+            static_rows: bindings.len(),
+            ..QueryFeatures::default()
+        },
+        GraphPattern::OrderBy { inner, expression } => {
+            let mut features = pattern_features(inner);
+            features.guarded_hash = true;
+            for expression in expression {
+                let expression = match expression {
+                    spargebra::algebra::OrderExpression::Asc(expression)
+                    | spargebra::algebra::OrderExpression::Desc(expression) => expression,
+                };
+                features = merge_features(features, expression_features(expression));
+            }
+            features
+        }
+        GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } => {
+            let mut features = pattern_features(inner);
+            features.guarded_hash = true;
+            features
+        }
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            let mut features = pattern_features(inner);
+            features.guarded_hash = true;
+            for (_, aggregate) in aggregates {
+                if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
+                    features = merge_features(features, expression_features(expr));
+                }
+            }
+            features
+        }
+        #[allow(unreachable_patterns)]
+        _ => QueryFeatures {
+            guarded_hash: true,
+            ..QueryFeatures::default()
+        },
+    }
+}
+
+fn expression_features(expression: &Expression) -> QueryFeatures {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => QueryFeatures::default(),
+        Expression::Or(left, right)
+        | Expression::And(left, right)
+        | Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            merge_features(expression_features(left), expression_features(right))
+        }
+        Expression::In(left, right) => right
+            .iter()
+            .fold(expression_features(left), |features, expression| {
+                merge_features(features, expression_features(expression))
+            }),
+        Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) | Expression::Not(inner) => {
+            expression_features(inner)
+        }
+        Expression::Exists(pattern) => {
+            let mut features = pattern_features(pattern);
+            features.guarded_hash = true;
+            features
+        }
+        Expression::If(condition, left, right) => merge_features(
+            expression_features(condition),
+            merge_features(expression_features(left), expression_features(right)),
+        ),
+        Expression::Coalesce(expressions) | Expression::FunctionCall(_, expressions) => expressions
+            .iter()
+            .fold(QueryFeatures::default(), |features, expression| {
+                merge_features(features, expression_features(expression))
+            }),
+        #[allow(unreachable_patterns)]
+        _ => QueryFeatures {
+            guarded_hash: true,
+            ..QueryFeatures::default()
+        },
+    }
+}
+
+fn property_path_depth(path: &spargebra::algebra::PropertyPathExpression) -> usize {
+    use spargebra::algebra::PropertyPathExpression;
+
+    match path {
+        PropertyPathExpression::NamedNode(_) | PropertyPathExpression::NegatedPropertySet(_) => 1,
+        PropertyPathExpression::Reverse(inner)
+        | PropertyPathExpression::ZeroOrMore(inner)
+        | PropertyPathExpression::OneOrMore(inner)
+        | PropertyPathExpression::ZeroOrOne(inner) => {
+            1usize.saturating_add(property_path_depth(inner))
+        }
+        PropertyPathExpression::Sequence(left, right)
+        | PropertyPathExpression::Alternative(left, right) => {
+            1usize.saturating_add(property_path_depth(left).max(property_path_depth(right)))
         }
     }
 }
@@ -325,7 +733,7 @@ impl SparqlEngine {
     }
 
     pub(crate) fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
-        Ok(parse_prepared_query(sparql)?.0)
+        Ok(parse_prepared_query(sparql, &QueryLimits::production())?.0)
     }
 
     pub(crate) fn explain_prepared_in_graphs(
@@ -369,6 +777,7 @@ impl SparqlEngine {
         options: &QueryExecutionOptions,
         explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<QueryPlan> {
+        enforce_query_bytes(prepared.query_bytes, &options.limits)?;
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
@@ -383,6 +792,7 @@ impl SparqlEngine {
         let fast_path = fast_path_plan(&query, options);
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
+        QueryBudget::new(&query, options.limits)?;
         Ok(explain_query_plan(
             &query,
             query_fingerprint(&query),
@@ -447,11 +857,12 @@ impl SparqlEngine {
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryResults> {
-        let (prepared, parse_time) = parse_prepared_query(sparql)?;
+        let options = QueryExecutionOptions::default();
+        let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
         self.execute_prepared_with_snapshot_visibility(
             &prepared,
             policy_visible,
-            &QueryExecutionOptions::default(),
+            &options,
             parse_time,
             false,
         )
@@ -463,11 +874,12 @@ impl SparqlEngine {
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryExecution> {
-        let (prepared, parse_time) = parse_prepared_query(sparql)?;
+        let options = QueryExecutionOptions::default();
+        let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
         self.execute_prepared_with_snapshot_visibility(
             &prepared,
             policy_visible,
-            &QueryExecutionOptions::default(),
+            &options,
             parse_time,
             true,
         )
@@ -481,6 +893,7 @@ impl SparqlEngine {
         parse_time: Duration,
         collect_plan_statistics: bool,
     ) -> Result<QueryExecution> {
+        enforce_query_bytes(prepared.query_bytes, &options.limits)?;
         let mut query = prepared.query.as_ref().clone();
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
@@ -545,7 +958,6 @@ impl SparqlEngine {
         optimize: bool,
         read_mode: QueryReadMode,
     ) -> Result<(QueryResults, ReadStatistics)> {
-        let (prepared, parse_time) = parse_prepared_query(sparql)?;
         let options = QueryExecutionOptions {
             cancellation: QueryCancellation::new(),
             read_mode,
@@ -554,6 +966,7 @@ impl SparqlEngine {
             fast_paths: QueryFastPathMode::Auto,
             limits: QueryLimits::default(),
         };
+        let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
         let (execution, read_statistics) =
             self.execute_prepared_scope(&prepared, scope, &options, parse_time, false, None)?;
         Ok((execution.results, read_statistics))
@@ -568,6 +981,7 @@ impl SparqlEngine {
         collect_plan_statistics: bool,
         explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<(QueryExecution, ReadStatistics)> {
+        enforce_query_bytes(prepared.query_bytes, &options.limits)?;
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
@@ -620,8 +1034,10 @@ impl SparqlEngine {
     ) -> Result<(QueryExecution, ReadStatistics)> {
         let (context, named_graphs) =
             scope_read_context(scope, view, options.cancellation.clone())?;
+        context.check_cancelled()?;
+        let budget = Arc::new(QueryBudget::new(&query, options.limits)?);
         if let Some(plan) = stages.fast_path.take() {
-            let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &options.limits)?;
+            let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &budget)?;
             let read_statistics = context.snapshot();
             let mut statistics = build_execution_statistics(
                 stages,
@@ -692,14 +1108,16 @@ impl SparqlEngine {
                 .set_available_named_graphs(named_graphs);
         }
         let execution_started = Instant::now();
-        let (results, explanation) = prepared.explain(StoreDataset::with_default_union_marker(
+        let (results, explanation) = prepared.explain(StoreDataset::with_query_budget(
             view,
             &context,
             default_union_marker,
+            Arc::clone(&budget),
         ));
         let initial_execution_time = execution_started.elapsed();
         let results = results.map_err(map_eval_error)?;
-        let (results, collection) = collect_query_results(results, execution_started, &context)?;
+        let (results, collection) =
+            collect_query_results(results, execution_started, &context, &budget)?;
         let read_statistics = context.snapshot();
         let explanation_metrics = if collect_plan_statistics {
             read_explanation_metrics(&explanation)?
@@ -842,18 +1260,19 @@ impl SparqlEngine {
                 }
                 GraphUpdateOperation::Clear { graph, .. }
                 | GraphUpdateOperation::Drop { graph, .. } => {
-                    for graph in update_graph_target_graphs(&self.store, graph)? {
+                    let target_graphs =
+                        update_graph_target_graphs(&self.store, graph, options.limits.max_graphs)?;
+                    for graph in &target_graphs {
                         authorize_update_graph(&view, auth, &graph, crate::Action::Write, false)?;
                     }
-                    for change in materialize_graph_target_removals(&self.store, graph)? {
-                        push_update_change(
-                            &mut changes,
-                            &mut changed_graphs,
-                            change,
-                            &options.limits,
-                            started,
-                        )?;
-                    }
+                    materialize_graph_target_removals(
+                        &self.store,
+                        target_graphs,
+                        &mut changes,
+                        &mut changed_graphs,
+                        &options.limits,
+                        started,
+                    )?;
                 }
                 GraphUpdateOperation::Create { graph, .. } => {
                     let graph = GraphId(graph.clone());
@@ -1160,10 +1579,29 @@ fn authorize_update_expression(
     }
 }
 
-fn update_graph_target_graphs(store: &GraphStore, target: &GraphTarget) -> Result<Vec<GraphId>> {
+fn update_graph_target_graphs(
+    store: &GraphStore,
+    target: &GraphTarget,
+    max_graphs: usize,
+) -> Result<Vec<GraphId>> {
     match target {
         GraphTarget::NamedNode(graph) => Ok(vec![GraphId(graph.clone())]),
-        GraphTarget::NamedGraphs | GraphTarget::AllGraphs => Ok(store.graphs()?),
+        GraphTarget::NamedGraphs | GraphTarget::AllGraphs => {
+            let mut graphs = Vec::new();
+            for graph_id in store.graph_term_id_iter() {
+                if graphs.len() >= max_graphs {
+                    return Err(SparqlError::QueryLimit {
+                        resource: "update graphs",
+                        limit: max_graphs,
+                    });
+                }
+                let term = store.decode_term(graph_id?)?;
+                if let Some(graph) = term.to_named_node() {
+                    graphs.push(GraphId(graph));
+                }
+            }
+            Ok(graphs)
+        }
         GraphTarget::DefaultGraph => Err(SparqlError::Unsupported(
             "default graph updates are not supported; use GRAPH <iri>".into(),
         )),
@@ -1259,7 +1697,8 @@ struct CollectionMetrics {
     result_cells: u64,
 }
 
-fn parse_prepared_query(sparql: &str) -> Result<(PreparedQuery, Duration)> {
+fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQuery, Duration)> {
+    enforce_query_bytes(sparql.len(), limits)?;
     let started = Instant::now();
     let full = format!("{COMMON_PREFIXES}{sparql}");
     let query = SparqlParser::new()
@@ -1268,9 +1707,20 @@ fn parse_prepared_query(sparql: &str) -> Result<(PreparedQuery, Duration)> {
     Ok((
         PreparedQuery {
             query: Arc::new(query),
+            query_bytes: sparql.len(),
         },
         started.elapsed(),
     ))
+}
+
+fn enforce_query_bytes(bytes: usize, limits: &QueryLimits) -> Result<()> {
+    if bytes > limits.max_query_bytes {
+        return Err(SparqlError::QueryLimit {
+            resource: "query bytes",
+            limit: limits.max_query_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn query_fingerprint(query: &Query) -> String {
@@ -2091,6 +2541,8 @@ enum StoreTerm {
 enum StoreDatasetError {
     #[error("store: {0}")]
     Store(#[from] StoreError),
+    #[error("query limit exceeded: {0:?}")]
+    QueryLimit(#[from] QueryLimitExceeded),
     #[error("invalid RDF term: {0}")]
     InvalidTerm(String),
 }
@@ -2107,6 +2559,7 @@ struct StoreDataset<'store, 'context, 'visibility> {
     context: &'context ReadContext<'visibility>,
     default_union_marker: Option<BlankNode>,
     default_union_marker_pending: Cell<bool>,
+    query_budget: Option<Arc<QueryBudget>>,
 }
 
 impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> {
@@ -2120,6 +2573,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             context,
             default_union_marker: None,
             default_union_marker_pending: Cell::new(false),
+            query_budget: None,
         }
     }
 
@@ -2133,6 +2587,22 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             context,
             default_union_marker: Some(marker),
             default_union_marker_pending: Cell::new(true),
+            query_budget: None,
+        }
+    }
+
+    fn with_query_budget(
+        view: &'context StoreReadView<'store>,
+        context: &'context ReadContext<'visibility>,
+        marker: BlankNode,
+        query_budget: Arc<QueryBudget>,
+    ) -> Self {
+        Self {
+            view,
+            context,
+            default_union_marker: Some(marker),
+            default_union_marker_pending: Cell::new(true),
+            query_budget: Some(query_budget),
         }
     }
 
@@ -2264,12 +2734,19 @@ where
             Ok(quads) => quads,
             Err(error) => return Box::new(std::iter::once(Err(error.into()))),
         };
+        let query_budget = self.query_budget.clone();
+        let quads = quads.map(move |quad| {
+            if let Some(query_budget) = &query_budget {
+                query_budget.observe_intermediate(1)?;
+            }
+            quad.map_err(StoreDatasetError::from)
+        });
         let view = self.view;
         let context = self.context;
 
         match graph_name {
             Some(Some(StoreTerm::DefaultUnion)) => Box::new(quads.map(|quad| {
-                let quad = quad.map_err(StoreDatasetError::from)?;
+                let quad = quad?;
                 Ok(InternalQuad {
                     subject: StoreTerm::Existing(Self::stored_term(
                         view,
@@ -2293,7 +2770,7 @@ where
                 })
             })),
             Some(Some(StoreTerm::Existing(_))) => Box::new(quads.map(|quad| {
-                let quad = quad.map_err(StoreDatasetError::from)?;
+                let quad = quad?;
                 Ok(InternalQuad {
                     subject: StoreTerm::Existing(Self::stored_term(
                         view,
@@ -2320,7 +2797,7 @@ where
             })),
             Some(Some(StoreTerm::Missing(_))) => unreachable!("missing graph short-circuits above"),
             Some(None) => Box::new(quads.map(|quad| {
-                let quad = quad.map_err(StoreDatasetError::from)?;
+                let quad = quad?;
                 Ok(InternalQuad {
                     subject: StoreTerm::Existing(Self::stored_term(
                         view,
@@ -2344,7 +2821,7 @@ where
                 })
             })),
             None => Box::new(quads.map(|quad| {
-                let quad = quad.map_err(StoreDatasetError::from)?;
+                let quad = quad?;
                 Ok(InternalQuad {
                     subject: StoreTerm::Existing(Self::stored_term(
                         view,
@@ -2471,6 +2948,7 @@ fn collect_query_results(
     results: spareval::QueryResults<'_>,
     execution_started: Instant,
     context: &ReadContext<'_>,
+    budget: &QueryBudget,
 ) -> Result<(QueryResults, CollectionMetrics)> {
     match results {
         spareval::QueryResults::Solutions(mut solutions) => {
@@ -2481,6 +2959,7 @@ fn collect_query_results(
             let mut rows = Vec::new();
             let mut metrics = CollectionMetrics::default();
             loop {
+                budget.check()?;
                 let execution = Instant::now();
                 let solution = solutions.next();
                 metrics.execution_time = metrics.execution_time.saturating_add(execution.elapsed());
@@ -2501,25 +2980,30 @@ fn collect_query_results(
                 metrics.result_cells = metrics
                     .result_cells
                     .saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX));
+                budget.observe_solution(&row)?;
                 rows.push(row);
                 metrics.collection_time =
                     metrics.collection_time.saturating_add(collecting.elapsed());
             }
             Ok((QueryResults::Solutions(rows), metrics))
         }
-        spareval::QueryResults::Boolean(value) => Ok((
-            QueryResults::Boolean(value),
-            CollectionMetrics {
-                time_to_first_internal_result: Some(execution_started.elapsed()),
-                result_rows: 1,
-                result_cells: 1,
-                ..CollectionMetrics::default()
-            },
-        )),
+        spareval::QueryResults::Boolean(value) => {
+            budget.observe_boolean()?;
+            Ok((
+                QueryResults::Boolean(value),
+                CollectionMetrics {
+                    time_to_first_internal_result: Some(execution_started.elapsed()),
+                    result_rows: 1,
+                    result_cells: 1,
+                    ..CollectionMetrics::default()
+                },
+            ))
+        }
         spareval::QueryResults::Graph(mut triples) => {
             let mut graph = Vec::new();
             let mut metrics = CollectionMetrics::default();
             loop {
+                budget.check()?;
                 let execution = Instant::now();
                 let triple = triples.next();
                 metrics.execution_time = metrics.execution_time.saturating_add(execution.elapsed());
@@ -2535,11 +3019,13 @@ fn collect_query_results(
                     object,
                 } = triple.map_err(map_eval_error)?;
                 let collecting = Instant::now();
-                graph.push((
+                let triple = (
                     EncodedTerm::from(&subject),
                     EncodedTerm::from_named_node(&predicate),
                     EncodedTerm::from_term(&object),
-                ));
+                );
+                budget.observe_graph_triple(&triple)?;
+                graph.push(triple);
                 for _ in 0..3 {
                     context.increment_result_terms_decoded();
                 }
@@ -2556,6 +3042,19 @@ fn collect_query_results(
 fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
     match error {
         QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+        QueryEvaluationError::Dataset(error)
+            if error
+                .downcast_ref::<StoreDatasetError>()
+                .is_some_and(|error| matches!(error, StoreDatasetError::QueryLimit(_))) =>
+        {
+            let StoreDatasetError::QueryLimit(error) = error
+                .downcast_ref::<StoreDatasetError>()
+                .expect("query-limit dataset error was matched")
+            else {
+                unreachable!("query-limit dataset error was matched")
+            };
+            (*error).into()
+        }
         QueryEvaluationError::Dataset(error)
             if error
                 .downcast_ref::<StoreDatasetError>()
@@ -2637,15 +3136,12 @@ fn ground_term_to_encoded(term: &spargebra::term::GroundTerm) -> EncodedTerm {
 
 fn materialize_graph_target_removals(
     store: &GraphStore,
-    target: &GraphTarget,
-) -> Result<Vec<MaterializedQuadChange>> {
-    let graphs = match target {
-        GraphTarget::NamedNode(node) => vec![GraphId(node.clone())],
-        GraphTarget::DefaultGraph => Vec::new(),
-        GraphTarget::NamedGraphs | GraphTarget::AllGraphs => store.graphs()?,
-    };
-
-    let mut changes = Vec::new();
+    graphs: Vec<GraphId>,
+    changes: &mut Vec<MaterializedQuadChange>,
+    changed_graphs: &mut HashSet<GraphId>,
+    limits: &UpdateLimits,
+    started: Instant,
+) -> Result<()> {
     for graph in graphs {
         let graph_term = EncodedTerm::from_named_node(&graph.0);
         let Some(graph_id) = store.lookup_term(&graph_term)? else {
@@ -2653,16 +3149,21 @@ fn materialize_graph_target_removals(
         };
 
         store.for_each_quad_in_graph::<SparqlError, _>(graph_id, |quad| {
-            changes.push(MaterializedQuadChange::Delete {
-                graph: graph.clone(),
-                subject: store.decode_term(quad.subject)?,
-                predicate: store.decode_term(quad.predicate)?,
-                object: store.decode_term(quad.object)?,
-            });
-            Ok(())
+            push_update_change(
+                changes,
+                changed_graphs,
+                MaterializedQuadChange::Delete {
+                    graph: graph.clone(),
+                    subject: store.decode_term(quad.subject)?,
+                    predicate: store.decode_term(quad.predicate)?,
+                    object: store.decode_term(quad.object)?,
+                },
+                limits,
+                started,
+            )
         })?;
     }
-    Ok(changes)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3463,16 +3964,19 @@ mod tests {
         prepared
             .dataset_mut()
             .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
+        let budget = Arc::new(QueryBudget::new(&limit, QueryLimits::default()).unwrap());
         let rows = collect_query_results(
             prepared
-                .execute(StoreDataset::with_default_union_marker(
+                .execute(StoreDataset::with_query_budget(
                     &view,
                     &context,
                     default_union_marker,
+                    Arc::clone(&budget),
                 ))
                 .unwrap(),
             Instant::now(),
             &context,
+            &budget,
         )
         .unwrap()
         .0;

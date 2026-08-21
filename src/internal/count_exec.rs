@@ -6,7 +6,7 @@ use crate::count_plan::{CountValueDomain, SubjectSetMode};
 use crate::query_context::ReadContext;
 use crate::query_cursor::CountGrouping;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
-use crate::sparql::{Result, SparqlError};
+use crate::sparql::{QueryBudget, Result, SparqlError};
 use crate::store::{QueryTermId, StoreError, TermId};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
@@ -17,14 +17,10 @@ const PARALLEL_COUNT_MIN_ROWS: u64 = 32;
 type GraphOrphanCache = HashMap<QueryTermId, Option<Rc<HashSet<TermId>>>>;
 type ParallelGraphOrphanCache = Arc<HashMap<QueryTermId, Option<Arc<HashSet<TermId>>>>>;
 
-fn enforce_hash_entries(entries: usize, limit: usize) -> Result<()> {
-    if entries > limit {
-        return Err(SparqlError::QueryLimit {
-            resource: "hash keys",
-            limit,
-        });
-    }
-    Ok(())
+fn enforce_hash_entries(entries: usize, budget: &QueryBudget) -> Result<()> {
+    budget
+        .check_hash(entries, entries.saturating_mul(32))
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -134,7 +130,7 @@ pub(crate) fn single_pattern_count(
     selector: GraphSelector,
     pattern: QuadPattern,
     domain: CountValueDomain,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
     if matches!(domain, CountValueDomain::Scalar)
         && let GraphSelector::Named(graph) = selector
@@ -162,16 +158,14 @@ pub(crate) fn single_pattern_count(
             if matches!(selector, GraphSelector::DefaultUnion)
                 && !matches!(domain, CountValueDomain::Scalar) =>
         {
-            return source_union_distinct_count(view, context, pattern, domain, max_hash_entries)
-                .map(Some);
+            return source_union_distinct_count(view, context, pattern, domain, budget).map(Some);
         }
         Ok(None) => return Ok(None),
         Err(StoreError::QueryIndexUnavailable(_))
             if matches!(selector, GraphSelector::DefaultUnion)
                 && !matches!(domain, CountValueDomain::Scalar) =>
         {
-            return source_union_distinct_count(view, context, pattern, domain, max_hash_entries)
-                .map(Some);
+            return source_union_distinct_count(view, context, pattern, domain, budget).map(Some);
         }
         Err(error) => return Err(error.into()),
     };
@@ -217,6 +211,7 @@ pub(crate) fn single_pattern_count(
                     }
                 }
                 context.increment_matching_quads();
+                budget.observe_intermediate(1)?;
                 match domain {
                     CountValueDomain::Scalar => count.increment()?,
                     CountValueDomain::Subject => {
@@ -224,7 +219,7 @@ pub(crate) fn single_pattern_count(
                         if grouping == CountGrouping::Subject {
                             subjects.observe(subject)?;
                         } else if distinct.insert(subject) {
-                            enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                            enforce_hash_entries(distinct.len(), budget)?;
                             count.increment()?;
                         }
                     }
@@ -233,7 +228,7 @@ pub(crate) fn single_pattern_count(
                         if grouping == CountGrouping::Object {
                             objects.observe(object)?;
                         } else if distinct.insert(object) {
-                            enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                            enforce_hash_entries(distinct.len(), budget)?;
                             count.increment()?;
                         }
                     }
@@ -253,12 +248,12 @@ pub(crate) fn single_pattern_count(
                 let workers = crate::query_worker::worker_count();
                 match cursor.into_scalar_partitions(workers) {
                     Ok(partitions) => {
-                        return parallel_default_union_count(view, context, partitions);
+                        return parallel_default_union_count(view, context, partitions, budget);
                     }
                     Err(original) => cursor = *original,
                 }
             }
-            default_union_count(view, context, &mut cursor, domain, max_hash_entries)
+            default_union_count(view, context, &mut cursor, domain, budget)
         }
         GraphSelector::Union => Ok(None),
     }
@@ -269,7 +264,7 @@ fn source_union_distinct_count(
     context: &ReadContext<'_>,
     pattern: QuadPattern,
     domain: CountValueDomain,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<ScalarCount> {
     let mut cursor = view.scan(context, GraphSelector::Union, pattern)?;
     let grouping = cursor.count_grouping();
@@ -283,6 +278,7 @@ fn source_union_distinct_count(
     let mut count = ScalarCount::default();
     for quad in &mut cursor {
         let quad = quad?;
+        budget.observe_intermediate(1)?;
         let value = match domain {
             CountValueDomain::Subject => quad.subject,
             CountValueDomain::Object => quad.object,
@@ -292,7 +288,7 @@ fn source_union_distinct_count(
             if adjacent {
                 last = Some(value);
             } else {
-                enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                enforce_hash_entries(distinct.len(), budget)?;
             }
             count.increment()?;
         }
@@ -362,7 +358,7 @@ pub(crate) fn subject_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = SubjectKeySet::default();
     let mut hash_entries = 0usize;
@@ -373,11 +369,12 @@ pub(crate) fn subject_join_count(
         build_selector,
         build_pattern,
         JoinKeyDomain::Subject,
+        budget,
         |key| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             if table.observe(key)? {
                 hash_entries = hash_entries.saturating_add(1);
-                enforce_hash_entries(hash_entries, max_hash_entries)?;
+                enforce_hash_entries(hash_entries, budget)?;
             }
             Ok(())
         },
@@ -394,6 +391,7 @@ pub(crate) fn subject_join_count(
         probe_selector,
         probe_pattern,
         JoinKeyDomain::Subject,
+        budget,
         |key| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             count.add(table.multiplicity(key))
@@ -413,7 +411,7 @@ pub(crate) fn object_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = ObjectKeySet::default();
     let mut hash_entries = 0usize;
@@ -424,11 +422,12 @@ pub(crate) fn object_join_count(
         build_selector,
         build_pattern,
         JoinKeyDomain::Object,
+        budget,
         |key| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             if table.observe(key)? {
                 hash_entries = hash_entries.saturating_add(1);
-                enforce_hash_entries(hash_entries, max_hash_entries)?;
+                enforce_hash_entries(hash_entries, budget)?;
             }
             Ok(())
         },
@@ -445,6 +444,7 @@ pub(crate) fn object_join_count(
         probe_selector,
         probe_pattern,
         JoinKeyDomain::Object,
+        budget,
         |key| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             count.add(table.multiplicity(key))
@@ -464,7 +464,7 @@ pub(crate) fn object_subject_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = ObjectKeySet::default();
     let mut hash_entries = 0usize;
@@ -475,11 +475,12 @@ pub(crate) fn object_subject_join_count(
         build_selector,
         build_pattern,
         JoinKeyDomain::Object,
+        budget,
         |object| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             if table.observe(object)? {
                 hash_entries = hash_entries.saturating_add(1);
-                enforce_hash_entries(hash_entries, max_hash_entries)?;
+                enforce_hash_entries(hash_entries, budget)?;
             }
             Ok(())
         },
@@ -496,6 +497,7 @@ pub(crate) fn object_subject_join_count(
         probe_selector,
         probe_pattern,
         JoinKeyDomain::Subject,
+        budget,
         |subject| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             count.add(table.multiplicity(subject))
@@ -515,7 +517,7 @@ pub(crate) fn subject_object_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = SubjectKeySet::default();
     let mut hash_entries = 0usize;
@@ -526,11 +528,12 @@ pub(crate) fn subject_object_join_count(
         build_selector,
         build_pattern,
         JoinKeyDomain::Subject,
+        budget,
         |subject| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             if table.observe(subject)? {
                 hash_entries = hash_entries.saturating_add(1);
-                enforce_hash_entries(hash_entries, max_hash_entries)?;
+                enforce_hash_entries(hash_entries, budget)?;
             }
             Ok(())
         },
@@ -547,6 +550,7 @@ pub(crate) fn subject_object_join_count(
         probe_selector,
         probe_pattern,
         JoinKeyDomain::Object,
+        budget,
         |object| {
             intermediate_rows = intermediate_rows.saturating_add(1);
             count.add(table.multiplicity(object))
@@ -563,7 +567,7 @@ pub(crate) fn subject_star_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     patterns: &[(GraphSelector, QuadPattern)],
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut relations = Vec::with_capacity(patterns.len());
     let mut intermediate_rows = 0_u64;
@@ -576,11 +580,12 @@ pub(crate) fn subject_star_count(
             selector,
             pattern,
             JoinKeyDomain::Subject,
+            budget,
             |subject| {
                 intermediate_rows = intermediate_rows.saturating_add(1);
                 if relation.observe(subject)? {
                     hash_entries = hash_entries.saturating_add(1);
-                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                    enforce_hash_entries(hash_entries, budget)?;
                 }
                 Ok(())
             },
@@ -619,7 +624,7 @@ pub(crate) fn optional_subject_star_count(
     context: &ReadContext<'_>,
     mandatory: &[(GraphSelector, QuadPattern)],
     optional: &[(GraphSelector, QuadPattern)],
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut relations = Vec::with_capacity(mandatory.len() + optional.len());
     let mut intermediate_rows = 0_u64;
@@ -632,11 +637,12 @@ pub(crate) fn optional_subject_star_count(
             selector,
             pattern,
             JoinKeyDomain::Subject,
+            budget,
             |subject| {
                 intermediate_rows = intermediate_rows.saturating_add(1);
                 if relation.observe(subject)? {
                     hash_entries = hash_entries.saturating_add(1);
-                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                    enforce_hash_entries(hash_entries, budget)?;
                 }
                 Ok(())
             },
@@ -699,7 +705,7 @@ pub(crate) fn subject_set_count(
     outer: &[(GraphSelector, QuadPattern)],
     inner: &[(GraphSelector, QuadPattern)],
     mode: SubjectSetMode,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut outer_relations = Vec::with_capacity(outer.len());
     let mut intermediate_rows = 0_u64;
@@ -712,11 +718,12 @@ pub(crate) fn subject_set_count(
             selector,
             pattern,
             JoinKeyDomain::Subject,
+            budget,
             |subject| {
                 intermediate_rows = intermediate_rows.saturating_add(1);
                 if relation.observe(subject)? {
                     hash_entries = hash_entries.saturating_add(1);
-                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                    enforce_hash_entries(hash_entries, budget)?;
                 }
                 Ok(())
             },
@@ -736,11 +743,12 @@ pub(crate) fn subject_set_count(
             selector,
             pattern,
             JoinKeyDomain::Subject,
+            budget,
             |subject| {
                 intermediate_rows = intermediate_rows.saturating_add(1);
                 if relation.insert(subject) {
                     hash_entries = hash_entries.saturating_add(1);
-                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                    enforce_hash_entries(hash_entries, budget)?;
                 }
                 Ok(())
             },
@@ -799,6 +807,7 @@ fn for_each_join_key(
     selector: GraphSelector,
     pattern: QuadPattern,
     domain: JoinKeyDomain,
+    budget: &QueryBudget,
     mut observe: impl FnMut(QueryTermId) -> Result<()>,
 ) -> Result<Option<()>> {
     let Some(mut cursor) = view.raw_query_index_keys(context, selector, pattern)? else {
@@ -850,6 +859,7 @@ fn for_each_join_key(
                     }
                 }
                 context.increment_matching_quads();
+                budget.observe_intermediate(1)?;
                 observe(selected)?;
             }
         }
@@ -901,6 +911,7 @@ fn for_each_join_key(
 
                 group_emitted = true;
                 context.increment_matching_quads();
+                budget.observe_intermediate(1)?;
                 observe(match domain {
                     JoinKeyDomain::Subject => subject,
                     JoinKeyDomain::Object => object,
@@ -944,7 +955,7 @@ fn default_union_count(
     context: &ReadContext<'_>,
     cursor: &mut crate::query_cursor::RawQueryIndexKeyCursor,
     domain: CountValueDomain,
-    max_hash_entries: usize,
+    budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
     let grouping = cursor.count_grouping();
     let adjacent = matches!(
@@ -1041,6 +1052,7 @@ fn default_union_count(
             group_emitted = true;
         }
         context.increment_matching_quads();
+        budget.observe_intermediate(1)?;
         match domain {
             CountValueDomain::Scalar => count.increment()?,
             CountValueDomain::Subject => {
@@ -1048,7 +1060,7 @@ fn default_union_count(
                 if adjacent {
                     subjects.observe(subject)?;
                 } else if distinct.insert(subject) {
-                    enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                    enforce_hash_entries(distinct.len(), budget)?;
                     count.increment()?;
                 }
             }
@@ -1057,7 +1069,7 @@ fn default_union_count(
                 if adjacent {
                     objects.observe(object)?;
                 } else if distinct.insert(object) {
-                    enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                    enforce_hash_entries(distinct.len(), budget)?;
                     count.increment()?;
                 }
             }
@@ -1087,11 +1099,12 @@ fn parallel_default_union_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     partitions: Vec<crate::query_cursor::RawQueryIndexKeyCursor>,
+    budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
     let graph_cache = parallel_graph_cache(view, context)?;
     let cancellation = context.cancellation();
     let results = crate::query_worker::map_ordered(partitions, |cursor| {
-        count_default_union_partition(cursor, &graph_cache, &cancellation)
+        count_default_union_partition(cursor, &graph_cache, &cancellation, budget)
     })?;
 
     let mut count = ScalarCount::default();
@@ -1132,6 +1145,7 @@ fn count_default_union_partition(
     mut cursor: crate::query_cursor::RawQueryIndexKeyCursor,
     graph_cache: &ParallelGraphOrphanCache,
     cancellation: &crate::query_context::QueryCancellation,
+    budget: &QueryBudget,
 ) -> Result<ParallelCountWork> {
     let mut result = ParallelCountWork::default();
     let mut current_group = None;
@@ -1187,6 +1201,7 @@ fn count_default_union_partition(
 
         group_emitted = true;
         result.matching_quads = result.matching_quads.saturating_add(1);
+        budget.observe_intermediate(1)?;
         result.count.increment()?;
     }
     if cancellation.is_cancelled() {
