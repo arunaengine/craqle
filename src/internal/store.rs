@@ -4603,6 +4603,31 @@ impl GraphStore {
         self.commit_fjall_batch(batch).unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_query_index_state(&self, state: QueryIndexState) {
+        let _indexes = self.indexes_write();
+        let snapshot = self.db.snapshot();
+        let QueryIndexHeaderRead::Valid(mut header) =
+            self.query_index_header_from_snapshot(&snapshot).unwrap()
+        else {
+            panic!("query-index header must be present before degrading it");
+        };
+        let mut batch = self.buffered_batch();
+        match state {
+            QueryIndexState::Missing => batch.remove(&self.qv2_meta, QUERY_INDEX_HEADER_KEY),
+            QueryIndexState::Building => {
+                header.state = StoredQueryIndexState::Building;
+                self.stage_query_index_header(&mut batch, &header);
+            }
+            QueryIndexState::Failed(reason) => {
+                header.state = StoredQueryIndexState::Failed(reason);
+                self.stage_query_index_header(&mut batch, &header);
+            }
+            QueryIndexState::Ready => panic!("test helper only degrades query indexes"),
+        }
+        self.commit_fjall_batch(batch).unwrap();
+    }
+
     /// The vocabulary term ids orphan detection matches on.
     ///
     /// `None` means the term was never interned, so no stored quad can mention

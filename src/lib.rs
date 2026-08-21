@@ -124,6 +124,7 @@ pub use crate::shacl::{
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics, QueryLimits,
     QueryLogicalOperator, QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryResults,
+    UpdateLimits, UpdateOptions,
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
@@ -248,6 +249,7 @@ impl From<sparql::SparqlError> for CraqleError {
         match error {
             sparql::SparqlError::Cancelled => Self::QueryCancelled,
             sparql::SparqlError::Store(store::StoreError::Cancelled) => Self::QueryCancelled,
+            sparql::SparqlError::Authorization(error) => Self::Authorization(error),
             error => Self::Sparql(error),
         }
     }
@@ -2509,30 +2511,34 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         sparql_update: &str,
     ) -> Result<Option<Batch>> {
-        let changes = self.sparql.evaluate_update(sparql_update)?;
+        self.apply_sparql_update_with_options(auth, sparql_update, &UpdateOptions::default())
+    }
+
+    /// Apply a bounded SPARQL update and publish the resulting replication batch.
+    pub fn apply_sparql_update_with_options(
+        &self,
+        auth: &dyn Authorizer,
+        sparql_update: &str,
+        options: &UpdateOptions,
+    ) -> Result<Option<Batch>> {
+        let changes = self.sparql.evaluate_update(auth, sparql_update, options)?;
         if changes.is_empty() {
             return Ok(None);
         }
 
+        let mut authorized = HashSet::new();
+        for change in &changes {
+            let graph = match change {
+                CoreMaterializedQuadChange::Insert { graph, .. }
+                | CoreMaterializedQuadChange::Delete { graph, .. } => graph,
+            };
+            if authorized.insert(graph.clone()) {
+                self.ensure_graph_action(graph, auth, Action::Write)?;
+            }
+        }
         let graph = single_graph_for_changes(&changes)?;
-        self.ensure_graph_action(&graph, auth, Action::Write)?;
         let batch = self.replication.local_apply_changes(&graph, changes)?;
         Ok(Some(self.finish_batch(&graph, batch)?))
-    }
-
-    /// Advanced: apply a SPARQL update locally without authorization checks.
-    pub fn local_update(&self, sparql_update: &str) -> Result<Option<Batch>> {
-        let batch = self.replication.local_update(sparql_update)?;
-        if let Some(batch) = batch {
-            let graph = batch.graph.clone();
-            return Ok(Some(self.finish_batch(&graph, batch)?));
-        }
-        Ok(None)
-    }
-
-    /// Alias for [`CraqleNode::local_update`].
-    pub fn update(&self, sparql_update: &str) -> Result<Option<Batch>> {
-        self.local_update(sparql_update)
     }
 
     /// Advanced: insert raw quads directly into one graph.
@@ -2710,71 +2716,71 @@ impl CraqleNode {
         Ok(self.execute_prepared(auth, query, options)?.statistics.plan)
     }
 
-    /// Execute a SPARQL query against an explicit set of local graphs.
-    pub fn query_graphs(&self, graphs: &[GraphId], sparql: &str) -> Result<QueryResults> {
-        Ok(self.sparql.query_with_graphs(sparql, graphs)?)
-    }
-
-    /// Execute a complete query over explicit graphs with diagnostics.
-    pub fn query_graphs_with_statistics(
+    /// Execute a SPARQL query against an explicit, wholly authorized graph set.
+    ///
+    /// Missing and unreadable graph names both fail the complete request with
+    /// an authorization error; neither is silently removed from the dataset.
+    pub fn query_in_graphs(
         &self,
+        auth: &dyn Authorizer,
         graphs: &[GraphId],
         sparql: &str,
-    ) -> Result<QueryExecution> {
-        Ok(self.sparql.query_with_graphs_statistics(sparql, graphs)?)
+    ) -> Result<QueryResults> {
+        Ok(self
+            .query_in_graphs_with_options(auth, graphs, sparql, &QueryExecutionOptions::default())?
+            .results)
     }
 
-    /// Execute a prepared query over an explicit graph set.
-    pub fn execute_prepared_graphs(
+    /// Execute a complete query over an explicit, wholly authorized graph set.
+    pub fn query_in_graphs_with_options(
         &self,
+        auth: &dyn Authorizer,
+        graphs: &[GraphId],
+        sparql: &str,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryExecution> {
+        let query = self.prepare_query(sparql)?;
+        self.execute_prepared_in_graphs(auth, graphs, &query, options)
+    }
+
+    /// Execute a prepared query over an explicit, wholly authorized graph set.
+    pub fn execute_prepared_in_graphs(
+        &self,
+        auth: &dyn Authorizer,
         graphs: &[GraphId],
         query: &PreparedQuery,
         options: &QueryExecutionOptions,
     ) -> Result<QueryExecution> {
         Ok(self
             .sparql
-            .execute_prepared_with_graphs(query, graphs, options)?)
+            .execute_prepared_in_graphs(auth, query, graphs, options)?)
     }
 
-    /// Inspect a prepared plan for an explicit graph set without executing it.
-    pub fn explain_prepared_graphs(
+    /// Inspect a prepared plan for an explicit, wholly authorized graph set.
+    pub fn explain_prepared_in_graphs(
         &self,
+        auth: &dyn Authorizer,
         graphs: &[GraphId],
         query: &PreparedQuery,
         options: &QueryExecutionOptions,
     ) -> Result<QueryPlan> {
         Ok(self
             .sparql
-            .explain_prepared_with_graphs(query, graphs, options)?)
+            .explain_prepared_in_graphs(auth, query, graphs, options)?)
     }
 
-    /// Execute over explicit graphs completely and return the measured plan.
-    pub fn analyze_prepared_graphs(
+    /// Execute over explicit authorized graphs and return the measured plan.
+    pub fn analyze_prepared_in_graphs(
         &self,
+        auth: &dyn Authorizer,
         graphs: &[GraphId],
         query: &PreparedQuery,
         options: &QueryExecutionOptions,
     ) -> Result<QueryPlan> {
         Ok(self
-            .execute_prepared_graphs(graphs, query, options)?
+            .execute_prepared_in_graphs(auth, graphs, query, options)?
             .statistics
             .plan)
-    }
-
-    /// Execute a complete query with an explicit storage-read mode.
-    ///
-    /// This diagnostic entry point is intended for same-binary tests and
-    /// benchmarks. `ForceQv` returns an error when query-index v2 is not trusted.
-    #[doc(hidden)]
-    pub fn query_graphs_with_read_mode(
-        &self,
-        graphs: &[GraphId],
-        sparql: &str,
-        read_mode: QueryReadMode,
-    ) -> Result<(QueryResults, ReadStatistics)> {
-        Ok(self
-            .sparql
-            .query_with_graphs_read_mode(sparql, graphs, read_mode)?)
     }
 
     /// Execute a SPARQL query where graph visibility is decided by `visible`.
@@ -2785,30 +2791,12 @@ impl CraqleNode {
     /// reaches instead of the total corpus. A quad participates in evaluation
     /// iff its graph satisfies the predicate; the predicate must be cheap and
     /// side-effect free.
-    pub fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
+    #[cfg(test)]
+    pub(crate) fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
     where
         F: Fn(&GraphId) -> bool,
     {
         Ok(self.sparql.query_with_visibility(sparql, &visible)?)
-    }
-
-    /// [`CraqleNode::query_graphs_with`] with explicit control over the
-    /// craqle query-plan optimizer. `optimize = false` evaluates the raw
-    /// sparopt plan; used for plan debugging and result-equivalence tests.
-    /// The `CRAQLE_QUERY_OPT=off` environment variable disables the
-    /// optimizer globally for the default query entry points.
-    pub fn query_graphs_with_planner<F>(
-        &self,
-        visible: F,
-        sparql: &str,
-        optimize: bool,
-    ) -> Result<QueryResults>
-    where
-        F: Fn(&GraphId) -> bool,
-    {
-        Ok(self
-            .sparql
-            .query_with_visibility_planned(sparql, &visible, optimize)?)
     }
 
     /// Block until the cross-graph derived indexes are built; they are kept

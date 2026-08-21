@@ -4,12 +4,15 @@
 //! runs with the craqle optimizer both enabled and disabled; solution rows are
 //! compared as multisets because SPARQL does not prescribe an order here.
 
+mod support;
+
 use oxrdf::Term;
 
 use craqle::{
-    CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange, QueryResults,
-    SearchStorage,
+    AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange,
+    QueryResults, SearchStorage,
 };
+use support::{query_with_test_planner, query_with_test_visibility};
 
 const PRIMARY_GRAPH: &str = "urn:baseline:primary";
 const DUPLICATE_GRAPH: &str = "urn:baseline:duplicate";
@@ -176,16 +179,10 @@ fn canonicalize(results: QueryResults) -> CanonicalResults {
 
 fn planner_result<F>(node: &CraqleNode, label: &str, visible: F, sparql: &str) -> CanonicalResults
 where
-    F: Fn(&GraphId) -> bool,
+    F: Fn(&GraphId) -> bool + Sync,
 {
-    let optimized = canonicalize(
-        node.query_graphs_with_planner(&visible, sparql, true)
-            .unwrap(),
-    );
-    let unoptimized = canonicalize(
-        node.query_graphs_with_planner(&visible, sparql, false)
-            .unwrap(),
-    );
+    let optimized = canonicalize(query_with_test_planner(node, &visible, sparql, true).unwrap());
+    let unoptimized = canonicalize(query_with_test_planner(node, &visible, sparql, false).unwrap());
     assert_eq!(
         optimized, unoptimized,
         "{label}: optimizer changed SPARQL semantics\nquery: {sparql}"
@@ -360,7 +357,7 @@ fn union_default_graph_deduplicates_identical_triples() {
 
     assert_eq!(
         solution_rows(canonicalize(
-            fixture.node.query_graphs_with(|_| true, &query).unwrap(),
+            query_with_test_visibility(&fixture.node, |_| true, &query).unwrap(),
         )),
         expected,
         "the union default graph must contain one copy of an identical triple"
@@ -408,7 +405,11 @@ fn hidden_graphs_and_recorded_orphans_are_not_query_visible() {
         solution_rows(canonicalize(
             fixture
                 .node
-                .query_graphs(std::slice::from_ref(&fixture.orphan), &orphan_query)
+                .query_in_graphs(
+                    &AllowAllAuthorizer,
+                    std::slice::from_ref(&fixture.orphan),
+                    &orphan_query,
+                )
                 .unwrap(),
         )),
         Vec::<Vec<(String, EncodedTerm)>>::new(),

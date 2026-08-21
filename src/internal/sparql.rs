@@ -17,8 +17,8 @@ use spareval::{
     DeleteInsertQuad, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
     QueryableDataset,
 };
-use spargebra::algebra::{GraphPattern, GraphTarget};
-use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, GraphTarget};
+use spargebra::term::{GraphNamePattern, GroundTerm, NamedNodePattern, TermPattern};
 use spargebra::{GraphUpdateOperation, Query, SparqlParser};
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +40,8 @@ pub enum SparqlError {
     Unsupported(String),
     #[error("invalid RDF term: {0}")]
     InvalidTerm(String),
+    #[error("authorization: {0}")]
+    Authorization(#[from] crate::AuthorizationError),
     #[error("store error: {0}")]
     Store(#[from] crate::store::StoreError),
     #[error("search error: {0}")]
@@ -53,6 +55,7 @@ impl SparqlError {
                 crate::CraqleErrorKind::InvalidInput
             }
             Self::QueryLimit { .. } => crate::CraqleErrorKind::QueryLimit,
+            Self::Authorization(_) => crate::CraqleErrorKind::Unauthorized,
             Self::Unsupported(_) => crate::CraqleErrorKind::Unsupported,
             Self::Cancelled => crate::CraqleErrorKind::Cancelled,
             Self::Store(error) => error.kind(),
@@ -127,6 +130,42 @@ impl Default for QueryExecutionOptions {
             limits: QueryLimits::default(),
         }
     }
+}
+
+/// Limits applied while parsing and materializing a SPARQL update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UpdateLimits {
+    pub max_update_bytes: usize,
+    pub max_materialized_bindings: usize,
+    pub max_changes: usize,
+    pub max_graphs: usize,
+    pub deadline: Option<Duration>,
+}
+
+impl UpdateLimits {
+    pub fn production() -> Self {
+        Self {
+            max_update_bytes: 1_048_576,
+            max_materialized_bindings: 100_000,
+            max_changes: 1_000_000,
+            max_graphs: 16,
+            deadline: Some(Duration::from_secs(30)),
+        }
+    }
+}
+
+impl Default for UpdateLimits {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
+/// Per-request controls for SPARQL Update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[non_exhaustive]
+pub struct UpdateOptions {
+    pub limits: UpdateLimits,
 }
 
 /// Complete query output and diagnostics from the same execution.
@@ -289,13 +328,20 @@ impl SparqlEngine {
         Ok(parse_prepared_query(sparql)?.0)
     }
 
-    pub(crate) fn explain_prepared_with_graphs(
+    pub(crate) fn explain_prepared_in_graphs(
         &self,
+        auth: &dyn crate::Authorizer,
         prepared: &PreparedQuery,
         graphs: &[GraphId],
         options: &QueryExecutionOptions,
     ) -> Result<QueryPlan> {
-        self.explain_prepared_scope(prepared, GraphScope::List(graphs), None, options)
+        self.explain_prepared_scope(
+            prepared,
+            GraphScope::List(graphs),
+            None,
+            options,
+            Some(auth),
+        )
     }
 
     pub(crate) fn explain_prepared_with_snapshot_visibility(
@@ -311,6 +357,7 @@ impl SparqlEngine {
             GraphScope::Predicate(&visible),
             Some((self.store.as_ref(), policy_visible)),
             options,
+            None,
         )
     }
 
@@ -320,7 +367,10 @@ impl SparqlEngine {
         scope: GraphScope<'_>,
         post_raw_visibility: Option<(&GraphStore, &SnapshotVisibleFn<'_>)>,
         options: &QueryExecutionOptions,
+        explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<QueryPlan> {
+        let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
+        authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
         rewrite_fts_query(
             &mut query,
@@ -341,6 +391,7 @@ impl SparqlEngine {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn query_with_graphs(
         &self,
         sparql: &str,
@@ -349,6 +400,7 @@ impl SparqlEngine {
         self.run_query(sparql, GraphScope::List(graphs), planner_enabled())
     }
 
+    #[cfg(test)]
     pub(crate) fn query_with_graphs_read_mode(
         &self,
         sparql: &str,
@@ -363,24 +415,9 @@ impl SparqlEngine {
         )
     }
 
-    pub(crate) fn query_with_graphs_statistics(
+    pub(crate) fn execute_prepared_in_graphs(
         &self,
-        sparql: &str,
-        graphs: &[GraphId],
-    ) -> Result<QueryExecution> {
-        let (prepared, parse_time) = parse_prepared_query(sparql)?;
-        self.execute_prepared_scope(
-            &prepared,
-            GraphScope::List(graphs),
-            &QueryExecutionOptions::default(),
-            parse_time,
-            true,
-        )
-        .map(|(execution, _)| execution)
-    }
-
-    pub(crate) fn execute_prepared_with_graphs(
-        &self,
+        auth: &dyn crate::Authorizer,
         prepared: &PreparedQuery,
         graphs: &[GraphId],
         options: &QueryExecutionOptions,
@@ -391,10 +428,12 @@ impl SparqlEngine {
             options,
             Duration::ZERO,
             true,
+            Some(auth),
         )
         .map(|(execution, _)| execution)
     }
 
+    #[cfg(test)]
     pub(crate) fn query_with_visibility(
         &self,
         sparql: &str,
@@ -486,17 +525,7 @@ impl SparqlEngine {
         .map(|(execution, _)| execution)
     }
 
-    /// Like [`SparqlEngine::query_with_visibility`] with explicit control over
-    /// the craqle plan optimizer (used by tests and as a debugging hatch).
-    pub(crate) fn query_with_visibility_planned(
-        &self,
-        sparql: &str,
-        visible: &VisibleFn<'_>,
-        optimize: bool,
-    ) -> Result<QueryResults> {
-        self.run_query(sparql, GraphScope::Predicate(visible), optimize)
-    }
-
+    #[cfg(test)]
     fn run_query(
         &self,
         sparql: &str,
@@ -508,6 +537,7 @@ impl SparqlEngine {
             .0)
     }
 
+    #[cfg(test)]
     fn run_query_mode(
         &self,
         sparql: &str,
@@ -525,7 +555,7 @@ impl SparqlEngine {
             limits: QueryLimits::default(),
         };
         let (execution, read_statistics) =
-            self.execute_prepared_scope(&prepared, scope, &options, parse_time, false)?;
+            self.execute_prepared_scope(&prepared, scope, &options, parse_time, false, None)?;
         Ok((execution.results, read_statistics))
     }
 
@@ -536,7 +566,10 @@ impl SparqlEngine {
         options: &QueryExecutionOptions,
         parse_time: Duration,
         collect_plan_statistics: bool,
+        explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<(QueryExecution, ReadStatistics)> {
+        let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
+        authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
         let rewrite_started = Instant::now();
         rewrite_fts_query(
@@ -558,7 +591,6 @@ impl SparqlEngine {
         let craqle_planning_time = planning_started.elapsed();
         let plan_fingerprint = query_fingerprint(&query);
         let logical_operator = query_logical_operator(&query);
-        let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         self.execute_query(
             query,
             scope,
@@ -625,9 +657,35 @@ impl SparqlEngine {
         }
         let mut prepared = evaluator.prepare(&query);
         let default_union_marker = BlankNode::default();
-        prepared
-            .dataset_mut()
-            .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
+        let source_default_graphs = if matches!(options.read_mode, QueryReadMode::ForceSource)
+            || !view.query_ids_trusted(&context)?
+        {
+            match scope {
+                GraphScope::List(graphs) => {
+                    let mut default_graphs = Vec::with_capacity(graphs.len());
+                    for graph in graphs {
+                        if view.contains_graph(graph)? {
+                            default_graphs.push(GraphName::NamedNode(graph.0.clone()));
+                        }
+                    }
+                    Some(default_graphs)
+                }
+                #[cfg(test)]
+                GraphScope::All => None,
+                GraphScope::Predicate(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(source_default_graphs) = source_default_graphs {
+            prepared
+                .dataset_mut()
+                .set_default_graph(source_default_graphs);
+        } else {
+            prepared
+                .dataset_mut()
+                .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
+        }
         if let Some(named_graphs) = named_graphs {
             prepared
                 .dataset_mut()
@@ -664,23 +722,55 @@ impl SparqlEngine {
         ))
     }
 
-    pub(crate) fn evaluate_update(&self, sparql: &str) -> Result<Vec<MaterializedQuadChange>> {
+    pub(crate) fn evaluate_update(
+        &self,
+        auth: &dyn crate::Authorizer,
+        sparql: &str,
+        options: &UpdateOptions,
+    ) -> Result<Vec<MaterializedQuadChange>> {
+        if sparql.len() > options.limits.max_update_bytes {
+            return Err(SparqlError::QueryLimit {
+                resource: "update bytes",
+                limit: options.limits.max_update_bytes,
+            });
+        }
+        let started = Instant::now();
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let update = SparqlParser::new()
             .parse_update(&full)
             .map_err(|e| SparqlError::Parse(e.to_string()))?;
 
+        let view = StoreReadView::new(&self.store);
+        let readable_graphs = readable_update_graphs(&view, auth)?;
         let mut changes = Vec::new();
+        let mut changed_graphs = HashSet::new();
         for operation in &update.operations {
+            check_update_deadline(started, &options.limits)?;
             match operation {
                 GraphUpdateOperation::InsertData { data } => {
                     for quad in data {
-                        changes.push(quad_to_insert(quad)?);
+                        let change = quad_to_insert(quad)?;
+                        authorize_materialized_change(&view, auth, &change)?;
+                        push_update_change(
+                            &mut changes,
+                            &mut changed_graphs,
+                            change,
+                            &options.limits,
+                            started,
+                        )?;
                     }
                 }
                 GraphUpdateOperation::DeleteData { data } => {
                     for quad in data {
-                        changes.push(ground_quad_to_delete(quad)?);
+                        let change = ground_quad_to_delete(quad)?;
+                        authorize_materialized_change(&view, auth, &change)?;
+                        push_update_change(
+                            &mut changes,
+                            &mut changed_graphs,
+                            change,
+                            &options.limits,
+                            started,
+                        )?;
                     }
                 }
                 GraphUpdateOperation::DeleteInsert {
@@ -689,6 +779,14 @@ impl SparqlEngine {
                     using,
                     pattern,
                 } => {
+                    authorize_update_dataset(&view, auth, using.as_ref())?;
+                    authorize_update_pattern(&view, auth, pattern)?;
+                    for quad in delete {
+                        authorize_update_template_graph(&view, auth, &quad.graph_name)?;
+                    }
+                    for quad in insert {
+                        authorize_update_template_graph(&view, auth, &quad.graph_name)?;
+                    }
                     let evaluator = QueryEvaluator::new();
                     let mut prepared = evaluator.prepare_delete_insert(
                         delete.clone(),
@@ -697,14 +795,18 @@ impl SparqlEngine {
                         using.clone(),
                         pattern,
                     );
-                    let view = StoreReadView::new(&self.store);
                     let default_union_marker = BlankNode::default();
-                    prepared
-                        .dataset_mut()
-                        .set_default_graph(vec![GraphName::BlankNode(
-                            default_union_marker.clone(),
-                        )]);
-                    let context = ReadContext::new(QueryCancellation::new());
+                    if using.is_none() {
+                        prepared
+                            .dataset_mut()
+                            .set_default_graph(vec![GraphName::BlankNode(
+                                default_union_marker.clone(),
+                            )]);
+                    }
+                    let context = ReadContext::with_visible_graphs(
+                        QueryCancellation::new(),
+                        readable_graphs.iter().cloned(),
+                    );
                     let iter = prepared
                         .execute(StoreDataset::with_default_union_marker(
                             &view,
@@ -713,16 +815,50 @@ impl SparqlEngine {
                         ))
                         .map_err(map_eval_error)?;
 
+                    let template_width = delete.len().saturating_add(insert.len()).max(1);
+                    let max_materialized_quads = options
+                        .limits
+                        .max_materialized_bindings
+                        .saturating_mul(template_width);
+                    let mut materialized_quads = 0_usize;
                     for quad in iter {
-                        changes.push(delete_insert_quad_to_change(quad.map_err(map_eval_error)?)?);
+                        materialized_quads = materialized_quads.saturating_add(1);
+                        if materialized_quads > max_materialized_quads {
+                            return Err(SparqlError::QueryLimit {
+                                resource: "materialized update bindings",
+                                limit: options.limits.max_materialized_bindings,
+                            });
+                        }
+                        let change = delete_insert_quad_to_change(quad.map_err(map_eval_error)?)?;
+                        authorize_materialized_change(&view, auth, &change)?;
+                        push_update_change(
+                            &mut changes,
+                            &mut changed_graphs,
+                            change,
+                            &options.limits,
+                            started,
+                        )?;
                     }
                 }
                 GraphUpdateOperation::Clear { graph, .. }
                 | GraphUpdateOperation::Drop { graph, .. } => {
-                    changes.extend(materialize_graph_target_removals(&self.store, graph)?);
+                    for graph in update_graph_target_graphs(&self.store, graph)? {
+                        authorize_update_graph(&view, auth, &graph, crate::Action::Write, false)?;
+                    }
+                    for change in materialize_graph_target_removals(&self.store, graph)? {
+                        push_update_change(
+                            &mut changes,
+                            &mut changed_graphs,
+                            change,
+                            &options.limits,
+                            started,
+                        )?;
+                    }
                 }
                 GraphUpdateOperation::Create { graph, .. } => {
-                    if self.store.contains_graph(&GraphId(graph.clone()))? {
+                    let graph = GraphId(graph.clone());
+                    authorize_update_graph(&view, auth, &graph, crate::Action::Write, false)?;
+                    if self.store.contains_graph(&graph)? {
                         continue;
                     }
                     return Err(SparqlError::Unsupported(
@@ -738,6 +874,299 @@ impl SparqlEngine {
         }
 
         Ok(changes)
+    }
+}
+
+fn check_update_deadline(started: Instant, limits: &UpdateLimits) -> Result<()> {
+    if limits
+        .deadline
+        .is_some_and(|deadline| started.elapsed() >= deadline)
+    {
+        return Err(SparqlError::QueryLimit {
+            resource: "update deadline",
+            limit: 0,
+        });
+    }
+    Ok(())
+}
+
+fn push_update_change(
+    changes: &mut Vec<MaterializedQuadChange>,
+    graphs: &mut HashSet<GraphId>,
+    change: MaterializedQuadChange,
+    limits: &UpdateLimits,
+    started: Instant,
+) -> Result<()> {
+    check_update_deadline(started, limits)?;
+    if changes.len() >= limits.max_changes {
+        return Err(SparqlError::QueryLimit {
+            resource: "update changes",
+            limit: limits.max_changes,
+        });
+    }
+    let graph = match &change {
+        MaterializedQuadChange::Insert { graph, .. }
+        | MaterializedQuadChange::Delete { graph, .. } => graph,
+    };
+    graphs.insert(graph.clone());
+    if graphs.len() > limits.max_graphs {
+        return Err(SparqlError::QueryLimit {
+            resource: "update graphs",
+            limit: limits.max_graphs,
+        });
+    }
+    changes.push(change);
+    Ok(())
+}
+
+fn authorize_update_graph(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+    graph: &GraphId,
+    action: crate::Action,
+    deny_missing: bool,
+) -> Result<()> {
+    let policy = view.snapshot().graph_policy(view.store(), graph)?;
+    if deny_missing && policy.is_none() {
+        return Err(crate::AuthorizationError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_owned(),
+        }
+        .into());
+    }
+    auth.authorize(graph, &policy.unwrap_or_default(), action)?;
+    Ok(())
+}
+
+fn authorize_materialized_change(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+    change: &MaterializedQuadChange,
+) -> Result<()> {
+    let graph = match change {
+        MaterializedQuadChange::Insert { graph, .. }
+        | MaterializedQuadChange::Delete { graph, .. } => graph,
+    };
+    authorize_update_graph(view, auth, graph, crate::Action::Write, false)
+}
+
+fn readable_update_graphs(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+) -> Result<HashSet<GraphId>> {
+    let mut readable = HashSet::new();
+    for graph in view.store().graphs()? {
+        let Some(policy) = view.snapshot().graph_policy(view.store(), &graph)? else {
+            continue;
+        };
+        match auth.authorize(&graph, &policy, crate::Action::Read) {
+            Ok(()) => {
+                readable.insert(graph);
+            }
+            Err(crate::AuthorizationError::PermissionDenied { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(readable)
+}
+
+fn authorize_update_dataset(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+    dataset: Option<&spargebra::algebra::QueryDataset>,
+) -> Result<()> {
+    let Some(dataset) = dataset else {
+        return Ok(());
+    };
+    for graph in &dataset.default {
+        authorize_update_graph(
+            view,
+            auth,
+            &GraphId(graph.clone()),
+            crate::Action::Read,
+            true,
+        )?;
+    }
+    if let Some(named) = &dataset.named {
+        for graph in named {
+            authorize_update_graph(
+                view,
+                auth,
+                &GraphId(graph.clone()),
+                crate::Action::Read,
+                true,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn authorize_update_template_graph(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+    graph: &GraphNamePattern,
+) -> Result<()> {
+    match graph {
+        GraphNamePattern::NamedNode(graph) => authorize_update_graph(
+            view,
+            auth,
+            &GraphId(graph.clone()),
+            crate::Action::Write,
+            false,
+        ),
+        GraphNamePattern::DefaultGraph => Err(SparqlError::Unsupported(
+            "default graph updates are not supported; use GRAPH <iri> { ... }".into(),
+        )),
+        GraphNamePattern::Variable(_) => Ok(()),
+    }
+}
+
+fn authorize_update_pattern(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+    pattern: &GraphPattern,
+) -> Result<()> {
+    match pattern {
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
+            Ok(())
+        }
+        GraphPattern::Join { left, right }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            authorize_update_pattern(view, auth, left)?;
+            authorize_update_pattern(view, auth, right)
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            authorize_update_pattern(view, auth, left)?;
+            authorize_update_pattern(view, auth, right)?;
+            if let Some(expression) = expression {
+                authorize_update_expression(view, auth, expression)?;
+            }
+            Ok(())
+        }
+        GraphPattern::Filter { expr, inner } => {
+            authorize_update_pattern(view, auth, inner)?;
+            authorize_update_expression(view, auth, expr)
+        }
+        GraphPattern::Graph { name, inner } => {
+            if let NamedNodePattern::NamedNode(graph) = name {
+                authorize_update_graph(
+                    view,
+                    auth,
+                    &GraphId(graph.clone()),
+                    crate::Action::Read,
+                    true,
+                )?;
+            }
+            authorize_update_pattern(view, auth, inner)
+        }
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            authorize_update_pattern(view, auth, inner)?;
+            authorize_update_expression(view, auth, expression)
+        }
+        GraphPattern::OrderBy { inner, expression } => {
+            authorize_update_pattern(view, auth, inner)?;
+            for expression in expression {
+                let expression = match expression {
+                    spargebra::algebra::OrderExpression::Asc(expression)
+                    | spargebra::algebra::OrderExpression::Desc(expression) => expression,
+                };
+                authorize_update_expression(view, auth, expression)?;
+            }
+            Ok(())
+        }
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => authorize_update_pattern(view, auth, inner),
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            authorize_update_pattern(view, auth, inner)?;
+            for (_, aggregate) in aggregates {
+                if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
+                    authorize_update_expression(view, auth, expr)?;
+                }
+            }
+            Ok(())
+        }
+        GraphPattern::Service { .. } => Err(SparqlError::Unsupported(
+            "SERVICE is not supported by SPARQL Update".into(),
+        )),
+        #[allow(unreachable_patterns)]
+        _ => Err(SparqlError::Unsupported(
+            "unsupported SPARQL Update graph pattern".into(),
+        )),
+    }
+}
+
+fn authorize_update_expression(
+    view: &StoreReadView<'_>,
+    auth: &dyn crate::Authorizer,
+    expression: &Expression,
+) -> Result<()> {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => Ok(()),
+        Expression::Or(left, right)
+        | Expression::And(left, right)
+        | Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            authorize_update_expression(view, auth, left)?;
+            authorize_update_expression(view, auth, right)
+        }
+        Expression::In(left, right) => {
+            authorize_update_expression(view, auth, left)?;
+            for expression in right {
+                authorize_update_expression(view, auth, expression)?;
+            }
+            Ok(())
+        }
+        Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) | Expression::Not(inner) => {
+            authorize_update_expression(view, auth, inner)
+        }
+        Expression::Exists(pattern) => authorize_update_pattern(view, auth, pattern),
+        Expression::If(condition, left, right) => {
+            authorize_update_expression(view, auth, condition)?;
+            authorize_update_expression(view, auth, left)?;
+            authorize_update_expression(view, auth, right)
+        }
+        Expression::Coalesce(expressions) | Expression::FunctionCall(_, expressions) => {
+            for expression in expressions {
+                authorize_update_expression(view, auth, expression)?;
+            }
+            Ok(())
+        }
+        #[allow(unreachable_patterns)]
+        _ => Err(SparqlError::Unsupported(
+            "unsupported SPARQL Update expression".into(),
+        )),
+    }
+}
+
+fn update_graph_target_graphs(store: &GraphStore, target: &GraphTarget) -> Result<Vec<GraphId>> {
+    match target {
+        GraphTarget::NamedNode(graph) => Ok(vec![GraphId(graph.clone())]),
+        GraphTarget::NamedGraphs | GraphTarget::AllGraphs => Ok(store.graphs()?),
+        GraphTarget::DefaultGraph => Err(SparqlError::Unsupported(
+            "default graph updates are not supported; use GRAPH <iri>".into(),
+        )),
     }
 }
 
@@ -777,6 +1206,31 @@ fn scope_read_context<'scope>(
             None,
         )),
     }
+}
+
+fn authorize_explicit_graph_scope(
+    view: &StoreReadView<'_>,
+    scope: GraphScope<'_>,
+    auth: Option<&dyn crate::Authorizer>,
+) -> Result<()> {
+    let (GraphScope::List(graphs), Some(auth)) = (scope, auth) else {
+        return Ok(());
+    };
+    let mut seen = HashSet::with_capacity(graphs.len());
+    for graph in graphs {
+        if !seen.insert(graph.as_str()) {
+            continue;
+        }
+        let Some(policy) = view.snapshot().graph_policy(view.store(), graph)? else {
+            return Err(crate::AuthorizationError::PermissionDenied {
+                action: crate::Action::Read,
+                graph: graph.as_str().to_owned(),
+            }
+            .into());
+        };
+        auth.authorize(graph, &policy, crate::Action::Read)?;
+    }
+    Ok(())
 }
 
 struct QueryStageStatistics {
@@ -2417,6 +2871,220 @@ mod tests {
     }
 
     #[test]
+    fn degraded_count_distinct_object_matches_generic_across_query_index_states() {
+        fn fixture(
+            state: Option<crate::QueryIndexState>,
+        ) -> (
+            tempfile::TempDir,
+            Arc<GraphStore>,
+            SparqlEngine,
+            Vec<GraphId>,
+            GraphId,
+        ) {
+            let (directory, store, _search, engine) = setup_engine();
+            let primary = GraphId::new("urn:test:count-distinct:primary");
+            let duplicate = GraphId::new("urn:test:count-distinct:duplicate");
+            let orphan = GraphId::new("urn:test:count-distinct:orphan");
+            let hidden = GraphId::new("urn:test:count-distinct:hidden");
+
+            for (subject, object) in [
+                (
+                    "urn:test:count-distinct:s:a",
+                    "urn:test:count-distinct:o:shared",
+                ),
+                (
+                    "urn:test:count-distinct:s:b",
+                    "urn:test:count-distinct:o:unique",
+                ),
+                (
+                    "urn:test:count-distinct:s:c",
+                    "urn:test:count-distinct:o:shared",
+                ),
+            ] {
+                insert_quad(
+                    &store,
+                    &primary,
+                    subject,
+                    "urn:test:count-distinct:p",
+                    EncodedTerm::from_named_node(&NamedNode::new_unchecked(object)),
+                );
+            }
+            insert_quad(
+                &store,
+                &duplicate,
+                "urn:test:count-distinct:s:a",
+                "urn:test:count-distinct:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    "urn:test:count-distinct:o:shared",
+                )),
+            );
+            insert_quad(
+                &store,
+                &hidden,
+                "urn:test:count-distinct:s:hidden",
+                "urn:test:count-distinct:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    "urn:test:count-distinct:o:hidden",
+                )),
+            );
+            insert_quad(
+                &store,
+                &orphan,
+                orphan.as_str(),
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    "http://schema.org/Dataset",
+                )),
+            );
+            insert_quad(
+                &store,
+                &orphan,
+                "urn:test:count-distinct:s:orphan",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    "http://schema.org/MediaObject",
+                )),
+            );
+            insert_quad(
+                &store,
+                &orphan,
+                "urn:test:count-distinct:s:orphan",
+                "urn:test:count-distinct:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    "urn:test:count-distinct:o:orphan",
+                )),
+            );
+            settle_diagnostics(&store, &primary);
+            settle_diagnostics(&store, &duplicate);
+            settle_diagnostics(&store, &orphan);
+            settle_diagnostics(&store, &hidden);
+
+            if let Some(state) = state {
+                store.set_test_query_index_state(state);
+            }
+            (
+                directory,
+                store,
+                engine,
+                vec![primary.clone(), duplicate, orphan],
+                primary,
+            )
+        }
+
+        fn execute(
+            engine: &SparqlEngine,
+            graphs: &[GraphId],
+            query: &str,
+            read_mode: QueryReadMode,
+            fast_paths: QueryFastPathMode,
+            max_hash_entries: usize,
+            cancellation: QueryCancellation,
+        ) -> Result<QueryExecution> {
+            let prepared = engine.prepare_query(query)?;
+            let mut options = QueryExecutionOptions::default();
+            options.read_mode = read_mode;
+            options.fast_paths = fast_paths;
+            options.limits.max_hash_entries = max_hash_entries;
+            options.cancellation = cancellation;
+            engine
+                .execute_prepared_scope(
+                    &prepared,
+                    GraphScope::List(graphs),
+                    &options,
+                    Duration::ZERO,
+                    false,
+                    None,
+                )
+                .map(|(execution, _)| execution)
+        }
+
+        let states = [
+            (None, QueryReadMode::Auto, "Ready"),
+            (
+                Some(crate::QueryIndexState::Missing),
+                QueryReadMode::Auto,
+                "Missing",
+            ),
+            (
+                Some(crate::QueryIndexState::Building),
+                QueryReadMode::Auto,
+                "Building",
+            ),
+            (
+                Some(crate::QueryIndexState::Failed("test-failed".to_owned())),
+                QueryReadMode::Auto,
+                "Failed",
+            ),
+            (None, QueryReadMode::ForceSource, "forced source"),
+        ];
+        for (state, read_mode, label) in states {
+            let (_directory, _store, engine, graphs, primary) = fixture(state);
+            let queries = [
+                "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s <urn:test:count-distinct:p> ?o }".to_owned(),
+                "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s <urn:test:count-distinct:p> ?o }".to_owned(),
+                format!(
+                    "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE {{ GRAPH <{}> {{ ?s <urn:test:count-distinct:p> ?o }} }}",
+                    primary.as_str()
+                ),
+                "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s <urn:test:count-distinct:missing> ?o }".to_owned(),
+            ];
+            for query in queries {
+                let fast = execute(
+                    &engine,
+                    &graphs,
+                    &query,
+                    read_mode,
+                    QueryFastPathMode::Auto,
+                    usize::MAX,
+                    QueryCancellation::new(),
+                )
+                .unwrap();
+                let generic = execute(
+                    &engine,
+                    &graphs,
+                    &query,
+                    read_mode,
+                    QueryFastPathMode::Disabled,
+                    usize::MAX,
+                    QueryCancellation::new(),
+                )
+                .unwrap();
+                assert_eq!(fast.results, generic.results, "{label}: {query}");
+                assert!(fast.statistics.fast_path.is_some(), "{label}: {query}");
+            }
+        }
+
+        let (_directory, _store, engine, graphs, _primary) = fixture(None);
+        let object_query =
+            "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s <urn:test:count-distinct:p> ?o }";
+        let error = execute(
+            &engine,
+            &graphs,
+            object_query,
+            QueryReadMode::ForceSource,
+            QueryFastPathMode::Auto,
+            1,
+            QueryCancellation::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SparqlError::QueryLimit { .. }));
+
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let error = execute(
+            &engine,
+            &graphs,
+            object_query,
+            QueryReadMode::ForceSource,
+            QueryFastPathMode::Auto,
+            usize::MAX,
+            cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::CraqleErrorKind::Cancelled);
+    }
+
+    #[test]
     fn named_dataset_cursor_is_lazy_and_matches_the_compatibility_collector() {
         let (_dir, store, _search, _engine) = setup_engine();
         let graph = GraphId::new("urn:test:dataset:named");
@@ -3003,11 +3671,13 @@ mod tests {
 
         let changes = engine
             .evaluate_update(
+                &crate::AllowAllAuthorizer,
                 "DELETE { GRAPH <urn:test:marker-seam:first> { \
                  ?s <urn:test:marker-seam:p> ?o } } \
                  INSERT { GRAPH <urn:test:marker-seam:first> { \
                  ?s <urn:test:marker-seam:updated> ?o } } \
                  WHERE { ?s <urn:test:marker-seam:p> ?o }",
+                &UpdateOptions::default(),
             )
             .unwrap();
         assert_eq!(2, changes.len());
@@ -3684,9 +4354,11 @@ mod tests {
 
         let changes = engine
             .evaluate_update(
+                &crate::AllowAllAuthorizer,
                 "DELETE { GRAPH <urn:test:g1> { ?s <http://schema.org/position> ?o } } \
                  INSERT { GRAPH <urn:test:g1> { ?s <http://schema.org/position> ?o2 } } \
                  WHERE { GRAPH <urn:test:g1> { ?s <http://schema.org/position> ?o . BIND(?o + 1 AS ?o2) } }",
+                &UpdateOptions::default(),
             )
             .unwrap();
 

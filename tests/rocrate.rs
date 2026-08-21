@@ -2071,7 +2071,8 @@ mod tests {
     /// Every subject and object bound by `?s ?p ?o` over one graph.
     fn queried_terms(node: &CraqleNode, graph: &GraphId) -> Vec<String> {
         solution_rows(
-            node.query_graphs(
+            node.query_in_graphs(
+                &AllowAllAuthorizer,
                 std::slice::from_ref(graph),
                 "SELECT ?s ?o WHERE { ?s ?p ?o }",
             )

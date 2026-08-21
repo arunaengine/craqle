@@ -602,7 +602,7 @@ impl TriplePlan {
         matches!(
             &self.subject,
             PatternTerm::Variable(subject) if subject == variable.as_str()
-        ) && matches!(&self.object, PatternTerm::Constant(_))
+        )
     }
 
     pub(crate) fn distinct_object_order(&self, variable: &Variable) -> bool {
@@ -729,11 +729,24 @@ pub(crate) fn execute(
                     triple.selector,
                     triple.pattern,
                     *domain,
+                    limits.max_hash_entries,
                 )? {
                     count = exact.get();
                 } else {
-                    let mut last_value = None;
                     let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+                    let grouping = cursor.count_grouping();
+                    let adjacent = matches!(
+                        (domain, grouping),
+                        (
+                            crate::count_plan::CountValueDomain::Subject,
+                            crate::query_cursor::CountGrouping::Subject
+                        ) | (
+                            crate::count_plan::CountValueDomain::Object,
+                            crate::query_cursor::CountGrouping::Object
+                        )
+                    );
+                    let mut last_value = None;
+                    let mut distinct = HashSet::new();
                     for quad in &mut cursor {
                         let quad = quad?;
                         let value = match domain {
@@ -741,11 +754,18 @@ pub(crate) fn execute(
                             crate::count_plan::CountValueDomain::Subject => Some(quad.subject),
                             crate::count_plan::CountValueDomain::Object => Some(quad.object),
                         };
-                        if value.is_none() || last_value != value {
+                        if value.is_none()
+                            || (adjacent && last_value != value)
+                            || (!adjacent
+                                && distinct.insert(value.expect("distinct domain has a value")))
+                        {
+                            enforce_hash_entries(distinct.len(), limits)?;
                             count = count.checked_add(1).ok_or_else(|| {
                                 crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
                             })?;
-                            last_value = value;
+                            if adjacent {
+                                last_value = value;
+                            }
                         }
                     }
                 }

@@ -470,8 +470,12 @@ mod tests {
             graph.as_str()
         );
 
-        net.peer_mut(0).update(&update0).unwrap();
-        net.peer_mut(1).update(&update1).unwrap();
+        net.peer_mut(0)
+            .apply_sparql_update(&writer_auth(), &update0)
+            .unwrap();
+        net.peer_mut(1)
+            .apply_sparql_update(&writer_auth(), &update1)
+            .unwrap();
         net.sync_until_converged(10).unwrap();
 
         let query = format!(

@@ -202,17 +202,19 @@ mod tests {
         let visible = |graph: &GraphId| registry_visible(registry, graph);
 
         let ask = || {
-            let result = node.query_graphs_with(visible, ASK_QUERY).unwrap();
+            let result = query_with_test_visibility(node, visible, ASK_QUERY).unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         };
         let select_datasets = || {
-            let rows = solution_rows(node.query_graphs_with(visible, SELECT_DATASETS).unwrap());
+            let rows =
+                solution_rows(query_with_test_visibility(node, visible, SELECT_DATASETS).unwrap());
             assert_eq!(rows.len(), 25);
             rows.len()
         };
         let select_files = || {
-            let rows = solution_rows(node.query_graphs_with(visible, SELECT_FILES).unwrap());
+            let rows =
+                solution_rows(query_with_test_visibility(node, visible, SELECT_FILES).unwrap());
             assert_eq!(rows.len(), 100);
             rows.len()
         };
@@ -226,7 +228,8 @@ mod tests {
              FILTER(CONTAINS(?name, \"doc-{needle_idx}\")) }}"
         );
         let filter_scan = || {
-            let rows = solution_rows(node.query_graphs_with(visible, &filter_contains).unwrap());
+            let rows =
+                solution_rows(query_with_test_visibility(node, visible, &filter_contains).unwrap());
             assert!(
                 rows.iter()
                     .any(|row| row.get("name").is_some_and(|name| name.0.contains(&needle))),
@@ -280,19 +283,19 @@ mod tests {
         let count_type_q = "SELECT (COUNT(*) AS ?c) WHERE { ?d a <http://schema.org/Dataset> }";
 
         measure("COUNT names (predicate registry)", samples, || {
-            solution_rows(node.query_graphs_with(visible, count_q).unwrap()).len()
+            solution_rows(query_with_test_visibility(&node, visible, count_q).unwrap()).len()
         });
         measure("COUNT names (predicate all)", samples, || {
-            solution_rows(node.query_graphs_with(all, count_q).unwrap()).len()
+            solution_rows(query_with_test_visibility(&node, all, count_q).unwrap()).len()
         });
         measure("COUNT type quads (predicate registry)", samples, || {
-            solution_rows(node.query_graphs_with(visible, count_type_q).unwrap()).len()
+            solution_rows(query_with_test_visibility(&node, visible, count_type_q).unwrap()).len()
         });
         measure("CONTAINS scan (predicate registry)", samples, || {
-            solution_rows(node.query_graphs_with(visible, contains_q).unwrap()).len()
+            solution_rows(query_with_test_visibility(&node, visible, contains_q).unwrap()).len()
         });
         measure("CONTAINS scan (predicate all)", samples, || {
-            solution_rows(node.query_graphs_with(all, contains_q).unwrap()).len()
+            solution_rows(query_with_test_visibility(&node, all, contains_q).unwrap()).len()
         });
     }
 

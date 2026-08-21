@@ -117,7 +117,6 @@ pub(crate) fn graph_write_guard(graph: &GraphId) -> MutexGuard<'static, ()> {
 /// The replication engine: local writes and CRDT merge of Irokle records.
 pub(crate) struct ReplicationEngine {
     store: Arc<GraphStore>,
-    sparql: Arc<SparqlEngine>,
     rules: Vec<Box<dyn Rule>>,
     actor: ActorId,
     sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
@@ -213,35 +212,34 @@ impl Drop for SettlementTimer<'_> {
 
 impl ReplicationEngine {
     #[cfg(any(not(feature = "shacl-core"), test))]
-    pub(crate) fn new(store: Arc<GraphStore>, sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
+    pub(crate) fn new(store: Arc<GraphStore>, _sparql: Arc<SparqlEngine>, actor: ActorId) -> Self {
         #[cfg(feature = "shacl-core")]
         {
             let shacl = Arc::new(crate::shacl_impl::ShaclCompiler::new(store.clone()));
-            Self::new_sync_shacl(store, sparql, actor, None, shacl)
+            Self::new_sync_shacl(store, _sparql, actor, None, shacl)
         }
         #[cfg(not(feature = "shacl-core"))]
         {
-            Self::new_with_sync(store, sparql, actor, None)
+            Self::new_with_sync(store, _sparql, actor, None)
         }
     }
 
     #[cfg(any(not(feature = "shacl-core"), test))]
     pub(crate) fn new_with_sync(
         store: Arc<GraphStore>,
-        sparql: Arc<SparqlEngine>,
+        _sparql: Arc<SparqlEngine>,
         actor: ActorId,
         sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
     ) -> Self {
         #[cfg(feature = "shacl-core")]
         {
             let shacl = Arc::new(crate::shacl_impl::ShaclCompiler::new(store.clone()));
-            Self::new_sync_shacl(store, sparql, actor, sync, shacl)
+            Self::new_sync_shacl(store, _sparql, actor, sync, shacl)
         }
         #[cfg(not(feature = "shacl-core"))]
         {
             Self {
                 store,
-                sparql,
                 rules: crate::rules::default_rules(),
                 actor,
                 sync,
@@ -256,24 +254,23 @@ impl ReplicationEngine {
     #[cfg(feature = "shacl-core")]
     pub(crate) fn new_with_shacl(
         store: Arc<GraphStore>,
-        sparql: Arc<SparqlEngine>,
+        _sparql: Arc<SparqlEngine>,
         actor: ActorId,
         shacl: Arc<crate::shacl_impl::ShaclCompiler>,
     ) -> Self {
-        Self::new_sync_shacl(store, sparql, actor, None, shacl)
+        Self::new_sync_shacl(store, _sparql, actor, None, shacl)
     }
 
     #[cfg(feature = "shacl-core")]
     pub(crate) fn new_sync_shacl(
         store: Arc<GraphStore>,
-        sparql: Arc<SparqlEngine>,
+        _sparql: Arc<SparqlEngine>,
         actor: ActorId,
         sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
         shacl: Arc<crate::shacl_impl::ShaclCompiler>,
     ) -> Self {
         Self {
             store,
-            sparql,
             rules: crate::rules::default_rules(),
             actor,
             sync,
@@ -389,24 +386,6 @@ impl ReplicationEngine {
             tag,
         )?;
         Ok(())
-    }
-
-    /// Execute a SPARQL Update locally with full validation.
-    /// Returns `None` if the update produced no changes.
-    pub(crate) fn local_update(&self, sparql_update: &str) -> Result<Option<Batch>, UpdateError> {
-        let changes = self.sparql.evaluate_update(sparql_update)?;
-
-        if changes.is_empty() {
-            return Ok(None);
-        }
-
-        let graph = match &changes[0] {
-            MaterializedQuadChange::Insert { graph, .. }
-            | MaterializedQuadChange::Delete { graph, .. } => graph.clone(),
-        };
-        self.ensure_change_set_targets(&graph, &changes)?;
-
-        self.commit_changes(&graph, changes).map(Some)
     }
 
     /// Insert raw quads (bypasses SPARQL, still validates).

@@ -409,10 +409,7 @@ mod tests {
         let visible = |graph: &GraphId| registry_visible(&registry, graph);
 
         let count_rows = |sparql: &str, optimize: bool| -> usize {
-            match node
-                .query_graphs_with_planner(visible, sparql, optimize)
-                .unwrap()
-            {
+            match query_with_test_planner(&node, visible, sparql, optimize).unwrap() {
                 QueryResults::Solutions(rows) => rows.len(),
                 QueryResults::Boolean(value) => {
                     assert!(value, "ASK shapes must hold on the corpus");

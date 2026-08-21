@@ -12,9 +12,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use craqle::{
-    ActorId, CraqleFjallPersistMode, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
-    MaterializedQuadChange, PreparedQuery, QueryExecution, QueryExecutionOptions, QueryReadMode,
-    QueryResults, ReadStatistics,
+    ActorId, AllowAllAuthorizer, CraqleFjallPersistMode, CraqleNode, CraqleOptions, EncodedTerm,
+    GraphId, MaterializedQuadChange, PreparedQuery, QueryExecution, QueryExecutionOptions,
+    QueryExecutionStatistics, QueryReadMode, QueryResults,
 };
 use oxrdf::Term;
 
@@ -396,8 +396,12 @@ impl Fixture {
             .position(|case| matches!(case.kind, QueryKind::Count))
             .expect("construct COUNT benchmark case");
         let count = count_value(
-            node.query_graphs(&visible_graphs, &cases[count_case].sparql)
-                .expect("run untimed COUNT semantic baseline"),
+            node.query_in_graphs(
+                &AllowAllAuthorizer,
+                &visible_graphs,
+                &cases[count_case].sparql,
+            )
+            .expect("run untimed COUNT semantic baseline"),
             cases[count_case].label,
         );
         assert!(
@@ -547,7 +551,7 @@ impl Fixture {
             .get(index)
             .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"));
         self.node
-            .query_graphs(&self.visible_graphs, &case.sparql)
+            .query_in_graphs(&AllowAllAuthorizer, &self.visible_graphs, &case.sparql)
             .unwrap_or_else(|_| panic!("{} query failed", case.label))
     }
 
@@ -573,7 +577,12 @@ impl Fixture {
             .get(index)
             .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"));
         self.node
-            .query_graphs_with_statistics(&self.visible_graphs, &case.sparql)
+            .query_in_graphs_with_options(
+                &AllowAllAuthorizer,
+                &self.visible_graphs,
+                &case.sparql,
+                &QueryExecutionOptions::default(),
+            )
             .unwrap_or_else(|_| panic!("{} diagnostic query failed", case.label))
     }
 
@@ -583,7 +592,12 @@ impl Fixture {
         options: &QueryExecutionOptions,
     ) -> QueryExecution {
         self.node
-            .execute_prepared_graphs(&self.visible_graphs, prepared, options)
+            .execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                &self.visible_graphs,
+                prepared,
+                options,
+            )
             .unwrap_or_else(|_| panic!("prepared hot-path query failed"))
     }
 
@@ -591,14 +605,27 @@ impl Fixture {
         &self,
         index: usize,
         read_mode: QueryReadMode,
-    ) -> (QueryResults, ReadStatistics) {
+    ) -> (QueryResults, QueryExecutionStatistics) {
         let case = self
             .cases
             .get(index)
             .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"));
-        self.node
-            .query_graphs_with_read_mode(&self.visible_graphs, &case.sparql, read_mode)
-            .unwrap_or_else(|_| panic!("{} query failed", case.label))
+        let prepared = self
+            .node
+            .prepare_query(&case.sparql)
+            .unwrap_or_else(|_| panic!("{} query preparation failed", case.label));
+        let mut options = QueryExecutionOptions::default();
+        options.read_mode = read_mode;
+        let execution = self
+            .node
+            .execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                &self.visible_graphs,
+                &prepared,
+                &options,
+            )
+            .unwrap_or_else(|_| panic!("{} query failed", case.label));
+        (execution.results, execution.statistics)
     }
 
     pub fn print_hot_work(&self) {
@@ -632,7 +659,7 @@ impl Fixture {
     /// Runs a full public query call over the generated visible-graph scope.
     pub fn run_visible_query(&self, sparql: &str, label: &str) -> QueryResults {
         self.node
-            .query_graphs(&self.visible_graphs, sparql)
+            .query_in_graphs(&AllowAllAuthorizer, &self.visible_graphs, sparql)
             .unwrap_or_else(|_| panic!("{label} query failed"))
     }
 
@@ -640,7 +667,7 @@ impl Fixture {
     /// corpus's deliberately hidden graphs for duplicate-baseline inspection.
     pub fn run_all_graph_query(&self, sparql: &str, label: &str) -> QueryResults {
         self.node
-            .query_graphs(&self.all_graphs, sparql)
+            .query_in_graphs(&AllowAllAuthorizer, &self.all_graphs, sparql)
             .unwrap_or_else(|_| panic!("{label} query failed"))
     }
 
@@ -784,7 +811,7 @@ impl Fixture {
     fn assert_case(&self, case: &QueryCase) -> CheckValue {
         let results = self
             .node
-            .query_graphs(&self.visible_graphs, &case.sparql)
+            .query_in_graphs(&AllowAllAuthorizer, &self.visible_graphs, &case.sparql)
             .unwrap_or_else(|_| panic!("{} semantic query failed", case.label));
         match &case.expected {
             Expected::Boolean(expected) => match results {
@@ -840,7 +867,7 @@ impl Fixture {
     fn solution_rows(&self, graphs: &[GraphId], sparql: &str, label: &str) -> usize {
         match self
             .node
-            .query_graphs(graphs, sparql)
+            .query_in_graphs(&AllowAllAuthorizer, graphs, sparql)
             .unwrap_or_else(|_| panic!("{label} query failed"))
         {
             QueryResults::Solutions(rows) => rows.len(),

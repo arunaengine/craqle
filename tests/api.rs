@@ -178,12 +178,12 @@ fn query_graphs_with_filters_by_lazy_predicate() {
         .unwrap();
     }
 
-    let rows = match node
-        .query_graphs_with(
-            |graph: &GraphId| graph.as_str() == "urn:test:lazy:one",
-            "SELECT ?name WHERE { ?s schema:name ?name }",
-        )
-        .unwrap()
+    let rows = match support::query_with_test_visibility(
+        &node,
+        |graph: &GraphId| graph.as_str() == "urn:test:lazy:one",
+        "SELECT ?name WHERE { ?s schema:name ?name }",
+    )
+    .unwrap()
     {
         QueryResults::Solutions(rows) => rows,
         other => panic!("expected solutions, got {other:?}"),
@@ -195,7 +195,7 @@ fn query_graphs_with_filters_by_lazy_predicate() {
     );
 
     assert_eq!(
-        node.query_graphs_with(|_: &GraphId| false, "ASK { ?s ?p ?o }")
+        support::query_with_test_visibility(&node, |_: &GraphId| false, "ASK { ?s ?p ?o }",)
             .unwrap(),
         QueryResults::Boolean(false)
     );
@@ -252,7 +252,10 @@ fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
     ] {
         assert_eq!(
             canonical_rows(node.query(&reader, sparql).unwrap()),
-            canonical_rows(node.query_graphs(&visible, sparql).unwrap()),
+            canonical_rows(
+                node.query_in_graphs(&AllowAllAuthorizer, &visible, sparql)
+                    .unwrap(),
+            ),
             "query and query_graphs(visible_graphs) disagree on `{sparql}` \
              with {readable} readable / {unreadable} unreadable graphs"
         );
@@ -260,7 +263,8 @@ fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
 
     assert_eq!(
         node.query(&reader, "ASK { ?s ?p ?o }").unwrap(),
-        node.query_graphs(&visible, "ASK { ?s ?p ?o }").unwrap()
+        node.query_in_graphs(&AllowAllAuthorizer, &visible, "ASK { ?s ?p ?o }")
+            .unwrap()
     );
 
     // G8 soundness: no hidden graph's data may appear either way.
@@ -401,6 +405,75 @@ fn write_access_is_required_for_updates() {
         )
         .unwrap();
     });
+}
+
+#[test]
+fn sparql_update_private_read_exfiltration_is_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    let writer = writer_auth();
+    let public = GraphId::new("urn:test:update-exfiltration:public");
+    let private = GraphId::new("urn:test:update-exfiltration:private");
+    for (graph, path) in [
+        (public.clone(), "/datasets/public/update-exfiltration"),
+        (private.clone(), "/datasets/private/update-exfiltration"),
+    ] {
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph,
+                "Update authorization fixture",
+                "Private-read exfiltration regression",
+                "2026-08-21",
+                None,
+                GraphPolicy {
+                    public: false,
+                    permission_paths: vec![path.to_owned()],
+                },
+            ),
+        )
+        .unwrap();
+    }
+    node.apply_sparql_update(
+        &writer,
+        "INSERT DATA { GRAPH <urn:test:update-exfiltration:private> { \
+         <urn:test:update-exfiltration:private> schema:hasPart <urn:item> . \
+         <urn:item> rdf:type schema:MediaObject ; schema:name \"Private item\" ; \
+         <urn:secret> \"classified\" . } }",
+    )
+    .unwrap();
+
+    let public_for_auth = public.clone();
+    let public_writer = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+        if graph == &public_for_auth && action == Action::Write {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_owned(),
+            })
+        }
+    };
+    let error = node
+        .apply_sparql_update(
+            &public_writer,
+            "INSERT { GRAPH <urn:test:update-exfiltration:public> { \
+             <urn:leak> <urn:value> ?secret } } \
+             WHERE { GRAPH <urn:test:update-exfiltration:private> { \
+             <urn:item> <urn:secret> ?secret } }",
+        )
+        .unwrap_err();
+    assert_eq!(CraqleErrorKind::Unauthorized, error.kind());
+
+    assert_eq!(
+        QueryResults::Boolean(false),
+        node.query_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&public),
+            "ASK { <urn:leak> <urn:value> ?secret }",
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -701,7 +774,8 @@ fn opening_with_irokle_replays_durable_graph_events() {
     assert!(node.contains_graph(&graph).unwrap());
     assert!(node.irokle_topic_id(&graph).unwrap().is_some());
     let rows = match node
-        .query_graphs(
+        .query_in_graphs(
+            &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             "SELECT ?name WHERE { GRAPH <urn:test:irokle-replay> { ?s <http://schema.org/name> ?name } }",
         )

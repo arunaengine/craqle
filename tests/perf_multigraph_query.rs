@@ -186,43 +186,45 @@ mod tests {
         let graphs = load_corpus(&node, graph_count, files_per_graph);
 
         measure("trivial ASK (graph list)", samples, || {
-            let result = node.query_graphs(&graphs, "ASK { ?s ?p ?o }").unwrap();
+            let result = node
+                .query_in_graphs(&AllowAllAuthorizer, &graphs, "ASK { ?s ?p ?o }")
+                .unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         });
         measure("trivial ASK (predicate all)", samples, || {
-            let result = node
-                .query_graphs_with(|_: &GraphId| true, "ASK { ?s ?p ?o }")
-                .unwrap();
+            let result =
+                query_with_test_visibility(&node, |_: &GraphId| true, "ASK { ?s ?p ?o }").unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         });
         measure("trivial ASK (predicate 90%)", samples, || {
-            let result = node
-                .query_graphs_with(ninety_percent_visible, "ASK { ?s ?p ?o }")
-                .unwrap();
+            let result =
+                query_with_test_visibility(&node, ninety_percent_visible, "ASK { ?s ?p ?o }")
+                    .unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         });
 
         let select_limited = "SELECT ?s ?name WHERE { ?s schema:name ?name } LIMIT 25";
         measure("SELECT name LIMIT 25 (graph list)", samples, || {
-            let rows = solution_rows(node.query_graphs(&graphs, select_limited).unwrap());
+            let rows = solution_rows(
+                node.query_in_graphs(&AllowAllAuthorizer, &graphs, select_limited)
+                    .unwrap(),
+            );
             assert_eq!(rows.len(), 25);
             rows.len()
         });
         measure("SELECT name LIMIT 25 (predicate all)", samples, || {
             let rows = solution_rows(
-                node.query_graphs_with(|_: &GraphId| true, select_limited)
-                    .unwrap(),
+                query_with_test_visibility(&node, |_: &GraphId| true, select_limited).unwrap(),
             );
             assert_eq!(rows.len(), 25);
             rows.len()
         });
         measure("SELECT name LIMIT 25 (predicate 90%)", samples, || {
             let rows = solution_rows(
-                node.query_graphs_with(ninety_percent_visible, select_limited)
-                    .unwrap(),
+                query_with_test_visibility(&node, ninety_percent_visible, select_limited).unwrap(),
             );
             assert_eq!(rows.len(), 25);
             rows.len()
@@ -233,22 +235,23 @@ mod tests {
             "SELECT ?s ?name WHERE {{ ?s schema:name ?name . FILTER(CONTAINS(?name, \"{NEEDLE}\")) }}"
         );
         measure("FILTER CONTAINS scan (graph list)", samples, || {
-            let rows = solution_rows(node.query_graphs(&graphs, &filter_scan).unwrap());
+            let rows = solution_rows(
+                node.query_in_graphs(&AllowAllAuthorizer, &graphs, &filter_scan)
+                    .unwrap(),
+            );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
         });
         measure("FILTER CONTAINS scan (predicate all)", samples, || {
             let rows = solution_rows(
-                node.query_graphs_with(|_: &GraphId| true, &filter_scan)
-                    .unwrap(),
+                query_with_test_visibility(&node, |_: &GraphId| true, &filter_scan).unwrap(),
             );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
         });
         measure("FILTER CONTAINS scan (predicate 90%)", samples, || {
             let rows = solution_rows(
-                node.query_graphs_with(ninety_percent_visible, &filter_scan)
-                    .unwrap(),
+                query_with_test_visibility(&node, ninety_percent_visible, &filter_scan).unwrap(),
             );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
@@ -259,7 +262,10 @@ mod tests {
             "GRAPH-bound type+name LIMIT 25 (graph list)",
             samples,
             || {
-                let rows = solution_rows(node.query_graphs(&graphs, graph_bound).unwrap());
+                let rows = solution_rows(
+                    node.query_in_graphs(&AllowAllAuthorizer, &graphs, graph_bound)
+                        .unwrap(),
+                );
                 assert_eq!(rows.len(), 25);
                 rows.len()
             },
@@ -269,8 +275,7 @@ mod tests {
             samples,
             || {
                 let rows = solution_rows(
-                    node.query_graphs_with(|_: &GraphId| true, graph_bound)
-                        .unwrap(),
+                    query_with_test_visibility(&node, |_: &GraphId| true, graph_bound).unwrap(),
                 );
                 assert_eq!(rows.len(), 25);
                 rows.len()
@@ -305,45 +310,53 @@ mod tests {
         let graph_bound_query = "SELECT ?g ?name WHERE { GRAPH ?g { ?s rdf:type schema:Dataset . ?s schema:name ?name } } LIMIT 25";
 
         let ask_list = || {
-            let result = node.query_graphs(&graphs, ask_query).unwrap();
-            assert_eq!(result, QueryResults::Boolean(true));
-            1
-        };
-        let ask_pred = || {
             let result = node
-                .query_graphs_with(ninety_percent_visible, ask_query)
+                .query_in_graphs(&AllowAllAuthorizer, &graphs, ask_query)
                 .unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         };
+        let ask_pred = || {
+            let result =
+                query_with_test_visibility(&node, ninety_percent_visible, ask_query).unwrap();
+            assert_eq!(result, QueryResults::Boolean(true));
+            1
+        };
         let select_limited = || {
-            let rows = solution_rows(node.query_graphs(&graphs, select_query).unwrap());
+            let rows = solution_rows(
+                node.query_in_graphs(&AllowAllAuthorizer, &graphs, select_query)
+                    .unwrap(),
+            );
             assert_eq!(rows.len(), 25);
             rows.len()
         };
         let select_limited_pred = || {
             let rows = solution_rows(
-                node.query_graphs_with(ninety_percent_visible, select_query)
-                    .unwrap(),
+                query_with_test_visibility(&node, ninety_percent_visible, select_query).unwrap(),
             );
             assert_eq!(rows.len(), 25);
             rows.len()
         };
         let filter_scan = || {
-            let rows = solution_rows(node.query_graphs(&graphs, &scan_query).unwrap());
-            assert_eq!(rows.len(), expected_needles);
-            rows.len()
-        };
-        let filter_scan_pred = || {
             let rows = solution_rows(
-                node.query_graphs_with(ninety_percent_visible, &scan_query)
+                node.query_in_graphs(&AllowAllAuthorizer, &graphs, &scan_query)
                     .unwrap(),
             );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
         };
+        let filter_scan_pred = || {
+            let rows = solution_rows(
+                query_with_test_visibility(&node, ninety_percent_visible, &scan_query).unwrap(),
+            );
+            assert_eq!(rows.len(), expected_needles);
+            rows.len()
+        };
         let graph_bound = || {
-            let rows = solution_rows(node.query_graphs(&graphs, graph_bound_query).unwrap());
+            let rows = solution_rows(
+                node.query_in_graphs(&AllowAllAuthorizer, &graphs, graph_bound_query)
+                    .unwrap(),
+            );
             assert_eq!(rows.len(), 25);
             rows.len()
         };

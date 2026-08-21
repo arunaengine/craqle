@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use crate::count_plan::{CountValueDomain, SubjectSetMode};
 use crate::query_context::ReadContext;
+use crate::query_cursor::CountGrouping;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{Result, SparqlError};
-use crate::store::{QueryTermId, TermId};
+use crate::store::{QueryTermId, StoreError, TermId};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
 #[cfg(not(test))]
@@ -133,6 +134,7 @@ pub(crate) fn single_pattern_count(
     selector: GraphSelector,
     pattern: QuadPattern,
     domain: CountValueDomain,
+    max_hash_entries: usize,
 ) -> Result<Option<ScalarCount>> {
     if matches!(domain, CountValueDomain::Scalar)
         && let GraphSelector::Named(graph) = selector
@@ -154,15 +156,39 @@ pub(crate) fn single_pattern_count(
     } else {
         None
     };
-    let Some(mut cursor) = view.raw_query_index_keys(context, selector, pattern)? else {
-        return Ok(None);
+    let mut cursor = match view.raw_query_index_keys(context, selector, pattern) {
+        Ok(Some(cursor)) => cursor,
+        Ok(None)
+            if matches!(selector, GraphSelector::DefaultUnion)
+                && !matches!(domain, CountValueDomain::Scalar) =>
+        {
+            return source_union_distinct_count(
+                view,
+                context,
+                pattern,
+                domain,
+                max_hash_entries,
+            )
+            .map(Some);
+        }
+        Ok(None) => return Ok(None),
+        Err(StoreError::QueryIndexUnavailable(_))
+            if matches!(selector, GraphSelector::DefaultUnion)
+                && !matches!(domain, CountValueDomain::Scalar) =>
+        {
+            return source_union_distinct_count(view, context, pattern, domain, max_hash_entries)
+                .map(Some);
+        }
+        Err(error) => return Err(error.into()),
     };
+    let grouping = cursor.count_grouping();
     match selector {
         GraphSelector::Named(graph) => {
             let orphaned = view.orphaned_ids(context, graph)?;
             let mut count = ScalarCount::default();
             let mut subjects = SubjectCountStream::default();
             let mut objects = ObjectCountStream::default();
+            let mut distinct = HashSet::new();
             let mut work = 0usize;
             while let Some(key) = cursor.next_key() {
                 let key = key?;
@@ -200,17 +226,32 @@ pub(crate) fn single_pattern_count(
                 match domain {
                     CountValueDomain::Scalar => count.increment()?,
                     CountValueDomain::Subject => {
-                        subjects.observe(subject.expect("subject domain extracted subject"))?
+                        let subject = subject.expect("subject domain extracted subject");
+                        if grouping == CountGrouping::Subject {
+                            subjects.observe(subject)?;
+                        } else if distinct.insert(subject) {
+                            enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                            count.increment()?;
+                        }
                     }
                     CountValueDomain::Object => {
-                        objects.observe(object.expect("object domain extracted object"))?
+                        let object = object.expect("object domain extracted object");
+                        if grouping == CountGrouping::Object {
+                            objects.observe(object)?;
+                        } else if distinct.insert(object) {
+                            enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                            count.increment()?;
+                        }
                     }
                 }
             }
             Ok(Some(match domain {
                 CountValueDomain::Scalar => count,
-                CountValueDomain::Subject => subjects.finish(),
-                CountValueDomain::Object => objects.finish(),
+                CountValueDomain::Subject if grouping == CountGrouping::Subject => {
+                    subjects.finish()
+                }
+                CountValueDomain::Object if grouping == CountGrouping::Object => objects.finish(),
+                CountValueDomain::Subject | CountValueDomain::Object => count,
             }))
         }
         GraphSelector::DefaultUnion => {
@@ -223,10 +264,46 @@ pub(crate) fn single_pattern_count(
                     Err(original) => cursor = *original,
                 }
             }
-            default_union_count(view, context, &mut cursor, domain)
+            default_union_count(view, context, &mut cursor, domain, max_hash_entries)
         }
         GraphSelector::Union => Ok(None),
     }
+}
+
+fn source_union_distinct_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    pattern: QuadPattern,
+    domain: CountValueDomain,
+    max_hash_entries: usize,
+) -> Result<ScalarCount> {
+    let mut cursor = view.scan(context, GraphSelector::Union, pattern)?;
+    let grouping = cursor.count_grouping();
+    let adjacent = matches!(
+        (domain, grouping),
+        (CountValueDomain::Subject, CountGrouping::Subject)
+            | (CountValueDomain::Object, CountGrouping::Object)
+    );
+    let mut last = None;
+    let mut distinct = HashSet::new();
+    let mut count = ScalarCount::default();
+    for quad in &mut cursor {
+        let quad = quad?;
+        let value = match domain {
+            CountValueDomain::Subject => quad.subject,
+            CountValueDomain::Object => quad.object,
+            CountValueDomain::Scalar => unreachable!("source fallback is distinct-only"),
+        };
+        if (adjacent && last != Some(value)) || (!adjacent && distinct.insert(value)) {
+            if adjacent {
+                last = Some(value);
+            } else {
+                enforce_hash_entries(distinct.len(), max_hash_entries)?;
+            }
+            count.increment()?;
+        }
+    }
+    Ok(count)
 }
 
 fn exact_default_union_count(
@@ -873,10 +950,18 @@ fn default_union_count(
     context: &ReadContext<'_>,
     cursor: &mut crate::query_cursor::RawQueryIndexKeyCursor,
     domain: CountValueDomain,
+    max_hash_entries: usize,
 ) -> Result<Option<ScalarCount>> {
+    let grouping = cursor.count_grouping();
+    let adjacent = matches!(
+        (domain, grouping),
+        (CountValueDomain::Subject, CountGrouping::Subject)
+            | (CountValueDomain::Object, CountGrouping::Object)
+    );
     let mut count = ScalarCount::default();
     let mut subjects = SubjectCountStream::default();
     let mut objects = ObjectCountStream::default();
+    let mut distinct = HashSet::new();
     let mut current_group = None;
     let mut group_emitted = false;
     let mut graph_cache = GraphOrphanCache::new();
@@ -920,13 +1005,15 @@ fn default_union_count(
                 (extracted, QueryTermId(0), QueryTermId(0))
             }
         };
-        if current_group != Some(group) {
-            current_group = Some(group);
-            group_emitted = false;
-            context.increment_duplicate_groups();
-        } else if group_emitted {
-            context.increment_skipped_copies();
-            continue;
+        if matches!(domain, CountValueDomain::Scalar) || adjacent {
+            if current_group != Some(group) {
+                current_group = Some(group);
+                group_emitted = false;
+                context.increment_duplicate_groups();
+            } else if group_emitted {
+                context.increment_skipped_copies();
+                continue;
+            }
         }
 
         context.record_key_fields_extracted(1);
@@ -956,22 +1043,37 @@ fn default_union_count(
             }
         }
 
-        group_emitted = true;
+        if matches!(domain, CountValueDomain::Scalar) || adjacent {
+            group_emitted = true;
+        }
         context.increment_matching_quads();
         match domain {
             CountValueDomain::Scalar => count.increment()?,
             CountValueDomain::Subject => {
-                subjects.observe(subject.expect("subject domain extracted subject"))?
+                let subject = subject.expect("subject domain extracted subject");
+                if adjacent {
+                    subjects.observe(subject)?;
+                } else if distinct.insert(subject) {
+                    enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                    count.increment()?;
+                }
             }
             CountValueDomain::Object => {
-                objects.observe(object.expect("object domain extracted object"))?
+                let object = object.expect("object domain extracted object");
+                if adjacent {
+                    objects.observe(object)?;
+                } else if distinct.insert(object) {
+                    enforce_hash_entries(distinct.len(), max_hash_entries)?;
+                    count.increment()?;
+                }
             }
         }
     }
     Ok(Some(match domain {
         CountValueDomain::Scalar => count,
-        CountValueDomain::Subject => subjects.finish(),
-        CountValueDomain::Object => objects.finish(),
+        CountValueDomain::Subject if adjacent => subjects.finish(),
+        CountValueDomain::Object if adjacent => objects.finish(),
+        CountValueDomain::Subject | CountValueDomain::Object => count,
     }))
 }
 

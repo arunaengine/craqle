@@ -5,8 +5,8 @@
 //! express the cross-graph multiplicity contract this suite targets.
 
 use craqle::{
-    CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy, MaterializedQuadChange,
-    QueryResults,
+    AllowAllAuthorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
+    MaterializedQuadChange, QueryResults,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -210,14 +210,10 @@ fn named_shared_query() -> String {
 #[test]
 fn graph_variable_preserves_visible_copy_multiplicity() {
     let fixture = fixture(2);
-    let visible = fixture.visible.clone();
     let rows = canonical_rows(
         fixture
             .node
-            .query_graphs_with(
-                move |graph| visible.iter().any(|candidate| candidate == graph),
-                &named_shared_query(),
-            )
+            .query(&fixture.reader, &named_shared_query())
             .unwrap(),
     );
 
@@ -227,20 +223,11 @@ fn graph_variable_preserves_visible_copy_multiplicity() {
 #[test]
 fn mixed_default_and_named_patterns_keep_dedup_and_multiplicity() {
     let fixture = fixture(2);
-    let visible = fixture.visible.clone();
     let query = format!(
         "SELECT ?g ?s WHERE {{ ?s <{TEST_PREDICATE}> \"{SHARED_VALUE}\" . \
          GRAPH ?g {{ ?s <{TEST_PREDICATE}> \"{SHARED_VALUE}\" }} }}"
     );
-    let rows = canonical_rows(
-        fixture
-            .node
-            .query_graphs_with(
-                move |graph| visible.iter().any(|candidate| candidate == graph),
-                &query,
-            )
-            .unwrap(),
-    );
+    let rows = canonical_rows(fixture.node.query(&fixture.reader, &query).unwrap());
 
     assert_eq!(rows, expected_named_rows(&fixture.visible));
     assert!(rows.iter().all(|row| {
@@ -286,12 +273,22 @@ fn explicit_graph_scopes_preserve_semantics_at_the_32_graph_boundary() {
     for count in [1, 2, 32, 33] {
         let graphs = &fixture.visible[..count];
         assert_eq!(
-            canonical_rows(fixture.node.query_graphs(graphs, &default_query).unwrap()),
+            canonical_rows(
+                fixture
+                    .node
+                    .query_in_graphs(&AllowAllAuthorizer, graphs, &default_query)
+                    .unwrap(),
+            ),
             expected_shared_rows(),
             "default union scope of {count} graphs"
         );
         assert_eq!(
-            canonical_rows(fixture.node.query_graphs(graphs, &named_query).unwrap()),
+            canonical_rows(
+                fixture
+                    .node
+                    .query_in_graphs(&AllowAllAuthorizer, graphs, &named_query)
+                    .unwrap(),
+            ),
             expected_named_rows(graphs),
             "named graph scope of {count} graphs"
         );

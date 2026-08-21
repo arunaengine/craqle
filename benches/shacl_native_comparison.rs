@@ -9,8 +9,8 @@ mod support;
 
 use allocation::AllocationInterval;
 use craqle::{
-    CompiledShaclSchema, EncodedTerm, GraphId, MaterializedQuadChange, QueryResults,
-    ShaclCompileOptions, ShaclValidationOptions,
+    AllowAllAuthorizer, CompiledShaclSchema, EncodedTerm, GraphId, MaterializedQuadChange,
+    QueryResults, ShaclCompileOptions, ShaclValidationOptions,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use rudof_rdf::rdf_core::RDFFormat;
@@ -287,7 +287,7 @@ fn copy_named_data(fixture: &Fixture, graph: &GraphId) -> CopiedData {
     );
     let QueryResults::Graph(triples) = fixture
         .node()
-        .query_graphs(std::slice::from_ref(graph), &query)
+        .query_in_graphs(&AllowAllAuthorizer, std::slice::from_ref(graph), &query)
         .expect("paired external SHACL data export query failed")
     else {
         panic!("paired external SHACL data export must return triples");

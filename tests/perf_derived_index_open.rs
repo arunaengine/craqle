@@ -135,7 +135,8 @@ mod tests {
 
         let first_query_start = Instant::now();
         let rows = solution_rows(
-            node.query_graphs(
+            node.query_in_graphs(
+                &AllowAllAuthorizer,
                 &graphs,
                 "SELECT ?s ?name WHERE { ?s schema:name ?name } LIMIT 25",
             )
@@ -146,7 +147,8 @@ mod tests {
 
         let second_query_start = Instant::now();
         let rows = solution_rows(
-            node.query_graphs(
+            node.query_in_graphs(
+                &AllowAllAuthorizer,
                 &graphs,
                 "SELECT ?s ?name WHERE { ?s schema:name ?name } LIMIT 25",
             )

@@ -116,7 +116,9 @@ mod tests {
             graph.as_str(),
             graph.as_str()
         );
-        net.peer_mut(1).update(&remove_link).unwrap();
+        net.peer_mut(1)
+            .apply_sparql_update(&writer_auth(), &remove_link)
+            .unwrap();
         net.sync_until_converged(10).unwrap();
 
         let violations = violation_messages(&net, 0, &graph);
@@ -168,7 +170,10 @@ mod tests {
             graph.as_str()
         );
 
-        match net.peer_mut(0).update(&delete_root) {
+        match net
+            .peer_mut(0)
+            .apply_sparql_update(&writer_auth(), &delete_root)
+        {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
                     violations

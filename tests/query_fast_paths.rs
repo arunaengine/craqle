@@ -1,7 +1,7 @@
 use craqle::{
-    CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId, JoinKind, JoinMode,
-    MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
-    QueryFastPathMode, QueryResults,
+    AllowAllAuthorizer, CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId,
+    JoinKind, JoinMode, MaterializedQuadChange, QueryExecution, QueryExecutionOptions,
+    QueryFastPathKind, QueryFastPathMode, QueryResults,
 };
 
 fn iri(value: &str) -> EncodedTerm {
@@ -35,7 +35,7 @@ fn run(
     let query = node.prepare_query(query).unwrap();
     let mut options = QueryExecutionOptions::default();
     options.fast_paths = fast_paths;
-    node.execute_prepared_graphs(graphs, &query, &options)
+    node.execute_prepared_in_graphs(&AllowAllAuthorizer, graphs, &query, &options)
         .unwrap()
 }
 
@@ -285,14 +285,24 @@ fn fast_paths_fail_closed() {
         .unwrap();
     let mut property_options = QueryExecutionOptions::default();
     property_options.join_mode = craqle::JoinMode::ForcePropertyStar;
-    node.execute_prepared_graphs(std::slice::from_ref(&graph), &star, &property_options)
-        .unwrap();
+    node.execute_prepared_in_graphs(
+        &AllowAllAuthorizer,
+        std::slice::from_ref(&graph),
+        &star,
+        &property_options,
+    )
+    .unwrap();
     let single = node
         .prepare_query("SELECT ?s WHERE { ?s <urn:test:fast:p> ?o } LIMIT 1")
         .unwrap();
     assert!(
-        node.execute_prepared_graphs(std::slice::from_ref(&graph), &single, &property_options)
-            .is_err()
+        node.execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &single,
+            &property_options,
+        )
+        .is_err()
     );
 
     let mut values = Vec::new();
@@ -396,7 +406,7 @@ fn fixed_predicate_triangle_ask_uses_bounded_query_ids() {
     let mut limited = QueryExecutionOptions::default();
     limited.limits.max_hash_entries = 1;
     let error = node
-        .execute_prepared_graphs(&graphs, &prepared, &limited)
+        .execute_prepared_in_graphs(&AllowAllAuthorizer, &graphs, &prepared, &limited)
         .unwrap_err();
     assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
 }
@@ -699,7 +709,7 @@ fn subject_set_counts_cover_exists_not_exists_and_minus() {
     let mut limited = QueryExecutionOptions::default();
     limited.limits.max_hash_entries = 1;
     let error = node
-        .execute_prepared_graphs(&graphs, &prepared, &limited)
+        .execute_prepared_in_graphs(&AllowAllAuthorizer, &graphs, &prepared, &limited)
         .unwrap_err();
     assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
 }
@@ -744,8 +754,13 @@ fn linear_chain_count_uses_explicit_cross_domains() {
                 let mut options = QueryExecutionOptions::default();
                 options.fast_paths = fast_paths;
                 options.join_mode = JoinMode::ForceHash;
-                node.execute_prepared_graphs(std::slice::from_ref(&graph), &prepared, &options)
-                    .unwrap()
+                node.execute_prepared_in_graphs(
+                    &AllowAllAuthorizer,
+                    std::slice::from_ref(&graph),
+                    &prepared,
+                    &options,
+                )
+                .unwrap()
             };
             let fast = execute(QueryFastPathMode::Auto);
             let generic = execute(QueryFastPathMode::Disabled);
@@ -795,8 +810,13 @@ fn hash_count_multiplicity() {
     let execute = |join_mode| {
         let mut options = QueryExecutionOptions::default();
         options.join_mode = join_mode;
-        node.execute_prepared_graphs(std::slice::from_ref(&graph), &query, &options)
-            .unwrap()
+        node.execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &query,
+            &options,
+        )
+        .unwrap()
     };
     let lateral = execute(JoinMode::ForceLateral);
     let hash = execute(JoinMode::ForceHash);
@@ -862,7 +882,12 @@ fn hash_count_multiplicity() {
     limited.join_mode = JoinMode::ForceHash;
     limited.limits.max_hash_entries = 1;
     let error = node
-        .execute_prepared_graphs(std::slice::from_ref(&graph), &query, &limited)
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &query,
+            &limited,
+        )
         .unwrap_err();
     assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
 }
@@ -951,8 +976,13 @@ fn randomized_paths_match() {
             let mut options = QueryExecutionOptions::default();
             options.fast_paths = fast_paths;
             options.join_mode = JoinMode::ForceHash;
-            node.execute_prepared_graphs(std::slice::from_ref(&graph), &hash_query, &options)
-                .unwrap()
+            node.execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                std::slice::from_ref(&graph),
+                &hash_query,
+                &options,
+            )
+            .unwrap()
         };
         let fast = execute_hash(QueryFastPathMode::Auto);
         let generic = execute_hash(QueryFastPathMode::Disabled);

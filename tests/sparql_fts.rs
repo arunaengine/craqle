@@ -102,9 +102,9 @@ mod tests {
 
     fn graph_rows_for<F>(node: &CraqleNode, visible: F, sparql: &str) -> BTreeSet<String>
     where
-        F: Fn(&GraphId) -> bool,
+        F: Fn(&GraphId) -> bool + Send + Sync,
     {
-        solution_rows(node.query_graphs_with(visible, sparql).unwrap())
+        solution_rows(query_with_test_visibility(node, visible, sparql).unwrap())
             .into_iter()
             .map(|row| row.get("g").expect("?g must be bound").0.clone())
             .collect()
@@ -278,7 +278,7 @@ mod tests {
             "#,
             readable.as_str()
         );
-        let rows = solution_rows(node.query_graphs_with(visible, &sparql).unwrap());
+        let rows = solution_rows(query_with_test_visibility(&node, visible, &sparql).unwrap());
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get("s").unwrap().0,
@@ -299,7 +299,8 @@ mod tests {
             "#,
             hidden.as_str()
         );
-        let hidden_rows = solution_rows(node.query_graphs_with(visible, &hidden_sparql).unwrap());
+        let hidden_rows =
+            solution_rows(query_with_test_visibility(&node, visible, &hidden_sparql).unwrap());
         assert!(hidden_rows.is_empty());
     }
 }

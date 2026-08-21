@@ -1,5 +1,6 @@
 use craqle::{
-    CraqleError, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId, JoinKind, JoinMode,
+    Action, AllowAllAuthorizer, AuthorizationError, CraqleError, CraqleErrorKind, CraqleNode,
+    DenyAllAuthorizer, EncodedTerm, GraphId, GraphPolicy, JoinKind, JoinMode,
     MaterializedQuadChange, QueryExecutionOptions, QueryLogicalOperator, QueryPhysicalOperator,
     QueryPlan, QueryResults,
 };
@@ -34,10 +35,15 @@ fn prepared_reads_fresh() {
 
     let sparql = "SELECT ?s ?o WHERE { ?s <urn:test:prepared:p> ?o }";
     let old = node
-        .query_graphs(std::slice::from_ref(&graph), sparql)
+        .query_in_graphs(&AllowAllAuthorizer, std::slice::from_ref(&graph), sparql)
         .unwrap();
     let diagnostic = node
-        .query_graphs_with_statistics(std::slice::from_ref(&graph), sparql)
+        .query_in_graphs_with_options(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            sparql,
+            &QueryExecutionOptions::default(),
+        )
         .unwrap();
     assert_eq!(diagnostic.results, old);
     assert_eq!(diagnostic.statistics.result_rows, 1);
@@ -57,7 +63,8 @@ fn prepared_reads_fresh() {
 
     let prepared = node.prepare_query(sparql).unwrap();
     let first = node
-        .execute_prepared_graphs(
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             &prepared,
             &QueryExecutionOptions::default(),
@@ -70,7 +77,8 @@ fn prepared_reads_fresh() {
     let rebuilt = node.rebuild_query_indexes().unwrap();
     assert!(rebuilt.query_id_generation > first_query_id_generation);
     let after_rebuild = node
-        .execute_prepared_graphs(
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             &prepared,
             &QueryExecutionOptions::default(),
@@ -92,7 +100,8 @@ fn prepared_reads_fresh() {
     )
     .unwrap();
     let second = node
-        .execute_prepared_graphs(
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             &prepared,
             &QueryExecutionOptions::default(),
@@ -124,7 +133,12 @@ fn prepared_cancellation() {
     options.cancellation.cancel();
 
     let error = node
-        .execute_prepared_graphs(std::slice::from_ref(&graph), &prepared, &options)
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &prepared,
+            &options,
+        )
         .unwrap_err();
     assert!(matches!(error, CraqleError::QueryCancelled), "{error:?}");
 }
@@ -146,6 +160,100 @@ fn diagnostic_access_matches() {
     let diagnostic = node.query_with_statistics(&authorizer, query).unwrap();
     assert_eq!(diagnostic.results, old);
     assert!(matches!(diagnostic.results, QueryResults::Solutions(rows) if rows.is_empty()));
+}
+
+#[test]
+fn explicit_graph_query_authorization_fails_the_whole_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let readable = GraphId::new("urn:test:explicit-auth:readable");
+    let hidden = GraphId::new("urn:test:explicit-auth:hidden");
+    let missing = GraphId::new("urn:test:explicit-auth:missing");
+    node.apply_changes_unchecked(
+        &readable,
+        vec![insert(
+            &readable,
+            "urn:test:explicit-auth:s:readable",
+            "urn:test:explicit-auth:o:readable",
+        )],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &hidden,
+        vec![insert(
+            &hidden,
+            "urn:test:explicit-auth:s:hidden",
+            "urn:test:explicit-auth:o:hidden",
+        )],
+    )
+    .unwrap();
+
+    let readable_for_auth = readable.clone();
+    let auth = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+        if graph == &readable_for_auth && action == Action::Read {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_owned(),
+            })
+        }
+    };
+    let sparql = "SELECT ?s WHERE { ?s <urn:test:prepared:p> ?o }";
+    assert!(matches!(
+        node.query_in_graphs(&auth, std::slice::from_ref(&readable), sparql),
+        Ok(QueryResults::Solutions(rows)) if rows.len() == 1
+    ));
+
+    for graphs in [
+        std::slice::from_ref(&hidden),
+        std::slice::from_ref(&missing),
+        &[readable.clone(), hidden.clone()],
+    ] {
+        let error = node.query_in_graphs(&auth, graphs, sparql).unwrap_err();
+        assert_eq!(CraqleErrorKind::Unauthorized, error.kind());
+    }
+
+    let mixed = [readable.clone(), hidden.clone()];
+    let prepared = node.prepare_query(sparql).unwrap();
+    let options = QueryExecutionOptions::default();
+    assert_eq!(
+        CraqleErrorKind::Unauthorized,
+        node.query_in_graphs_with_options(&auth, &mixed, sparql, &options)
+            .unwrap_err()
+            .kind()
+    );
+    assert_eq!(
+        CraqleErrorKind::Unauthorized,
+        node.execute_prepared_in_graphs(&auth, &mixed, &prepared, &options)
+            .unwrap_err()
+            .kind()
+    );
+    assert_eq!(
+        CraqleErrorKind::Unauthorized,
+        node.explain_prepared_in_graphs(&auth, &mixed, &prepared, &options)
+            .unwrap_err()
+            .kind()
+    );
+    assert_eq!(
+        CraqleErrorKind::Unauthorized,
+        node.analyze_prepared_in_graphs(&auth, &mixed, &prepared, &options)
+            .unwrap_err()
+            .kind()
+    );
+
+    let fts = node
+        .prepare_query(
+            "SELECT ?s WHERE { SERVICE <urn:craqle:fts> { \
+             ?s <urn:craqle:fts:query> \"authorization\" } }",
+        )
+        .unwrap();
+    assert_eq!(
+        CraqleErrorKind::Unauthorized,
+        node.execute_prepared_in_graphs(&auth, &mixed, &fts, &options)
+            .unwrap_err()
+            .kind()
+    );
 }
 
 #[test]
@@ -174,12 +282,22 @@ fn forced_join_results() {
     let mut lateral_options = QueryExecutionOptions::default();
     lateral_options.join_mode = JoinMode::ForceLateral;
     let lateral = node
-        .execute_prepared_graphs(std::slice::from_ref(&graph), &prepared, &lateral_options)
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &prepared,
+            &lateral_options,
+        )
         .unwrap();
     let mut hash_options = QueryExecutionOptions::default();
     hash_options.join_mode = JoinMode::ForceHash;
     let hash = node
-        .execute_prepared_graphs(std::slice::from_ref(&graph), &prepared, &hash_options)
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &prepared,
+            &hash_options,
+        )
         .unwrap();
 
     assert_eq!(hash.results, lateral.results);
@@ -192,7 +310,12 @@ fn forced_join_results() {
         JoinKind::Hash
     );
     let explained = node
-        .explain_prepared_graphs(std::slice::from_ref(&graph), &prepared, &hash_options)
+        .explain_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &prepared,
+            &hash_options,
+        )
         .unwrap();
     assert_eq!(
         explained.root.logical_operator,
@@ -213,7 +336,12 @@ fn forced_join_results() {
     );
 
     let analyzed = node
-        .analyze_prepared_graphs(std::slice::from_ref(&graph), &prepared, &hash_options)
+        .analyze_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &prepared,
+            &hash_options,
+        )
         .unwrap();
     assert_eq!(analyzed.root.actual_rows, Some(1));
     assert_eq!(analyzed.root.output_rows, 1);
@@ -228,10 +356,20 @@ fn forced_join_results() {
         )
         .unwrap();
     let graph_lateral = node
-        .execute_prepared_graphs(std::slice::from_ref(&graph), &graph_query, &lateral_options)
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &graph_query,
+            &lateral_options,
+        )
         .unwrap();
     let graph_hash = node
-        .execute_prepared_graphs(std::slice::from_ref(&graph), &graph_query, &hash_options)
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &graph_query,
+            &hash_options,
+        )
         .unwrap();
     assert_eq!(graph_hash.results, graph_lateral.results);
     assert!(matches!(

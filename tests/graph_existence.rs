@@ -261,8 +261,12 @@ mod tests {
         let visible = corpus.visible();
 
         let enumerated = solution_rows(
-            node.query_graphs(&visible, "SELECT ?g WHERE { GRAPH ?g {} }")
-                .unwrap(),
+            node.query_in_graphs(
+                &AllowAllAuthorizer,
+                &visible,
+                "SELECT ?g WHERE { GRAPH ?g {} }",
+            )
+            .unwrap(),
         )
         .into_iter()
         .map(|row| row.get("g").expect("?g must be bound").0.clone())
@@ -280,7 +284,11 @@ mod tests {
             .into_iter()
             .map(|(label, graph_iri)| {
                 let answer = node
-                    .query_graphs(&visible, &format!("ASK {{ GRAPH <{graph_iri}> {{}} }}"))
+                    .query_in_graphs(
+                        &AllowAllAuthorizer,
+                        &visible,
+                        &format!("ASK {{ GRAPH <{graph_iri}> {{}} }}"),
+                    )
                     .unwrap();
                 (label, answer == QueryResults::Boolean(true))
             })
@@ -350,7 +358,8 @@ mod tests {
             let visible = corpus.visible();
             for graph in [&corpus.empty, &corpus.orphaned] {
                 let rows = solution_rows(
-                    node.query_graphs(
+                    node.query_in_graphs(
+                        &AllowAllAuthorizer,
                         &visible,
                         &format!(
                             "SELECT ?s ?p ?o WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
@@ -381,7 +390,8 @@ mod tests {
             // The IRI is still a live object term, so it is certainly still
             // interned — yet the graph itself is gone.
             let referenced = solution_rows(
-                node.query_graphs(
+                node.query_in_graphs(
+                    &AllowAllAuthorizer,
                     &corpus.visible(),
                     &format!(
                         "SELECT ?s WHERE {{ ?s <{SCHEMA_IS_BASED_ON}> <{}> }}",

@@ -11,6 +11,35 @@ use crate::store::{
 };
 use crate::validation_delta::DeltaQuadCursor;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CountGrouping {
+    Subject,
+    Object,
+    None,
+}
+
+fn count_grouping_for_order(
+    order: QueryIndexCursorOrder,
+    mut fixed: impl FnMut(usize) -> bool,
+) -> CountGrouping {
+    let columns = match order {
+        QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
+        QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
+        QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
+        QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
+        QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
+        QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+    };
+    columns
+        .into_iter()
+        .find(|column| !fixed(*column))
+        .map_or(CountGrouping::None, |column| match column {
+            1 => CountGrouping::Subject,
+            3 => CountGrouping::Object,
+            _ => CountGrouping::None,
+        })
+}
+
 enum SourceIterator {
     Single(Option<RawQuadCandidate>),
     Durable {
@@ -170,6 +199,7 @@ pub(crate) struct RawQueryIndexKeyCursor {
     prefix: Vec<u8>,
     pattern: RawQueryIndexPattern,
     query_id_upper_bound: u64,
+    count_grouping: CountGrouping,
 }
 
 impl RawQueryIndexKeyCursor {
@@ -187,6 +217,28 @@ impl RawQueryIndexKeyCursor {
         } else {
             snapshot.prefix(keyspace, &prefix)
         };
+        let prefix_terms = prefix.len() / 8;
+        let count_grouping = count_grouping_for_order(order, |column| {
+            let column_position = match order {
+                QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
+                QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
+                QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
+                QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
+                QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
+                QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+            }
+            .iter()
+            .position(|candidate| *candidate == column)
+            .expect("query-index columns contain every term");
+            column_position < prefix_terms
+                || match column {
+                    0 => pattern.graph.is_some(),
+                    1 => pattern.subject.is_some(),
+                    2 => pattern.predicate.is_some(),
+                    3 => pattern.object.is_some(),
+                    _ => unreachable!("query-index columns are four terms"),
+                }
+        });
         Self {
             snapshot,
             keyspace: keyspace.clone(),
@@ -196,7 +248,12 @@ impl RawQueryIndexKeyCursor {
             prefix,
             pattern,
             query_id_upper_bound,
+            count_grouping,
         }
+    }
+
+    pub(crate) fn count_grouping(&self) -> CountGrouping {
+        self.count_grouping
     }
 
     pub(crate) fn into_scalar_partitions(
@@ -229,6 +286,7 @@ impl RawQueryIndexKeyCursor {
             prefix,
             pattern,
             query_id_upper_bound,
+            count_grouping,
         } = self;
         let count = count.min(usize::try_from(query_id_upper_bound).unwrap_or(count));
         let width = query_id_upper_bound.div_ceil(count as u64);
@@ -255,6 +313,7 @@ impl RawQueryIndexKeyCursor {
                     prefix: prefix.clone(),
                     pattern,
                     query_id_upper_bound,
+                    count_grouping,
                 })
             })
             .collect())
@@ -321,6 +380,26 @@ pub(crate) struct RawQuadCursor {
 }
 
 impl RawQuadCursor {
+    fn count_grouping(&self, pattern: QuadPattern) -> CountGrouping {
+        let fixed = |column| match column {
+            0 => pattern.graph.is_some(),
+            1 => pattern.subject.is_some(),
+            2 => pattern.predicate.is_some(),
+            3 => pattern.object.is_some(),
+            _ => unreachable!("quad columns are four terms"),
+        };
+        match &self.source {
+            SourceIterator::Durable { .. } => {
+                count_grouping_for_order(QueryIndexCursorOrder::Gspo, fixed)
+            }
+            SourceIterator::QueryIndex { order, .. } => count_grouping_for_order(*order, fixed),
+            SourceIterator::PredicateObject { .. } | SourceIterator::Object { .. } => {
+                CountGrouping::Subject
+            }
+            SourceIterator::Single(_) | SourceIterator::Empty => CountGrouping::None,
+        }
+    }
+
     pub(crate) fn single(candidate: Option<RawQuadCandidate>) -> Self {
         Self {
             source: SourceIterator::Single(candidate),
@@ -545,6 +624,7 @@ pub(crate) struct QueryCursor<'store, 'context, 'visibility> {
     pattern: QuadPattern,
     candidates_since_check: usize,
     finished: bool,
+    count_grouping: CountGrouping,
 }
 
 enum QuerySource<'store> {
@@ -565,6 +645,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
         raw: RawQuadCursor,
         pattern: QuadPattern,
     ) -> Self {
+        let count_grouping = raw.count_grouping(pattern);
         Self {
             store,
             snapshot,
@@ -573,6 +654,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
             pattern,
             candidates_since_check: 0,
             finished: false,
+            count_grouping,
         }
     }
 
@@ -590,12 +672,17 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
             pattern,
             candidates_since_check: 0,
             finished: false,
+            count_grouping: CountGrouping::None,
         }
     }
 
     fn fail(&mut self, error: crate::store::StoreError) -> Option<Result<EncodedQuad>> {
         self.finished = true;
         Some(Err(error))
+    }
+
+    pub(crate) fn count_grouping(&self) -> CountGrouping {
+        self.count_grouping
     }
 
     pub(crate) fn delta(
@@ -613,6 +700,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
             pattern,
             candidates_since_check: 0,
             finished: false,
+            count_grouping: CountGrouping::None,
         }
     }
 
@@ -623,6 +711,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
         raw: RawQuadCursor,
         pattern: QuadPattern,
     ) -> Self {
+        let count_grouping = raw.count_grouping(pattern);
         Self {
             store,
             snapshot,
@@ -635,6 +724,7 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
             pattern,
             candidates_since_check: 0,
             finished: false,
+            count_grouping,
         }
     }
 

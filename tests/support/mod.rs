@@ -17,6 +17,52 @@ pub use sim::*;
 /// deadlock fails the run instead of hanging it.
 pub const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+pub fn query_with_test_visibility<F>(
+    node: &CraqleNode,
+    visible: F,
+    sparql: &str,
+) -> craqle::Result<QueryResults>
+where
+    F: Fn(&GraphId) -> bool + Send + Sync,
+{
+    let auth = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+        if visible(graph) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_owned(),
+            })
+        }
+    };
+    node.query(&auth, sparql)
+}
+
+pub fn query_with_test_planner<F>(
+    node: &CraqleNode,
+    visible: F,
+    sparql: &str,
+    optimize: bool,
+) -> craqle::Result<QueryResults>
+where
+    F: Fn(&GraphId) -> bool + Send + Sync,
+{
+    let auth = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+        if visible(graph) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_owned(),
+            })
+        }
+    };
+    let query = node.prepare_query(sparql)?;
+    let mut options = QueryExecutionOptions::default();
+    options.optimize = optimize;
+    Ok(node.execute_prepared(&auth, &query, &options)?.results)
+}
+
 /// Run `body` on a detached thread and fail if it does not finish in time.
 ///
 /// The branch these tests guard replaces one engine-wide lock with a two-level

@@ -8,8 +8,8 @@ mod support;
 
 use allocation::AllocationInterval;
 use craqle::{
-    ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind, JoinMode,
-    MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
+    ActorId, AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind,
+    JoinMode, MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::{binary_blake3, env_duration, repository_commit};
@@ -83,7 +83,12 @@ impl JoinFixture {
         let mut options = QueryExecutionOptions::default();
         options.join_mode = mode;
         self.node
-            .execute_prepared_graphs(std::slice::from_ref(&self.graph), &self.query, &options)
+            .execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                std::slice::from_ref(&self.graph),
+                &self.query,
+                &options,
+            )
             .expect("execute forced join benchmark")
     }
 }

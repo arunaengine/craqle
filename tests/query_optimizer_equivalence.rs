@@ -138,14 +138,9 @@ mod tests {
     }
 
     fn assert_equivalent(node: &CraqleNode, label: &str, sparql: &str) -> usize {
-        let optimized = canonical_rows(
-            node.query_graphs_with_planner(visible, sparql, true)
-                .unwrap(),
-        );
-        let raw = canonical_rows(
-            node.query_graphs_with_planner(visible, sparql, false)
-                .unwrap(),
-        );
+        let optimized =
+            canonical_rows(query_with_test_planner(node, visible, sparql, true).unwrap());
+        let raw = canonical_rows(query_with_test_planner(node, visible, sparql, false).unwrap());
         assert_eq!(
             optimized, raw,
             "{label}: optimizer changed the result set\nquery: {sparql}"
@@ -350,10 +345,8 @@ mod tests {
         let sparql = "SELECT ?d ?n WHERE { ?d a <http://schema.org/Dataset> ; \
                       <http://schema.org/name> ?n }";
         for optimize in [true, false] {
-            let rows = solution_rows(
-                node.query_graphs_with_planner(visible, sparql, optimize)
-                    .unwrap(),
-            );
+            let rows =
+                solution_rows(query_with_test_planner(&node, visible, sparql, optimize).unwrap());
             assert!(!rows.is_empty());
             for row in &rows {
                 let name = &row.get("n").unwrap().0;
@@ -385,14 +378,9 @@ mod tests {
         // `?v = 1` is value equality: it must match both "1"^^xsd:integer and
         // the non-canonical "01"^^xsd:integer spellings.
         let sparql = "SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }";
-        let optimized = solution_rows(
-            node.query_graphs_with_planner(visible, sparql, true)
-                .unwrap(),
-        );
-        let raw = solution_rows(
-            node.query_graphs_with_planner(visible, sparql, false)
-                .unwrap(),
-        );
+        let optimized =
+            solution_rows(query_with_test_planner(&node, visible, sparql, true).unwrap());
+        let raw = solution_rows(query_with_test_planner(&node, visible, sparql, false).unwrap());
         assert_eq!(optimized.len(), raw.len());
         // Every visible dataset has a version quad; idx % 5 == 0 graphs use
         // the "01" spelling and must still match.
@@ -464,9 +452,12 @@ mod tests {
         let by_predicate = |graph: &GraphId| allowed.contains(graph.as_str());
 
         for (label, sparql) in bound_object_shapes() {
-            let from_list = canonical_rows(node.query_graphs(&listed, &sparql).unwrap());
+            let from_list = canonical_rows(
+                node.query_in_graphs(&AllowAllAuthorizer, &listed, &sparql)
+                    .unwrap(),
+            );
             let from_predicate =
-                canonical_rows(node.query_graphs_with(by_predicate, &sparql).unwrap());
+                canonical_rows(query_with_test_visibility(&node, by_predicate, &sparql).unwrap());
             assert_eq!(
                 from_list, from_predicate,
                 "{label}: explicit visible list diverged from the visibility predicate\n\
@@ -480,7 +471,8 @@ mod tests {
 
         // Soundness: no graph outside the visible set may surface.
         let graphs = solution_rows(
-            node.query_graphs(
+            node.query_in_graphs(
+                &AllowAllAuthorizer,
                 &listed,
                 "SELECT ?g WHERE { GRAPH ?g { ?d a <http://schema.org/Dataset> } }",
             )
@@ -567,8 +559,7 @@ mod tests {
         let sparql = format!("SELECT ?e WHERE {{ ?e <{EBV_VALUE}> ?v . FILTER({expression}) }}");
         let entities = |optimize: bool| -> BTreeSet<String> {
             solution_rows(
-                node.query_graphs_with_planner(|_: &GraphId| true, &sparql, optimize)
-                    .unwrap(),
+                query_with_test_planner(node, |_: &GraphId| true, &sparql, optimize).unwrap(),
             )
             .into_iter()
             .map(|row| row.get("e").expect("?e must be bound").0.clone())
