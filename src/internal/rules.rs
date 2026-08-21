@@ -1349,7 +1349,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (store, engine) = engine_at(dir.path());
             engine
-                .local_apply_changes_bulk_unchecked(graph, inserts(graph, triples))
+                .local_apply_bulk_bypassing_structural_rules(graph, inserts(graph, triples))
                 .unwrap();
             store.graph_diagnostics(graph).unwrap()
         }
@@ -1483,12 +1483,15 @@ mod tests {
                 let (store, engine) = engine_at(dir.path());
                 let mut triples = seed(&graph);
                 engine
-                    .local_apply_changes_unchecked(&graph, inserts(&graph, &triples))
+                    .local_apply_changes_bypassing_structural_rules(
+                        &graph,
+                        inserts(&graph, &triples),
+                    )
                     .unwrap();
 
                 let before = store.diagnostics_compute_count();
                 engine
-                    .local_apply_changes_unchecked(&graph, case.changes.clone())
+                    .local_apply_changes_bypassing_structural_rules(&graph, case.changes.clone())
                     .unwrap();
                 let settled = store.diagnostics_compute_count();
                 assert_eq!(
@@ -1539,7 +1542,7 @@ mod tests {
                 (iri(CHILD), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
             ];
             engine
-                .local_apply_changes_unchecked(&graph, inserts(&graph, &triples))
+                .local_apply_changes_bypassing_structural_rules(&graph, inserts(&graph, &triples))
                 .unwrap();
             assert!(!store.graph_diagnostics(&graph).unwrap().has_orphans());
 

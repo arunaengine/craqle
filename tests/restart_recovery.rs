@@ -9,6 +9,9 @@
 //! contract those mechanisms exist to uphold: after a reopen the node reports
 //! exactly the state it committed, and nothing is served stale.
 
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     CraqleNode, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy, MaterializedQuadChange, vocab,
 };

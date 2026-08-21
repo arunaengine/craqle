@@ -2,6 +2,8 @@
 
 mod support;
 
+use crate::support::TestWriteExt as _;
+
 use craqle::{
     CraqleError, CraqleNode, CreateCrateRequest, EncodedTerm, GraphId, MaterializedQuadChange,
     NewDataEntity, RoCrateError, ShaclBinding, ShaclBindingOptions, ShaclValidationState,

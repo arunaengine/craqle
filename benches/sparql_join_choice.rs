@@ -6,6 +6,8 @@ mod allocation;
 #[path = "support/mod.rs"]
 mod support;
 
+use support::BenchWriteExt as _;
+
 use allocation::AllocationInterval;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind,

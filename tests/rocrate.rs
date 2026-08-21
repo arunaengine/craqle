@@ -357,6 +357,7 @@ mod tests {
         .unwrap();
         net.peer(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![
                     (
@@ -507,6 +508,7 @@ mod tests {
         .unwrap();
         net.peer(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),
@@ -527,6 +529,7 @@ mod tests {
         .unwrap();
         net.peer(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),
@@ -547,6 +550,7 @@ mod tests {
         .unwrap();
         net.peer(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),
@@ -685,6 +689,7 @@ mod tests {
         .unwrap();
         net.peer(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),

@@ -11,6 +11,52 @@ pub mod fixture;
 
 use std::fmt;
 
+use craqle::{AllowAllAuthorizer, Batch, CraqleNode, GraphId, GraphPolicy, MaterializedQuadChange};
+
+pub trait BenchWriteExt {
+    fn apply_changes_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch>;
+
+    fn apply_changes_bulk_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch>;
+
+    fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> craqle::Result<()>;
+
+    fn delete_graph_unchecked(&self, graph: &GraphId) -> craqle::Result<()>;
+}
+
+impl BenchWriteExt for CraqleNode {
+    fn apply_changes_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch> {
+        self.apply_changes(&AllowAllAuthorizer, graph, changes)
+    }
+
+    fn apply_changes_bulk_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch> {
+        self.apply_changes(&AllowAllAuthorizer, graph, changes)
+    }
+
+    fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> craqle::Result<()> {
+        self.set_graph_policy(&AllowAllAuthorizer, graph, policy)
+    }
+
+    fn delete_graph_unchecked(&self, graph: &GraphId) -> craqle::Result<()> {
+        self.delete_graph(&AllowAllAuthorizer, graph)
+    }
+}
+
 /// Version of the deterministic generator. Bump this when its output contract
 /// changes in a way that makes existing measurements incomparable.
 pub const CORPUS_VERSION: &str = "performance-corpus-v1";

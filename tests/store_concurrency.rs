@@ -12,6 +12,8 @@
 
 mod support;
 
+use crate::support::TestWriteExt as _;
+
 use std::sync::Arc;
 use std::sync::mpsc;
 

@@ -1,3 +1,6 @@
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     Action, AllowAllAuthorizer, AuthorizationError, CraqleError, CraqleErrorKind, CraqleNode,
     DenyAllAuthorizer, EncodedTerm, GraphId, GraphPolicy, JoinKind, JoinMode,

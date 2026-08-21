@@ -19,9 +19,9 @@ use craqle::{
 use oxrdf::Term;
 
 use super::{
-    CORPUS_VERSION, CorpusConfig, CorpusShape, DEFAULT_SEED, DeterministicCorpus, GRAPHS_32,
-    GraphVisibility, ObjectSpec, PredicateKind, QUADS_10K, QUADS_10M, graph_visibility,
-    star_has_common,
+    BenchWriteExt as _, CORPUS_VERSION, CorpusConfig, CorpusShape, DEFAULT_SEED,
+    DeterministicCorpus, GRAPHS_32, GraphVisibility, ObjectSpec, PredicateKind, QUADS_10K,
+    QUADS_10M, graph_visibility, star_has_common,
 };
 
 /// Maximum buffered changes in one graph partition.

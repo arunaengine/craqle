@@ -104,7 +104,7 @@ pub use crate::core::{
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
 pub use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
-pub use crate::replication::{MergeError, UpdateError};
+pub use crate::replication::{CheckMode, DiagnosticsMode, MergeError, UpdateError, WriteChecks};
 pub use crate::rocrate::{
     AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
     canonicalize_jsonld, validate_rocrate_jsonld,
@@ -622,6 +622,7 @@ pub struct DescribeRequest<'a> {
 /// and still a trivially sized collector.
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
 
+#[cfg(test)]
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
 /// Smallest Tantivy over-fetch before authorization filtering.
@@ -2852,9 +2853,11 @@ impl CraqleNode {
     /// Advanced: insert raw quads directly into one graph.
     pub fn insert_quads(
         &self,
+        auth: &dyn Authorizer,
         graph: &GraphId,
         quads: Vec<(CoreEncodedTerm, CoreEncodedTerm, CoreEncodedTerm)>,
     ) -> Result<Batch> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.replication.local_insert_quads(graph, quads)?;
         self.finish_batch(graph, batch)
     }
@@ -2862,39 +2865,24 @@ impl CraqleNode {
     /// Advanced: apply an explicit change set with validation.
     pub fn apply_changes(
         &self,
+        auth: &dyn Authorizer,
         graph: &GraphId,
         changes: Vec<CoreMaterializedQuadChange>,
     ) -> Result<Batch> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.replication.local_apply_changes(graph, changes)?;
         self.finish_batch(graph, batch)
     }
 
-    /// Advanced: apply an explicit change set without post-state validation.
-    pub fn apply_changes_unchecked(
+    #[cfg(test)]
+    pub(crate) fn apply_changes_bypassing_structural_rules(
         &self,
         graph: &GraphId,
         changes: Vec<CoreMaterializedQuadChange>,
     ) -> Result<Batch> {
         let batch = self
             .replication
-            .local_apply_changes_unchecked(graph, changes)?;
-        self.finish_batch(graph, batch)
-    }
-
-    /// Advanced: apply a large change set using the bulk write path.
-    ///
-    /// Diagnostics are deferred so a run of these can share one recompute. The
-    /// caller must finish with [`CraqleNode::rebuild_graph_diagnostics`]: until
-    /// it runs, an entity whose orphan status this changed without being
-    /// written stays missing from search (G7).
-    pub fn apply_changes_bulk_unchecked(
-        &self,
-        graph: &GraphId,
-        changes: Vec<CoreMaterializedQuadChange>,
-    ) -> Result<Batch> {
-        let batch = self
-            .replication
-            .local_apply_changes_bulk_unchecked(graph, changes)?;
+            .local_apply_changes_bypassing_structural_rules(graph, changes)?;
         self.finish_batch(graph, batch)
     }
 
@@ -3413,7 +3401,12 @@ impl CraqleNode {
         Ok(self.store.verify_query_indexes(mode.into())?)
     }
 
-    pub fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn set_graph_policy_bypassing_authorization(
+        &self,
+        graph: &GraphId,
+        policy: GraphPolicy,
+    ) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
         self.set_local_graph_policy(graph, policy.normalized())?;
         self.persist_fjall()
@@ -3450,10 +3443,10 @@ impl CraqleNode {
 
     pub fn delete_graph(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<()> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.delete_graph_unchecked(graph)
+        self.delete_graph_after_authorization(graph)
     }
 
-    pub fn delete_graph_unchecked(&self, graph: &GraphId) -> Result<()> {
+    fn delete_graph_after_authorization(&self, graph: &GraphId) -> Result<()> {
         // Orders the tombstone against this graph's writes, and the publish
         // against its own apply; see `replication::GRAPH_WRITE_LOCKS`. Every
         // tombstone writer takes it, so a write that checks the tombstone
@@ -3614,6 +3607,7 @@ impl CraqleNode {
         Ok(())
     }
 
+    #[cfg(test)]
     fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.persist_graph_policy_with_durability(
             graph,
@@ -3796,6 +3790,7 @@ impl CraqleNode {
         }
     }
 
+    #[cfg(test)]
     fn validate_sync_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
         if policy.permission_paths.len() > MAX_SYNC_POLICY_PATHS {
             return Err(CraqleError::SyncInputRejected(format!(
@@ -4055,7 +4050,7 @@ mod tests {
             let focus = format!("urn:test:{prefix}:focus:{index}");
             let shape = format!("urn:test:{prefix}:shape:{index}");
             let property = format!("urn:test:{prefix}:property:{index}");
-            node.apply_changes_unchecked(
+            node.apply_changes_bypassing_structural_rules(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4078,7 +4073,7 @@ mod tests {
                 predicate: EncodedTerm(format!("<{sh_min_count}>")),
                 object: EncodedTerm(format!("\"1\"^^<{xsd_integer}>")),
             });
-            node.apply_changes_unchecked(&shapes, shape_changes)
+            node.apply_changes_bypassing_structural_rules(&shapes, shape_changes)
                 .unwrap();
             node.bind_shacl(
                 &AllowAllAuthorizer,
@@ -4130,6 +4125,7 @@ mod tests {
                             "urn:test:required-value"
                         };
                         let result = node.apply_changes(
+                            &AllowAllAuthorizer,
                             &graph,
                             vec![shacl_change(
                                 &graph,
@@ -4186,6 +4182,7 @@ mod tests {
                 start.wait();
                 let accepted = node
                     .apply_changes(
+                        &AllowAllAuthorizer,
                         &graph,
                         vec![shacl_change(
                             &graph,
@@ -4230,7 +4227,7 @@ mod tests {
             let focus = format!("urn:test:shape-race:{label}:focus");
             let shape = format!("urn:test:shape-race:{label}:shape");
             let property = format!("urn:test:shape-race:{label}:property");
-            node.apply_changes_unchecked(
+            node.apply_changes_bypassing_structural_rules(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4278,10 +4275,10 @@ mod tests {
                 predicate: EncodedTerm("<http://www.w3.org/ns/shacl#minCount>".to_owned()),
                 object: EncodedTerm("\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned()),
             });
-            node.apply_changes_unchecked(&dependency, shape_changes)
+            node.apply_changes_bypassing_structural_rules(&dependency, shape_changes)
                 .unwrap();
             if imported {
-                node.apply_changes_unchecked(
+                node.apply_changes_bypassing_structural_rules(
                     &root,
                     vec![shacl_change(
                         &root,
@@ -4314,6 +4311,7 @@ mod tests {
             std::thread::spawn(move || {
                 let accepted = writer
                     .apply_changes(
+                        &AllowAllAuthorizer,
                         &writer_data,
                         vec![shacl_change(
                             &writer_data,
@@ -4330,7 +4328,7 @@ mod tests {
                 assert!(wait_started.elapsed() < Duration::from_secs(5));
                 std::thread::yield_now();
             }
-            node.apply_changes_unchecked(
+            node.apply_changes_bypassing_structural_rules(
                 &dependency,
                 vec![MaterializedQuadChange::Insert {
                     graph: dependency.clone(),
@@ -4359,6 +4357,7 @@ mod tests {
         node.replication.arm_settle_failure();
         let batch = node
             .apply_changes(
+                &AllowAllAuthorizer,
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4859,6 +4858,7 @@ mod tests {
     /// One keyword write on the crate root, published as a single record.
     fn write_keyword(node: &CraqleNode, graph: &GraphId, value: &str) {
         node.insert_quads(
+            &AllowAllAuthorizer,
             graph,
             vec![(
                 EncodedTerm::from_named_node(&graph.0),
@@ -5533,7 +5533,8 @@ mod tests {
         PUBLISH_APPLY_STALL_MICROS.store(STALL_MICROS, Ordering::Relaxed);
         for round in 0..ROUNDS {
             let graph = GraphId::new(&format!("urn:test:policy-race-{round}"));
-            node.import_graph_policy(&graph, policy_at("seed")).unwrap();
+            node.set_graph_policy_bypassing_authorization(&graph, policy_at("seed"))
+                .unwrap();
 
             let (tx, rx) = mpsc::channel();
             for writer in 0..WRITERS {
@@ -5597,7 +5598,7 @@ mod tests {
 
         for round in 0..ROUNDS {
             let graph = GraphId::new(&format!("urn:test:delete-race-{round}"));
-            node.import_graph_policy(&graph, policy_at("delete-race"))
+            node.set_graph_policy_bypassing_authorization(&graph, policy_at("delete-race"))
                 .unwrap();
             seed_write(&node, &graph);
 
@@ -5610,7 +5611,7 @@ mod tests {
                 std::thread::spawn(move || {
                     start.wait();
                     if racer == 0 {
-                        node.delete_graph_unchecked(&graph).unwrap();
+                        node.delete_graph_after_authorization(&graph).unwrap();
                     } else {
                         if let Err(error) = seed_write_result(&node, &graph) {
                             assert_eq!(error.kind(), CraqleErrorKind::Conflict);
@@ -5785,7 +5786,7 @@ mod tests {
         let shapes = GraphId::new("urn:test:delete-replay-shapes");
         let focus = EncodedTerm("<urn:test:delete-replay-focus>".to_owned());
         pair.origin
-            .apply_changes_unchecked(
+            .apply_changes_bypassing_structural_rules(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -5796,7 +5797,7 @@ mod tests {
             )
             .unwrap();
         pair.origin
-            .apply_changes_unchecked(
+            .apply_changes_bypassing_structural_rules(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -5831,7 +5832,9 @@ mod tests {
             )
             .unwrap();
 
-        pair.origin.delete_graph_unchecked(&shapes).unwrap();
+        pair.origin
+            .delete_graph_after_authorization(&shapes)
+            .unwrap();
         pair.replica.store.set_graph_tombstone(&shapes).unwrap();
         pair.replica.store.arm_commit_failure();
         assert!(pair.replica.reconcile_irokle().is_err());
@@ -5944,7 +5947,7 @@ mod tests {
     }
 
     fn seed_write_result(node: &CraqleNode, graph: &GraphId) -> Result<Batch> {
-        node.apply_changes_unchecked(
+        node.apply_changes_bypassing_structural_rules(
             graph,
             vec![MaterializedQuadChange::Insert {
                 graph: graph.clone(),

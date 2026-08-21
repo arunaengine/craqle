@@ -6,6 +6,8 @@
 
 mod support;
 
+use crate::support::TestWriteExt as _;
+
 use oxrdf::Term;
 
 use craqle::{

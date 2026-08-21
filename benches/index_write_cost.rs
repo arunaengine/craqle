@@ -28,6 +28,8 @@ mod sim;
 #[path = "support/mod.rs"]
 mod support;
 
+use support::BenchWriteExt as _;
+
 use allocation::AllocationInterval;
 use sim::CraqleCluster;
 use support::{
@@ -464,6 +466,7 @@ fn merge_fixture(_triples: &[Triple]) -> MergeFixture {
     cluster
         .peer(0)
         .insert_quads(
+            &craqle::AllowAllAuthorizer,
             &graph,
             vec![(
                 subject,

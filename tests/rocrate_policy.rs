@@ -1,5 +1,8 @@
 #![cfg(feature = "shacl-core")]
 
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleError, CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm,
     GraphId, GraphPolicy, MaterializedQuadChange, PrepareRoCrateOptions, PreparedCommitMode,

@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
 pub mod perf;
 pub mod sim;
@@ -12,6 +13,191 @@ use oxrdf::{NamedNode, Term};
 pub use perf::*;
 #[allow(unused_imports)]
 pub use sim::*;
+
+pub trait TestWriteExt {
+    fn apply_changes_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch>;
+
+    fn apply_changes_bulk_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch>;
+
+    fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> craqle::Result<()>;
+
+    fn delete_graph_unchecked(&self, graph: &GraphId) -> craqle::Result<()>;
+}
+
+impl TestWriteExt for CraqleNode {
+    fn apply_changes_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch> {
+        apply_test_changes_bypassing_structural_rules(self, graph, changes)
+    }
+
+    fn apply_changes_bulk_unchecked(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+    ) -> craqle::Result<Batch> {
+        apply_test_changes_bypassing_structural_rules(self, graph, changes)
+    }
+
+    fn import_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> craqle::Result<()> {
+        self.set_graph_policy(&AllowAllAuthorizer, graph, policy)
+    }
+
+    fn delete_graph_unchecked(&self, graph: &GraphId) -> craqle::Result<()> {
+        self.delete_graph(&AllowAllAuthorizer, graph)
+    }
+}
+
+fn apply_test_changes_bypassing_structural_rules(
+    node: &CraqleNode,
+    graph: &GraphId,
+    changes: Vec<MaterializedQuadChange>,
+) -> craqle::Result<Batch> {
+    let mut quads = node
+        .graph_snapshot(graph)?
+        .quads
+        .into_iter()
+        .map(|quad| (quad.subject, quad.predicate, quad.object))
+        .collect::<BTreeSet<_>>();
+    for change in changes {
+        let (change_graph, subject, predicate, object, insert) = match change {
+            MaterializedQuadChange::Insert {
+                graph,
+                subject,
+                predicate,
+                object,
+            } => (graph, subject, predicate, object, true),
+            MaterializedQuadChange::Delete {
+                graph,
+                subject,
+                predicate,
+                object,
+            } => (graph, subject, predicate, object, false),
+        };
+        assert_eq!(&change_graph, graph, "test change targets the wrong graph");
+        if insert {
+            quads.insert((subject, predicate, object));
+        } else {
+            quads.remove(&(subject, predicate, object));
+        }
+    }
+
+    let document = expanded_jsonld(&quads);
+    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        &AllowAllAuthorizer,
+        graph.clone(),
+        &document,
+        node.graph_policy(graph)?,
+        CraqleRequestDurability::Durable,
+        None,
+    )
+}
+
+fn expanded_jsonld(quads: &BTreeSet<(EncodedTerm, EncodedTerm, EncodedTerm)>) -> String {
+    let context = if quads
+        .iter()
+        .any(|(_, _, object)| object.0 == "<https://w3id.org/ro/crate/1.1>")
+    {
+        "https://w3id.org/ro/crate/1.1/context"
+    } else if quads
+        .iter()
+        .any(|(_, _, object)| object.0 == "<https://w3id.org/ro/crate/1.2>")
+    {
+        "https://w3id.org/ro/crate/1.2/context"
+    } else {
+        "https://w3id.org/ro/crate/1.3/context"
+    };
+    let mut nodes = BTreeMap::<String, BTreeMap<String, Vec<serde_json::Value>>>::new();
+    for (subject, predicate, object) in quads {
+        let subject = resource_id(subject);
+        let predicate = predicate
+            .0
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .expect("test predicate must be an IRI")
+            .to_owned();
+        nodes
+            .entry(subject)
+            .or_default()
+            .entry(predicate)
+            .or_default()
+            .push(jsonld_object(object));
+    }
+    let graph = nodes
+        .into_iter()
+        .map(|(subject, properties)| {
+            let mut node = serde_json::Map::new();
+            node.insert("@id".to_owned(), serde_json::Value::String(subject));
+            node.extend(
+                properties
+                    .into_iter()
+                    .map(|(predicate, values)| (predicate, serde_json::Value::Array(values))),
+            );
+            serde_json::Value::Object(node)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "@context": context,
+        "@graph": graph
+    })
+    .to_string()
+}
+
+fn resource_id(term: &EncodedTerm) -> String {
+    term.0
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .map(str::to_owned)
+        .or_else(|| term.0.starts_with("_:").then(|| term.0.clone()))
+        .expect("test resource must be an IRI or blank node")
+}
+
+fn jsonld_object(term: &EncodedTerm) -> serde_json::Value {
+    if let Some(iri) = term
+        .0
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        return serde_json::json!({ "@id": iri });
+    }
+    if term.0.starts_with("_:") {
+        return serde_json::json!({ "@id": term.0 });
+    }
+    #[allow(unreachable_patterns)]
+    match Term::from_str(&term.0).expect("test object must be an RDF term") {
+        Term::Literal(literal) => {
+            let mut value = serde_json::Map::new();
+            value.insert(
+                "@value".to_owned(),
+                serde_json::Value::String(literal.value().to_owned()),
+            );
+            if let Some(language) = literal.language() {
+                value.insert(
+                    "@language".to_owned(),
+                    serde_json::Value::String(language.to_owned()),
+                );
+            } else if literal.datatype() != oxrdf::vocab::xsd::STRING {
+                value.insert(
+                    "@type".to_owned(),
+                    serde_json::Value::String(literal.datatype().as_str().to_owned()),
+                );
+            }
+            serde_json::Value::Object(value)
+        }
+        Term::NamedNode(_) | Term::BlankNode(_) => unreachable!("resource terms returned above"),
+        _ => panic!("RDF-star is unsupported in test fixtures"),
+    }
+}
 
 /// Generous enough that a slow machine never trips it, short enough that a real
 /// deadlock fails the run instead of hanging it.
@@ -323,6 +509,7 @@ pub fn violation_messages(net: &sim::CraqleCluster, peer: usize, graph: &GraphId
 
 pub fn keyword_insert(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
     peer.insert_quads(
+        &AllowAllAuthorizer,
         graph,
         vec![(
             EncodedTerm::from_named_node(&graph.0),
@@ -335,6 +522,7 @@ pub fn keyword_insert(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
 
 pub fn keyword_delete(peer: &CraqleNode, graph: &GraphId, keyword: &str) {
     peer.apply_changes(
+        &AllowAllAuthorizer,
         graph,
         vec![MaterializedQuadChange::Delete {
             graph: graph.clone(),

@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     Action, ActorId, AllowAllAuthorizer, AuthorizationError, CraqleError, CraqleNode,
     CraqleOptions, DenyAllAuthorizer, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
@@ -674,6 +677,7 @@ fn bindings_share_versions() {
     for path in [enforce_one_path, enforce_two_path] {
         assert!(
             node.apply_changes(
+                &AllowAllAuthorizer,
                 &data,
                 vec![add(
                     &data,
@@ -688,6 +692,7 @@ fn bindings_share_versions() {
     }
     assert!(
         node.apply_changes(
+            &AllowAllAuthorizer,
             &data,
             vec![del(
                 &data,
@@ -701,6 +706,7 @@ fn bindings_share_versions() {
     assert_eq!(node.graph_snapshot(&data).unwrap(), before);
 
     node.apply_changes(
+        &AllowAllAuthorizer,
         &data,
         vec![
             add(

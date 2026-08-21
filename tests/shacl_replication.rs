@@ -2,9 +2,11 @@
 
 mod support;
 
+use crate::support::TestWriteExt as _;
+
 use craqle::{
-    EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding, ShaclBindingOptions,
-    ShaclValidationState, ValidationPolicy,
+    AllowAllAuthorizer, EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding,
+    ShaclBindingOptions, ShaclValidationState, ValidationPolicy,
 };
 
 use crate::support::setup_network;
@@ -128,7 +130,9 @@ fn remote_violation_converges() {
         },
         MaterializedQuadChange::Delete { .. } => unreachable!(),
     };
-    net.peer(1).apply_changes(&data, vec![delete]).unwrap();
+    net.peer(1)
+        .apply_changes(&AllowAllAuthorizer, &data, vec![delete])
+        .unwrap();
     net.sync_until_converged(10).unwrap();
 
     assert_eq!(
@@ -263,7 +267,9 @@ fn remove_keeps_dot() {
         },
         MaterializedQuadChange::Delete { .. } => unreachable!(),
     };
-    net.peer(0).apply_changes(&data, vec![delete]).unwrap();
+    net.peer(0)
+        .apply_changes(&AllowAllAuthorizer, &data, vec![delete])
+        .unwrap();
 
     net.heal(0, 1);
     net.sync_until_converged(10).unwrap();

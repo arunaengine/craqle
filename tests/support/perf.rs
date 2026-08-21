@@ -202,6 +202,7 @@ pub fn attach_contextual_entities(
                 _ => "http://schema.org/funder",
             };
             node.insert_quads(
+                &craqle::AllowAllAuthorizer,
                 graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),

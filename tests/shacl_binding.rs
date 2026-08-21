@@ -1,8 +1,12 @@
 #![cfg(feature = "shacl-core")]
 
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
-    ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding,
-    ShaclBindingOptions, ShaclValidationState, ValidationPolicy,
+    ActorId, AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
+    MaterializedQuadChange, ShaclBinding, ShaclBindingOptions, ShaclValidationState,
+    ValidationPolicy,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -144,6 +148,7 @@ fn imports_settle_invalid() {
     assert_eq!(statuses[0].state, ShaclValidationState::Invalid);
 
     node.apply_changes(
+        &AllowAllAuthorizer,
         &data,
         vec![del(
             &data,
@@ -232,6 +237,7 @@ fn deleted_shapes_block() {
 
         assert!(
             node.apply_changes(
+                &AllowAllAuthorizer,
                 &data,
                 vec![add(
                     &data,
@@ -332,6 +338,7 @@ fn import_data_settles() {
 
     assert!(
         node.apply_changes(
+            &AllowAllAuthorizer,
             &data,
             vec![add(
                 &data,

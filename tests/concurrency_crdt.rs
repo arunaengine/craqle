@@ -43,6 +43,7 @@ mod tests {
                         (0..ROUNDS)
                             .map(|round| {
                                 node.insert_quads(
+                                    &craqle::AllowAllAuthorizer,
                                     graph,
                                     vec![keyword_change(
                                         graph,
@@ -467,8 +468,11 @@ mod tests {
                     // A racer that loses the interleaving is rejected by the
                     // reachability rule; what matters is the record the winners
                     // leave behind.
-                    let _ =
-                        node.apply_changes(&graph, vec![cut_parent_edge(&graph, round, parent)]);
+                    let _ = node.apply_changes(
+                        &AllowAllAuthorizer,
+                        &graph,
+                        vec![cut_parent_edge(&graph, round, parent)],
+                    );
                     tx.send(()).unwrap();
                 });
             }

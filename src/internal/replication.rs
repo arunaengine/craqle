@@ -135,16 +135,28 @@ pub(crate) struct ReplicationEngine {
     armed_settle_failure_after: std::sync::atomic::AtomicUsize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckMode {
+    Enabled,
+    Bypassed,
+}
+
+impl CheckMode {
+    fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// How a write should leave the graph's persisted diagnostics record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiagnosticsPlan {
+pub enum DiagnosticsMode {
     /// Refresh the record as part of this commit, under its guard.
     Immediate,
     /// Bulk import: the caller rebuilds diagnostics once at the end.
     Deferred,
 }
 
-impl DiagnosticsPlan {
+impl DiagnosticsMode {
     /// Run `capture` only when this write refreshes diagnostics immediately.
     fn pending_diagnostics<F>(&self, capture: F) -> crate::store::Result<Option<PendingDiagnostics>>
     where
@@ -157,12 +169,36 @@ impl DiagnosticsPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteChecks {
+    pub structural_rules: CheckMode,
+    pub shacl_enforcement: CheckMode,
+    pub diagnostics: DiagnosticsMode,
+}
+
+impl WriteChecks {
+    fn normal(diagnostics: DiagnosticsMode) -> Self {
+        Self {
+            structural_rules: CheckMode::Enabled,
+            shacl_enforcement: CheckMode::Enabled,
+            diagnostics,
+        }
+    }
+
+    fn bypassing_structural_rules(diagnostics: DiagnosticsMode) -> Self {
+        Self {
+            structural_rules: CheckMode::Bypassed,
+            shacl_enforcement: CheckMode::Enabled,
+            diagnostics,
+        }
+    }
+}
+
 /// A local write, ready to be committed to one graph.
 struct LocalCommit<'a> {
     graph: &'a GraphId,
     changes: Vec<MaterializedQuadChange>,
-    plan: DiagnosticsPlan,
-    validate_rules: bool,
+    checks: WriteChecks,
     #[cfg(feature = "shacl-core")]
     prepared_fence: Option<PreparedCommitFence<'a>>,
 }
@@ -425,11 +461,8 @@ impl ReplicationEngine {
         self.commit_changes(graph, changes)
     }
 
-    /// Apply a pre-materialized change set locally without full graph validation.
-    ///
-    /// Intended for trusted higher-level RO-Crate operations that maintain
-    /// structural invariants incrementally.
-    pub(crate) fn local_apply_changes_unchecked(
+    #[cfg(test)]
+    pub(crate) fn local_apply_changes_bypassing_structural_rules(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -443,8 +476,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::Immediate,
-            validate_rules: false,
+            checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Immediate),
             #[cfg(feature = "shacl-core")]
             prepared_fence: None,
         })
@@ -452,7 +484,7 @@ impl ReplicationEngine {
 
     /// Apply a trusted bulk change set locally and defer graph-diagnostics
     /// recomputation until the caller explicitly rebuilds diagnostics.
-    pub(crate) fn local_apply_changes_bulk_unchecked(
+    pub(crate) fn local_apply_bulk_bypassing_structural_rules(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -466,8 +498,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::Deferred,
-            validate_rules: false,
+            checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             #[cfg(feature = "shacl-core")]
             prepared_fence: None,
         })
@@ -485,8 +516,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::Deferred,
-            validate_rules: true,
+            checks: WriteChecks::normal(DiagnosticsMode::Deferred),
             #[cfg(feature = "shacl-core")]
             prepared_fence: None,
         })
@@ -516,8 +546,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::Deferred,
-            validate_rules: true,
+            checks: WriteChecks::normal(DiagnosticsMode::Deferred),
             prepared_fence: Some(fence),
         })
     }
@@ -626,7 +655,7 @@ impl ReplicationEngine {
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
-        validate_rules: bool,
+        enforce_shacl: bool,
     ) -> Result<PreparedShaclWrite<'_>, UpdateError> {
         let (data_version, statuses) = {
             let _binding_guard = self.store.binding_guard();
@@ -646,7 +675,7 @@ impl ReplicationEngine {
             data_version,
             statuses: advisory_statuses,
         });
-        let enforce_evaluations = if validate_rules {
+        let enforce_evaluations = if enforce_shacl {
             let enforce_work = BindingWork {
                 base,
                 data_version,
@@ -704,10 +733,10 @@ impl ReplicationEngine {
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
-        validate_rules: bool,
+        enforce_shacl: bool,
     ) -> Result<(BindingGuard<'_>, PreparedShaclWrite<'_>), UpdateError> {
         for _ in 0..SHACL_WRITE_RETRIES {
-            let prepared = self.prepare_shacl_write(graph, changes, validate_rules)?;
+            let prepared = self.prepare_shacl_write(graph, changes, enforce_shacl)?;
             let binding_guard = self.store.binding_guard();
             if self.prepared_shacl_write_is_current(graph, &prepared)? {
                 return Ok((binding_guard, prepared));
@@ -1381,8 +1410,7 @@ impl ReplicationEngine {
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            plan: DiagnosticsPlan::Immediate,
-            validate_rules: true,
+            checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             #[cfg(feature = "shacl-core")]
             prepared_fence: None,
         })
@@ -1393,8 +1421,7 @@ impl ReplicationEngine {
         let LocalCommit {
             graph,
             changes,
-            plan,
-            validate_rules,
+            checks,
             #[cfg(feature = "shacl-core")]
             prepared_fence,
         } = commit;
@@ -1416,12 +1443,15 @@ impl ReplicationEngine {
             if let Some(fence) = prepared_fence.as_ref() {
                 self.ensure_prepared_data_current(graph, fence)?;
             }
-            if validate_rules {
+            if checks.structural_rules.enabled() {
                 self.validate(graph, &changes)?;
             }
             #[cfg(feature = "shacl-core")]
-            let (binding_guard, prepared_shacl) =
-                self.prepare_shacl_write_for_commit(graph, &changes, validate_rules)?;
+            let (binding_guard, prepared_shacl) = self.prepare_shacl_write_for_commit(
+                graph,
+                &changes,
+                checks.shacl_enforcement.enabled(),
+            )?;
             #[cfg(feature = "shacl-core")]
             if let Some(fence) = prepared_fence.as_ref() {
                 self.ensure_prepared_shapes_current(fence)?;
@@ -1447,7 +1477,7 @@ impl ReplicationEngine {
                 ));
             };
             let _merged = self
-                .apply_irokle_guarded(&batch, plan)
+                .apply_irokle_guarded(&batch, checks.diagnostics)
                 .map_err(update_error_from_merge)?;
             #[cfg(feature = "shacl-core")]
             {
@@ -1484,12 +1514,15 @@ impl ReplicationEngine {
             self.ensure_prepared_data_current(graph, fence)?;
         }
 
-        if validate_rules {
+        if checks.structural_rules.enabled() {
             self.validate(graph, &changes)?;
         }
         #[cfg(feature = "shacl-core")]
-        let (binding_guard, prepared_shacl) =
-            self.prepare_shacl_write_for_commit(graph, &changes, validate_rules)?;
+        let (binding_guard, prepared_shacl) = self.prepare_shacl_write_for_commit(
+            graph,
+            &changes,
+            checks.shacl_enforcement.enabled(),
+        )?;
         #[cfg(feature = "shacl-core")]
         if let Some(fence) = prepared_fence.as_ref() {
             self.ensure_prepared_shapes_current(fence)?;
@@ -1506,7 +1539,7 @@ impl ReplicationEngine {
         // Captured before the write, under the guard, so it describes exactly
         // the state this commit starts from. Skipped entirely when the caller
         // defers the refresh — reading it can itself force a recompute.
-        let pending = plan.pending_diagnostics(|| {
+        let pending = checks.diagnostics.pending_diagnostics(|| {
             Ok(PendingDiagnostics {
                 previous: self.store.graph_diagnostics(graph)?,
                 summary: crate::rules::summarize_delta(graph, &changes),
@@ -1684,7 +1717,7 @@ impl ReplicationEngine {
     /// enforces causal delivery; this path intentionally bypasses Craqle's old
     /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
     pub(crate) fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
-        self.apply_irokle_batch_with_plan(&incoming, DiagnosticsPlan::Immediate)
+        self.apply_irokle_batch_with_plan(&incoming, DiagnosticsMode::Immediate)
     }
 
     /// **Call with the graph's write lock held.** Every caller does, and so
@@ -1694,7 +1727,7 @@ impl ReplicationEngine {
     fn apply_irokle_batch_with_plan(
         &self,
         incoming: &Batch,
-        plan: DiagnosticsPlan,
+        plan: DiagnosticsMode,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
@@ -1774,7 +1807,7 @@ impl ReplicationEngine {
     fn apply_irokle_guarded(
         &self,
         incoming: &Batch,
-        plan: DiagnosticsPlan,
+        plan: DiagnosticsMode,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
@@ -2208,7 +2241,7 @@ mod tests {
         let shapes = GraphId::new("urn:test:pending-shapes");
         let focus = EncodedTerm("<urn:test:pending-focus>".to_owned());
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -2219,7 +2252,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -2492,7 +2525,7 @@ mod tests {
         engine.arm_settle_failure();
         let shapes = binding.shapes_graph;
         let batch = engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &shapes,
                 vec![MaterializedQuadChange::Insert {
                     graph: shapes.clone(),
@@ -2648,7 +2681,7 @@ mod tests {
         receiver.replay_pending_bindings().unwrap();
         let shapes = GraphId::new("urn:test:pending-shapes");
         let batch = sender
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &shapes,
                 vec![MaterializedQuadChange::Insert {
                     graph: shapes.clone(),
@@ -2696,7 +2729,7 @@ mod tests {
             receiver.replay_pending_bindings().unwrap();
             let shapes = GraphId::new("urn:test:pending-shapes");
             let batch = sender
-                .local_apply_changes_unchecked(
+                .local_apply_changes_bypassing_structural_rules(
                     &shapes,
                     vec![
                         MaterializedQuadChange::Insert {
@@ -2781,7 +2814,7 @@ mod tests {
         let before = store.graph_version_digest(&data).unwrap();
 
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -2852,7 +2885,7 @@ mod tests {
         let shape = EncodedTerm("<urn:test:pending-shape>".to_owned());
         let property = EncodedTerm("<urn:test:pending-property>".to_owned());
         setup
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -2889,7 +2922,7 @@ mod tests {
             )
             .unwrap();
         setup
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -2962,7 +2995,7 @@ mod tests {
         let imported = GraphId::new("urn:test:arrive-import");
         let focus = EncodedTerm("<urn:test:arrive-focus>".to_owned());
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -2973,7 +3006,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &root,
                 vec![MaterializedQuadChange::Insert {
                     graph: root.clone(),
@@ -3029,7 +3062,7 @@ mod tests {
         assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
 
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &imported,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -3071,7 +3104,7 @@ mod tests {
         let focus = EncodedTerm("<urn:test:stale-deps-focus>".to_owned());
         let imports = EncodedTerm("<http://www.w3.org/2002/07/owl#imports>".to_owned());
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -3083,7 +3116,7 @@ mod tests {
             .unwrap();
         for (graph, import) in [(&root, &first), (&first, &nested)] {
             engine
-                .local_apply_changes_unchecked(
+                .local_apply_changes_bypassing_structural_rules(
                     graph,
                     vec![MaterializedQuadChange::Insert {
                         graph: graph.clone(),
@@ -3096,7 +3129,7 @@ mod tests {
         }
         let old_nested = store.graph_version_digest(&nested).unwrap();
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &nested,
                 vec![MaterializedQuadChange::Insert {
                     graph: nested.clone(),
@@ -3181,7 +3214,7 @@ mod tests {
         );
 
         engine
-            .local_apply_changes_unchecked(
+            .local_apply_changes_bypassing_structural_rules(
                 &second,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -3219,7 +3252,7 @@ mod tests {
             let shapes = if imported { &import } else { &root };
             let focus = EncodedTerm("<urn:test:error-focus>".to_owned());
             engine
-                .local_apply_changes_unchecked(
+                .local_apply_changes_bypassing_structural_rules(
                     &data,
                     vec![MaterializedQuadChange::Insert {
                         graph: data.clone(),
@@ -3231,7 +3264,7 @@ mod tests {
                 .unwrap();
             if imported {
                 engine
-                    .local_apply_changes_unchecked(
+                    .local_apply_changes_bypassing_structural_rules(
                         &root,
                         vec![MaterializedQuadChange::Insert {
                             graph: root.clone(),
@@ -3245,7 +3278,7 @@ mod tests {
                     .unwrap();
             }
             engine
-                .local_apply_changes_unchecked(
+                .local_apply_changes_bypassing_structural_rules(
                     shapes,
                     vec![
                         MaterializedQuadChange::Insert {
@@ -3313,7 +3346,7 @@ mod tests {
             engine.replay_pending_bindings().unwrap();
 
             engine
-                .local_apply_changes_unchecked(
+                .local_apply_changes_bypassing_structural_rules(
                     shapes,
                     vec![MaterializedQuadChange::Insert {
                         graph: shapes.clone(),

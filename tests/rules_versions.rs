@@ -1,3 +1,6 @@
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleError, CraqleNode, CreateCrateOptions, CreateCrateRequest,
     EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange, RoCrateError, RoCrateVersion, vocab,
@@ -126,6 +129,7 @@ fn version_marker_cases() {
         .unwrap();
 
         node.apply_changes(
+            &AllowAllAuthorizer,
             &graph,
             vec![
                 marker_change(&graph, from, false),

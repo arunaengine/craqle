@@ -607,7 +607,7 @@ impl RoCrateManager {
         };
         let batch = self
             .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+            .local_apply_bulk_bypassing_structural_rules(&graph_id, changes)?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
         if is_replacement {
             // Keep checked and prevalidated replacement paths in lockstep.
@@ -1068,7 +1068,7 @@ impl RoCrateManager {
         };
         let batch = self
             .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+            .local_apply_bulk_bypassing_structural_rules(&graph_id, changes)?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
@@ -1096,7 +1096,7 @@ impl RoCrateManager {
         let changes = self.plan_empty_import(&graph_id, value)?;
         let batch = self
             .engine
-            .local_apply_changes_bulk_unchecked(&graph_id, changes)?;
+            .local_apply_bulk_bypassing_structural_rules(&graph_id, changes)?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
         self.store_import_context(&graph_id, context, license)?;
         Ok(batch)

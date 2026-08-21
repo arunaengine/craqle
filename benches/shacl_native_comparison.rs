@@ -7,6 +7,8 @@ mod allocation;
 #[path = "support/mod.rs"]
 mod support;
 
+use support::BenchWriteExt as _;
+
 use allocation::AllocationInterval;
 use craqle::{
     AllowAllAuthorizer, CompiledShaclSchema, EncodedTerm, GraphId, MaterializedQuadChange,

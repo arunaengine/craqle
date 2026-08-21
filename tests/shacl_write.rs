@@ -2,6 +2,8 @@
 
 mod support;
 
+use crate::support::TestWriteExt as _;
+
 use std::sync::{Arc, Barrier, mpsc};
 
 use craqle::{
@@ -170,7 +172,11 @@ fn enforce_insert_atomic() {
 
     let before = state(&node, &data);
     let error = node
-        .apply_changes(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:two"))])
+        .apply_changes(
+            &AllowAllAuthorizer,
+            &data,
+            vec![add(&data, FOCUS, VALUE, iri("urn:test:two"))],
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -185,6 +191,7 @@ fn new_graph_atomic() {
     let graph = GraphId::new("urn:test:shacl-write-invalid-new");
     let error = node
         .apply_changes(
+            &AllowAllAuthorizer,
             &graph,
             vec![add(
                 &graph,
@@ -222,7 +229,11 @@ fn enforce_delete_atomic() {
 
     let before = state(&node, &data);
     let error = node
-        .apply_changes(&data, vec![del(&data, FOCUS, VALUE, iri("urn:test:one"))])
+        .apply_changes(
+            &AllowAllAuthorizer,
+            &data,
+            vec![del(&data, FOCUS, VALUE, iri("urn:test:one"))],
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -243,8 +254,12 @@ fn enforce_valid_status() {
     assert_eq!(bound.state, ShaclValidationState::Valid);
 
     let before = node.graph_snapshot(&data).unwrap();
-    node.apply_changes(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:two"))])
-        .unwrap();
+    node.apply_changes(
+        &AllowAllAuthorizer,
+        &data,
+        vec![add(&data, FOCUS, VALUE, iri("urn:test:two"))],
+    )
+    .unwrap();
     let current = status(&node, &data);
     let report = current.report.as_ref().unwrap();
     assert_eq!(current.state, ShaclValidationState::Valid);
@@ -286,8 +301,12 @@ fn checked_writes_serialize() {
             let data = data.clone();
             tasks.push(std::thread::spawn(move || {
                 start.wait();
-                sent.send(node.apply_changes(&data, vec![add(&data, FOCUS, VALUE, iri(object))]))
-                    .unwrap();
+                sent.send(node.apply_changes(
+                    &AllowAllAuthorizer,
+                    &data,
+                    vec![add(&data, FOCUS, VALUE, iri(object))],
+                ))
+                .unwrap();
             }));
         }
         drop(sent);
@@ -339,7 +358,10 @@ fn advisory_invalid_commits() {
         ShaclValidationState::Valid
     );
     let change = add(&data, FOCUS, VALUE, iri("urn:test:two"));
-    let enforced = match node.apply_changes(&data, vec![change.clone()]).unwrap_err() {
+    let enforced = match node
+        .apply_changes(&AllowAllAuthorizer, &data, vec![change.clone()])
+        .unwrap_err()
+    {
         CraqleError::Update(UpdateError::ShaclValidationFailed(mut reports)) => {
             assert_eq!(reports.len(), 1);
             reports.pop().unwrap()
@@ -353,7 +375,8 @@ fn advisory_invalid_commits() {
         ShaclValidationState::Valid
     );
 
-    node.apply_changes(&data, vec![change]).unwrap();
+    node.apply_changes(&AllowAllAuthorizer, &data, vec![change])
+        .unwrap();
     let current = status(&node, &data);
     let report = current.report.as_ref().unwrap();
     assert_eq!(current.state, ShaclValidationState::Invalid);
@@ -397,6 +420,7 @@ fn disabled_keeps_rocrate() {
     let before = state(&node, &data);
     let error = node
         .apply_changes(
+            &AllowAllAuthorizer,
             &data,
             vec![del(
                 &data,
@@ -414,7 +438,7 @@ fn disabled_keeps_rocrate() {
 }
 
 #[test]
-fn bulk_policy_paths() {
+fn separate_structural_and_shacl_write_checks() {
     let (_directory, node) = open_node();
     let data = GraphId::new("urn:test:shacl-write-bulk-data");
     let shapes = GraphId::new("urn:test:shacl-write-bulk-shapes");
@@ -474,23 +498,20 @@ fn bulk_policy_paths() {
         bind(&node, &raw, &raw_shapes, ValidationPolicy::Enforce).state,
         ShaclValidationState::Valid
     );
-    node.apply_changes_bulk_unchecked(&raw, vec![add(&raw, FOCUS, VALUE, iri("urn:test:trusted"))])
-        .unwrap();
-    let raw_status = status(&node, &raw);
-    assert_eq!(raw_status.state, ShaclValidationState::Invalid);
+    let before = state(&node, &raw);
+    let error = node
+        .apply_changes_bulk_unchecked(&raw, vec![add(&raw, FOCUS, VALUE, iri("urn:test:trusted"))])
+        .unwrap_err();
     assert!(
-        raw_status
-            .report
-            .as_ref()
-            .is_some_and(|report| !report.conforms)
+        matches!(
+            error,
+            CraqleError::RoCrate(craqle::RoCrateError::Update(
+                UpdateError::ShaclValidationFailed(_)
+            ))
+        ),
+        "unexpected trusted-import error: {error:?}"
     );
-    assert!(
-        node.graph_snapshot(&raw)
-            .unwrap()
-            .quads
-            .iter()
-            .any(|quad| quad.object == iri("urn:test:trusted"))
-    );
+    assert_eq!(state(&node, &raw), before);
 }
 
 #[cfg(feature = "search")]
@@ -524,6 +545,7 @@ fn enforce_search_atomic() {
 
     let error = node
         .apply_changes(
+            &AllowAllAuthorizer,
             &data,
             vec![
                 add(&data, FOCUS, VALUE, iri("urn:test:two")),

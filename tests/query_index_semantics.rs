@@ -4,6 +4,9 @@
 //! public graph result contains triples but no graph provenance, so it cannot
 //! express the cross-graph multiplicity contract this suite targets.
 
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
     MaterializedQuadChange, QueryResults,

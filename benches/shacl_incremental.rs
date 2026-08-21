@@ -8,6 +8,8 @@ mod allocation;
 #[path = "support/mod.rs"]
 mod support;
 
+use support::BenchWriteExt as _;
+
 use allocation::AllocationInterval;
 use craqle::{
     AllowAllAuthorizer, CompiledShaclSchema, CreateCrateRequest, EncodedTerm, GraphId, GraphPolicy,
@@ -515,6 +517,7 @@ fn run_write(
     data.fixture
         .node()
         .apply_changes(
+            &AUTH,
             &graph,
             vec![add(
                 &graph,
@@ -610,7 +613,10 @@ fn policy_bench(c: &mut Criterion, data: &BenchData) {
                 for _ in 0..iterations {
                     let changes = policy_changes(graph, label, 0, predicate);
                     let start = Instant::now();
-                    let result = data.fixture.node().apply_changes(graph, changes.clone());
+                    let result = data
+                        .fixture
+                        .node()
+                        .apply_changes(&AUTH, graph, changes.clone());
                     elapsed += start.elapsed();
                     assert_eq!(
                         result.is_ok(),
@@ -768,7 +774,10 @@ fn policy_sample(
         .shacl_binding_statuses(&AUTH, graph)
         .expect("read policy benchmark status");
     let interval = AllocationInterval::begin();
-    let result = data.fixture.node().apply_changes(graph, changes.clone());
+    let result = data
+        .fixture
+        .node()
+        .apply_changes(&AUTH, graph, changes.clone());
     let allocation = interval.finish();
     assert_eq!(
         result.is_ok(),

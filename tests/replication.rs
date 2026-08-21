@@ -717,6 +717,7 @@ mod tests {
 
         net.peer_mut(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),
@@ -727,6 +728,7 @@ mod tests {
             .unwrap();
         net.peer_mut(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&graph.0),

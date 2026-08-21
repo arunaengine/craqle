@@ -55,7 +55,9 @@ mod tests {
             let validated_dir = tempfile::tempdir().unwrap();
             let validated = CraqleNode::open(validated_dir.path()).unwrap();
             let validated_apply_start = Instant::now();
-            validated.apply_changes(&graph, planned.clone()).unwrap();
+            validated
+                .apply_changes(&writer, &graph, planned.clone())
+                .unwrap();
             Some(validated_apply_start.elapsed())
         } else {
             None

@@ -43,7 +43,10 @@ mod tests {
             ),
         ];
 
-        match net.peer(0).insert_quads(&graph, orphan_quads) {
+        match net
+            .peer(0)
+            .insert_quads(&AllowAllAuthorizer, &graph, orphan_quads)
+        {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
                     violations
@@ -238,6 +241,7 @@ mod tests {
 
         net.peer(0)
             .insert_quads(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![(
                     EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("./secondary/")),
@@ -251,6 +255,7 @@ mod tests {
 
         net.peer(0)
             .apply_changes(
+                &AllowAllAuthorizer,
                 &graph,
                 vec![MaterializedQuadChange::Delete {
                     graph: graph.clone(),
@@ -367,7 +372,9 @@ mod tests {
             object: iri(leaf),
         }];
         tail.extend(media_object_triples(&graph, leaf));
-        net.peer(0).apply_changes(&graph, tail).unwrap();
+        net.peer(0)
+            .apply_changes(&AllowAllAuthorizer, &graph, tail)
+            .unwrap();
 
         assert!(graph_contains(&net, 0, &graph, "deep-leaf.txt"));
         assert!(!net.peer(0).graph_diagnostics(&graph).unwrap().has_orphans());
@@ -401,7 +408,9 @@ mod tests {
             },
         ];
 
-        net.peer(0).apply_changes(&graph, changes).unwrap();
+        net.peer(0)
+            .apply_changes(&AllowAllAuthorizer, &graph, changes)
+            .unwrap();
         assert!(
             net.peer(0).graph_violations(&graph).unwrap().is_empty(),
             "delete-then-reinsert must leave the root data entity in place"
@@ -434,7 +443,10 @@ mod tests {
             },
         ];
 
-        match net.peer(0).apply_changes(&graph, changes) {
+        match net
+            .peer(0)
+            .apply_changes(&AllowAllAuthorizer, &graph, changes)
+        {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
                     violations
@@ -465,7 +477,10 @@ mod tests {
         cycle.extend(media_object_triples(&graph, "./cycle-b"));
 
         // The validated path rejects it outright.
-        match net.peer(0).apply_changes(&graph, cycle.clone()) {
+        match net
+            .peer(0)
+            .apply_changes(&AllowAllAuthorizer, &graph, cycle.clone())
+        {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
                     violations
@@ -518,7 +533,9 @@ mod tests {
         cycle.extend(media_object_triples(&graph, "./ring-a"));
         cycle.extend(media_object_triples(&graph, "./ring-b"));
 
-        net.peer(0).apply_changes(&graph, cycle).unwrap();
+        net.peer(0)
+            .apply_changes(&AllowAllAuthorizer, &graph, cycle)
+            .unwrap();
         assert!(!net.peer(0).graph_diagnostics(&graph).unwrap().has_orphans());
     }
 }

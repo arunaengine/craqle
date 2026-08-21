@@ -1,5 +1,8 @@
 #![cfg(feature = "shacl-core")]
 
+mod support;
+
+use crate::support::TestWriteExt as _;
 use craqle::{
     ActorId, AllowAllAuthorizer, CompiledShaclSchema, CraqleError, CraqleNode, CraqleOptions,
     EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding, ShaclBindingOptions,
@@ -1801,7 +1804,8 @@ fn batch_state_matches() {
         },
         MaterializedQuadChange::Delete { .. } => unreachable!(),
     };
-    node.apply_changes(&data, vec![transient, removal]).unwrap();
+    node.apply_changes(&AUTH, &data, vec![transient, removal])
+        .unwrap();
     let schema = node
         .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
         .unwrap();
@@ -1860,6 +1864,7 @@ fn policy_report_persistence() {
     let before_index = node.query_index_status_fast().unwrap();
     let rejected = node
         .apply_changes(
+            &AUTH,
             &data,
             vec![match second_value.clone() {
                 MaterializedQuadChange::Insert {
@@ -1891,6 +1896,7 @@ fn policy_report_persistence() {
     };
     node.bind_shacl(&AUTH, &advisory).unwrap();
     node.apply_changes(
+        &AUTH,
         &data,
         vec![match second_value {
             MaterializedQuadChange::Insert {
