@@ -73,9 +73,9 @@ jobs:
           toolchain: nightly
       - run: cargo install cargo-public-api --locked --version 0.52.0
       - run: scripts/check-public-api.sh
-      - name: Check semantic compatibility with the accepted 0.1 baseline
+      - name: Check semantic compatibility with the 0.2 API baseline
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239
         with:
-          baseline-rev: 6434630190037781b4c8d94d76081f77121dc532
+          baseline-rev: c01f744d655d7bb121f975b0868526b8c75f820b
           feature-group: all-features
           release-type: major
