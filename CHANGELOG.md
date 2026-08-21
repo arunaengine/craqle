@@ -12,6 +12,8 @@ All notable changes to Craqle are documented here.
 - RO-Crate 1.1, 1.2, and 1.3 import and export handling.
 - Stable high-level public error categories and an authoritative disk-format
   marker.
+- A bounded, result-checked SPARQL comparison harness pinned to Oxigraph
+  `0.5.9`; it rejects unauthorized 10M inputs.
 
 ### Changed
 
@@ -34,6 +36,9 @@ All notable changes to Craqle are documented here.
   and small-bound-graph checked-write baselines are retained.
 - Current-final-binary 10M SHACL, incremental-validation, and checked-write
   evidence remains deferred until explicitly authorized.
+- The initial direct Oxigraph diagnostic verifies the focused query result
+  matrix at 10K and 1M but uses an in-memory Oxigraph store, so the
+  same-durability comparison gate remains open.
 
 ### Compatibility
 
