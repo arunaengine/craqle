@@ -1,10 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(feature = "shacl-core")]
 use std::time::{Duration, Instant};
 
+use crate::cache::BoundedCache;
+#[cfg(test)]
+use crate::cache::CacheStatistics;
 use crate::core::*;
 use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
 use crate::{
@@ -169,10 +172,16 @@ const SHACL_PENDING_QUEUE_SCHEMA_KEY: &[u8] = b"vshacl-pending-queue";
 const SHACL_PENDING_QUEUE_SCHEMA_VERSION: u8 = 1;
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
-/// Upper bound on the global term-decode cache. Term ids are content hashes so
-/// entries are never invalidated; the cache is simply cleared when it hits the
-/// cap.
+const QV_COMMIT_ACTIVE: u64 = 1;
+const QV_COMMIT_DIRTY: u64 = 2;
 const TERM_DECODE_CACHE_CAP: usize = 1_000_000;
+const TERM_DECODE_CACHE_BYTES: usize = 128 * 1_048_576;
+const QUAD_SUBJECT_CACHE_CAP: usize = 65_536;
+const QUAD_SUBJECT_CACHE_BYTES: usize = 64 * 1_048_576;
+const OBJECT_ORDER_CACHE_CAP: usize = 4_096;
+const OBJECT_ORDER_CACHE_BYTES: usize = 64 * 1_048_576;
+const PLANNER_DISTINCT_CACHE_CAP: usize = 4_096;
+const PLANNER_DISTINCT_CACHE_BYTES: usize = 1_048_576;
 const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
 const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const MAX_DB_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
@@ -540,39 +549,37 @@ impl WriteBatch {
     }
 }
 
-/// Outcome of applying one quad mutation to a derived index.
-///
-/// `Anomaly` means the index disagreed with the durable `quads` keyspace, which
-/// is the source of truth: an insert found the `(predicate, object)` pair
-/// already present, or a remove found nothing to remove. Both are impossible
-/// while every read→write cycle of a graph is serialized by its commit guard,
-/// so seeing one means the index has drifted and must be rebuilt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexApply {
-    Ok,
-    Anomaly,
-}
-
-/// Every in-memory structure a reader correlates with a graph's vector clock,
-/// behind one lock so a commit publishes all of them at once.
-///
-/// Splitting them cost consistency: `fjall::Batch::commit` applies a batch's
-/// keys to the memtables one at a time, so the durable clock still reads
-/// pre-commit while the same batch's quads are already visible. Freshness
-/// checks therefore read [`IndexState::clocks`], and a read that observes a
-/// published clock has by construction waited for the index, the derived
-/// mirror and the order cache that clock describes (G6).
-#[derive(Default)]
+/// Bounded cache state published after a durable graph commit.
 struct IndexState {
-    graph_subjects: HashMap<TermId, HashSet<TermId>>,
-    by_graph_subject: HashMap<(TermId, TermId), HashSet<(TermId, TermId)>>,
-    /// Planner/cross-graph mirror, built on first use.
-    derived: Option<DerivedIndexState>,
+    quad_subjects: BoundedCache<(TermId, TermId, u64), Arc<Vec<(TermId, TermId)>>>,
     object_order: ObjectOrderCache,
+    planner_distinct: BoundedCache<(u64, Option<QueryTermId>, DistinctDomain), usize>,
+    generations: HashMap<TermId, u64>,
     /// Per-graph clocks as published by each graph's last commit. A missing
     /// entry is the empty clock, which is what the durable read yields for a
     /// graph that has never committed.
     clocks: HashMap<TermId, VectorClock>,
+}
+
+impl Default for IndexState {
+    fn default() -> Self {
+        Self {
+            quad_subjects: BoundedCache::new(QUAD_SUBJECT_CACHE_CAP, QUAD_SUBJECT_CACHE_BYTES),
+            object_order: ObjectOrderCache::default(),
+            planner_distinct: BoundedCache::new(
+                PLANNER_DISTINCT_CACHE_CAP,
+                PLANNER_DISTINCT_CACHE_BYTES,
+            ),
+            generations: HashMap::new(),
+            clocks: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum DistinctDomain {
+    Subject,
+    Object,
 }
 
 type ObjectOrderKey = (TermId, TermId, TermId);
@@ -584,38 +591,50 @@ type ObjectOrderValues = Arc<Vec<TermId>>;
 /// commit has since invalidated must not be installed. `generation` moves on
 /// every invalidation and a repopulating reader only installs what it computed
 /// while the count has not moved.
-#[derive(Default)]
 struct ObjectOrderCache {
-    entries: HashMap<ObjectOrderKey, ObjectOrderValues>,
-    generation: u64,
+    entries: BoundedCache<(ObjectOrderKey, u64), ObjectOrderValues>,
+}
+
+impl Default for ObjectOrderCache {
+    fn default() -> Self {
+        Self {
+            entries: BoundedCache::new(OBJECT_ORDER_CACHE_CAP, OBJECT_ORDER_CACHE_BYTES),
+        }
+    }
 }
 
 impl ObjectOrderCache {
-    fn get(&self, key: &ObjectOrderKey) -> Option<ObjectOrderValues> {
-        self.entries.get(key).cloned()
+    fn get(&mut self, key: &ObjectOrderKey, generation: u64) -> Option<ObjectOrderValues> {
+        self.entries.get_cloned(&(*key, generation))
     }
 
     fn invalidate(&mut self, key: &ObjectOrderKey) {
-        self.entries.remove(key);
-        self.generation += 1;
+        self.entries.remove_where(|(cached, _)| cached == key);
     }
 
+    #[cfg(test)]
     fn clear(&mut self) {
         self.entries.clear();
-        self.generation += 1;
     }
 
     /// Drop every entry belonging to `graph`, e.g. when the graph is deleted.
     fn drop_graph(&mut self, graph: TermId) {
-        self.entries.retain(|(cached, _, _), _| *cached != graph);
-        self.generation += 1;
+        self.entries
+            .remove_where(|((cached, _, _), _)| *cached == graph);
     }
 
-    /// Install `objects` only if nothing was invalidated since `generation`.
     fn install(&mut self, entry: OrderEntry, generation: u64) {
-        if self.generation == generation {
-            self.entries.insert(entry.key, entry.objects);
-        }
+        let bytes = entry
+            .objects
+            .len()
+            .saturating_mul(std::mem::size_of::<TermId>());
+        self.entries
+            .insert((entry.key, generation), entry.objects, bytes);
+    }
+
+    #[cfg(test)]
+    fn statistics(&self) -> CacheStatistics {
+        self.entries.statistics()
     }
 }
 
@@ -626,72 +645,22 @@ struct OrderEntry {
 }
 
 impl IndexState {
-    fn insert_quad(&mut self, quad: EncodedQuad) -> IndexApply {
-        let entries = self
-            .by_graph_subject
-            .entry((quad.graph, quad.subject))
-            .or_default();
-        if !entries.insert((quad.predicate, quad.object)) {
-            return IndexApply::Anomaly;
-        }
-        if entries.len() == 1 {
-            self.graph_subjects
-                .entry(quad.graph)
-                .or_default()
-                .insert(quad.subject);
-        }
-        IndexApply::Ok
-    }
-
-    fn remove_quad(&mut self, quad: EncodedQuad) -> IndexApply {
-        let Entry::Occupied(mut entry) = self.by_graph_subject.entry((quad.graph, quad.subject))
-        else {
-            return IndexApply::Anomaly;
-        };
-        let removed = entry.get_mut().remove(&(quad.predicate, quad.object));
-        if entry.get().is_empty() {
-            entry.remove();
-            if let Entry::Occupied(mut subjects) = self.graph_subjects.entry(quad.graph) {
-                subjects.get_mut().remove(&quad.subject);
-                if subjects.get().is_empty() {
-                    subjects.remove();
-                }
-            }
-        }
-        if removed {
-            IndexApply::Ok
-        } else {
-            IndexApply::Anomaly
-        }
-    }
-
-    /// Apply one commit's whole in-memory half, reporting whether any mutation
-    /// disagreed with the durable `quads` keyspace.
-    ///
-    /// The clocks land last only for readability — the caller holds the write
-    /// lock across all of it, so nothing observes an intermediate state.
-    fn publish(&mut self, publish: &PendingPublish) -> bool {
-        let mut anomaly = false;
+    fn publish(&mut self, publish: &PendingPublish) {
+        let mut changed_graphs = HashSet::new();
         for mutation in &publish.quad_mutations {
-            let (quad, inserting) = match mutation {
-                QuadMutation::Insert(quad) => (*quad, true),
-                QuadMutation::Remove(quad) => (*quad, false),
+            let quad = match mutation {
+                QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
             };
-            let outcome = if inserting {
-                self.insert_quad(quad)
-            } else {
-                self.remove_quad(quad)
-            };
-            anomaly |= outcome == IndexApply::Anomaly;
-            if let Some(derived) = self.derived.as_mut() {
-                if inserting {
-                    derived.insert_quad(quad);
-                } else {
-                    derived.remove_quad(quad);
-                }
-            }
+            self.quad_subjects.remove_where(|(graph, subject, _)| {
+                *graph == quad.graph && *subject == quad.subject
+            });
             self.object_order
                 .invalidate(&(quad.graph, quad.subject, quad.predicate));
+            changed_graphs.insert(quad.graph);
+        }
+        for graph in changed_graphs {
+            let generation = self.generations.entry(graph).or_default();
+            *generation = generation.wrapping_add(1);
         }
 
         for (&graph_id, clock) in &publish.clocks {
@@ -700,7 +669,6 @@ impl IndexState {
                 None => self.clocks.remove(&graph_id),
             };
         }
-        anomaly
     }
 }
 
@@ -717,192 +685,6 @@ struct PendingPublish {
 impl PendingPublish {
     fn is_empty(&self) -> bool {
         self.quad_mutations.is_empty() && self.clocks.is_empty()
-    }
-}
-
-#[derive(Default)]
-struct DerivedIndexState {
-    by_subject: HashMap<TermId, HashSet<(TermId, TermId, TermId)>>,
-    by_predicate_object: HashMap<(TermId, TermId), PredicateObjectSubjects>,
-    by_object: HashMap<TermId, HashMap<TermId, ObjectEntries>>,
-    /// predicate → graph → live quad count, so a predicate-only pattern can be
-    /// answered by scanning just the graphs that actually contain it instead of
-    /// every subject in the corpus. Counts are needed so a graph is
-    /// dropped only when its last quad for that predicate goes away.
-    predicate_graph_counts: HashMap<TermId, HashMap<TermId, usize>>,
-    // Approximate corpus-wide cardinalities for the query planner; quad
-    // instances are counted per graph (no cross-graph triple dedup).
-    predicate_object_counts: HashMap<(TermId, TermId), usize>,
-    predicate_counts: HashMap<TermId, usize>,
-    predicate_subject_term_counts: HashMap<TermId, HashMap<TermId, usize>>,
-    predicate_object_term_counts: HashMap<TermId, HashMap<TermId, usize>>,
-    object_counts: HashMap<TermId, usize>,
-    total_quads: usize,
-}
-
-type PredicateObjectSubjects = HashMap<TermId, Arc<Vec<TermId>>>;
-type ObjectEntries = Arc<BTreeSet<(TermId, TermId)>>;
-
-impl DerivedIndexState {
-    fn insert_quad(&mut self, quad: EncodedQuad) {
-        let is_new = self.by_subject.entry(quad.subject).or_default().insert((
-            quad.predicate,
-            quad.object,
-            quad.graph,
-        ));
-        let subjects = self
-            .by_predicate_object
-            .entry((quad.predicate, quad.object))
-            .or_default()
-            .entry(quad.graph)
-            .or_default();
-        let subjects = Arc::make_mut(subjects);
-        if let Err(index) = subjects.binary_search(&quad.subject) {
-            subjects.insert(index, quad.subject);
-        }
-        let entries = self
-            .by_object
-            .entry(quad.object)
-            .or_default()
-            .entry(quad.graph)
-            .or_default();
-        Arc::make_mut(entries).insert((quad.subject, quad.predicate));
-        if is_new {
-            *self
-                .predicate_object_counts
-                .entry((quad.predicate, quad.object))
-                .or_default() += 1;
-            *self.predicate_counts.entry(quad.predicate).or_default() += 1;
-            *self
-                .predicate_subject_term_counts
-                .entry(quad.predicate)
-                .or_default()
-                .entry(quad.subject)
-                .or_default() += 1;
-            *self
-                .predicate_object_term_counts
-                .entry(quad.predicate)
-                .or_default()
-                .entry(quad.object)
-                .or_default() += 1;
-            *self.object_counts.entry(quad.object).or_default() += 1;
-            *self
-                .predicate_graph_counts
-                .entry(quad.predicate)
-                .or_default()
-                .entry(quad.graph)
-                .or_default() += 1;
-            self.total_quads += 1;
-        }
-    }
-
-    fn remove_quad(&mut self, quad: EncodedQuad) {
-        let mut was_present = false;
-        if let Entry::Occupied(mut entry) = self.by_subject.entry(quad.subject) {
-            was_present = entry
-                .get_mut()
-                .remove(&(quad.predicate, quad.object, quad.graph));
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-        if was_present {
-            if let Entry::Occupied(mut count) = self
-                .predicate_object_counts
-                .entry((quad.predicate, quad.object))
-            {
-                *count.get_mut() = count.get().saturating_sub(1);
-                if *count.get() == 0 {
-                    count.remove();
-                }
-            }
-            if let Entry::Occupied(mut count) = self.predicate_counts.entry(quad.predicate) {
-                *count.get_mut() = count.get().saturating_sub(1);
-                if *count.get() == 0 {
-                    count.remove();
-                }
-            }
-            decrement_nested_count(
-                &mut self.predicate_subject_term_counts,
-                quad.predicate,
-                quad.subject,
-            );
-            decrement_nested_count(
-                &mut self.predicate_object_term_counts,
-                quad.predicate,
-                quad.object,
-            );
-            if let Entry::Occupied(mut count) = self.object_counts.entry(quad.object) {
-                *count.get_mut() = count.get().saturating_sub(1);
-                if *count.get() == 0 {
-                    count.remove();
-                }
-            }
-            if let Entry::Occupied(mut graphs) = self.predicate_graph_counts.entry(quad.predicate) {
-                if let Entry::Occupied(mut count) = graphs.get_mut().entry(quad.graph) {
-                    *count.get_mut() = count.get().saturating_sub(1);
-                    if *count.get() == 0 {
-                        count.remove();
-                    }
-                }
-                if graphs.get().is_empty() {
-                    graphs.remove();
-                }
-            }
-            self.total_quads = self.total_quads.saturating_sub(1);
-        }
-
-        if let Entry::Occupied(mut entry) = self
-            .by_predicate_object
-            .entry((quad.predicate, quad.object))
-        {
-            if let Entry::Occupied(mut graphs) = entry.get_mut().entry(quad.graph) {
-                let subjects = Arc::make_mut(graphs.get_mut());
-                if let Ok(index) = subjects.binary_search(&quad.subject) {
-                    subjects.remove(index);
-                }
-                if subjects.is_empty() {
-                    graphs.remove();
-                }
-            }
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-
-        if let Entry::Occupied(mut entry) = self.by_object.entry(quad.object) {
-            if let Entry::Occupied(mut graphs) = entry.get_mut().entry(quad.graph) {
-                let empty = {
-                    let entries = Arc::make_mut(graphs.get_mut());
-                    entries.remove(&(quad.subject, quad.predicate));
-                    entries.is_empty()
-                };
-                if empty {
-                    graphs.remove();
-                }
-            }
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-    }
-}
-
-fn decrement_nested_count(
-    counts: &mut HashMap<TermId, HashMap<TermId, usize>>,
-    outer: TermId,
-    inner: TermId,
-) {
-    if let Entry::Occupied(mut outer_entry) = counts.entry(outer) {
-        if let Entry::Occupied(mut count) = outer_entry.get_mut().entry(inner) {
-            *count.get_mut() = count.get().saturating_sub(1);
-            if *count.get() == 0 {
-                count.remove();
-            }
-        }
-        if outer_entry.get().is_empty() {
-            outer_entry.remove();
-        }
     }
 }
 
@@ -951,6 +733,12 @@ pub struct GraphStore {
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
     /// [`GraphStore::graph_commit_guard`].
     commit_locks: Vec<Mutex<()>>,
+    /// One qv maintainer may stage global counters at a time. Other graph
+    /// commits never wait: they mark qv degraded and commit source state.
+    qv_commit_state: AtomicU64,
+    qv_degraded: AtomicBool,
+    qv_pending_commits: AtomicU64,
+    qv_catchup_failed: AtomicBool,
     #[cfg(feature = "shacl-core")]
     binding_lock: Mutex<()>,
     #[cfg(feature = "shacl-core")]
@@ -983,18 +771,20 @@ pub struct GraphStore {
     /// Memory mirror of the persisted `'O'` records; always carries the clock
     /// tag so a reader can tell a fresh entry from a stale one.
     diagnostics_cache: RwLock<HashMap<TermId, StoredDiagnostics>>,
-    /// Global term-id → term cache. Term ids are content hashes, so an entry
-    /// can never become wrong; the map is bounded by clearing at
-    /// [`TERM_DECODE_CACHE_CAP`].
-    term_decode_cache: RwLock<HashMap<TermId, Arc<EncodedTerm>>>,
+    /// Global term-id → term cache. Term ids are content hashes, so entries do
+    /// not need invalidation; capacity and bytes are bounded independently.
+    term_decode_cache: RwLock<BoundedCache<TermId, Arc<EncodedTerm>>>,
     /// Set by a test to stall between the durable commit and the index apply,
     /// widening a window that is otherwise microseconds wide.
     #[cfg(test)]
     commit_stall: Mutex<Option<std::time::Duration>>,
-    /// True while the test-only post-durable commit stall holds `indexes`
-    /// write-locked.
+    /// True while a test-only commit is stalled before cache publication.
     #[cfg(test)]
     commit_stalled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    commit_stall_active: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    commit_stall_max_active: std::sync::atomic::AtomicUsize,
     /// Makes the next durable batch fail immediately before fjall commits.
     #[cfg(test)]
     commit_failure: std::sync::atomic::AtomicBool,
@@ -1020,9 +810,9 @@ pub struct GraphStore {
     /// acknowledgement's token read and its committed removal and be erased
     /// without ever being indexed (G7).
     ///
-    /// **Lock order: innermost.** Take it last — after the graph commit guard
-    /// and after `indexes` — hold it only across the queue read plus the commit
-    /// that acts on it, and take no other `GraphStore` lock while it is held.
+    /// **Lock order: innermost.** Take it after the graph commit guard, hold it
+    /// only across the queue read plus the commit that acts on it, and take no
+    /// other `GraphStore` lock while it is held.
     fts_queue_lock: Mutex<()>,
     dirty_counter: AtomicU64,
     /// How many times this store instance has recomputed graph diagnostics.
@@ -1052,6 +842,14 @@ pub struct GraphStore {
 ///
 /// Poison is recovered: the protected state lives in fjall, not behind the mutex.
 pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+struct QueryIndexCommitReset<'a>(&'a AtomicU64);
+
+impl Drop for QueryIndexCommitReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
 
 #[cfg(feature = "shacl-core")]
 pub(crate) struct BindingGuard<'a> {
@@ -2497,11 +2295,9 @@ impl GraphStore {
         Ok(true)
     }
 
-    /// Captures one durable snapshot only after a concurrent commit has made
-    /// both its Fjall batch and in-memory publication visible. The returned
-    /// object never retains this lock across cursor iteration.
+    /// Captures the durable source/qv authority. Cache publication may follow
+    /// it; generation checks keep stale cache entries off this read path.
     pub(crate) fn read_snapshot(&self) -> StoreReadSnapshot {
-        let _publication = self.indexes_read();
         StoreReadSnapshot {
             snapshot: self.db.snapshot(),
         }
@@ -2518,6 +2314,16 @@ impl GraphStore {
         #[cfg(test)]
         self.query_index_admission_probes
             .fetch_add(1, Ordering::Relaxed);
+        if self.qv_degraded.load(Ordering::Acquire) {
+            return Ok(QueryIndexAdmission {
+                trusted: false,
+                query_id_generation: None,
+                query_id_upper_bound: None,
+                fallback_reason: Some("concurrent-source-commit"),
+                header_reads: 0,
+                counter_reads: 0,
+            });
+        }
         let header = match self.query_index_header_from_snapshot(snapshot)? {
             QueryIndexHeaderRead::Absent => {
                 return Ok(QueryIndexAdmission {
@@ -2773,6 +2579,17 @@ impl GraphStore {
                 #[cfg(test)]
                 self.query_index_admission_probes
                     .fetch_add(1, Ordering::Relaxed);
+                if self.qv_degraded.load(Ordering::Acquire) {
+                    return Ok(QueryIndexStatus {
+                        schema_version: QUERY_INDEX_SCHEMA_VERSION,
+                        state: QueryIndexState::Failed("concurrent-source-commit".to_owned()),
+                        query_id_generation: header.query_id_generation,
+                        query_term_ids: header.next_query_id,
+                        source_live_quads: header.source_live_quads,
+                        indexed_quads: header.indexed_quads,
+                        last_build_sequence: header.last_build_sequence,
+                    });
+                }
                 let admission = self.header_admission(&snapshot, &header)?;
                 let state =
                     if matches!(header.state, StoredQueryIndexState::Ready) && !admission.trusted {
@@ -2820,7 +2637,6 @@ impl GraphStore {
     }
 
     fn initialize_query_indexes_at_open(&self) -> Result<()> {
-        let _indexes = self.indexes_write();
         let snapshot = self.db.snapshot();
         match self.query_index_header_from_snapshot(&snapshot)? {
             QueryIndexHeaderRead::Absent => {
@@ -3582,37 +3398,15 @@ impl GraphStore {
         }
     }
 
-    fn build_indexes(&self) -> Result<IndexState> {
-        let mut indexes = IndexState::default();
-        for guard in self.quads.iter() {
-            let (key, value) = guard.into_inner()?;
-            if key.len() != 64 {
-                continue;
-            }
-            if dot_payload_is_empty(value.as_ref()) {
-                continue;
-            }
-            indexes.insert_quad(Self::decode_quad_key(key.as_ref())?);
-        }
-        Ok(indexes)
-    }
-
-    /// Rebuild every derived structure from the durable `quads` keyspace, the
-    /// source of truth. The clock mirror is kept: those commits did land.
-    ///
-    /// Scan and install share the write lock, so no commit can publish between
-    /// them and be erased. The scan takes no other lock, so it cannot deadlock.
+    /// Drop rebuildable cache state. Durable source/qv keyspaces are the read
+    /// authority, so rebuilding does not require a corpus-sized mirror.
+    #[cfg(test)]
     fn rebuild_indexes(&self) -> Result<()> {
-        {
-            let mut indexes = self.indexes_write();
-            let rebuilt = self.build_indexes()?;
-            #[cfg(test)]
-            self.stall_in_rebuild();
-            indexes.graph_subjects = rebuilt.graph_subjects;
-            indexes.by_graph_subject = rebuilt.by_graph_subject;
-            indexes.derived = None;
-            indexes.object_order.clear();
-        }
+        #[cfg(test)]
+        self.stall_in_rebuild();
+        let mut indexes = self.indexes_write();
+        indexes.quad_subjects.clear();
+        indexes.object_order.clear();
         self.term_decode_cache
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -3838,7 +3632,16 @@ impl GraphStore {
     }
 
     pub(crate) fn rebuild_query_indexes(&self) -> Result<()> {
-        let _indexes = self.indexes_write();
+        if self
+            .qv_commit_state
+            .compare_exchange(0, QV_COMMIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StoreError::QueryIndexUnavailable(
+                "query-index rebuild overlaps a graph commit",
+            ));
+        }
+        let _qv_reset = QueryIndexCommitReset(&self.qv_commit_state);
         let initial_snapshot = self.db.snapshot();
         let previous = match self.query_index_header_from_snapshot(&initial_snapshot)? {
             QueryIndexHeaderRead::Valid(header) => Some(header),
@@ -3925,25 +3728,20 @@ impl GraphStore {
         if result.is_err() {
             let _ = self.mark_query_index_rebuild_failed("rebuild-failed");
         }
+        let clean = self.finish_query_index_commit();
+        if result.is_ok() && clean {
+            self.qv_degraded.store(false, Ordering::Release);
+        }
         result
     }
 
-    /// Commit a batch and publish its in-memory half.
-    ///
-    /// An [`IndexApply::Anomaly`] means the index drifted from the store, so it
-    /// is rebuilt before this returns rather than left inconsistent.
+    /// Commit a batch and publish its bounded in-memory cache state.
     fn apply_commit(&self, commit: DurableCommit, publish: PendingPublish) -> Result<()> {
         if publish.is_empty() {
             return self.commit_durable(commit);
         }
 
-        if self.commit_with_index(commit, &publish)? {
-            tracing::warn!(
-                "index anomaly detected while applying a commit; rebuilding indexes from the store"
-            );
-            return self.rebuild_indexes();
-        }
-        Ok(())
+        self.commit_with_index(commit, &publish)
     }
 
     /// Stall inside the publish window. Test-only.
@@ -3954,8 +3752,12 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(delay) = stall {
+            let active = self.commit_stall_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.commit_stall_max_active
+                .fetch_max(active, Ordering::SeqCst);
             self.commit_stalled.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
+            self.commit_stall_active.fetch_sub(1, Ordering::SeqCst);
             self.commit_stalled.store(false, Ordering::SeqCst);
         }
     }
@@ -3969,12 +3771,19 @@ impl GraphStore {
             .commit_stall
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+        self.commit_stall_active.store(0, Ordering::SeqCst);
+        self.commit_stall_max_active.store(0, Ordering::SeqCst);
     }
 
     /// Whether a commit is inside its post-durable publication stall.
     #[cfg(test)]
     pub(crate) fn commit_stalled(&self) -> bool {
         self.commit_stalled.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn commit_stall_max_active(&self) -> usize {
+        self.commit_stall_max_active.load(Ordering::SeqCst)
     }
 
     /// Make exactly the next durable batch commit fail. Test-only.
@@ -4135,12 +3944,25 @@ impl GraphStore {
         Ok(Some(query))
     }
 
+    fn query_index_spo_exists(&self, snapshot: &Snapshot, quad: QueryQuad) -> Result<bool> {
+        let key = qv2_spog_key(quad);
+        let mut prefix = [0u8; 24];
+        prefix.copy_from_slice(&key[..24]);
+        match snapshot.prefix(&self.qv2_spog, prefix).next() {
+            Some(guard) => {
+                let _ = guard.into_inner()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn insertions_preserve_union_uniqueness(
+        &self,
+        snapshot: &Snapshot,
         transitions: &[(QueryQuad, bool)],
         new_terms: &HashSet<QueryTermId>,
-        source_terms: &HashMap<QueryTermId, TermId>,
-        derived: Option<&DerivedIndexState>,
-    ) -> bool {
+    ) -> Result<bool> {
         let mut inserted = BTreeSet::new();
         for (quad, is_live) in transitions {
             if !is_live {
@@ -4148,7 +3970,7 @@ impl GraphStore {
             }
             let spo = (quad.subject, quad.predicate, quad.object);
             if !inserted.insert(spo) {
-                return false;
+                return Ok(false);
             }
             if new_terms.contains(&quad.subject)
                 || new_terms.contains(&quad.predicate)
@@ -4156,64 +3978,29 @@ impl GraphStore {
             {
                 continue;
             }
-            let Some(derived) = derived else {
-                return false;
-            };
-            let Some(subject) = source_terms.get(&quad.subject) else {
-                return false;
-            };
-            let Some(expected_predicate) = source_terms.get(&quad.predicate) else {
-                return false;
-            };
-            let Some(expected_object) = source_terms.get(&quad.object) else {
-                return false;
-            };
-            if derived.by_subject.get(subject).is_some_and(|entries| {
-                entries.iter().any(|(predicate, object, _)| {
-                    predicate == expected_predicate && object == expected_object
-                })
-            }) {
-                return false;
+            if self.query_index_spo_exists(snapshot, *quad)? {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     fn single_transition_preserves_union_uniqueness(
+        &self,
+        snapshot: &Snapshot,
         transition: (QueryQuad, bool),
         mappings: &[(TermId, QueryTermId)],
-        resolved: &HashMap<TermId, QueryTermId>,
-        derived: Option<&DerivedIndexState>,
-    ) -> bool {
+    ) -> Result<bool> {
         let (quad, is_live) = transition;
         if !is_live {
-            return true;
+            return Ok(true);
         }
         if mappings.iter().any(|(_, query)| {
             *query == quad.subject || *query == quad.predicate || *query == quad.object
         }) {
-            return true;
+            return Ok(true);
         }
-        let source = |query| {
-            resolved
-                .iter()
-                .find_map(|(term, current)| (*current == query).then_some(*term))
-        };
-        let (Some(subject), Some(predicate), Some(object), Some(derived)) = (
-            source(quad.subject),
-            source(quad.predicate),
-            source(quad.object),
-            derived,
-        ) else {
-            return false;
-        };
-        !derived.by_subject.get(&subject).is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|(current_predicate, current_object, _)| {
-                    *current_predicate == predicate && *current_object == object
-                })
-        })
+        Ok(!self.query_index_spo_exists(snapshot, quad)?)
     }
 
     fn plan_ready_query_index_maintenance(
@@ -4221,7 +4008,6 @@ impl GraphStore {
         snapshot: &Snapshot,
         header: &QueryIndexHeader,
         transitions: Vec<NetQuadTransition>,
-        derived: Option<&DerivedIndexState>,
     ) -> Result<Option<QueryIndexMaintenancePlan>> {
         let total =
             match self.query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::Total)? {
@@ -4287,6 +4073,8 @@ impl GraphStore {
                 predicate,
                 object,
             };
+            let mut already_desired = true;
+            let mut all_at_prior_state = true;
             for (keyspace, key) in [
                 (&self.qv2_gspo, qv2_gspo_key(quad)),
                 (&self.qv2_gpos, qv2_gpos_key(quad)),
@@ -4296,14 +4084,19 @@ impl GraphStore {
                 (&self.qv2_gosp, qv2_gosp_key(quad)),
             ] {
                 let current = snapshot.get(keyspace, key)?;
-                let expected = if transition.is_live {
-                    current.is_none()
-                } else {
-                    current.is_some_and(|value| value.as_ref().is_empty())
+                let present = match current {
+                    None => false,
+                    Some(value) if value.as_ref().is_empty() => true,
+                    Some(_) => return Ok(None),
                 };
-                if !expected {
-                    return Ok(None);
-                }
+                already_desired &= present == transition.is_live;
+                all_at_prior_state &= present != transition.is_live;
+            }
+            if already_desired {
+                continue;
+            }
+            if !all_at_prior_state {
+                return Ok(None);
             }
             query_transitions.push((quad, transition.is_live));
         }
@@ -4328,24 +4121,10 @@ impl GraphStore {
         };
         let union_uniqueness_preserved = !union_duplicate_free
             || if let [transition] = query_transitions.as_slice() {
-                Self::single_transition_preserves_union_uniqueness(
-                    *transition,
-                    &mappings,
-                    &resolved,
-                    derived,
-                )
+                self.single_transition_preserves_union_uniqueness(snapshot, *transition, &mappings)?
             } else {
                 let new_terms = mappings.iter().map(|(_, query)| *query).collect();
-                let source_terms = resolved
-                    .iter()
-                    .map(|(term, query)| (*query, *term))
-                    .collect();
-                Self::insertions_preserve_union_uniqueness(
-                    &query_transitions,
-                    &new_terms,
-                    &source_terms,
-                    derived,
-                )
+                self.insertions_preserve_union_uniqueness(snapshot, &query_transitions, &new_terms)?
             };
 
         let mut deltas = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, i128)>::new();
@@ -4501,7 +4280,6 @@ impl GraphStore {
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         publish: &PendingPublish,
-        indexes: &IndexState,
     ) -> Result<()> {
         let snapshot = self.db.snapshot();
         match self.query_index_header_from_snapshot(&snapshot)? {
@@ -4528,7 +4306,6 @@ impl GraphStore {
                         &snapshot,
                         &header,
                         transitions,
-                        indexes.derived.as_ref(),
                     )? {
                         Some(plan) => self.stage_query_index_maintenance_plan(batch, plan),
                         None => self.stage_query_index_failed(
@@ -4543,68 +4320,148 @@ impl GraphStore {
         }
     }
 
-    /// Publish the durable batch and the index together, reporting anomalies.
-    /// A reader past the new clock never sees state predating it.
-    ///
-    /// Only the queue lock nests inside, and the fjall reads made here take no
-    /// further lock, so the section cannot deadlock.
-    fn commit_with_index(
-        &self,
-        mut commit: DurableCommit,
-        publish: &PendingPublish,
-    ) -> Result<bool> {
-        let mut indexes = self.indexes_write();
-        self.stage_query_index_maintenance(&mut commit.batch, publish, &indexes)?;
-        self.commit_durable(commit)?;
-        #[cfg(test)]
-        self.stall_after_commit();
-        Ok(indexes.publish(publish))
+    fn begin_query_index_commit(&self) -> bool {
+        loop {
+            let state = self.qv_commit_state.load(Ordering::Acquire);
+            if state & QV_COMMIT_ACTIVE == 0 {
+                if self
+                    .qv_commit_state
+                    .compare_exchange(state, QV_COMMIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+                continue;
+            }
+            if state & QV_COMMIT_DIRTY == 0
+                && self
+                    .qv_commit_state
+                    .compare_exchange(
+                        state,
+                        state | QV_COMMIT_DIRTY,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+            if self.qv_pending_commits.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.qv_catchup_failed.store(false, Ordering::Release);
+            }
+            self.qv_degraded.store(true, Ordering::Release);
+            return false;
+        }
     }
 
-    fn build_derived_indexes(indexes: &IndexState) -> DerivedIndexState {
-        let mut derived = DerivedIndexState::default();
-        for (&(graph, subject), entries) in &indexes.by_graph_subject {
-            for &(predicate, object) in entries {
-                derived.insert_quad(EncodedQuad {
-                    graph,
-                    subject,
-                    predicate,
-                    object,
-                });
+    fn finish_query_index_commit(&self) -> bool {
+        loop {
+            let state = self.qv_commit_state.load(Ordering::Acquire);
+            if self
+                .qv_commit_state
+                .compare_exchange(state, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return state == QV_COMMIT_ACTIVE;
             }
         }
-        derived
+    }
+
+    fn catch_up_query_index(&self, publish: &PendingPublish) -> Result<()> {
+        loop {
+            if self
+                .qv_commit_state
+                .compare_exchange(0, QV_COMMIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let _reset = QueryIndexCommitReset(&self.qv_commit_state);
+        let mut batch = self.buffered_batch();
+        self.stage_query_index_maintenance(&mut batch, publish)?;
+        self.commit_fjall_batch(batch)
+    }
+
+    fn finish_pending_query_index_commit(&self, caught_up: bool) {
+        if !caught_up {
+            self.qv_catchup_failed.store(true, Ordering::Release);
+        }
+        if self.qv_pending_commits.fetch_sub(1, Ordering::AcqRel) == 1
+            && !self.qv_catchup_failed.load(Ordering::Acquire)
+        {
+            self.qv_degraded.store(false, Ordering::Release);
+        }
+    }
+
+    /// Commit without holding the global cache lock, then publish only the
+    /// affected cache generations under a short write section.
+    fn commit_with_index(&self, mut commit: DurableCommit, publish: &PendingPublish) -> Result<()> {
+        let maintains_query_index = self.begin_query_index_commit();
+        if maintains_query_index {
+            if let Err(error) = self.stage_query_index_maintenance(&mut commit.batch, publish) {
+                let _ = self.finish_query_index_commit();
+                return Err(error);
+            }
+        }
+        let committed = self.commit_durable(commit);
+        let published = if committed.is_ok() {
+            #[cfg(test)]
+            self.stall_after_commit();
+            self.indexes_write().publish(publish);
+            true
+        } else {
+            false
+        };
+        if maintains_query_index {
+            self.finish_query_index_commit();
+        } else {
+            let caught_up = if committed.is_ok() {
+                match self.catch_up_query_index(publish) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "query-index catch-up failed after a durable source commit"
+                        );
+                        self.mark_query_index_rebuild_failed("concurrent-catch-up-failed")
+                            .is_ok()
+                    }
+                }
+            } else {
+                true
+            };
+            self.finish_pending_query_index_commit(caught_up);
+        }
+        committed?;
+        debug_assert!(published, "successful durable commit publishes cache state");
+        Ok(())
     }
 
     pub fn ensure_derived_indexes(&self) {
-        self.with_derived_indexes(|_| ());
-    }
-
-    /// Runs `f` under the index lock, so `f` must not call back into the store:
-    /// any store lock it takes self-deadlocks.
-    fn with_derived_indexes<R>(&self, f: impl FnOnce(&DerivedIndexState) -> R) -> R {
-        {
-            let indexes = self.indexes_read();
-            if let Some(derived) = indexes.derived.as_ref() {
-                return f(derived);
-            }
-        }
-
-        let mut indexes = self.indexes_write();
-        if indexes.derived.is_none() {
-            let derived = Self::build_derived_indexes(&indexes);
-            indexes.derived = Some(derived);
-        }
-        f(indexes
-            .derived
-            .as_ref()
-            .expect("derived indexes initialized"))
+        // qv and source keyspaces are the read authority; there is no required
+        // corpus-wide in-memory mirror to warm.
     }
 
     /// Diagnostics recomputations performed by this store instance.
     #[cfg(test)]
     pub(crate) fn diagnostics_compute_count(&self) -> u64 {
         self.diagnostics_computed.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn cache_statistics(&self) -> [CacheStatistics; 3] {
+        let indexes = self.indexes_read();
+        let quad = indexes.quad_subjects.statistics();
+        let object = indexes.object_order.statistics();
+        drop(indexes);
+        let terms = self
+            .term_decode_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .statistics();
+        [quad, object, terms]
     }
 
     #[cfg(test)]
@@ -4619,7 +4476,6 @@ impl GraphStore {
 
     #[cfg(test)]
     pub(crate) fn fail_test_indexes(&self) {
-        let _indexes = self.indexes_write();
         let snapshot = self.db.snapshot();
         let previous = match self.query_index_header_from_snapshot(&snapshot).unwrap() {
             QueryIndexHeaderRead::Valid(header) => Some(header),
@@ -4632,7 +4488,6 @@ impl GraphStore {
 
     #[cfg(test)]
     pub(crate) fn set_test_query_index_state(&self, state: QueryIndexState) {
-        let _indexes = self.indexes_write();
         let snapshot = self.db.snapshot();
         let QueryIndexHeaderRead::Valid(mut header) =
             self.query_index_header_from_snapshot(&snapshot).unwrap()
@@ -4676,50 +4531,42 @@ impl GraphStore {
     /// Term ids of the graph's orphaned data entities.
     ///
     /// Evaluates [`crate::rules::orphaned_data_entities`] entirely on term ids
-    /// against the in-memory index: nothing is decoded, so the cost is a handful
-    /// of integer comparisons per stored triple instead of three `String` clones
-    /// plus hashing of full IRIs. The rule is the specification and the two are
+    /// against the durable graph prefix: nothing is decoded, so the cost is a
+    /// handful of integer comparisons per stored triple. The rule is the specification and the two are
     /// cross-checked on generated graph shapes by
     /// `orphan_ids_match`; recomputation is on the hot path of
     /// every write that defers its diagnostics refresh, where the decoding
     /// version cost 74ms on a 10,000-entity crate.
     ///
     /// The crate root is the graph term itself, so its term id *is* `graph_id`.
-    fn orphaned_entity_ids(&self, graph_id: TermId, vocab: &OrphanVocab) -> HashSet<TermId> {
+    fn orphaned_entity_ids(
+        &self,
+        graph_id: TermId,
+        vocab: &OrphanVocab,
+    ) -> Result<HashSet<TermId>> {
         let mut data_entities: HashSet<TermId> = HashSet::new();
         let mut adjacency: HashMap<TermId, Vec<TermId>> = HashMap::new();
-        {
-            // Guards IndexState for the single pass over the graph's triples.
-            let indexes = self.indexes_read();
-            let Some(subjects) = indexes.graph_subjects.get(&graph_id) else {
-                return HashSet::new();
-            };
-            for &subject in subjects {
-                let Some(entries) = indexes.by_graph_subject.get(&(graph_id, subject)) else {
-                    continue;
-                };
-                for &(predicate, object) in entries {
-                    if vocab.has_part == Some(predicate) {
-                        adjacency.entry(subject).or_default().push(object);
-                        if subject != graph_id {
-                            data_entities.insert(subject);
-                        }
-                        if object != graph_id {
-                            data_entities.insert(object);
-                        }
-                    }
-                    if vocab.rdf_type == Some(predicate)
-                        && subject != graph_id
-                        && vocab.data_types.contains(&Some(object))
-                    {
-                        data_entities.insert(subject);
-                    }
+        self.for_each_stored_quad(graph_id, |quad, _| {
+            if vocab.has_part == Some(quad.predicate) {
+                adjacency.entry(quad.subject).or_default().push(quad.object);
+                if quad.subject != graph_id {
+                    data_entities.insert(quad.subject);
+                }
+                if quad.object != graph_id {
+                    data_entities.insert(quad.object);
                 }
             }
-        }
+            if vocab.rdf_type == Some(quad.predicate)
+                && quad.subject != graph_id
+                && vocab.data_types.contains(&Some(quad.object))
+            {
+                data_entities.insert(quad.subject);
+            }
+            Ok(())
+        })?;
 
         if data_entities.is_empty() {
-            return HashSet::new();
+            return Ok(HashSet::new());
         }
 
         let mut reachable: HashSet<TermId> = HashSet::from([graph_id]);
@@ -4733,7 +4580,7 @@ impl GraphStore {
         }
 
         data_entities.retain(|entity| !reachable.contains(entity));
-        data_entities
+        Ok(data_entities)
     }
 
     /// Snapshot-only twin of [`GraphStore::orphaned_entity_ids`]. Reads use it
@@ -4835,7 +4682,7 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(GraphDiagnostics::default());
         };
-        let orphans = self.orphaned_entity_ids(graph_id, &self.orphan_vocab()?);
+        let orphans = self.orphaned_entity_ids(graph_id, &self.orphan_vocab()?)?;
         // Only the orphans are decoded; the common case is none at all.
         let mut entities = Vec::with_capacity(orphans.len());
         for orphan in orphans {
@@ -4947,105 +4794,203 @@ impl GraphStore {
         graph: TermId,
         predicate: Option<TermId>,
         object: Option<TermId>,
-    ) -> Vec<EncodedQuad> {
-        let indexes = self.indexes_read();
-        let Some(subjects) = indexes.graph_subjects.get(&graph) else {
-            return Vec::new();
-        };
-
+    ) -> Result<Vec<EncodedQuad>> {
         let mut quads = Vec::new();
-        for &subject in subjects {
-            let Some(entries) = indexes.by_graph_subject.get(&(graph, subject)) else {
+        for guard in self.quads.prefix(graph.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            if dot_payload_is_empty(value.as_ref()) {
                 continue;
-            };
-            for &(candidate_predicate, candidate_object) in entries {
-                if predicate.is_some_and(|expected| expected != candidate_predicate) {
-                    continue;
-                }
-                if object.is_some_and(|expected| expected != candidate_object) {
-                    continue;
-                }
-                quads.push(EncodedQuad {
-                    graph,
-                    subject,
-                    predicate: candidate_predicate,
-                    object: candidate_object,
-                });
             }
+            let quad = Self::decode_quad_key(key.as_ref())?;
+            if predicate.is_some_and(|expected| expected != quad.predicate)
+                || object.is_some_and(|expected| expected != quad.object)
+            {
+                continue;
+            }
+            quads.push(quad);
         }
-        quads
+        Ok(quads)
     }
 
-    /// Approximate corpus-wide quad counts used by the query planner. All are
-    /// O(1) reads against the lazily built derived indexes; values count quad
-    /// instances per graph (no cross-graph triple dedup), which is good
-    /// enough for relative selectivity ordering.
+    fn planner_count(&self, count: Result<Option<u64>>, fallback: impl FnOnce() -> usize) -> usize {
+        count
+            .ok()
+            .flatten()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_else(fallback)
+    }
+
+    fn source_pattern_count(
+        &self,
+        subject: Option<TermId>,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+    ) -> usize {
+        self.quads_for_pattern(None, subject, predicate, object)
+            .map(|quads| quads.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    fn query_index_pattern_count(
+        &self,
+        order: QueryIndexCursorOrder,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> Option<usize> {
+        let snapshot = self.read_snapshot();
+        if !snapshot.query_index_admission(self).ok()?.trusted {
+            return None;
+        }
+        let mut cursor = snapshot.query_index_cursor(self, order, pattern).ok()?;
+        let mut count = 0usize;
+        while let Some(candidate) = cursor.next_candidate() {
+            let candidate = candidate.ok()?;
+            if candidate.live && pattern.matches(candidate.quad) {
+                count = count.saturating_add(1);
+            }
+        }
+        Some(count)
+    }
+
+    fn query_index_distinct_count(
+        &self,
+        predicate: Option<TermId>,
+        domain: DistinctDomain,
+    ) -> Option<usize> {
+        let snapshot = self.db.snapshot();
+        if !self.snapshot_admission(&snapshot).ok()?.trusted {
+            return None;
+        }
+        let QueryIndexHeaderRead::Valid(header) =
+            self.query_index_header_from_snapshot(&snapshot).ok()?
+        else {
+            return None;
+        };
+        let predicate = match predicate {
+            Some(predicate) => match self
+                .query_term_id_from_snapshot(&snapshot, predicate)
+                .ok()?
+            {
+                Some(predicate) => Some(predicate),
+                None => return Some(0),
+            },
+            None => None,
+        };
+        let cache_key = (header.source_epoch, predicate, domain);
+        if let Some(count) = self.indexes_write().planner_distinct.get_cloned(&cache_key) {
+            return Some(count);
+        }
+
+        let count = match (predicate, domain) {
+            (predicate, DistinctDomain::Subject) => {
+                let mut subject = None;
+                let mut matched = false;
+                let mut count = 0usize;
+                for guard in snapshot.iter(&self.qv2_spog) {
+                    let (key, _) = guard.into_inner().ok()?;
+                    let quad = decode_qv2_spog_key(key.as_ref())?;
+                    if subject != Some(quad.subject) {
+                        count = count.saturating_add(usize::from(matched));
+                        subject = Some(quad.subject);
+                        matched = false;
+                    }
+                    matched |= predicate.is_none_or(|expected| quad.predicate == expected);
+                }
+                count.saturating_add(usize::from(matched))
+            }
+            (Some(predicate), DistinctDomain::Object) => {
+                let mut object = None;
+                let mut count = 0usize;
+                for guard in snapshot.prefix(&self.qv2_posg, predicate.to_be_bytes()) {
+                    let (key, _) = guard.into_inner().ok()?;
+                    let quad = decode_qv2_posg_key(key.as_ref())?;
+                    if object != Some(quad.object) {
+                        object = Some(quad.object);
+                        count = count.saturating_add(1);
+                    }
+                }
+                count
+            }
+            (None, DistinctDomain::Object) => {
+                let mut object = None;
+                let mut count = 0usize;
+                for guard in snapshot.iter(&self.qv2_ospg) {
+                    let (key, _) = guard.into_inner().ok()?;
+                    let quad = decode_qv2_ospg_key(key.as_ref())?;
+                    if object != Some(quad.object) {
+                        object = Some(quad.object);
+                        count = count.saturating_add(1);
+                    }
+                }
+                count
+            }
+        };
+        self.indexes_write().planner_distinct.insert(
+            cache_key,
+            count,
+            std::mem::size_of_val(&count),
+        );
+        Some(count)
+    }
+
+    /// Approximate corpus-wide counts used only for planning. qv counters are
+    /// preferred; source scans remain the correctness-preserving fallback.
     pub(crate) fn stat_predicate_object_count(&self, predicate: TermId, object: TermId) -> usize {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .predicate_object_counts
-                .get(&(predicate, object))
-                .copied()
-                .unwrap_or(0)
+        let snapshot = self.read_snapshot();
+        self.planner_count(snapshot.qv_po_count(self, predicate, object), || {
+            self.source_pattern_count(None, Some(predicate), Some(object))
         })
     }
 
     pub(crate) fn stat_predicate_count(&self, predicate: TermId) -> usize {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .predicate_counts
-                .get(&predicate)
-                .copied()
-                .unwrap_or(0)
+        let snapshot = self.read_snapshot();
+        self.planner_count(snapshot.qv_p_count(self, predicate), || {
+            self.source_pattern_count(None, Some(predicate), None)
         })
     }
 
     pub(crate) fn predicate_subject_count(&self, predicate: TermId) -> usize {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .predicate_subject_term_counts
-                .get(&predicate)
-                .map(HashMap::len)
-                .unwrap_or(0)
-        })
+        self.query_index_distinct_count(Some(predicate), DistinctDomain::Subject)
+            .unwrap_or_else(|| self.stat_predicate_count(predicate))
     }
 
     pub(crate) fn predicate_object_count(&self, predicate: TermId) -> usize {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .predicate_object_term_counts
-                .get(&predicate)
-                .map(HashMap::len)
-                .unwrap_or(0)
-        })
+        self.query_index_distinct_count(Some(predicate), DistinctDomain::Object)
+            .unwrap_or_else(|| self.stat_predicate_count(predicate))
     }
 
     pub(crate) fn stat_object_count(&self, object: TermId) -> usize {
-        self.with_derived_indexes(|indexes| {
-            indexes.object_counts.get(&object).copied().unwrap_or(0)
-        })
+        let pattern = crate::rdf_read::QuadPattern {
+            object: Some(object),
+            ..crate::rdf_read::QuadPattern::default()
+        };
+        self.query_index_pattern_count(QueryIndexCursorOrder::Ospg, pattern)
+            .unwrap_or_else(|| self.source_pattern_count(None, None, Some(object)))
     }
 
     pub(crate) fn stat_subject_count(&self, subject: TermId) -> usize {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .by_subject
-                .get(&subject)
-                .map(HashSet::len)
-                .unwrap_or(0)
-        })
+        let pattern = crate::rdf_read::QuadPattern {
+            subject: Some(subject),
+            ..crate::rdf_read::QuadPattern::default()
+        };
+        self.query_index_pattern_count(QueryIndexCursorOrder::Spog, pattern)
+            .unwrap_or_else(|| self.source_pattern_count(Some(subject), None, None))
     }
 
     pub(crate) fn distinct_subject_count(&self) -> usize {
-        self.with_derived_indexes(|indexes| indexes.by_subject.len())
+        self.query_index_distinct_count(None, DistinctDomain::Subject)
+            .unwrap_or_else(|| self.stat_total_quads())
     }
 
     pub(crate) fn distinct_object_count(&self) -> usize {
-        self.with_derived_indexes(|indexes| indexes.object_counts.len())
+        self.query_index_distinct_count(None, DistinctDomain::Object)
+            .unwrap_or_else(|| self.stat_total_quads())
     }
 
     pub(crate) fn stat_total_quads(&self) -> usize {
-        self.with_derived_indexes(|indexes| indexes.total_quads)
+        let snapshot = self.read_snapshot();
+        self.planner_count(snapshot.qv_total_count(self), || {
+            self.source_pattern_count(None, None, None)
+        })
     }
 
     pub(crate) fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
@@ -5110,19 +5055,17 @@ impl GraphStore {
         !dot_payload_is_empty(bytes)
     }
 
-    fn count_objects_for_ids(&self, graph: TermId, subject: TermId, predicate: TermId) -> usize {
-        self.indexes
-            .read()
-            .unwrap()
-            .by_graph_subject
-            .get(&(graph, subject))
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|(candidate_predicate, _)| *candidate_predicate == predicate)
-                    .count()
-            })
-            .unwrap_or(0)
+    fn count_objects_for_ids(
+        &self,
+        graph: TermId,
+        subject: TermId,
+        predicate: TermId,
+    ) -> Result<usize> {
+        Ok(self
+            .subject_entries((graph, subject), None)?
+            .into_iter()
+            .filter(|(candidate_predicate, _)| *candidate_predicate == predicate)
+            .count())
     }
 
     /// Objects of `(graph, subject, predicate)` in decoded-term order.
@@ -5139,25 +5082,21 @@ impl GraphStore {
         predicate: TermId,
     ) -> Result<Arc<Vec<TermId>>> {
         let key = (graph, subject, predicate);
-        let (generation, object_ids) = {
-            let indexes = self.indexes_read();
-            if let Some(cached) = indexes.object_order.get(&key) {
+        let generation = {
+            let mut indexes = self.indexes_write();
+            let generation = indexes.generations.get(&graph).copied().unwrap_or(0);
+            if let Some(cached) = indexes.object_order.get(&key, generation) {
                 return Ok(cached);
             }
-            let object_ids = indexes
-                .by_graph_subject
-                .get(&(graph, subject))
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|(candidate_predicate, object)| {
-                            (*candidate_predicate == predicate).then_some(*object)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (indexes.object_order.generation, object_ids)
+            generation
         };
+        let object_ids = self
+            .subject_entries((graph, subject), None)?
+            .into_iter()
+            .filter_map(|(candidate_predicate, object)| {
+                (candidate_predicate == predicate).then_some(object)
+            })
+            .collect::<Vec<_>>();
 
         let mut ordered = object_ids
             .into_iter()
@@ -5170,13 +5109,16 @@ impl GraphStore {
                 .map(|(_, object)| object)
                 .collect::<Vec<_>>(),
         );
-        self.indexes_write().object_order.install(
-            OrderEntry {
-                key,
-                objects: Arc::clone(&objects),
-            },
-            generation,
-        );
+        let mut indexes = self.indexes_write();
+        if indexes.generations.get(&graph).copied().unwrap_or(0) == generation {
+            indexes.object_order.install(
+                OrderEntry {
+                    key,
+                    objects: Arc::clone(&objects),
+                },
+                generation,
+            );
+        }
         Ok(objects)
     }
 
@@ -5257,6 +5199,10 @@ impl GraphStore {
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            qv_commit_state: AtomicU64::new(0),
+            qv_degraded: AtomicBool::new(false),
+            qv_pending_commits: AtomicU64::new(0),
+            qv_catchup_failed: AtomicBool::new(false),
             #[cfg(feature = "shacl-core")]
             binding_lock: Mutex::new(()),
             #[cfg(feature = "shacl-core")]
@@ -5287,11 +5233,18 @@ impl GraphStore {
             validation_max_active: std::sync::atomic::AtomicUsize::new(0),
             indexes: RwLock::new(IndexState::default()),
             diagnostics_cache: RwLock::new(HashMap::new()),
-            term_decode_cache: RwLock::new(HashMap::new()),
+            term_decode_cache: RwLock::new(BoundedCache::new(
+                TERM_DECODE_CACHE_CAP,
+                TERM_DECODE_CACHE_BYTES,
+            )),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
             #[cfg(test)]
             commit_stalled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            commit_stall_active: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            commit_stall_max_active: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             commit_failure: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -5316,7 +5269,6 @@ impl GraphStore {
         };
 
         store.ensure_disk_format()?;
-        store.rebuild_indexes()?;
         store.initialize_query_indexes_at_open()?;
         store.restore_dirty_counter()?;
         store.repair_graph_diagnostics_at_open()?;
@@ -5475,30 +5427,29 @@ impl GraphStore {
     /// Decode a term id through the global term cache.
     ///
     /// Term ids are content hashes of immutable term bytes, so a cached entry
-    /// can never become stale and needs no invalidation path — the only bound
-    /// is the cap, at which the whole map is cleared. Returns an `Arc` so hot
-    /// paths (visibility checks, snapshot/fingerprint scans) share one
-    /// allocation instead of cloning the string per lookup.
+    /// can never become stale and needs no invalidation path. Returns an `Arc`
+    /// so hot paths share one allocation instead of cloning the string.
     pub(crate) fn decode_term_arc(&self, id: TermId) -> Result<Arc<EncodedTerm>> {
         if let Some(term) = self
             .term_decode_cache
-            .read()
+            .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&id)
+            .get_cloned(&id)
         {
-            return Ok(term.clone());
+            return Ok(term);
         }
 
         let term = Arc::new(self.read_term(id)?);
-        // Guards the term-id → term cache.
         let mut cache = self
             .term_decode_cache
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= TERM_DECODE_CACHE_CAP {
-            cache.clear();
-        }
-        Ok(cache.entry(id).or_insert(term).clone())
+        cache.insert(
+            id,
+            Arc::clone(&term),
+            term.0.len().saturating_add(std::mem::size_of::<TermId>()),
+        );
+        Ok(term)
     }
 
     pub fn decode_term(&self, id: TermId) -> Result<EncodedTerm> {
@@ -6035,7 +5986,13 @@ impl GraphStore {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&graph_id);
-        self.indexes_write().object_order.drop_graph(graph_id);
+        let mut indexes = self.indexes_write();
+        indexes
+            .quad_subjects
+            .remove_where(|(graph, _, _)| *graph == graph_id);
+        indexes.object_order.drop_graph(graph_id);
+        let generation = indexes.generations.entry(graph_id).or_default();
+        *generation = generation.wrapping_add(1);
         Ok(())
     }
 
@@ -6067,16 +6024,24 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(true);
         };
-        Ok(self.graph_subject_count(graph_id) == 0)
+        Ok(self.graph_subject_count(graph_id)? == 0)
     }
 
-    /// Live subject count for a graph, straight off the in-memory index.
-    pub(crate) fn graph_subject_count(&self, graph_id: TermId) -> usize {
-        self.indexes_read()
-            .graph_subjects
-            .get(&graph_id)
-            .map(HashSet::len)
-            .unwrap_or(0)
+    pub(crate) fn graph_subject_count(&self, graph_id: TermId) -> Result<usize> {
+        let mut previous = None;
+        let mut count = 0usize;
+        for guard in self.quads.prefix(graph_id.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            if dot_payload_is_empty(value.as_ref()) {
+                continue;
+            }
+            let subject = Self::decode_quad_key(key.as_ref())?.subject;
+            if previous != Some(subject) {
+                previous = Some(subject);
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
     }
 
     pub fn contains_subject(&self, graph: &GraphId, subject: &EncodedTerm) -> Result<bool> {
@@ -6087,10 +6052,16 @@ impl GraphStore {
             return Ok(false);
         };
 
-        let indexes = self.indexes_read();
-        Ok(indexes
-            .by_graph_subject
-            .contains_key(&(graph_id, subject_id)))
+        let mut prefix = [0u8; 32];
+        prefix[..16].copy_from_slice(&graph_id.to_be_bytes());
+        prefix[16..].copy_from_slice(&subject_id.to_be_bytes());
+        for guard in self.quads.prefix(prefix) {
+            let (_, value) = guard.into_inner()?;
+            if !dot_payload_is_empty(value.as_ref()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn graphs(&self) -> Result<Vec<GraphId>> {
@@ -6603,9 +6574,6 @@ impl GraphStore {
     }
 
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
-        // Held across the clock read and the scan, so both describe the
-        // same committed state and no torn batch is visible.
-        let indexes = self.indexes_read();
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(GraphReplicaSnapshot {
                 graph: graph.clone(),
@@ -6613,20 +6581,23 @@ impl GraphStore {
                 quads: Vec::new(),
             });
         };
-        let vector_clock = indexes.clocks.get(&graph_id).cloned().unwrap_or_default();
+        let snapshot = self.db.snapshot();
+        let vector_clock = self.snapshot_vector_clock(&snapshot, graph_id)?;
 
-        // One prefix scan yields both the quads and their dot sets, instead of
-        // an index scan plus a point read per quad.
         let mut quads = Vec::new();
-        self.for_each_stored_quad(graph_id, |quad, dots| {
+        for guard in snapshot.prefix(&self.quads, graph_id.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            if dot_payload_is_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = Self::decode_quad_key(key.as_ref())?;
             quads.push(SnapshotQuadState {
                 subject: self.decode_term_arc(quad.subject)?.as_ref().clone(),
                 predicate: self.decode_term_arc(quad.predicate)?.as_ref().clone(),
                 object: self.decode_term_arc(quad.object)?.as_ref().clone(),
-                dots: decode_dots(dots)?,
+                dots: decode_dots(value.as_ref())?,
             });
-            Ok(())
-        })?;
+        }
 
         Ok(GraphReplicaSnapshot {
             graph: graph.clone(),
@@ -6636,9 +6607,6 @@ impl GraphStore {
     }
 
     pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
-        // Commits publish under this lock, so holding it keeps the scan
-        // from observing a batch that is still being applied.
-        let _indexes = self.indexes_read();
         let Some(graph_id) = self.graph_id_for(graph)? else {
             let empty = *blake3::hash(&[]).as_bytes();
             return Ok((0, empty, empty));
@@ -6647,7 +6615,13 @@ impl GraphStore {
         let mut count = 0u64;
         let mut xor = [0u8; 32];
         let mut sum = [0u8; 32];
-        self.for_each_stored_quad(graph_id, |quad, _dots| {
+        let snapshot = self.db.snapshot();
+        for guard in snapshot.prefix(&self.quads, graph_id.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            if dot_payload_is_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = Self::decode_quad_key(key.as_ref())?;
             let mut hasher = blake3::Hasher::new();
             hasher.update(self.decode_term_arc(quad.subject)?.0.as_bytes());
             hasher.update(&[0]);
@@ -6660,20 +6634,12 @@ impl GraphStore {
                 sum[index] = sum[index].wrapping_add(*byte);
             }
             count += 1;
-            Ok(())
-        })?;
+        }
         Ok((count, xor, sum))
     }
 
     pub fn subject_triple_count_by_ids(&self, graph: TermId, subject: TermId) -> Result<usize> {
-        Ok(self
-            .indexes
-            .read()
-            .unwrap()
-            .by_graph_subject
-            .get(&(graph, subject))
-            .map(HashSet::len)
-            .unwrap_or(0))
+        Ok(self.subject_entries((graph, subject), None)?.len())
     }
 
     /// OR-Set add: stage `add.dot` into the quad's dot set (G1).
@@ -6730,15 +6696,17 @@ impl GraphStore {
         self.read_quad_dots(&Self::quad_key(graph, subject, predicate, object))
     }
 
-    /// Is this exact quad live? O(1) against the derived indexes, committed
-    /// state only — uncommitted batch state is invisible here.
-    pub fn contains_quad(&self, quad: EncodedQuad) -> bool {
-        self.with_derived_indexes(|indexes| {
-            indexes
-                .by_subject
-                .get(&quad.subject)
-                .is_some_and(|entries| entries.contains(&(quad.predicate, quad.object, quad.graph)))
-        })
+    /// Is this exact durable quad live? Uncommitted batch state is invisible.
+    pub fn contains_quad(&self, quad: EncodedQuad) -> Result<bool> {
+        Ok(self
+            .quads
+            .get(Self::quad_key(
+                quad.graph,
+                quad.subject,
+                quad.predicate,
+                quad.object,
+            ))?
+            .is_some_and(|value| !dot_payload_is_empty(value.as_ref())))
     }
 
     /// The token the next FTS queue entry will receive, pinned under the queue
@@ -6782,72 +6750,10 @@ impl GraphStore {
     /// of mixing two execution states.
     fn current_derived_raw_cursor(
         &self,
-        snapshot_seqno: u64,
-        pattern: crate::rdf_read::QuadPattern,
+        _snapshot_seqno: u64,
+        _pattern: crate::rdf_read::QuadPattern,
     ) -> Option<crate::query_cursor::RawQuadCursor> {
-        let uses_predicate_object = matches!(
-            (
-                pattern.graph,
-                pattern.subject,
-                pattern.predicate,
-                pattern.object
-            ),
-            (Some(_), None, Some(_), Some(_))
-        );
-        let uses_object = matches!(
-            (
-                pattern.graph,
-                pattern.subject,
-                pattern.predicate,
-                pattern.object
-            ),
-            (Some(_), None, None, Some(_))
-        );
-        if !uses_predicate_object && !uses_object {
-            return None;
-        }
-
-        self.ensure_derived_indexes();
-        let indexes = self.indexes_read();
-        if self.db.snapshot().seqno() != snapshot_seqno {
-            return None;
-        }
-        let derived = indexes
-            .derived
-            .as_ref()
-            .expect("ensure_derived_indexes initialized the derived index");
-        match (
-            pattern.graph,
-            pattern.subject,
-            pattern.predicate,
-            pattern.object,
-        ) {
-            (Some(graph), None, Some(predicate), Some(object)) => Some(
-                derived
-                    .by_predicate_object
-                    .get(&(predicate, object))
-                    .and_then(|graphs| graphs.get(&graph))
-                    .cloned()
-                    .map(|subjects| {
-                        crate::query_cursor::RawQuadCursor::predicate_object(
-                            subjects, graph, predicate, object,
-                        )
-                    })
-                    .unwrap_or_else(crate::query_cursor::RawQuadCursor::empty),
-            ),
-            (Some(graph), None, None, Some(object)) => Some(
-                derived
-                    .by_object
-                    .get(&object)
-                    .and_then(|graphs| graphs.get(&graph))
-                    .cloned()
-                    .map(|entries| {
-                        crate::query_cursor::RawQuadCursor::object(entries, graph, object)
-                    })
-                    .unwrap_or_else(crate::query_cursor::RawQuadCursor::empty),
-            ),
-            _ => None,
-        }
+        None
     }
 
     pub fn for_each_quad_in_graph<E, F>(
@@ -6859,7 +6765,7 @@ impl GraphStore {
         E: From<StoreError>,
         F: FnMut(EncodedQuad) -> std::result::Result<(), E>,
     {
-        for quad in self.graph_scan(graph, None, None) {
+        for quad in self.graph_scan(graph, None, None)? {
             visit(quad)?;
         }
         Ok(())
@@ -7002,7 +6908,7 @@ impl GraphStore {
         if req.subjects.is_empty() {
             return Ok(());
         }
-        if self.fts_reindex_is_cheaper(req.graph_id, req.subjects.len()) {
+        if self.fts_reindex_is_cheaper(req.graph_id, req.subjects.len())? {
             return self.enqueue_fts_reindex(batch, req.graph_id);
         }
         for subject in req.subjects {
@@ -7023,9 +6929,9 @@ impl GraphStore {
     /// Safe to take the per-subject branch (G7) because callers pass exactly the
     /// subjects their write changed, and orphan-status flips on untouched
     /// subjects are queued separately by the diagnostics settle.
-    fn fts_reindex_is_cheaper(&self, graph_id: TermId, subjects: usize) -> bool {
-        subjects >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD
-            && subjects * 2 >= self.graph_subject_count(graph_id)
+    fn fts_reindex_is_cheaper(&self, graph_id: TermId, subjects: usize) -> Result<bool> {
+        Ok(subjects >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD
+            && subjects * 2 >= self.graph_subject_count(graph_id)?)
     }
 
     pub fn enqueue_fts_reindex(&self, batch: &mut WriteBatch, graph_id: TermId) -> Result<()> {
@@ -7461,27 +7367,55 @@ impl GraphStore {
         self.apply_commit(commit, publish)
     }
 
-    /// Copy a subject's `(predicate, object)` id pairs out of the index,
-    /// dropping `excluded` **while the read lock is held**.
-    ///
-    /// Filtering by term id before anything is decoded means excluding a
-    /// high-cardinality predicate (`hasPart` on a crate root) never copies or
-    /// decodes those entries at all.
+    /// Copy a subject's live `(predicate, object)` ids from the bounded cache
+    /// or the durable GSPO prefix when the cache generation is stale/missing.
     fn subject_entries(
         &self,
         key: (TermId, TermId),
         excluded: Option<TermId>,
-    ) -> Vec<(TermId, TermId)> {
-        // Guards IndexState for the duration of the filtered copy.
-        let indexes = self.indexes_read();
-        let Some(entries) = indexes.by_graph_subject.get(&key) else {
-            return Vec::new();
-        };
-        entries
+    ) -> Result<Vec<(TermId, TermId)>> {
+        let (graph, subject) = key;
+        let generation = self
+            .indexes_read()
+            .generations
+            .get(&graph)
+            .copied()
+            .unwrap_or(0);
+        let cache_key = (graph, subject, generation);
+        let entries =
+            if let Some(entries) = self.indexes_write().quad_subjects.get_cloned(&cache_key) {
+                entries
+            } else {
+                let mut prefix = [0u8; 32];
+                prefix[..16].copy_from_slice(&graph.to_be_bytes());
+                prefix[16..].copy_from_slice(&subject.to_be_bytes());
+                let mut entries = Vec::new();
+                for guard in self.quads.prefix(prefix) {
+                    let (quad_key, value) = guard.into_inner()?;
+                    if dot_payload_is_empty(value.as_ref()) {
+                        continue;
+                    }
+                    let quad = Self::decode_quad_key(quad_key.as_ref())?;
+                    entries.push((quad.predicate, quad.object));
+                }
+                let entries = Arc::new(entries);
+                let mut indexes = self.indexes_write();
+                if indexes.generations.get(&graph).copied().unwrap_or(0) == generation {
+                    indexes.quad_subjects.insert(
+                        cache_key,
+                        Arc::clone(&entries),
+                        entries
+                            .len()
+                            .saturating_mul(2 * std::mem::size_of::<TermId>()),
+                    );
+                }
+                entries
+            };
+        Ok(entries
             .iter()
             .copied()
             .filter(|(predicate, _)| Some(*predicate) != excluded)
-            .collect()
+            .collect())
     }
 
     fn decode_entries(
@@ -7504,7 +7438,7 @@ impl GraphStore {
         graph: TermId,
         subject: TermId,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        self.decode_entries(self.subject_entries((graph, subject), None))
+        self.decode_entries(self.subject_entries((graph, subject), None)?)
     }
 
     pub fn triples_for_subject_excluding_predicate(
@@ -7513,7 +7447,7 @@ impl GraphStore {
         subject: TermId,
         excluded_predicate: TermId,
     ) -> Result<Vec<(EncodedTerm, EncodedTerm)>> {
-        self.decode_entries(self.subject_entries((graph, subject), Some(excluded_predicate)))
+        self.decode_entries(self.subject_entries((graph, subject), Some(excluded_predicate))?)
     }
 
     pub fn count_objects_for_subject_predicate(
@@ -7531,7 +7465,7 @@ impl GraphStore {
         let Some(predicate_id) = self.lookup_term(predicate)? else {
             return Ok(0);
         };
-        Ok(self.count_objects_for_ids(graph_id, subject_id, predicate_id))
+        self.count_objects_for_ids(graph_id, subject_id, predicate_id)
     }
 
     /// One page of the objects of `(graph, subject, predicate)`, in the stable
@@ -7586,21 +7520,31 @@ impl GraphStore {
         Ok((total, objects))
     }
 
-    /// Test-only hook: drop a live quad from the in-memory index without
-    /// touching the store, simulating index drift so tests can prove the next
-    /// commit repairs it.
+    /// Test-only hook that corrupts one bounded subject-cache entry without
+    /// touching durable source state.
     #[cfg(test)]
     fn corrupt_index_for_test(&self, quad: EncodedQuad) {
+        let mut entries = self
+            .subject_entries((quad.graph, quad.subject), None)
+            .unwrap();
+        entries.retain(|entry| *entry != (quad.predicate, quad.object));
         let mut indexes = self.indexes_write();
-        indexes.remove_quad(quad);
+        let generation = indexes.generations.get(&quad.graph).copied().unwrap_or(0);
+        let entries = Arc::new(entries);
+        indexes.quad_subjects.insert(
+            (quad.graph, quad.subject, generation),
+            Arc::clone(&entries),
+            entries
+                .len()
+                .saturating_mul(2 * std::mem::size_of::<TermId>()),
+        );
     }
 
     #[cfg(test)]
     fn index_contains(&self, quad: EncodedQuad) -> bool {
-        self.indexes_read()
-            .by_graph_subject
-            .get(&(quad.graph, quad.subject))
-            .is_some_and(|entries| entries.contains(&(quad.predicate, quad.object)))
+        self.subject_entries((quad.graph, quad.subject), None)
+            .unwrap()
+            .contains(&(quad.predicate, quad.object))
     }
 }
 
@@ -9594,7 +9538,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_queries_use_in_memory_indexes() {
+    fn graph_queries_use_durable_source() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:s"));
@@ -9630,7 +9574,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_indexes_track_commits_incrementally() {
+    fn durable_pattern_reads_track_commits() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:s"));
@@ -9638,7 +9582,7 @@ mod tests {
             EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:p"));
         let object = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:o"));
 
-        // Built before any write: later commits must maintain it in place.
+        // The compatibility entry point must not change durable reads.
         store.ensure_derived_indexes();
 
         let actor = ActorId::random();
@@ -9875,7 +9819,7 @@ mod tests {
         }
         store.commit(batch).unwrap();
 
-        assert_eq!(count, store.graph_subject_count(graph_id));
+        assert_eq!(count, store.graph_subject_count(graph_id).unwrap());
         (graph_id, subjects)
     }
 
@@ -9956,7 +9900,7 @@ mod tests {
         assert_eq!((100, 0), enqueue_and_count(&store, graph_id, &subjects));
     }
 
-    // ── Commit guard and prompt index repair ────────────────────────────
+    // ── Commit guards and cache publication ─────────────────────────────
 
     /// Concurrent adds to one quad must each contribute a distinct dot (G1).
     ///
@@ -10003,6 +9947,166 @@ mod tests {
         let clock = store.get_vector_clock(&graph).unwrap();
         let clocked: u64 = clock.0.values().sum();
         assert_eq!(dots.len() as u64, clocked);
+    }
+
+    #[test]
+    fn global_commit_lock_concurrency() {
+        let (_dir, store) = setup_store();
+        let first = GraphId::new("urn:test:independent-commit:first");
+        let second = GraphId::new("urn:test:independent-commit:second");
+        store.create_graph(&first).unwrap();
+        store.create_graph(&second).unwrap();
+        let first_quad = encode_quad(&store, &first, ("urn:s:1", "urn:p", "urn:o"));
+        let second_quad = encode_quad(&store, &second, ("urn:s:2", "urn:p", "urn:o"));
+        store.set_commit_stall(std::time::Duration::from_millis(200));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                commit_add(&store, &first, first_quad);
+            });
+            scope.spawn(|| {
+                commit_add(&store, &second, second_quad);
+            });
+        });
+
+        assert!(
+            store.commit_stall_max_active() >= 2,
+            "independent durable commits were serialized by one cache lock"
+        );
+        assert_query_index_ready(&store, 2);
+    }
+
+    #[test]
+    fn commit_failure_publishes_no_cache_state() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:failed-commit-cache");
+        store.create_graph(&graph).unwrap();
+        let seeded = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:seeded"));
+        let rejected = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:rejected"));
+        commit_add(&store, &graph, seeded);
+        assert!(store.index_contains(seeded));
+        let generation = store.indexes_read().generations.get(&seeded.graph).copied();
+
+        let _commit_guard = store.graph_commit_guard(&graph);
+        let mut batch = store.new_batch();
+        store
+            .insert_quad(
+                &mut batch,
+                QuadAdd {
+                    quad: rejected,
+                    dot: Dot {
+                        actor: ActorId::random(),
+                        counter: 1,
+                    },
+                },
+            )
+            .unwrap();
+        store.arm_commit_failure();
+        assert!(store.commit(batch).is_err());
+
+        assert_eq!(
+            generation,
+            store.indexes_read().generations.get(&seeded.graph).copied()
+        );
+        assert!(store.index_contains(seeded));
+        assert!(!store.contains_quad(rejected).unwrap());
+    }
+
+    #[test]
+    fn crash_after_durable_commit_rebuilds_cache_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:durable-before-cache");
+        let quad;
+        {
+            let store = GraphStore::open(directory.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+            let actor = ActorId::random();
+            let dot = Dot { actor, counter: 1 };
+            let mut batch = store.new_batch();
+            store
+                .insert_quad(&mut batch, QuadAdd { quad, dot })
+                .unwrap();
+            let mut clock = VectorClock::new();
+            clock.advance(actor, 1);
+            store
+                .set_vector_clock(
+                    &mut batch,
+                    ClockUpdate {
+                        graph_id: quad.graph,
+                        clock: &clock,
+                    },
+                )
+                .unwrap();
+            let WriteBatch {
+                inner,
+                pending_quad_states: _,
+                pending_terms: _,
+                publish,
+                pending_fts,
+            } = batch;
+            let mut durable = DurableCommit {
+                batch: inner,
+                pending_fts,
+            };
+            assert!(store.begin_query_index_commit());
+            store
+                .stage_query_index_maintenance(&mut durable.batch, &publish)
+                .unwrap();
+            store.commit_durable(durable).unwrap();
+            assert!(store.finish_query_index_commit());
+            store.persist().unwrap();
+            // Deliberately omit `indexes.publish(&publish)`: this is the crash
+            // window after durable commit and before cache publication.
+        }
+
+        let reopened = GraphStore::open(directory.path()).unwrap();
+        assert!(reopened.contains_quad(quad).unwrap());
+        assert_eq!(
+            1,
+            reopened
+                .subject_triple_count_by_ids(quad.graph, quad.subject)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn bounded_store_cache_statistics() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:bounded-cache-stats");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+
+        store.triples_for_subject(quad.graph, quad.subject).unwrap();
+        store.triples_for_subject(quad.graph, quad.subject).unwrap();
+        let subject = named("urn:s");
+        let predicate = named("urn:p");
+        for _ in 0..2 {
+            store
+                .objects_page(
+                    GraphSubjectPredicate {
+                        graph: &graph,
+                        subject: &subject,
+                        predicate: &predicate,
+                    },
+                    PageRequest {
+                        cursor: PageCursor::Offset(0),
+                        limit: 1,
+                    },
+                )
+                .unwrap();
+        }
+        store.decode_term_arc(quad.object).unwrap();
+        store.decode_term_arc(quad.object).unwrap();
+
+        for statistics in store.cache_statistics() {
+            assert!(statistics.entries > 0);
+            assert!(statistics.bytes > 0);
+            assert!(statistics.hits > 0);
+            assert!(statistics.misses > 0);
+            assert_eq!(0, statistics.evictions);
+        }
     }
 
     /// The self-guarding store functions take their own guard, so calling them
@@ -10061,11 +10165,10 @@ mod tests {
         }
     }
 
-    /// Prompt-repair proof: a commit that trips the anomaly check rebuilds the
-    /// index from the store before it returns, so unrelated drift is gone by
-    /// the time the caller sees the result — not "at next restart".
+    /// A graph generation change makes every older subject cache entry stale,
+    /// including unrelated entries that were locally corrupted.
     #[test]
-    fn commit_repairs_anomaly() {
+    fn commit_generation_invalidates_corrupt_cache() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:index-anomaly");
         store.create_graph(&graph).unwrap();
@@ -10077,14 +10180,14 @@ mod tests {
         assert!(store.index_contains(removed));
         assert!(store.index_contains(collateral));
 
-        // Simulate drift: both quads vanish from the index while the store
-        // still holds them.
+        // Simulate drift in two subject-cache entries while durable source
+        // still holds both quads.
         store.corrupt_index_for_test(removed);
         store.corrupt_index_for_test(collateral);
         assert!(!store.index_contains(removed));
         assert!(!store.index_contains(collateral));
 
-        // Retracting `removed` makes the index remove find nothing -> anomaly.
+        // Retracting one quad advances the graph generation.
         let mut witnessed = VectorClock::new();
         witnessed.advance(removed_dot.actor, removed_dot.counter);
         let _commit_guard = store.graph_commit_guard(&graph);
@@ -10104,14 +10207,14 @@ mod tests {
 
         assert!(
             store.index_contains(collateral),
-            "the detecting commit must rebuild the index, restoring unrelated drift"
+            "the new generation must reload unrelated cached subjects"
         );
         assert!(
             !store.index_contains(removed),
-            "the rebuilt index must match the store, where the quad is gone"
+            "the new generation must read the durable removal"
         );
-        assert!(!store.contains_quad(removed));
-        assert!(store.contains_quad(collateral));
+        assert!(!store.contains_quad(removed).unwrap());
+        assert!(store.contains_quad(collateral).unwrap());
     }
 
     // ── FTS queue tokens across restarts ────────────────────────────────

@@ -15,6 +15,8 @@
 
 #![warn(unreachable_pub)]
 
+#[path = "internal/cache.rs"]
+mod cache;
 #[path = "internal/core.rs"]
 mod core;
 #[path = "internal/count_exec.rs"]
@@ -824,7 +826,6 @@ pub struct CraqleNode {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
     search_worker: SearchUpdateWorker,
-    _index_warmer: DerivedIndexWarmer,
     sparql: Arc<SparqlEngine>,
     #[cfg(feature = "shacl-core")]
     shacl: Arc<ShaclCompiler>,
@@ -848,32 +849,6 @@ pub struct CraqleNode {
 struct ReindexGate {
     reached: mpsc::Sender<()>,
     go: mpsc::Receiver<()>,
-}
-
-// Joined on drop so the store (and its fjall lock) cannot outlive the node.
-struct DerivedIndexWarmer {
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl DerivedIndexWarmer {
-    fn start(store: &Arc<GraphStore>) -> Self {
-        let store = Arc::downgrade(store);
-        Self {
-            handle: Some(std::thread::spawn(move || {
-                if let Some(store) = store.upgrade() {
-                    store.ensure_derived_indexes();
-                }
-            })),
-        }
-    }
-}
-
-impl Drop for DerivedIndexWarmer {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 /// Configuration used when constructing a [`CraqleNode`].
@@ -1083,9 +1058,6 @@ impl CraqleNode {
         options: CraqleOptions,
     ) -> Self {
         let (actor, sync, remote_policy_authorizer) = options.into_parts();
-        // Cross-graph derived indexes are built off the boot path so the
-        // first multi-graph query does not pay the build under a write lock.
-        let index_warmer = DerivedIndexWarmer::start(&store);
         let search_worker = SearchUpdateWorker::start(store.clone(), search.clone());
         let sparql = Arc::new(SparqlEngine::new(store.clone(), search.clone()));
         #[cfg(feature = "shacl-core")]
@@ -1124,7 +1096,6 @@ impl CraqleNode {
             store,
             search,
             search_worker,
-            _index_warmer: index_warmer,
             sparql,
             #[cfg(feature = "shacl-core")]
             shacl,
@@ -3095,8 +3066,8 @@ impl CraqleNode {
         Ok(self.sparql.query_with_visibility(sparql, &visible)?)
     }
 
-    /// Block until the cross-graph derived indexes are built; they are kept
-    /// up to date incrementally afterwards.
+    /// Compatibility no-op: durable qv indexes are maintained with graph
+    /// commits and source storage remains the fallback authority.
     pub fn ensure_query_indexes(&self) {
         self.store.ensure_derived_indexes();
     }

@@ -1391,12 +1391,14 @@ impl RoCrateManager {
         ) else {
             return Ok(false);
         };
-        Ok(store.contains_quad(EncodedQuad {
-            graph,
-            subject,
-            predicate,
-            object,
-        }))
+        store
+            .contains_quad(EncodedQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            })
+            .map_err(Into::into)
     }
 
     fn upsert_data_entity_incremental(

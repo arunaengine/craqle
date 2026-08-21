@@ -33,8 +33,10 @@ use super::model::{
     NodeKindPlan, PathPlan, SeverityPlan, ShapeId, ShapeKind, TargetPlan,
 };
 use super::resolve::{ResolvedSchema, ResolvedTarget, resolve};
+use crate::cache::BoundedCache;
 
 const CACHE_CAPACITY: usize = 32;
+const CACHE_BYTES: usize = 64 * 1_048_576;
 const EXTENSION_PROFILE: u32 = 0;
 const RUDOF_VERSION: &str = "0.3.10";
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
@@ -69,9 +71,9 @@ struct ValidationCacheKey {
 
 pub(crate) struct ShaclCompiler {
     store: Arc<GraphStore>,
-    cache: Mutex<HashMap<CacheKey, Arc<CompiledSchemaInner>>>,
-    resolved_cache: Mutex<HashMap<[u8; 32], Arc<ResolvedSchema>>>,
-    validation_cache: Mutex<HashMap<ValidationCacheKey, ShaclValidationReport>>,
+    cache: Mutex<BoundedCache<CacheKey, Arc<CompiledSchemaInner>>>,
+    resolved_cache: Mutex<BoundedCache<[u8; 32], Arc<ResolvedSchema>>>,
+    validation_cache: Mutex<BoundedCache<ValidationCacheKey, ShaclValidationReport>>,
 }
 
 struct ValidationTimer<'a> {
@@ -89,9 +91,9 @@ impl ShaclCompiler {
     pub(crate) fn new(store: Arc<GraphStore>) -> Self {
         Self {
             store,
-            cache: Mutex::new(HashMap::new()),
-            resolved_cache: Mutex::new(HashMap::new()),
-            validation_cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, CACHE_BYTES)),
+            resolved_cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, CACHE_BYTES)),
+            validation_cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, CACHE_BYTES)),
         }
     }
 
@@ -108,7 +110,7 @@ impl ShaclCompiler {
             rocrate_version: options.rocrate_version,
             extension_profile: EXTENSION_PROFILE,
         };
-        if let Some(inner) = self.cache().get(&key).cloned() {
+        if let Some(inner) = self.cache().get_cloned(&key) {
             return Ok(CompiledShaclSchema {
                 inner,
                 shape_versions: materialized.graph_versions.into(),
@@ -155,11 +157,8 @@ impl ShaclCompiler {
         )?);
         let compile_time = compile_start.elapsed();
 
-        let mut cache = self.cache();
-        if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&key) {
-            cache.clear();
-        }
-        cache.insert(key, inner.clone());
+        self.cache()
+            .insert(key, inner.clone(), materialized.ntriples.len());
         Ok(CompiledShaclSchema {
             inner,
             shape_versions: materialized.graph_versions.into(),
@@ -173,7 +172,7 @@ impl ShaclCompiler {
         })
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, Arc<CompiledSchemaInner>>> {
+    fn cache(&self) -> std::sync::MutexGuard<'_, BoundedCache<CacheKey, Arc<CompiledSchemaInner>>> {
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -188,16 +187,14 @@ impl ShaclCompiler {
             .resolved_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(resolved) = cache.get(&fingerprint) {
-            return Ok((resolved.clone(), true, std::time::Duration::ZERO));
+        if let Some(resolved) = cache.get_cloned(&fingerprint) {
+            return Ok((resolved, true, std::time::Duration::ZERO));
         }
         let start = Instant::now();
         let resolved = Arc::new(resolve(&self.store, schema.inner.clone())?);
         let resolve_time = start.elapsed();
-        if cache.len() >= CACHE_CAPACITY {
-            cache.clear();
-        }
-        cache.insert(fingerprint, resolved.clone());
+        let bytes = resolved.shapes.len().saturating_mul(4_096).max(1);
+        cache.insert(fingerprint, resolved.clone(), bytes);
         Ok((resolved, false, resolve_time))
     }
 
@@ -380,8 +377,7 @@ impl ShaclCompiler {
             Some(report) => Some(report),
             None => self
                 .validation_cache()
-                .get(&self.validation_cache_key(&base, data_graph, schema, options)?)
-                .cloned(),
+                .get_cloned(&self.validation_cache_key(&base, data_graph, schema, options)?),
         };
         let base_available = base_report.is_some();
         let estimate =
@@ -451,7 +447,7 @@ impl ShaclCompiler {
             None => {
                 let base_cache_key =
                     self.validation_cache_key(&base, data_graph, schema, options)?;
-                if let Some(report) = self.validation_cache().get(&base_cache_key).cloned() {
+                if let Some(report) = self.validation_cache().get_cloned(&base_cache_key) {
                     report
                 } else {
                     let report = match eval::validate_view(
@@ -812,18 +808,18 @@ impl ShaclCompiler {
 
     fn validation_cache(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ValidationCacheKey, ShaclValidationReport>> {
+    ) -> std::sync::MutexGuard<'_, BoundedCache<ValidationCacheKey, ShaclValidationReport>> {
         self.validation_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn cache_validation(&self, key: ValidationCacheKey, report: ShaclValidationReport) {
+        let bytes = postcard::to_allocvec(&report)
+            .map(|encoded| encoded.len())
+            .unwrap_or(CACHE_BYTES);
         let mut cache = self.validation_cache();
-        if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&key) {
-            cache.clear();
-        }
-        cache.insert(key, report);
+        cache.insert(key, report, bytes);
     }
 
     pub(crate) fn seed_validation_report(
