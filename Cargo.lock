@@ -2250,7 +2250,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.1.3"
-source = "git+https://github.com/arunaengine/irokle.git?branch=main#ebd4abd142f66816a16492c615525809f6c8b663"
+source = "git+https://github.com/arunaengine/irokle.git?rev=ebd4abd142f66816a16492c615525809f6c8b663#ebd4abd142f66816a16492c615525809f6c8b663"
 dependencies = [
  "blake3",
  "bytes",
@@ -2270,7 +2270,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?branch=main#ebd4abd142f66816a16492c615525809f6c8b663"
+source = "git+https://github.com/arunaengine/irokle.git?rev=ebd4abd142f66816a16492c615525809f6c8b663#ebd4abd142f66816a16492c615525809f6c8b663"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3534,8 +3534,7 @@ dependencies = [
 [[package]]
 name = "prefixmap"
 version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efab5bb582c2ce5e6575d39ff9d52e7a94ac5d76bb8f682aff21a20920dc5d91"
+source = "git+https://github.com/arunaengine/rudof.git?rev=4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7#4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7"
 dependencies = [
  "colored",
  "indexmap",
@@ -4056,6 +4055,7 @@ dependencies = [
 [[package]]
 name = "ro-crate-rs"
 version = "0.6.0"
+source = "git+https://github.com/arunaengine/ro-crate-rs.git?rev=71c891374785827f5e819cdcc7dfae64f31be0fc#71c891374785827f5e819cdcc7dfae64f31be0fc"
 dependencies = [
  "chrono",
  "dirs",
@@ -4076,8 +4076,7 @@ dependencies = [
 [[package]]
 name = "rudof_config"
 version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bcc1c906f8782d74a88d745343a7945f1d814f3a185df44bec4992e39e5e417"
+source = "git+https://github.com/arunaengine/rudof.git?rev=4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7#4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7"
 dependencies = [
  "dirs",
  "serde",
@@ -4088,8 +4087,7 @@ dependencies = [
 [[package]]
 name = "rudof_iri"
 version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb558a7b3208da242c5ace51453f72a1bb4226e07463adcd222e89e0f43f8ce5"
+source = "git+https://github.com/arunaengine/rudof.git?rev=4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7#4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7"
 dependencies = [
  "getrandom 0.3.4",
  "indexmap",
@@ -4105,8 +4103,7 @@ dependencies = [
 [[package]]
 name = "rudof_rdf"
 version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81c5abbee907488e11b39054e804b48fd6e8a23293fcac0c5d52fe33cf31e874"
+source = "git+https://github.com/arunaengine/rudof.git?rev=4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7#4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7"
 dependencies = [
  "colored",
  "const_format",
@@ -4522,6 +4519,7 @@ dependencies = [
 [[package]]
 name = "shacl"
 version = "0.3.8"
+source = "git+https://github.com/arunaengine/rudof.git?rev=4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7#4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7"
 dependencies = [
  "anyhow",
  "dashmap",

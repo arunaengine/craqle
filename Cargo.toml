@@ -38,19 +38,13 @@ tracing = "0.1.44"
 tokio = "1.53.1"
 
 # RO-Crate implementation
-rocraters = { package = "ro-crate-rs", git = "https://github.com/intbio-ncl/ro-crate-rs.git", tag = "v0.6.0", features = [
+rocraters = { package = "ro-crate-rs", git = "https://github.com/arunaengine/ro-crate-rs.git", rev = "71c891374785827f5e819cdcc7dfae64f31be0fc", features = [
     "rdf",
 ] }
 
 # Testing
 proptest = "1.11.0"
 tempfile = "3.27.0"
-
-[patch."https://github.com/intbio-ncl/ro-crate-rs.git"]
-ro-crate-rs = { path = "vendor/ro-crate-rs-0.6.0" }
-
-[patch.crates-io]
-shacl = { path = "vendor/shacl-0.3.8" }
 
 [package]
 name = "craqle"
@@ -74,7 +68,7 @@ shacl-core = [
 blake3 = { workspace = true }
 chrono = { workspace = true }
 fjall = { workspace = true }
-irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f66816a16492c615525809f6c8b663", features = [
     "fjall",
 ] }
 oxrdf = { workspace = true }
@@ -83,9 +77,9 @@ oxsdatatypes = { workspace = true, optional = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
 regex = { workspace = true, optional = true }
-shacl = { version = "=0.3.8", default-features = false, optional = true }
-rudof_rdf = { version = "=0.3.8", default-features = false, optional = true }
-rudof_iri = { version = "=0.3.8", default-features = false, optional = true }
+shacl = { git = "https://github.com/arunaengine/rudof.git", rev = "4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7", default-features = false, optional = true }
+rudof_rdf = { git = "https://github.com/arunaengine/rudof.git", rev = "4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7", default-features = false, optional = true }
+rudof_iri = { git = "https://github.com/arunaengine/rudof.git", rev = "4c24dcaaa27ea893ebb9b110ea311ebb0609d0e7", default-features = false, optional = true }
 serde_json = { workspace = true }
 spargebra = { workspace = true }
 spareval = { workspace = true }
