@@ -180,7 +180,7 @@ impl Fixture {
         Self::load(BenchConfig::from_environment())
     }
 
-    fn load(config: BenchConfig) -> Self {
+    pub fn load(config: BenchConfig) -> Self {
         let database = tempfile::tempdir().expect("create benchmark temporary database");
         let node = CraqleNode::open_with_options(
             database.path(),
@@ -511,6 +511,28 @@ impl Fixture {
             .get(index)
             .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"))
             .label
+    }
+
+    pub fn hot_path_query(&self, index: usize) -> &str {
+        &self
+            .cases
+            .get(index)
+            .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"))
+            .sparql
+    }
+
+    pub fn hot_path_is_unordered_limit(&self, index: usize) -> bool {
+        matches!(
+            self.cases
+                .get(index)
+                .unwrap_or_else(|| panic!("unknown hot-path benchmark case {index}"))
+                .kind,
+            QueryKind::SelectLimit
+        )
+    }
+
+    pub fn visible_graphs(&self) -> &[GraphId] {
+        &self.visible_graphs
     }
 
     /// Runs one full public query call. The current API returns fully collected
@@ -964,7 +986,7 @@ fn query_cases(terms: &QueryTerms) -> Vec<QueryCase> {
     ]
 }
 
-fn graph_id(index: usize) -> GraphId {
+pub fn graph_id(index: usize) -> GraphId {
     GraphId::new(&format!(
         "urn:craqle:bench:performance-corpus-v1:graph:{index}"
     ))
@@ -984,13 +1006,13 @@ fn hash_frame(hasher: &mut blake3::Hasher, domain: &[u8], value: &[u8]) {
     hasher.update(value);
 }
 
-fn subject_term(subject: u64) -> EncodedTerm {
+pub fn subject_term(subject: u64) -> EncodedTerm {
     EncodedTerm(format!(
         "<urn:craqle:bench:performance-corpus-v1:subject:{subject:016x}>"
     ))
 }
 
-fn predicate_term(predicate: PredicateKind) -> EncodedTerm {
+pub fn predicate_term(predicate: PredicateKind) -> EncodedTerm {
     match predicate {
         PredicateKind::Type => {
             EncodedTerm("<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_string())
@@ -1007,7 +1029,7 @@ fn predicate_term(predicate: PredicateKind) -> EncodedTerm {
     }
 }
 
-fn object_term(object: ObjectSpec) -> EncodedTerm {
+pub fn object_term(object: ObjectSpec) -> EncodedTerm {
     match object {
         ObjectSpec::Iri(value) => EncodedTerm(format!(
             "<urn:craqle:bench:performance-corpus-v1:object:{value:016x}>"

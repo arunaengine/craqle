@@ -702,6 +702,7 @@ dependencies = [
  "globset",
  "iroh",
  "irokle",
+ "oxigraph",
  "oxjsonld",
  "oxrdf",
  "oxsdatatypes",

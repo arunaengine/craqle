@@ -102,6 +102,7 @@ criterion = "0.8.2"
 proptest = { workspace = true }
 tempfile = { workspace = true }
 iroh = "1.0.3"
+oxigraph = { version = "=0.5.9", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
@@ -149,4 +150,8 @@ harness = false
 
 [[bench]]
 name = "sparql_access_path_scaling"
+harness = false
+
+[[bench]]
+name = "oxigraph_comparison"
 harness = false
