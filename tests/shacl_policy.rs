@@ -547,7 +547,7 @@ fn shacl_policy_snapshot() {
 }
 
 #[test]
-fn policy_calls_serialize() {
+fn status_reads_release_binding_lock_before_authorization() {
     let (_directory, node) = node();
     let node = Arc::new(node);
     let data = GraphId::new("urn:test:shacl-policy:locked-data");
@@ -610,11 +610,12 @@ fn policy_calls_serialize() {
             done_tx.send(()).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("policy update stayed blocked behind status authorization");
+        update.join().unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(status.join().unwrap().len(), 1);
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        update.join().unwrap();
     }
 }
 
