@@ -74,6 +74,17 @@ pub(crate) struct ShaclCompiler {
     validation_cache: Mutex<HashMap<ValidationCacheKey, ShaclValidationReport>>,
 }
 
+struct ValidationTimer<'a> {
+    store: &'a GraphStore,
+    started: Instant,
+}
+
+impl Drop for ValidationTimer<'_> {
+    fn drop(&mut self) {
+        self.store.record_validation(self.started.elapsed());
+    }
+}
+
 impl ShaclCompiler {
     pub(crate) fn new(store: Arc<GraphStore>) -> Self {
         Self {
@@ -243,6 +254,12 @@ impl ShaclCompiler {
         options: &ShaclValidationOptions,
         stop_after_first: bool,
     ) -> Result<ShaclValidationReport> {
+        #[cfg(test)]
+        let _validation_probe = self.store.validation_probe();
+        let _validation_timer = ValidationTimer {
+            store: &self.store,
+            started: Instant::now(),
+        };
         if options.execution_mode == ShaclExecutionMode::ForceDelta {
             return Err(ShaclError::DeltaExecutionUnavailable {
                 reason: "a candidate change set was not supplied".to_owned(),
@@ -325,6 +342,12 @@ impl ShaclCompiler {
         options: &ShaclValidationOptions,
         base_report: Option<ShaclValidationReport>,
     ) -> Result<ShaclValidationReport> {
+        #[cfg(test)]
+        let _validation_probe = self.store.validation_probe();
+        let _validation_timer = ValidationTimer {
+            store: &self.store,
+            started: Instant::now(),
+        };
         if options.cancellation.is_cancelled() {
             return Err(ShaclError::ValidationCancelled.into());
         }
@@ -1346,7 +1369,7 @@ fn visit_shape_graph(
     stack.push(graph.to_string());
     let snapshot = store.graph_snapshot(graph)?;
     reject_unsupported_raw(&snapshot)?;
-    let imports = imports(&snapshot)?;
+    let imports = imports(store, graph)?;
     for import in imports {
         if !options.allow_local_imports {
             return Err(ShaclError::ImportsDisabled {
@@ -1370,16 +1393,25 @@ fn visit_shape_graph(
     Ok(())
 }
 
-fn imports(snapshot: &GraphReplicaSnapshot) -> Result<Vec<String>> {
+fn imports(store: &GraphStore, graph: &GraphId) -> Result<Vec<String>> {
+    let view = StoreReadView::new(store);
+    let context = ReadContext::for_validation(crate::QueryCancellation::new(), graph);
+    let graph_id = hash_term(&EncodedTerm::from_named_node(&graph.0));
+    let imports_id = hash_term(&EncodedTerm(OWL_IMPORTS.to_owned()));
     let mut imports = Vec::new();
-    for quad in &snapshot.quads {
-        if quad.predicate.0 != OWL_IMPORTS {
-            continue;
-        }
-        let Some(import) = named_iri(&quad.object) else {
+    for quad in view.scan(
+        &context,
+        GraphSelector::Named(graph_id),
+        QuadPattern {
+            predicate: Some(imports_id),
+            ..QuadPattern::default()
+        },
+    )? {
+        let object = view.decode_term(&context, quad?.object)?;
+        let Some(import) = named_iri(&object) else {
             return Err(ShaclError::IllFormedShapes {
-                graph: snapshot.graph.to_string(),
-                message: format!("owl:imports object must be an IRI, got {}", quad.object.0),
+                graph: graph.to_string(),
+                message: format!("owl:imports object must be an IRI, got {}", object.0),
             }
             .into());
         };

@@ -58,13 +58,15 @@ use std::panic;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
 };
 #[cfg(feature = "shacl-core")]
-use crate::rdf_read::StoreReadView;
+use crate::query_context::ReadContext;
+#[cfg(feature = "shacl-core")]
+use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::replication::ReplicationEngine;
 use crate::rocrate::RoCrateManager;
 use crate::search::SearchIndex;
@@ -72,6 +74,8 @@ use crate::search::SearchIndex;
 use crate::shacl_impl::ShaclCompiler;
 use crate::sparql::SparqlEngine;
 use crate::store::GraphStore;
+#[cfg(feature = "shacl-core")]
+use crate::store::hash_term;
 use oxrdf::{NamedNode, Term};
 
 pub use crate::core::{
@@ -89,10 +93,12 @@ pub use crate::rocrate::{
 pub use crate::search::SearchHit;
 #[cfg(feature = "shacl-core")]
 pub use crate::shacl::{
-    CompiledShaclSchema, ShaclBinding, ShaclBindingOptions, ShaclBindingStatus,
-    ShaclCompileOptions, ShaclCompileStatistics, ShaclError, ShaclExecutionMode, ShaclMessage,
-    ShaclProfile, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
-    ShaclValidationState, ShaclValidationStatistics, ValidationPolicy,
+    CompiledShaclSchema, PendingReplayFailure, PendingReplayOutcome, PendingReplayPolicy,
+    PendingReplayStatistics, PendingShaclQueueStatus, SHACL_COMPILER_MODEL_VERSION, ShaclBinding,
+    ShaclBindingOptions, ShaclBindingStatus, ShaclCompileOptions, ShaclCompileStatistics,
+    ShaclError, ShaclExecutionMode, ShaclMessage, ShaclProfile, ShaclRuntimeStatistics,
+    ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult, ShaclValidationState,
+    ShaclValidationStatistics, ValidationPolicy,
 };
 pub use crate::sparql::{
     PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
@@ -631,6 +637,8 @@ pub struct CraqleNode {
     sparql: Arc<SparqlEngine>,
     #[cfg(feature = "shacl-core")]
     shacl: Arc<ShaclCompiler>,
+    #[cfg(feature = "shacl-core")]
+    startup_pending_replay: PendingReplayOutcome,
     replication: Arc<ReplicationEngine>,
     local_replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
@@ -680,6 +688,8 @@ pub struct CraqleOptions {
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
     search_storage: SearchStorage,
     graph_store_persist_mode: CraqleFjallPersistMode,
+    #[cfg(feature = "shacl-core")]
+    pending_replay_policy: PendingReplayPolicy,
 }
 
 /// Storage backend used for the full-text search index.
@@ -697,6 +707,8 @@ impl Default for CraqleOptions {
             sync: None,
             search_storage: SearchStorage::default(),
             graph_store_persist_mode: CraqleFjallPersistMode::default(),
+            #[cfg(feature = "shacl-core")]
+            pending_replay_policy: PendingReplayPolicy::default(),
         }
     }
 }
@@ -723,6 +735,12 @@ impl CraqleOptions {
 
     pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
         self.graph_store_persist_mode
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn with_pending_replay_policy(mut self, policy: PendingReplayPolicy) -> Self {
+        self.pending_replay_policy = policy;
+        self
     }
 
     pub fn with_irokle<S: irokle::Storage>(
@@ -783,6 +801,8 @@ impl CraqleNode {
         std::fs::create_dir_all(root)?;
         let search_storage = options.search_storage;
         let graph_store_persist_mode = options.graph_store_persist_mode;
+        #[cfg(feature = "shacl-core")]
+        let pending_replay_policy = options.pending_replay_policy;
 
         let store = Arc::new(GraphStore::open_with_persist_mode(
             root.join("store"),
@@ -794,10 +814,48 @@ impl CraqleNode {
         });
         let search_needs_rebuild =
             search.needs_rebuild() || search_storage == SearchStorage::Memory;
-        let node = Self::from_store_and_search(store, search.clone(), options);
+        #[allow(unused_mut)]
+        let mut node = Self::from_store_and_search(store, search.clone(), options);
         reconcile_at_open(&node)?;
         #[cfg(feature = "shacl-core")]
-        node.replication.replay_pending_bindings()?;
+        {
+            let startup_started = Instant::now();
+            let mut outcome = PendingReplayOutcome::default();
+            if node.store.pending_shacl_queue_repair_required()? {
+                let repair = {
+                    let _binding_guard = node.store.binding_guard();
+                    node.store.repair_pending_shacl_queue()?
+                };
+                node.persist_fjall()?;
+                outcome.statistics.binding_records_scanned = repair.binding_records_scanned;
+                outcome.statistics.pending_queue_entries_scanned =
+                    repair.pending_queue_entries_scanned;
+            }
+            let replay = match pending_replay_policy {
+                PendingReplayPolicy::ReplayAllBeforeOpen => Some(
+                    node.replication
+                        .replay_pending_bindings_bounded(usize::MAX, None)?,
+                ),
+                PendingReplayPolicy::ReplayBounded {
+                    max_graphs,
+                    max_elapsed,
+                } => Some(
+                    node.replication
+                        .replay_pending_bindings_bounded(max_graphs, Some(max_elapsed))?,
+                ),
+                PendingReplayPolicy::Defer => None,
+            };
+            if let Some(replay) = replay {
+                outcome.statistics.pending_queue_entries_scanned +=
+                    replay.statistics.pending_queue_entries_scanned;
+                outcome.statistics.graphs_settled = replay.statistics.graphs_settled;
+                outcome.statistics.reports_produced = replay.statistics.reports_produced;
+                outcome.failures = replay.failures;
+                outcome.budget_exhausted = replay.budget_exhausted;
+            }
+            outcome.statistics.elapsed = startup_started.elapsed();
+            node.startup_pending_replay = outcome;
+        }
         if search_needs_rebuild {
             node.schedule_full_search_reindex()?;
         }
@@ -855,6 +913,8 @@ impl CraqleNode {
             sparql,
             #[cfg(feature = "shacl-core")]
             shacl,
+            #[cfg(feature = "shacl-core")]
+            startup_pending_replay: PendingReplayOutcome::default(),
             replication,
             local_replication,
             sync,
@@ -875,7 +935,6 @@ impl CraqleNode {
         shapes_graph: &GraphId,
         options: &ShaclCompileOptions,
     ) -> Result<CompiledShaclSchema> {
-        let _binding_guard = self.store.binding_guard();
         self.authorize_shape_graphs(auth, shapes_graph)?;
         let schema = self.shacl.compile(shapes_graph, options)?;
         self.authorize_shape_versions(auth, schema.shape_versions())?;
@@ -922,7 +981,6 @@ impl CraqleNode {
         if binding.policy != ValidationPolicy::Disabled {
             self.ensure_graph_action(&binding.data_graph, auth, Action::Read)?;
         }
-        let _binding_guard = self.store.binding_guard();
         self.authorize_shape_graphs(auth, &binding.shapes_graph)?;
         if !self.store.contains_graph(&binding.data_graph)? {
             return Err(store::StoreError::GraphNotFound(binding.data_graph.to_string()).into());
@@ -930,22 +988,23 @@ impl CraqleNode {
         if !self.store.contains_graph(&binding.shapes_graph)? {
             return Err(store::StoreError::GraphNotFound(binding.shapes_graph.to_string()).into());
         }
-        let status = if binding.policy == ValidationPolicy::Disabled {
+        let mut completed = None;
+        for _ in 0..3 {
+            let data_version = self.store.graph_version_digest(&binding.data_graph)?;
             let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
-            ShaclBindingStatus {
-                binding: binding.clone(),
-                state: ShaclValidationState::Pending,
-                report: None,
-                error: None,
-                data_version: self.store.graph_version_digest(&binding.data_graph)?,
-                shapes_version,
-                schema_fingerprint: [0; 32],
-                shape_versions: vec![(binding.shapes_graph.clone(), shapes_version)],
-            }
-        } else {
-            let mut completed = None;
-            for _ in 0..3 {
-                let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
+            let status = if binding.policy == ValidationPolicy::Disabled {
+                ShaclBindingStatus {
+                    binding: binding.clone(),
+                    state: ShaclValidationState::Pending,
+                    report: None,
+                    error: None,
+                    data_version,
+                    shapes_version,
+                    schema_fingerprint: [0; 32],
+                    compiler_model_version: SHACL_COMPILER_MODEL_VERSION,
+                    shape_versions: vec![(binding.shapes_graph.clone(), shapes_version)],
+                }
+            } else {
                 let schema = self.shacl.compile(
                     &binding.shapes_graph,
                     &binding.validation_options.compile_options(),
@@ -957,30 +1016,35 @@ impl CraqleNode {
                     &binding.validation_options.validation_options(),
                     false,
                 )?;
-                if self.store.graph_version_digest(&binding.shapes_graph)? == shapes_version
-                    && self.shacl.versions_are_current(schema.shape_versions())?
-                {
-                    completed = Some(ShaclBindingStatus {
-                        binding: binding.clone(),
-                        state: if report.conforms {
-                            ShaclValidationState::Valid
-                        } else {
-                            ShaclValidationState::Invalid
-                        },
-                        report: Some(report),
-                        error: None,
-                        data_version: self.store.graph_version_digest(&binding.data_graph)?,
-                        shapes_version,
-                        schema_fingerprint: schema.plan_fingerprint(),
-                        shape_versions: schema.shape_versions().to_vec(),
-                    });
-                    break;
+                ShaclBindingStatus {
+                    binding: binding.clone(),
+                    state: if report.conforms {
+                        ShaclValidationState::Valid
+                    } else {
+                        ShaclValidationState::Invalid
+                    },
+                    report: Some(report),
+                    error: None,
+                    data_version,
+                    shapes_version,
+                    schema_fingerprint: schema.plan_fingerprint(),
+                    compiler_model_version: SHACL_COMPILER_MODEL_VERSION,
+                    shape_versions: schema.shape_versions().to_vec(),
                 }
+            };
+            let binding_guard = self.store.binding_guard();
+            if self.store.graph_version_digest(&binding.data_graph)? == data_version
+                && self.store.graph_version_digest(&binding.shapes_graph)? == shapes_version
+                && self.shacl.versions_are_current(&status.shape_versions)?
+            {
+                completed = Some((binding_guard, status));
+                break;
             }
+        }
+        let (_binding_guard, status) =
             completed.ok_or_else(|| ShaclError::SchemaChangedDuringValidation {
                 graph: binding.shapes_graph.to_string(),
-            })?
-        };
+            })?;
         let mut batch = self.store.new_batch();
         self.store.stage_binding_status(&mut batch, &status)?;
         self.store.commit(batch)?;
@@ -1025,12 +1089,19 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         data_graph: &GraphId,
     ) -> Result<Vec<ShaclBindingStatus>> {
-        let _commit_guard = self.store.graph_commit_guard(data_graph);
         self.ensure_graph_action(data_graph, auth, Action::Read)?;
-        let _binding_guard = self.store.binding_guard();
-        let mut statuses = self.store.shacl_binding_statuses(data_graph)?;
+        let mut statuses = {
+            let _binding_guard = self.store.binding_guard();
+            self.store.shacl_binding_statuses(data_graph)?
+        };
+        let mut version_checks = 0u64;
         for status in &mut statuses {
-            self.authorize_shape_graphs(auth, &status.binding.shapes_graph)?;
+            self.ensure_graph_action(&status.binding.shapes_graph, auth, Action::Read)?;
+            for (graph, _) in &status.shape_versions {
+                if graph != &status.binding.shapes_graph {
+                    self.ensure_graph_action(graph, auth, Action::Read)?;
+                }
+            }
             if status.binding.policy == ValidationPolicy::Disabled {
                 if matches!(
                     status.state,
@@ -1042,39 +1113,78 @@ impl CraqleNode {
                 }
                 continue;
             }
-            let schema = match self.shacl.compile(
-                &status.binding.shapes_graph,
-                &status.binding.validation_options.compile_options(),
-            ) {
-                Ok(schema) => schema,
-                Err(error) => {
-                    status.state = ShaclValidationState::Failed;
-                    status.report = None;
-                    status.error = Some(error.to_string());
-                    continue;
-                }
-            };
-            self.authorize_shape_versions(auth, schema.shape_versions())?;
+            version_checks += 1 + status.shape_versions.len() as u64;
+            let root_recorded = status.shape_versions.iter().any(|(graph, version)| {
+                graph == &status.binding.shapes_graph && *version == status.shapes_version
+            });
             let current = self.store.contains_graph(&status.binding.data_graph)?
-                && self.store.contains_graph(&status.binding.shapes_graph)?
                 && status.data_version
                     == self
                         .store
                         .graph_version_digest(&status.binding.data_graph)?
-                && status.shapes_version
-                    == self
-                        .store
-                        .graph_version_digest(&status.binding.shapes_graph)?
-                && status.schema_fingerprint == schema.plan_fingerprint()
-                && status.shape_versions.as_slice() == schema.shape_versions()
-                && self.shacl.versions_are_current(schema.shape_versions())?;
+                && root_recorded
+                && status.compiler_model_version == SHACL_COMPILER_MODEL_VERSION
+                && self.shacl.versions_are_current(&status.shape_versions)?;
             if !current {
                 status.state = ShaclValidationState::Pending;
                 status.report = None;
                 status.error = None;
             }
         }
+        self.store
+            .record_status_read(statuses.len() as u64, version_checks);
         Ok(statuses)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn startup_pending_replay(&self) -> &PendingReplayOutcome {
+        &self.startup_pending_replay
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn pending_shacl_queue(&self) -> Result<Vec<GraphId>> {
+        Ok(self.store.pending_shacl_queue()?)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn pending_shacl_queue_status(&self) -> Result<PendingShaclQueueStatus> {
+        let runtime = self.store.shacl_runtime_statistics();
+        Ok(PendingShaclQueueStatus {
+            pending_count: self.store.pending_shacl_count()?,
+            settlement_failures: runtime.settlement_failures,
+        })
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn replay_pending_shacl(
+        &self,
+        max_graphs: usize,
+        max_elapsed: Duration,
+    ) -> Result<PendingReplayOutcome> {
+        Ok(self
+            .replication
+            .replay_pending_bindings_bounded(max_graphs, Some(max_elapsed))?)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn repair_pending_shacl_queue(&self) -> Result<PendingReplayStatistics> {
+        let started = Instant::now();
+        let repair = {
+            let _binding_guard = self.store.binding_guard();
+            self.store.repair_pending_shacl_queue()?
+        };
+        self.persist_fjall()?;
+        Ok(PendingReplayStatistics {
+            binding_records_scanned: repair.binding_records_scanned,
+            pending_queue_entries_scanned: repair.pending_queue_entries_scanned,
+            elapsed: started.elapsed(),
+            ..PendingReplayStatistics::default()
+        })
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub fn shacl_runtime_statistics(&self) -> ShaclRuntimeStatistics {
+        self.store.shacl_runtime_statistics()
     }
 
     #[cfg(feature = "shacl-core")]
@@ -1140,6 +1250,9 @@ impl CraqleNode {
     fn authorize_shape_graphs(&self, auth: &dyn Authorizer, shapes_graph: &GraphId) -> Result<()> {
         const OWL_IMPORTS: &str = "<http://www.w3.org/2002/07/owl#imports>";
 
+        let view = StoreReadView::new(&self.store);
+        let context = ReadContext::for_validation(QueryCancellation::new(), shapes_graph);
+        let imports_id = hash_term(&EncodedTerm(OWL_IMPORTS.to_owned()));
         let mut pending = vec![shapes_graph.clone()];
         let mut visited = HashSet::new();
         while let Some(graph) = pending.pop() {
@@ -1147,18 +1260,24 @@ impl CraqleNode {
                 continue;
             }
             self.ensure_graph_action(&graph, auth, Action::Read)?;
-            if !self.store.contains_graph(&graph)? {
+            if !view.contains_graph(&graph)? {
                 continue;
             }
-            for quad in self.store.graph_snapshot(&graph)?.quads {
-                if quad.predicate.0 != OWL_IMPORTS {
-                    continue;
-                }
-                let Some(import) = quad.object.to_named_node() else {
+            let graph_id = hash_term(&EncodedTerm::from_named_node(&graph.0));
+            for quad in view.scan(
+                &context,
+                GraphSelector::Named(graph_id),
+                QuadPattern {
+                    predicate: Some(imports_id),
+                    ..QuadPattern::default()
+                },
+            )? {
+                let object = view.decode_term(&context, quad?.object)?;
+                let Some(import) = object.to_named_node() else {
                     continue;
                 };
                 let imported = GraphId::new(import.as_str());
-                if self.store.contains_graph(&imported)? {
+                if view.contains_graph(&imported)? {
                     pending.push(imported);
                 }
             }
@@ -2040,19 +2159,6 @@ impl CraqleNode {
             .replication
             .local_apply_changes_bulk_unchecked(graph, changes)?;
         self.finish_batch(graph, batch)
-    }
-
-    /// Benchmark-only deferred bulk fixture loading.
-    #[cfg(feature = "bench-internals")]
-    #[doc(hidden)]
-    pub fn apply_bulk_deferred(
-        &self,
-        graph: &GraphId,
-        changes: Vec<CoreMaterializedQuadChange>,
-    ) -> Result<Batch> {
-        Ok(self
-            .replication
-            .local_apply_changes_bulk_unchecked(graph, changes)?)
     }
 
     /// Rebuild graph diagnostics from the current visible graph state.
@@ -3108,6 +3214,392 @@ mod tests {
                 permission_paths: vec!["/t/x".to_string()],
             },
         )
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn shacl_change(
+        graph: &GraphId,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> MaterializedQuadChange {
+        MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: EncodedTerm(format!("<{subject}>")),
+            predicate: EncodedTerm(format!("<{predicate}>")),
+            object: EncodedTerm(format!("<{object}>")),
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn independent_graph_ids(prefix: &str, count: usize) -> Vec<GraphId> {
+        let mut used = HashSet::new();
+        let mut graphs = Vec::new();
+        let mut candidate = 0usize;
+        while graphs.len() < count {
+            let graph = GraphId::new(&format!("urn:test:{prefix}:data:{candidate}"));
+            let shard = (store::hash_term(&EncodedTerm::from_named_node(&graph.0)).0 as usize) % 64;
+            if used.insert(shard) {
+                graphs.push(graph);
+            }
+            candidate += 1;
+        }
+        graphs
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn bound_policy_graphs(
+        node: &CraqleNode,
+        prefix: &str,
+        count: usize,
+        policy: ValidationPolicy,
+    ) -> Vec<(GraphId, String)> {
+        let data_graphs = independent_graph_ids(prefix, count);
+        let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let sh_node = "http://www.w3.org/ns/shacl#NodeShape";
+        let sh_property_shape = "http://www.w3.org/ns/shacl#PropertyShape";
+        let sh_target = "http://www.w3.org/ns/shacl#targetNode";
+        let sh_property = "http://www.w3.org/ns/shacl#property";
+        let sh_path = "http://www.w3.org/ns/shacl#path";
+        let sh_min_count = "http://www.w3.org/ns/shacl#minCount";
+        let xsd_integer = "http://www.w3.org/2001/XMLSchema#integer";
+        let mut result = Vec::new();
+        for (index, data) in data_graphs.into_iter().enumerate() {
+            let shapes = GraphId::new(&format!("urn:test:{prefix}:shapes:{index}"));
+            let focus = format!("urn:test:{prefix}:focus:{index}");
+            let shape = format!("urn:test:{prefix}:shape:{index}");
+            let property = format!("urn:test:{prefix}:property:{index}");
+            node.apply_changes_unchecked(
+                &data,
+                vec![shacl_change(
+                    &data,
+                    &focus,
+                    "urn:test:unrelated-seed",
+                    "urn:test:seed",
+                )],
+            )
+            .unwrap();
+            let mut shape_changes = vec![
+                shacl_change(&shapes, &shape, rdf_type, sh_node),
+                shacl_change(&shapes, &shape, sh_target, &focus),
+                shacl_change(&shapes, &shape, sh_property, &property),
+                shacl_change(&shapes, &property, rdf_type, sh_property_shape),
+                shacl_change(&shapes, &property, sh_path, "urn:test:required-value"),
+            ];
+            shape_changes.push(MaterializedQuadChange::Insert {
+                graph: shapes.clone(),
+                subject: EncodedTerm(format!("<{property}>")),
+                predicate: EncodedTerm(format!("<{sh_min_count}>")),
+                object: EncodedTerm(format!("\"1\"^^<{xsd_integer}>")),
+            });
+            node.apply_changes_unchecked(&shapes, shape_changes)
+                .unwrap();
+            node.bind_shacl(
+                &AllowAllAuthorizer,
+                &ShaclBinding {
+                    data_graph: data.clone(),
+                    shapes_graph: shapes,
+                    policy,
+                    validation_options: ShaclBindingOptions::default(),
+                },
+            )
+            .unwrap();
+            result.push((data, focus));
+        }
+        result
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn independent_shacl_writers_validate_concurrently() {
+        for count in [1usize, 2, 4, 8, 16] {
+            for (label, policy, rejected) in [
+                ("disabled", ValidationPolicy::Disabled, false),
+                ("advisory", ValidationPolicy::Advisory, false),
+                ("enforce-valid", ValidationPolicy::Enforce, false),
+                ("enforce-rejected", ValidationPolicy::Enforce, true),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let node = Arc::new(
+                    CraqleNode::open_with_options(
+                        directory.path(),
+                        CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+                    )
+                    .unwrap(),
+                );
+                let graphs =
+                    bound_policy_graphs(&node, &format!("writers:{label}:{count}"), count, policy);
+                node.store.set_validation_stall(Duration::from_millis(40));
+                let start = Arc::new(std::sync::Barrier::new(count + 1));
+                let (tx, rx) = mpsc::channel();
+                for (index, (graph, focus)) in graphs.into_iter().enumerate() {
+                    let node = Arc::clone(&node);
+                    let start = Arc::clone(&start);
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let predicate = if rejected {
+                            "urn:test:unrelated-write"
+                        } else {
+                            "urn:test:required-value"
+                        };
+                        let result = node.apply_changes(
+                            &graph,
+                            vec![shacl_change(
+                                &graph,
+                                &focus,
+                                predicate,
+                                &format!("urn:test:writer-value:{index}"),
+                            )],
+                        );
+                        tx.send(result.is_ok()).unwrap();
+                    });
+                }
+                drop(tx);
+                start.wait();
+                let results = (0..count)
+                    .map(|_| rx.recv_timeout(PROGRESS_TIMEOUT).unwrap())
+                    .collect::<Vec<_>>();
+                let max_active = node.store.validation_max_active();
+                node.store.set_validation_stall(Duration::ZERO);
+                assert!(results.iter().all(|accepted| *accepted != rejected));
+                if policy == ValidationPolicy::Disabled {
+                    assert_eq!(max_active, 0);
+                } else {
+                    assert_eq!(max_active, count);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn same_graph_shacl_writers_remain_serialized() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            CraqleNode::open_with_options(
+                directory.path(),
+                CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+            )
+            .unwrap(),
+        );
+        let (graph, focus) =
+            bound_policy_graphs(&node, "same-graph-writers", 1, ValidationPolicy::Enforce)
+                .pop()
+                .unwrap();
+        node.store.set_validation_stall(Duration::from_millis(40));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+        for index in 0..2 {
+            let node = Arc::clone(&node);
+            let start = Arc::clone(&start);
+            let tx = tx.clone();
+            let graph = graph.clone();
+            let focus = focus.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                let accepted = node
+                    .apply_changes(
+                        &graph,
+                        vec![shacl_change(
+                            &graph,
+                            &focus,
+                            "urn:test:required-value",
+                            &format!("urn:test:same-graph-value:{index}"),
+                        )],
+                    )
+                    .is_ok();
+                tx.send(accepted).unwrap();
+            });
+        }
+        drop(tx);
+        start.wait();
+        assert!(rx.recv_timeout(PROGRESS_TIMEOUT).unwrap());
+        assert!(rx.recv_timeout(PROGRESS_TIMEOUT).unwrap());
+        let max_active = node.store.validation_max_active();
+        node.store.set_validation_stall(Duration::ZERO);
+        assert_eq!(max_active, 1);
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn shape_dependency_mutation_during_validation_rechecks_fences() {
+        for imported in [false, true] {
+            let label = if imported { "import" } else { "root" };
+            let directory = tempfile::tempdir().unwrap();
+            let node = Arc::new(
+                CraqleNode::open_with_options(
+                    directory.path(),
+                    CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+                )
+                .unwrap(),
+            );
+            let data = GraphId::new(&format!("urn:test:shape-race:{label}:data"));
+            let root = GraphId::new(&format!("urn:test:shape-race:{label}:root"));
+            let dependency = if imported {
+                GraphId::new(&format!("urn:test:shape-race:{label}:import"))
+            } else {
+                root.clone()
+            };
+            let focus = format!("urn:test:shape-race:{label}:focus");
+            let shape = format!("urn:test:shape-race:{label}:shape");
+            let property = format!("urn:test:shape-race:{label}:property");
+            node.apply_changes_unchecked(
+                &data,
+                vec![shacl_change(
+                    &data,
+                    &focus,
+                    "urn:test:unrelated-seed",
+                    "urn:test:seed",
+                )],
+            )
+            .unwrap();
+            let mut shape_changes = vec![
+                shacl_change(
+                    &dependency,
+                    &shape,
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/ns/shacl#NodeShape",
+                ),
+                shacl_change(
+                    &dependency,
+                    &shape,
+                    "http://www.w3.org/ns/shacl#targetNode",
+                    &focus,
+                ),
+                shacl_change(
+                    &dependency,
+                    &shape,
+                    "http://www.w3.org/ns/shacl#property",
+                    &property,
+                ),
+                shacl_change(
+                    &dependency,
+                    &property,
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/ns/shacl#PropertyShape",
+                ),
+                shacl_change(
+                    &dependency,
+                    &property,
+                    "http://www.w3.org/ns/shacl#path",
+                    "urn:test:required-value",
+                ),
+            ];
+            shape_changes.push(MaterializedQuadChange::Insert {
+                graph: dependency.clone(),
+                subject: EncodedTerm(format!("<{property}>")),
+                predicate: EncodedTerm("<http://www.w3.org/ns/shacl#minCount>".to_owned()),
+                object: EncodedTerm("\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned()),
+            });
+            node.apply_changes_unchecked(&dependency, shape_changes)
+                .unwrap();
+            if imported {
+                node.apply_changes_unchecked(
+                    &root,
+                    vec![shacl_change(
+                        &root,
+                        "urn:test:shape-race:ontology",
+                        "http://www.w3.org/2002/07/owl#imports",
+                        dependency.as_str(),
+                    )],
+                )
+                .unwrap();
+            }
+            node.bind_shacl(
+                &AllowAllAuthorizer,
+                &ShaclBinding {
+                    data_graph: data.clone(),
+                    shapes_graph: root,
+                    policy: ValidationPolicy::Enforce,
+                    validation_options: ShaclBindingOptions {
+                        allow_local_imports: imported,
+                        ..ShaclBindingOptions::default()
+                    },
+                },
+            )
+            .unwrap();
+
+            node.store.set_validation_stall(Duration::from_millis(100));
+            let (tx, rx) = mpsc::channel();
+            let writer = Arc::clone(&node);
+            let writer_data = data.clone();
+            let writer_focus = focus.clone();
+            std::thread::spawn(move || {
+                let accepted = writer
+                    .apply_changes(
+                        &writer_data,
+                        vec![shacl_change(
+                            &writer_data,
+                            &writer_focus,
+                            "urn:test:required-value",
+                            "urn:test:shape-race:value",
+                        )],
+                    )
+                    .is_ok();
+                tx.send(accepted).unwrap();
+            });
+            let wait_started = Instant::now();
+            while node.store.validation_active() == 0 {
+                assert!(wait_started.elapsed() < Duration::from_secs(5));
+                std::thread::yield_now();
+            }
+            node.apply_changes_unchecked(
+                &dependency,
+                vec![MaterializedQuadChange::Insert {
+                    graph: dependency.clone(),
+                    subject: EncodedTerm(format!("<{property}>")),
+                    predicate: EncodedTerm("<http://www.w3.org/ns/shacl#maxCount>".to_owned()),
+                    object: EncodedTerm(
+                        "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned(),
+                    ),
+                }],
+            )
+            .unwrap();
+            assert!(!rx.recv_timeout(PROGRESS_TIMEOUT).unwrap());
+            node.store.set_validation_stall(Duration::ZERO);
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn sync_local_settlement_failure_returns_committed_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = sync_node(&directory);
+        let (data, focus) =
+            bound_policy_graphs(&node, "sync-settlement", 1, ValidationPolicy::Enforce)
+                .pop()
+                .unwrap();
+        node.replication.arm_settle_failure();
+        let batch = node
+            .apply_changes(
+                &data,
+                vec![shacl_change(
+                    &data,
+                    &focus,
+                    "urn:test:required-value",
+                    "urn:test:sync-settlement:value",
+                )],
+            )
+            .unwrap();
+        assert_eq!(batch.graph, data);
+        assert_eq!(
+            node.shacl_binding_statuses(&AllowAllAuthorizer, &data)
+                .unwrap()[0]
+                .state,
+            ShaclValidationState::Pending
+        );
+        assert_eq!(node.pending_shacl_queue_status().unwrap().pending_count, 1);
+        assert_eq!(
+            node.pending_shacl_queue_status()
+                .unwrap()
+                .settlement_failures,
+            1
+        );
+        let replay = node
+            .replay_pending_shacl(1, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(replay.statistics.graphs_settled, 1);
     }
 
     #[test]
@@ -4280,6 +4772,93 @@ mod tests {
             pair.replica.store.pending_shacl_graphs().unwrap(),
             vec![data]
         );
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn binding_status_reads_scale_with_records_not_shape_triples() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            directory.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let data = GraphId::new("urn:test:status-cost:data");
+        node.store.create_graph(&data).unwrap();
+        let data_version = node.store.graph_version_digest(&data).unwrap();
+        let mut previous = 0usize;
+
+        for count in [1usize, 10, 100, 1_000] {
+            let mut graph_batch = node.store.new_batch();
+            for index in previous..count {
+                node.store
+                    .stage_graph(
+                        &mut graph_batch,
+                        &GraphId::new(&format!("urn:test:status-cost:shapes:{index}")),
+                    )
+                    .unwrap();
+            }
+            node.store.commit(graph_batch).unwrap();
+
+            let mut binding_batch = node.store.new_batch();
+            for index in previous..count {
+                let shapes = GraphId::new(&format!("urn:test:status-cost:shapes:{index}"));
+                let shapes_version = node.store.graph_version_digest(&shapes).unwrap();
+                node.store
+                    .stage_binding_status(
+                        &mut binding_batch,
+                        &ShaclBindingStatus {
+                            binding: ShaclBinding {
+                                data_graph: data.clone(),
+                                shapes_graph: shapes.clone(),
+                                policy: ValidationPolicy::Advisory,
+                                validation_options: ShaclBindingOptions::default(),
+                            },
+                            state: ShaclValidationState::Valid,
+                            report: Some(ShaclValidationReport {
+                                conforms: true,
+                                results: Vec::new(),
+                                statistics: ShaclValidationStatistics::default(),
+                            }),
+                            error: None,
+                            data_version,
+                            shapes_version,
+                            schema_fingerprint: [index as u8; 32],
+                            compiler_model_version: SHACL_COMPILER_MODEL_VERSION,
+                            shape_versions: vec![(shapes, shapes_version)],
+                        },
+                    )
+                    .unwrap();
+            }
+            node.store.commit(binding_batch).unwrap();
+
+            let before = node.shacl_runtime_statistics();
+            let statuses = node
+                .shacl_binding_statuses(&AllowAllAuthorizer, &data)
+                .unwrap();
+            let after = node.shacl_runtime_statistics();
+            assert_eq!(statuses.len(), count);
+            assert!(statuses.iter().all(|status| {
+                status.state == ShaclValidationState::Valid && status.report.is_some()
+            }));
+            assert_eq!(
+                after.status_bindings_read - before.status_bindings_read,
+                count as u64
+            );
+            assert_eq!(
+                after.status_version_checks - before.status_version_checks,
+                (count * 2) as u64
+            );
+            assert_eq!(
+                after.status_shape_compilations,
+                before.status_shape_compilations
+            );
+            assert_eq!(
+                after.status_full_shape_scans,
+                before.status_full_shape_scans
+            );
+            previous = count;
+        }
     }
 
     /// A bare quad write, skipping the crate-structure rules these tests are

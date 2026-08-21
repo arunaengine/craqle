@@ -11,6 +11,15 @@ struct OtherAppEvent {
     value: String,
 }
 
+#[test]
+fn normal_release_surface_has_no_benchmark_only_loader() {
+    let manifest = include_str!("../Cargo.toml");
+    let library = include_str!("../src/lib.rs");
+    assert!(!manifest.contains("bench-internals"));
+    assert!(!library.contains("apply_bulk_deferred"));
+    assert!(!library.contains("Benchmark-only"));
+}
+
 fn writer_auth() -> GrantAuthorizer {
     GrantAuthorizer::new(vec![PermissionGrant::new(
         "/datasets/**",

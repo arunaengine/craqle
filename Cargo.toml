@@ -60,7 +60,6 @@ license = "MIT"
 
 [features]
 default = ["search"]
-bench-internals = []
 search = ["dep:tantivy"]
 iroh = ["irokle/iroh"]
 shacl-core = [

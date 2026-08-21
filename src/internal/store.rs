@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map:
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use crate::core::*;
 use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
@@ -96,6 +97,10 @@ const SHACL_REVERSE_PREFIX: u8 = b's';
 /// Queued active SHACL data graphs awaiting settlement.
 #[cfg(feature = "shacl-core")]
 const SHACL_PENDING_PREFIX: u8 = b'V';
+#[cfg(feature = "shacl-core")]
+const SHACL_PENDING_QUEUE_SCHEMA_KEY: &[u8] = b"vshacl-pending-queue";
+#[cfg(feature = "shacl-core")]
+const SHACL_PENDING_QUEUE_SCHEMA_VERSION: u8 = 1;
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
 /// Upper bound on the global term-decode cache. Term ids are content hashes so
@@ -851,6 +856,32 @@ pub struct GraphStore {
     commit_locks: Vec<Mutex<()>>,
     #[cfg(feature = "shacl-core")]
     binding_lock: Mutex<()>,
+    #[cfg(feature = "shacl-core")]
+    binding_lock_wait_ns: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    binding_lock_hold_ns: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    graph_commit_lock_wait_ns: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    validation_ns: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    settlement_ns: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    settlement_failures: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    status_bindings_read: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    status_version_checks: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    status_shape_compilations: AtomicU64,
+    #[cfg(feature = "shacl-core")]
+    status_full_shape_scans: AtomicU64,
+    #[cfg(all(test, feature = "shacl-core"))]
+    validation_stall: Mutex<Duration>,
+    #[cfg(all(test, feature = "shacl-core"))]
+    validation_active: std::sync::atomic::AtomicUsize,
+    #[cfg(all(test, feature = "shacl-core"))]
+    validation_max_active: std::sync::atomic::AtomicUsize,
     indexes: RwLock<IndexState>,
     /// Memory mirror of the persisted `'O'` records; always carries the clock
     /// tag so a reader can tell a fresh entry from a stale one.
@@ -924,6 +955,52 @@ pub struct GraphStore {
 ///
 /// Poison is recovered: the protected state lives in fjall, not behind the mutex.
 pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+#[cfg(feature = "shacl-core")]
+pub(crate) struct BindingGuard<'a> {
+    #[allow(dead_code)]
+    guard: MutexGuard<'a, ()>,
+    hold_started: Instant,
+    hold_ns: &'a AtomicU64,
+}
+
+#[cfg(feature = "shacl-core")]
+impl Drop for BindingGuard<'_> {
+    fn drop(&mut self) {
+        self.hold_ns
+            .fetch_add(elapsed_ns(self.hold_started.elapsed()), Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "shacl-core")]
+pub(crate) struct PendingQueueRepairStatistics {
+    pub(crate) binding_records_scanned: u64,
+    pub(crate) pending_queue_entries_scanned: u64,
+}
+
+#[cfg(feature = "shacl-core")]
+pub(crate) struct PendingQueueScan {
+    pub(crate) graphs: Vec<GraphId>,
+    pub(crate) entries_scanned: u64,
+    pub(crate) budget_exhausted: bool,
+}
+
+#[cfg(feature = "shacl-core")]
+fn elapsed_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(all(test, feature = "shacl-core"))]
+pub(crate) struct ValidationProbe<'a> {
+    active: &'a std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, feature = "shacl-core"))]
+impl Drop for ValidationProbe<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// An OR-Set add: contributes exactly one unique dot to the quad's dot set (G1).
 pub struct QuadAdd {
@@ -1838,18 +1915,108 @@ impl GraphStore {
     /// from the graph term id, so both entry points map to the same lock.
     pub(crate) fn graph_commit_guard_by_id(&self, graph_id: TermId) -> GraphCommitGuard<'_> {
         let shard = (graph_id.0 as usize) % self.commit_locks.len();
-        GraphCommitGuard(
-            self.commit_locks[shard]
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+        #[cfg(feature = "shacl-core")]
+        let wait_started = Instant::now();
+        let guard = self.commit_locks[shard]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(feature = "shacl-core")]
+        self.graph_commit_lock_wait_ns
+            .fetch_add(elapsed_ns(wait_started.elapsed()), Ordering::Relaxed);
+        GraphCommitGuard(guard)
     }
 
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn binding_guard(&self) -> MutexGuard<'_, ()> {
-        self.binding_lock
+    pub(crate) fn binding_guard(&self) -> BindingGuard<'_> {
+        let wait_started = Instant::now();
+        let guard = self
+            .binding_lock
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner);
+        self.binding_lock_wait_ns
+            .fetch_add(elapsed_ns(wait_started.elapsed()), Ordering::Relaxed);
+        BindingGuard {
+            guard,
+            hold_started: Instant::now(),
+            hold_ns: &self.binding_lock_hold_ns,
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn record_validation(&self, elapsed: Duration) {
+        self.validation_ns
+            .fetch_add(elapsed_ns(elapsed), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn record_settlement(&self, elapsed: Duration) {
+        self.settlement_ns
+            .fetch_add(elapsed_ns(elapsed), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn record_settlement_failure(&self) {
+        self.settlement_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn record_status_read(&self, bindings: u64, version_checks: u64) {
+        self.status_bindings_read
+            .fetch_add(bindings, Ordering::Relaxed);
+        self.status_version_checks
+            .fetch_add(version_checks, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn shacl_runtime_statistics(&self) -> crate::ShaclRuntimeStatistics {
+        crate::ShaclRuntimeStatistics {
+            binding_lock_wait_ns: self.binding_lock_wait_ns.load(Ordering::Relaxed),
+            binding_lock_hold_ns: self.binding_lock_hold_ns.load(Ordering::Relaxed),
+            graph_commit_lock_wait_ns: self.graph_commit_lock_wait_ns.load(Ordering::Relaxed),
+            validation_ns: self.validation_ns.load(Ordering::Relaxed),
+            settlement_ns: self.settlement_ns.load(Ordering::Relaxed),
+            settlement_failures: self.settlement_failures.load(Ordering::Relaxed),
+            status_bindings_read: self.status_bindings_read.load(Ordering::Relaxed),
+            status_version_checks: self.status_version_checks.load(Ordering::Relaxed),
+            status_shape_compilations: self.status_shape_compilations.load(Ordering::Relaxed),
+            status_full_shape_scans: self.status_full_shape_scans.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn validation_probe(&self) -> ValidationProbe<'_> {
+        let active = self.validation_active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.validation_max_active
+            .fetch_max(active, Ordering::SeqCst);
+        let stall = *self
+            .validation_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !stall.is_zero() {
+            std::thread::sleep(stall);
+        }
+        ValidationProbe {
+            active: &self.validation_active,
+        }
+    }
+
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn set_validation_stall(&self, stall: Duration) {
+        *self
+            .validation_stall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = stall;
+        self.validation_max_active.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn validation_max_active(&self) -> usize {
+        self.validation_max_active.load(Ordering::SeqCst)
+    }
+
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn validation_active(&self) -> usize {
+        self.validation_active.load(Ordering::SeqCst)
     }
 
     fn indexes_read(&self) -> RwLockReadGuard<'_, IndexState> {
@@ -4150,6 +4317,32 @@ impl GraphStore {
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             #[cfg(feature = "shacl-core")]
             binding_lock: Mutex::new(()),
+            #[cfg(feature = "shacl-core")]
+            binding_lock_wait_ns: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            binding_lock_hold_ns: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            graph_commit_lock_wait_ns: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            validation_ns: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            settlement_ns: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            settlement_failures: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            status_bindings_read: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            status_version_checks: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            status_shape_compilations: AtomicU64::new(0),
+            #[cfg(feature = "shacl-core")]
+            status_full_shape_scans: AtomicU64::new(0),
+            #[cfg(all(test, feature = "shacl-core"))]
+            validation_stall: Mutex::new(Duration::ZERO),
+            #[cfg(all(test, feature = "shacl-core"))]
+            validation_active: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "shacl-core"))]
+            validation_max_active: std::sync::atomic::AtomicUsize::new(0),
             indexes: RwLock::new(IndexState::default()),
             diagnostics_cache: RwLock::new(HashMap::new()),
             term_decode_cache: RwLock::new(HashMap::new()),
@@ -4416,13 +4609,80 @@ impl GraphStore {
         Ok(statuses)
     }
 
-    /// Queued graphs plus legacy Pending statuses for startup recovery.
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn pending_shacl_graphs(&self) -> Result<Vec<GraphId>> {
+    pub(crate) fn pending_shacl_queue_repair_required(&self) -> Result<bool> {
+        Ok(self
+            .graphs
+            .get(SHACL_PENDING_QUEUE_SCHEMA_KEY)?
+            .is_none_or(|value| value.as_ref() != [SHACL_PENDING_QUEUE_SCHEMA_VERSION]))
+    }
+
+    /// Rebuild the durable pending queue from all binding records.
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn repair_pending_shacl_queue(&self) -> Result<PendingQueueRepairStatistics> {
+        let mut batch = self.new_batch();
+        let mut pending_queue_entries_scanned = 0u64;
+        for guard in self.graphs.prefix(shacl_pending_prefix()) {
+            let (key, _) = guard.into_inner()?;
+            pending_queue_entries_scanned += 1;
+            batch.remove(&self.graphs, key);
+        }
+
+        let mut binding_records_scanned = 0u64;
+        for guard in self.graphs.prefix([SHACL_BINDING_PREFIX]) {
+            let (key, value) = guard.into_inner()?;
+            binding_records_scanned += 1;
+            if key.len() != 33 {
+                return Err(StoreError::InvalidEncoding {
+                    context: "SHACL binding key",
+                    message: format!("expected 33 bytes, found {}", key.len()),
+                });
+            }
+            let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
+            if status.binding.policy == crate::shacl::ValidationPolicy::Disabled
+                || status.state != crate::shacl::ShaclValidationState::Pending
+            {
+                continue;
+            }
+            let Some(data_graph) = self.graph_id_for(&status.binding.data_graph)? else {
+                return Err(StoreError::GraphNotFound(
+                    status.binding.data_graph.to_string(),
+                ));
+            };
+            batch.insert(&self.graphs, shacl_pending_key(data_graph), []);
+        }
+        batch.insert(
+            &self.graphs,
+            SHACL_PENDING_QUEUE_SCHEMA_KEY,
+            [SHACL_PENDING_QUEUE_SCHEMA_VERSION],
+        );
+        self.commit(batch)?;
+        Ok(PendingQueueRepairStatistics {
+            binding_records_scanned,
+            pending_queue_entries_scanned,
+        })
+    }
+
+    /// Scan only the durable pending queue, optionally stopping at a replay budget.
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn pending_shacl_queue_bounded(
+        &self,
+        max_graphs: usize,
+        deadline: Option<Instant>,
+    ) -> Result<PendingQueueScan> {
         let mut graphs = Vec::new();
         let mut terms = HashMap::new();
+        let mut entries_scanned = 0u64;
         for guard in self.graphs.prefix(shacl_pending_prefix()) {
+            if graphs.len() >= max_graphs || deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return Ok(PendingQueueScan {
+                    graphs,
+                    entries_scanned,
+                    budget_exhausted: true,
+                });
+            }
             let (key, value) = guard.into_inner()?;
+            entries_scanned += 1;
             if key.len() != 17 || !value.is_empty() {
                 return Err(StoreError::InvalidEncoding {
                     context: "SHACL pending graph key",
@@ -4444,25 +4704,38 @@ impl GraphStore {
                 })?;
             graphs.push(graph);
         }
-        // Recovery also finds legacy Pending records or a queue removal interrupted by a crash.
-        for guard in self.graphs.prefix([SHACL_BINDING_PREFIX]) {
-            let (key, value) = guard.into_inner()?;
-            if key.len() != 33 {
-                return Err(StoreError::InvalidEncoding {
-                    context: "SHACL binding key",
-                    message: format!("expected 33 bytes, found {}", key.len()),
-                });
-            }
-            let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
-            if status.binding.policy != crate::shacl::ValidationPolicy::Disabled
-                && status.state == crate::shacl::ShaclValidationState::Pending
-            {
-                graphs.push(status.binding.data_graph);
-            }
-        }
         graphs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        graphs.dedup();
-        Ok(graphs)
+        Ok(PendingQueueScan {
+            graphs,
+            entries_scanned,
+            budget_exhausted: false,
+        })
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn pending_shacl_queue(&self) -> Result<Vec<GraphId>> {
+        Ok(self.pending_shacl_queue_bounded(usize::MAX, None)?.graphs)
+    }
+
+    #[cfg(all(test, feature = "shacl-core"))]
+    pub(crate) fn pending_shacl_graphs(&self) -> Result<Vec<GraphId>> {
+        self.pending_shacl_queue()
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn pending_shacl_count(&self) -> Result<u64> {
+        let mut count = 0u64;
+        for guard in self.graphs.prefix(shacl_pending_prefix()) {
+            let _ = guard.into_inner()?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn shacl_graph_is_pending(&self, graph: &GraphId) -> Result<bool> {
+        let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
+        Ok(self.graphs.contains_key(shacl_pending_key(graph))?)
     }
 
     /// Active data graphs whose bindings depend on `changed_graph`.
@@ -6172,6 +6445,129 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn stage_binding_records(store: &GraphStore, start: usize, end: usize) {
+        let data = GraphId::new("urn:test:queue-scale:data");
+        if start == 0 {
+            store.create_graph(&data).unwrap();
+        }
+        let mut graph_batch = store.new_batch();
+        for index in start..end {
+            store
+                .stage_graph(
+                    &mut graph_batch,
+                    &GraphId::new(&format!("urn:test:queue-scale:shapes:{index}")),
+                )
+                .unwrap();
+        }
+        store.commit(graph_batch).unwrap();
+
+        let data_version = store.graph_version_digest(&data).unwrap();
+        let mut binding_batch = store.new_batch();
+        for index in start..end {
+            let shapes = GraphId::new(&format!("urn:test:queue-scale:shapes:{index}"));
+            let shapes_version = store.graph_version_digest(&shapes).unwrap();
+            store
+                .stage_binding_status(
+                    &mut binding_batch,
+                    &crate::ShaclBindingStatus {
+                        binding: crate::ShaclBinding {
+                            data_graph: data.clone(),
+                            shapes_graph: shapes.clone(),
+                            policy: crate::ValidationPolicy::Advisory,
+                            validation_options: crate::ShaclBindingOptions::default(),
+                        },
+                        state: crate::ShaclValidationState::Valid,
+                        report: Some(crate::ShaclValidationReport {
+                            conforms: true,
+                            results: Vec::new(),
+                            statistics: crate::ShaclValidationStatistics::default(),
+                        }),
+                        error: None,
+                        data_version,
+                        shapes_version,
+                        schema_fingerprint: [index as u8; 32],
+                        compiler_model_version: crate::SHACL_COMPILER_MODEL_VERSION,
+                        shape_versions: vec![(shapes, shapes_version)],
+                    },
+                )
+                .unwrap();
+        }
+        store.commit(binding_batch).unwrap();
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn pending_queue_scan_is_independent_of_binding_count() {
+        let (_dir, store) = setup_store();
+        let mut previous = 0;
+        for count in [0, 100, 1_000, 10_000] {
+            stage_binding_records(&store, previous, count);
+            let started = Instant::now();
+            let scan = store.pending_shacl_queue_bounded(usize::MAX, None).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(scan.entries_scanned, 0, "binding count {count}");
+            assert!(scan.graphs.is_empty(), "binding count {count}");
+            assert!(!scan.budget_exhausted, "binding count {count}");
+            eprintln!("binding_records={count} pending_queue_scan={elapsed:?}");
+            previous = count;
+        }
+
+        let data = GraphId::new("urn:test:queue-scale:data");
+        let shapes = GraphId::new("urn:test:queue-scale:shapes:9999");
+        let mut status = store
+            .shacl_binding_statuses(&data)
+            .unwrap()
+            .into_iter()
+            .find(|status| status.binding.shapes_graph == shapes)
+            .unwrap();
+        status.state = crate::ShaclValidationState::Pending;
+        status.report = None;
+        let mut batch = store.new_batch();
+        store.stage_binding_pending(&mut batch, &status).unwrap();
+        store.commit(batch).unwrap();
+        let scan = store.pending_shacl_queue_bounded(usize::MAX, None).unwrap();
+        assert_eq!(scan.entries_scanned, 1);
+        assert_eq!(scan.graphs, vec![data]);
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn explicit_queue_repair_restores_missing_and_malformed_entries() {
+        let (_dir, store) = setup_store();
+        stage_binding_records(&store, 0, 100);
+        let data = GraphId::new("urn:test:queue-scale:data");
+        let mut status = store
+            .shacl_binding_statuses(&data)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        status.state = crate::ShaclValidationState::Pending;
+        status.report = None;
+        let mut batch = store.new_batch();
+        store.stage_binding_status(&mut batch, &status).unwrap();
+        batch.insert(&store.graphs, [SHACL_PENDING_PREFIX, 0], [1]);
+        store.commit(batch).unwrap();
+
+        assert!(store.pending_shacl_queue().is_err());
+        assert!(store.pending_shacl_queue_repair_required().unwrap());
+        let repair = store.repair_pending_shacl_queue().unwrap();
+        assert_eq!(repair.binding_records_scanned, 100);
+        assert_eq!(repair.pending_queue_entries_scanned, 1);
+        assert_eq!(store.pending_shacl_queue().unwrap(), vec![data.clone()]);
+        assert!(!store.pending_shacl_queue_repair_required().unwrap());
+
+        let mut batch = store.new_batch();
+        let data_id = store.graph_id_for(&data).unwrap().unwrap();
+        batch.remove(&store.graphs, shacl_pending_key(data_id));
+        store.commit(batch).unwrap();
+        assert!(store.pending_shacl_queue().unwrap().is_empty());
+        let repair = store.repair_pending_shacl_queue().unwrap();
+        assert_eq!(repair.binding_records_scanned, 100);
+        assert_eq!(store.pending_shacl_queue().unwrap(), vec![data]);
     }
 
     #[test]

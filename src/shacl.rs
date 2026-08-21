@@ -12,6 +12,78 @@ pub enum ShaclProfile {
     CraqleFastV1,
 }
 
+/// Persisted model version used by the native SHACL compiler.
+pub const SHACL_COMPILER_MODEL_VERSION: u32 = 1;
+
+/// Startup policy for durable SHACL work left pending by an earlier process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingReplayPolicy {
+    ReplayAllBeforeOpen,
+    ReplayBounded {
+        max_graphs: usize,
+        max_elapsed: Duration,
+    },
+    Defer,
+}
+
+impl Default for PendingReplayPolicy {
+    fn default() -> Self {
+        Self::ReplayBounded {
+            max_graphs: 100,
+            max_elapsed: Duration::from_millis(250),
+        }
+    }
+}
+
+/// Work performed while repairing or replaying the durable SHACL queue.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PendingReplayStatistics {
+    pub binding_records_scanned: u64,
+    pub pending_queue_entries_scanned: u64,
+    pub graphs_settled: u64,
+    pub reports_produced: u64,
+    pub elapsed: Duration,
+}
+
+/// One queued graph whose settlement failed without changing its source write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingReplayFailure {
+    pub graph: crate::GraphId,
+    pub bindings: Vec<ShaclBinding>,
+    pub data_version: Option<[u8; 32]>,
+    pub error: String,
+}
+
+/// Complete outcome of one bounded pending replay pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PendingReplayOutcome {
+    pub statistics: PendingReplayStatistics,
+    pub failures: Vec<PendingReplayFailure>,
+    pub budget_exhausted: bool,
+}
+
+/// Cheap durable queue state. Reading it never validates a graph.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingShaclQueueStatus {
+    pub pending_count: u64,
+    pub settlement_failures: u64,
+}
+
+/// Cumulative SHACL work and lock counters for one open store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShaclRuntimeStatistics {
+    pub binding_lock_wait_ns: u64,
+    pub binding_lock_hold_ns: u64,
+    pub graph_commit_lock_wait_ns: u64,
+    pub validation_ns: u64,
+    pub settlement_ns: u64,
+    pub settlement_failures: u64,
+    pub status_bindings_read: u64,
+    pub status_version_checks: u64,
+    pub status_shape_compilations: u64,
+    pub status_full_shape_scans: u64,
+}
+
 /// Execution path requested for a complete native SHACL validation.
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
@@ -106,6 +178,7 @@ pub struct ShaclBindingStatus {
     pub data_version: [u8; 32],
     pub shapes_version: [u8; 32],
     pub schema_fingerprint: [u8; 32],
+    pub compiler_model_version: u32,
     pub(crate) shape_versions: Vec<(crate::GraphId, [u8; 32])>,
 }
 

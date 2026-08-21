@@ -1,6 +1,6 @@
 use crate::{EncodedTerm, RoCrateVersion};
 
-pub(crate) const COMPILED_SHACL_FORMAT_VERSION: u32 = 1;
+pub(crate) const COMPILED_SHACL_FORMAT_VERSION: u32 = crate::SHACL_COMPILER_MODEL_VERSION;
 
 #[derive(Debug)]
 pub(crate) struct CompiledSchemaInner {

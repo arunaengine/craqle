@@ -51,6 +51,128 @@ const IMPORT_ROOT: &str = r#"
 <urn:test:incremental-import-root> <http://www.w3.org/2002/07/owl#imports> <urn:test:incremental-import> .
 "#;
 
+const TARGET_NODE_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> <urn:test:value> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const TARGET_CLASS_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetClass> <urn:test:MatrixClass> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> <urn:test:value> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const TARGET_OBJECTS_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetObjectsOf> <urn:test:rel> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> <urn:test:value> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const INVERSE_PATH_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> _:inverse .
+_:inverse <http://www.w3.org/ns/shacl#inversePath> <urn:test:rel> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const SEQUENCE_PATH_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> _:sequence .
+_:sequence <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:test:first> .
+_:sequence <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:tail .
+_:tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:test:second> .
+_:tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const ZERO_OR_ONE_PATH_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> _:path .
+_:path <http://www.w3.org/ns/shacl#zeroOrOnePath> <urn:test:rel> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#maxCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const ZERO_OR_MORE_PATH_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> _:path .
+_:path <http://www.w3.org/ns/shacl#zeroOrMorePath> <urn:test:rel> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#maxCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const ONE_OR_MORE_PATH_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> _:path .
+_:path <http://www.w3.org/ns/shacl#oneOrMorePath> <urn:test:rel> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+const LOGICAL_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#and> _:and .
+_:and <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:test:matrix-left> .
+_:and <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:tail .
+_:tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:test:matrix-right> .
+_:tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+<urn:test:matrix-left> <http://www.w3.org/ns/shacl#class> <urn:test:LeftClass> .
+<urn:test:matrix-right> <http://www.w3.org/ns/shacl#class> <urn:test:RightClass> .
+"#;
+
+const QUALIFIED_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> <urn:test:value> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#qualifiedValueShape> <urn:test:qualified> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#qualifiedMinCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:test:qualified> <http://www.w3.org/ns/shacl#class> <urn:test:GoodClass> .
+"#;
+
+const CLOSED_SHAPES: &str = r#"
+<urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#closed> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
+<urn:test:matrix-property> <http://www.w3.org/ns/shacl#path> <urn:test:allowed> .
+"#;
+
+const SHARED_DEPENDENCY_SHAPES: &str = r#"
+<urn:test:matrix-shape-a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape-a> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape-a> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property-a> .
+<urn:test:matrix-property-a> <http://www.w3.org/ns/shacl#path> <urn:test:value> .
+<urn:test:matrix-property-a> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:test:matrix-shape-b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:matrix-shape-b> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
+<urn:test:matrix-shape-b> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property-b> .
+<urn:test:matrix-property-b> <http://www.w3.org/ns/shacl#path> <urn:test:value> .
+<urn:test:matrix-property-b> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
+struct ModeCase {
+    name: &'static str,
+    shapes: &'static str,
+    seed: &'static [(&'static str, &'static str, &'static str)],
+    changes: &'static [(bool, &'static str, &'static str, &'static str)],
+}
+
 const AUTH: AllowAllAuthorizer = AllowAllAuthorizer;
 
 fn node() -> (tempfile::TempDir, CraqleNode) {
@@ -117,6 +239,94 @@ fn mode_options(execution_mode: ShaclExecutionMode) -> ShaclValidationOptions {
         execution_mode,
         ..ShaclValidationOptions::default()
     }
+}
+
+fn assert_mode_case(case: &ModeCase) {
+    let (_directory, node) = node();
+    let data = GraphId::new(&format!("urn:test:auto-matrix:{}:data", case.name));
+    let shapes = GraphId::new(&format!("urn:test:auto-matrix:{}:shapes", case.name));
+    insert_shape_text(&node, &shapes, case.shapes);
+    node.apply_changes_unchecked(
+        &data,
+        case.seed
+            .iter()
+            .map(|(subject, predicate, object)| change(&data, true, subject, predicate, object))
+            .collect(),
+    )
+    .unwrap();
+    let schema = node
+        .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    node.validate_shacl(&AUTH, &data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    let changes = case
+        .changes
+        .iter()
+        .map(|(insert, subject, predicate, object)| {
+            change(&data, *insert, subject, predicate, object)
+        })
+        .collect::<Vec<_>>();
+    let full = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::ForceFull),
+        )
+        .unwrap();
+    let delta = node.validate_shacl_delta(
+        &AUTH,
+        &data,
+        &schema,
+        &changes,
+        &mode_options(ShaclExecutionMode::ForceDelta),
+    );
+    if let Ok(delta) = &delta {
+        assert_eq!(delta.conforms, full.conforms, "{}", case.name);
+        assert_eq!(delta.results, full.results, "{}", case.name);
+        assert_eq!(
+            delta.statistics.selected_mode,
+            ShaclExecutionMode::ForceDelta,
+            "{}",
+            case.name
+        );
+    } else {
+        assert!(matches!(
+            delta,
+            Err(CraqleError::Shacl(
+                ShaclError::DeltaExecutionUnavailable { .. }
+            ))
+        ));
+    }
+    let auto = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::Auto),
+        )
+        .unwrap();
+    assert_eq!(auto.conforms, full.conforms, "{}", case.name);
+    assert_eq!(auto.results, full.results, "{}", case.name);
+    assert_ne!(
+        auto.statistics.selected_mode,
+        ShaclExecutionMode::Auto,
+        "{}",
+        case.name
+    );
+    eprintln!(
+        "case={} estimated_delta_work={} estimated_full_work={} selected={:?} \
+         candidate_reads={} focus_nodes={} constraints_evaluated={}",
+        case.name,
+        auto.statistics.estimated_delta_work,
+        auto.statistics.estimated_full_work,
+        auto.statistics.selected_mode,
+        auto.statistics.read.candidate_quads,
+        auto.statistics.focus_nodes,
+        auto.statistics.constraints_evaluated,
+    );
 }
 
 #[test]
@@ -246,6 +456,427 @@ fn modes_match_reports() {
         error,
         CraqleError::Shacl(ShaclError::DeltaExecutionUnavailable { .. })
     ));
+}
+
+#[test]
+fn auto_force_mode_correctness_matrix() {
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let cases = [
+        ModeCase {
+            name: "target-node-direct",
+            shapes: TARGET_NODE_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:seed",
+                "urn:test:seed-value",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "target-class-insert",
+            shapes: TARGET_CLASS_SHAPES,
+            seed: &[("urn:test:matrix-focus", RDF_TYPE, "urn:test:MatrixClass")],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "target-class-delete",
+            shapes: TARGET_CLASS_SHAPES,
+            seed: &[
+                ("urn:test:matrix-focus", RDF_TYPE, "urn:test:MatrixClass"),
+                (
+                    "urn:test:matrix-focus",
+                    "urn:test:value",
+                    "urn:test:value-1",
+                ),
+            ],
+            changes: &[(
+                false,
+                "urn:test:matrix-focus",
+                RDF_TYPE,
+                "urn:test:MatrixClass",
+            )],
+        },
+        ModeCase {
+            name: "target-subjects-of",
+            shapes: SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-2",
+            )],
+        },
+        ModeCase {
+            name: "target-objects-of",
+            shapes: TARGET_OBJECTS_SHAPES,
+            seed: &[(
+                "urn:test:matrix-source",
+                "urn:test:rel",
+                "urn:test:matrix-focus",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "inverse-path",
+            shapes: INVERSE_PATH_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:seed",
+                "urn:test:seed-value",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-source",
+                "urn:test:rel",
+                "urn:test:matrix-focus",
+            )],
+        },
+        ModeCase {
+            name: "sequence-path",
+            shapes: SEQUENCE_PATH_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:first",
+                "urn:test:matrix-middle",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-middle",
+                "urn:test:second",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "zero-or-one-path",
+            shapes: ZERO_OR_ONE_PATH_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:seed",
+                "urn:test:seed-value",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:rel",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "zero-or-more-path",
+            shapes: ZERO_OR_MORE_PATH_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:seed",
+                "urn:test:seed-value",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:rel",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "one-or-more-path",
+            shapes: ONE_OR_MORE_PATH_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:seed",
+                "urn:test:seed-value",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:rel",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "logical-nested",
+            shapes: LOGICAL_SHAPES,
+            seed: &[("urn:test:matrix-focus", RDF_TYPE, "urn:test:LeftClass")],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                RDF_TYPE,
+                "urn:test:RightClass",
+            )],
+        },
+        ModeCase {
+            name: "qualified-value",
+            shapes: QUALIFIED_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:matrix-member",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-member",
+                RDF_TYPE,
+                "urn:test:GoodClass",
+            )],
+        },
+        ModeCase {
+            name: "closed-shape",
+            shapes: CLOSED_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:allowed",
+                "urn:test:value-1",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:extra",
+                "urn:test:value-2",
+            )],
+        },
+        ModeCase {
+            name: "unrelated-predicate",
+            shapes: SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+            changes: &[(
+                true,
+                "urn:test:other",
+                "urn:test:unrelated",
+                "urn:test:value-2",
+            )],
+        },
+        ModeCase {
+            name: "shared-dependencies",
+            shapes: SHARED_DEPENDENCY_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:seed",
+                "urn:test:seed-value",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "duplicate-insert",
+            shapes: TARGET_NODE_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+            changes: &[(
+                true,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+        },
+        ModeCase {
+            name: "absent-delete",
+            shapes: TARGET_NODE_SHAPES,
+            seed: &[(
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:value-1",
+            )],
+            changes: &[(
+                false,
+                "urn:test:matrix-focus",
+                "urn:test:value",
+                "urn:test:missing",
+            )],
+        },
+    ];
+
+    for case in &cases {
+        assert_mode_case(case);
+    }
+}
+
+#[test]
+fn auto_handles_skewed_high_frequency_predicates() {
+    let (_directory, node) = node();
+    let data = GraphId::new("urn:test:auto-skew:data");
+    let shapes = GraphId::new("urn:test:auto-skew:shapes");
+    insert_shape_text(&node, &shapes, TARGET_NODE_SHAPES);
+    let mut seed = vec![change(
+        &data,
+        true,
+        "urn:test:matrix-focus",
+        "urn:test:seed",
+        "urn:test:seed-value",
+    )];
+    for index in 0..2_000 {
+        seed.push(change(
+            &data,
+            true,
+            &format!("urn:test:skew-subject:{index}"),
+            "urn:test:common",
+            &format!("urn:test:skew-object:{index}"),
+        ));
+    }
+    node.apply_changes_unchecked(&data, seed).unwrap();
+    let schema = node
+        .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    node.validate_shacl(&AUTH, &data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    let changes = vec![change(
+        &data,
+        true,
+        "urn:test:matrix-focus",
+        "urn:test:value",
+        "urn:test:value-1",
+    )];
+    let delta = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::ForceDelta),
+        )
+        .unwrap();
+    let full = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::ForceFull),
+        )
+        .unwrap();
+    let auto = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::Auto),
+        )
+        .unwrap();
+    assert_eq!(delta.results, full.results);
+    assert_eq!(auto.results, full.results);
+    assert_eq!(
+        auto.statistics.selected_mode,
+        ShaclExecutionMode::ForceDelta
+    );
+    assert!(auto.statistics.estimated_delta_work < auto.statistics.estimated_full_work);
+    assert!(auto.statistics.read.candidate_quads < 100);
+}
+
+#[test]
+fn imported_shape_change_invalidates_then_reestimates() {
+    let (_directory, node) = node();
+    let data = GraphId::new("urn:test:auto-import:data");
+    let root = GraphId::new("urn:test:incremental-import-root");
+    let imported = GraphId::new("urn:test:incremental-import");
+    insert_shape_text(&node, &imported, TARGET_NODE_SHAPES);
+    insert_shape_text(&node, &root, IMPORT_ROOT);
+    node.apply_changes_unchecked(
+        &data,
+        vec![change(
+            &data,
+            true,
+            "urn:test:matrix-focus",
+            "urn:test:seed",
+            "urn:test:seed-value",
+        )],
+    )
+    .unwrap();
+    let compile_options = ShaclCompileOptions {
+        allow_local_imports: true,
+        ..ShaclCompileOptions::default()
+    };
+    let old_schema = node.compile_shacl(&AUTH, &root, &compile_options).unwrap();
+    insert_shape_text(
+        &node,
+        &imported,
+        r#"
+<urn:test:imported-extra> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:imported-extra> <http://www.w3.org/ns/shacl#targetNode> <urn:test:unrelated-focus> .
+"#,
+    );
+    let changes = vec![change(
+        &data,
+        true,
+        "urn:test:matrix-focus",
+        "urn:test:value",
+        "urn:test:value-1",
+    )];
+    let stale = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &old_schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::Auto),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        CraqleError::Shacl(ShaclError::SchemaChangedDuringValidation { .. })
+    ));
+
+    let schema = node.compile_shacl(&AUTH, &root, &compile_options).unwrap();
+    node.validate_shacl(&AUTH, &data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    let delta = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::ForceDelta),
+        )
+        .unwrap();
+    let full = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::ForceFull),
+        )
+        .unwrap();
+    let auto = node
+        .validate_shacl_delta(
+            &AUTH,
+            &data,
+            &schema,
+            &changes,
+            &mode_options(ShaclExecutionMode::Auto),
+        )
+        .unwrap();
+    assert_eq!(delta.results, full.results);
+    assert_eq!(auto.results, full.results);
+    assert_ne!(auto.statistics.selected_mode, ShaclExecutionMode::Auto);
 }
 
 #[test]
