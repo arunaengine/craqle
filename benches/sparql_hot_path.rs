@@ -130,6 +130,53 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     }
     group.finish();
 
+    let terms = fixture.query_terms();
+    let subject_set_queries = [
+        (
+            "exists",
+            format!(
+                "SELECT (COUNT(*) AS ?count) WHERE {{ ?s {} ?outer FILTER EXISTS {{ ?s {} ?inner }} }}",
+                terms.common_predicate.0, terms.rare_predicate.0,
+            ),
+        ),
+        (
+            "not_exists",
+            format!(
+                "SELECT (COUNT(*) AS ?count) WHERE {{ ?s {} ?outer FILTER NOT EXISTS {{ ?s {} ?inner }} }}",
+                terms.common_predicate.0, terms.rare_predicate.0,
+            ),
+        ),
+    ];
+    let mut group = c.benchmark_group("sparql_subject_set_count_comparison");
+    group.sample_size(config.sample_size);
+    group.warm_up_time(config.warm_up);
+    group.measurement_time(config.measurement);
+    for (label, query) in subject_set_queries {
+        let prepared = fixture.prepare_query(&query);
+        let fast = fixture.run_hot_prepared(&prepared, &fast_options);
+        let generic = fixture.run_hot_prepared(&prepared, &generic_options);
+        assert_eq!(fast.results, generic.results);
+        assert_eq!(
+            fast.statistics.fast_path,
+            Some(craqle::QueryFastPathKind::HashJoinCount)
+        );
+        println!(
+            "sparql_subject_set_count work: case={label} fast_qv_keys={} fast_intermediate_rows={} \
+             generic_source_keys={} generic_intermediate_rows={}",
+            fast.statistics.qv_keys_read,
+            fast.statistics.intermediate_rows,
+            generic.statistics.source_keys_read,
+            generic.statistics.intermediate_rows,
+        );
+        group.bench_function(format!("{label}/fast"), |b| {
+            b.iter(|| black_box(fixture.run_hot_prepared(&prepared, &fast_options)));
+        });
+        group.bench_function(format!("{label}/generic"), |b| {
+            b.iter(|| black_box(fixture.run_hot_prepared(&prepared, &generic_options)));
+        });
+    }
+    group.finish();
+
     let prepared = fixture.prepare_hot_path(0);
     let options = QueryExecutionOptions::default();
     let parsed_result = fixture.measure_hot_path(0);
