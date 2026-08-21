@@ -58,7 +58,9 @@ use std::panic;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "shacl-core")]
+use std::time::Instant;
 
 use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
