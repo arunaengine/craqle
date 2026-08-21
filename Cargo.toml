@@ -62,7 +62,6 @@ categories = ["database", "data-structures", "science"]
 default = ["search"]
 search = ["dep:tantivy"]
 iroh = ["irokle/iroh"]
-federation-routing = []
 shacl-core = [
     "dep:shacl",
     "dep:rudof_rdf",

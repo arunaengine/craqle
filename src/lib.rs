@@ -55,8 +55,6 @@ mod store;
 mod validation_delta;
 
 mod auth;
-#[cfg(feature = "federation-routing")]
-pub mod federation;
 #[cfg(feature = "shacl-core")]
 pub mod shacl;
 mod sync;
@@ -229,9 +227,6 @@ pub enum CraqleError {
     #[cfg(feature = "shacl-core")]
     #[error("prepared commit mode {mode:?} requires a compiled RO-Crate policy")]
     RoCratePolicyRequired { mode: PreparedCommitMode },
-    #[cfg(feature = "federation-routing")]
-    #[error("federation routing: {0}")]
-    FederationRouting(#[from] federation::FederationRoutingError),
     #[error("sync input rejected: {0}")]
     SyncInputRejected(String),
     #[error("sync: {0}")]
@@ -270,8 +265,6 @@ impl CraqleError {
             Self::RoCratePolicyRejected(_) => CraqleErrorKind::InvalidInput,
             #[cfg(feature = "shacl-core")]
             Self::RoCratePolicyRequired { .. } => CraqleErrorKind::InvalidInput,
-            #[cfg(feature = "federation-routing")]
-            Self::FederationRouting(error) => error.kind(),
             Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
             Self::Sync(error) => error.kind(),
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,

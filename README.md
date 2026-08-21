@@ -6,8 +6,8 @@ searching, and replicating RO-Crates as RDF named graphs.
 The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Irokle graph topics provide the durable operation log and sync obligations, while Craqle reduces those events into an OR-Set RDF projection. Invalid visible RO-Crates are not exported.
 
 `0.2.0-rc.1` is a release candidate for the supported 0.2 API, disk-data,
-SPARQL, `CraqleFastV1` SHACL, RO-Crate, and exact federation-routing
-contracts. It is not the final 0.2 release.
+SPARQL, `CraqleFastV1` SHACL, and RO-Crate contracts. It is not the final 0.2
+release.
 
 Within the 0.2.x series:
 
@@ -31,9 +31,6 @@ Within the 0.2.x series:
 | qv query indexes | Supported derived data |
 | `CraqleFastV1` SHACL | Supported bounded profile |
 | Enforce and Advisory policies | Supported |
-| Exact graph routing | Supported after all routing gates pass |
-| Federated coordinator fragments | Coordinator-facing API |
-| Full federation service | Outside Craqle 0.2 |
 | Full SHACL Core | Not claimed |
 | SHACL-SPARQL, JS, AF, remote imports | Unsupported |
 | RDF-star | Unsupported |
@@ -43,7 +40,6 @@ Within the 0.2.x series:
 | Classification | Surface |
 | --- | --- |
 | Stable in 0.2.x | Root storage, RO-Crate, authorization, local SPARQL, search, replication, error, and disk-format APIs documented in Rustdoc |
-| Coordinator-facing in 0.2.x | Exact federation topology and compact-fragment APIs once their release gates pass |
 | Feature-gated in 0.2.x | `shacl-core`, `search`, and `iroh` surfaces |
 | Internal | Everything under `src/internal/`, encoded storage IDs, physical forcing controls used only by tests and benchmarks |
 | Deprecated | APIs explicitly carrying a Rust `deprecated` attribute and a documented replacement; retained until 0.3 unless correctness or security requires removal |
@@ -216,7 +212,6 @@ must preserve one consistent view of all authoritative keyspaces.
 | --- | --- | --- |
 | `search` | Yes | Tantivy full-text derived index |
 | `shacl-core` | No | Native bounded `CraqleFastV1` compilation, validation, and policy bindings |
-| `federation-routing` | No | Coordinator-facing exact graph topology and replica selection |
 | `iroh` | No | Irokle Iroh transport and asynchronous write-concern scheduling |
 
 There is also a small demo in `examples/demo.rs`:

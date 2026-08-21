@@ -1,47 +1,5 @@
 pub mod craqle
 pub use craqle::irokle
-pub mod craqle::federation
-#[non_exhaustive] pub enum craqle::federation::FederationRoutingError
-pub craqle::federation::FederationRoutingError::GraphMismatch
-pub craqle::federation::FederationRoutingError::GraphMismatch::actual: alloc::string::String
-pub craqle::federation::FederationRoutingError::GraphMismatch::requested: alloc::string::String
-pub craqle::federation::FederationRoutingError::GraphNotRouted
-pub craqle::federation::FederationRoutingError::GraphNotRouted::graph: alloc::string::String
-pub craqle::federation::FederationRoutingError::NoHealthyCurrentHolder
-pub craqle::federation::FederationRoutingError::NoHealthyCurrentHolder::graph: alloc::string::String
-impl craqle::federation::FederationRoutingError
-pub fn craqle::federation::FederationRoutingError::kind(&self) -> craqle::CraqleErrorKind
-#[non_exhaustive] pub enum craqle::federation::GraphHolderHealth
-pub craqle::federation::GraphHolderHealth::Healthy
-pub craqle::federation::GraphHolderHealth::Unhealthy
-pub craqle::federation::GraphHolderHealth::Unknown
-pub struct craqle::federation::GraphHolder
-pub craqle::federation::GraphHolder::graph_generation: [u8; 32]
-pub craqle::federation::GraphHolder::health: craqle::federation::GraphHolderHealth
-pub craqle::federation::GraphHolder::node_id: craqle::federation::NodeId
-pub craqle::federation::GraphHolder::observed_latency: core::option::Option<core::time::Duration>
-pub struct craqle::federation::GraphReplicaSet
-pub craqle::federation::GraphReplicaSet::graph: craqle::GraphId
-pub craqle::federation::GraphReplicaSet::graph_generation: [u8; 32]
-pub craqle::federation::GraphReplicaSet::primary: craqle::federation::GraphHolder
-pub craqle::federation::GraphReplicaSet::replicas: alloc::vec::Vec<craqle::federation::GraphHolder>
-pub craqle::federation::GraphReplicaSet::topology_generation: u64
-pub struct craqle::federation::GraphRoute
-pub craqle::federation::GraphRoute::first: craqle::federation::NodeId
-pub craqle::federation::GraphRoute::graph: craqle::GraphId
-pub craqle::federation::GraphRoute::graph_generation: [u8; 32]
-pub craqle::federation::GraphRoute::hedge: core::option::Option<craqle::federation::HedgedGraphRequest>
-pub craqle::federation::GraphRoute::query_fingerprint: [u8; 32]
-pub craqle::federation::GraphRoute::topology_generation: u64
-pub struct craqle::federation::HedgedGraphRequest
-pub craqle::federation::HedgedGraphRequest::after: core::time::Duration
-pub craqle::federation::HedgedGraphRequest::node_id: craqle::federation::NodeId
-pub struct craqle::federation::ReplicaSelectionOptions
-pub craqle::federation::ReplicaSelectionOptions::hedge_after: core::option::Option<core::time::Duration>
-pub trait craqle::federation::FederationTopology: core::marker::Send + core::marker::Sync
-pub fn craqle::federation::FederationTopology::graph_holders(&self, &craqle::GraphId) -> craqle::Result<core::option::Option<craqle::federation::GraphReplicaSet>>
-pub fn craqle::federation::route_graph(&dyn craqle::federation::FederationTopology, &craqle::GraphId, [u8; 32], craqle::federation::ReplicaSelectionOptions) -> craqle::Result<craqle::federation::GraphRoute>
-pub type craqle::federation::NodeId = craqle::ActorId
 pub mod craqle::shacl
 pub enum craqle::shacl::PendingReplayPolicy
 pub craqle::shacl::PendingReplayPolicy::Defer
@@ -255,7 +213,6 @@ pub craqle::AuthorizationError::PermissionDenied::action: craqle::Action
 pub craqle::AuthorizationError::PermissionDenied::graph: alloc::string::String
 #[non_exhaustive] pub enum craqle::CraqleError
 pub craqle::CraqleError::Authorization(craqle::AuthorizationError)
-pub craqle::CraqleError::FederationRouting(craqle::federation::FederationRoutingError)
 pub craqle::CraqleError::Io(core::io::error::Error)
 pub craqle::CraqleError::Merge(craqle::MergeError)
 pub craqle::CraqleError::MultiGraphUpdateUnsupported

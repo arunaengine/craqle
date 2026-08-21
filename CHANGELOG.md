@@ -48,9 +48,6 @@ All notable changes to Craqle are documented here.
   unsupported forms fail explicitly.
 - The release candidate uses exact Git dependencies and is not yet eligible
   for a crates.io publication.
-- First-time global federation misses require exact fan-out unless an
-  authoritative exact directory or deterministic partition exists.
-
 ### Migration from 0.1.x
 
 The first 0.2 deployment uses a new empty database. Craqle does not silently
