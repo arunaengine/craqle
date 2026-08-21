@@ -38,7 +38,7 @@ tracing = "0.1.44"
 tokio = "1.53.1"
 
 # RO-Crate implementation
-rocraters = { package = "ro-crate-rs", git = "https://github.com/arunaengine/ro-crate-rs.git", rev = "71c891374785827f5e819cdcc7dfae64f31be0fc", features = [
+rocraters = { package = "ro-crate-rs", git = "https://github.com/arunaengine/ro-crate-rs.git", rev = "d60e99123d6e73d7730717ef30ce546da84e1177", features = [
     "rdf",
 ] }
 
