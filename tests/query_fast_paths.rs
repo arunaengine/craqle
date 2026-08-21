@@ -95,6 +95,18 @@ fn fast_paths_match_generic() {
         "urn:test:fast:p",
         iri("urn:test:fast:o:shared"),
     ));
+    changes.push(insert(
+        &primary,
+        "urn:test:fast:shared",
+        "urn:test:fast:q",
+        iri("urn:test:fast:o:other"),
+    ));
+    changes.push(insert(
+        &primary,
+        "urn:test:fast:shared",
+        "urn:test:fast:r",
+        iri("urn:test:fast:o:other"),
+    ));
     node.apply_changes_unchecked(&primary, changes).unwrap();
     node.apply_changes_unchecked(
         &duplicate,
@@ -150,6 +162,10 @@ fn fast_paths_match_generic() {
         (
             "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:primary> { ?s <urn:test:fast:p> ?o } }",
             QueryFastPathKind::NamedCount,
+        ),
+        (
+            "SELECT (COUNT(*) AS ?count) WHERE { <urn:test:fast:shared> ?p <urn:test:fast:o:shared> }",
+            QueryFastPathKind::UnionCount,
         ),
         (
             "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s <urn:test:fast:p> <urn:test:fast:o:shared> }",

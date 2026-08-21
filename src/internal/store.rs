@@ -1917,16 +1917,40 @@ impl StoreReadSnapshot {
         order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
     ) -> Result<Option<crate::query_cursor::RawQueryIndexKeyCursor>> {
+        let resolve = |term: Option<TermId>| -> Result<Option<Option<QueryTermId>>> {
+            match term {
+                Some(term) => Ok(store
+                    .query_term_id_from_snapshot(&self.snapshot, term)?
+                    .map(Some)),
+                None => Ok(Some(None)),
+            }
+        };
+        let Some(graph) = resolve(pattern.graph)? else {
+            return Ok(None);
+        };
+        let Some(subject) = resolve(pattern.subject)? else {
+            return Ok(None);
+        };
+        let Some(predicate) = resolve(pattern.predicate)? else {
+            return Ok(None);
+        };
+        let Some(object) = resolve(pattern.object)? else {
+            return Ok(None);
+        };
         let Some((keyspace, prefix)) = store.query_index_range(&self.snapshot, order, pattern)?
         else {
             return Ok(None);
         };
+        let filter =
+            crate::query_cursor::RawQueryIndexPattern::new(graph, subject, predicate, object)
+                .without_prefix(order, prefix.len() / 8);
         Ok(Some(crate::query_cursor::RawQueryIndexKeyCursor::new(
             self.snapshot.clone(),
             keyspace,
             &store.qv2_query_to_term,
             order,
             prefix,
+            filter,
         )))
     }
 

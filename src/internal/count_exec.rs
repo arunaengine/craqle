@@ -140,6 +140,11 @@ pub(crate) fn single_pattern_count(
                     work = 0;
                     context.check_cancelled()?;
                 }
+                let (matches, extracted) = cursor.matches(key);
+                context.record_key_fields_extracted(extracted);
+                if !matches {
+                    continue;
+                }
 
                 let subject = (matches!(domain, CountValueDomain::Subject) || !orphaned.is_empty())
                     .then(|| {
@@ -300,6 +305,11 @@ fn for_each_join_key(
                     work = 0;
                     context.check_cancelled()?;
                 }
+                let (matches, extracted) = cursor.matches(key);
+                context.record_key_fields_extracted(extracted);
+                if !matches {
+                    continue;
+                }
 
                 context.record_key_fields_extracted(1);
                 let selected = match domain {
@@ -343,6 +353,11 @@ fn for_each_join_key(
                 if work == CANCELLATION_CHECK_INTERVAL {
                     work = 0;
                     context.check_cancelled()?;
+                }
+                let (matches, extracted) = cursor.matches(key);
+                context.record_key_fields_extracted(extracted);
+                if !matches {
+                    continue;
                 }
 
                 context.record_key_fields_extracted(3);
@@ -431,6 +446,11 @@ fn default_union_count(
         if work == CANCELLATION_CHECK_INTERVAL {
             work = 0;
             context.check_cancelled()?;
+        }
+        let (matches, extracted) = cursor.matches(key);
+        context.record_key_fields_extracted(extracted);
+        if !matches {
+            continue;
         }
 
         let mut subject = None;

@@ -64,6 +64,55 @@ pub(crate) struct RawQueryIndexKey {
     pub(crate) bytes_read: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RawQueryIndexPattern {
+    graph: Option<QueryTermId>,
+    subject: Option<QueryTermId>,
+    predicate: Option<QueryTermId>,
+    object: Option<QueryTermId>,
+}
+
+impl RawQueryIndexPattern {
+    pub(crate) fn new(
+        graph: Option<QueryTermId>,
+        subject: Option<QueryTermId>,
+        predicate: Option<QueryTermId>,
+        object: Option<QueryTermId>,
+    ) -> Self {
+        Self {
+            graph,
+            subject,
+            predicate,
+            object,
+        }
+    }
+
+    pub(crate) fn without_prefix(
+        mut self,
+        order: QueryIndexCursorOrder,
+        prefix_terms: usize,
+    ) -> Self {
+        let columns = match order {
+            QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
+            QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
+            QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
+            QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
+            QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
+            QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+        };
+        for column in columns.into_iter().take(prefix_terms) {
+            match column {
+                0 => self.graph = None,
+                1 => self.subject = None,
+                2 => self.predicate = None,
+                3 => self.object = None,
+                _ => unreachable!("query-index columns are four terms"),
+            }
+        }
+        self
+    }
+}
+
 impl RawQueryIndexKey {
     fn term_at(self, index: usize) -> QueryTermId {
         QueryTermId(u64::from_be_bytes(
@@ -117,6 +166,7 @@ pub(crate) struct RawQueryIndexKeyCursor {
     query_to_term: Keyspace,
     iterator: fjall::Iter,
     order: QueryIndexCursorOrder,
+    pattern: RawQueryIndexPattern,
 }
 
 impl RawQueryIndexKeyCursor {
@@ -126,6 +176,7 @@ impl RawQueryIndexKeyCursor {
         query_to_term: &Keyspace,
         order: QueryIndexCursorOrder,
         prefix: Vec<u8>,
+        pattern: RawQueryIndexPattern,
     ) -> Self {
         let iterator = if prefix.is_empty() {
             snapshot.iter(keyspace)
@@ -137,6 +188,7 @@ impl RawQueryIndexKeyCursor {
             query_to_term: query_to_term.clone(),
             iterator,
             order,
+            pattern,
         }
     }
 
@@ -170,6 +222,27 @@ impl RawQueryIndexKeyCursor {
 
     pub(crate) fn source_term(&self, term: QueryTermId) -> Result<TermId> {
         GraphStore::decode_query_source_term(&self.snapshot, &self.query_to_term, term)
+    }
+
+    pub(crate) fn matches(&self, key: RawQueryIndexKey) -> (bool, u64) {
+        let mut extracted = 0_u64;
+        for (expected, actual) in [
+            (
+                self.pattern.graph,
+                RawQueryIndexKey::graph as fn(RawQueryIndexKey) -> QueryTermId,
+            ),
+            (self.pattern.subject, RawQueryIndexKey::subject),
+            (self.pattern.predicate, RawQueryIndexKey::predicate),
+            (self.pattern.object, RawQueryIndexKey::object),
+        ] {
+            if let Some(expected) = expected {
+                extracted += 1;
+                if expected != actual(key) {
+                    return (false, extracted);
+                }
+            }
+        }
+        (true, extracted)
     }
 }
 
