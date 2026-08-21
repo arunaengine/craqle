@@ -3,6 +3,16 @@
 //! The integration surface is the root API: [`CraqleNode`], the typed request
 //! structs, and RO-Crate JSON-LD import/export. Everything under
 //! `src/internal/` is private to the crate.
+//!
+//! # Compatibility in 0.2.x
+//!
+//! Documented public APIs remain source compatible throughout 0.2.x unless a
+//! correctness or security defect makes that impossible. Authoritative CRDT
+//! data written by 0.2 remains readable by later 0.2 releases. Query and search
+//! indexes, compiled SHACL caches, federation metadata, and negative-result
+//! certificates are derived data and may be rebuilt or discarded. Unsupported
+//! forms return an error. A future 0.3 release may make breaking changes with a
+//! migration note.
 
 #![warn(unreachable_pub)]
 
@@ -114,6 +124,49 @@ pub use auth::{
 };
 pub use irokle;
 
+/// Stable high-level classification for public Craqle failures.
+///
+/// Detailed error variants may gain additional context during 0.2.x. Callers
+/// that need durable control flow should use [`CraqleError::kind`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CraqleErrorKind {
+    InvalidInput,
+    Unsupported,
+    Unauthorized,
+    Conflict,
+    StalePreparedState,
+    QueryLimit,
+    ValidationLimit,
+    Storage,
+    CorruptDerivedData,
+    CorruptAuthoritativeData,
+    DependencyUnavailable,
+    Cancelled,
+}
+
+/// Authoritative on-disk format understood by this release.
+///
+/// The version covers CRDT source state, graph recovery metadata, and committed
+/// policy bindings. Disposable indexes and caches have their own format
+/// markers and do not change this version.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub struct DiskFormatVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl DiskFormatVersion {
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+}
+
+/// Current authoritative disk format written by Craqle 0.2.
+pub const DISK_FORMAT_VERSION: DiskFormatVersion = DiskFormatVersion::new(1, 0);
+
 /// Test-only stall between a publish and its own apply, in microseconds.
 ///
 /// The pair is one critical section: the window between the two is exactly
@@ -142,6 +195,7 @@ fn stall_publish_apply() {
 fn stall_publish_apply() {}
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CraqleError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -184,6 +238,26 @@ impl From<sparql::SparqlError> for CraqleError {
 }
 
 impl CraqleError {
+    /// Stable category for programmatic error handling in the 0.2 series.
+    pub fn kind(&self) -> CraqleErrorKind {
+        match self {
+            Self::Io(_) | Self::SearchWorker(_) => CraqleErrorKind::Storage,
+            Self::Authorization(_) => CraqleErrorKind::Unauthorized,
+            Self::Store(error) => error.kind(),
+            Self::Search(error) => error.kind(),
+            Self::Sparql(error) => error.kind(),
+            Self::QueryCancelled => CraqleErrorKind::Cancelled,
+            Self::Update(error) => error.kind(),
+            Self::Merge(error) => error.kind(),
+            Self::RoCrate(error) => error.kind(),
+            #[cfg(feature = "shacl-core")]
+            Self::Shacl(error) => error.kind(),
+            Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
+            Self::Sync(error) => error.kind(),
+            Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
+        }
+    }
+
     /// Whether this rejects a record for what it contains, so a reconcile may
     /// quarantine it; everything else is retryable and must stall instead.
     pub fn rejects_record(&self) -> bool {
@@ -230,18 +304,16 @@ pub enum CraqleFjallPersistMode {
     SyncAll,
 }
 
-impl From<CraqleFjallPersistMode> for fjall::PersistMode {
-    fn from(mode: CraqleFjallPersistMode) -> Self {
-        match mode {
-            CraqleFjallPersistMode::Buffer => Self::Buffer,
-            CraqleFjallPersistMode::SyncData => Self::SyncData,
-            CraqleFjallPersistMode::SyncAll => Self::SyncAll,
+impl CraqleFjallPersistMode {
+    fn into_store_mode(self) -> fjall::PersistMode {
+        match self {
+            Self::Buffer => fjall::PersistMode::Buffer,
+            Self::SyncData => fjall::PersistMode::SyncData,
+            Self::SyncAll => fjall::PersistMode::SyncAll,
         }
     }
-}
 
-impl From<fjall::PersistMode> for CraqleFjallPersistMode {
-    fn from(mode: fjall::PersistMode) -> Self {
+    fn from_store_mode(mode: fjall::PersistMode) -> Self {
         match mode {
             fjall::PersistMode::Buffer => Self::Buffer,
             fjall::PersistMode::SyncData => Self::SyncData,
@@ -787,6 +859,11 @@ fn reconcile_at_open(node: &CraqleNode) -> Result<()> {
 }
 
 impl CraqleNode {
+    /// Authoritative disk format validated when this node opened.
+    pub fn disk_format_version(&self) -> DiskFormatVersion {
+        DISK_FORMAT_VERSION
+    }
+
     /// Open a node rooted at `path` with default options.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, CraqleOptions::default())
@@ -808,7 +885,7 @@ impl CraqleNode {
 
         let store = Arc::new(GraphStore::open_with_persist_mode(
             root.join("store"),
-            graph_store_persist_mode.into(),
+            graph_store_persist_mode.into_store_mode(),
         )?);
         let search = Arc::new(match search_storage {
             SearchStorage::Disk => SearchIndex::open(root.join("search"))?,
@@ -1289,7 +1366,7 @@ impl CraqleNode {
 
     /// Return the Fjall persistence mode used for explicit graph-store persists.
     pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
-        self.store.persist_mode().into()
+        CraqleFjallPersistMode::from_store_mode(self.store.persist_mode())
     }
 
     pub fn irokle_topic_id(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {

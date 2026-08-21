@@ -48,9 +48,15 @@ tempfile = "3.27.0"
 
 [package]
 name = "craqle"
-version = "0.1.1"
+version = "0.2.0-rc.1"
 edition = "2024"
+rust-version = "1.91"
 license = "MIT"
+description = "Versioned RDF graph storage, SPARQL, SHACL, and RO-Crate workflows"
+repository = "https://github.com/arunaengine/craqle"
+readme = "README.md"
+keywords = ["rdf", "ro-crate", "sparql", "shacl", "crdt"]
+categories = ["database", "data-structures", "science"]
 
 [features]
 default = ["search"]

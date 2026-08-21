@@ -392,3 +392,29 @@ pub enum ShaclError {
         message: String,
     },
 }
+
+impl ShaclError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::UnsupportedComponent { .. }
+            | Self::ImportsDisabled { .. }
+            | Self::ImportNotLocal { .. }
+            | Self::UnsupportedRdfStarTerm { .. }
+            | Self::ShapesGraphMutationUnsupported { .. }
+            | Self::DeltaExecutionUnavailable { .. } => crate::CraqleErrorKind::Unsupported,
+            Self::SchemaChangedDuringValidation { .. } => {
+                crate::CraqleErrorKind::StalePreparedState
+            }
+            Self::ValidationCancelled => crate::CraqleErrorKind::Cancelled,
+            Self::PathBudgetExceeded { .. }
+            | Self::PathDepthExceeded { .. }
+            | Self::ResultLimitExceeded { .. } => crate::CraqleErrorKind::ValidationLimit,
+            Self::ShapesGraphNotFound { .. }
+            | Self::IllFormedShapes { .. }
+            | Self::ImportCycle { .. }
+            | Self::DataGraphNotFound { .. }
+            | Self::CyclicShapeEvaluation { .. }
+            | Self::InvalidPattern { .. } => crate::CraqleErrorKind::InvalidInput,
+        }
+    }
+}

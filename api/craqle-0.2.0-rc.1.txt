@@ -1,0 +1,1003 @@
+pub mod craqle
+pub use craqle::irokle
+pub mod craqle::shacl
+pub enum craqle::shacl::PendingReplayPolicy
+pub craqle::shacl::PendingReplayPolicy::Defer
+pub craqle::shacl::PendingReplayPolicy::ReplayAllBeforeOpen
+pub craqle::shacl::PendingReplayPolicy::ReplayBounded
+pub craqle::shacl::PendingReplayPolicy::ReplayBounded::max_elapsed: core::time::Duration
+pub craqle::shacl::PendingReplayPolicy::ReplayBounded::max_graphs: usize
+impl core::default::Default for craqle::shacl::PendingReplayPolicy
+pub fn craqle::shacl::PendingReplayPolicy::default() -> Self
+pub enum craqle::shacl::ShaclError
+pub craqle::shacl::ShaclError::CyclicShapeEvaluation
+pub craqle::shacl::ShaclError::CyclicShapeEvaluation::focus: alloc::string::String
+pub craqle::shacl::ShaclError::CyclicShapeEvaluation::shape: alloc::string::String
+pub craqle::shacl::ShaclError::DataGraphNotFound
+pub craqle::shacl::ShaclError::DataGraphNotFound::graph: alloc::string::String
+pub craqle::shacl::ShaclError::DeltaExecutionUnavailable
+pub craqle::shacl::ShaclError::DeltaExecutionUnavailable::reason: alloc::string::String
+pub craqle::shacl::ShaclError::IllFormedShapes
+pub craqle::shacl::ShaclError::IllFormedShapes::graph: alloc::string::String
+pub craqle::shacl::ShaclError::IllFormedShapes::message: alloc::string::String
+pub craqle::shacl::ShaclError::ImportCycle
+pub craqle::shacl::ShaclError::ImportCycle::graphs: alloc::vec::Vec<alloc::string::String>
+pub craqle::shacl::ShaclError::ImportNotLocal
+pub craqle::shacl::ShaclError::ImportNotLocal::graph: alloc::string::String
+pub craqle::shacl::ShaclError::ImportNotLocal::import: alloc::string::String
+pub craqle::shacl::ShaclError::ImportsDisabled
+pub craqle::shacl::ShaclError::ImportsDisabled::graph: alloc::string::String
+pub craqle::shacl::ShaclError::ImportsDisabled::import: alloc::string::String
+pub craqle::shacl::ShaclError::InvalidPattern
+pub craqle::shacl::ShaclError::InvalidPattern::flags: alloc::string::String
+pub craqle::shacl::ShaclError::InvalidPattern::message: alloc::string::String
+pub craqle::shacl::ShaclError::InvalidPattern::pattern: alloc::string::String
+pub craqle::shacl::ShaclError::InvalidPattern::shape: alloc::string::String
+pub craqle::shacl::ShaclError::PathBudgetExceeded
+pub craqle::shacl::ShaclError::PathBudgetExceeded::limit: u64
+pub craqle::shacl::ShaclError::PathDepthExceeded
+pub craqle::shacl::ShaclError::PathDepthExceeded::limit: usize
+pub craqle::shacl::ShaclError::ResultLimitExceeded
+pub craqle::shacl::ShaclError::ResultLimitExceeded::limit: usize
+pub craqle::shacl::ShaclError::SchemaChangedDuringValidation
+pub craqle::shacl::ShaclError::SchemaChangedDuringValidation::graph: alloc::string::String
+pub craqle::shacl::ShaclError::ShapesGraphMutationUnsupported
+pub craqle::shacl::ShaclError::ShapesGraphMutationUnsupported::graph: alloc::string::String
+pub craqle::shacl::ShaclError::ShapesGraphNotFound
+pub craqle::shacl::ShaclError::ShapesGraphNotFound::graph: alloc::string::String
+pub craqle::shacl::ShaclError::UnsupportedComponent
+pub craqle::shacl::ShaclError::UnsupportedComponent::component: alloc::string::String
+pub craqle::shacl::ShaclError::UnsupportedComponent::shape: alloc::string::String
+pub craqle::shacl::ShaclError::UnsupportedRdfStarTerm
+pub craqle::shacl::ShaclError::UnsupportedRdfStarTerm::term: alloc::string::String
+pub craqle::shacl::ShaclError::ValidationCancelled
+pub enum craqle::shacl::ShaclExecutionMode
+pub craqle::shacl::ShaclExecutionMode::Auto
+pub craqle::shacl::ShaclExecutionMode::ForceDelta
+pub craqle::shacl::ShaclExecutionMode::ForceFull
+pub enum craqle::shacl::ShaclProfile
+pub craqle::shacl::ShaclProfile::CraqleFastV1
+#[non_exhaustive] pub enum craqle::shacl::ShaclValidationState
+pub craqle::shacl::ShaclValidationState::Failed
+pub craqle::shacl::ShaclValidationState::Invalid
+pub craqle::shacl::ShaclValidationState::Pending
+pub craqle::shacl::ShaclValidationState::Valid
+#[non_exhaustive] pub enum craqle::shacl::ValidationPolicy
+pub craqle::shacl::ValidationPolicy::Advisory
+pub craqle::shacl::ValidationPolicy::Disabled
+pub craqle::shacl::ValidationPolicy::Enforce
+pub struct craqle::shacl::CompiledShaclSchema
+impl craqle::shacl::CompiledShaclSchema
+pub fn craqle::shacl::CompiledShaclSchema::model_version(&self) -> u32
+pub fn craqle::shacl::CompiledShaclSchema::plan_fingerprint(&self) -> [u8; 32]
+pub fn craqle::shacl::CompiledShaclSchema::profile(&self) -> craqle::shacl::ShaclProfile
+pub fn craqle::shacl::CompiledShaclSchema::rocrate_version(&self) -> craqle::RoCrateVersion
+pub fn craqle::shacl::CompiledShaclSchema::schema_hash(&self) -> [u8; 32]
+pub fn craqle::shacl::CompiledShaclSchema::shape_count(&self) -> usize
+pub fn craqle::shacl::CompiledShaclSchema::statistics(&self) -> &craqle::shacl::ShaclCompileStatistics
+pub struct craqle::shacl::PendingReplayFailure
+pub craqle::shacl::PendingReplayFailure::bindings: alloc::vec::Vec<craqle::shacl::ShaclBinding>
+pub craqle::shacl::PendingReplayFailure::data_version: core::option::Option<[u8; 32]>
+pub craqle::shacl::PendingReplayFailure::error: alloc::string::String
+pub craqle::shacl::PendingReplayFailure::graph: craqle::GraphId
+pub struct craqle::shacl::PendingReplayOutcome
+pub craqle::shacl::PendingReplayOutcome::budget_exhausted: bool
+pub craqle::shacl::PendingReplayOutcome::failures: alloc::vec::Vec<craqle::shacl::PendingReplayFailure>
+pub craqle::shacl::PendingReplayOutcome::statistics: craqle::shacl::PendingReplayStatistics
+pub struct craqle::shacl::PendingReplayStatistics
+pub craqle::shacl::PendingReplayStatistics::binding_records_scanned: u64
+pub craqle::shacl::PendingReplayStatistics::elapsed: core::time::Duration
+pub craqle::shacl::PendingReplayStatistics::graphs_settled: u64
+pub craqle::shacl::PendingReplayStatistics::pending_queue_entries_scanned: u64
+pub craqle::shacl::PendingReplayStatistics::reports_produced: u64
+pub struct craqle::shacl::PendingShaclQueueStatus
+pub craqle::shacl::PendingShaclQueueStatus::pending_count: u64
+pub craqle::shacl::PendingShaclQueueStatus::settlement_failures: u64
+pub struct craqle::shacl::ShaclBinding
+pub craqle::shacl::ShaclBinding::data_graph: craqle::GraphId
+pub craqle::shacl::ShaclBinding::policy: craqle::shacl::ValidationPolicy
+pub craqle::shacl::ShaclBinding::shapes_graph: craqle::GraphId
+pub craqle::shacl::ShaclBinding::validation_options: craqle::shacl::ShaclBindingOptions
+pub struct craqle::shacl::ShaclBindingOptions
+pub craqle::shacl::ShaclBindingOptions::allow_local_imports: bool
+pub craqle::shacl::ShaclBindingOptions::max_path_depth: usize
+pub craqle::shacl::ShaclBindingOptions::max_path_edges: u64
+pub craqle::shacl::ShaclBindingOptions::max_results: usize
+pub craqle::shacl::ShaclBindingOptions::rocrate_version: craqle::RoCrateVersion
+impl core::default::Default for craqle::shacl::ShaclBindingOptions
+pub fn craqle::shacl::ShaclBindingOptions::default() -> Self
+pub struct craqle::shacl::ShaclBindingStatus
+pub craqle::shacl::ShaclBindingStatus::binding: craqle::shacl::ShaclBinding
+pub craqle::shacl::ShaclBindingStatus::compiler_model_version: u32
+pub craqle::shacl::ShaclBindingStatus::data_version: [u8; 32]
+pub craqle::shacl::ShaclBindingStatus::error: core::option::Option<alloc::string::String>
+pub craqle::shacl::ShaclBindingStatus::report: core::option::Option<craqle::shacl::ShaclValidationReport>
+pub craqle::shacl::ShaclBindingStatus::schema_fingerprint: [u8; 32]
+pub craqle::shacl::ShaclBindingStatus::shapes_version: [u8; 32]
+pub craqle::shacl::ShaclBindingStatus::state: craqle::shacl::ShaclValidationState
+pub struct craqle::shacl::ShaclCompileOptions
+pub craqle::shacl::ShaclCompileOptions::allow_local_imports: bool
+pub craqle::shacl::ShaclCompileOptions::rocrate_version: craqle::RoCrateVersion
+pub struct craqle::shacl::ShaclCompileStatistics
+pub craqle::shacl::ShaclCompileStatistics::cache_hit: bool
+pub craqle::shacl::ShaclCompileStatistics::compile_time: core::time::Duration
+pub craqle::shacl::ShaclCompileStatistics::parse_time: core::time::Duration
+pub craqle::shacl::ShaclCompileStatistics::shape_graphs: usize
+pub craqle::shacl::ShaclCompileStatistics::shape_triples: usize
+pub struct craqle::shacl::ShaclMessage
+pub craqle::shacl::ShaclMessage::language: core::option::Option<alloc::string::String>
+pub craqle::shacl::ShaclMessage::text: alloc::string::String
+pub struct craqle::shacl::ShaclRuntimeStatistics
+pub craqle::shacl::ShaclRuntimeStatistics::binding_lock_hold_ns: u64
+pub craqle::shacl::ShaclRuntimeStatistics::binding_lock_wait_ns: u64
+pub craqle::shacl::ShaclRuntimeStatistics::graph_commit_lock_wait_ns: u64
+pub craqle::shacl::ShaclRuntimeStatistics::settlement_failures: u64
+pub craqle::shacl::ShaclRuntimeStatistics::settlement_ns: u64
+pub craqle::shacl::ShaclRuntimeStatistics::status_bindings_read: u64
+pub craqle::shacl::ShaclRuntimeStatistics::status_full_shape_scans: u64
+pub craqle::shacl::ShaclRuntimeStatistics::status_shape_compilations: u64
+pub craqle::shacl::ShaclRuntimeStatistics::status_version_checks: u64
+pub craqle::shacl::ShaclRuntimeStatistics::validation_ns: u64
+pub struct craqle::shacl::ShaclValidationOptions
+pub craqle::shacl::ShaclValidationOptions::cancellation: craqle::QueryCancellation
+pub craqle::shacl::ShaclValidationOptions::execution_mode: craqle::shacl::ShaclExecutionMode
+pub craqle::shacl::ShaclValidationOptions::max_path_depth: usize
+pub craqle::shacl::ShaclValidationOptions::max_path_edges: u64
+pub craqle::shacl::ShaclValidationOptions::max_results: usize
+impl core::default::Default for craqle::shacl::ShaclValidationOptions
+pub fn craqle::shacl::ShaclValidationOptions::default() -> Self
+pub struct craqle::shacl::ShaclValidationReport
+pub craqle::shacl::ShaclValidationReport::conforms: bool
+pub craqle::shacl::ShaclValidationReport::results: alloc::vec::Vec<craqle::shacl::ShaclValidationResult>
+pub craqle::shacl::ShaclValidationReport::statistics: craqle::shacl::ShaclValidationStatistics
+impl craqle::shacl::ShaclValidationReport
+pub fn craqle::shacl::ShaclValidationReport::crate_violations(&self) -> alloc::vec::Vec<craqle::CrateViolation>
+pub struct craqle::shacl::ShaclValidationResult
+pub craqle::shacl::ShaclValidationResult::focus_node: craqle::EncodedTerm
+pub craqle::shacl::ShaclValidationResult::messages: alloc::vec::Vec<craqle::shacl::ShaclMessage>
+pub craqle::shacl::ShaclValidationResult::result_path: core::option::Option<alloc::string::String>
+pub craqle::shacl::ShaclValidationResult::severity: craqle::EncodedTerm
+pub craqle::shacl::ShaclValidationResult::source_constraint_component: alloc::string::String
+pub craqle::shacl::ShaclValidationResult::source_shape: craqle::EncodedTerm
+pub craqle::shacl::ShaclValidationResult::value: core::option::Option<craqle::EncodedTerm>
+pub struct craqle::shacl::ShaclValidationStatistics
+pub craqle::shacl::ShaclValidationStatistics::compile_time: core::time::Duration
+pub craqle::shacl::ShaclValidationStatistics::constraint_time: core::time::Duration
+pub craqle::shacl::ShaclValidationStatistics::constraints_evaluated: u64
+pub craqle::shacl::ShaclValidationStatistics::estimated_affected_shapes: u64
+pub craqle::shacl::ShaclValidationStatistics::estimated_delta_work: u64
+pub craqle::shacl::ShaclValidationStatistics::estimated_focus_nodes: u64
+pub craqle::shacl::ShaclValidationStatistics::estimated_full_work: u64
+pub craqle::shacl::ShaclValidationStatistics::focus_nodes: u64
+pub craqle::shacl::ShaclValidationStatistics::full_graph_fallbacks: u64
+pub craqle::shacl::ShaclValidationStatistics::parse_time: core::time::Duration
+pub craqle::shacl::ShaclValidationStatistics::path_candidate_quads: u64
+pub craqle::shacl::ShaclValidationStatistics::path_index_seeks: u64
+pub craqle::shacl::ShaclValidationStatistics::read: craqle::ReadStatistics
+pub craqle::shacl::ShaclValidationStatistics::report_time: core::time::Duration
+pub craqle::shacl::ShaclValidationStatistics::selected_mode: craqle::shacl::ShaclExecutionMode
+pub craqle::shacl::ShaclValidationStatistics::shape_compile_cache_hit: bool
+pub craqle::shacl::ShaclValidationStatistics::shapes_considered: u64
+pub craqle::shacl::ShaclValidationStatistics::shapes_executed: u64
+pub craqle::shacl::ShaclValidationStatistics::shapes_skipped: u64
+pub craqle::shacl::ShaclValidationStatistics::stopped_early: bool
+pub craqle::shacl::ShaclValidationStatistics::target_candidates: u64
+pub craqle::shacl::ShaclValidationStatistics::target_time: core::time::Duration
+pub craqle::shacl::ShaclValidationStatistics::terms_decoded: u64
+pub craqle::shacl::ShaclValidationStatistics::violations: u64
+pub const craqle::shacl::SHACL_COMPILER_MODEL_VERSION: u32
+pub mod craqle::vocab
+pub fn craqle::vocab::metadata_descriptor() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::rdf_type() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_about() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_conforms_to() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_creative_work() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_dataset() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_date_published() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_description() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_has_part() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_identifier() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_keywords() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_license() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_media_object() -> oxrdf::named_node::NamedNode
+pub fn craqle::vocab::schema_name() -> oxrdf::named_node::NamedNode
+pub enum craqle::Action
+pub craqle::Action::Read
+pub craqle::Action::Write
+pub enum craqle::AuthorizationError
+pub craqle::AuthorizationError::InvalidPattern
+pub craqle::AuthorizationError::InvalidPattern::message: alloc::string::String
+pub craqle::AuthorizationError::InvalidPattern::pattern: alloc::string::String
+pub craqle::AuthorizationError::PermissionDenied
+pub craqle::AuthorizationError::PermissionDenied::action: craqle::Action
+pub craqle::AuthorizationError::PermissionDenied::graph: alloc::string::String
+#[non_exhaustive] pub enum craqle::CraqleError
+pub craqle::CraqleError::Authorization(craqle::AuthorizationError)
+pub craqle::CraqleError::Io(core::io::error::Error)
+pub craqle::CraqleError::Merge(craqle::MergeError)
+pub craqle::CraqleError::MultiGraphUpdateUnsupported
+pub craqle::CraqleError::QueryCancelled
+pub craqle::CraqleError::RoCrate(craqle::RoCrateError)
+pub craqle::CraqleError::Search(craqle::search::SearchError)
+pub craqle::CraqleError::SearchWorker(alloc::string::String)
+pub craqle::CraqleError::Shacl(craqle::shacl::ShaclError)
+pub craqle::CraqleError::Sparql(craqle::sparql::SparqlError)
+pub craqle::CraqleError::Store(craqle::store::StoreError)
+pub craqle::CraqleError::Sync(craqle::CraqleSyncError)
+pub craqle::CraqleError::SyncInputRejected(alloc::string::String)
+pub craqle::CraqleError::Update(craqle::UpdateError)
+impl craqle::CraqleError
+pub fn craqle::CraqleError::kind(&self) -> craqle::CraqleErrorKind
+pub fn craqle::CraqleError::rejects_record(&self) -> bool
+#[non_exhaustive] pub enum craqle::CraqleErrorKind
+pub craqle::CraqleErrorKind::Cancelled
+pub craqle::CraqleErrorKind::Conflict
+pub craqle::CraqleErrorKind::CorruptAuthoritativeData
+pub craqle::CraqleErrorKind::CorruptDerivedData
+pub craqle::CraqleErrorKind::DependencyUnavailable
+pub craqle::CraqleErrorKind::InvalidInput
+pub craqle::CraqleErrorKind::QueryLimit
+pub craqle::CraqleErrorKind::StalePreparedState
+pub craqle::CraqleErrorKind::Storage
+pub craqle::CraqleErrorKind::Unauthorized
+pub craqle::CraqleErrorKind::Unsupported
+pub craqle::CraqleErrorKind::ValidationLimit
+pub enum craqle::CraqleFjallPersistMode
+pub craqle::CraqleFjallPersistMode::Buffer
+pub craqle::CraqleFjallPersistMode::SyncAll
+pub craqle::CraqleFjallPersistMode::SyncData
+pub enum craqle::CraqleGraphEvent
+pub craqle::CraqleGraphEvent::ContextUpdated
+pub craqle::CraqleGraphEvent::ContextUpdated::context: core::option::Option<alloc::string::String>
+pub craqle::CraqleGraphEvent::ContextUpdated::graph: craqle::GraphId
+pub craqle::CraqleGraphEvent::ContextUpdated::license: core::option::Option<alloc::string::String>
+pub craqle::CraqleGraphEvent::ContextUpdated::license_digest: core::option::Option<[u8; 32]>
+pub craqle::CraqleGraphEvent::ContextUpdated::tag: craqle::core::ContextTag
+pub craqle::CraqleGraphEvent::GraphDeleted
+pub craqle::CraqleGraphEvent::GraphDeleted::graph: craqle::GraphId
+pub craqle::CraqleGraphEvent::Policy
+pub craqle::CraqleGraphEvent::Policy::graph: craqle::GraphId
+pub craqle::CraqleGraphEvent::Policy::policy: craqle::GraphPolicy
+pub craqle::CraqleGraphEvent::QuadChanges
+pub craqle::CraqleGraphEvent::QuadChanges::changes: alloc::vec::Vec<craqle::MaterializedQuadChange>
+pub craqle::CraqleGraphEvent::QuadChanges::graph: craqle::GraphId
+impl craqle::CraqleGraphEvent
+pub fn craqle::CraqleGraphEvent::graph(&self) -> &craqle::GraphId
+impl irokle::event::Event for craqle::CraqleGraphEvent where Self: serde_core::ser::Serialize + serde_core::de::DeserializeOwned + core::marker::Send + core::marker::Sync + 'static
+pub const craqle::CraqleGraphEvent::TYPE_ID: &'static str
+pub enum craqle::CraqleRequestDurability
+pub craqle::CraqleRequestDurability::Durable
+pub craqle::CraqleRequestDurability::WalAlreadyDurable
+pub enum craqle::CraqleSyncError
+pub craqle::CraqleSyncError::InvalidEvent(alloc::string::String)
+pub craqle::CraqleSyncError::Irokle(irokle::error::Error)
+pub craqle::CraqleSyncError::NotConfigured
+pub craqle::CraqleSyncError::Store(craqle::store::StoreError)
+pub craqle::CraqleSyncError::TopicConflict
+pub craqle::CraqleSyncError::TopicConflict::existing: irokle::ids::TopicId
+pub craqle::CraqleSyncError::TopicConflict::graph: alloc::string::String
+pub craqle::CraqleSyncError::TopicConflict::incoming: irokle::ids::TopicId
+impl craqle::CraqleSyncError
+pub fn craqle::CraqleSyncError::rejects_record(&self) -> bool
+pub enum craqle::JoinKind
+pub craqle::JoinKind::Hash
+pub craqle::JoinKind::IndexedLateral
+pub craqle::JoinKind::PropertyStar
+pub enum craqle::JoinMode
+pub craqle::JoinMode::Auto
+pub craqle::JoinMode::ForceHash
+pub craqle::JoinMode::ForceLateral
+pub craqle::JoinMode::ForcePropertyStar
+pub enum craqle::MaterializedQuadChange
+pub craqle::MaterializedQuadChange::Delete
+pub craqle::MaterializedQuadChange::Delete::graph: craqle::GraphId
+pub craqle::MaterializedQuadChange::Delete::object: craqle::EncodedTerm
+pub craqle::MaterializedQuadChange::Delete::predicate: craqle::EncodedTerm
+pub craqle::MaterializedQuadChange::Delete::subject: craqle::EncodedTerm
+pub craqle::MaterializedQuadChange::Insert
+pub craqle::MaterializedQuadChange::Insert::graph: craqle::GraphId
+pub craqle::MaterializedQuadChange::Insert::object: craqle::EncodedTerm
+pub craqle::MaterializedQuadChange::Insert::predicate: craqle::EncodedTerm
+pub craqle::MaterializedQuadChange::Insert::subject: craqle::EncodedTerm
+pub enum craqle::MergeError
+pub craqle::MergeError::InputRejected(alloc::string::String)
+pub craqle::MergeError::Store(craqle::store::StoreError)
+pub enum craqle::PendingReplayPolicy
+pub craqle::PendingReplayPolicy::Defer
+pub craqle::PendingReplayPolicy::ReplayAllBeforeOpen
+pub craqle::PendingReplayPolicy::ReplayBounded
+pub craqle::PendingReplayPolicy::ReplayBounded::max_elapsed: core::time::Duration
+pub craqle::PendingReplayPolicy::ReplayBounded::max_graphs: usize
+impl core::default::Default for craqle::shacl::PendingReplayPolicy
+pub fn craqle::shacl::PendingReplayPolicy::default() -> Self
+pub enum craqle::PermissionLevel
+pub craqle::PermissionLevel::Read
+pub craqle::PermissionLevel::Write
+impl craqle::PermissionLevel
+pub fn craqle::PermissionLevel::allows(self, craqle::Action) -> bool
+pub enum craqle::QuadOp
+pub craqle::QuadOp::Add
+pub craqle::QuadOp::Add::dot: craqle::Dot
+pub craqle::QuadOp::Add::object: craqle::EncodedTerm
+pub craqle::QuadOp::Add::predicate: craqle::EncodedTerm
+pub craqle::QuadOp::Add::subject: craqle::EncodedTerm
+pub craqle::QuadOp::Remove
+pub craqle::QuadOp::Remove::object: craqle::EncodedTerm
+pub craqle::QuadOp::Remove::predicate: craqle::EncodedTerm
+pub craqle::QuadOp::Remove::subject: craqle::EncodedTerm
+pub craqle::QuadOp::Remove::witnessed: craqle::VectorClock
+pub enum craqle::QueryFastPathKind
+pub craqle::QueryFastPathKind::Ask
+pub craqle::QueryFastPathKind::CountDistinctSubject
+pub craqle::QueryFastPathKind::HashJoinCount
+pub craqle::QueryFastPathKind::NamedCount
+pub craqle::QueryFastPathKind::PropertyStar
+pub craqle::QueryFastPathKind::SelectLimit
+pub craqle::QueryFastPathKind::UnionCount
+pub enum craqle::QueryFastPathMode
+pub craqle::QueryFastPathMode::Auto
+pub craqle::QueryFastPathMode::Disabled
+#[non_exhaustive] pub enum craqle::QueryIndexState
+pub craqle::QueryIndexState::Building
+pub craqle::QueryIndexState::Failed(alloc::string::String)
+pub craqle::QueryIndexState::Missing
+pub craqle::QueryIndexState::Ready
+#[non_exhaustive] pub enum craqle::QueryIndexVerificationMode
+pub craqle::QueryIndexVerificationMode::Full
+pub craqle::QueryIndexVerificationMode::Sample
+impl core::convert::From<bool> for craqle::QueryIndexVerificationMode
+pub fn craqle::QueryIndexVerificationMode::from(bool) -> Self
+#[non_exhaustive] pub enum craqle::QueryLogicalOperator
+pub craqle::QueryLogicalOperator::Ask
+pub craqle::QueryLogicalOperator::Construct
+pub craqle::QueryLogicalOperator::Describe
+pub craqle::QueryLogicalOperator::Evaluation
+pub craqle::QueryLogicalOperator::Join
+pub craqle::QueryLogicalOperator::Select
+#[non_exhaustive] pub enum craqle::QueryPhysicalOperator
+pub craqle::QueryPhysicalOperator::Evaluator(alloc::string::String)
+pub craqle::QueryPhysicalOperator::FastPath(craqle::QueryFastPathKind)
+pub craqle::QueryPhysicalOperator::Generic
+pub craqle::QueryPhysicalOperator::PlannedJoin(craqle::JoinKind)
+pub enum craqle::QueryReadMode
+pub craqle::QueryReadMode::Auto
+pub craqle::QueryReadMode::ForceQv
+pub craqle::QueryReadMode::ForceSource
+pub enum craqle::QueryResults
+pub craqle::QueryResults::Boolean(bool)
+pub craqle::QueryResults::Graph(alloc::vec::Vec<(craqle::EncodedTerm, craqle::EncodedTerm, craqle::EncodedTerm)>)
+pub craqle::QueryResults::Solutions(alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, craqle::EncodedTerm>>)
+#[non_exhaustive] pub enum craqle::ReadAccessPath
+pub craqle::ReadAccessPath::Empty
+pub craqle::ReadAccessPath::QvGpos
+pub craqle::ReadAccessPath::QvPosg
+pub craqle::ReadAccessPath::QvSpog
+pub craqle::ReadAccessPath::SourceGspo
+pub enum craqle::RoCrateError
+pub craqle::RoCrateError::EntityNotFound(alloc::string::String)
+pub craqle::RoCrateError::InvalidBatch(alloc::string::String)
+pub craqle::RoCrateError::InvalidGraph(alloc::string::String)
+pub craqle::RoCrateError::Json(serde_json::error::Error)
+pub craqle::RoCrateError::JsonLd(alloc::string::String)
+pub craqle::RoCrateError::MissingVersion
+pub craqle::RoCrateError::Rdf(rocraters::ro_crate::rdf::error::RdfError)
+pub craqle::RoCrateError::Store(craqle::store::StoreError)
+pub craqle::RoCrateError::UnknownVersion(alloc::string::String)
+pub craqle::RoCrateError::UnsupportedJsonLd(alloc::string::String)
+pub craqle::RoCrateError::UnsupportedTerm(alloc::string::String)
+pub craqle::RoCrateError::Update(craqle::UpdateError)
+pub craqle::RoCrateError::VersionMismatch
+pub craqle::RoCrateError::VersionMismatch::first: craqle::RoCrateVersion
+pub craqle::RoCrateError::VersionMismatch::second: craqle::RoCrateVersion
+#[non_exhaustive] pub enum craqle::RoCrateVersion
+pub craqle::RoCrateVersion::V1_1
+pub craqle::RoCrateVersion::V1_2
+pub craqle::RoCrateVersion::V1_3
+pub enum craqle::SearchStorage
+pub craqle::SearchStorage::Disk
+pub craqle::SearchStorage::Memory
+pub enum craqle::ShaclError
+pub craqle::ShaclError::CyclicShapeEvaluation
+pub craqle::ShaclError::CyclicShapeEvaluation::focus: alloc::string::String
+pub craqle::ShaclError::CyclicShapeEvaluation::shape: alloc::string::String
+pub craqle::ShaclError::DataGraphNotFound
+pub craqle::ShaclError::DataGraphNotFound::graph: alloc::string::String
+pub craqle::ShaclError::DeltaExecutionUnavailable
+pub craqle::ShaclError::DeltaExecutionUnavailable::reason: alloc::string::String
+pub craqle::ShaclError::IllFormedShapes
+pub craqle::ShaclError::IllFormedShapes::graph: alloc::string::String
+pub craqle::ShaclError::IllFormedShapes::message: alloc::string::String
+pub craqle::ShaclError::ImportCycle
+pub craqle::ShaclError::ImportCycle::graphs: alloc::vec::Vec<alloc::string::String>
+pub craqle::ShaclError::ImportNotLocal
+pub craqle::ShaclError::ImportNotLocal::graph: alloc::string::String
+pub craqle::ShaclError::ImportNotLocal::import: alloc::string::String
+pub craqle::ShaclError::ImportsDisabled
+pub craqle::ShaclError::ImportsDisabled::graph: alloc::string::String
+pub craqle::ShaclError::ImportsDisabled::import: alloc::string::String
+pub craqle::ShaclError::InvalidPattern
+pub craqle::ShaclError::InvalidPattern::flags: alloc::string::String
+pub craqle::ShaclError::InvalidPattern::message: alloc::string::String
+pub craqle::ShaclError::InvalidPattern::pattern: alloc::string::String
+pub craqle::ShaclError::InvalidPattern::shape: alloc::string::String
+pub craqle::ShaclError::PathBudgetExceeded
+pub craqle::ShaclError::PathBudgetExceeded::limit: u64
+pub craqle::ShaclError::PathDepthExceeded
+pub craqle::ShaclError::PathDepthExceeded::limit: usize
+pub craqle::ShaclError::ResultLimitExceeded
+pub craqle::ShaclError::ResultLimitExceeded::limit: usize
+pub craqle::ShaclError::SchemaChangedDuringValidation
+pub craqle::ShaclError::SchemaChangedDuringValidation::graph: alloc::string::String
+pub craqle::ShaclError::ShapesGraphMutationUnsupported
+pub craqle::ShaclError::ShapesGraphMutationUnsupported::graph: alloc::string::String
+pub craqle::ShaclError::ShapesGraphNotFound
+pub craqle::ShaclError::ShapesGraphNotFound::graph: alloc::string::String
+pub craqle::ShaclError::UnsupportedComponent
+pub craqle::ShaclError::UnsupportedComponent::component: alloc::string::String
+pub craqle::ShaclError::UnsupportedComponent::shape: alloc::string::String
+pub craqle::ShaclError::UnsupportedRdfStarTerm
+pub craqle::ShaclError::UnsupportedRdfStarTerm::term: alloc::string::String
+pub craqle::ShaclError::ValidationCancelled
+pub enum craqle::ShaclExecutionMode
+pub craqle::ShaclExecutionMode::Auto
+pub craqle::ShaclExecutionMode::ForceDelta
+pub craqle::ShaclExecutionMode::ForceFull
+pub enum craqle::ShaclProfile
+pub craqle::ShaclProfile::CraqleFastV1
+#[non_exhaustive] pub enum craqle::ShaclValidationState
+pub craqle::ShaclValidationState::Failed
+pub craqle::ShaclValidationState::Invalid
+pub craqle::ShaclValidationState::Pending
+pub craqle::ShaclValidationState::Valid
+pub enum craqle::UpdateError
+pub craqle::UpdateError::InvalidChangeSet(alloc::string::String)
+pub craqle::UpdateError::Shacl(craqle::shacl::ShaclError)
+pub craqle::UpdateError::ShaclValidationFailed(alloc::vec::Vec<craqle::shacl::ShaclValidationReport>)
+pub craqle::UpdateError::Sparql(craqle::sparql::SparqlError)
+pub craqle::UpdateError::Store(craqle::store::StoreError)
+pub craqle::UpdateError::Sync(craqle::CraqleSyncError)
+pub craqle::UpdateError::ValidationFailed(alloc::vec::Vec<craqle::CrateViolation>)
+#[non_exhaustive] pub enum craqle::ValidationPolicy
+pub craqle::ValidationPolicy::Advisory
+pub craqle::ValidationPolicy::Disabled
+pub craqle::ValidationPolicy::Enforce
+pub struct craqle::ActorId(pub [u8; 32])
+impl craqle::ActorId
+pub fn craqle::ActorId::as_bytes(&self) -> &[u8; 32]
+pub fn craqle::ActorId::from_bytes([u8; 32]) -> Self
+pub fn craqle::ActorId::random() -> Self
+impl core::fmt::Display for craqle::ActorId
+pub fn craqle::ActorId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craqle::AllowAllAuthorizer
+impl craqle::Authorizer for craqle::AllowAllAuthorizer
+pub fn craqle::AllowAllAuthorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+pub struct craqle::AppendDataEntitiesReport
+pub craqle::AppendDataEntitiesReport::batch: craqle::Batch
+pub craqle::AppendDataEntitiesReport::change_count: usize
+pub craqle::AppendDataEntitiesReport::entity_count: usize
+pub struct craqle::Batch
+pub craqle::Batch::actor: craqle::ActorId
+pub craqle::Batch::base_clock: craqle::VectorClock
+pub craqle::Batch::counter: u64
+pub craqle::Batch::graph: craqle::GraphId
+pub craqle::Batch::ops: alloc::vec::Vec<craqle::QuadOp>
+pub craqle::Batch::timestamp: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+pub struct craqle::CanonicalJsonLd
+pub craqle::CanonicalJsonLd::digest: [u8; 32]
+pub craqle::CanonicalJsonLd::nquads: alloc::string::String
+pub struct craqle::CompiledShaclSchema
+impl craqle::shacl::CompiledShaclSchema
+pub fn craqle::shacl::CompiledShaclSchema::model_version(&self) -> u32
+pub fn craqle::shacl::CompiledShaclSchema::plan_fingerprint(&self) -> [u8; 32]
+pub fn craqle::shacl::CompiledShaclSchema::profile(&self) -> craqle::shacl::ShaclProfile
+pub fn craqle::shacl::CompiledShaclSchema::rocrate_version(&self) -> craqle::RoCrateVersion
+pub fn craqle::shacl::CompiledShaclSchema::schema_hash(&self) -> [u8; 32]
+pub fn craqle::shacl::CompiledShaclSchema::shape_count(&self) -> usize
+pub fn craqle::shacl::CompiledShaclSchema::statistics(&self) -> &craqle::shacl::ShaclCompileStatistics
+pub struct craqle::CraqleIrokleOptions
+pub craqle::CraqleIrokleOptions::initial_peers: alloc::collections::btree::set::BTreeSet<irokle::ids::PeerId>
+pub craqle::CraqleIrokleOptions::replication_policy: irokle::topic::ReplicationPolicy
+pub craqle::CraqleIrokleOptions::write_concern: irokle::node::WriteConcern
+impl craqle::CraqleIrokleOptions
+pub fn craqle::CraqleIrokleOptions::new() -> Self
+pub fn craqle::CraqleIrokleOptions::with_initial_peers<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = irokle::ids::PeerId>
+pub fn craqle::CraqleIrokleOptions::with_replication_policy(self, irokle::topic::ReplicationPolicy) -> Self
+pub fn craqle::CraqleIrokleOptions::with_write_concern(self, irokle::node::WriteConcern) -> Self
+pub struct craqle::CraqleNode
+impl craqle::CraqleNode
+pub fn craqle::CraqleNode::actor(&self) -> craqle::ActorId
+pub fn craqle::CraqleNode::add_contextual_entity(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &str, &str) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::add_contextual_entity_with(&self, &dyn craqle::Authorizer, craqle::CreateEntityRequest) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::add_contextual_entity_with_triples(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &str, &str, alloc::vec::Vec<(oxrdf::named_node::NamedNode, oxrdf::triple::Term)>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::add_data_entity(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &str, &str) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::add_data_entity_with(&self, &dyn craqle::Authorizer, craqle::CreateEntityRequest) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::add_data_entity_with_triples(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &str, &str, alloc::vec::Vec<(oxrdf::named_node::NamedNode, oxrdf::triple::Term)>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::add_irokle_peer(&self, &craqle::GraphId, irokle::ids::PeerId) -> craqle::Result<()>
+pub fn craqle::CraqleNode::analyze_prepared(&self, &dyn craqle::Authorizer, &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryPlan>
+pub fn craqle::CraqleNode::analyze_prepared_graphs(&self, &[craqle::GraphId], &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryPlan>
+pub fn craqle::CraqleNode::append_new_data_entities_under(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, alloc::vec::Vec<craqle::NewDataEntity>) -> craqle::Result<craqle::AppendDataEntitiesReport>
+pub fn craqle::CraqleNode::append_new_root_data_entities(&self, &dyn craqle::Authorizer, &craqle::GraphId, alloc::vec::Vec<craqle::NewDataEntity>) -> craqle::Result<craqle::AppendDataEntitiesReport>
+pub fn craqle::CraqleNode::apply_changes(&self, &craqle::GraphId, alloc::vec::Vec<craqle::MaterializedQuadChange>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_changes_bulk_unchecked(&self, &craqle::GraphId, alloc::vec::Vec<craqle::MaterializedQuadChange>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_changes_unchecked(&self, &craqle::GraphId, alloc::vec::Vec<craqle::MaterializedQuadChange>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document(&self, &dyn craqle::Authorizer, craqle::GraphId, &str) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document_checked_with_policy(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document_checked_with_policy_and_durability(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy, craqle::CraqleRequestDurability) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document_checked_with_policy_and_durability_as(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy, craqle::CraqleRequestDurability, core::option::Option<craqle::ActorId>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document_prevalidated_with_policy_and_durability_as(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy, craqle::CraqleRequestDurability, core::option::Option<craqle::ActorId>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document_with_policy(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_rocrate_document_with_policy_and_durability(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy, craqle::CraqleRequestDurability) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::apply_sparql_update(&self, &dyn craqle::Authorizer, &str) -> craqle::Result<core::option::Option<craqle::Batch>>
+pub fn craqle::CraqleNode::bind_irokle_topic(&self, &craqle::GraphId) -> craqle::Result<core::option::Option<irokle::ids::TopicId>>
+pub fn craqle::CraqleNode::bind_or_derive_irokle_topic(&self, &craqle::GraphId) -> craqle::Result<irokle::ids::TopicId>
+pub fn craqle::CraqleNode::bind_shacl(&self, &dyn craqle::Authorizer, &craqle::shacl::ShaclBinding) -> craqle::Result<craqle::shacl::ShaclBindingStatus>
+pub fn craqle::CraqleNode::bootstrap_rocrate_document(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::compile_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::ShaclCompileOptions) -> craqle::Result<craqle::shacl::CompiledShaclSchema>
+pub fn craqle::CraqleNode::conforms_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::CompiledShaclSchema, &craqle::shacl::ShaclValidationOptions) -> craqle::Result<bool>
+pub fn craqle::CraqleNode::contains_graph(&self, &craqle::GraphId) -> craqle::Result<bool>
+pub fn craqle::CraqleNode::crate_version(&self, &craqle::GraphId) -> craqle::Result<craqle::RoCrateVersion>
+pub fn craqle::CraqleNode::create_crate(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::create_crate_prevalidated_with_durability_as(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest, craqle::CraqleRequestDurability, core::option::Option<craqle::ActorId>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::create_crate_with_durability(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest, craqle::CraqleRequestDurability) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::create_crate_with_durability_as(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest, craqle::CraqleRequestDurability, core::option::Option<craqle::ActorId>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::create_crate_with_options(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest, craqle::CreateCrateOptions) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::delete_graph(&self, &dyn craqle::Authorizer, &craqle::GraphId) -> craqle::Result<()>
+pub fn craqle::CraqleNode::delete_graph_unchecked(&self, &craqle::GraphId) -> craqle::Result<()>
+pub fn craqle::CraqleNode::describe_subject(&self, &dyn craqle::Authorizer, craqle::DescribeRequest<'_>) -> craqle::Result<alloc::vec::Vec<(craqle::EncodedTerm, craqle::EncodedTerm)>>
+pub fn craqle::CraqleNode::disk_format_version(&self) -> craqle::DiskFormatVersion
+pub fn craqle::CraqleNode::ensure_irokle_topic(&self, &craqle::GraphId) -> craqle::Result<irokle::ids::TopicId>
+pub fn craqle::CraqleNode::ensure_query_indexes(&self)
+pub fn craqle::CraqleNode::execute_prepared(&self, &dyn craqle::Authorizer, &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryExecution>
+pub fn craqle::CraqleNode::execute_prepared_graphs(&self, &[craqle::GraphId], &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryExecution>
+pub fn craqle::CraqleNode::explain_prepared(&self, &dyn craqle::Authorizer, &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryPlan>
+pub fn craqle::CraqleNode::explain_prepared_graphs(&self, &[craqle::GraphId], &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryPlan>
+pub fn craqle::CraqleNode::export_rocrate(&self, &dyn craqle::Authorizer, &craqle::GraphId) -> craqle::Result<alloc::string::String>
+pub fn craqle::CraqleNode::export_rocrate_page(&self, &dyn craqle::Authorizer, &craqle::GraphId, usize, usize) -> craqle::Result<craqle::RoCratePage>
+pub fn craqle::CraqleNode::export_rocrate_page_after(&self, &dyn craqle::Authorizer, &craqle::GraphId, core::option::Option<&str>, usize) -> craqle::Result<craqle::RoCratePage>
+pub fn craqle::CraqleNode::export_rocrate_summary(&self, &dyn craqle::Authorizer, &craqle::GraphId) -> craqle::Result<alloc::string::String>
+pub fn craqle::CraqleNode::flush_search_updates(&self) -> craqle::Result<()>
+pub fn craqle::CraqleNode::from_store_and_search(alloc::sync::Arc<craqle::store::GraphStore>, alloc::sync::Arc<craqle::search::SearchIndex>, craqle::CraqleOptions) -> Self
+pub fn craqle::CraqleNode::graph_diagnostics(&self, &craqle::GraphId) -> craqle::Result<craqle::GraphDiagnostics>
+pub fn craqle::CraqleNode::graph_fingerprint(&self, &craqle::GraphId) -> craqle::Result<(u64, [u8; 32], [u8; 32])>
+pub fn craqle::CraqleNode::graph_policy(&self, &craqle::GraphId) -> craqle::Result<craqle::GraphPolicy>
+pub fn craqle::CraqleNode::graph_snapshot(&self, &craqle::GraphId) -> craqle::Result<craqle::GraphReplicaSnapshot>
+pub fn craqle::CraqleNode::graph_store_persist_mode(&self) -> craqle::CraqleFjallPersistMode
+pub fn craqle::CraqleNode::graph_violations(&self, &craqle::GraphId) -> craqle::Result<alloc::vec::Vec<craqle::CrateViolation>>
+pub fn craqle::CraqleNode::graphs(&self) -> craqle::Result<alloc::vec::Vec<craqle::GraphId>>
+pub fn craqle::CraqleNode::hydrate_search_hits(&self, &dyn craqle::Authorizer, &[craqle::SearchHit]) -> craqle::Result<alloc::vec::Vec<craqle::HydratedSearchHit>>
+pub fn craqle::CraqleNode::import_graph_policy(&self, &craqle::GraphId, craqle::GraphPolicy) -> craqle::Result<()>
+pub fn craqle::CraqleNode::insert_quads(&self, &craqle::GraphId, alloc::vec::Vec<(craqle::EncodedTerm, craqle::EncodedTerm, craqle::EncodedTerm)>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::irokle_sync_status(&self, &craqle::GraphId) -> craqle::Result<alloc::vec::Vec<irokle::storage::SyncPeerStatus>>
+pub fn craqle::CraqleNode::irokle_topic_id(&self, &craqle::GraphId) -> craqle::Result<core::option::Option<irokle::ids::TopicId>>
+pub fn craqle::CraqleNode::local_update(&self, &str) -> craqle::Result<core::option::Option<craqle::Batch>>
+pub fn craqle::CraqleNode::manual_compact_store(&self) -> craqle::Result<()>
+pub fn craqle::CraqleNode::mint_irokle_topic(&self, &craqle::GraphId, alloc::collections::btree::set::BTreeSet<irokle::ids::PeerId>) -> craqle::Result<irokle::ids::TopicId>
+pub fn craqle::CraqleNode::open(impl core::convert::AsRef<std::path::Path>) -> craqle::Result<Self>
+pub fn craqle::CraqleNode::open_with_actor(impl core::convert::AsRef<std::path::Path>, craqle::ActorId) -> craqle::Result<Self>
+pub fn craqle::CraqleNode::open_with_options(impl core::convert::AsRef<std::path::Path>, craqle::CraqleOptions) -> craqle::Result<Self>
+pub fn craqle::CraqleNode::patch_contextual_with(&self, &dyn craqle::Authorizer, craqle::PatchEntityRequest, craqle::CraqleRequestDurability, core::option::Option<craqle::ActorId>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::patch_data_with(&self, &dyn craqle::Authorizer, craqle::PatchEntityRequest, craqle::CraqleRequestDurability, core::option::Option<craqle::ActorId>) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::pending_shacl_queue(&self) -> craqle::Result<alloc::vec::Vec<craqle::GraphId>>
+pub fn craqle::CraqleNode::pending_shacl_queue_status(&self) -> craqle::Result<craqle::shacl::PendingShaclQueueStatus>
+pub fn craqle::CraqleNode::persist_fjall(&self) -> craqle::Result<()>
+pub fn craqle::CraqleNode::prepare_query(&self, &str) -> craqle::Result<craqle::PreparedQuery>
+pub fn craqle::CraqleNode::preview_rocrate_update(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str) -> craqle::Result<alloc::vec::Vec<craqle::MaterializedQuadChange>>
+pub fn craqle::CraqleNode::query(&self, &dyn craqle::Authorizer, &str) -> craqle::Result<craqle::QueryResults>
+pub fn craqle::CraqleNode::query_graphs(&self, &[craqle::GraphId], &str) -> craqle::Result<craqle::QueryResults>
+pub fn craqle::CraqleNode::query_graphs_with<F>(&self, F, &str) -> craqle::Result<craqle::QueryResults> where F: core::ops::function::Fn(&craqle::GraphId) -> bool
+pub fn craqle::CraqleNode::query_graphs_with_planner<F>(&self, F, &str, bool) -> craqle::Result<craqle::QueryResults> where F: core::ops::function::Fn(&craqle::GraphId) -> bool
+pub fn craqle::CraqleNode::query_graphs_with_statistics(&self, &[craqle::GraphId], &str) -> craqle::Result<craqle::QueryExecution>
+pub fn craqle::CraqleNode::query_index_status(&self) -> craqle::Result<craqle::QueryIndexStatus>
+pub fn craqle::CraqleNode::query_index_status_fast(&self) -> craqle::Result<craqle::QueryIndexStatus>
+pub fn craqle::CraqleNode::query_with_statistics(&self, &dyn craqle::Authorizer, &str) -> craqle::Result<craqle::QueryExecution>
+pub fn craqle::CraqleNode::rebuild_graph_diagnostics(&self, &craqle::GraphId) -> craqle::Result<()>
+pub fn craqle::CraqleNode::rebuild_query_indexes(&self) -> craqle::Result<craqle::QueryIndexStatus>
+pub fn craqle::CraqleNode::reconcile_irokle(&self) -> craqle::Result<std::collections::hash::set::HashSet<craqle::GraphId>>
+pub fn craqle::CraqleNode::reindex_search(&self) -> craqle::Result<()>
+pub fn craqle::CraqleNode::remove_irokle_peer(&self, &craqle::GraphId, irokle::ids::PeerId) -> craqle::Result<()>
+pub fn craqle::CraqleNode::repair_pending_shacl_queue(&self) -> craqle::Result<craqle::shacl::PendingReplayStatistics>
+pub fn craqle::CraqleNode::replay_pending_shacl(&self, usize, core::time::Duration) -> craqle::Result<craqle::shacl::PendingReplayOutcome>
+pub fn craqle::CraqleNode::search(&self, &dyn craqle::Authorizer, craqle::SearchRequest<'_>) -> craqle::Result<alloc::vec::Vec<craqle::SearchHit>>
+pub fn craqle::CraqleNode::search_graphs(&self, &dyn craqle::Authorizer, craqle::GraphSearchRequest<'_>) -> craqle::Result<alloc::vec::Vec<craqle::SearchHit>>
+pub fn craqle::CraqleNode::search_resources(&self, &dyn craqle::Authorizer, craqle::SearchRequest<'_>) -> craqle::Result<alloc::vec::Vec<craqle::HydratedSearchHit>>
+pub fn craqle::CraqleNode::set_graph_policy(&self, &dyn craqle::Authorizer, &craqle::GraphId, craqle::GraphPolicy) -> craqle::Result<()>
+pub fn craqle::CraqleNode::shacl_binding_statuses(&self, &dyn craqle::Authorizer, &craqle::GraphId) -> craqle::Result<alloc::vec::Vec<craqle::shacl::ShaclBindingStatus>>
+pub fn craqle::CraqleNode::shacl_bindings(&self, &dyn craqle::Authorizer, &craqle::GraphId) -> craqle::Result<alloc::vec::Vec<craqle::shacl::ShaclBinding>>
+pub fn craqle::CraqleNode::shacl_runtime_statistics(&self) -> craqle::shacl::ShaclRuntimeStatistics
+pub fn craqle::CraqleNode::startup_pending_replay(&self) -> &craqle::shacl::PendingReplayOutcome
+pub fn craqle::CraqleNode::unbind_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::GraphId) -> craqle::Result<()>
+pub fn craqle::CraqleNode::update(&self, &str) -> craqle::Result<core::option::Option<craqle::Batch>>
+pub fn craqle::CraqleNode::update_property(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &str, core::option::Option<&str>, &str) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::validate_create_crate(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest) -> craqle::Result<alloc::vec::Vec<craqle::MaterializedQuadChange>>
+pub fn craqle::CraqleNode::validate_rocrate_document_checked_with_policy(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy) -> craqle::Result<alloc::vec::Vec<craqle::MaterializedQuadChange>>
+pub fn craqle::CraqleNode::validate_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::CompiledShaclSchema, &craqle::shacl::ShaclValidationOptions) -> craqle::Result<craqle::shacl::ShaclValidationReport>
+pub fn craqle::CraqleNode::validate_shacl_delta(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::CompiledShaclSchema, &[craqle::MaterializedQuadChange], &craqle::shacl::ShaclValidationOptions) -> craqle::Result<craqle::shacl::ShaclValidationReport>
+pub fn craqle::CraqleNode::vector_clock(&self, &craqle::GraphId) -> craqle::Result<craqle::VectorClock>
+pub fn craqle::CraqleNode::verify_query_indexes(&self, impl core::convert::Into<craqle::QueryIndexVerificationMode>) -> craqle::Result<craqle::QueryIndexVerification>
+pub fn craqle::CraqleNode::visible_graphs(&self, &dyn craqle::Authorizer) -> craqle::Result<alloc::vec::Vec<craqle::GraphId>>
+pub struct craqle::CraqleOptions
+impl craqle::CraqleOptions
+pub fn craqle::CraqleOptions::graph_store_persist_mode(&self) -> craqle::CraqleFjallPersistMode
+pub fn craqle::CraqleOptions::new() -> Self
+pub fn craqle::CraqleOptions::with_actor(self, craqle::ActorId) -> Self
+pub fn craqle::CraqleOptions::with_graph_store_persist_mode(self, craqle::CraqleFjallPersistMode) -> Self
+pub fn craqle::CraqleOptions::with_irokle<S: irokle::storage::Storage>(self, irokle::node::Irokle<S>, craqle::CraqleIrokleOptions) -> Self
+pub fn craqle::CraqleOptions::with_pending_replay_policy(self, craqle::shacl::PendingReplayPolicy) -> Self
+pub fn craqle::CraqleOptions::with_search_storage(self, craqle::SearchStorage) -> Self
+impl core::default::Default for craqle::CraqleOptions
+pub fn craqle::CraqleOptions::default() -> Self
+pub struct craqle::CrateViolation
+pub craqle::CrateViolation::code: &'static str
+pub craqle::CrateViolation::entity_id: core::option::Option<alloc::string::String>
+pub craqle::CrateViolation::message: alloc::string::String
+pub craqle::CrateViolation::pointer: alloc::string::String
+pub struct craqle::CreateCrateOptions
+pub craqle::CreateCrateOptions::license: core::option::Option<alloc::string::String>
+pub craqle::CreateCrateOptions::version: craqle::RoCrateVersion
+pub struct craqle::CreateCrateRequest
+pub craqle::CreateCrateRequest::date_published: alloc::string::String
+pub craqle::CreateCrateRequest::description: alloc::string::String
+pub craqle::CreateCrateRequest::graph: craqle::GraphId
+pub craqle::CreateCrateRequest::license: core::option::Option<alloc::string::String>
+pub craqle::CreateCrateRequest::name: alloc::string::String
+pub craqle::CreateCrateRequest::policy: craqle::GraphPolicy
+impl craqle::CreateCrateRequest
+pub fn craqle::CreateCrateRequest::new(craqle::GraphId, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<alloc::string::String>, craqle::GraphPolicy) -> Self
+pub struct craqle::CreateEntityRequest
+pub craqle::CreateEntityRequest::additional_triples: alloc::vec::Vec<(oxrdf::named_node::NamedNode, oxrdf::triple::Term)>
+pub craqle::CreateEntityRequest::entity_id: alloc::string::String
+pub craqle::CreateEntityRequest::entity_type: alloc::string::String
+pub craqle::CreateEntityRequest::graph: craqle::GraphId
+pub craqle::CreateEntityRequest::name: alloc::string::String
+pub struct craqle::DenyAllAuthorizer
+impl craqle::Authorizer for craqle::DenyAllAuthorizer
+pub fn craqle::DenyAllAuthorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+pub struct craqle::DescribeRequest<'a>
+pub craqle::DescribeRequest::graph: &'a craqle::GraphId
+pub craqle::DescribeRequest::subject_id: &'a str
+pub struct craqle::DiskFormatVersion
+pub craqle::DiskFormatVersion::major: u16
+pub craqle::DiskFormatVersion::minor: u16
+impl craqle::DiskFormatVersion
+pub const fn craqle::DiskFormatVersion::new(u16, u16) -> Self
+pub struct craqle::Dot
+pub craqle::Dot::actor: craqle::ActorId
+pub craqle::Dot::counter: u64
+pub struct craqle::EncodedTerm(pub alloc::string::String)
+impl craqle::EncodedTerm
+pub fn craqle::EncodedTerm::from_named_node(&oxrdf::named_node::NamedNode) -> Self
+pub fn craqle::EncodedTerm::from_subject_id(&str) -> Self
+pub fn craqle::EncodedTerm::from_term(&oxrdf::triple::Term) -> Self
+pub fn craqle::EncodedTerm::to_named_node(&self) -> core::option::Option<oxrdf::named_node::NamedNode>
+pub fn craqle::EncodedTerm::to_term(&self) -> core::option::Option<oxrdf::triple::Term>
+impl core::convert::From<&oxrdf::named_node::NamedNode> for craqle::EncodedTerm
+pub fn craqle::EncodedTerm::from(&oxrdf::named_node::NamedNode) -> Self
+impl core::convert::From<&oxrdf::triple::NamedOrBlankNode> for craqle::EncodedTerm
+pub fn craqle::EncodedTerm::from(&oxrdf::triple::NamedOrBlankNode) -> Self
+impl core::convert::From<oxrdf::named_node::NamedNode> for craqle::EncodedTerm
+pub fn craqle::EncodedTerm::from(oxrdf::named_node::NamedNode) -> Self
+pub struct craqle::GrantAuthorizer
+pub craqle::GrantAuthorizer::grants: alloc::vec::Vec<craqle::PermissionGrant>
+impl craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::new(alloc::vec::Vec<craqle::PermissionGrant>) -> Self
+impl core::clone::Clone for craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::clone(&self) -> Self
+impl core::cmp::Eq for craqle::GrantAuthorizer
+impl core::cmp::PartialEq for craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::eq(&self, &Self) -> bool
+impl core::default::Default for craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::default() -> Self
+impl core::fmt::Debug for craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl craqle::Authorizer for craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+pub struct craqle::GraphDiagnostics
+pub craqle::GraphDiagnostics::orphaned_entities: alloc::vec::Vec<alloc::string::String>
+impl craqle::GraphDiagnostics
+pub fn craqle::GraphDiagnostics::from_orphaned_entities(alloc::vec::Vec<alloc::string::String>) -> Self
+pub fn craqle::GraphDiagnostics::has_orphans(&self) -> bool
+pub struct craqle::GraphId(pub oxrdf::named_node::NamedNode)
+impl craqle::GraphId
+pub fn craqle::GraphId::as_str(&self) -> &str
+pub fn craqle::GraphId::new(&str) -> Self
+impl core::convert::From<&str> for craqle::GraphId
+pub fn craqle::GraphId::from(&str) -> Self
+impl core::fmt::Display for craqle::GraphId
+pub fn craqle::GraphId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craqle::GraphPolicy
+pub craqle::GraphPolicy::permission_paths: alloc::vec::Vec<alloc::string::String>
+pub craqle::GraphPolicy::public: bool
+impl craqle::GraphPolicy
+pub fn craqle::GraphPolicy::normalized(self) -> Self
+pub struct craqle::GraphReplicaSnapshot
+pub craqle::GraphReplicaSnapshot::clock: craqle::VectorClock
+pub craqle::GraphReplicaSnapshot::graph: craqle::GraphId
+pub craqle::GraphReplicaSnapshot::quads: alloc::vec::Vec<craqle::SnapshotQuadState>
+pub struct craqle::GraphSearchRequest<'a>
+pub craqle::GraphSearchRequest::graphs: &'a [craqle::GraphId]
+pub craqle::GraphSearchRequest::limit: usize
+pub craqle::GraphSearchRequest::query: &'a str
+pub struct craqle::HydratedSearchHit
+pub craqle::HydratedSearchHit::hit: craqle::SearchHit
+pub craqle::HydratedSearchHit::properties: alloc::vec::Vec<(craqle::EncodedTerm, craqle::EncodedTerm)>
+pub struct craqle::IrokleGraphSync<S: irokle::storage::Storage>
+impl<S: irokle::storage::Storage> craqle::IrokleGraphSync<S>
+pub fn craqle::IrokleGraphSync<S>::new(irokle::node::Irokle<S>, craqle::CraqleIrokleOptions) -> Self
+pub fn craqle::IrokleGraphSync<S>::node(&self) -> &irokle::node::Irokle<S>
+pub struct craqle::NewDataEntity
+pub craqle::NewDataEntity::additional_triples: alloc::vec::Vec<(oxrdf::named_node::NamedNode, oxrdf::triple::Term)>
+pub craqle::NewDataEntity::entity_id: alloc::string::String
+pub craqle::NewDataEntity::entity_type: alloc::string::String
+pub craqle::NewDataEntity::name: alloc::string::String
+pub struct craqle::PatchEntityRequest
+pub craqle::PatchEntityRequest::entity: craqle::CreateEntityRequest
+pub craqle::PatchEntityRequest::replaced_predicates: alloc::vec::Vec<oxrdf::named_node::NamedNode>
+pub struct craqle::PendingReplayFailure
+pub craqle::PendingReplayFailure::bindings: alloc::vec::Vec<craqle::shacl::ShaclBinding>
+pub craqle::PendingReplayFailure::data_version: core::option::Option<[u8; 32]>
+pub craqle::PendingReplayFailure::error: alloc::string::String
+pub craqle::PendingReplayFailure::graph: craqle::GraphId
+pub struct craqle::PendingReplayOutcome
+pub craqle::PendingReplayOutcome::budget_exhausted: bool
+pub craqle::PendingReplayOutcome::failures: alloc::vec::Vec<craqle::shacl::PendingReplayFailure>
+pub craqle::PendingReplayOutcome::statistics: craqle::shacl::PendingReplayStatistics
+pub struct craqle::PendingReplayStatistics
+pub craqle::PendingReplayStatistics::binding_records_scanned: u64
+pub craqle::PendingReplayStatistics::elapsed: core::time::Duration
+pub craqle::PendingReplayStatistics::graphs_settled: u64
+pub craqle::PendingReplayStatistics::pending_queue_entries_scanned: u64
+pub craqle::PendingReplayStatistics::reports_produced: u64
+pub struct craqle::PendingShaclQueueStatus
+pub craqle::PendingShaclQueueStatus::pending_count: u64
+pub craqle::PendingShaclQueueStatus::settlement_failures: u64
+pub struct craqle::PermissionGrant
+pub craqle::PermissionGrant::level: craqle::PermissionLevel
+pub craqle::PermissionGrant::pattern: alloc::string::String
+impl craqle::PermissionGrant
+pub fn craqle::PermissionGrant::new(impl core::convert::Into<alloc::string::String>, craqle::PermissionLevel) -> Self
+pub struct craqle::PlannedJoin
+pub craqle::PlannedJoin::estimated_distinct_join_keys: u64
+pub craqle::PlannedJoin::estimated_hash_cost: u64
+pub craqle::PlannedJoin::estimated_lateral_cost: u64
+pub craqle::PlannedJoin::estimated_left_rows: u64
+pub craqle::PlannedJoin::estimated_output_rows: u64
+pub craqle::PlannedJoin::estimated_right_rows: u64
+pub craqle::PlannedJoin::physical_operator: craqle::JoinKind
+pub struct craqle::PredicateFilter
+pub craqle::PredicateFilter::predicates: std::collections::hash::set::HashSet<oxrdf::named_node::NamedNode>
+impl core::default::Default for craqle::PredicateFilter
+pub fn craqle::PredicateFilter::default() -> Self
+pub struct craqle::PreparedQuery
+impl core::fmt::Debug for craqle::PreparedQuery
+pub fn craqle::PreparedQuery::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craqle::QueryCancellation
+impl craqle::QueryCancellation
+pub fn craqle::QueryCancellation::cancel(&self)
+pub fn craqle::QueryCancellation::is_cancelled(&self) -> bool
+pub fn craqle::QueryCancellation::new() -> Self
+impl core::default::Default for craqle::QueryCancellation
+pub fn craqle::QueryCancellation::default() -> Self
+impl core::fmt::Debug for craqle::QueryCancellation
+pub fn craqle::QueryCancellation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craqle::QueryExecution
+pub craqle::QueryExecution::results: craqle::QueryResults
+pub craqle::QueryExecution::statistics: craqle::QueryExecutionStatistics
+#[non_exhaustive] pub struct craqle::QueryExecutionOptions
+pub craqle::QueryExecutionOptions::cancellation: craqle::QueryCancellation
+pub craqle::QueryExecutionOptions::fast_paths: craqle::QueryFastPathMode
+pub craqle::QueryExecutionOptions::join_mode: craqle::JoinMode
+pub craqle::QueryExecutionOptions::optimize: bool
+pub craqle::QueryExecutionOptions::read_mode: craqle::QueryReadMode
+impl core::default::Default for craqle::QueryExecutionOptions
+pub fn craqle::QueryExecutionOptions::default() -> Self
+pub struct craqle::QueryExecutionStatistics
+pub craqle::QueryExecutionStatistics::candidate_quads: u64
+pub craqle::QueryExecutionStatistics::duplicate_copies_skipped: u64
+pub craqle::QueryExecutionStatistics::duplicate_groups: u64
+pub craqle::QueryExecutionStatistics::execution_time: core::time::Duration
+pub craqle::QueryExecutionStatistics::fallback_reason: core::option::Option<alloc::string::String>
+pub craqle::QueryExecutionStatistics::fast_path: core::option::Option<craqle::QueryFastPathKind>
+pub craqle::QueryExecutionStatistics::graphs_considered: u64
+pub craqle::QueryExecutionStatistics::index_seeks: u64
+pub craqle::QueryExecutionStatistics::intermediate_rows: u64
+pub craqle::QueryExecutionStatistics::matching_quads: u64
+pub craqle::QueryExecutionStatistics::orphan_checks: u64
+pub craqle::QueryExecutionStatistics::parse_time: core::time::Duration
+pub craqle::QueryExecutionStatistics::plan: craqle::QueryPlan
+pub craqle::QueryExecutionStatistics::plan_fingerprint: alloc::string::String
+pub craqle::QueryExecutionStatistics::planned_joins: alloc::vec::Vec<craqle::PlannedJoin>
+pub craqle::QueryExecutionStatistics::planning_time: core::time::Duration
+pub craqle::QueryExecutionStatistics::qv_admission_checks: u64
+pub craqle::QueryExecutionStatistics::qv_bytes_read: u64
+pub craqle::QueryExecutionStatistics::qv_counter_reads: u64
+pub craqle::QueryExecutionStatistics::qv_header_reads: u64
+pub craqle::QueryExecutionStatistics::qv_keys_read: u64
+pub craqle::QueryExecutionStatistics::qv_trusted: bool
+pub craqle::QueryExecutionStatistics::result_cells: u64
+pub craqle::QueryExecutionStatistics::result_collection_time: core::time::Duration
+pub craqle::QueryExecutionStatistics::result_rows: u64
+pub craqle::QueryExecutionStatistics::rewrite_time: core::time::Duration
+pub craqle::QueryExecutionStatistics::selected_access_paths: alloc::vec::Vec<craqle::ReadAccessPath>
+pub craqle::QueryExecutionStatistics::source_bytes_read: u64
+pub craqle::QueryExecutionStatistics::source_keys_read: u64
+pub craqle::QueryExecutionStatistics::terms_decoded: u64
+pub craqle::QueryExecutionStatistics::time_to_first_internal_result: core::option::Option<core::time::Duration>
+#[non_exhaustive] pub struct craqle::QueryIndexStatus
+pub craqle::QueryIndexStatus::indexed_quads: u64
+pub craqle::QueryIndexStatus::last_build_sequence: u64
+pub craqle::QueryIndexStatus::schema_version: u32
+pub craqle::QueryIndexStatus::source_live_quads: u64
+pub craqle::QueryIndexStatus::state: craqle::QueryIndexState
+#[non_exhaustive] pub struct craqle::QueryIndexVerification
+pub craqle::QueryIndexVerification::checked_index_rows: u64
+pub craqle::QueryIndexVerification::checked_source_rows: u64
+pub craqle::QueryIndexVerification::full: bool
+pub craqle::QueryIndexVerification::indexed_quads: u64
+pub craqle::QueryIndexVerification::problems: alloc::vec::Vec<alloc::string::String>
+pub craqle::QueryIndexVerification::source_live_quads: u64
+pub craqle::QueryIndexVerification::valid: bool
+pub struct craqle::QueryPlan
+pub craqle::QueryPlan::fingerprint: alloc::string::String
+pub craqle::QueryPlan::root: craqle::QueryPlanNode
+pub struct craqle::QueryPlanNode
+pub craqle::QueryPlanNode::access_paths: alloc::vec::Vec<craqle::ReadAccessPath>
+pub craqle::QueryPlanNode::actual_rows: core::option::Option<u64>
+pub craqle::QueryPlanNode::candidate_rows: u64
+pub craqle::QueryPlanNode::children: alloc::vec::Vec<craqle::QueryPlanNode>
+pub craqle::QueryPlanNode::elapsed_time: core::time::Duration
+pub craqle::QueryPlanNode::estimated_rows: core::option::Option<u64>
+pub craqle::QueryPlanNode::index_seeks: u64
+pub craqle::QueryPlanNode::logical_operator: craqle::QueryLogicalOperator
+pub craqle::QueryPlanNode::output_rows: u64
+pub craqle::QueryPlanNode::physical_operator: craqle::QueryPhysicalOperator
+pub struct craqle::ReadStatistics
+pub craqle::ReadStatistics::candidate_quads: u64
+pub craqle::ReadStatistics::duplicate_copies_skipped: u64
+pub craqle::ReadStatistics::duplicate_groups: u64
+pub craqle::ReadStatistics::fallback_reason: core::option::Option<alloc::string::String>
+pub craqle::ReadStatistics::graphs_considered: u64
+pub craqle::ReadStatistics::index_seeks: u64
+pub craqle::ReadStatistics::matching_quads: u64
+pub craqle::ReadStatistics::orphan_checks: u64
+pub craqle::ReadStatistics::qv_admission_checks: u64
+pub craqle::ReadStatistics::qv_bytes_read: u64
+pub craqle::ReadStatistics::qv_counter_reads: u64
+pub craqle::ReadStatistics::qv_header_reads: u64
+pub craqle::ReadStatistics::qv_keys_read: u64
+pub craqle::ReadStatistics::qv_trusted: bool
+pub craqle::ReadStatistics::selected_access_paths: alloc::vec::Vec<craqle::ReadAccessPath>
+pub craqle::ReadStatistics::source_bytes_read: u64
+pub craqle::ReadStatistics::source_keys_read: u64
+pub craqle::ReadStatistics::terms_decoded: u64
+pub struct craqle::RoCratePage
+pub craqle::RoCratePage::jsonld: alloc::string::String
+pub craqle::RoCratePage::next_cursor: core::option::Option<alloc::string::String>
+pub craqle::RoCratePage::next_offset: core::option::Option<usize>
+pub craqle::RoCratePage::returned_data_entities: usize
+pub craqle::RoCratePage::total_data_entities: usize
+pub struct craqle::SearchHit
+pub craqle::SearchHit::graph_id: alloc::string::String
+pub craqle::SearchHit::score: f32
+pub craqle::SearchHit::subject_iri: alloc::string::String
+pub struct craqle::SearchRequest<'a>
+pub craqle::SearchRequest::limit: usize
+pub craqle::SearchRequest::query: &'a str
+pub struct craqle::ShaclBinding
+pub craqle::ShaclBinding::data_graph: craqle::GraphId
+pub craqle::ShaclBinding::policy: craqle::shacl::ValidationPolicy
+pub craqle::ShaclBinding::shapes_graph: craqle::GraphId
+pub craqle::ShaclBinding::validation_options: craqle::shacl::ShaclBindingOptions
+pub struct craqle::ShaclBindingOptions
+pub craqle::ShaclBindingOptions::allow_local_imports: bool
+pub craqle::ShaclBindingOptions::max_path_depth: usize
+pub craqle::ShaclBindingOptions::max_path_edges: u64
+pub craqle::ShaclBindingOptions::max_results: usize
+pub craqle::ShaclBindingOptions::rocrate_version: craqle::RoCrateVersion
+impl core::default::Default for craqle::shacl::ShaclBindingOptions
+pub fn craqle::shacl::ShaclBindingOptions::default() -> Self
+pub struct craqle::ShaclBindingStatus
+pub craqle::ShaclBindingStatus::binding: craqle::shacl::ShaclBinding
+pub craqle::ShaclBindingStatus::compiler_model_version: u32
+pub craqle::ShaclBindingStatus::data_version: [u8; 32]
+pub craqle::ShaclBindingStatus::error: core::option::Option<alloc::string::String>
+pub craqle::ShaclBindingStatus::report: core::option::Option<craqle::shacl::ShaclValidationReport>
+pub craqle::ShaclBindingStatus::schema_fingerprint: [u8; 32]
+pub craqle::ShaclBindingStatus::shapes_version: [u8; 32]
+pub craqle::ShaclBindingStatus::state: craqle::shacl::ShaclValidationState
+pub struct craqle::ShaclCompileOptions
+pub craqle::ShaclCompileOptions::allow_local_imports: bool
+pub craqle::ShaclCompileOptions::rocrate_version: craqle::RoCrateVersion
+pub struct craqle::ShaclCompileStatistics
+pub craqle::ShaclCompileStatistics::cache_hit: bool
+pub craqle::ShaclCompileStatistics::compile_time: core::time::Duration
+pub craqle::ShaclCompileStatistics::parse_time: core::time::Duration
+pub craqle::ShaclCompileStatistics::shape_graphs: usize
+pub craqle::ShaclCompileStatistics::shape_triples: usize
+pub struct craqle::ShaclMessage
+pub craqle::ShaclMessage::language: core::option::Option<alloc::string::String>
+pub craqle::ShaclMessage::text: alloc::string::String
+pub struct craqle::ShaclRuntimeStatistics
+pub craqle::ShaclRuntimeStatistics::binding_lock_hold_ns: u64
+pub craqle::ShaclRuntimeStatistics::binding_lock_wait_ns: u64
+pub craqle::ShaclRuntimeStatistics::graph_commit_lock_wait_ns: u64
+pub craqle::ShaclRuntimeStatistics::settlement_failures: u64
+pub craqle::ShaclRuntimeStatistics::settlement_ns: u64
+pub craqle::ShaclRuntimeStatistics::status_bindings_read: u64
+pub craqle::ShaclRuntimeStatistics::status_full_shape_scans: u64
+pub craqle::ShaclRuntimeStatistics::status_shape_compilations: u64
+pub craqle::ShaclRuntimeStatistics::status_version_checks: u64
+pub craqle::ShaclRuntimeStatistics::validation_ns: u64
+pub struct craqle::ShaclValidationOptions
+pub craqle::ShaclValidationOptions::cancellation: craqle::QueryCancellation
+pub craqle::ShaclValidationOptions::execution_mode: craqle::shacl::ShaclExecutionMode
+pub craqle::ShaclValidationOptions::max_path_depth: usize
+pub craqle::ShaclValidationOptions::max_path_edges: u64
+pub craqle::ShaclValidationOptions::max_results: usize
+impl core::default::Default for craqle::shacl::ShaclValidationOptions
+pub fn craqle::shacl::ShaclValidationOptions::default() -> Self
+pub struct craqle::ShaclValidationReport
+pub craqle::ShaclValidationReport::conforms: bool
+pub craqle::ShaclValidationReport::results: alloc::vec::Vec<craqle::shacl::ShaclValidationResult>
+pub craqle::ShaclValidationReport::statistics: craqle::shacl::ShaclValidationStatistics
+impl craqle::shacl::ShaclValidationReport
+pub fn craqle::shacl::ShaclValidationReport::crate_violations(&self) -> alloc::vec::Vec<craqle::CrateViolation>
+pub struct craqle::ShaclValidationResult
+pub craqle::ShaclValidationResult::focus_node: craqle::EncodedTerm
+pub craqle::ShaclValidationResult::messages: alloc::vec::Vec<craqle::shacl::ShaclMessage>
+pub craqle::ShaclValidationResult::result_path: core::option::Option<alloc::string::String>
+pub craqle::ShaclValidationResult::severity: craqle::EncodedTerm
+pub craqle::ShaclValidationResult::source_constraint_component: alloc::string::String
+pub craqle::ShaclValidationResult::source_shape: craqle::EncodedTerm
+pub craqle::ShaclValidationResult::value: core::option::Option<craqle::EncodedTerm>
+pub struct craqle::ShaclValidationStatistics
+pub craqle::ShaclValidationStatistics::compile_time: core::time::Duration
+pub craqle::ShaclValidationStatistics::constraint_time: core::time::Duration
+pub craqle::ShaclValidationStatistics::constraints_evaluated: u64
+pub craqle::ShaclValidationStatistics::estimated_affected_shapes: u64
+pub craqle::ShaclValidationStatistics::estimated_delta_work: u64
+pub craqle::ShaclValidationStatistics::estimated_focus_nodes: u64
+pub craqle::ShaclValidationStatistics::estimated_full_work: u64
+pub craqle::ShaclValidationStatistics::focus_nodes: u64
+pub craqle::ShaclValidationStatistics::full_graph_fallbacks: u64
+pub craqle::ShaclValidationStatistics::parse_time: core::time::Duration
+pub craqle::ShaclValidationStatistics::path_candidate_quads: u64
+pub craqle::ShaclValidationStatistics::path_index_seeks: u64
+pub craqle::ShaclValidationStatistics::read: craqle::ReadStatistics
+pub craqle::ShaclValidationStatistics::report_time: core::time::Duration
+pub craqle::ShaclValidationStatistics::selected_mode: craqle::shacl::ShaclExecutionMode
+pub craqle::ShaclValidationStatistics::shape_compile_cache_hit: bool
+pub craqle::ShaclValidationStatistics::shapes_considered: u64
+pub craqle::ShaclValidationStatistics::shapes_executed: u64
+pub craqle::ShaclValidationStatistics::shapes_skipped: u64
+pub craqle::ShaclValidationStatistics::stopped_early: bool
+pub craqle::ShaclValidationStatistics::target_candidates: u64
+pub craqle::ShaclValidationStatistics::target_time: core::time::Duration
+pub craqle::ShaclValidationStatistics::terms_decoded: u64
+pub craqle::ShaclValidationStatistics::violations: u64
+pub struct craqle::SnapshotQuadState
+pub craqle::SnapshotQuadState::dots: alloc::vec::Vec<craqle::Dot>
+pub craqle::SnapshotQuadState::object: craqle::EncodedTerm
+pub craqle::SnapshotQuadState::predicate: craqle::EncodedTerm
+pub craqle::SnapshotQuadState::subject: craqle::EncodedTerm
+pub struct craqle::VectorClock(pub alloc::collections::btree::map::BTreeMap<craqle::ActorId, u64>)
+impl craqle::VectorClock
+pub fn craqle::VectorClock::advance(&mut self, craqle::ActorId, u64)
+pub fn craqle::VectorClock::contains(&self, &craqle::Dot) -> bool
+pub fn craqle::VectorClock::merge(&mut self, &craqle::VectorClock)
+pub fn craqle::VectorClock::new() -> Self
+pub const craqle::DISK_FORMAT_VERSION: craqle::DiskFormatVersion
+pub const craqle::MAX_SEARCH_LIMIT: usize
+pub const craqle::SHACL_COMPILER_MODEL_VERSION: u32
+pub trait craqle::Authorizer: core::marker::Send + core::marker::Sync
+pub fn craqle::Authorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+impl craqle::Authorizer for craqle::AllowAllAuthorizer
+pub fn craqle::AllowAllAuthorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+impl craqle::Authorizer for craqle::DenyAllAuthorizer
+pub fn craqle::DenyAllAuthorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+impl craqle::Authorizer for craqle::GrantAuthorizer
+pub fn craqle::GrantAuthorizer::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+impl<F> craqle::Authorizer for F where F: core::ops::function::Fn(&craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError> + core::marker::Send + core::marker::Sync
+pub fn F::authorize(&self, &craqle::GraphId, &craqle::GraphPolicy, craqle::Action) -> core::result::Result<(), craqle::AuthorizationError>
+pub fn craqle::canonicalize_jsonld(&str) -> core::result::Result<craqle::CanonicalJsonLd, craqle::RoCrateError>
+pub fn craqle::validate_rocrate_jsonld(&str) -> core::result::Result<craqle::CanonicalJsonLd, craqle::RoCrateError>
+pub type craqle::Result<T> = core::result::Result<T, craqle::CraqleError>

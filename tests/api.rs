@@ -20,6 +20,36 @@ fn normal_release_surface_has_no_benchmark_only_loader() {
     assert!(!library.contains("Benchmark-only"));
 }
 
+#[test]
+fn public_disk_version_and_error_categories_are_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(dir.path()).unwrap();
+    assert_eq!(DISK_FORMAT_VERSION, node.disk_format_version());
+
+    let error = node.prepare_query("SELECT WHERE {").unwrap_err();
+    assert_eq!(CraqleErrorKind::InvalidInput, error.kind());
+
+    let denied = DenyAllAuthorizer;
+    let graph = GraphId::new("urn:test:error-category:hidden");
+    node.create_crate(
+        &writer_auth(),
+        CreateCrateRequest::new(
+            graph.clone(),
+            "Hidden",
+            "Error category fixture",
+            "2026-01-01",
+            None,
+            GraphPolicy {
+                public: false,
+                permission_paths: vec!["/datasets/private/hidden".to_owned()],
+            },
+        ),
+    )
+    .unwrap();
+    let error = node.export_rocrate(&denied, &graph).unwrap_err();
+    assert_eq!(CraqleErrorKind::Unauthorized, error.kind());
+}
+
 fn writer_auth() -> GrantAuthorizer {
     GrantAuthorizer::new(vec![PermissionGrant::new(
         "/datasets/**",

@@ -44,6 +44,32 @@ pub enum MergeError {
     InputRejected(String),
 }
 
+impl UpdateError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::Sparql(error) => error.kind(),
+            Self::ValidationFailed(_) | Self::InvalidChangeSet(_) => {
+                crate::CraqleErrorKind::InvalidInput
+            }
+            #[cfg(feature = "shacl-core")]
+            Self::Shacl(error) => error.kind(),
+            #[cfg(feature = "shacl-core")]
+            Self::ShaclValidationFailed(_) => crate::CraqleErrorKind::InvalidInput,
+            Self::Store(error) => error.kind(),
+            Self::Sync(error) => error.kind(),
+        }
+    }
+}
+
+impl MergeError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::Store(error) => error.kind(),
+            Self::InputRejected(_) => crate::CraqleErrorKind::InvalidInput,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MergeResult {
     pub applied: bool,

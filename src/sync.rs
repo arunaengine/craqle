@@ -145,6 +145,16 @@ pub enum CraqleSyncError {
 }
 
 impl CraqleSyncError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::Store(error) => error.kind(),
+            Self::NotConfigured => crate::CraqleErrorKind::DependencyUnavailable,
+            Self::TopicConflict { .. } => crate::CraqleErrorKind::Conflict,
+            Self::InvalidEvent(_) => crate::CraqleErrorKind::CorruptAuthoritativeData,
+            Self::Irokle(_) => crate::CraqleErrorKind::Storage,
+        }
+    }
+
     /// Whether the bytes read are what failed, rather than the transport or
     /// storage carrying them. No retry can clear these.
     pub fn rejects_record(&self) -> bool {

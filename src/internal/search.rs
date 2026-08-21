@@ -52,6 +52,16 @@ pub enum SearchError {
     Store(#[from] crate::store::StoreError),
 }
 
+impl SearchError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::QueryParse(_) => crate::CraqleErrorKind::InvalidInput,
+            Self::Tantivy(_) => crate::CraqleErrorKind::Storage,
+            Self::Store(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) type Result<T> = std::result::Result<T, SearchError>;
 
 #[derive(Debug, Clone)]

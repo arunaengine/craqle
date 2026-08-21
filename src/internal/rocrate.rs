@@ -99,6 +99,26 @@ pub enum RoCrateError {
     },
 }
 
+impl RoCrateError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::Update(error) => error.kind(),
+            Self::Store(error) => error.kind(),
+            Self::UnsupportedJsonLd(_) | Self::UnsupportedTerm(_) | Self::UnknownVersion(_) => {
+                crate::CraqleErrorKind::Unsupported
+            }
+            Self::Json(_)
+            | Self::Rdf(_)
+            | Self::JsonLd(_)
+            | Self::InvalidGraph(_)
+            | Self::EntityNotFound(_)
+            | Self::InvalidBatch(_)
+            | Self::MissingVersion
+            | Self::VersionMismatch { .. } => crate::CraqleErrorKind::InvalidInput,
+        }
+    }
+}
+
 /// Cursor-style JSON-LD page export returned by partial RO-Crate export APIs.
 #[derive(Debug, Clone)]
 pub struct RoCratePage {

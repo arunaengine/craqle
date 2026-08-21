@@ -40,6 +40,20 @@ pub enum SparqlError {
     Search(#[from] crate::search::SearchError),
 }
 
+impl SparqlError {
+    pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
+        match self {
+            Self::Parse(_) | Self::Evaluation(_) | Self::Planning(_) | Self::InvalidTerm(_) => {
+                crate::CraqleErrorKind::InvalidInput
+            }
+            Self::Unsupported(_) => crate::CraqleErrorKind::Unsupported,
+            Self::Cancelled => crate::CraqleErrorKind::Cancelled,
+            Self::Store(error) => error.kind(),
+            Self::Search(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) type Result<T> = std::result::Result<T, SparqlError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

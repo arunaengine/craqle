@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use crate::core::*;
 use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
 use crate::{
-    QueryIndexState, QueryIndexStatus, QueryIndexVerification, QueryIndexVerificationMode,
+    CraqleErrorKind, DISK_FORMAT_VERSION, DiskFormatVersion, QueryIndexState, QueryIndexStatus,
+    QueryIndexVerification, QueryIndexVerificationMode,
 };
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable, Snapshot,
@@ -38,9 +39,39 @@ pub enum StoreError {
     QueryIndexVerificationFailed(&'static str),
     #[error("query index unavailable: {0}")]
     QueryIndexUnavailable(&'static str),
+    #[error("authoritative disk-format marker is missing from a non-empty store")]
+    MissingAuthoritativeFormat,
+    #[error("invalid authoritative disk-format marker")]
+    InvalidAuthoritativeFormat,
+    #[error(
+        "unsupported authoritative disk format {found_major}.{found_minor}; this release supports {supported_major}.{supported_minor}"
+    )]
+    UnsupportedAuthoritativeFormat {
+        found_major: u16,
+        found_minor: u16,
+        supported_major: u16,
+        supported_minor: u16,
+    },
 }
 
 impl StoreError {
+    pub(crate) fn kind(&self) -> CraqleErrorKind {
+        match self {
+            Self::Cancelled => CraqleErrorKind::Cancelled,
+            Self::TermCollision { .. } => CraqleErrorKind::Conflict,
+            Self::GraphNotFound(_) => CraqleErrorKind::InvalidInput,
+            Self::QueryIndexVerificationFailed(_) | Self::QueryIndexUnavailable(_) => {
+                CraqleErrorKind::CorruptDerivedData
+            }
+            Self::TermNotFound(_)
+            | Self::InvalidEncoding { .. }
+            | Self::MissingAuthoritativeFormat
+            | Self::InvalidAuthoritativeFormat => CraqleErrorKind::CorruptAuthoritativeData,
+            Self::UnsupportedAuthoritativeFormat { .. } => CraqleErrorKind::Unsupported,
+            Self::Fjall(_) | Self::Postcard(_) => CraqleErrorKind::Storage,
+        }
+    }
+
     /// Whether the bytes offered are what failed, rather than the storage layer
     /// underneath them. A retry can only ever reproduce these.
     pub fn rejects_record(&self) -> bool {
@@ -91,6 +122,7 @@ const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
 const GRAPH_CLOCK_PREFIX: u8 = b'K';
 /// Persisted, clock-tagged graph diagnostics.
 const GRAPH_DIAGNOSTICS_PREFIX: u8 = b'O';
+const DISK_FORMAT_KEY: &[u8] = b"\0craqle-authoritative-format";
 #[cfg(feature = "shacl-core")]
 const SHACL_BINDING_PREFIX: u8 = b'S';
 #[cfg(feature = "shacl-core")]
@@ -141,6 +173,23 @@ const MAX_JOURNALING_BYTES: u64 = 64 * 1_024 * 1_024;
 const WRITE_HEAVY_TABLE_TARGET_BYTES: u64 = 256 * 1_024 * 1_024;
 const WRITE_HEAVY_L0_THRESHOLD: u8 = 12;
 const WRITE_HEAVY_LEVEL_RATIO: f32 = 20.0;
+
+fn encode_disk_format(version: DiskFormatVersion) -> [u8; 4] {
+    let mut bytes = [0u8; 4];
+    bytes[..2].copy_from_slice(&version.major.to_be_bytes());
+    bytes[2..].copy_from_slice(&version.minor.to_be_bytes());
+    bytes
+}
+
+fn decode_disk_format(bytes: &[u8]) -> Result<DiskFormatVersion> {
+    if bytes.len() != 4 {
+        return Err(StoreError::InvalidAuthoritativeFormat);
+    }
+    Ok(DiskFormatVersion {
+        major: u16::from_be_bytes(bytes[..2].try_into().unwrap()),
+        minor: u16::from_be_bytes(bytes[2..].try_into().unwrap()),
+    })
+}
 
 fn recommended_db_cache_bytes() -> u64 {
     let available = std::fs::read_to_string("/proc/meminfo")
@@ -4374,11 +4423,58 @@ impl GraphStore {
             persists: AtomicU64::new(0),
         };
 
+        store.ensure_disk_format()?;
         store.rebuild_indexes()?;
         store.initialize_query_indexes_at_open()?;
         store.restore_dirty_counter()?;
         store.repair_graph_diagnostics_at_open()?;
         Ok(store)
+    }
+
+    fn ensure_disk_format(&self) -> Result<()> {
+        match self.graphs.get(DISK_FORMAT_KEY)? {
+            Some(bytes) => {
+                let found = decode_disk_format(bytes.as_ref())?;
+                if found.major != DISK_FORMAT_VERSION.major
+                    || found.minor > DISK_FORMAT_VERSION.minor
+                {
+                    return Err(StoreError::UnsupportedAuthoritativeFormat {
+                        found_major: found.major,
+                        found_minor: found.minor,
+                        supported_major: DISK_FORMAT_VERSION.major,
+                        supported_minor: DISK_FORMAT_VERSION.minor,
+                    });
+                }
+                Ok(())
+            }
+            None if self.authoritative_keyspaces_are_empty()? => {
+                let mut batch = self.buffered_batch();
+                batch.insert(
+                    &self.graphs,
+                    DISK_FORMAT_KEY,
+                    encode_disk_format(DISK_FORMAT_VERSION),
+                );
+                batch.commit()?;
+                self.db.persist(self.persist_mode)?;
+                Ok(())
+            }
+            None => Err(StoreError::MissingAuthoritativeFormat),
+        }
+    }
+
+    fn authoritative_keyspaces_are_empty(&self) -> Result<bool> {
+        for keyspace in [&self.terms, &self.quads, &self.log] {
+            if keyspace.iter().next().is_some() {
+                return Ok(false);
+            }
+        }
+        for guard in self.graphs.iter() {
+            let (key, _) = guard.into_inner()?;
+            if key.as_ref() != DISK_FORMAT_KEY {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Restore the FTS queue token counter across restarts.
@@ -6446,6 +6542,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    fn seed_raw_graph_record(path: &Path, key: &[u8], value: &[u8]) {
+        let db = Database::builder(path).open().unwrap();
+        let graphs = db
+            .keyspace("graphs", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut batch = db.batch();
+        batch.insert(&graphs, key, value);
+        batch.commit().unwrap();
+        db.persist(PersistMode::SyncAll).unwrap();
+    }
+
+    #[test]
+    fn disk_format_marker_is_written_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        GraphStore::open(dir.path()).unwrap().persist().unwrap();
+        GraphStore::open(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn future_disk_format_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_raw_graph_record(
+            dir.path(),
+            DISK_FORMAT_KEY,
+            &encode_disk_format(DiskFormatVersion::new(DISK_FORMAT_VERSION.major + 1, 0)),
+        );
+
+        assert!(matches!(
+            GraphStore::open(dir.path()),
+            Err(StoreError::UnsupportedAuthoritativeFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_disk_format_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_raw_graph_record(dir.path(), DISK_FORMAT_KEY, &[1, 2, 3]);
+
+        assert!(matches!(
+            GraphStore::open(dir.path()),
+            Err(StoreError::InvalidAuthoritativeFormat)
+        ));
+    }
+
+    #[test]
+    fn unmarked_nonempty_authoritative_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_raw_graph_record(dir.path(), b"Mlegacy", b"value");
+
+        assert!(matches!(
+            GraphStore::open(dir.path()),
+            Err(StoreError::MissingAuthoritativeFormat)
+        ));
     }
 
     #[cfg(feature = "shacl-core")]

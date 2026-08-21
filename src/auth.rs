@@ -45,7 +45,7 @@ impl PermissionGrant {
 /// Authorization failure returned by [`Authorizer`] implementations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthorizationError {
-    #[error("permission denied for {action:?} on graph `{graph}`")]
+    #[error("permission denied for {action:?}")]
     PermissionDenied { action: Action, graph: String },
     #[error("invalid permission pattern `{pattern}`: {message}")]
     InvalidPattern { pattern: String, message: String },

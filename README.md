@@ -1,10 +1,56 @@
 # Craqle
 
-Craqle is an experimental Rust library for storing, validating, querying, searching, and replicating RO-Crates as RDF named graphs.
+Craqle 0.2 is a versioned Rust library for storing, querying, validating,
+searching, and replicating RO-Crates as RDF named graphs.
 
 The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Irokle graph topics provide the durable operation log and sync obligations, while Craqle reduces those events into an OR-Set RDF projection. Invalid visible RO-Crates are not exported.
 
-This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. Search is intentionally minimal. The workspace depends on `intbio-ncl/ro-crate-rs` tag `v0.6.0` with the `rdf` feature and a local compatibility patch in `vendor/ro-crate-rs-0.6.0`.
+`0.2.0-rc.1` is a release candidate for the supported 0.2 API, disk-data,
+SPARQL, `CraqleFastV1` SHACL, RO-Crate, and exact federation-routing
+contracts. It is not the final 0.2 release.
+
+Within the 0.2.x series:
+
+- documented public APIs remain source compatible unless a correctness or
+  security defect makes this impossible;
+- authoritative CRDT data written by 0.2 remains readable by later 0.2
+  releases;
+- derived qv indexes, search indexes, compiled-schema caches, federation
+  metadata, and negative certificates may be rebuilt;
+- unsupported forms fail explicitly;
+- deprecated 0.2 APIs remain until 0.3 unless they create a correctness or
+  security issue, and their Rust documentation names the replacement;
+- a future 0.3 release may contain breaking changes with a migration note.
+
+| Area | 0.2 status |
+| --- | --- |
+| RDF named-graph storage | Supported |
+| CRDT source data | Supported |
+| RO-Crate 1.1, 1.2, and 1.3 import/export | Supported within documented behavior |
+| Local SPARQL | Supported |
+| qv query indexes | Supported derived data |
+| `CraqleFastV1` SHACL | Supported bounded profile |
+| Enforce and Advisory policies | Supported |
+| Exact graph routing | Supported after all routing gates pass |
+| Federated coordinator fragments | Coordinator-facing API |
+| Full federation service | Outside Craqle 0.2 |
+| Full SHACL Core | Not claimed |
+| SHACL-SPARQL, JS, AF, remote imports | Unsupported |
+| RDF-star | Unsupported |
+
+## Public API policy
+
+| Classification | Surface |
+| --- | --- |
+| Stable in 0.2.x | Root storage, RO-Crate, authorization, local SPARQL, search, replication, error, and disk-format APIs documented in Rustdoc |
+| Coordinator-facing in 0.2.x | Exact federation topology, dependency, certificate, and compact-fragment APIs once their release gates pass |
+| Feature-gated in 0.2.x | `shacl-core`, `search`, and `iroh` surfaces |
+| Internal | Everything under `src/internal/`, encoded storage IDs, physical forcing controls used only by tests and benchmarks |
+| Deprecated | APIs explicitly carrying a Rust `deprecated` attribute and a documented replacement; retained until 0.3 unless correctness or security requires removal |
+
+Public enums intended to grow are non-exhaustive. Existing names do not change
+semantics silently. The committed API snapshot is checked alongside a Rust
+semver analysis in CI.
 
 - create and update RO-Crates as named RDF graphs
 - import and export RO-Crate JSON-LD
@@ -144,11 +190,34 @@ let batch = node.apply_rocrate_document(&writer, graph.clone(), updated_jsonld)?
 
 ## Limitations
 
-- The API is still moving and there are no stability guarantees yet.
 - Search is intentionally minimal even though it uses Tantivy; for richer results you still hydrate metadata from RDF.
 - Irokle transport integration is library-level; Craqle does not provide a standalone sync server.
-- The workspace uses `intbio-ncl/ro-crate-rs` tag `v0.6.0` plus the tracked local compatibility patch.
+- The Git release candidate pins exact revisions of maintained RO-Crate and
+  Rudof dependency forks. It is not crates.io-ready until equivalent registry
+  releases exist.
 - `CraqleFastV1` is a deliberately bounded profile, not unrestricted SHACL Core conformance.
+
+## Disk data and recovery
+
+The authoritative format marker is `1.0`. CRDT source records, the term data
+needed to decode them, graph recovery metadata, and committed policy bindings
+are authoritative and must be included in a consistent backup. An unknown
+future authoritative format, a malformed marker, or an unmarked non-empty
+store fails closed at open.
+
+qv query indexes, Tantivy search indexes, compiled SHACL caches, federation
+metadata, and negative-result certificates are derived and disposable. They
+may be omitted from a backup and rebuilt from authoritative state. Restoring a
+database requires an empty destination and must preserve one consistent view
+of all authoritative keyspaces.
+
+## Feature flags
+
+| Feature | Default | Behavior |
+| --- | --- | --- |
+| `search` | Yes | Tantivy full-text derived index |
+| `shacl-core` | No | Native bounded `CraqleFastV1` compilation, validation, and policy bindings |
+| `iroh` | No | Irokle Iroh transport and asynchronous write-concern scheduling |
 
 There is also a small demo in `examples/demo.rs`:
 
