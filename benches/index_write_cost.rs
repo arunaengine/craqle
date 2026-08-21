@@ -264,6 +264,50 @@ fn local_fixture(config: CorpusConfig, changes: Vec<MaterializedQuadChange>) -> 
     local_fixture_mode(config, changes, CraqleFjallPersistMode::Buffer)
 }
 
+fn local_fixture_union_proof_state(
+    config: CorpusConfig,
+    changes: Vec<MaterializedQuadChange>,
+    mode: CraqleFjallPersistMode,
+    invalidate: bool,
+) -> LocalFixture {
+    let fixture = local_fixture_mode(config, changes, mode);
+    let spec = DeterministicCorpus::new(config)
+        .expect("validated write benchmark corpus")
+        .iter()
+        .next()
+        .expect("write benchmark corpus is non-empty");
+    let duplicate = GraphId::new("urn:craqle:bench:index-write-cost:union-proof-unknown");
+    let warm = operation_triple(spec);
+    fixture
+        .node
+        .apply_changes_unchecked(&duplicate, vec![warm.change(&duplicate, true)])
+        .expect("warm union-proof write state");
+    fixture
+        .node
+        .apply_changes_unchecked(&duplicate, vec![warm.change(&duplicate, false)])
+        .expect("restore the warmed union-proof write state");
+    if invalidate {
+        let triple = triple_from_spec(spec);
+        fixture
+            .node
+            .apply_changes_unchecked(&duplicate, vec![triple.change(&duplicate, true)])
+            .expect("create a duplicate union row");
+        fixture
+            .node
+            .apply_changes_unchecked(&duplicate, vec![triple.change(&duplicate, false)])
+            .expect("remove the duplicate union row");
+    }
+    fixture
+        .node
+        .flush_search_updates()
+        .expect("settle union-proof benchmark search work");
+    fixture
+        .node
+        .persist_fjall()
+        .expect("persist union-proof benchmark setup");
+    fixture
+}
+
 fn changes_for(
     graph: &GraphId,
     triples: &[Triple],
@@ -740,12 +784,12 @@ fn assert_merge_contract(triples: &[Triple]) -> u64 {
     bytes
 }
 
-fn assert_durable(config: CorpusConfig, triples: &[Triple], fixture_hash: &str) -> u64 {
+fn assert_sync_data(config: CorpusConfig, triples: &[Triple], fixture_hash: &str) -> u64 {
     let graph = GraphId::new(LOCAL_GRAPH);
     let fixture = local_fixture_mode(
         config,
         changes_for(&graph, triples, 0..1, true),
-        CraqleFjallPersistMode::SyncAll,
+        CraqleFjallPersistMode::SyncData,
     );
     let before = directory_bytes(&fixture.database.path().join("store"));
     let allocation = AllocationInterval::begin();
@@ -755,8 +799,8 @@ fn assert_durable(config: CorpusConfig, triples: &[Triple], fixture_hash: &str) 
     assert_rows(&fixture.node, &fixture.graphs, config.quads + 1);
     let bytes = settle_and_size(&fixture.node, &fixture.database);
     println!(
-        "index_write_cost case=single_insert_durable corpus_version={CORPUS_VERSION} \
-         seed={DEFAULT_SEED:#x} rows={} db_bytes={bytes} db_growth={} persistence=sync_all \
+        "index_write_cost case=single_insert_sync_data corpus_version={CORPUS_VERSION} \
+         seed={DEFAULT_SEED:#x} rows={} db_bytes={bytes} db_growth={} persistence=sync_data \
          write_path=raw_unchecked_changes validation_reads=0 source_keys_written=1 \
          qv_keys_written=3 key_count_scope=logical_quad_rows_and_qv_orders \
          fixture_hash={fixture_hash} fixture_scope=preloaded_corpus \
@@ -810,11 +854,14 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
     println!(
         "index_write_cost metadata: corpus_version={CORPUS_VERSION} seed={DEFAULT_SEED:#x} \
          corpus_quads={} corpus_graphs={} duplicate_percent={} operation_rows={} \
-         fixture_hash={fixture_hash} local_cases=single_insert,single_delete,batch_100,batch_10000,\
-         single_insert_durable,concurrent_local_writes replicated_case=replicated_merge \
+         fixture_hash={fixture_hash} local_cases=single_insert,single_insert_union_proof_current,\
+         single_insert_union_proof_unknown,single_delete,batch_100,batch_10000,\
+         single_insert_sync_data,single_insert_sync_data_union_proof_current,\
+         single_insert_sync_data_union_proof_unknown,concurrent_local_writes \
+         replicated_case=replicated_merge \
          replicated_fixture_scope=crate_metadata \
          setup=iter_batched_per_iteration preload=streamed_bounded_buffer persistence=buffer \
-         durable_case=single_insert_durable durable_persistence=sync_all \
+         durable_case=single_insert_sync_data durable_persistence=sync_data \
          durable_timed_scope=apply_plus_persist \
          local_write_path=raw_unchecked_changes replicated_path=CraqleCluster::sync_pair \
          key_count_scope=logical_quad_rows_and_qv_orders \
@@ -859,7 +906,7 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
         true,
         &fixture_hash,
     );
-    assert_durable(config, &triples, &fixture_hash);
+    assert_sync_data(config, &triples, &fixture_hash);
     assert_concurrent_contract(config, &triples, &fixture_hash);
     assert_merge_contract(&triples);
 
@@ -874,6 +921,38 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
             || {
                 let graph = GraphId::new(LOCAL_GRAPH);
                 local_fixture(config, changes_for(&graph, &triples, 0..1, true))
+            },
+            |fixture| apply_local_fixture(fixture, false),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("single_insert_union_proof_current", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture_union_proof_state(
+                    config,
+                    changes_for(&graph, &triples, 0..1, true),
+                    CraqleFjallPersistMode::Buffer,
+                    false,
+                )
+            },
+            |fixture| apply_local_fixture(fixture, false),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("single_insert_union_proof_unknown", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture_union_proof_state(
+                    config,
+                    changes_for(&graph, &triples, 0..1, true),
+                    CraqleFjallPersistMode::Buffer,
+                    true,
+                )
             },
             |fixture| apply_local_fixture(fixture, false),
             BatchSize::PerIteration,
@@ -925,14 +1004,46 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Elements(1));
-    group.bench_function("single_insert_durable", |b| {
+    group.bench_function("single_insert_sync_data", |b| {
         b.iter_batched(
             || {
                 let graph = GraphId::new(LOCAL_GRAPH);
                 local_fixture_mode(
                     config,
                     changes_for(&graph, &triples, 0..1, true),
-                    CraqleFjallPersistMode::SyncAll,
+                    CraqleFjallPersistMode::SyncData,
+                )
+            },
+            |fixture| apply_durable(fixture, false),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("single_insert_sync_data_union_proof_current", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture_union_proof_state(
+                    config,
+                    changes_for(&graph, &triples, 0..1, true),
+                    CraqleFjallPersistMode::SyncData,
+                    false,
+                )
+            },
+            |fixture| apply_durable(fixture, false),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("single_insert_sync_data_union_proof_unknown", |b| {
+        b.iter_batched(
+            || {
+                let graph = GraphId::new(LOCAL_GRAPH);
+                local_fixture_union_proof_state(
+                    config,
+                    changes_for(&graph, &triples, 0..1, true),
+                    CraqleFjallPersistMode::SyncData,
+                    true,
                 )
             },
             |fixture| apply_durable(fixture, false),
