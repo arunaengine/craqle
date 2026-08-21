@@ -83,6 +83,10 @@ pub struct ReadStatistics {
     pub orphan_checks: u64,
     pub duplicate_groups: u64,
     pub duplicate_copies_skipped: u64,
+    pub key_fields_extracted: u64,
+    pub authoritative_terms_decoded: u64,
+    pub result_terms_decoded: u64,
+    pub encoded_quad_constructions: u64,
     pub terms_decoded: u64,
 }
 
@@ -129,6 +133,10 @@ struct ReadCounters {
     orphan_checks: Cell<u64>,
     duplicate_groups: Cell<u64>,
     duplicate_copies_skipped: Cell<u64>,
+    key_fields_extracted: Cell<u64>,
+    authoritative_terms_decoded: Cell<u64>,
+    result_terms_decoded: Cell<u64>,
+    encoded_quad_constructions: Cell<u64>,
     terms_decoded: Cell<u64>,
 }
 
@@ -161,6 +169,10 @@ impl ReadCounters {
             orphan_checks: self.orphan_checks.get(),
             duplicate_groups: self.duplicate_groups.get(),
             duplicate_copies_skipped: self.duplicate_copies_skipped.get(),
+            key_fields_extracted: self.key_fields_extracted.get(),
+            authoritative_terms_decoded: self.authoritative_terms_decoded.get(),
+            result_terms_decoded: self.result_terms_decoded.get(),
+            encoded_quad_constructions: self.encoded_quad_constructions.get(),
             terms_decoded: self.terms_decoded.get(),
         }
     }
@@ -331,6 +343,10 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.matching_quads);
     }
 
+    pub(crate) fn record_matching_quads(&self, count: u64) {
+        ReadCounters::add(&self.counters.matching_quads, count);
+    }
+
     pub(crate) fn increment_graphs_considered(&self) {
         ReadCounters::increment(&self.counters.graphs_considered);
     }
@@ -347,8 +363,21 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.duplicate_copies_skipped);
     }
 
+    pub(crate) fn record_key_fields_extracted(&self, count: u64) {
+        ReadCounters::add(&self.counters.key_fields_extracted, count);
+    }
+
+    pub(crate) fn increment_encoded_quad_constructions(&self) {
+        ReadCounters::increment(&self.counters.encoded_quad_constructions);
+    }
+
     pub(crate) fn increment_terms_decoded(&self) {
+        ReadCounters::increment(&self.counters.authoritative_terms_decoded);
         ReadCounters::increment(&self.counters.terms_decoded);
+    }
+
+    pub(crate) fn increment_result_terms_decoded(&self) {
+        ReadCounters::increment(&self.counters.result_terms_decoded);
     }
 
     pub(crate) fn graph_visibility(&self, graph: TermId) -> Option<bool> {

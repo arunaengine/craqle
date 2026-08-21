@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use oxrdf::{Literal, Term, Variable};
 use spargebra::Query;
-use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
+use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
@@ -28,6 +28,7 @@ pub enum QueryFastPathKind {
     NamedCount,
     UnionCount,
     CountDistinctSubject,
+    CountDistinctObject,
     PropertyStar,
     HashJoinCount,
 }
@@ -63,7 +64,7 @@ pub(crate) enum FastPathPlan {
     Count {
         triple: TriplePlan,
         output: String,
-        distinct_subject: bool,
+        domain: crate::count_plan::CountValueDomain,
     },
     PropertyStar {
         triples: Vec<TriplePlan>,
@@ -85,9 +86,13 @@ impl FastPathPlan {
             Self::Ask(_) => QueryFastPathKind::Ask,
             Self::SelectLimit { .. } => QueryFastPathKind::SelectLimit,
             Self::Count {
-                distinct_subject: true,
+                domain: crate::count_plan::CountValueDomain::Subject,
                 ..
             } => QueryFastPathKind::CountDistinctSubject,
+            Self::Count {
+                domain: crate::count_plan::CountValueDomain::Object,
+                ..
+            } => QueryFastPathKind::CountDistinctObject,
             Self::Count { triple, .. } => match &triple.graph {
                 PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
                 PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
@@ -137,7 +142,7 @@ pub(crate) fn analyze(query: &Query) -> Option<FastPathPlan> {
             pattern,
             ..
         } => {
-            if let Some(plan) = count_plan(pattern) {
+            if let Some(plan) = crate::count_plan::analyze(pattern) {
                 return Some(plan);
             }
             let (inner, variables, limit) = projection(pattern)?;
@@ -232,71 +237,9 @@ fn property_star_plan(
     })
 }
 
-fn count_plan(pattern: &GraphPattern) -> Option<FastPathPlan> {
-    let GraphPattern::Project { inner, variables } = pattern else {
-        return None;
-    };
-    let [output] = variables.as_slice() else {
-        return None;
-    };
-    let GraphPattern::Extend {
-        inner,
-        variable,
-        expression: Expression::Variable(aggregate_result),
-    } = inner.as_ref()
-    else {
-        return None;
-    };
-    if variable != output {
-        return None;
-    }
-    let GraphPattern::Group {
-        inner,
-        variables,
-        aggregates,
-    } = inner.as_ref()
-    else {
-        return None;
-    };
-    if !variables.is_empty() {
-        return None;
-    }
-    let [(aggregate_variable, aggregate)] = aggregates.as_slice() else {
-        return None;
-    };
-    if aggregate_variable != aggregate_result {
-        return None;
-    }
-    let count_all = matches!(
-        aggregate,
-        AggregateExpression::CountSolutions { distinct: false }
-    );
-    if count_all && let Some((left, right, join_variables)) = two_joined_triples(inner) {
-        return Some(FastPathPlan::HashJoinCount {
-            left,
-            right,
-            output: output.as_str().to_owned(),
-            join_variables,
-        });
-    }
-    let triple = single_triple(inner)?;
-    let distinct_subject = match aggregate {
-        AggregateExpression::CountSolutions { distinct: false } => false,
-        AggregateExpression::FunctionCall {
-            name: AggregateFunction::Count,
-            expr: Expression::Variable(variable),
-            distinct: true,
-        } if triple.distinct_subject_order(variable) => true,
-        _ => return None,
-    };
-    Some(FastPathPlan::Count {
-        triple,
-        output: output.as_str().to_owned(),
-        distinct_subject,
-    })
-}
-
-fn two_joined_triples(pattern: &GraphPattern) -> Option<(TriplePlan, TriplePlan, Vec<String>)> {
+pub(crate) fn two_joined_triples(
+    pattern: &GraphPattern,
+) -> Option<(TriplePlan, TriplePlan, Vec<String>)> {
     let (graph, patterns) = match pattern {
         GraphPattern::Bgp { patterns } => (PatternGraph::DefaultUnion, patterns.as_slice()),
         GraphPattern::Graph {
@@ -343,7 +286,7 @@ fn triple_variable_names(triple: &TriplePlan) -> HashSet<String> {
         .collect()
 }
 
-fn single_triple(pattern: &GraphPattern) -> Option<TriplePlan> {
+pub(crate) fn single_triple(pattern: &GraphPattern) -> Option<TriplePlan> {
     match pattern {
         GraphPattern::Bgp { patterns } if patterns.len() == 1 => {
             triple_plan(PatternGraph::DefaultUnion, &patterns[0])
@@ -419,12 +362,30 @@ struct ResolvedTriple<'a> {
 }
 
 impl TriplePlan {
-    fn distinct_subject_order(&self, variable: &Variable) -> bool {
+    pub(crate) fn distinct_subject_order(&self, variable: &Variable) -> bool {
         matches!(
             &self.subject,
             PatternTerm::Variable(subject) if subject == variable.as_str()
         ) && matches!(&self.predicate, PatternTerm::Constant(_))
             && matches!(&self.object, PatternTerm::Constant(_))
+    }
+
+    pub(crate) fn distinct_object_order(&self, variable: &Variable) -> bool {
+        matches!(
+            &self.object,
+            PatternTerm::Variable(object) if object == variable.as_str()
+        ) && matches!(&self.subject, PatternTerm::Constant(_))
+            && matches!(&self.predicate, PatternTerm::Constant(_))
+    }
+
+    fn count_value_domain(&self, variable: &str) -> Option<crate::count_plan::CountValueDomain> {
+        if matches!(&self.subject, PatternTerm::Variable(subject) if subject == variable) {
+            Some(crate::count_plan::CountValueDomain::Subject)
+        } else if matches!(&self.object, PatternTerm::Variable(object) if object == variable) {
+            Some(crate::count_plan::CountValueDomain::Object)
+        } else {
+            None
+        }
     }
 
     fn resolve<'a>(
@@ -538,32 +499,51 @@ pub(crate) fn execute(
         FastPathPlan::Count {
             triple,
             output,
-            distinct_subject,
+            domain,
         } => {
             let mut count = 0_u64;
-            let mut last_subject = None;
             if let Some(triple) = triple.resolve(view, context)? {
-                let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
-                for quad in &mut cursor {
-                    let quad = quad?;
-                    if !distinct_subject || last_subject != Some(quad.subject) {
-                        count = count.checked_add(1).ok_or_else(|| {
-                            crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
-                        })?;
-                        last_subject = Some(quad.subject);
+                if let Some(exact) = crate::count_exec::single_pattern_count(
+                    view,
+                    context,
+                    triple.selector,
+                    triple.pattern,
+                    *domain,
+                )? {
+                    count = exact.get();
+                } else {
+                    let mut last_value = None;
+                    let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+                    for quad in &mut cursor {
+                        let quad = quad?;
+                        let value = match domain {
+                            crate::count_plan::CountValueDomain::Scalar => None,
+                            crate::count_plan::CountValueDomain::Subject => Some(quad.subject),
+                            crate::count_plan::CountValueDomain::Object => Some(quad.object),
+                        };
+                        if value.is_none() || last_value != value {
+                            count = count.checked_add(1).ok_or_else(|| {
+                                crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                            })?;
+                            last_value = value;
+                        }
                     }
                 }
             }
             Ok(count_outcome(
                 output,
                 count,
-                if *distinct_subject {
-                    QueryFastPathKind::CountDistinctSubject
-                } else {
-                    match &triple.graph {
+                match domain {
+                    crate::count_plan::CountValueDomain::Subject => {
+                        QueryFastPathKind::CountDistinctSubject
+                    }
+                    crate::count_plan::CountValueDomain::Object => {
+                        QueryFastPathKind::CountDistinctObject
+                    }
+                    crate::count_plan::CountValueDomain::Scalar => match &triple.graph {
                         PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
                         PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
-                    }
+                    },
                 },
                 count,
                 started,
@@ -610,6 +590,45 @@ fn hash_join_count(
         } else {
             (right, right_resolved, left, left_resolved)
         };
+    if let [join_variable] = join_variables {
+        let raw = match (
+            build_plan.count_value_domain(join_variable),
+            probe_plan.count_value_domain(join_variable),
+        ) {
+            (
+                Some(crate::count_plan::CountValueDomain::Subject),
+                Some(crate::count_plan::CountValueDomain::Subject),
+            ) => crate::count_exec::subject_join_count(
+                view,
+                context,
+                build.selector,
+                build.pattern,
+                probe.selector,
+                probe.pattern,
+            )?,
+            (
+                Some(crate::count_plan::CountValueDomain::Object),
+                Some(crate::count_plan::CountValueDomain::Object),
+            ) => crate::count_exec::object_join_count(
+                view,
+                context,
+                build.selector,
+                build.pattern,
+                probe.selector,
+                probe.pattern,
+            )?,
+            _ => None,
+        };
+        if let Some((count, intermediate_rows)) = raw {
+            return Ok(count_outcome(
+                output,
+                count.get(),
+                QueryFastPathKind::HashJoinCount,
+                intermediate_rows,
+                started,
+            ));
+        }
+    }
     let mut table: HashMap<Vec<TermId>, u64> = HashMap::new();
     let mut intermediate_rows = 0_u64;
     let mut build_cursor = view.scan(context, build.selector, build.pattern)?;
@@ -848,7 +867,7 @@ fn decode_binding(
     let mut row = HashMap::with_capacity(projected.len());
     for variable in projected {
         if let Some(value) = binding.get(variable.as_str()) {
-            row.insert(variable.clone(), view.decode_term(context, *value)?);
+            row.insert(variable.clone(), view.decode_result_term(context, *value)?);
         }
     }
     Ok(row)
@@ -874,7 +893,7 @@ fn collect_row(
     let mut row = HashMap::with_capacity(projected.len());
     for variable in projected {
         if let Some(value) = bindings.get(variable.as_str()) {
-            row.insert(variable.clone(), view.decode_term(context, *value)?);
+            row.insert(variable.clone(), view.decode_result_term(context, *value)?);
         }
     }
     Ok(row)

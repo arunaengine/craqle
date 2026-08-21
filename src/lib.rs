@@ -17,6 +17,10 @@
 
 #[path = "internal/core.rs"]
 mod core;
+#[path = "internal/count_exec.rs"]
+mod count_exec;
+#[path = "internal/count_plan.rs"]
+mod count_plan;
 #[path = "internal/planner.rs"]
 mod planner;
 #[allow(dead_code)]

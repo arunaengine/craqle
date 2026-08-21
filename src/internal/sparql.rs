@@ -186,6 +186,10 @@ pub struct QueryExecutionStatistics {
     pub orphan_checks: u64,
     pub duplicate_groups: u64,
     pub duplicate_copies_skipped: u64,
+    pub key_fields_extracted: u64,
+    pub authoritative_terms_decoded: u64,
+    pub result_terms_decoded: u64,
+    pub encoded_quad_constructions: u64,
     pub terms_decoded: u64,
     pub intermediate_rows: u64,
     pub result_rows: u64,
@@ -612,7 +616,7 @@ impl SparqlEngine {
         ));
         let initial_execution_time = execution_started.elapsed();
         let results = results.map_err(map_eval_error)?;
-        let (results, collection) = collect_query_results(results, execution_started)?;
+        let (results, collection) = collect_query_results(results, execution_started, &context)?;
         let read_statistics = context.snapshot();
         let explanation_metrics = if collect_plan_statistics {
             read_explanation_metrics(&explanation)?
@@ -1001,6 +1005,10 @@ fn build_execution_statistics(
         orphan_checks: reads.orphan_checks,
         duplicate_groups: reads.duplicate_groups,
         duplicate_copies_skipped: reads.duplicate_copies_skipped,
+        key_fields_extracted: reads.key_fields_extracted,
+        authoritative_terms_decoded: reads.authoritative_terms_decoded,
+        result_terms_decoded: reads.result_terms_decoded,
+        encoded_quad_constructions: reads.encoded_quad_constructions,
         terms_decoded: reads.terms_decoded,
         intermediate_rows: explanation.intermediate_rows,
         result_rows: collection.result_rows,
@@ -1983,6 +1991,7 @@ where
 fn collect_query_results(
     results: spareval::QueryResults<'_>,
     execution_started: Instant,
+    context: &ReadContext<'_>,
 ) -> Result<(QueryResults, CollectionMetrics)> {
     match results {
         spareval::QueryResults::Solutions(mut solutions) => {
@@ -2007,6 +2016,7 @@ fn collect_query_results(
                 let mut row = HashMap::with_capacity(solution.len());
                 for (variable, term) in solution.iter() {
                     row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term));
+                    context.increment_result_terms_decoded();
                 }
                 metrics.result_rows = metrics.result_rows.saturating_add(1);
                 metrics.result_cells = metrics
@@ -2051,6 +2061,9 @@ fn collect_query_results(
                     EncodedTerm::from_named_node(&predicate),
                     EncodedTerm::from_term(&object),
                 ));
+                for _ in 0..3 {
+                    context.increment_result_terms_decoded();
+                }
                 metrics.result_rows = metrics.result_rows.saturating_add(1);
                 metrics.result_cells = metrics.result_cells.saturating_add(3);
                 metrics.collection_time =
@@ -2766,6 +2779,7 @@ mod tests {
                 ))
                 .unwrap(),
             Instant::now(),
+            &context,
         )
         .unwrap()
         .0;

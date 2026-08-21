@@ -156,6 +156,10 @@ fn fast_paths_match_generic() {
             QueryFastPathKind::CountDistinctSubject,
         ),
         (
+            "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { <urn:test:fast:shared> <urn:test:fast:p> ?o }",
+            QueryFastPathKind::CountDistinctObject,
+        ),
+        (
             "SELECT ?s ?name ?date WHERE { ?s <urn:test:fast:p> ?o ; <urn:test:fast:name> ?name ; <urn:test:fast:date> ?date }",
             QueryFastPathKind::PropertyStar,
         ),
@@ -199,6 +203,25 @@ fn fast_paths_match_generic() {
         QueryFastPathMode::Disabled,
     );
     assert_eq!(duplicate_count.results, generic_duplicate_count.results);
+    assert_eq!(duplicate_count.statistics.encoded_quad_constructions, 0);
+    assert_eq!(duplicate_count.statistics.authoritative_terms_decoded, 0);
+    assert_eq!(duplicate_count.statistics.result_terms_decoded, 0);
+    assert_eq!(duplicate_count.statistics.terms_decoded, 0);
+
+    let subject_only = run(
+        &node,
+        &graphs,
+        "SELECT ?s WHERE { ?s <urn:test:fast:p> ?o } LIMIT 10",
+        QueryFastPathMode::Auto,
+    );
+    assert_eq!(
+        subject_only.statistics.authoritative_terms_decoded,
+        subject_only.statistics.result_cells
+    );
+    assert_eq!(
+        subject_only.statistics.result_terms_decoded,
+        subject_only.statistics.result_cells
+    );
 }
 
 #[test]
@@ -286,16 +309,17 @@ fn hash_count_multiplicity() {
             &graph,
             &subject,
             "urn:test:fast:left",
-            iri(&format!("urn:test:fast:left-value:{index}")),
+            iri(&format!("urn:test:fast:join-value:{index}")),
         ));
         changes.push(insert(
             &graph,
             &subject,
             "urn:test:fast:right",
-            iri(&format!("urn:test:fast:right-value:{index}")),
+            iri(&format!("urn:test:fast:join-value:{index}")),
         ));
     }
     node.apply_changes_unchecked(&graph, changes).unwrap();
+    node.rebuild_graph_diagnostics(&graph).unwrap();
     node.ensure_query_indexes();
     let query = node
         .prepare_query(
@@ -338,6 +362,38 @@ fn hash_count_multiplicity() {
         automatic.statistics.planned_joins[0].physical_operator,
         JoinKind::Hash
     );
+
+    for query in [
+        "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:hash> { \
+         ?s <urn:test:fast:left> ?left . ?s <urn:test:fast:right> ?right } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:hash> { \
+         ?left <urn:test:fast:left> ?key . ?right <urn:test:fast:right> ?key } }",
+    ] {
+        let fast = run(
+            &node,
+            std::slice::from_ref(&graph),
+            query,
+            QueryFastPathMode::Auto,
+        );
+        let generic = run(
+            &node,
+            std::slice::from_ref(&graph),
+            query,
+            QueryFastPathMode::Disabled,
+        );
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(
+            fast.statistics.fast_path,
+            Some(QueryFastPathKind::HashJoinCount)
+        );
+        assert_eq!(fast.statistics.encoded_quad_constructions, 0);
+        assert_eq!(fast.statistics.authoritative_terms_decoded, 0);
+        assert_eq!(fast.statistics.result_terms_decoded, 0);
+        assert_eq!(
+            fast.statistics.key_fields_extracted,
+            fast.statistics.qv_keys_read
+        );
+    }
 }
 
 #[test]

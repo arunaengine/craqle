@@ -226,6 +226,66 @@ impl<'store> StoreReadView<'store> {
         self.snapshot.query_term_id(self.store, term)
     }
 
+    pub(crate) fn decode_result_term(
+        &self,
+        context: &ReadContext<'_>,
+        term: TermId,
+    ) -> Result<EncodedTerm> {
+        let decoded = decode_term(self.store, context, term)?;
+        context.increment_result_terms_decoded();
+        Ok(decoded)
+    }
+
+    pub(crate) fn raw_query_index_keys(
+        &self,
+        context: &ReadContext<'_>,
+        selector: GraphSelector,
+        pattern: QuadPattern,
+    ) -> Result<Option<crate::query_cursor::RawQueryIndexKeyCursor>> {
+        context.check_cancelled()?;
+        let Some(pattern) = selector.apply(pattern) else {
+            return Ok(None);
+        };
+        if let GraphSelector::Named(graph) = selector
+            && !self.graph_is_visible(context, graph)?
+        {
+            return Ok(None);
+        }
+        if matches!(self.read_mode, QueryReadMode::ForceSource) {
+            return Ok(None);
+        }
+        let path = match self.read_mode {
+            QueryReadMode::Auto => Self::auto_access_path(selector, pattern),
+            QueryReadMode::ForceQv => Self::force_qv_path(selector, pattern),
+            QueryReadMode::ForceSource => unreachable!("handled above"),
+        };
+        let admission = self.qv_admission(context)?;
+        if !admission.trusted {
+            if matches!(self.read_mode, QueryReadMode::ForceQv)
+                || matches!(selector, GraphSelector::DefaultUnion)
+            {
+                return Err(StoreError::QueryIndexUnavailable(
+                    admission
+                        .fallback_reason
+                        .unwrap_or("query-index-v2-not-trusted"),
+                ));
+            }
+            return Ok(None);
+        }
+        context.record_access_path(path);
+        context.increment_index_seeks();
+        self.snapshot
+            .query_index_key_cursor(self.store, Self::qv_order(path), pattern)
+    }
+
+    pub(crate) fn orphaned_ids(
+        &self,
+        context: &ReadContext<'_>,
+        graph: TermId,
+    ) -> Result<Rc<HashSet<TermId>>> {
+        orphaned_for_graph(self.store, &self.snapshot, context, graph)
+    }
+
     fn qv_order(path: ReadAccessPath) -> QueryIndexCursorOrder {
         match path {
             ReadAccessPath::QvGspo => QueryIndexCursorOrder::Gspo,
@@ -258,7 +318,6 @@ impl<'store> StoreReadView<'store> {
         self.snapshot.graph_term_id_iter(self.store)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_g_count(
         &self,
         context: &ReadContext<'_>,
@@ -271,7 +330,6 @@ impl<'store> StoreReadView<'store> {
         self.snapshot.qv_g_count(self.store, graph)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_gp_count(
         &self,
         context: &ReadContext<'_>,
@@ -285,7 +343,6 @@ impl<'store> StoreReadView<'store> {
         self.snapshot.qv_gp_count(self.store, graph, predicate)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_gpo_count(
         &self,
         context: &ReadContext<'_>,
@@ -301,7 +358,6 @@ impl<'store> StoreReadView<'store> {
             .qv_gpo_count(self.store, graph, predicate, object)
     }
 
-    #[cfg(feature = "shacl-core")]
     fn qv_ready(&self, context: &ReadContext<'_>) -> Result<bool> {
         Ok(self.qv_admission(context)?.trusted)
     }

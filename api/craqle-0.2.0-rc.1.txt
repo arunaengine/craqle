@@ -340,6 +340,7 @@ pub craqle::QuadOp::Remove::witnessed: craqle::VectorClock
 pub enum craqle::QueryFastPathKind
 pub craqle::QueryFastPathKind::Ask
 pub craqle::QueryFastPathKind::CountDistinctSubject
+pub craqle::QueryFastPathKind::CountDistinctObject
 pub craqle::QueryFastPathKind::HashJoinCount
 pub craqle::QueryFastPathKind::NamedCount
 pub craqle::QueryFastPathKind::PropertyStar
@@ -852,15 +853,18 @@ pub craqle::QueryExecutionOptions::read_mode: craqle::QueryReadMode
 impl core::default::Default for craqle::QueryExecutionOptions
 pub fn craqle::QueryExecutionOptions::default() -> Self
 pub struct craqle::QueryExecutionStatistics
+pub craqle::QueryExecutionStatistics::authoritative_terms_decoded: u64
 pub craqle::QueryExecutionStatistics::candidate_quads: u64
 pub craqle::QueryExecutionStatistics::duplicate_copies_skipped: u64
 pub craqle::QueryExecutionStatistics::duplicate_groups: u64
+pub craqle::QueryExecutionStatistics::encoded_quad_constructions: u64
 pub craqle::QueryExecutionStatistics::execution_time: core::time::Duration
 pub craqle::QueryExecutionStatistics::fallback_reason: core::option::Option<alloc::string::String>
 pub craqle::QueryExecutionStatistics::fast_path: core::option::Option<craqle::QueryFastPathKind>
 pub craqle::QueryExecutionStatistics::graphs_considered: u64
 pub craqle::QueryExecutionStatistics::index_seeks: u64
 pub craqle::QueryExecutionStatistics::intermediate_rows: u64
+pub craqle::QueryExecutionStatistics::key_fields_extracted: u64
 pub craqle::QueryExecutionStatistics::matching_quads: u64
 pub craqle::QueryExecutionStatistics::orphan_checks: u64
 pub craqle::QueryExecutionStatistics::parse_time: core::time::Duration
@@ -868,16 +872,17 @@ pub craqle::QueryExecutionStatistics::plan: craqle::QueryPlan
 pub craqle::QueryExecutionStatistics::plan_fingerprint: alloc::string::String
 pub craqle::QueryExecutionStatistics::planned_joins: alloc::vec::Vec<craqle::PlannedJoin>
 pub craqle::QueryExecutionStatistics::planning_time: core::time::Duration
+pub craqle::QueryExecutionStatistics::query_id_generation: core::option::Option<u64>
 pub craqle::QueryExecutionStatistics::qv_admission_checks: u64
 pub craqle::QueryExecutionStatistics::qv_bytes_read: u64
 pub craqle::QueryExecutionStatistics::qv_counter_reads: u64
 pub craqle::QueryExecutionStatistics::qv_header_reads: u64
 pub craqle::QueryExecutionStatistics::qv_keys_read: u64
 pub craqle::QueryExecutionStatistics::qv_trusted: bool
-pub craqle::QueryExecutionStatistics::query_id_generation: core::option::Option<u64>
 pub craqle::QueryExecutionStatistics::result_cells: u64
 pub craqle::QueryExecutionStatistics::result_collection_time: core::time::Duration
 pub craqle::QueryExecutionStatistics::result_rows: u64
+pub craqle::QueryExecutionStatistics::result_terms_decoded: u64
 pub craqle::QueryExecutionStatistics::rewrite_time: core::time::Duration
 pub craqle::QueryExecutionStatistics::selected_access_paths: alloc::vec::Vec<craqle::ReadAccessPath>
 pub craqle::QueryExecutionStatistics::source_bytes_read: u64
@@ -915,21 +920,25 @@ pub craqle::QueryPlanNode::logical_operator: craqle::QueryLogicalOperator
 pub craqle::QueryPlanNode::output_rows: u64
 pub craqle::QueryPlanNode::physical_operator: craqle::QueryPhysicalOperator
 pub struct craqle::ReadStatistics
+pub craqle::ReadStatistics::authoritative_terms_decoded: u64
 pub craqle::ReadStatistics::candidate_quads: u64
 pub craqle::ReadStatistics::duplicate_copies_skipped: u64
 pub craqle::ReadStatistics::duplicate_groups: u64
+pub craqle::ReadStatistics::encoded_quad_constructions: u64
 pub craqle::ReadStatistics::fallback_reason: core::option::Option<alloc::string::String>
 pub craqle::ReadStatistics::graphs_considered: u64
 pub craqle::ReadStatistics::index_seeks: u64
+pub craqle::ReadStatistics::key_fields_extracted: u64
 pub craqle::ReadStatistics::matching_quads: u64
 pub craqle::ReadStatistics::orphan_checks: u64
+pub craqle::ReadStatistics::query_id_generation: core::option::Option<u64>
 pub craqle::ReadStatistics::qv_admission_checks: u64
 pub craqle::ReadStatistics::qv_bytes_read: u64
 pub craqle::ReadStatistics::qv_counter_reads: u64
 pub craqle::ReadStatistics::qv_header_reads: u64
 pub craqle::ReadStatistics::qv_keys_read: u64
 pub craqle::ReadStatistics::qv_trusted: bool
-pub craqle::ReadStatistics::query_id_generation: core::option::Option<u64>
+pub craqle::ReadStatistics::result_terms_decoded: u64
 pub craqle::ReadStatistics::selected_access_paths: alloc::vec::Vec<craqle::ReadAccessPath>
 pub craqle::ReadStatistics::source_bytes_read: u64
 pub craqle::ReadStatistics::source_keys_read: u64

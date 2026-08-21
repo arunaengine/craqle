@@ -1911,6 +1911,25 @@ impl StoreReadSnapshot {
         ))
     }
 
+    pub(crate) fn query_index_key_cursor(
+        &self,
+        store: &GraphStore,
+        order: QueryIndexCursorOrder,
+        pattern: crate::rdf_read::QuadPattern,
+    ) -> Result<Option<crate::query_cursor::RawQueryIndexKeyCursor>> {
+        let Some((keyspace, prefix)) = store.query_index_range(&self.snapshot, order, pattern)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(crate::query_cursor::RawQueryIndexKeyCursor::new(
+            self.snapshot.clone(),
+            keyspace,
+            &store.qv2_query_to_term,
+            order,
+            prefix,
+        )))
+    }
+
     pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
         store.snapshot_admission(&self.snapshot)
     }
@@ -1923,7 +1942,6 @@ impl StoreReadSnapshot {
         store.query_term_id_from_snapshot(&self.snapshot, term)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_g_count(&self, store: &GraphStore, graph: TermId) -> Result<Option<u64>> {
         let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
             return Ok(Some(0));
@@ -1931,7 +1949,6 @@ impl StoreReadSnapshot {
         self.qv_count(store, QueryIndexCounterKey::Graph(graph), false)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_gp_count(
         &self,
         store: &GraphStore,
@@ -1951,7 +1968,6 @@ impl StoreReadSnapshot {
         )
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_gpo_count(
         &self,
         store: &GraphStore,
@@ -1975,7 +1991,6 @@ impl StoreReadSnapshot {
         )
     }
 
-    #[cfg(feature = "shacl-core")]
     fn qv_count(
         &self,
         store: &GraphStore,
@@ -4561,6 +4576,8 @@ impl GraphStore {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
+            context.record_key_fields_extracted(4);
+            context.increment_encoded_quad_constructions();
             if vocab.has_part == Some(quad.predicate) {
                 adjacency.entry(quad.subject).or_default().push(quad.object);
                 if quad.subject != graph_id {

@@ -380,6 +380,8 @@ impl<'delta> DeltaQuadCursor<'delta> {
             live: present && !self.base_live_delta_rows.contains(&key),
             storage: CandidateStorage::Delta,
             bytes_read: 0,
+            key_fields_extracted: 0,
+            encoded_quad_constructed: false,
         }))
     }
 }

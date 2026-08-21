@@ -7,7 +7,7 @@ use fjall::{Keyspace, Readable, Snapshot};
 use crate::query_context::ReadContext;
 use crate::rdf_read::QuadPattern;
 use crate::store::{
-    EncodedQuad, GraphStore, QueryIndexCursorOrder, Result, StoreReadSnapshot, TermId,
+    EncodedQuad, GraphStore, QueryIndexCursorOrder, QueryTermId, Result, StoreReadSnapshot, TermId,
 };
 use crate::validation_delta::DeltaQuadCursor;
 
@@ -46,6 +46,8 @@ pub(crate) struct RawQuadCandidate {
     pub(crate) live: bool,
     pub(crate) storage: CandidateStorage,
     pub(crate) bytes_read: u64,
+    pub(crate) key_fields_extracted: u8,
+    pub(crate) encoded_quad_constructed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +55,122 @@ pub(crate) enum CandidateStorage {
     Source,
     QueryIndex,
     Delta,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RawQueryIndexKey {
+    bytes: [u8; 32],
+    order: QueryIndexCursorOrder,
+    pub(crate) bytes_read: u64,
+}
+
+impl RawQueryIndexKey {
+    fn term_at(self, index: usize) -> QueryTermId {
+        QueryTermId(u64::from_be_bytes(
+            self.bytes[index * 8..(index + 1) * 8]
+                .try_into()
+                .expect("query-index term slices are eight bytes"),
+        ))
+    }
+
+    pub(crate) fn graph(self) -> QueryTermId {
+        self.term_at(match self.order {
+            QueryIndexCursorOrder::Gspo
+            | QueryIndexCursorOrder::Gpos
+            | QueryIndexCursorOrder::Gosp => 0,
+            QueryIndexCursorOrder::Spog
+            | QueryIndexCursorOrder::Posg
+            | QueryIndexCursorOrder::Ospg => 3,
+        })
+    }
+
+    pub(crate) fn subject(self) -> QueryTermId {
+        self.term_at(match self.order {
+            QueryIndexCursorOrder::Gspo | QueryIndexCursorOrder::Ospg => 1,
+            QueryIndexCursorOrder::Gpos => 3,
+            QueryIndexCursorOrder::Spog => 0,
+            QueryIndexCursorOrder::Posg | QueryIndexCursorOrder::Gosp => 2,
+        })
+    }
+
+    pub(crate) fn predicate(self) -> QueryTermId {
+        self.term_at(match self.order {
+            QueryIndexCursorOrder::Gspo | QueryIndexCursorOrder::Ospg => 2,
+            QueryIndexCursorOrder::Gpos | QueryIndexCursorOrder::Spog => 1,
+            QueryIndexCursorOrder::Posg => 0,
+            QueryIndexCursorOrder::Gosp => 3,
+        })
+    }
+
+    pub(crate) fn object(self) -> QueryTermId {
+        self.term_at(match self.order {
+            QueryIndexCursorOrder::Gspo => 3,
+            QueryIndexCursorOrder::Gpos | QueryIndexCursorOrder::Spog => 2,
+            QueryIndexCursorOrder::Posg | QueryIndexCursorOrder::Gosp => 1,
+            QueryIndexCursorOrder::Ospg => 0,
+        })
+    }
+}
+
+pub(crate) struct RawQueryIndexKeyCursor {
+    snapshot: Snapshot,
+    query_to_term: Keyspace,
+    iterator: fjall::Iter,
+    order: QueryIndexCursorOrder,
+}
+
+impl RawQueryIndexKeyCursor {
+    pub(crate) fn new(
+        snapshot: Snapshot,
+        keyspace: &Keyspace,
+        query_to_term: &Keyspace,
+        order: QueryIndexCursorOrder,
+        prefix: Vec<u8>,
+    ) -> Self {
+        let iterator = if prefix.is_empty() {
+            snapshot.iter(keyspace)
+        } else {
+            snapshot.prefix(keyspace, prefix)
+        };
+        Self {
+            snapshot,
+            query_to_term: query_to_term.clone(),
+            iterator,
+            order,
+        }
+    }
+
+    pub(crate) fn next_key(&mut self) -> Option<Result<RawQueryIndexKey>> {
+        let guard = self.iterator.next()?;
+        let (key, value) = match guard.into_inner() {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error.into())),
+        };
+        if !value.as_ref().is_empty() {
+            return Some(Err(crate::store::StoreError::InvalidQueryIndexEncoding {
+                context: "qv2 query index value",
+                message: format!("expected empty value, found {} bytes", value.len()),
+            }));
+        }
+        let bytes = match <[u8; 32]>::try_from(key.as_ref()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Some(Err(crate::store::StoreError::InvalidQueryIndexEncoding {
+                    context: "qv2 query index key",
+                    message: format!("expected 32 bytes, found {}", key.len()),
+                }));
+            }
+        };
+        Some(Ok(RawQueryIndexKey {
+            bytes,
+            order: self.order,
+            bytes_read: (key.len() + value.len()) as u64,
+        }))
+    }
+
+    pub(crate) fn source_term(&self, term: QueryTermId) -> Result<TermId> {
+        GraphStore::decode_query_source_term(&self.snapshot, &self.query_to_term, term)
+    }
 }
 
 /// Lazy source cursor. It owns either a Fjall snapshot or a copy-on-write
@@ -173,6 +291,8 @@ impl RawQuadCursor {
                     live: GraphStore::quad_value_is_live(value.as_ref()),
                     storage: CandidateStorage::Source,
                     bytes_read: (key.len() + value.len()) as u64,
+                    key_fields_extracted: 4,
+                    encoded_quad_constructed: true,
                 }))
             }
             SourceIterator::QueryIndex {
@@ -214,6 +334,8 @@ impl RawQuadCursor {
                     live: true,
                     storage: CandidateStorage::QueryIndex,
                     bytes_read: (key.len() + value.len()) as u64,
+                    key_fields_extracted: 4,
+                    encoded_quad_constructed: true,
                 }))
             }
             SourceIterator::PredicateObject {
@@ -235,6 +357,8 @@ impl RawQuadCursor {
                     live: true,
                     storage: CandidateStorage::Source,
                     bytes_read: 64,
+                    key_fields_extracted: 1,
+                    encoded_quad_constructed: true,
                 }))
             }
             SourceIterator::Object {
@@ -259,6 +383,8 @@ impl RawQuadCursor {
                     live: true,
                     storage: CandidateStorage::Source,
                     bytes_read: 64,
+                    key_fields_extracted: 2,
+                    encoded_quad_constructed: true,
                 }))
             }
             SourceIterator::Empty => None,
@@ -384,6 +510,11 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
 
     fn account_candidate(&mut self, candidate: &RawQuadCandidate) -> Result<()> {
         self.context.increment_candidate_quads();
+        self.context
+            .record_key_fields_extracted(u64::from(candidate.key_fields_extracted));
+        if candidate.encoded_quad_constructed {
+            self.context.increment_encoded_quad_constructions();
+        }
         match candidate.storage {
             CandidateStorage::Source => self.context.record_source_read(candidate.bytes_read),
             CandidateStorage::QueryIndex => self.context.record_qv_read(candidate.bytes_read),
@@ -537,5 +668,60 @@ pub(crate) fn point_candidate(
         live: GraphStore::quad_value_is_live(value.as_ref()),
         storage: CandidateStorage::Source,
         bytes_read: (64 + value.len()) as u64,
+        key_fields_extracted: 0,
+        encoded_quad_constructed: true,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_query_index_key_extracts_every_order() {
+        let graph = QueryTermId(1);
+        let subject = QueryTermId(2);
+        let predicate = QueryTermId(3);
+        let object = QueryTermId(4);
+        for (order, terms) in [
+            (
+                QueryIndexCursorOrder::Gspo,
+                [graph, subject, predicate, object],
+            ),
+            (
+                QueryIndexCursorOrder::Gpos,
+                [graph, predicate, object, subject],
+            ),
+            (
+                QueryIndexCursorOrder::Spog,
+                [subject, predicate, object, graph],
+            ),
+            (
+                QueryIndexCursorOrder::Posg,
+                [predicate, object, subject, graph],
+            ),
+            (
+                QueryIndexCursorOrder::Ospg,
+                [object, subject, predicate, graph],
+            ),
+            (
+                QueryIndexCursorOrder::Gosp,
+                [graph, object, subject, predicate],
+            ),
+        ] {
+            let mut bytes = [0_u8; 32];
+            for (index, term) in terms.into_iter().enumerate() {
+                bytes[index * 8..(index + 1) * 8].copy_from_slice(&term.0.to_be_bytes());
+            }
+            let key = RawQueryIndexKey {
+                bytes,
+                order,
+                bytes_read: 32,
+            };
+            assert_eq!(key.graph(), graph);
+            assert_eq!(key.subject(), subject);
+            assert_eq!(key.predicate(), predicate);
+            assert_eq!(key.object(), object);
+        }
+    }
 }
