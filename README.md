@@ -164,11 +164,14 @@ SHACL settlement.
 
 `CraqleFastV1` supports node, class, subjects-of, objects-of, and implicit-class
 targets; direct, inverse, sequence, alternative, zero-or-one, zero-or-more,
-and one-or-more paths; and the bounded native constraint set documented in
-[`docs/performance-v1/SHACL_SUPPORT.md`](docs/performance-v1/SHACL_SUPPORT.md).
-It returns one complete report or one error. SHACL-SPARQL, SHACL-JS, SHACL-AF,
-custom components and targets, reifier shapes, RDF-star shapes, remote imports,
-and the other components listed in that support document are not supported.
+and one-or-more paths. Its constraints are min/max count; datatype, node kind,
+class, value and enumeration checks; numeric, string, pattern, and language
+checks; closed shapes; pairwise property checks; nested logical constraints;
+and qualified value constraints. It returns one complete report or one error.
+Local imports are opt-in and version-fenced. SHACL-SPARQL, SHACL-JS, SHACL-AF,
+custom components and targets, reifier shapes, RDF-star shapes, and remote
+imports are unsupported and fail explicitly. Defaults bound reports to 10,000
+results, paths to 1,000,000 edges, and path depth to 128.
 
 Search it with Tantivy-backed full-text search:
 
@@ -183,6 +186,59 @@ Preview and apply a full RO-Crate JSON-LD update:
 let changes = node.preview_rocrate_update(&writer, &graph, updated_jsonld)?;
 let batch = node.apply_rocrate_document(&writer, graph.clone(), updated_jsonld)?;
 ```
+
+With `shacl-core`, a raw document can be parsed once, checked without changing
+the graph, and committed against the same data and shapes version fences:
+
+```rust
+use craqle::{
+    PrepareRoCrateOptions, PreparedCommitMode, RoCratePolicyOptions,
+    ShaclCompileOptions,
+};
+
+let policy = node.compile_rocrate_policy(
+    &writer,
+    &shapes_graph,
+    &ShaclCompileOptions::default(),
+)?;
+let prepared = node.prepare_rocrate_document(
+    &writer,
+    &graph,
+    raw_jsonld,
+    &PrepareRoCrateOptions::default(),
+)?;
+let report = node.evaluate_rocrate_policy(
+    &writer,
+    &prepared,
+    &policy,
+    &RoCratePolicyOptions::default(),
+)?;
+if report.conforms {
+    node.commit_prepared_rocrate_document(
+        &writer,
+        prepared,
+        Some(&policy),
+        PreparedCommitMode::Enforce,
+    )?;
+}
+```
+
+## Accepted performance snapshot
+
+These are retained same-fixture measurements, not promises for every workload.
+The Criterion p95/p99 values used ten samples and are nearest-rank sample
+values, not production tail estimates.
+
+| 1M case | Selected path | Comparison path |
+| --- | ---: | ---: |
+| Predicate-object ASK | Auto 0.263 ms | Forced source 17.612 ms |
+| Predicate-object LIMIT | Auto 0.165 ms | Forced source 16.840 ms |
+| Join | Auto/hash about 2.1 s | Forced lateral about 36.5 s |
+| Native cached SHACL | 9.9x faster than external copy | Zero data-graph copy bytes |
+
+Historical 10M SPARQL rows remain access-path evidence only. No
+current-final-binary 10M SHACL, incremental-validation, or checked-write result
+is claimed; that long run remains deferred until explicitly authorized.
 
 ## Limitations
 
