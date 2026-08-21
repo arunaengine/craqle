@@ -29,6 +29,8 @@ mod query_context;
 #[allow(dead_code)]
 #[path = "internal/query_cursor.rs"]
 mod query_cursor;
+#[path = "internal/query_worker.rs"]
+mod query_worker;
 #[allow(dead_code)]
 #[path = "internal/rdf_read.rs"]
 mod rdf_read;

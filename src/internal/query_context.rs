@@ -279,6 +279,10 @@ impl<'a> ReadContext<'a> {
         Ok(())
     }
 
+    pub(crate) fn cancellation(&self) -> QueryCancellation {
+        self.cancellation.clone()
+    }
+
     pub(crate) fn increment_index_seeks(&self) {
         ReadCounters::increment(&self.counters.index_seeks);
     }
@@ -335,8 +339,17 @@ impl<'a> ReadContext<'a> {
         ReadCounters::add(&self.counters.qv_bytes_read, bytes);
     }
 
+    pub(crate) fn record_qv_reads(&self, count: u64, bytes: u64) {
+        ReadCounters::add(&self.counters.qv_keys_read, count);
+        ReadCounters::add(&self.counters.qv_bytes_read, bytes);
+    }
+
     pub(crate) fn increment_candidate_quads(&self) {
         ReadCounters::increment(&self.counters.candidate_quads);
+    }
+
+    pub(crate) fn record_candidate_quads(&self, count: u64) {
+        ReadCounters::add(&self.counters.candidate_quads, count);
     }
 
     pub(crate) fn increment_matching_quads(&self) {
@@ -359,8 +372,16 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.duplicate_groups);
     }
 
+    pub(crate) fn record_duplicate_groups(&self, count: u64) {
+        ReadCounters::add(&self.counters.duplicate_groups, count);
+    }
+
     pub(crate) fn increment_skipped_copies(&self) {
         ReadCounters::increment(&self.counters.duplicate_copies_skipped);
+    }
+
+    pub(crate) fn record_skipped_copies(&self, count: u64) {
+        ReadCounters::add(&self.counters.duplicate_copies_skipped, count);
     }
 
     pub(crate) fn record_key_fields_extracted(&self, count: u64) {

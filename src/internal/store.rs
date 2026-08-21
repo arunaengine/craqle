@@ -288,7 +288,7 @@ const QUERY_INDEX_PREDICATE_COUNT_TAG: u8 = b'P';
 const QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG: u8 = b'A';
 const QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG: u8 = b'O';
 const QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG: u8 = b'X';
-const QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG: u8 = b'M';
+const QUERY_INDEX_UNION_DUPLICATE_FREE_TAG: u8 = b'U';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StoredQueryIndexState {
@@ -354,19 +354,20 @@ impl QueryIndexHeader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryIndexCounterKey {
     Total,
+    UnionDuplicateFree,
     Graph(QueryTermId),
     Predicate(QueryTermId),
     GraphPredicate(QueryTermId, QueryTermId),
     PredicateObject(QueryTermId, QueryTermId),
     GraphPredicateObject(QueryTermId, QueryTermId, QueryTermId),
-    PredicateMutationEpoch(QueryTermId),
 }
 
 impl QueryIndexCounterKey {
     fn bytes(self) -> Vec<u8> {
         let mut key = match self {
             Self::Total => return QUERY_INDEX_TOTAL_KEY.to_vec(),
-            Self::Graph(_) | Self::Predicate(_) | Self::PredicateMutationEpoch(_) => vec![0; 9],
+            Self::UnionDuplicateFree => return vec![QUERY_INDEX_UNION_DUPLICATE_FREE_TAG],
+            Self::Graph(_) | Self::Predicate(_) => vec![0; 9],
             Self::GraphPredicate(_, _) | Self::PredicateObject(_, _) => vec![0; 17],
             Self::GraphPredicateObject(_, _, _) => vec![0; 25],
         };
@@ -395,11 +396,10 @@ impl QueryIndexCounterKey {
                 key[9..17].copy_from_slice(&predicate.to_be_bytes());
                 key[17..25].copy_from_slice(&object.to_be_bytes());
             }
-            Self::PredicateMutationEpoch(predicate) => {
-                key[0] = QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG;
-                key[1..9].copy_from_slice(&predicate.to_be_bytes());
-            }
             Self::Total => unreachable!("total counter returned before allocating a key"),
+            Self::UnionDuplicateFree => {
+                unreachable!("union proof returned before allocating a key")
+            }
         }
         key
     }
@@ -1557,6 +1557,10 @@ fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Total)
         }
         Some(b'T') => QueryIndexCounterKeyRead::InvalidLength,
+        Some(QUERY_INDEX_UNION_DUPLICATE_FREE_TAG) if bytes.len() == 1 => {
+            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::UnionDuplicateFree)
+        }
+        Some(QUERY_INDEX_UNION_DUPLICATE_FREE_TAG) => QueryIndexCounterKeyRead::InvalidLength,
         Some(QUERY_INDEX_GRAPH_COUNT_TAG) if bytes.len() == 9 => QueryIndexCounterKeyRead::Counter(
             QueryIndexCounterKey::Graph(query_index_term_at(bytes, 1)),
         ),
@@ -1564,11 +1568,6 @@ fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Predicate(query_index_term_at(
                 bytes, 1,
             )))
-        }
-        Some(QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG) if bytes.len() == 9 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::PredicateMutationEpoch(
-                query_index_term_at(bytes, 1),
-            ))
         }
         Some(QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG) if bytes.len() == 17 => {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicate(
@@ -1592,7 +1591,6 @@ fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
         Some(
             QUERY_INDEX_GRAPH_COUNT_TAG
             | QUERY_INDEX_PREDICATE_COUNT_TAG
-            | QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG
             | QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG
             | QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG
             | QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG,
@@ -1807,6 +1805,7 @@ pub(crate) enum QueryIndexCursorOrder {
 pub(crate) struct QueryIndexAdmission {
     pub(crate) trusted: bool,
     pub(crate) query_id_generation: Option<u64>,
+    pub(crate) query_id_upper_bound: Option<u64>,
     pub(crate) fallback_reason: Option<&'static str>,
     pub(crate) header_reads: u64,
     pub(crate) counter_reads: u64,
@@ -1916,6 +1915,7 @@ impl StoreReadSnapshot {
         store: &GraphStore,
         order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
+        query_id_upper_bound: u64,
     ) -> Result<Option<crate::query_cursor::RawQueryIndexKeyCursor>> {
         let resolve = |term: Option<TermId>| -> Result<Option<Option<QueryTermId>>> {
             match term {
@@ -1951,6 +1951,7 @@ impl StoreReadSnapshot {
             order,
             prefix,
             filter,
+            query_id_upper_bound,
         )))
     }
 
@@ -1971,6 +1972,51 @@ impl StoreReadSnapshot {
             return Ok(Some(0));
         };
         self.qv_count(store, QueryIndexCounterKey::Graph(graph), false)
+    }
+
+    pub(crate) fn qv_total_count(&self, store: &GraphStore) -> Result<Option<u64>> {
+        self.qv_count(store, QueryIndexCounterKey::Total, false)
+    }
+
+    pub(crate) fn qv_union_duplicate_free(&self, store: &GraphStore) -> Result<Option<bool>> {
+        Ok(
+            match store.query_index_counter_from_snapshot(
+                &self.snapshot,
+                QueryIndexCounterKey::UnionDuplicateFree,
+            )? {
+                QueryIndexCounterRead::Value(0) => Some(false),
+                QueryIndexCounterRead::Value(1) => Some(true),
+                QueryIndexCounterRead::Missing
+                | QueryIndexCounterRead::Malformed
+                | QueryIndexCounterRead::Value(_) => None,
+            },
+        )
+    }
+
+    pub(crate) fn qv_p_count(&self, store: &GraphStore, predicate: TermId) -> Result<Option<u64>> {
+        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
+            return Ok(Some(0));
+        };
+        self.qv_count(store, QueryIndexCounterKey::Predicate(predicate), true)
+    }
+
+    pub(crate) fn qv_po_count(
+        &self,
+        store: &GraphStore,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<Option<u64>> {
+        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
+            return Ok(Some(0));
+        };
+        let Some(object) = store.query_term_id_from_snapshot(&self.snapshot, object)? else {
+            return Ok(Some(0));
+        };
+        self.qv_count(
+            store,
+            QueryIndexCounterKey::PredicateObject(predicate, object),
+            true,
+        )
     }
 
     pub(crate) fn qv_gp_count(
@@ -2450,6 +2496,7 @@ impl GraphStore {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
                     query_id_generation: None,
+                    query_id_upper_bound: None,
                     fallback_reason: Some("metadata-missing"),
                     header_reads: 1,
                     counter_reads: 0,
@@ -2459,6 +2506,7 @@ impl GraphStore {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
                     query_id_generation: None,
+                    query_id_upper_bound: None,
                     fallback_reason: Some("metadata-malformed"),
                     header_reads: 1,
                     counter_reads: 0,
@@ -2489,6 +2537,7 @@ impl GraphStore {
             return Ok(QueryIndexAdmission {
                 trusted: false,
                 query_id_generation: None,
+                query_id_upper_bound: None,
                 fallback_reason: Some(fallback_reason),
                 header_reads: 1,
                 counter_reads: 0,
@@ -2508,6 +2557,7 @@ impl GraphStore {
         Ok(QueryIndexAdmission {
             trusted,
             query_id_generation: trusted.then_some(header.query_id_generation),
+            query_id_upper_bound: trusted.then_some(header.next_query_id),
             fallback_reason,
             header_reads: 1,
             counter_reads: 1,
@@ -2763,6 +2813,11 @@ impl GraphStore {
                 let mut batch = self.buffered_batch();
                 self.stage_query_index_header(&mut batch, &QueryIndexHeader::empty_ready());
                 batch.insert(&self.qv2_meta, QUERY_INDEX_TOTAL_KEY, 0u64.to_be_bytes());
+                batch.insert(
+                    &self.qv2_meta,
+                    QueryIndexCounterKey::UnionDuplicateFree.bytes(),
+                    1u64.to_be_bytes(),
+                );
                 self.commit_fjall_batch(batch)
             }
             QueryIndexHeaderRead::Malformed => {
@@ -3034,37 +3089,12 @@ impl GraphStore {
         Ok(())
     }
 
-    fn verify_predicate_mutation_epoch(
-        &self,
-        snapshot: &Snapshot,
-        predicate: QueryTermId,
-        source_epoch: Option<u64>,
-        report: &mut QueryIndexVerificationBuilder,
-    ) -> Result<()> {
-        let Some(source_epoch) = source_epoch else {
-            report.problem("mutation-epoch-without-header");
-            return Ok(());
-        };
-        match snapshot.get(
-            &self.qv2_meta,
-            QueryIndexCounterKey::PredicateMutationEpoch(predicate).bytes(),
-        )? {
-            None => report.problem("mutation-epoch-missing"),
-            Some(value) => match decode_query_index_u64(value.as_ref()) {
-                Some(epoch) if epoch != 0 && epoch <= source_epoch => {}
-                _ => report.problem("mutation-epoch-invalid"),
-            },
-        }
-        Ok(())
-    }
-
     fn verify_posg_counter_group(
         &self,
         snapshot: &Snapshot,
         dimension: usize,
         terms: [QueryTermId; 2],
         expected: u64,
-        source_epoch: Option<u64>,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
         let (key, missing_problem, mismatch_problem) = match dimension {
@@ -3087,18 +3117,13 @@ impl GraphStore {
             missing_problem,
             mismatch_problem,
             report,
-        )?;
-        if dimension == 1 {
-            self.verify_predicate_mutation_epoch(snapshot, terms[0], source_epoch, report)?;
-        }
-        Ok(())
+        )
     }
 
     fn verify_posg_counter_dimension(
         &self,
         snapshot: &Snapshot,
         dimension: usize,
-        source_epoch: Option<u64>,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
         let mut current = None::<[QueryTermId; 2]>;
@@ -3112,14 +3137,7 @@ impl GraphStore {
             if let Some(previous) = current
                 && previous[..dimension] != terms[..dimension]
             {
-                self.verify_posg_counter_group(
-                    snapshot,
-                    dimension,
-                    previous,
-                    count,
-                    source_epoch,
-                    report,
-                )?;
+                self.verify_posg_counter_group(snapshot, dimension, previous, count, report)?;
                 count = 0;
             }
             current = Some(terms);
@@ -3130,14 +3148,7 @@ impl GraphStore {
                 ))?;
         }
         if let Some(previous) = current {
-            self.verify_posg_counter_group(
-                snapshot,
-                dimension,
-                previous,
-                count,
-                source_epoch,
-                report,
-            )?;
+            self.verify_posg_counter_group(snapshot, dimension, previous, count, report)?;
         }
         Ok(())
     }
@@ -3151,8 +3162,7 @@ impl GraphStore {
             QueryIndexCounterKey::Graph(graph) => {
                 snapshot.prefix(&self.qv2_gpos, query_index_prefix(&[graph]))
             }
-            QueryIndexCounterKey::Predicate(predicate)
-            | QueryIndexCounterKey::PredicateMutationEpoch(predicate) => {
+            QueryIndexCounterKey::Predicate(predicate) => {
                 snapshot.prefix(&self.qv2_posg, query_index_prefix(&[predicate]))
             }
             QueryIndexCounterKey::GraphPredicate(graph, predicate) => {
@@ -3166,7 +3176,9 @@ impl GraphStore {
                     &self.qv2_gpos,
                     query_index_prefix(&[graph, predicate, object]),
                 ),
-            QueryIndexCounterKey::Total => return Ok(true),
+            QueryIndexCounterKey::Total | QueryIndexCounterKey::UnionDuplicateFree => {
+                return Ok(true);
+            }
         };
         match rows.next() {
             Some(guard) => {
@@ -3185,6 +3197,7 @@ impl GraphStore {
     ) -> Result<()> {
         let mut headers = 0u64;
         let mut totals = 0u64;
+        let mut union_proofs = 0u64;
         for guard in snapshot.iter(&self.qv2_meta) {
             let (key, value) = guard.into_inner()?;
             match decode_query_index_counter_key(key.as_ref()) {
@@ -3218,14 +3231,16 @@ impl GraphStore {
                                 None => report.problem("meta-total-without-header"),
                             }
                         }
-                        QueryIndexCounterKey::PredicateMutationEpoch(_) => {
-                            let source_epoch = header.map(|header| header.source_epoch);
-                            if value == 0 || source_epoch.is_none() || value > source_epoch.unwrap()
+                        QueryIndexCounterKey::UnionDuplicateFree => {
+                            union_proofs = union_proofs.checked_add(1).ok_or(
+                                StoreError::QueryIndexVerificationFailed("metadata-count-overflow"),
+                            )?;
+                            if value > 1 {
+                                report.problem("union-proof-value-invalid");
+                            } else if value == 1
+                                && !self.query_index_union_duplicate_free(snapshot)?
                             {
-                                report.problem("mutation-epoch-invalid");
-                            }
-                            if !self.query_index_counter_has_rows(snapshot, counter)? {
-                                report.problem("meta-counter-orphan");
+                                report.problem("union-proof-mismatch");
                             }
                         }
                         _ => {
@@ -3249,6 +3264,9 @@ impl GraphStore {
         }
         if totals != 1 {
             report.problem("meta-total-count");
+        }
+        if union_proofs != 1 {
+            report.problem("union-proof-count");
         }
         Ok(())
     }
@@ -3403,9 +3421,8 @@ impl GraphStore {
             self.verify_gpos_counter_dimension(snapshot, 1, &mut report)?;
             self.verify_gpos_counter_dimension(snapshot, 2, &mut report)?;
             self.verify_gpos_counter_dimension(snapshot, 3, &mut report)?;
-            let source_epoch = header.map(|header| header.source_epoch);
-            self.verify_posg_counter_dimension(snapshot, 1, source_epoch, &mut report)?;
-            self.verify_posg_counter_dimension(snapshot, 2, source_epoch, &mut report)?;
+            self.verify_posg_counter_dimension(snapshot, 1, &mut report)?;
+            self.verify_posg_counter_dimension(snapshot, 2, &mut report)?;
             self.verify_query_index_meta_records(snapshot, header, &mut report)?;
             self.verify_query_id_mappings(snapshot, header, &mut report)?;
         }
@@ -3666,11 +3683,9 @@ impl GraphStore {
     fn build_query_index_chunk(
         &self,
         quads: &[EncodedQuad],
-        source_epoch: u64,
         next_query_id: &mut u64,
     ) -> Result<()> {
         let mut increments = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, u64)>::new();
-        let mut predicates = BTreeSet::new();
         let mut allocated = HashMap::new();
         let mut batch = self.buffered_batch();
         for quad in quads {
@@ -3710,7 +3725,6 @@ impl GraphStore {
             ] {
                 batch.insert(keyspace, key, Vec::<u8>::new());
             }
-            predicates.insert(quad.predicate);
             for counter in query_index_live_counter_keys(quad) {
                 let entry = increments.entry(counter.bytes()).or_insert((counter, 0));
                 entry.1 =
@@ -3737,17 +3751,10 @@ impl GraphStore {
                     ))?;
             batch.insert(&self.qv2_meta, counter.bytes(), next.to_be_bytes());
         }
-        for predicate in predicates {
-            batch.insert(
-                &self.qv2_meta,
-                QueryIndexCounterKey::PredicateMutationEpoch(predicate).bytes(),
-                source_epoch.to_be_bytes(),
-            );
-        }
         self.commit_fjall_batch(batch)
     }
 
-    fn build_query_index_rows(&self, snapshot: &Snapshot, source_epoch: u64) -> Result<(u64, u64)> {
+    fn build_query_index_rows(&self, snapshot: &Snapshot) -> Result<(u64, u64)> {
         let mut rows = 0u64;
         let mut next_query_id = 0u64;
         let mut chunk = Vec::with_capacity(QUERY_INDEX_BUILD_CHUNK_ROWS);
@@ -3766,14 +3773,30 @@ impl GraphStore {
                 ))?;
             chunk.push(quad);
             if chunk.len() == QUERY_INDEX_BUILD_CHUNK_ROWS {
-                self.build_query_index_chunk(&chunk, source_epoch, &mut next_query_id)?;
+                self.build_query_index_chunk(&chunk, &mut next_query_id)?;
                 chunk.clear();
             }
         }
         if !chunk.is_empty() {
-            self.build_query_index_chunk(&chunk, source_epoch, &mut next_query_id)?;
+            self.build_query_index_chunk(&chunk, &mut next_query_id)?;
         }
         Ok((rows, next_query_id))
+    }
+
+    fn query_index_union_duplicate_free(&self, snapshot: &Snapshot) -> Result<bool> {
+        let mut previous = None;
+        for guard in snapshot.iter(&self.qv2_spog) {
+            let (key, _) = guard.into_inner()?;
+            let quad = decode_qv2_spog_key(key.as_ref()).ok_or(
+                StoreError::QueryIndexVerificationFailed("union-proof-row-malformed"),
+            )?;
+            let current = (quad.subject, quad.predicate, quad.object);
+            if previous == Some(current) {
+                return Ok(false);
+            }
+            previous = Some(current);
+        }
+        Ok(true)
     }
 
     fn mark_query_index_rebuild_failed(&self, reason: &'static str) -> Result<()> {
@@ -3827,7 +3850,9 @@ impl GraphStore {
                 .and_then(|header| header.query_id_generation.checked_add(1))
                 .unwrap_or(1);
             let (source_live_quads, next_query_id) =
-                self.build_query_index_rows(&source_snapshot, source_epoch)?;
+                self.build_query_index_rows(&source_snapshot)?;
+            let union_duplicate_free =
+                self.query_index_union_duplicate_free(&self.db.snapshot())?;
             let candidate = QueryIndexHeader {
                 state: StoredQueryIndexState::Building,
                 source_epoch,
@@ -3844,6 +3869,11 @@ impl GraphStore {
                     &self.qv2_meta,
                     QUERY_INDEX_TOTAL_KEY,
                     source_live_quads.to_be_bytes(),
+                );
+                batch.insert(
+                    &self.qv2_meta,
+                    QueryIndexCounterKey::UnionDuplicateFree.bytes(),
+                    u64::from(union_duplicate_free).to_be_bytes(),
                 );
                 self.stage_query_index_header(&mut batch, &candidate);
                 self.commit_fjall_batch(batch)?;
@@ -4078,11 +4108,93 @@ impl GraphStore {
         Ok(Some(query))
     }
 
+    fn insertions_preserve_union_uniqueness(
+        transitions: &[(QueryQuad, bool)],
+        new_terms: &HashSet<QueryTermId>,
+        source_terms: &HashMap<QueryTermId, TermId>,
+        derived: Option<&DerivedIndexState>,
+    ) -> bool {
+        let mut inserted = BTreeSet::new();
+        for (quad, is_live) in transitions {
+            if !is_live {
+                continue;
+            }
+            let spo = (quad.subject, quad.predicate, quad.object);
+            if !inserted.insert(spo) {
+                return false;
+            }
+            if new_terms.contains(&quad.subject)
+                || new_terms.contains(&quad.predicate)
+                || new_terms.contains(&quad.object)
+            {
+                continue;
+            }
+            let Some(derived) = derived else {
+                return false;
+            };
+            let Some(subject) = source_terms.get(&quad.subject) else {
+                return false;
+            };
+            let Some(expected_predicate) = source_terms.get(&quad.predicate) else {
+                return false;
+            };
+            let Some(expected_object) = source_terms.get(&quad.object) else {
+                return false;
+            };
+            if derived.by_subject.get(subject).is_some_and(|entries| {
+                entries.iter().any(|(predicate, object, _)| {
+                    predicate == expected_predicate && object == expected_object
+                })
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn single_transition_preserves_union_uniqueness(
+        transition: (QueryQuad, bool),
+        mappings: &[(TermId, QueryTermId)],
+        resolved: &HashMap<TermId, QueryTermId>,
+        derived: Option<&DerivedIndexState>,
+    ) -> bool {
+        let (quad, is_live) = transition;
+        if !is_live {
+            return true;
+        }
+        if mappings.iter().any(|(_, query)| {
+            *query == quad.subject || *query == quad.predicate || *query == quad.object
+        }) {
+            return true;
+        }
+        let source = |query| {
+            resolved
+                .iter()
+                .find_map(|(term, current)| (*current == query).then_some(*term))
+        };
+        let (Some(subject), Some(predicate), Some(object), Some(derived)) = (
+            source(quad.subject),
+            source(quad.predicate),
+            source(quad.object),
+            derived,
+        ) else {
+            return false;
+        };
+        !derived.by_subject.get(&subject).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|(current_predicate, current_object, _)| {
+                    *current_predicate == predicate && *current_object == object
+                })
+        })
+    }
+
     fn plan_ready_query_index_maintenance(
         &self,
         snapshot: &Snapshot,
         header: &QueryIndexHeader,
         transitions: Vec<NetQuadTransition>,
+        derived: Option<&DerivedIndexState>,
     ) -> Result<Option<QueryIndexMaintenancePlan>> {
         let total =
             match self.query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::Total)? {
@@ -4178,11 +4290,40 @@ impl GraphStore {
             }));
         }
 
+        let union_duplicate_free = match self
+            .query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::UnionDuplicateFree)?
+        {
+            QueryIndexCounterRead::Value(0) => false,
+            QueryIndexCounterRead::Value(1) => true,
+            QueryIndexCounterRead::Missing
+            | QueryIndexCounterRead::Malformed
+            | QueryIndexCounterRead::Value(_) => return Ok(None),
+        };
+        let union_uniqueness_preserved = !union_duplicate_free
+            || if let [transition] = query_transitions.as_slice() {
+                Self::single_transition_preserves_union_uniqueness(
+                    *transition,
+                    &mappings,
+                    &resolved,
+                    derived,
+                )
+            } else {
+                let new_terms = mappings.iter().map(|(_, query)| *query).collect();
+                let source_terms = resolved
+                    .iter()
+                    .map(|(term, query)| (*query, *term))
+                    .collect();
+                Self::insertions_preserve_union_uniqueness(
+                    &query_transitions,
+                    &new_terms,
+                    &source_terms,
+                    derived,
+                )
+            };
+
         let mut deltas = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, i128)>::new();
-        let mut touched_predicates = BTreeSet::new();
         for (quad, is_live) in &query_transitions {
             let delta = if *is_live { 1 } else { -1 };
-            touched_predicates.insert(quad.predicate);
             for counter in query_index_live_counter_keys(*quad) {
                 let entry = deltas.entry(counter.bytes()).or_insert((counter, 0));
                 let Some(next) = entry.1.checked_add(delta) else {
@@ -4192,9 +4333,8 @@ impl GraphStore {
             }
         }
 
-        let mut current_values = BTreeMap::<Vec<u8>, u64>::new();
-        let mut counters = Vec::with_capacity(deltas.len() + touched_predicates.len());
-        for (bytes, (counter, delta)) in &deltas {
+        let mut counters = Vec::with_capacity(deltas.len() + 1);
+        for (counter, delta) in deltas.values() {
             let has_rows = !matches!(counter, QueryIndexCounterKey::Total)
                 && self.query_index_counter_has_rows(snapshot, *counter)?;
             let current = match self.query_index_counter_from_snapshot(snapshot, *counter)? {
@@ -4216,7 +4356,6 @@ impl GraphStore {
                 | QueryIndexCounterRead::Malformed
                 | QueryIndexCounterRead::Value(_) => return Ok(None),
             };
-            current_values.insert(bytes.clone(), current);
             let Some(next) = Self::adjusted_query_index_counter(current, *delta) else {
                 return Ok(None);
             };
@@ -4227,6 +4366,12 @@ impl GraphStore {
                 } else {
                     None
                 },
+            });
+        }
+        if union_duplicate_free && !union_uniqueness_preserved {
+            counters.push(QueryIndexCounterUpdate {
+                key: QueryIndexCounterKey::UnionDuplicateFree,
+                value: Some(0),
             });
         }
 
@@ -4247,39 +4392,6 @@ impl GraphStore {
         let Some(source_epoch) = header.source_epoch.checked_add(1) else {
             return Ok(None);
         };
-
-        for predicate in touched_predicates {
-            let predicate_counter = QueryIndexCounterKey::Predicate(predicate);
-            let predicate_bytes = predicate_counter.bytes();
-            let Some(previous_predicate_rows) = current_values.get(&predicate_bytes).copied()
-            else {
-                return Ok(None);
-            };
-            match self.query_index_counter_from_snapshot(
-                snapshot,
-                QueryIndexCounterKey::PredicateMutationEpoch(predicate),
-            )? {
-                QueryIndexCounterRead::Value(epoch)
-                    if previous_predicate_rows != 0
-                        && epoch != 0
-                        && epoch <= header.source_epoch => {}
-                QueryIndexCounterRead::Missing if previous_predicate_rows == 0 => {}
-                QueryIndexCounterRead::Missing
-                | QueryIndexCounterRead::Malformed
-                | QueryIndexCounterRead::Value(_) => return Ok(None),
-            }
-            let Some(predicate_update) = counters
-                .iter()
-                .find(|update| update.key == predicate_counter)
-            else {
-                return Ok(None);
-            };
-            let next_predicate_rows = predicate_update.value.unwrap_or(0);
-            counters.push(QueryIndexCounterUpdate {
-                key: QueryIndexCounterKey::PredicateMutationEpoch(predicate),
-                value: (next_predicate_rows != 0).then_some(source_epoch),
-            });
-        }
 
         let Some(updated_total) = counters
             .iter()
@@ -4362,6 +4474,7 @@ impl GraphStore {
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         publish: &PendingPublish,
+        indexes: &IndexState,
     ) -> Result<()> {
         let snapshot = self.db.snapshot();
         match self.query_index_header_from_snapshot(&snapshot)? {
@@ -4388,6 +4501,7 @@ impl GraphStore {
                         &snapshot,
                         &header,
                         transitions,
+                        indexes.derived.as_ref(),
                     )? {
                         Some(plan) => self.stage_query_index_maintenance_plan(batch, plan),
                         None => self.stage_query_index_failed(
@@ -4413,7 +4527,7 @@ impl GraphStore {
         publish: &PendingPublish,
     ) -> Result<bool> {
         let mut indexes = self.indexes_write();
-        self.stage_query_index_maintenance(&mut commit.batch, publish)?;
+        self.stage_query_index_maintenance(&mut commit.batch, publish, &indexes)?;
         self.commit_durable(commit)?;
         #[cfg(test)]
         self.stall_after_commit();
@@ -8432,7 +8546,54 @@ mod tests {
     }
 
     #[test]
-    fn query_index_tracks_exact_dimensions_and_removes_last_predicate_epoch() {
+    fn query_index_union_duplicate_proof_falls_back_and_rebuilds() {
+        let (_dir, store) = setup_store();
+        let first_graph = GraphId::new("urn:test:qv:union-proof:first");
+        let second_graph = GraphId::new("urn:test:qv:union-proof:second");
+        store.create_graph(&first_graph).unwrap();
+        store.create_graph(&second_graph).unwrap();
+        let first = encode_quad(
+            &store,
+            &first_graph,
+            ("urn:test:s", "urn:test:p", "urn:test:o"),
+        );
+        let second = encode_quad(
+            &store,
+            &second_graph,
+            ("urn:test:s", "urn:test:p", "urn:test:o"),
+        );
+
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            Some(1)
+        );
+        commit_add(&store, &first_graph, first);
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            Some(1)
+        );
+        commit_add(&store, &second_graph, second);
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            Some(0)
+        );
+
+        let clock = store.get_vector_clock(&second_graph).unwrap();
+        commit_remove(&store, &second_graph, second, &clock);
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            Some(0)
+        );
+        store.rebuild_query_indexes().unwrap();
+        assert_eq!(
+            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            Some(1)
+        );
+        assert_query_index_ready(&store, 1);
+    }
+
+    #[test]
+    fn query_index_tracks_exact_dimensions_and_removes_zero_counters() {
         let (_dir, store) = setup_store();
         let graph_one = GraphId::new("urn:test:qv:counters:one");
         let graph_two = GraphId::new("urn:test:qv:counters:two");
@@ -8506,14 +8667,6 @@ mod tests {
             ),
             Some(2)
         );
-        assert_eq!(
-            query_index_counter_for_test(
-                &store,
-                QueryIndexCounterKey::PredicateMutationEpoch(one_query.predicate)
-            ),
-            Some(query_index_header_for_test(&store).source_epoch)
-        );
-
         let mut witnessed = VectorClock::new();
         witnessed.advance(three_dot.actor, three_dot.counter);
         commit_remove(&store, &graph_one, three, &witnessed);
@@ -8527,7 +8680,6 @@ mod tests {
                 three_query.predicate,
                 three_query.object,
             ),
-            QueryIndexCounterKey::PredicateMutationEpoch(three_query.predicate),
         ] {
             assert_eq!(query_index_counter_for_test(&store, key), None);
         }
@@ -8564,7 +8716,6 @@ mod tests {
                 query_quad.predicate,
                 query_quad.object,
             ),
-            QueryIndexCounterKey::PredicateMutationEpoch(query_quad.predicate),
         ] {
             assert_eq!(query_index_counter_for_test(&store, key), None);
         }

@@ -274,8 +274,14 @@ impl<'store> StoreReadView<'store> {
         }
         context.record_access_path(path);
         context.increment_index_seeks();
-        self.snapshot
-            .query_index_key_cursor(self.store, Self::qv_order(path), pattern)
+        self.snapshot.query_index_key_cursor(
+            self.store,
+            Self::qv_order(path),
+            pattern,
+            admission
+                .query_id_upper_bound
+                .expect("trusted query index has a dense-ID upper bound"),
+        )
     }
 
     pub(crate) fn orphaned_ids(
@@ -328,6 +334,50 @@ impl<'store> StoreReadView<'store> {
         }
         context.record_qv_meta();
         self.snapshot.qv_g_count(self.store, graph)
+    }
+
+    pub(crate) fn qv_total_count(&self, context: &ReadContext<'_>) -> Result<Option<u64>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot.qv_total_count(self.store)
+    }
+
+    pub(crate) fn qv_union_duplicate_free(
+        &self,
+        context: &ReadContext<'_>,
+    ) -> Result<Option<bool>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot.qv_union_duplicate_free(self.store)
+    }
+
+    pub(crate) fn qv_p_count(
+        &self,
+        context: &ReadContext<'_>,
+        predicate: TermId,
+    ) -> Result<Option<u64>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot.qv_p_count(self.store, predicate)
+    }
+
+    pub(crate) fn qv_po_count(
+        &self,
+        context: &ReadContext<'_>,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<Option<u64>> {
+        if !self.qv_ready(context)? {
+            return Ok(None);
+        }
+        context.record_qv_meta();
+        self.snapshot.qv_po_count(self.store, predicate, object)
     }
 
     pub(crate) fn qv_gp_count(

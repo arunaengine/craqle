@@ -708,6 +708,7 @@ dependencies = [
  "oxsdatatypes",
  "postcard",
  "proptest",
+ "rayon",
  "regex",
  "ro-crate-rs",
  "rudof_iri",

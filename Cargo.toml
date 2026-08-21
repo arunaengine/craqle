@@ -36,6 +36,7 @@ anyhow = "1.0.104"
 globset = "0.4.20"
 tracing = "0.1.44"
 tokio = "1.53.1"
+rayon = "1.11.0"
 
 # RO-Crate implementation
 rocraters = { package = "ro-crate-rs", git = "https://github.com/arunaengine/ro-crate-rs.git", rev = "d60e99123d6e73d7730717ef30ce546da84e1177", features = [
@@ -95,6 +96,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

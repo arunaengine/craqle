@@ -379,6 +379,47 @@ fn count_fast_path_matches_every_triple_binding_shape() {
 }
 
 #[test]
+fn duplicate_free_union_count_uses_exact_graph_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let first = GraphId::new("urn:test:fast:union-meta:first");
+    let second = GraphId::new("urn:test:fast:union-meta:second");
+    node.apply_changes_unchecked(
+        &first,
+        vec![insert(&first, "urn:s:first", "urn:p", iri("urn:o:first"))],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &second,
+        vec![insert(
+            &second,
+            "urn:s:second",
+            "urn:p",
+            iri("urn:o:second"),
+        )],
+    )
+    .unwrap();
+    let graphs = vec![first.clone(), second.clone()];
+    let query = "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o }";
+
+    let exact = run(&node, &graphs, query, QueryFastPathMode::Auto);
+    let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+    assert_eq!(exact.results, generic.results);
+    assert_eq!(exact.statistics.qv_keys_read, 0);
+    assert_eq!(exact.statistics.encoded_quad_constructions, 0);
+
+    node.apply_changes_unchecked(
+        &second,
+        vec![insert(&second, "urn:s:first", "urn:p", iri("urn:o:first"))],
+    )
+    .unwrap();
+    let grouped = run(&node, &graphs, query, QueryFastPathMode::Auto);
+    let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+    assert_eq!(grouped.results, generic.results);
+    assert!(grouped.statistics.qv_keys_read > 0);
+}
+
+#[test]
 fn subject_star_count_preserves_multiplicity() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();

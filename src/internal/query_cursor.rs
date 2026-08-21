@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 
 use fjall::{Keyspace, Readable, Snapshot};
@@ -163,10 +163,13 @@ impl RawQueryIndexKey {
 
 pub(crate) struct RawQueryIndexKeyCursor {
     snapshot: Snapshot,
+    keyspace: Keyspace,
     query_to_term: Keyspace,
     iterator: fjall::Iter,
     order: QueryIndexCursorOrder,
+    prefix: Vec<u8>,
     pattern: RawQueryIndexPattern,
+    query_id_upper_bound: u64,
 }
 
 impl RawQueryIndexKeyCursor {
@@ -177,19 +180,84 @@ impl RawQueryIndexKeyCursor {
         order: QueryIndexCursorOrder,
         prefix: Vec<u8>,
         pattern: RawQueryIndexPattern,
+        query_id_upper_bound: u64,
     ) -> Self {
         let iterator = if prefix.is_empty() {
             snapshot.iter(keyspace)
         } else {
-            snapshot.prefix(keyspace, prefix)
+            snapshot.prefix(keyspace, &prefix)
         };
         Self {
             snapshot,
+            keyspace: keyspace.clone(),
             query_to_term: query_to_term.clone(),
             iterator,
             order,
+            prefix,
             pattern,
+            query_id_upper_bound,
         }
+    }
+
+    pub(crate) fn into_scalar_partitions(
+        self,
+        count: usize,
+    ) -> std::result::Result<Vec<Self>, Box<Self>> {
+        let prefix_terms = self.prefix.len() / 8;
+        let columns = match self.order {
+            QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
+            QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
+            QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
+            QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
+            QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
+            QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+        };
+        if count < 2
+            || prefix_terms >= columns.len()
+            || columns[prefix_terms] == 0
+            || self.query_id_upper_bound < 2
+        {
+            return Err(Box::new(self));
+        }
+
+        let Self {
+            snapshot,
+            keyspace,
+            query_to_term,
+            iterator: _,
+            order,
+            prefix,
+            pattern,
+            query_id_upper_bound,
+        } = self;
+        let count = count.min(usize::try_from(query_id_upper_bound).unwrap_or(count));
+        let width = query_id_upper_bound.div_ceil(count as u64);
+        Ok((0..count)
+            .filter_map(|partition| {
+                let start = (partition as u64).saturating_mul(width);
+                if start >= query_id_upper_bound {
+                    return None;
+                }
+                let end = ((partition + 1) as u64)
+                    .saturating_mul(width)
+                    .min(query_id_upper_bound);
+                let mut lower = prefix.clone();
+                lower.extend_from_slice(&start.to_be_bytes());
+                let mut upper = prefix.clone();
+                upper.extend_from_slice(&end.to_be_bytes());
+                let iterator = snapshot.range(&keyspace, (Included(lower), Excluded(upper)));
+                Some(Self {
+                    snapshot: snapshot.clone(),
+                    keyspace: keyspace.clone(),
+                    query_to_term: query_to_term.clone(),
+                    iterator,
+                    order,
+                    prefix: prefix.clone(),
+                    pattern,
+                    query_id_upper_bound,
+                })
+            })
+            .collect())
     }
 
     pub(crate) fn next_key(&mut self) -> Option<Result<RawQueryIndexKey>> {

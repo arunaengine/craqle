@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::count_plan::CountValueDomain;
 use crate::query_context::ReadContext;
@@ -8,7 +9,12 @@ use crate::sparql::{Result, SparqlError};
 use crate::store::{QueryTermId, TermId};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
+#[cfg(not(test))]
+const PARALLEL_COUNT_MIN_ROWS: u64 = 65_536;
+#[cfg(test)]
+const PARALLEL_COUNT_MIN_ROWS: u64 = 32;
 type GraphOrphanCache = HashMap<QueryTermId, Option<Rc<HashSet<TermId>>>>;
+type ParallelGraphOrphanCache = Arc<HashMap<QueryTermId, Option<Arc<HashSet<TermId>>>>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ScalarCount(u64);
@@ -122,7 +128,20 @@ pub(crate) fn single_pattern_count(
     {
         return Ok(Some(count));
     }
+    if matches!(domain, CountValueDomain::Scalar)
+        && matches!(selector, GraphSelector::DefaultUnion)
+        && let Some(count) = exact_default_union_count(view, context, pattern)?
+    {
+        return Ok(Some(count));
+    }
 
+    let parallel_rows = if matches!(selector, GraphSelector::DefaultUnion)
+        && matches!(domain, CountValueDomain::Scalar)
+    {
+        raw_row_estimate(view, context, pattern)?
+    } else {
+        None
+    };
     let Some(mut cursor) = view.raw_query_index_keys(context, selector, pattern)? else {
         return Ok(None);
     };
@@ -182,8 +201,74 @@ pub(crate) fn single_pattern_count(
                 CountValueDomain::Object => objects.finish(),
             }))
         }
-        GraphSelector::DefaultUnion => default_union_count(view, context, &mut cursor, domain),
+        GraphSelector::DefaultUnion => {
+            if parallel_rows.is_some_and(|rows| rows >= PARALLEL_COUNT_MIN_ROWS) {
+                let workers = crate::query_worker::worker_count();
+                match cursor.into_scalar_partitions(workers) {
+                    Ok(partitions) => {
+                        return parallel_default_union_count(view, context, partitions);
+                    }
+                    Err(original) => cursor = *original,
+                }
+            }
+            default_union_count(view, context, &mut cursor, domain)
+        }
         GraphSelector::Union => Ok(None),
+    }
+}
+
+fn exact_default_union_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    pattern: QuadPattern,
+) -> Result<Option<ScalarCount>> {
+    if pattern.subject.is_some()
+        || (pattern.predicate.is_none() && pattern.object.is_some())
+        || view.qv_union_duplicate_free(context)? != Some(true)
+    {
+        return Ok(None);
+    }
+
+    let mut count = ScalarCount::default();
+    for graph in view.graph_term_id_iter() {
+        context.check_cancelled()?;
+        let graph = graph?;
+        if !view.graph_is_visible(context, graph)? {
+            continue;
+        }
+        if !view.orphaned_ids(context, graph)?.is_empty() {
+            return Ok(None);
+        }
+        let graph_count = match (pattern.predicate, pattern.object) {
+            (Some(predicate), Some(object)) => {
+                view.qv_gpo_count(context, graph, predicate, object)?
+            }
+            (Some(predicate), None) => view.qv_gp_count(context, graph, predicate)?,
+            (None, None) => view.qv_g_count(context, graph)?,
+            (None, Some(_)) => unreachable!("object-only patterns returned above"),
+        };
+        let Some(graph_count) = graph_count else {
+            return Ok(None);
+        };
+        count.add(graph_count)?;
+    }
+    context.record_matching_quads(count.get());
+    Ok(Some(count))
+}
+
+fn raw_row_estimate(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    pattern: QuadPattern,
+) -> Result<Option<u64>> {
+    if pattern.subject.is_some() {
+        return Ok(None);
+    }
+    match (pattern.predicate, pattern.object) {
+        (Some(predicate), Some(object)) => Ok(view.qv_po_count(context, predicate, object)?),
+        (Some(predicate), None) => Ok(view.qv_p_count(context, predicate)?),
+        (None, None) => Ok(view.qv_total_count(context)?),
+        (None, Some(_)) => Ok(None),
     }
 }
 
@@ -673,6 +758,130 @@ fn default_union_count(
         CountValueDomain::Subject => subjects.finish(),
         CountValueDomain::Object => objects.finish(),
     }))
+}
+
+#[derive(Default)]
+struct ParallelCountWork {
+    count: ScalarCount,
+    qv_keys: u64,
+    qv_bytes: u64,
+    candidate_quads: u64,
+    matching_quads: u64,
+    duplicate_groups: u64,
+    skipped_copies: u64,
+    key_fields_extracted: u64,
+}
+
+fn parallel_default_union_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    partitions: Vec<crate::query_cursor::RawQueryIndexKeyCursor>,
+) -> Result<Option<ScalarCount>> {
+    let graph_cache = parallel_graph_cache(view, context)?;
+    let cancellation = context.cancellation();
+    let results = crate::query_worker::map_ordered(partitions, |cursor| {
+        count_default_union_partition(cursor, &graph_cache, &cancellation)
+    })?;
+
+    let mut count = ScalarCount::default();
+    for result in results {
+        count.add(result.count.get())?;
+        context.record_qv_reads(result.qv_keys, result.qv_bytes);
+        context.record_candidate_quads(result.candidate_quads);
+        context.record_matching_quads(result.matching_quads);
+        context.record_duplicate_groups(result.duplicate_groups);
+        context.record_skipped_copies(result.skipped_copies);
+        context.record_key_fields_extracted(result.key_fields_extracted);
+    }
+    Ok(Some(count))
+}
+
+fn parallel_graph_cache(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+) -> Result<ParallelGraphOrphanCache> {
+    let mut cache = HashMap::new();
+    for graph in view.graph_term_id_iter() {
+        context.check_cancelled()?;
+        let graph = graph?;
+        let Some(query_graph) = view.query_term_id(context, graph)? else {
+            continue;
+        };
+        let orphaned = if view.graph_is_visible(context, graph)? {
+            Some(Arc::new((*view.orphaned_ids(context, graph)?).clone()))
+        } else {
+            None
+        };
+        cache.insert(query_graph, orphaned);
+    }
+    Ok(Arc::new(cache))
+}
+
+fn count_default_union_partition(
+    mut cursor: crate::query_cursor::RawQueryIndexKeyCursor,
+    graph_cache: &ParallelGraphOrphanCache,
+    cancellation: &crate::query_context::QueryCancellation,
+) -> Result<ParallelCountWork> {
+    let mut result = ParallelCountWork::default();
+    let mut current_group = None;
+    let mut group_emitted = false;
+    let mut work = 0usize;
+    while let Some(key) = cursor.next_key() {
+        let key = key?;
+        result.qv_keys = result.qv_keys.saturating_add(1);
+        result.qv_bytes = result.qv_bytes.saturating_add(key.bytes_read);
+        result.candidate_quads = result.candidate_quads.saturating_add(1);
+        work += 1;
+        if work == CANCELLATION_CHECK_INTERVAL {
+            work = 0;
+            if cancellation.is_cancelled() {
+                return Err(SparqlError::Cancelled);
+            }
+        }
+        let (matches, extracted) = cursor.matches(key);
+        result.key_fields_extracted = result.key_fields_extracted.saturating_add(extracted);
+        if !matches {
+            continue;
+        }
+
+        result.key_fields_extracted = result.key_fields_extracted.saturating_add(3);
+        let subject = key.subject();
+        let object = key.object();
+        let group = (subject, key.predicate(), object);
+        if current_group != Some(group) {
+            current_group = Some(group);
+            group_emitted = false;
+            result.duplicate_groups = result.duplicate_groups.saturating_add(1);
+        } else if group_emitted {
+            result.skipped_copies = result.skipped_copies.saturating_add(1);
+            continue;
+        }
+
+        result.key_fields_extracted = result.key_fields_extracted.saturating_add(1);
+        let orphaned = graph_cache.get(&key.graph()).ok_or_else(|| {
+            crate::store::StoreError::InvalidQueryIndexEncoding {
+                context: "qv2 graph mapping",
+                message: "query index row references an unknown graph".to_owned(),
+            }
+        })?;
+        let Some(orphaned) = orphaned else {
+            continue;
+        };
+        if !orphaned.is_empty()
+            && (orphaned.contains(&cursor.source_term(subject)?)
+                || orphaned.contains(&cursor.source_term(object)?))
+        {
+            continue;
+        }
+
+        group_emitted = true;
+        result.matching_quads = result.matching_quads.saturating_add(1);
+        result.count.increment()?;
+    }
+    if cancellation.is_cancelled() {
+        return Err(SparqlError::Cancelled);
+    }
+    Ok(result)
 }
 
 fn graph_orphans(
