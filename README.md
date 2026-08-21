@@ -15,8 +15,8 @@ Within the 0.2.x series:
   security defect makes this impossible;
 - authoritative CRDT data written by 0.2 remains readable by later 0.2
   releases;
-- derived qv indexes, search indexes, compiled-schema caches, federation
-  metadata, and negative certificates may be rebuilt;
+- derived qv indexes, search indexes, and compiled-schema caches may be
+  rebuilt;
 - unsupported forms fail explicitly;
 - deprecated 0.2 APIs remain until 0.3 unless they create a correctness or
   security issue, and their Rust documentation names the replacement;
@@ -43,7 +43,7 @@ Within the 0.2.x series:
 | Classification | Surface |
 | --- | --- |
 | Stable in 0.2.x | Root storage, RO-Crate, authorization, local SPARQL, search, replication, error, and disk-format APIs documented in Rustdoc |
-| Coordinator-facing in 0.2.x | Exact federation topology, dependency, certificate, and compact-fragment APIs once their release gates pass |
+| Coordinator-facing in 0.2.x | Exact federation topology and compact-fragment APIs once their release gates pass |
 | Feature-gated in 0.2.x | `shacl-core`, `search`, and `iroh` surfaces |
 | Internal | Everything under `src/internal/`, encoded storage IDs, physical forcing controls used only by tests and benchmarks |
 | Deprecated | APIs explicitly carrying a Rust `deprecated` attribute and a documented replacement; retained until 0.3 unless correctness or security requires removal |
@@ -205,11 +205,10 @@ are authoritative and must be included in a consistent backup. An unknown
 future authoritative format, a malformed marker, or an unmarked non-empty
 store fails closed at open.
 
-qv query indexes, Tantivy search indexes, compiled SHACL caches, federation
-metadata, and negative-result certificates are derived and disposable. They
-may be omitted from a backup and rebuilt from authoritative state. Restoring a
-database requires an empty destination and must preserve one consistent view
-of all authoritative keyspaces.
+qv query indexes, Tantivy search indexes, and compiled SHACL caches are derived
+and disposable. They may be omitted from a backup and rebuilt from
+authoritative state. Restoring a database requires an empty destination and
+must preserve one consistent view of all authoritative keyspaces.
 
 ## Feature flags
 

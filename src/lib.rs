@@ -9,10 +9,9 @@
 //! Documented public APIs remain source compatible throughout 0.2.x unless a
 //! correctness or security defect makes that impossible. Authoritative CRDT
 //! data written by 0.2 remains readable by later 0.2 releases. Query and search
-//! indexes, compiled SHACL caches, federation metadata, and negative-result
-//! certificates are derived data and may be rebuilt or discarded. Unsupported
-//! forms return an error. A future 0.3 release may make breaking changes with a
-//! migration note.
+//! indexes and compiled SHACL caches are derived data and may be rebuilt or
+//! discarded. Unsupported forms return an error. A future 0.3 release may make
+//! breaking changes with a migration note.
 
 #![warn(unreachable_pub)]
 
