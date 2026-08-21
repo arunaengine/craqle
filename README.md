@@ -260,9 +260,9 @@ larger unordered solution.
 | Common-to-rare written-order join | 0.212 ms | 0.047 ms |
 
 This is diagnostic evidence, not the final fair comparison: Craqle used its
-durable Fjall store while Oxigraph used its in-memory store. It therefore does
-not support a general relative-performance claim or close the same-durability
-release gate. The harness rejects 10M inputs.
+buffered Fjall temporary store while Oxigraph used its in-memory store. It
+therefore does not support a general relative-performance claim or close the
+same-durability release gate. The harness rejects 10M inputs.
 
 ## Limitations
 

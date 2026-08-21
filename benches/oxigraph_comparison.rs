@@ -67,7 +67,7 @@ fn main() {
     let oxigraph_load = oxigraph_load_started.elapsed();
     println!(
         "oxigraph_comparison setup: craqle_load_ms={:.3} oxigraph_load_ms={:.3} \
-         craqle_persistence=fjall_durable oxigraph_persistence=in_memory \
+         craqle_persistence=fjall_buffered_tempdir oxigraph_persistence=in_memory \
          oxigraph_version=0.5.9",
         millis(craqle_load),
         millis(oxigraph_load),
