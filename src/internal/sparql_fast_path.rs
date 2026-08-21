@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use oxrdf::{Literal, Term, Variable};
@@ -10,7 +11,9 @@ use crate::core::EncodedTerm;
 use crate::query_context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{QueryResults, Result};
-use crate::store::{EncodedQuad, TermId};
+use crate::store::{EncodedQuad, QueryTermId, TermId};
+
+const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
 
 fn enforce_hash_entries(entries: usize, limits: &crate::sparql::QueryLimits) -> Result<()> {
     if entries > limits.max_hash_entries {
@@ -67,6 +70,7 @@ pub(crate) struct TriplePlan {
 #[derive(Clone)]
 pub(crate) enum FastPathPlan {
     Ask(TriplePlan),
+    TriangleAsk(TriplePlan),
     SelectLimit {
         triple: TriplePlan,
         variables: Vec<String>,
@@ -109,7 +113,7 @@ pub(crate) enum FastPathPlan {
 impl FastPathPlan {
     pub(crate) fn kind(&self) -> QueryFastPathKind {
         match self {
-            Self::Ask(_) => QueryFastPathKind::Ask,
+            Self::Ask(_) | Self::TriangleAsk(_) => QueryFastPathKind::Ask,
             Self::SelectLimit { .. } => QueryFastPathKind::SelectLimit,
             Self::Count {
                 domain: crate::count_plan::CountValueDomain::Subject,
@@ -160,12 +164,14 @@ pub(crate) fn analyze(query: &Query) -> Option<FastPathPlan> {
             ..
         } => {
             let pattern = match pattern {
-                GraphPattern::Project { inner, variables } if variables.is_empty() => {
-                    inner.as_ref()
-                }
+                GraphPattern::Project { inner, .. } => inner.as_ref(),
                 pattern => pattern,
             };
-            Some(FastPathPlan::Ask(single_triple(pattern)?))
+            if let Some(triple) = single_triple(pattern) {
+                Some(FastPathPlan::Ask(triple))
+            } else {
+                Some(FastPathPlan::TriangleAsk(triangle_triple(pattern)?))
+            }
         }
         Query::Select {
             dataset: None,
@@ -475,6 +481,55 @@ pub(crate) fn single_triple(pattern: &GraphPattern) -> Option<TriplePlan> {
     }
 }
 
+fn triangle_triple(pattern: &GraphPattern) -> Option<TriplePlan> {
+    let (graph, patterns) = match pattern {
+        GraphPattern::Bgp { patterns } => (PatternGraph::DefaultUnion, patterns.as_slice()),
+        GraphPattern::Graph {
+            name: NamedNodePattern::NamedNode(graph),
+            inner,
+        } => {
+            let GraphPattern::Bgp { patterns } = inner.as_ref() else {
+                return None;
+            };
+            (
+                PatternGraph::Named(EncodedTerm::from_named_node(graph)),
+                patterns.as_slice(),
+            )
+        }
+        _ => return None,
+    };
+    let [first, _, _] = patterns else {
+        return None;
+    };
+    let NamedNodePattern::NamedNode(predicate) = &first.predicate else {
+        return None;
+    };
+    let mut subjects = HashSet::new();
+    let mut objects = HashSet::new();
+    for pattern in patterns {
+        if !matches!(
+            &pattern.predicate,
+            NamedNodePattern::NamedNode(candidate) if candidate == predicate
+        ) {
+            return None;
+        }
+        let (TermPattern::Variable(subject), TermPattern::Variable(object)) =
+            (&pattern.subject, &pattern.object)
+        else {
+            return None;
+        };
+        if subject == object {
+            return None;
+        }
+        subjects.insert(subject.as_str());
+        objects.insert(object.as_str());
+    }
+    if subjects.len() != 3 || subjects != objects {
+        return None;
+    }
+    triple_plan(graph, first)
+}
+
 fn triple_plan(graph: PatternGraph, pattern: &TriplePattern) -> Option<TriplePlan> {
     let subject = pattern_term(&pattern.subject)?;
     let predicate = match &pattern.predicate {
@@ -628,6 +683,7 @@ pub(crate) fn execute(
                 result_cells: 1,
             })
         }
+        FastPathPlan::TriangleAsk(triple) => triangle_ask(triple, view, context, limits, started),
         FastPathPlan::SelectLimit {
             triple,
             variables,
@@ -747,6 +803,182 @@ pub(crate) fn execute(
             output,
             join_variables,
         } => hash_join_count(left, right, output, join_variables, view, context, limits),
+    }
+}
+
+fn triangle_ask(
+    triple: &TriplePlan,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    limits: &crate::sparql::QueryLimits,
+    started: Instant,
+) -> Result<FastPathOutcome> {
+    let Some(triple) = triple.resolve(view, context)? else {
+        return Ok(boolean_ask_outcome(false, 0, started));
+    };
+    let (value, intermediate_rows) =
+        if let Some(mut edges) = raw_triangle_edges(view, context, triple, limits)? {
+            let intermediate_rows = u64::try_from(edges.len()).unwrap_or(u64::MAX);
+            (
+                sorted_edges_contain_triangle(&mut edges, context)?,
+                intermediate_rows,
+            )
+        } else {
+            let mut edges = Vec::new();
+            let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+            for quad in &mut cursor {
+                let quad = quad?;
+                edges.push((quad.subject, quad.object));
+                enforce_hash_entries(edges.len(), limits)?;
+            }
+            let intermediate_rows = u64::try_from(edges.len()).unwrap_or(u64::MAX);
+            (
+                sorted_edges_contain_triangle(&mut edges, context)?,
+                intermediate_rows,
+            )
+        };
+    Ok(boolean_ask_outcome(value, intermediate_rows, started))
+}
+
+fn raw_triangle_edges(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    triple: ResolvedTriple<'_>,
+    limits: &crate::sparql::QueryLimits,
+) -> Result<Option<Vec<(QueryTermId, QueryTermId)>>> {
+    let Some(mut cursor) = view.raw_query_index_keys(context, triple.selector, triple.pattern)?
+    else {
+        return Ok(None);
+    };
+    let mut edges = Vec::new();
+    let mut work = 0usize;
+    match triple.selector {
+        GraphSelector::Named(graph) => {
+            let orphaned = view.orphaned_ids(context, graph)?;
+            while let Some(key) = cursor.next_key() {
+                let key = key?;
+                context.increment_candidate_quads();
+                context.record_qv_read(key.bytes_read);
+                work += 1;
+                if work == CANCELLATION_CHECK_INTERVAL {
+                    work = 0;
+                    context.check_cancelled()?;
+                }
+                let (matches, extracted) = cursor.matches(key);
+                context.record_key_fields_extracted(extracted);
+                if !matches {
+                    continue;
+                }
+                context.record_key_fields_extracted(2);
+                let edge = (key.subject(), key.object());
+                if !orphaned.is_empty()
+                    && (orphaned.contains(&cursor.source_term(edge.0)?)
+                        || orphaned.contains(&cursor.source_term(edge.1)?))
+                {
+                    continue;
+                }
+                context.increment_matching_quads();
+                edges.push(edge);
+                enforce_hash_entries(edges.len(), limits)?;
+            }
+        }
+        GraphSelector::DefaultUnion => {
+            let mut graph_cache = HashMap::<QueryTermId, Option<Rc<HashSet<TermId>>>>::new();
+            let mut current_edge = None;
+            let mut edge_emitted = false;
+            while let Some(key) = cursor.next_key() {
+                let key = key?;
+                context.increment_candidate_quads();
+                context.record_qv_read(key.bytes_read);
+                work += 1;
+                if work == CANCELLATION_CHECK_INTERVAL {
+                    work = 0;
+                    context.check_cancelled()?;
+                }
+                let (matches, extracted) = cursor.matches(key);
+                context.record_key_fields_extracted(extracted);
+                if !matches {
+                    continue;
+                }
+                context.record_key_fields_extracted(2);
+                let edge = (key.subject(), key.object());
+                if current_edge != Some(edge) {
+                    current_edge = Some(edge);
+                    edge_emitted = false;
+                    context.increment_duplicate_groups();
+                } else if edge_emitted {
+                    context.increment_skipped_copies();
+                    continue;
+                }
+
+                context.record_key_fields_extracted(1);
+                let query_graph = key.graph();
+                let orphaned = if let Some(orphaned) = graph_cache.get(&query_graph) {
+                    orphaned.clone()
+                } else {
+                    let graph = cursor.source_term(query_graph)?;
+                    let orphaned = if view.graph_is_visible(context, graph)? {
+                        Some(view.orphaned_ids(context, graph)?)
+                    } else {
+                        None
+                    };
+                    graph_cache.insert(query_graph, orphaned.clone());
+                    orphaned
+                };
+                let Some(orphaned) = orphaned else {
+                    continue;
+                };
+                if !orphaned.is_empty()
+                    && (orphaned.contains(&cursor.source_term(edge.0)?)
+                        || orphaned.contains(&cursor.source_term(edge.1)?))
+                {
+                    continue;
+                }
+                edge_emitted = true;
+                context.increment_matching_quads();
+                edges.push(edge);
+                enforce_hash_entries(edges.len(), limits)?;
+            }
+        }
+        GraphSelector::Union => return Ok(None),
+    }
+    Ok(Some(edges))
+}
+
+fn sorted_edges_contain_triangle<T: Copy + Ord>(
+    edges: &mut Vec<(T, T)>,
+    context: &ReadContext<'_>,
+) -> Result<bool> {
+    edges.sort_unstable();
+    edges.dedup();
+    let mut work = 0usize;
+    for &(first, second) in edges.iter() {
+        let start = edges.partition_point(|(subject, _)| *subject < second);
+        let end = edges.partition_point(|(subject, _)| *subject <= second);
+        for &(_, third) in &edges[start..end] {
+            work += 1;
+            if work == CANCELLATION_CHECK_INTERVAL {
+                work = 0;
+                context.check_cancelled()?;
+            }
+            if edges.binary_search(&(third, first)).is_ok() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn boolean_ask_outcome(value: bool, intermediate_rows: u64, started: Instant) -> FastPathOutcome {
+    FastPathOutcome {
+        results: QueryResults::Boolean(value),
+        kind: QueryFastPathKind::Ask,
+        execution_time: started.elapsed(),
+        collection_time: Duration::ZERO,
+        time_to_first_result: Some(started.elapsed()),
+        intermediate_rows,
+        result_rows: 1,
+        result_cells: 1,
     }
 }
 

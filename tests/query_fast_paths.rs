@@ -322,6 +322,82 @@ fn fast_paths_fail_closed() {
 }
 
 #[test]
+fn fixed_predicate_triangle_ask_uses_bounded_query_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:fast:triangle");
+    let duplicate = GraphId::new("urn:test:fast:triangle:duplicate");
+    node.apply_changes_unchecked(
+        &graph,
+        vec![
+            insert(&graph, "urn:a", "urn:edge", iri("urn:b")),
+            insert(&graph, "urn:b", "urn:edge", iri("urn:c")),
+            insert(&graph, "urn:c", "urn:edge", iri("urn:a")),
+            insert(&graph, "urn:x", "urn:edge", iri("urn:y")),
+            insert(&graph, "urn:a", "urn:other", iri("urn:b")),
+            insert(&graph, "urn:b", "urn:other", iri("urn:c")),
+        ],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &duplicate,
+        vec![insert(&duplicate, "urn:a", "urn:edge", iri("urn:b"))],
+    )
+    .unwrap();
+    node.ensure_query_indexes();
+    let graphs = vec![graph.clone(), duplicate.clone()];
+
+    for query in [
+        "ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a }",
+        "ASK { ?c <urn:edge> ?a . ?a <urn:edge> ?b . ?b <urn:edge> ?c }",
+        "ASK { GRAPH <urn:test:fast:triangle> { \
+         ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a } }",
+        "ASK { ?a <urn:other> ?b . ?b <urn:other> ?c . ?c <urn:other> ?a }",
+    ] {
+        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
+        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(
+            fast.statistics.fast_path,
+            Some(QueryFastPathKind::Ask),
+            "{query}"
+        );
+        assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
+        assert_eq!(fast.statistics.authoritative_terms_decoded, 0, "{query}");
+    }
+
+    let hidden = run(
+        &node,
+        std::slice::from_ref(&duplicate),
+        "ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a }",
+        QueryFastPathMode::Auto,
+    );
+    assert_eq!(hidden.results, QueryResults::Boolean(false));
+
+    for query in [
+        "ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:other> ?a }",
+        "ASK { <urn:a> <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> <urn:a> }",
+        "ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . \
+         ?c <urn:edge> ?d . ?d <urn:edge> ?a }",
+    ] {
+        let auto = run(&node, &graphs, query, QueryFastPathMode::Auto);
+        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        assert_eq!(auto.results, generic.results, "{query}");
+        assert_eq!(auto.statistics.fast_path, None, "{query}");
+    }
+
+    let prepared = node
+        .prepare_query("ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a }")
+        .unwrap();
+    let mut limited = QueryExecutionOptions::default();
+    limited.limits.max_hash_entries = 1;
+    let error = node
+        .execute_prepared_graphs(&graphs, &prepared, &limited)
+        .unwrap_err();
+    assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
+}
+
+#[test]
 fn count_fast_path_matches_every_triple_binding_shape() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
