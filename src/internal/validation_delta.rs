@@ -435,7 +435,9 @@ impl<'store, 'delta> DeltaReadView<'store, 'delta> {
 
 impl RdfReadView for DeltaReadView<'_, '_> {
     fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
-        self.base.contains_graph(graph)
+        Ok(self.base.contains_graph(graph)?
+            || (hash_term(&EncodedTerm::from_named_node(&graph.0)) == self.graph()
+                && self.index.states.values().any(|present| *present)))
     }
 
     fn scan<'store, 'context, 'visibility>(

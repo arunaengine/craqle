@@ -102,6 +102,10 @@ pub use crate::rocrate::{
     AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
     canonicalize_jsonld, validate_rocrate_jsonld,
 };
+#[cfg(feature = "shacl-core")]
+pub use crate::rocrate::{
+    PrepareRoCrateOptions, PreparedGraphBase, PreparedRoCrateDocument, PreparedRoCrateStatistics,
+};
 pub use crate::search::SearchHit;
 #[cfg(feature = "shacl-core")]
 pub use crate::shacl::{
@@ -218,6 +222,12 @@ pub enum CraqleError {
     #[cfg(feature = "shacl-core")]
     #[error("shacl: {0}")]
     Shacl(#[from] ShaclError),
+    #[cfg(feature = "shacl-core")]
+    #[error("prepared RO-Crate document did not conform to the requested policy")]
+    RoCratePolicyRejected(Box<RoCratePolicyReport>),
+    #[cfg(feature = "shacl-core")]
+    #[error("prepared commit mode {mode:?} requires a compiled RO-Crate policy")]
+    RoCratePolicyRequired { mode: PreparedCommitMode },
     #[error("sync input rejected: {0}")]
     SyncInputRejected(String),
     #[error("sync: {0}")]
@@ -252,6 +262,10 @@ impl CraqleError {
             Self::RoCrate(error) => error.kind(),
             #[cfg(feature = "shacl-core")]
             Self::Shacl(error) => error.kind(),
+            #[cfg(feature = "shacl-core")]
+            Self::RoCratePolicyRejected(_) => CraqleErrorKind::InvalidInput,
+            #[cfg(feature = "shacl-core")]
+            Self::RoCratePolicyRequired { .. } => CraqleErrorKind::InvalidInput,
             Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
             Self::Sync(error) => error.kind(),
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
@@ -414,6 +428,83 @@ impl RoCrateVersion {
             Self::V1_3 => include_bytes!("resources/ro_crate_1_3.jsonld"),
         }
     }
+}
+
+/// Stable identifier for one compiled RO-Crate SHACL policy.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PolicyId([u8; 32]);
+
+#[cfg(feature = "shacl-core")]
+impl PolicyId {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Compiled native policy and every shapes-version fence it depends on.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug)]
+pub struct CompiledRoCratePolicy {
+    pub policy_id: PolicyId,
+    pub shacl: CompiledShaclSchema,
+    pub compiler_model_version: u32,
+    pub root_shapes_graph: GraphId,
+    pub root_shapes_version: [u8; 32],
+    pub imported_shapes: Vec<(GraphId, [u8; 32])>,
+}
+
+/// Limits used while evaluating a prepared raw RO-Crate candidate.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug, Default)]
+pub struct RoCratePolicyOptions {
+    pub validation: ShaclValidationOptions,
+}
+
+/// Parse-once preparation and native-validation work for one policy report.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RoCratePolicyStatistics {
+    pub parse_count: u64,
+    pub parse_time: Duration,
+    pub encode_time: Duration,
+    pub structural_time: Duration,
+    pub diff_time: Duration,
+    pub target_time: Duration,
+    pub constraint_time: Duration,
+    pub report_time: Duration,
+    pub encoded_triples: u64,
+    pub encoded_changes: u64,
+}
+
+/// One complete structural and native-SHACL policy result for a raw document.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoCratePolicyReport {
+    pub conforms: bool,
+    pub detected_version: RoCrateVersion,
+    pub document_digest: [u8; 32],
+    pub rocrate_violations: Vec<CrateViolation>,
+    pub shacl: ShaclValidationReport,
+    pub statistics: RoCratePolicyStatistics,
+}
+
+/// Policy behavior requested when committing a prepared document.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PreparedCommitMode {
+    Enforce,
+    Advisory,
+    StructuralOnly,
+}
+
+/// Source batch and optional advisory/enforcement report from a prepared commit.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug)]
+pub struct PreparedRoCrateCommitOutcome {
+    pub batch: Batch,
+    pub policy_report: Option<RoCratePolicyReport>,
 }
 
 /// Input for creating a new RO-Crate graph.
@@ -1020,6 +1111,167 @@ impl CraqleNode {
         Ok(schema)
     }
 
+    /// Compile a reusable native SHACL policy with immutable dependency fences.
+    #[cfg(feature = "shacl-core")]
+    pub fn compile_rocrate_policy(
+        &self,
+        auth: &dyn Authorizer,
+        shapes_graph: &GraphId,
+        options: &ShaclCompileOptions,
+    ) -> Result<CompiledRoCratePolicy> {
+        let shacl = self.compile_shacl(auth, shapes_graph, options)?;
+        let root_shapes_version = shacl
+            .shape_versions()
+            .iter()
+            .find_map(|(graph, version)| (graph == shapes_graph).then_some(*version))
+            .ok_or_else(|| ShaclError::SchemaChangedDuringValidation {
+                graph: shapes_graph.to_string(),
+            })?;
+        let imported_shapes = shacl
+            .shape_versions()
+            .iter()
+            .filter(|(graph, _)| graph != shapes_graph)
+            .cloned()
+            .collect();
+        Ok(CompiledRoCratePolicy {
+            policy_id: rocrate_policy_id(shapes_graph, &shacl),
+            shacl,
+            compiler_model_version: SHACL_COMPILER_MODEL_VERSION,
+            root_shapes_graph: shapes_graph.clone(),
+            root_shapes_version,
+            imported_shapes,
+        })
+    }
+
+    /// Parse and encode one raw RO-Crate document without mutating source state.
+    #[cfg(feature = "shacl-core")]
+    pub fn prepare_rocrate_document(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        jsonld: &str,
+        options: &PrepareRoCrateOptions,
+    ) -> Result<PreparedRoCrateDocument> {
+        self.ensure_policy_action(graph, &options.new_graph_policy, auth, Action::Write)?;
+        Ok(self.manager().prepare_jsonld(graph, jsonld, options)?)
+    }
+
+    /// Evaluate one prepared candidate against structural RO-Crate rules and SHACL.
+    #[cfg(feature = "shacl-core")]
+    pub fn evaluate_rocrate_policy(
+        &self,
+        auth: &dyn Authorizer,
+        document: &PreparedRoCrateDocument,
+        policy: &CompiledRoCratePolicy,
+        options: &RoCratePolicyOptions,
+    ) -> Result<RoCratePolicyReport> {
+        self.authorize_prepared_document(auth, document, Action::Read)?;
+        self.authorize_shape_versions(auth, policy.shacl.shape_versions())?;
+        if document.detected_version != policy.shacl.rocrate_version() {
+            return Err(RoCrateError::VersionMismatch {
+                first: document.detected_version,
+                second: policy.shacl.rocrate_version(),
+            }
+            .into());
+        }
+        self.ensure_prepared_document_current(document)?;
+        self.ensure_rocrate_policy_current(policy)?;
+
+        let shacl = self.shacl.validate_delta(
+            &document.graph,
+            &policy.shacl,
+            &document.encoded_changes,
+            &options.validation,
+        )?;
+
+        self.ensure_prepared_document_current(document)?;
+        self.ensure_rocrate_policy_current(policy)?;
+        Ok(RoCratePolicyReport {
+            conforms: document.structural_findings.is_empty() && shacl.conforms,
+            detected_version: document.detected_version,
+            document_digest: document.document_digest,
+            rocrate_violations: document.structural_findings.clone(),
+            statistics: RoCratePolicyStatistics {
+                parse_count: document.statistics.parse_count,
+                parse_time: document.statistics.parse_time,
+                encode_time: document.statistics.encode_time,
+                structural_time: document.statistics.structural_time,
+                diff_time: document.statistics.diff_time,
+                target_time: shacl.statistics.target_time,
+                constraint_time: shacl.statistics.constraint_time,
+                report_time: shacl.statistics.report_time,
+                encoded_triples: document.statistics.encoded_triples,
+                encoded_changes: document.statistics.encoded_changes,
+            },
+            shacl,
+        })
+    }
+
+    /// Commit a prepared candidate after rechecking its data and policy fences.
+    #[cfg(feature = "shacl-core")]
+    pub fn commit_prepared_rocrate_document(
+        &self,
+        auth: &dyn Authorizer,
+        document: PreparedRoCrateDocument,
+        policy: Option<&CompiledRoCratePolicy>,
+        mode: PreparedCommitMode,
+    ) -> Result<PreparedRoCrateCommitOutcome> {
+        self.authorize_prepared_document(auth, &document, Action::Write)?;
+        let policy_report = match mode {
+            PreparedCommitMode::Enforce | PreparedCommitMode::Advisory => {
+                let policy = policy.ok_or(CraqleError::RoCratePolicyRequired { mode })?;
+                let report = self.evaluate_rocrate_policy(
+                    auth,
+                    &document,
+                    policy,
+                    &RoCratePolicyOptions::default(),
+                )?;
+                if mode == PreparedCommitMode::Enforce && !report.conforms {
+                    return Err(CraqleError::RoCratePolicyRejected(Box::new(report)));
+                }
+                Some(report)
+            }
+            PreparedCommitMode::StructuralOnly => {
+                if !document.structural_findings.is_empty() {
+                    return Err(CraqleError::RoCrate(RoCrateError::Update(
+                        UpdateError::ValidationFailed(document.structural_findings.clone()),
+                    )));
+                }
+                None
+            }
+        };
+
+        let graph = document.graph.clone();
+        let policy_to_persist = document.metadata.policy_to_persist.clone();
+        let shape_versions = policy
+            .map(|policy| policy.shacl.shape_versions())
+            .unwrap_or_default();
+        let batch = self.manager().commit_prepared(document, shape_versions)?;
+        if let Some(policy) = policy_to_persist {
+            self.persist_graph_policy(&graph, policy)?;
+        }
+        let batch = self.finish_batch(&graph, batch)?;
+        Ok(PreparedRoCrateCommitOutcome {
+            batch,
+            policy_report,
+        })
+    }
+
+    /// Prepare and evaluate a raw RO-Crate document with exactly one JSON parse.
+    #[cfg(feature = "shacl-core")]
+    pub fn validate_rocrate_document(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        jsonld: &str,
+        policy: &CompiledRoCratePolicy,
+        options: &RoCratePolicyOptions,
+    ) -> Result<RoCratePolicyReport> {
+        let document =
+            self.prepare_rocrate_document(auth, graph, jsonld, &PrepareRoCrateOptions::default())?;
+        self.evaluate_rocrate_policy(auth, &document, policy, options)
+    }
+
     #[cfg(feature = "shacl-core")]
     pub fn validate_shacl(
         &self,
@@ -1321,6 +1573,88 @@ impl CraqleNode {
     ) -> Result<()> {
         for (graph, _) in shape_versions {
             self.ensure_graph_action(graph, auth, Action::Read)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn authorize_prepared_document(
+        &self,
+        auth: &dyn Authorizer,
+        document: &PreparedRoCrateDocument,
+        action: Action,
+    ) -> Result<()> {
+        let policy = match &document.base {
+            PreparedGraphBase::New => document
+                .metadata
+                .policy_to_persist
+                .clone()
+                .unwrap_or_default(),
+            PreparedGraphBase::Existing { .. } => self.store.graph_policy(&document.graph)?,
+        };
+        auth.authorize(&document.graph, &policy, action)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn ensure_prepared_document_current(&self, document: &PreparedRoCrateDocument) -> Result<()> {
+        let current = match &document.base {
+            PreparedGraphBase::New => !self.store.contains_graph(&document.graph)?,
+            PreparedGraphBase::Existing { data_version } => {
+                self.store.contains_graph(&document.graph)?
+                    && self.store.graph_version_digest(&document.graph)? == *data_version
+            }
+        };
+        if current {
+            Ok(())
+        } else {
+            Err(RoCrateError::StalePreparedState {
+                fence: "data graph version".to_owned(),
+            }
+            .into())
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn ensure_rocrate_policy_current(&self, policy: &CompiledRoCratePolicy) -> Result<()> {
+        let shape_versions = policy.shacl.shape_versions();
+        if policy.compiler_model_version != SHACL_COMPILER_MODEL_VERSION
+            || policy.shacl.model_version() != SHACL_COMPILER_MODEL_VERSION
+        {
+            return Err(RoCrateError::StalePreparedState {
+                fence: "compiler model version".to_owned(),
+            }
+            .into());
+        }
+        if policy.policy_id != rocrate_policy_id(&policy.root_shapes_graph, &policy.shacl) {
+            return Err(RoCrateError::StalePreparedState {
+                fence: "compiled policy identity".to_owned(),
+            }
+            .into());
+        }
+        let root_matches = shape_versions.iter().any(|(graph, version)| {
+            graph == &policy.root_shapes_graph && version == &policy.root_shapes_version
+        });
+        let imported_shapes = shape_versions
+            .iter()
+            .filter(|(graph, _)| graph != &policy.root_shapes_graph)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !root_matches || imported_shapes != policy.imported_shapes {
+            return Err(RoCrateError::StalePreparedState {
+                fence: "compiled policy shape-version set".to_owned(),
+            }
+            .into());
+        }
+        for (graph, expected) in shape_versions {
+            if !self.store.contains_graph(graph)?
+                || self.store.graph_version_digest(graph)? != *expected
+            {
+                return Err(RoCrateError::StalePreparedState {
+                    fence: format!("shapes graph `{}` version", graph.as_str()),
+                }
+                .into());
+            }
         }
         Ok(())
     }
@@ -3142,6 +3476,17 @@ impl CraqleNode {
     fn manager_for_durability(&self, durability: CraqleRequestDurability) -> RoCrateManager {
         self.manager_with(durability, None)
     }
+}
+
+#[cfg(feature = "shacl-core")]
+fn rocrate_policy_id(shapes_graph: &GraphId, schema: &CompiledShaclSchema) -> PolicyId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"craqle-rocrate-policy-v1");
+    hasher.update(&(shapes_graph.as_str().len() as u64).to_be_bytes());
+    hasher.update(shapes_graph.as_str().as_bytes());
+    hasher.update(&schema.plan_fingerprint());
+    hasher.update(&SHACL_COMPILER_MODEL_VERSION.to_be_bytes());
+    PolicyId(*hasher.finalize().as_bytes())
 }
 
 fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<GraphId> {

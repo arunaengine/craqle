@@ -30,6 +30,9 @@ pub enum UpdateError {
     ShaclValidationFailed(Vec<crate::ShaclValidationReport>),
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
+    #[cfg(feature = "shacl-core")]
+    #[error("prepared state is stale: {fence}")]
+    StalePreparedState { fence: String },
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
     #[error("sync: {0}")]
@@ -55,6 +58,8 @@ impl UpdateError {
             Self::Shacl(error) => error.kind(),
             #[cfg(feature = "shacl-core")]
             Self::ShaclValidationFailed(_) => crate::CraqleErrorKind::InvalidInput,
+            #[cfg(feature = "shacl-core")]
+            Self::StalePreparedState { .. } => crate::CraqleErrorKind::StalePreparedState,
             Self::Store(error) => error.kind(),
             Self::Sync(error) => error.kind(),
         }
@@ -156,6 +161,14 @@ struct LocalCommit<'a> {
     changes: Vec<MaterializedQuadChange>,
     plan: DiagnosticsPlan,
     validate_rules: bool,
+    #[cfg(feature = "shacl-core")]
+    prepared_fence: Option<PreparedCommitFence<'a>>,
+}
+
+#[cfg(feature = "shacl-core")]
+struct PreparedCommitFence<'a> {
+    data_version: Option<[u8; 32]>,
+    shape_versions: &'a [(GraphId, [u8; 32])],
 }
 
 #[cfg(feature = "shacl-core")]
@@ -451,6 +464,8 @@ impl ReplicationEngine {
             changes,
             plan: DiagnosticsPlan::Immediate,
             validate_rules: false,
+            #[cfg(feature = "shacl-core")]
+            prepared_fence: None,
         })
     }
 
@@ -472,6 +487,8 @@ impl ReplicationEngine {
             changes,
             plan: DiagnosticsPlan::Deferred,
             validate_rules: false,
+            #[cfg(feature = "shacl-core")]
+            prepared_fence: None,
         })
     }
 
@@ -489,6 +506,38 @@ impl ReplicationEngine {
             changes,
             plan: DiagnosticsPlan::Deferred,
             validate_rules: true,
+            #[cfg(feature = "shacl-core")]
+            prepared_fence: None,
+        })
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn local_apply_bulk_prepared(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        data_version: Option<[u8; 32]>,
+        shape_versions: &[(GraphId, [u8; 32])],
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+        let fence = PreparedCommitFence {
+            data_version,
+            shape_versions,
+        };
+        if changes.is_empty() {
+            let _write_guard = graph_write_guard(graph);
+            let _commit_guard = self.store.graph_commit_guard(graph);
+            self.ensure_prepared_data_current(graph, &fence)?;
+            let _binding_guard = self.store.binding_guard();
+            self.ensure_prepared_shapes_current(&fence)?;
+            return self.empty_batch(graph);
+        }
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            plan: DiagnosticsPlan::Deferred,
+            validate_rules: true,
+            prepared_fence: Some(fence),
         })
     }
 
@@ -1305,6 +1354,43 @@ impl ReplicationEngine {
         Ok(())
     }
 
+    #[cfg(feature = "shacl-core")]
+    fn ensure_prepared_data_current(
+        &self,
+        graph: &GraphId,
+        fence: &PreparedCommitFence<'_>,
+    ) -> Result<(), UpdateError> {
+        let current = self.store.contains_graph(graph)?;
+        let matches = match fence.data_version {
+            None => !current,
+            Some(expected) => current && self.store.graph_version_digest(graph)? == expected,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(UpdateError::StalePreparedState {
+                fence: "data graph version".to_owned(),
+            })
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn ensure_prepared_shapes_current(
+        &self,
+        fence: &PreparedCommitFence<'_>,
+    ) -> Result<(), UpdateError> {
+        for (graph, expected) in fence.shape_versions {
+            if !self.store.contains_graph(graph)?
+                || self.store.graph_version_digest(graph)? != *expected
+            {
+                return Err(UpdateError::StalePreparedState {
+                    fence: format!("shapes graph `{}` version", graph.as_str()),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Internal: assign dots, write to store, build replication batch.
     fn commit_changes(
         &self,
@@ -1316,6 +1402,8 @@ impl ReplicationEngine {
             changes,
             plan: DiagnosticsPlan::Immediate,
             validate_rules: true,
+            #[cfg(feature = "shacl-core")]
+            prepared_fence: None,
         })
     }
 
@@ -1326,6 +1414,8 @@ impl ReplicationEngine {
             changes,
             plan,
             validate_rules,
+            #[cfg(feature = "shacl-core")]
+            prepared_fence,
         } = commit;
 
         if let Some(sync) = &self.sync {
@@ -1344,12 +1434,20 @@ impl ReplicationEngine {
             // Validation and publication are serialized with every local CRDT
             // mutation of this graph.
             let _commit_guard = self.store.graph_commit_guard(graph);
+            #[cfg(feature = "shacl-core")]
+            if let Some(fence) = prepared_fence.as_ref() {
+                self.ensure_prepared_data_current(graph, fence)?;
+            }
             if validate_rules {
                 self.validate(graph, &changes)?;
             }
             #[cfg(feature = "shacl-core")]
             let (binding_guard, prepared_shacl) =
                 self.prepare_shacl_write_for_commit(graph, &changes, validate_rules)?;
+            #[cfg(feature = "shacl-core")]
+            if let Some(fence) = prepared_fence.as_ref() {
+                self.ensure_prepared_shapes_current(fence)?;
+            }
             #[cfg(feature = "shacl-core")]
             let pending_graphs = self.store.affected_shacl_graphs(graph)?;
             #[cfg(feature = "shacl-core")]
@@ -1403,12 +1501,21 @@ impl ReplicationEngine {
         // (G1, G2, G5, G6).
         let _commit_guard = self.store.graph_commit_guard(graph);
 
+        #[cfg(feature = "shacl-core")]
+        if let Some(fence) = prepared_fence.as_ref() {
+            self.ensure_prepared_data_current(graph, fence)?;
+        }
+
         if validate_rules {
             self.validate(graph, &changes)?;
         }
         #[cfg(feature = "shacl-core")]
         let (binding_guard, prepared_shacl) =
             self.prepare_shacl_write_for_commit(graph, &changes, validate_rules)?;
+        #[cfg(feature = "shacl-core")]
+        if let Some(fence) = prepared_fence.as_ref() {
+            self.ensure_prepared_shapes_current(fence)?;
+        }
         #[cfg(feature = "shacl-core")]
         let pending_graphs = self.store.affected_shacl_graphs(graph)?;
         #[cfg(feature = "shacl-core")]

@@ -1,9 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;
+#[cfg(feature = "shacl-core")]
+use std::time::{Duration, Instant};
 
 use crate::RoCrateVersion;
 use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
+#[cfg(feature = "shacl-core")]
+use crate::core::{CrateViolation, GraphPolicy};
 use crate::replication::ReplicationEngine;
 use crate::store::{EncodedQuad, GraphSubjectPredicate, PageCursor, PageRequest, TermId};
 use oxjsonld::{JsonLdParser, JsonLdRemoteDocument};
@@ -97,6 +101,12 @@ pub enum RoCrateError {
         first: RoCrateVersion,
         second: RoCrateVersion,
     },
+    #[cfg(feature = "shacl-core")]
+    #[error("RO-Crate document is {bytes} bytes, exceeding the {limit}-byte limit")]
+    DocumentTooLarge { bytes: usize, limit: usize },
+    #[cfg(feature = "shacl-core")]
+    #[error("prepared RO-Crate state is stale: {fence}")]
+    StalePreparedState { fence: String },
 }
 
 impl RoCrateError {
@@ -115,6 +125,10 @@ impl RoCrateError {
             | Self::InvalidBatch(_)
             | Self::MissingVersion
             | Self::VersionMismatch { .. } => crate::CraqleErrorKind::InvalidInput,
+            #[cfg(feature = "shacl-core")]
+            Self::DocumentTooLarge { .. } => crate::CraqleErrorKind::ValidationLimit,
+            #[cfg(feature = "shacl-core")]
+            Self::StalePreparedState { .. } => crate::CraqleErrorKind::StalePreparedState,
         }
     }
 }
@@ -133,6 +147,79 @@ pub struct RoCratePage {
 pub struct CanonicalJsonLd {
     pub nquads: String,
     pub digest: [u8; 32],
+}
+
+/// Version fence captured while preparing a raw RO-Crate document.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PreparedGraphBase {
+    New,
+    Existing { data_version: [u8; 32] },
+}
+
+/// Bounds and new-graph authorization policy used during document preparation.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug)]
+pub struct PrepareRoCrateOptions {
+    pub new_graph_policy: GraphPolicy,
+    pub max_document_bytes: usize,
+}
+
+#[cfg(feature = "shacl-core")]
+impl Default for PrepareRoCrateOptions {
+    fn default() -> Self {
+        Self {
+            new_graph_policy: GraphPolicy::default(),
+            max_document_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Work completed once while preparing a raw RO-Crate document.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PreparedRoCrateStatistics {
+    pub parse_count: u64,
+    pub parse_time: Duration,
+    pub encode_time: Duration,
+    pub structural_time: Duration,
+    pub diff_time: Duration,
+    pub encoded_triples: u64,
+    pub encoded_changes: u64,
+}
+
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRoCrateMetadata {
+    pub context: Option<String>,
+    pub license: Option<String>,
+    pub policy_to_persist: Option<GraphPolicy>,
+}
+
+/// Parse-once, encoded candidate for policy evaluation and version-fenced commit.
+#[cfg(feature = "shacl-core")]
+#[derive(Clone, Debug)]
+pub struct PreparedRoCrateDocument {
+    pub graph: GraphId,
+    pub base: PreparedGraphBase,
+    pub detected_version: RoCrateVersion,
+    pub document_digest: [u8; 32],
+    pub statistics: PreparedRoCrateStatistics,
+    pub(crate) encoded_changes: Vec<MaterializedQuadChange>,
+    pub(crate) structural_findings: Vec<CrateViolation>,
+    pub(crate) metadata: PreparedRoCrateMetadata,
+}
+
+#[cfg(feature = "shacl-core")]
+impl PreparedRoCrateDocument {
+    pub fn structural_findings(&self) -> &[CrateViolation] {
+        &self.structural_findings
+    }
+
+    pub fn change_count(&self) -> usize {
+        self.encoded_changes.len()
+    }
 }
 
 pub fn canonicalize_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError> {
@@ -1033,6 +1120,133 @@ impl RoCrateManager {
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
         self.plan_import_value_checked(&self.crate_ctx(graph_id)?, value)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn prepare_jsonld(
+        &self,
+        graph_id: &GraphId,
+        jsonld: &str,
+        options: &PrepareRoCrateOptions,
+    ) -> Result<PreparedRoCrateDocument, RoCrateError> {
+        if jsonld.len() > options.max_document_bytes {
+            return Err(RoCrateError::DocumentTooLarge {
+                bytes: jsonld.len(),
+                limit: options.max_document_bytes,
+            });
+        }
+
+        let parse_started = Instant::now();
+        let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        validate_jsonld_import(&value)?;
+        let parse_time = parse_started.elapsed();
+
+        let encode_started = Instant::now();
+        let context_version = detect_context_version(&value)?;
+        let target = jsonld_triples(graph_id, &value)?;
+        let detected_version = validate_crate_version(graph_id, &target, context_version)?;
+        let document_digest = prepared_triple_digest(&target);
+        let encoded_triples = target.len() as u64;
+        let metadata = PreparedRoCrateMetadata {
+            context: extract_raw_context(&value),
+            license: extract_raw_license(&value),
+            policy_to_persist: None,
+        };
+        let encode_time = encode_started.elapsed();
+
+        let store = self.engine.store();
+        let base = if store.contains_graph(graph_id)? {
+            PreparedGraphBase::Existing {
+                data_version: store.graph_version_digest(graph_id)?,
+            }
+        } else {
+            PreparedGraphBase::New
+        };
+
+        let structural_started = Instant::now();
+        let pointers = SubmittedPointers::new(&value, graph_id);
+        let structural_findings = complete_import_violations(graph_id, &target, Some(&pointers));
+        let structural_time = structural_started.elapsed();
+
+        let diff_started = Instant::now();
+        let cx = self.crate_ctx(graph_id)?;
+        let encoded_changes = if self.graph_is_missing_or_empty(graph_id)? {
+            insert_changes(graph_id, target)
+        } else {
+            match self.append_like_changes(&cx, &target)? {
+                Some(changes) => changes,
+                None => diff_triples(graph_id, &self.replacement_base(&cx, &target)?, &target)?,
+            }
+        };
+        let diff_time = diff_started.elapsed();
+
+        if !self.prepared_base_is_current(graph_id, &base)? {
+            return Err(RoCrateError::StalePreparedState {
+                fence: "data graph changed during preparation".to_owned(),
+            });
+        }
+
+        let mut metadata = metadata;
+        if matches!(&base, PreparedGraphBase::New) {
+            metadata.policy_to_persist = Some(options.new_graph_policy.clone().normalized());
+        }
+        Ok(PreparedRoCrateDocument {
+            graph: graph_id.clone(),
+            base,
+            detected_version,
+            document_digest,
+            statistics: PreparedRoCrateStatistics {
+                parse_count: 1,
+                parse_time,
+                encode_time,
+                structural_time,
+                diff_time,
+                encoded_triples,
+                encoded_changes: encoded_changes.len() as u64,
+            },
+            encoded_changes,
+            structural_findings,
+            metadata,
+        })
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn commit_prepared(
+        &self,
+        document: PreparedRoCrateDocument,
+        shape_versions: &[(GraphId, [u8; 32])],
+    ) -> Result<Batch, RoCrateError> {
+        let expected_data_version = match document.base {
+            PreparedGraphBase::New => None,
+            PreparedGraphBase::Existing { data_version } => Some(data_version),
+        };
+        let batch = self.engine.local_apply_bulk_prepared(
+            &document.graph,
+            document.encoded_changes,
+            expected_data_version,
+            shape_versions,
+        )?;
+        self.engine.rebuild_graph_diagnostics(&document.graph)?;
+        self.store_import_context(
+            &document.graph,
+            document.metadata.context,
+            document.metadata.license,
+        )?;
+        Ok(batch)
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn prepared_base_is_current(
+        &self,
+        graph_id: &GraphId,
+        base: &PreparedGraphBase,
+    ) -> Result<bool, RoCrateError> {
+        let store = self.engine.store();
+        match base {
+            PreparedGraphBase::New => Ok(!store.contains_graph(graph_id)?),
+            PreparedGraphBase::Existing { data_version } => Ok(store.contains_graph(graph_id)?
+                && store.graph_version_digest(graph_id)? == *data_version),
+        }
     }
 
     /// Apply one property mutation to an entity. See [`PropertyUpdate`] for the
@@ -2093,6 +2307,19 @@ fn triples_from_insert_changes(changes: &[MaterializedQuadChange]) -> BTreeSet<T
         .collect()
 }
 
+#[cfg(feature = "shacl-core")]
+fn prepared_triple_digest(triples: &BTreeSet<TripleKey>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"craqle-rocrate-candidate-v1");
+    for (subject, predicate, object) in triples {
+        for term in [subject, predicate, object] {
+            hasher.update(&(term.0.len() as u64).to_be_bytes());
+            hasher.update(term.0.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
 fn diff_triples(
     graph_id: &GraphId,
     current: &BTreeSet<TripleKey>,
@@ -2430,6 +2657,21 @@ fn validate_complete_import_triples(
     triples: &BTreeSet<TripleKey>,
     pointers: Option<&SubmittedPointers>,
 ) -> Result<(), RoCrateError> {
+    let violations = complete_import_violations(graph_id, triples, pointers);
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(RoCrateError::Update(
+            crate::replication::UpdateError::ValidationFailed(violations),
+        ))
+    }
+}
+
+fn complete_import_violations(
+    graph_id: &GraphId,
+    triples: &BTreeSet<TripleKey>,
+    pointers: Option<&SubmittedPointers>,
+) -> Vec<crate::core::CrateViolation> {
     let root = root_term(graph_id);
     let metadata = EncodedTerm::from_named_node(&vocab::metadata_descriptor());
     let rdf_type = EncodedTerm::from_named_node(&vocab::rdf_type());
@@ -2567,13 +2809,7 @@ fn validate_complete_import_triples(
         ));
     }
 
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(RoCrateError::Update(
-            crate::replication::UpdateError::ValidationFailed(violations),
-        ))
-    }
+    violations
 }
 
 fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError> {

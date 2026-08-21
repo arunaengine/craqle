@@ -218,6 +218,9 @@ pub craqle::CraqleError::Merge(craqle::MergeError)
 pub craqle::CraqleError::MultiGraphUpdateUnsupported
 pub craqle::CraqleError::QueryCancelled
 pub craqle::CraqleError::RoCrate(craqle::RoCrateError)
+pub craqle::CraqleError::RoCratePolicyRejected(alloc::boxed::Box<craqle::RoCratePolicyReport>)
+pub craqle::CraqleError::RoCratePolicyRequired
+pub craqle::CraqleError::RoCratePolicyRequired::mode: craqle::PreparedCommitMode
 pub craqle::CraqleError::Search(craqle::search::SearchError)
 pub craqle::CraqleError::SearchWorker(alloc::string::String)
 pub craqle::CraqleError::Shacl(craqle::shacl::ShaclError)
@@ -315,6 +318,14 @@ pub craqle::PermissionLevel::Read
 pub craqle::PermissionLevel::Write
 impl craqle::PermissionLevel
 pub fn craqle::PermissionLevel::allows(self, craqle::Action) -> bool
+#[non_exhaustive] pub enum craqle::PreparedCommitMode
+pub craqle::PreparedCommitMode::Advisory
+pub craqle::PreparedCommitMode::Enforce
+pub craqle::PreparedCommitMode::StructuralOnly
+#[non_exhaustive] pub enum craqle::PreparedGraphBase
+pub craqle::PreparedGraphBase::Existing
+pub craqle::PreparedGraphBase::Existing::data_version: [u8; 32]
+pub craqle::PreparedGraphBase::New
 pub enum craqle::QuadOp
 pub craqle::QuadOp::Add
 pub craqle::QuadOp::Add::dot: craqle::Dot
@@ -374,6 +385,9 @@ pub craqle::ReadAccessPath::QvPosg
 pub craqle::ReadAccessPath::QvSpog
 pub craqle::ReadAccessPath::SourceGspo
 pub enum craqle::RoCrateError
+pub craqle::RoCrateError::DocumentTooLarge
+pub craqle::RoCrateError::DocumentTooLarge::bytes: usize
+pub craqle::RoCrateError::DocumentTooLarge::limit: usize
 pub craqle::RoCrateError::EntityNotFound(alloc::string::String)
 pub craqle::RoCrateError::InvalidBatch(alloc::string::String)
 pub craqle::RoCrateError::InvalidGraph(alloc::string::String)
@@ -381,6 +395,8 @@ pub craqle::RoCrateError::Json(serde_json::error::Error)
 pub craqle::RoCrateError::JsonLd(alloc::string::String)
 pub craqle::RoCrateError::MissingVersion
 pub craqle::RoCrateError::Rdf(rocraters::ro_crate::rdf::error::RdfError)
+pub craqle::RoCrateError::StalePreparedState
+pub craqle::RoCrateError::StalePreparedState::fence: alloc::string::String
 pub craqle::RoCrateError::Store(craqle::store::StoreError)
 pub craqle::RoCrateError::UnknownVersion(alloc::string::String)
 pub craqle::RoCrateError::UnsupportedJsonLd(alloc::string::String)
@@ -454,6 +470,8 @@ pub craqle::UpdateError::InvalidChangeSet(alloc::string::String)
 pub craqle::UpdateError::Shacl(craqle::shacl::ShaclError)
 pub craqle::UpdateError::ShaclValidationFailed(alloc::vec::Vec<craqle::shacl::ShaclValidationReport>)
 pub craqle::UpdateError::Sparql(craqle::sparql::SparqlError)
+pub craqle::UpdateError::StalePreparedState
+pub craqle::UpdateError::StalePreparedState::fence: alloc::string::String
 pub craqle::UpdateError::Store(craqle::store::StoreError)
 pub craqle::UpdateError::Sync(craqle::CraqleSyncError)
 pub craqle::UpdateError::ValidationFailed(alloc::vec::Vec<craqle::CrateViolation>)
@@ -485,6 +503,13 @@ pub craqle::Batch::timestamp: chrono::datetime::DateTime<chrono::offset::utc::Ut
 pub struct craqle::CanonicalJsonLd
 pub craqle::CanonicalJsonLd::digest: [u8; 32]
 pub craqle::CanonicalJsonLd::nquads: alloc::string::String
+pub struct craqle::CompiledRoCratePolicy
+pub craqle::CompiledRoCratePolicy::compiler_model_version: u32
+pub craqle::CompiledRoCratePolicy::imported_shapes: alloc::vec::Vec<(craqle::GraphId, [u8; 32])>
+pub craqle::CompiledRoCratePolicy::policy_id: craqle::PolicyId
+pub craqle::CompiledRoCratePolicy::root_shapes_graph: craqle::GraphId
+pub craqle::CompiledRoCratePolicy::root_shapes_version: [u8; 32]
+pub craqle::CompiledRoCratePolicy::shacl: craqle::shacl::CompiledShaclSchema
 pub struct craqle::CompiledShaclSchema
 impl craqle::shacl::CompiledShaclSchema
 pub fn craqle::shacl::CompiledShaclSchema::model_version(&self) -> u32
@@ -532,6 +557,8 @@ pub fn craqle::CraqleNode::bind_irokle_topic(&self, &craqle::GraphId) -> craqle:
 pub fn craqle::CraqleNode::bind_or_derive_irokle_topic(&self, &craqle::GraphId) -> craqle::Result<irokle::ids::TopicId>
 pub fn craqle::CraqleNode::bind_shacl(&self, &dyn craqle::Authorizer, &craqle::shacl::ShaclBinding) -> craqle::Result<craqle::shacl::ShaclBindingStatus>
 pub fn craqle::CraqleNode::bootstrap_rocrate_document(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy) -> craqle::Result<craqle::Batch>
+pub fn craqle::CraqleNode::commit_prepared_rocrate_document(&self, &dyn craqle::Authorizer, craqle::PreparedRoCrateDocument, core::option::Option<&craqle::CompiledRoCratePolicy>, craqle::PreparedCommitMode) -> craqle::Result<craqle::PreparedRoCrateCommitOutcome>
+pub fn craqle::CraqleNode::compile_rocrate_policy(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::ShaclCompileOptions) -> craqle::Result<craqle::CompiledRoCratePolicy>
 pub fn craqle::CraqleNode::compile_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::ShaclCompileOptions) -> craqle::Result<craqle::shacl::CompiledShaclSchema>
 pub fn craqle::CraqleNode::conforms_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::CompiledShaclSchema, &craqle::shacl::ShaclValidationOptions) -> craqle::Result<bool>
 pub fn craqle::CraqleNode::contains_graph(&self, &craqle::GraphId) -> craqle::Result<bool>
@@ -547,6 +574,7 @@ pub fn craqle::CraqleNode::describe_subject(&self, &dyn craqle::Authorizer, craq
 pub fn craqle::CraqleNode::disk_format_version(&self) -> craqle::DiskFormatVersion
 pub fn craqle::CraqleNode::ensure_irokle_topic(&self, &craqle::GraphId) -> craqle::Result<irokle::ids::TopicId>
 pub fn craqle::CraqleNode::ensure_query_indexes(&self)
+pub fn craqle::CraqleNode::evaluate_rocrate_policy(&self, &dyn craqle::Authorizer, &craqle::PreparedRoCrateDocument, &craqle::CompiledRoCratePolicy, &craqle::RoCratePolicyOptions) -> craqle::Result<craqle::RoCratePolicyReport>
 pub fn craqle::CraqleNode::execute_prepared(&self, &dyn craqle::Authorizer, &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryExecution>
 pub fn craqle::CraqleNode::execute_prepared_graphs(&self, &[craqle::GraphId], &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryExecution>
 pub fn craqle::CraqleNode::explain_prepared(&self, &dyn craqle::Authorizer, &craqle::PreparedQuery, &craqle::QueryExecutionOptions) -> craqle::Result<craqle::QueryPlan>
@@ -581,6 +609,7 @@ pub fn craqle::CraqleNode::pending_shacl_queue(&self) -> craqle::Result<alloc::v
 pub fn craqle::CraqleNode::pending_shacl_queue_status(&self) -> craqle::Result<craqle::shacl::PendingShaclQueueStatus>
 pub fn craqle::CraqleNode::persist_fjall(&self) -> craqle::Result<()>
 pub fn craqle::CraqleNode::prepare_query(&self, &str) -> craqle::Result<craqle::PreparedQuery>
+pub fn craqle::CraqleNode::prepare_rocrate_document(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &craqle::PrepareRoCrateOptions) -> craqle::Result<craqle::PreparedRoCrateDocument>
 pub fn craqle::CraqleNode::preview_rocrate_update(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str) -> craqle::Result<alloc::vec::Vec<craqle::MaterializedQuadChange>>
 pub fn craqle::CraqleNode::query(&self, &dyn craqle::Authorizer, &str) -> craqle::Result<craqle::QueryResults>
 pub fn craqle::CraqleNode::query_graphs(&self, &[craqle::GraphId], &str) -> craqle::Result<craqle::QueryResults>
@@ -609,6 +638,7 @@ pub fn craqle::CraqleNode::unbind_shacl(&self, &dyn craqle::Authorizer, &craqle:
 pub fn craqle::CraqleNode::update(&self, &str) -> craqle::Result<core::option::Option<craqle::Batch>>
 pub fn craqle::CraqleNode::update_property(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &str, core::option::Option<&str>, &str) -> craqle::Result<craqle::Batch>
 pub fn craqle::CraqleNode::validate_create_crate(&self, &dyn craqle::Authorizer, craqle::CreateCrateRequest) -> craqle::Result<alloc::vec::Vec<craqle::MaterializedQuadChange>>
+pub fn craqle::CraqleNode::validate_rocrate_document(&self, &dyn craqle::Authorizer, &craqle::GraphId, &str, &craqle::CompiledRoCratePolicy, &craqle::RoCratePolicyOptions) -> craqle::Result<craqle::RoCratePolicyReport>
 pub fn craqle::CraqleNode::validate_rocrate_document_checked_with_policy(&self, &dyn craqle::Authorizer, craqle::GraphId, &str, craqle::GraphPolicy) -> craqle::Result<alloc::vec::Vec<craqle::MaterializedQuadChange>>
 pub fn craqle::CraqleNode::validate_shacl(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::CompiledShaclSchema, &craqle::shacl::ShaclValidationOptions) -> craqle::Result<craqle::shacl::ShaclValidationReport>
 pub fn craqle::CraqleNode::validate_shacl_delta(&self, &dyn craqle::Authorizer, &craqle::GraphId, &craqle::shacl::CompiledShaclSchema, &[craqle::MaterializedQuadChange], &craqle::shacl::ShaclValidationOptions) -> craqle::Result<craqle::shacl::ShaclValidationReport>
@@ -763,13 +793,41 @@ pub craqle::PlannedJoin::estimated_left_rows: u64
 pub craqle::PlannedJoin::estimated_output_rows: u64
 pub craqle::PlannedJoin::estimated_right_rows: u64
 pub craqle::PlannedJoin::physical_operator: craqle::JoinKind
+pub struct craqle::PolicyId(_)
+impl craqle::PolicyId
+pub fn craqle::PolicyId::as_bytes(&self) -> &[u8; 32]
 pub struct craqle::PredicateFilter
 pub craqle::PredicateFilter::predicates: std::collections::hash::set::HashSet<oxrdf::named_node::NamedNode>
 impl core::default::Default for craqle::PredicateFilter
 pub fn craqle::PredicateFilter::default() -> Self
+pub struct craqle::PrepareRoCrateOptions
+pub craqle::PrepareRoCrateOptions::max_document_bytes: usize
+pub craqle::PrepareRoCrateOptions::new_graph_policy: craqle::GraphPolicy
+impl core::default::Default for craqle::PrepareRoCrateOptions
+pub fn craqle::PrepareRoCrateOptions::default() -> Self
 pub struct craqle::PreparedQuery
 impl core::fmt::Debug for craqle::PreparedQuery
 pub fn craqle::PreparedQuery::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct craqle::PreparedRoCrateCommitOutcome
+pub craqle::PreparedRoCrateCommitOutcome::batch: craqle::Batch
+pub craqle::PreparedRoCrateCommitOutcome::policy_report: core::option::Option<craqle::RoCratePolicyReport>
+pub struct craqle::PreparedRoCrateDocument
+pub craqle::PreparedRoCrateDocument::base: craqle::PreparedGraphBase
+pub craqle::PreparedRoCrateDocument::detected_version: craqle::RoCrateVersion
+pub craqle::PreparedRoCrateDocument::document_digest: [u8; 32]
+pub craqle::PreparedRoCrateDocument::graph: craqle::GraphId
+pub craqle::PreparedRoCrateDocument::statistics: craqle::PreparedRoCrateStatistics
+impl craqle::PreparedRoCrateDocument
+pub fn craqle::PreparedRoCrateDocument::change_count(&self) -> usize
+pub fn craqle::PreparedRoCrateDocument::structural_findings(&self) -> &[craqle::CrateViolation]
+pub struct craqle::PreparedRoCrateStatistics
+pub craqle::PreparedRoCrateStatistics::diff_time: core::time::Duration
+pub craqle::PreparedRoCrateStatistics::encode_time: core::time::Duration
+pub craqle::PreparedRoCrateStatistics::encoded_changes: u64
+pub craqle::PreparedRoCrateStatistics::encoded_triples: u64
+pub craqle::PreparedRoCrateStatistics::parse_count: u64
+pub craqle::PreparedRoCrateStatistics::parse_time: core::time::Duration
+pub craqle::PreparedRoCrateStatistics::structural_time: core::time::Duration
 pub struct craqle::QueryCancellation
 impl craqle::QueryCancellation
 pub fn craqle::QueryCancellation::cancel(&self)
@@ -875,6 +933,26 @@ pub craqle::RoCratePage::next_cursor: core::option::Option<alloc::string::String
 pub craqle::RoCratePage::next_offset: core::option::Option<usize>
 pub craqle::RoCratePage::returned_data_entities: usize
 pub craqle::RoCratePage::total_data_entities: usize
+pub struct craqle::RoCratePolicyOptions
+pub craqle::RoCratePolicyOptions::validation: craqle::shacl::ShaclValidationOptions
+pub struct craqle::RoCratePolicyReport
+pub craqle::RoCratePolicyReport::conforms: bool
+pub craqle::RoCratePolicyReport::detected_version: craqle::RoCrateVersion
+pub craqle::RoCratePolicyReport::document_digest: [u8; 32]
+pub craqle::RoCratePolicyReport::rocrate_violations: alloc::vec::Vec<craqle::CrateViolation>
+pub craqle::RoCratePolicyReport::shacl: craqle::shacl::ShaclValidationReport
+pub craqle::RoCratePolicyReport::statistics: craqle::RoCratePolicyStatistics
+pub struct craqle::RoCratePolicyStatistics
+pub craqle::RoCratePolicyStatistics::constraint_time: core::time::Duration
+pub craqle::RoCratePolicyStatistics::diff_time: core::time::Duration
+pub craqle::RoCratePolicyStatistics::encode_time: core::time::Duration
+pub craqle::RoCratePolicyStatistics::encoded_changes: u64
+pub craqle::RoCratePolicyStatistics::encoded_triples: u64
+pub craqle::RoCratePolicyStatistics::parse_count: u64
+pub craqle::RoCratePolicyStatistics::parse_time: core::time::Duration
+pub craqle::RoCratePolicyStatistics::report_time: core::time::Duration
+pub craqle::RoCratePolicyStatistics::structural_time: core::time::Duration
+pub craqle::RoCratePolicyStatistics::target_time: core::time::Duration
 pub struct craqle::SearchHit
 pub craqle::SearchHit::graph_id: alloc::string::String
 pub craqle::SearchHit::score: f32
