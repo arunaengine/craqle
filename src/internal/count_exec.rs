@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::count_plan::CountValueDomain;
 use crate::query_context::ReadContext;
@@ -7,6 +8,7 @@ use crate::sparql::{Result, SparqlError};
 use crate::store::{QueryTermId, TermId};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
+type GraphOrphanCache = HashMap<QueryTermId, Option<Rc<HashSet<TermId>>>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ScalarCount(u64);
@@ -483,6 +485,7 @@ fn for_each_join_key(
         GraphSelector::DefaultUnion => {
             let mut current_group = None;
             let mut group_emitted = false;
+            let mut graph_cache = GraphOrphanCache::new();
             let mut work = 0usize;
             while let Some(key) = cursor.next_key() {
                 let key = key?;
@@ -513,11 +516,11 @@ fn for_each_join_key(
                 }
 
                 context.record_key_fields_extracted(1);
-                let graph = cursor.source_term(key.graph())?;
-                if !view.graph_is_visible(context, graph)? {
+                let Some(orphaned) =
+                    graph_orphans(view, context, &cursor, &mut graph_cache, key.graph())?
+                else {
                     continue;
-                }
-                let orphaned = view.orphaned_ids(context, graph)?;
+                };
                 if !orphaned.is_empty()
                     && (orphaned.contains(&cursor.source_term(subject)?)
                         || orphaned.contains(&cursor.source_term(object)?))
@@ -576,6 +579,7 @@ fn default_union_count(
     let mut objects = ObjectCountStream::default();
     let mut current_group = None;
     let mut group_emitted = false;
+    let mut graph_cache = GraphOrphanCache::new();
     let mut work = 0usize;
     while let Some(key) = cursor.next_key() {
         let key = key?;
@@ -626,11 +630,10 @@ fn default_union_count(
         }
 
         context.record_key_fields_extracted(1);
-        let graph = cursor.source_term(key.graph())?;
-        if !view.graph_is_visible(context, graph)? {
+        let Some(orphaned) = graph_orphans(view, context, cursor, &mut graph_cache, key.graph())?
+        else {
             continue;
-        }
-        let orphaned = view.orphaned_ids(context, graph)?;
+        };
         if !orphaned.is_empty() {
             let subject = match subject {
                 Some(subject) => subject,
@@ -670,4 +673,24 @@ fn default_union_count(
         CountValueDomain::Subject => subjects.finish(),
         CountValueDomain::Object => objects.finish(),
     }))
+}
+
+fn graph_orphans(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    cursor: &crate::query_cursor::RawQueryIndexKeyCursor,
+    cache: &mut GraphOrphanCache,
+    query_graph: QueryTermId,
+) -> Result<Option<Rc<HashSet<TermId>>>> {
+    if let Some(orphaned) = cache.get(&query_graph) {
+        return Ok(orphaned.clone());
+    }
+    let graph = cursor.source_term(query_graph)?;
+    let orphaned = if view.graph_is_visible(context, graph)? {
+        Some(view.orphaned_ids(context, graph)?)
+    } else {
+        None
+    };
+    cache.insert(query_graph, orphaned.clone());
+    Ok(orphaned)
 }
