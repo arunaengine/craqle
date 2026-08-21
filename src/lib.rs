@@ -354,6 +354,10 @@ pub enum QueryIndexState {
 pub struct QueryIndexStatus {
     pub schema_version: u32,
     pub state: QueryIndexState,
+    /// Generation fencing dense query IDs and any physical plan that embeds them.
+    pub query_id_generation: u64,
+    /// Dense IDs allocated in this generation, including retained IDs for deleted rows.
+    pub query_term_ids: u64,
     /// Live canonical source rows in the coherent status snapshot.
     pub source_live_quads: u64,
     /// Indexed live rows in the same coherent snapshot.
@@ -2753,7 +2757,7 @@ impl CraqleNode {
     /// Execute a complete query with an explicit storage-read mode.
     ///
     /// This diagnostic entry point is intended for same-binary tests and
-    /// benchmarks. `ForceQv` returns an error when qv1 is not trusted.
+    /// benchmarks. `ForceQv` returns an error when query-index v2 is not trusted.
     #[doc(hidden)]
     pub fn query_graphs_with_read_mode(
         &self,
@@ -3086,7 +3090,7 @@ impl CraqleNode {
         Ok(self.store.query_index_status()?)
     }
 
-    /// Return qv1 readiness using metadata and exact counters only.
+    /// Return query-index v2 readiness using metadata and exact counters only.
     pub fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
         Ok(self.store.query_index_status_fast()?)
     }

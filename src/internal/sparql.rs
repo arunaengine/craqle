@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use crate::query_context::{QueryCancellation, QueryReadMode, ReadContext, ReadSt
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
 use crate::sparql_fast_path::{FastPathPlan, QueryFastPathKind, QueryFastPathMode};
-use crate::store::{GraphStore, StoreError, StoreReadSnapshot, TermId};
+use crate::store::{GraphStore, QueryTermId, StoreError, StoreReadSnapshot, TermId};
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use spareval::{
     DeleteInsertQuad, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
@@ -66,8 +67,8 @@ pub enum QueryResults {
 /// A parsed SPARQL query that can be executed repeatedly.
 ///
 /// It contains no store snapshot, graph-visibility decision, or execution
-/// statistics. FTS rewriting and physical planning run against current state
-/// on every execution.
+/// statistics. FTS rewriting, physical planning, and dense query-ID resolution
+/// run against current state on every execution.
 #[derive(Clone)]
 pub struct PreparedQuery {
     query: Arc<Query>,
@@ -173,6 +174,7 @@ pub struct QueryExecutionStatistics {
     pub qv_header_reads: u64,
     pub qv_counter_reads: u64,
     pub qv_trusted: bool,
+    pub query_id_generation: Option<u64>,
     pub fallback_reason: Option<String>,
     pub source_keys_read: u64,
     pub source_bytes_read: u64,
@@ -987,6 +989,7 @@ fn build_execution_statistics(
         qv_header_reads: reads.qv_header_reads,
         qv_counter_reads: reads.qv_counter_reads,
         qv_trusted: reads.qv_trusted,
+        query_id_generation: reads.query_id_generation,
         fallback_reason: reads.fallback_reason,
         source_keys_read: reads.source_keys_read,
         source_bytes_read: reads.source_bytes_read,
@@ -1555,9 +1558,42 @@ fn ground_named_node(iri: &str) -> GroundTerm {
     GroundTerm::NamedNode(NamedNode::new_unchecked(iri))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StoredQueryTerm {
+    source: TermId,
+    query: Option<QueryTermId>,
+}
+
+impl PartialEq for StoredQueryTerm {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.query, other.query) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.source == other.source,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+}
+
+impl Eq for StoredQueryTerm {}
+
+impl Hash for StoredQueryTerm {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.query {
+            Some(query) => {
+                1u8.hash(state);
+                query.hash(state);
+            }
+            None => {
+                0u8.hash(state);
+                self.source.hash(state);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum StoreTerm {
-    Existing(TermId),
+    Existing(StoredQueryTerm),
     Missing(EncodedTerm),
     /// Claimed exactly once while spareval encodes the per-execution default
     /// graph marker. It is never a stored RDF term.
@@ -1616,7 +1652,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
     fn resolve_pattern_term(&self, term: Option<&StoreTerm>) -> ResolvedPatternTerm {
         match term {
             None => ResolvedPatternTerm::Any,
-            Some(StoreTerm::Existing(id)) => ResolvedPatternTerm::Existing(*id),
+            Some(StoreTerm::Existing(term)) => ResolvedPatternTerm::Existing(term.source),
             Some(StoreTerm::Missing(_)) => ResolvedPatternTerm::Missing,
             Some(StoreTerm::DefaultUnion) => ResolvedPatternTerm::DefaultUnion,
         }
@@ -1626,6 +1662,27 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
         self.view
             .decode_term_arc(self.context, id)
             .map_err(Into::into)
+    }
+
+    fn stored_term(
+        view: &StoreReadView<'_>,
+        context: &ReadContext<'_>,
+        source: TermId,
+        require_query_id: bool,
+    ) -> std::result::Result<StoredQueryTerm, StoreDatasetError> {
+        let query = if view.query_ids_trusted(context)? {
+            let query = view.query_term_id(context, source)?;
+            if require_query_id && query.is_none() {
+                return Err(StoreError::QueryIndexVerificationFailed(
+                    "term-to-query-mapping-missing",
+                )
+                .into());
+            }
+            query
+        } else {
+            None
+        };
+        Ok(StoredQueryTerm { source, query })
     }
 
     fn externalize_encoded_term(
@@ -1641,8 +1698,8 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
         term: StoreTerm,
     ) -> std::result::Result<Term, StoreDatasetError> {
         match term {
-            StoreTerm::Existing(id) => {
-                let decoded = self.decode_term(id)?;
+            StoreTerm::Existing(term) => {
+                let decoded = self.decode_term(term.source)?;
                 self.externalize_encoded_term(&decoded)
             }
             StoreTerm::Missing(term) => self.externalize_encoded_term(&term),
@@ -1708,7 +1765,7 @@ where
             ..QuadPattern::default()
         };
         let selector = match graph_name {
-            Some(Some(StoreTerm::Existing(graph))) => GraphSelector::Named(*graph),
+            Some(Some(StoreTerm::Existing(graph))) => GraphSelector::Named(graph.source),
             Some(Some(StoreTerm::Missing(_))) => return Box::new(std::iter::empty()),
             Some(Some(StoreTerm::DefaultUnion)) => GraphSelector::DefaultUnion,
             // Compatibility callers use `Some(None)` for the distinct union
@@ -1720,43 +1777,109 @@ where
             Ok(quads) => quads,
             Err(error) => return Box::new(std::iter::once(Err(error.into()))),
         };
+        let view = self.view;
+        let context = self.context;
 
         match graph_name {
             Some(Some(StoreTerm::DefaultUnion)) => Box::new(quads.map(|quad| {
                 let quad = quad.map_err(StoreDatasetError::from)?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(quad.subject),
-                    predicate: StoreTerm::Existing(quad.predicate),
-                    object: StoreTerm::Existing(quad.object),
+                    subject: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.subject,
+                        true,
+                    )?),
+                    predicate: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.predicate,
+                        true,
+                    )?),
+                    object: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.object,
+                        true,
+                    )?),
                     graph_name: None,
                 })
             })),
             Some(Some(StoreTerm::Existing(_))) => Box::new(quads.map(|quad| {
                 let quad = quad.map_err(StoreDatasetError::from)?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(quad.subject),
-                    predicate: StoreTerm::Existing(quad.predicate),
-                    object: StoreTerm::Existing(quad.object),
-                    graph_name: Some(StoreTerm::Existing(quad.graph)),
+                    subject: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.subject,
+                        true,
+                    )?),
+                    predicate: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.predicate,
+                        true,
+                    )?),
+                    object: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.object,
+                        true,
+                    )?),
+                    graph_name: Some(StoreTerm::Existing(Self::stored_term(
+                        view, context, quad.graph, true,
+                    )?)),
                 })
             })),
             Some(Some(StoreTerm::Missing(_))) => unreachable!("missing graph short-circuits above"),
             Some(None) => Box::new(quads.map(|quad| {
                 let quad = quad.map_err(StoreDatasetError::from)?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(quad.subject),
-                    predicate: StoreTerm::Existing(quad.predicate),
-                    object: StoreTerm::Existing(quad.object),
+                    subject: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.subject,
+                        true,
+                    )?),
+                    predicate: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.predicate,
+                        true,
+                    )?),
+                    object: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.object,
+                        true,
+                    )?),
                     graph_name: None,
                 })
             })),
             None => Box::new(quads.map(|quad| {
                 let quad = quad.map_err(StoreDatasetError::from)?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(quad.subject),
-                    predicate: StoreTerm::Existing(quad.predicate),
-                    object: StoreTerm::Existing(quad.object),
-                    graph_name: Some(StoreTerm::Existing(quad.graph)),
+                    subject: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.subject,
+                        true,
+                    )?),
+                    predicate: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.predicate,
+                        true,
+                    )?),
+                    object: StoreTerm::Existing(Self::stored_term(
+                        view,
+                        context,
+                        quad.object,
+                        true,
+                    )?),
+                    graph_name: Some(StoreTerm::Existing(Self::stored_term(
+                        view, context, quad.graph, true,
+                    )?)),
                 })
             })),
         }
@@ -1770,11 +1893,13 @@ where
         let view = self.view;
         let context = self.context;
         Box::new(
-            self.view
-                .graph_term_id_iter()
+            view.graph_term_id_iter()
                 .filter_map(move |graph_id| match graph_id {
                     Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
-                        Ok(true) => Some(Ok(StoreTerm::Existing(graph_id))),
+                        Ok(true) => Some(
+                            Self::stored_term(view, context, graph_id, false)
+                                .map(StoreTerm::Existing),
+                        ),
                         Ok(false) => None,
                         Err(error) => Some(Err(error.into())),
                     },
@@ -1799,8 +1924,8 @@ where
             // a graph in this execution snapshot.
             return Ok(false);
         };
-        Ok(self.view.contains_graph_by_id(*graph)?
-            && self.view.graph_is_visible(self.context, *graph)?)
+        Ok(self.view.contains_graph_by_id(graph.source)?
+            && self.view.graph_is_visible(self.context, graph.source)?)
     }
 
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
@@ -1819,7 +1944,7 @@ where
         }
         let encoded = EncodedTerm::from_term(&term);
         Ok(match self.view.lookup_term(self.context, &encoded)? {
-            Some(id) => StoreTerm::Existing(id),
+            Some(id) => StoreTerm::Existing(Self::stored_term(self.view, self.context, id, false)?),
             None => StoreTerm::Missing(encoded),
         })
     }
@@ -2050,6 +2175,8 @@ fn materialize_graph_target_removals(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
     use crate::query_context::ReadAccessPath;
@@ -2069,6 +2196,30 @@ mod tests {
         let search = Arc::new(SearchIndex::open_in_memory().unwrap());
         let engine = SparqlEngine::new(store.clone(), search.clone());
         (dir, store, search, engine)
+    }
+
+    #[test]
+    fn trusted_store_terms_hash_and_compare_in_query_id_space() {
+        let first = StoredQueryTerm {
+            source: TermId(1),
+            query: Some(QueryTermId(7)),
+        };
+        let same_query_id = StoredQueryTerm {
+            source: TermId(2),
+            query: Some(QueryTermId(7)),
+        };
+        assert_eq!(first, same_query_id);
+        assert_eq!(HashSet::from([first, same_query_id]).len(), 1);
+
+        let source_first = StoredQueryTerm {
+            source: TermId(1),
+            query: None,
+        };
+        let source_second = StoredQueryTerm {
+            source: TermId(2),
+            query: None,
+        };
+        assert_ne!(source_first, source_second);
     }
 
     fn insert_quad(
@@ -2275,7 +2426,7 @@ mod tests {
             .internalize_term(Term::Literal(Literal::new_simple_literal("4")))
             .unwrap();
         let term_id = |term: Option<&StoreTerm>| match term {
-            Some(StoreTerm::Existing(id)) => Some(*id),
+            Some(StoreTerm::Existing(term)) => Some(term.source),
             Some(StoreTerm::Missing(_) | StoreTerm::DefaultUnion) => {
                 panic!("fixture term should be interned")
             }
@@ -2302,7 +2453,7 @@ mod tests {
                     let StoreTerm::Existing(object) = quad.object else {
                         panic!("stored object should be interned");
                     };
-                    (subject, predicate, object)
+                    (subject.source, predicate.source, object.source)
                 })
                 .collect();
             let mut collected: Vec<_> = store
@@ -2506,7 +2657,7 @@ mod tests {
         let stored_marker = dataset
             .internalize_term(Term::BlankNode(marker.clone()))
             .unwrap();
-        assert!(matches!(stored_marker, StoreTerm::Existing(id) if id == marker_id));
+        assert!(matches!(stored_marker, StoreTerm::Existing(term) if term.source == marker_id));
         assert_eq!(
             Term::BlankNode(marker.clone()),
             dataset.externalize_term(StoreTerm::DefaultUnion).unwrap()

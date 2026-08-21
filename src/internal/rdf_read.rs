@@ -156,14 +156,18 @@ impl<'store> StoreReadView<'store> {
 
     fn auto_access_path(selector: GraphSelector, pattern: QuadPattern) -> ReadAccessPath {
         match selector {
-            GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::SourceGspo,
+            GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::QvGspo,
             GraphSelector::Named(_) if pattern.predicate.is_some() => ReadAccessPath::QvGpos,
-            GraphSelector::Named(_) => ReadAccessPath::SourceGspo,
+            GraphSelector::Named(_) if pattern.object.is_some() => ReadAccessPath::QvGosp,
+            GraphSelector::Named(_) => ReadAccessPath::QvGspo,
             GraphSelector::Union | GraphSelector::DefaultUnion if pattern.subject.is_some() => {
                 ReadAccessPath::QvSpog
             }
             GraphSelector::Union | GraphSelector::DefaultUnion if pattern.predicate.is_some() => {
                 ReadAccessPath::QvPosg
+            }
+            GraphSelector::Union | GraphSelector::DefaultUnion if pattern.object.is_some() => {
+                ReadAccessPath::QvOspg
             }
             GraphSelector::Union | GraphSelector::DefaultUnion => ReadAccessPath::QvSpog,
         }
@@ -171,24 +175,36 @@ impl<'store> StoreReadView<'store> {
 
     fn force_qv_path(selector: GraphSelector, pattern: QuadPattern) -> ReadAccessPath {
         match selector {
+            GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::QvGspo,
             GraphSelector::Named(_) if pattern.predicate.is_some() => ReadAccessPath::QvGpos,
-            GraphSelector::Named(_) if pattern.subject.is_some() => ReadAccessPath::QvSpog,
-            GraphSelector::Named(_) => ReadAccessPath::QvGpos,
+            GraphSelector::Named(_) if pattern.object.is_some() => ReadAccessPath::QvGosp,
+            GraphSelector::Named(_) => ReadAccessPath::QvGspo,
             GraphSelector::Union | GraphSelector::DefaultUnion if pattern.subject.is_some() => {
                 ReadAccessPath::QvSpog
             }
-            GraphSelector::Union | GraphSelector::DefaultUnion => ReadAccessPath::QvPosg,
+            GraphSelector::Union | GraphSelector::DefaultUnion if pattern.predicate.is_some() => {
+                ReadAccessPath::QvPosg
+            }
+            GraphSelector::Union | GraphSelector::DefaultUnion if pattern.object.is_some() => {
+                ReadAccessPath::QvOspg
+            }
+            GraphSelector::Union | GraphSelector::DefaultUnion => ReadAccessPath::QvSpog,
         }
     }
 
     fn qv_admission(&self, context: &ReadContext<'_>) -> Result<QueryIndexAdmission> {
         if let Some(admission) = self.qv_admission.get().copied() {
-            context.observe_qv_admission(admission.trusted, admission.fallback_reason);
+            context.observe_qv_admission(
+                admission.trusted,
+                admission.query_id_generation,
+                admission.fallback_reason,
+            );
             return Ok(admission);
         }
         let admission = self.snapshot.query_index_admission(self.store)?;
         context.record_qv_admission(
             admission.trusted,
+            admission.query_id_generation,
             admission.fallback_reason,
             admission.header_reads,
             admission.counter_reads,
@@ -197,11 +213,27 @@ impl<'store> StoreReadView<'store> {
         Ok(admission)
     }
 
+    pub(crate) fn query_ids_trusted(&self, context: &ReadContext<'_>) -> Result<bool> {
+        Ok(self.qv_admission(context)?.trusted)
+    }
+
+    pub(crate) fn query_term_id(
+        &self,
+        context: &ReadContext<'_>,
+        term: TermId,
+    ) -> Result<Option<crate::store::QueryTermId>> {
+        context.check_cancelled()?;
+        self.snapshot.query_term_id(self.store, term)
+    }
+
     fn qv_order(path: ReadAccessPath) -> QueryIndexCursorOrder {
         match path {
+            ReadAccessPath::QvGspo => QueryIndexCursorOrder::Gspo,
             ReadAccessPath::QvGpos => QueryIndexCursorOrder::Gpos,
             ReadAccessPath::QvSpog => QueryIndexCursorOrder::Spog,
             ReadAccessPath::QvPosg => QueryIndexCursorOrder::Posg,
+            ReadAccessPath::QvOspg => QueryIndexCursorOrder::Ospg,
+            ReadAccessPath::QvGosp => QueryIndexCursorOrder::Gosp,
             ReadAccessPath::SourceGspo | ReadAccessPath::Empty => {
                 unreachable!("only qv access paths have qv orders")
             }
@@ -356,7 +388,9 @@ impl RdfReadView for StoreReadView<'_> {
                 || matches!(selector, GraphSelector::DefaultUnion)
             {
                 return Err(StoreError::QueryIndexUnavailable(
-                    admission.fallback_reason.unwrap_or("qv1-not-trusted"),
+                    admission
+                        .fallback_reason
+                        .unwrap_or("query-index-v2-not-trusted"),
                 ));
             }
             context.record_access_path(ReadAccessPath::SourceGspo);
@@ -372,9 +406,9 @@ impl RdfReadView for StoreReadView<'_> {
 
         context.record_access_path(requested);
         context.increment_index_seeks();
-        let raw = self
-            .snapshot
-            .query_index_cursor(self.store, Self::qv_order(requested), pattern);
+        let raw =
+            self.snapshot
+                .query_index_cursor(self.store, Self::qv_order(requested), pattern)?;
         if matches!(selector, GraphSelector::DefaultUnion) {
             Ok(QueryCursor::default_union(
                 self.store,
@@ -1538,10 +1572,11 @@ mod tests {
                 )
             );
             let auto_statistics = auto_context.snapshot();
-            assert_eq!(1, auto_statistics.source_keys_read, "{graph_count} graphs");
+            assert_eq!(0, auto_statistics.source_keys_read, "{graph_count} graphs");
+            assert_eq!(1, auto_statistics.qv_keys_read, "{graph_count} graphs");
             assert_eq!(1, auto_statistics.candidate_quads, "{graph_count} graphs");
             assert_eq!(
-                vec![ReadAccessPath::SourceGspo],
+                vec![ReadAccessPath::QvGspo],
                 auto_statistics.selected_access_paths
             );
 
@@ -1563,11 +1598,60 @@ mod tests {
                 )
             );
             assert_eq!(
-                graph_count as u64,
+                1,
                 forced_context.snapshot().qv_keys_read,
-                "forced SPOG demonstrates the cross-graph work avoided for {graph}"
+                "forced GSPO remains graph-local for {graph}"
             );
         }
+    }
+
+    #[test]
+    fn object_bound_patterns_use_object_leading_query_indexes() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:object-leading");
+        let first = add_quad(
+            &store,
+            &graph,
+            "urn:test:object-leading:s1",
+            "urn:test:object-leading:p1",
+            "urn:test:object-leading:o",
+        );
+        let second = add_quad(
+            &store,
+            &graph,
+            "urn:test:object-leading:s2",
+            "urn:test:object-leading:p2",
+            "urn:test:object-leading:o",
+        );
+        let view = StoreReadView::new(&store);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let rows = collect_rows(
+            view.scan(
+                &context,
+                GraphSelector::Named(first.graph),
+                QuadPattern {
+                    object: Some(first.object),
+                    ..QuadPattern::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted(rows), sorted(vec![first, second]));
+        let statistics = context.snapshot();
+        assert_eq!(
+            vec![ReadAccessPath::QvGosp],
+            statistics.selected_access_paths
+        );
+        assert_eq!(2, statistics.qv_keys_read);
+
+        let union_path = StoreReadView::auto_access_path(
+            GraphSelector::Union,
+            QuadPattern {
+                object: Some(first.object),
+                ..QuadPattern::default()
+            },
+        );
+        assert_eq!(ReadAccessPath::QvOspg, union_path);
     }
 
     #[test]

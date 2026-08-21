@@ -37,6 +37,11 @@ pub enum StoreError {
     },
     #[error("query index verification failed: {0}")]
     QueryIndexVerificationFailed(&'static str),
+    #[error("invalid query-index encoding for {context}: {message}")]
+    InvalidQueryIndexEncoding {
+        context: &'static str,
+        message: String,
+    },
     #[error("query index unavailable: {0}")]
     QueryIndexUnavailable(&'static str),
     #[error("authoritative disk-format marker is missing from a non-empty store")]
@@ -60,9 +65,9 @@ impl StoreError {
             Self::Cancelled => CraqleErrorKind::Cancelled,
             Self::TermCollision { .. } => CraqleErrorKind::Conflict,
             Self::GraphNotFound(_) => CraqleErrorKind::InvalidInput,
-            Self::QueryIndexVerificationFailed(_) | Self::QueryIndexUnavailable(_) => {
-                CraqleErrorKind::CorruptDerivedData
-            }
+            Self::QueryIndexVerificationFailed(_)
+            | Self::InvalidQueryIndexEncoding { .. }
+            | Self::QueryIndexUnavailable(_) => CraqleErrorKind::CorruptDerivedData,
             Self::TermNotFound(_)
             | Self::InvalidEncoding { .. }
             | Self::MissingAuthoritativeFormat
@@ -99,12 +104,36 @@ impl TermId {
     }
 }
 
+/// Dense identifier used only by rebuildable query-derived state.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct QueryTermId(pub(crate) u64);
+
+impl QueryTermId {
+    fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    fn from_be_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodedQuad {
     pub graph: TermId,
     pub subject: TermId,
     pub predicate: TermId,
     pub object: TermId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryQuad {
+    pub(crate) graph: QueryTermId,
+    pub(crate) subject: QueryTermId,
+    pub(crate) predicate: QueryTermId,
+    pub(crate) object: QueryTermId,
 }
 
 const DOT_ENCODING_TAG: u8 = b'D';
@@ -242,12 +271,13 @@ enum QuadMutation {
 
 /// Quad key bytes: `graph || subject || predicate || object`, 4 × 16 bytes.
 type QuadKey = [u8; 64];
+type QueryQuadKey = [u8; 32];
 
-const QUERY_INDEX_SCHEMA_VERSION: u32 = 1;
+const QUERY_INDEX_SCHEMA_VERSION: u32 = 2;
 const QUERY_INDEX_HEADER_KEY: [u8; 1] = *b"H";
 const QUERY_INDEX_TOTAL_KEY: [u8; 1] = *b"T";
-const QUERY_INDEX_HEADER_MAGIC: [u8; 4] = *b"QVI1";
-const QUERY_INDEX_HEADER_BASE_LEN: usize = 54;
+const QUERY_INDEX_HEADER_MAGIC: [u8; 4] = *b"QVI2";
+const QUERY_INDEX_HEADER_BASE_LEN: usize = 70;
 const QUERY_INDEX_FAILURE_MAX_BYTES: usize = 256;
 const QUERY_INDEX_BUILD_CHUNK_ROWS: usize = 1_024;
 const QUERY_INDEX_SAMPLE_ROWS: u64 = 128;
@@ -275,6 +305,8 @@ struct QueryIndexHeader {
     source_live_quads: u64,
     indexed_quads: u64,
     last_build_sequence: u64,
+    query_id_generation: u64,
+    next_query_id: u64,
 }
 
 impl QueryIndexHeader {
@@ -286,6 +318,8 @@ impl QueryIndexHeader {
             source_live_quads: 0,
             indexed_quads: 0,
             last_build_sequence: 0,
+            query_id_generation: 1,
+            next_query_id: 0,
         }
     }
 
@@ -307,6 +341,7 @@ impl QueryIndexHeader {
         matches!(self.state, StoredQueryIndexState::Ready)
             && self.source_epoch == self.index_epoch
             && self.source_live_quads == self.indexed_quads
+            && self.query_id_generation != 0
     }
 
     fn is_not_ahead_of_snapshot(&self, snapshot_sequence: u64) -> bool {
@@ -319,50 +354,50 @@ impl QueryIndexHeader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryIndexCounterKey {
     Total,
-    Graph(TermId),
-    Predicate(TermId),
-    GraphPredicate(TermId, TermId),
-    PredicateObject(TermId, TermId),
-    GraphPredicateObject(TermId, TermId, TermId),
-    PredicateMutationEpoch(TermId),
+    Graph(QueryTermId),
+    Predicate(QueryTermId),
+    GraphPredicate(QueryTermId, QueryTermId),
+    PredicateObject(QueryTermId, QueryTermId),
+    GraphPredicateObject(QueryTermId, QueryTermId, QueryTermId),
+    PredicateMutationEpoch(QueryTermId),
 }
 
 impl QueryIndexCounterKey {
     fn bytes(self) -> Vec<u8> {
         let mut key = match self {
             Self::Total => return QUERY_INDEX_TOTAL_KEY.to_vec(),
-            Self::Graph(_) | Self::Predicate(_) | Self::PredicateMutationEpoch(_) => vec![0; 17],
-            Self::GraphPredicate(_, _) | Self::PredicateObject(_, _) => vec![0; 33],
-            Self::GraphPredicateObject(_, _, _) => vec![0; 49],
+            Self::Graph(_) | Self::Predicate(_) | Self::PredicateMutationEpoch(_) => vec![0; 9],
+            Self::GraphPredicate(_, _) | Self::PredicateObject(_, _) => vec![0; 17],
+            Self::GraphPredicateObject(_, _, _) => vec![0; 25],
         };
         match self {
             Self::Graph(graph) => {
                 key[0] = QUERY_INDEX_GRAPH_COUNT_TAG;
-                key[1..17].copy_from_slice(&graph.to_be_bytes());
+                key[1..9].copy_from_slice(&graph.to_be_bytes());
             }
             Self::Predicate(predicate) => {
                 key[0] = QUERY_INDEX_PREDICATE_COUNT_TAG;
-                key[1..17].copy_from_slice(&predicate.to_be_bytes());
+                key[1..9].copy_from_slice(&predicate.to_be_bytes());
             }
             Self::GraphPredicate(graph, predicate) => {
                 key[0] = QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG;
-                key[1..17].copy_from_slice(&graph.to_be_bytes());
-                key[17..33].copy_from_slice(&predicate.to_be_bytes());
+                key[1..9].copy_from_slice(&graph.to_be_bytes());
+                key[9..17].copy_from_slice(&predicate.to_be_bytes());
             }
             Self::PredicateObject(predicate, object) => {
                 key[0] = QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG;
-                key[1..17].copy_from_slice(&predicate.to_be_bytes());
-                key[17..33].copy_from_slice(&object.to_be_bytes());
+                key[1..9].copy_from_slice(&predicate.to_be_bytes());
+                key[9..17].copy_from_slice(&object.to_be_bytes());
             }
             Self::GraphPredicateObject(graph, predicate, object) => {
                 key[0] = QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG;
-                key[1..17].copy_from_slice(&graph.to_be_bytes());
-                key[17..33].copy_from_slice(&predicate.to_be_bytes());
-                key[33..49].copy_from_slice(&object.to_be_bytes());
+                key[1..9].copy_from_slice(&graph.to_be_bytes());
+                key[9..17].copy_from_slice(&predicate.to_be_bytes());
+                key[17..25].copy_from_slice(&object.to_be_bytes());
             }
             Self::PredicateMutationEpoch(predicate) => {
                 key[0] = QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG;
-                key[1..17].copy_from_slice(&predicate.to_be_bytes());
+                key[1..9].copy_from_slice(&predicate.to_be_bytes());
             }
             Self::Total => unreachable!("total counter returned before allocating a key"),
         }
@@ -396,7 +431,8 @@ struct QueryIndexCounterUpdate {
 }
 
 struct QueryIndexMaintenancePlan {
-    transitions: Vec<NetQuadTransition>,
+    transitions: Vec<(QueryQuad, bool)>,
+    mappings: Vec<(TermId, QueryTermId)>,
     counters: Vec<QueryIndexCounterUpdate>,
     header: Option<QueryIndexHeader>,
 }
@@ -895,10 +931,15 @@ pub struct GraphStore {
     quads: Keyspace,
     graphs: Keyspace,
     log: Keyspace,
-    qv1_gpos: Keyspace,
-    qv1_spog: Keyspace,
-    qv1_posg: Keyspace,
-    qv1_meta: Keyspace,
+    qv2_gspo: Keyspace,
+    qv2_gpos: Keyspace,
+    qv2_spog: Keyspace,
+    qv2_posg: Keyspace,
+    qv2_ospg: Keyspace,
+    qv2_gosp: Keyspace,
+    qv2_term_to_query: Keyspace,
+    qv2_query_to_term: Keyspace,
+    qv2_meta: Keyspace,
     /// Guards first-write-wins term interning, sharded by term id.
     term_locks: Vec<Mutex<()>>,
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
@@ -982,7 +1023,7 @@ pub struct GraphStore {
     /// Tests use it to prove a reopen served the persisted record instead of
     /// recomputing, and that a stale record was repaired at open.
     diagnostics_computed: AtomicU64,
-    /// Metadata point reads performed by the O(1) qv1 admission gate.
+    /// Metadata point reads performed by the O(1) qv2 admission gate.
     #[cfg(test)]
     query_index_admission_probes: AtomicU64,
     #[cfg(test)]
@@ -1425,6 +1466,8 @@ fn encode_query_index_header(header: &QueryIndexHeader) -> Vec<u8> {
     bytes.extend_from_slice(&header.source_live_quads.to_be_bytes());
     bytes.extend_from_slice(&header.indexed_quads.to_be_bytes());
     bytes.extend_from_slice(&header.last_build_sequence.to_be_bytes());
+    bytes.extend_from_slice(&header.query_id_generation.to_be_bytes());
+    bytes.extend_from_slice(&header.next_query_id.to_be_bytes());
     bytes.extend_from_slice(&(failure.len() as u16).to_be_bytes());
     bytes.extend_from_slice(failure.as_bytes());
     bytes
@@ -1461,8 +1504,14 @@ fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
     let Some(last_build_sequence) = decode_query_index_u64(&bytes[44..52]) else {
         return QueryIndexHeaderRead::Malformed;
     };
+    let Some(query_id_generation) = decode_query_index_u64(&bytes[52..60]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
+    let Some(next_query_id) = decode_query_index_u64(&bytes[60..68]) else {
+        return QueryIndexHeaderRead::Malformed;
+    };
     let failure_len = u16::from_be_bytes(
-        bytes[52..54]
+        bytes[68..70]
             .try_into()
             .expect("fixed query-index header slice"),
     ) as usize;
@@ -1487,12 +1536,14 @@ fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
         source_live_quads,
         indexed_quads,
         last_build_sequence,
+        query_id_generation,
+        next_query_id,
     })
 }
 
-fn query_index_term_at(bytes: &[u8], offset: usize) -> TermId {
-    TermId::from_be_bytes(
-        bytes[offset..offset + 16]
+fn query_index_term_at(bytes: &[u8], offset: usize) -> QueryTermId {
+    QueryTermId::from_be_bytes(
+        bytes[offset..offset + 8]
             .try_into()
             .expect("fixed query-index term slice"),
     )
@@ -1506,38 +1557,36 @@ fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Total)
         }
         Some(b'T') => QueryIndexCounterKeyRead::InvalidLength,
-        Some(QUERY_INDEX_GRAPH_COUNT_TAG) if bytes.len() == 17 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Graph(query_index_term_at(
-                bytes, 1,
-            )))
-        }
-        Some(QUERY_INDEX_PREDICATE_COUNT_TAG) if bytes.len() == 17 => {
+        Some(QUERY_INDEX_GRAPH_COUNT_TAG) if bytes.len() == 9 => QueryIndexCounterKeyRead::Counter(
+            QueryIndexCounterKey::Graph(query_index_term_at(bytes, 1)),
+        ),
+        Some(QUERY_INDEX_PREDICATE_COUNT_TAG) if bytes.len() == 9 => {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Predicate(query_index_term_at(
                 bytes, 1,
             )))
         }
-        Some(QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG) if bytes.len() == 17 => {
+        Some(QUERY_INDEX_PREDICATE_MUTATION_EPOCH_TAG) if bytes.len() == 9 => {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::PredicateMutationEpoch(
                 query_index_term_at(bytes, 1),
             ))
         }
-        Some(QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG) if bytes.len() == 33 => {
+        Some(QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG) if bytes.len() == 17 => {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicate(
                 query_index_term_at(bytes, 1),
-                query_index_term_at(bytes, 17),
+                query_index_term_at(bytes, 9),
             ))
         }
-        Some(QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 33 => {
+        Some(QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 17 => {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::PredicateObject(
                 query_index_term_at(bytes, 1),
-                query_index_term_at(bytes, 17),
+                query_index_term_at(bytes, 9),
             ))
         }
-        Some(QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 49 => {
+        Some(QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 25 => {
             QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicateObject(
                 query_index_term_at(bytes, 1),
+                query_index_term_at(bytes, 9),
                 query_index_term_at(bytes, 17),
-                query_index_term_at(bytes, 33),
             ))
         }
         Some(
@@ -1553,67 +1602,134 @@ fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
     }
 }
 
-fn query_index_key(parts: [TermId; 4]) -> QuadKey {
-    let mut key = [0u8; 64];
+fn query_index_key(parts: [QueryTermId; 4]) -> QueryQuadKey {
+    let mut key = [0u8; 32];
     for (index, term) in parts.into_iter().enumerate() {
-        key[index * 16..(index + 1) * 16].copy_from_slice(&term.to_be_bytes());
+        key[index * 8..(index + 1) * 8].copy_from_slice(&term.to_be_bytes());
     }
     key
 }
 
-fn query_index_prefix(parts: &[TermId]) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(parts.len() * 16);
+fn query_index_prefix(parts: &[QueryTermId]) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(parts.len() * 8);
     for term in parts {
         prefix.extend_from_slice(&term.to_be_bytes());
     }
     prefix
 }
 
-fn qv1_gpos_key(quad: EncodedQuad) -> QuadKey {
+fn qv2_gspo_key(quad: QueryQuad) -> QueryQuadKey {
+    query_index_key([quad.graph, quad.subject, quad.predicate, quad.object])
+}
+
+fn qv2_gpos_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.graph, quad.predicate, quad.object, quad.subject])
 }
 
-fn qv1_spog_key(quad: EncodedQuad) -> QuadKey {
+fn qv2_spog_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.subject, quad.predicate, quad.object, quad.graph])
 }
 
-fn qv1_posg_key(quad: EncodedQuad) -> QuadKey {
+fn qv2_posg_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.predicate, quad.object, quad.subject, quad.graph])
 }
 
-fn decode_qv1_gpos_key(bytes: &[u8]) -> Option<EncodedQuad> {
-    (bytes.len() == 64).then(|| EncodedQuad {
+fn qv2_ospg_key(quad: QueryQuad) -> QueryQuadKey {
+    query_index_key([quad.object, quad.subject, quad.predicate, quad.graph])
+}
+
+fn qv2_gosp_key(quad: QueryQuad) -> QueryQuadKey {
+    query_index_key([quad.graph, quad.object, quad.subject, quad.predicate])
+}
+
+fn decode_qv2_gspo_key(bytes: &[u8]) -> Option<QueryQuad> {
+    (bytes.len() == 32).then(|| QueryQuad {
         graph: query_index_term_at(bytes, 0),
+        subject: query_index_term_at(bytes, 8),
         predicate: query_index_term_at(bytes, 16),
-        object: query_index_term_at(bytes, 32),
-        subject: query_index_term_at(bytes, 48),
+        object: query_index_term_at(bytes, 24),
     })
 }
 
-fn decode_qv1_spog_key(bytes: &[u8]) -> Option<EncodedQuad> {
-    (bytes.len() == 64).then(|| EncodedQuad {
-        subject: query_index_term_at(bytes, 0),
-        predicate: query_index_term_at(bytes, 16),
-        object: query_index_term_at(bytes, 32),
-        graph: query_index_term_at(bytes, 48),
-    })
-}
-
-fn decode_qv1_posg_key(bytes: &[u8]) -> Option<EncodedQuad> {
-    (bytes.len() == 64).then(|| EncodedQuad {
-        predicate: query_index_term_at(bytes, 0),
+fn decode_qv2_gpos_key(bytes: &[u8]) -> Option<QueryQuad> {
+    (bytes.len() == 32).then(|| QueryQuad {
+        graph: query_index_term_at(bytes, 0),
+        predicate: query_index_term_at(bytes, 8),
         object: query_index_term_at(bytes, 16),
-        subject: query_index_term_at(bytes, 32),
-        graph: query_index_term_at(bytes, 48),
+        subject: query_index_term_at(bytes, 24),
     })
+}
+
+fn decode_qv2_spog_key(bytes: &[u8]) -> Option<QueryQuad> {
+    (bytes.len() == 32).then(|| QueryQuad {
+        subject: query_index_term_at(bytes, 0),
+        predicate: query_index_term_at(bytes, 8),
+        object: query_index_term_at(bytes, 16),
+        graph: query_index_term_at(bytes, 24),
+    })
+}
+
+fn decode_qv2_posg_key(bytes: &[u8]) -> Option<QueryQuad> {
+    (bytes.len() == 32).then(|| QueryQuad {
+        predicate: query_index_term_at(bytes, 0),
+        object: query_index_term_at(bytes, 8),
+        subject: query_index_term_at(bytes, 16),
+        graph: query_index_term_at(bytes, 24),
+    })
+}
+
+fn decode_qv2_ospg_key(bytes: &[u8]) -> Option<QueryQuad> {
+    (bytes.len() == 32).then(|| QueryQuad {
+        object: query_index_term_at(bytes, 0),
+        subject: query_index_term_at(bytes, 8),
+        predicate: query_index_term_at(bytes, 16),
+        graph: query_index_term_at(bytes, 24),
+    })
+}
+
+fn decode_qv2_gosp_key(bytes: &[u8]) -> Option<QueryQuad> {
+    (bytes.len() == 32).then(|| QueryQuad {
+        graph: query_index_term_at(bytes, 0),
+        object: query_index_term_at(bytes, 8),
+        subject: query_index_term_at(bytes, 16),
+        predicate: query_index_term_at(bytes, 24),
+    })
+}
+
+fn source_term_at(bytes: &[u8], offset: usize) -> TermId {
+    TermId::from_be_bytes(
+        bytes[offset..offset + 16]
+            .try_into()
+            .expect("fixed source term slice"),
+    )
+}
+
+fn decode_query_term_id_value(bytes: &[u8], context: &'static str) -> Result<QueryTermId> {
+    let raw: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidQueryIndexEncoding {
+            context,
+            message: format!("expected 8 bytes, found {}", bytes.len()),
+        })?;
+    Ok(QueryTermId::from_be_bytes(raw))
+}
+
+fn decode_query_source_term_value(bytes: &[u8], context: &'static str) -> Result<TermId> {
+    let raw: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidQueryIndexEncoding {
+            context,
+            message: format!("expected 16 bytes, found {}", bytes.len()),
+        })?;
+    Ok(TermId::from_be_bytes(raw))
 }
 
 fn decode_source_quad_key(bytes: &[u8]) -> Option<EncodedQuad> {
     (bytes.len() == 64).then(|| EncodedQuad {
-        graph: query_index_term_at(bytes, 0),
-        subject: query_index_term_at(bytes, 16),
-        predicate: query_index_term_at(bytes, 32),
-        object: query_index_term_at(bytes, 48),
+        graph: source_term_at(bytes, 0),
+        subject: source_term_at(bytes, 16),
+        predicate: source_term_at(bytes, 32),
+        object: source_term_at(bytes, 48),
     })
 }
 
@@ -1644,7 +1760,7 @@ fn coalesced_query_index_transitions(mutations: &[QuadMutation]) -> Vec<NetQuadT
         .collect()
 }
 
-fn query_index_live_counter_keys(quad: EncodedQuad) -> [QueryIndexCounterKey; 6] {
+fn query_index_live_counter_keys(quad: QueryQuad) -> [QueryIndexCounterKey; 6] {
     [
         QueryIndexCounterKey::Total,
         QueryIndexCounterKey::Graph(quad.graph),
@@ -1667,23 +1783,30 @@ enum QueryIndexVerificationExpectation {
 
 #[derive(Clone, Copy)]
 enum QueryIndexKeyOrder {
+    Gspo,
     Gpos,
     Spog,
     Posg,
+    Ospg,
+    Gosp,
 }
 
-/// The physical order selected for one trusted qv1 range. This remains
+/// The physical order selected for one trusted qv2 range. This remains
 /// crate-private so query readers never learn Fjall keyspace details.
 #[derive(Clone, Copy)]
 pub(crate) enum QueryIndexCursorOrder {
+    Gspo,
     Gpos,
     Spog,
     Posg,
+    Ospg,
+    Gosp,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryIndexAdmission {
     pub(crate) trusted: bool,
+    pub(crate) query_id_generation: Option<u64>,
     pub(crate) fallback_reason: Option<&'static str>,
     pub(crate) header_reads: u64,
     pub(crate) counter_reads: u64,
@@ -1774,22 +1897,37 @@ impl StoreReadSnapshot {
         store: &GraphStore,
         order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> crate::query_cursor::RawQuadCursor {
-        let (keyspace, prefix) = store.query_index_range(order, pattern);
-        crate::query_cursor::RawQuadCursor::query_index(
+    ) -> Result<crate::query_cursor::RawQuadCursor> {
+        let Some((keyspace, prefix)) = store.query_index_range(&self.snapshot, order, pattern)?
+        else {
+            return Ok(crate::query_cursor::RawQuadCursor::empty());
+        };
+        Ok(crate::query_cursor::RawQuadCursor::query_index(
             self.snapshot.clone(),
             keyspace,
+            &store.qv2_query_to_term,
             order,
             prefix,
-        )
+        ))
     }
 
     pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
         store.snapshot_admission(&self.snapshot)
     }
 
+    pub(crate) fn query_term_id(
+        &self,
+        store: &GraphStore,
+        term: TermId,
+    ) -> Result<Option<QueryTermId>> {
+        store.query_term_id_from_snapshot(&self.snapshot, term)
+    }
+
     #[cfg(feature = "shacl-core")]
     pub(crate) fn qv_g_count(&self, store: &GraphStore, graph: TermId) -> Result<Option<u64>> {
+        let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
+            return Ok(Some(0));
+        };
         self.qv_count(store, QueryIndexCounterKey::Graph(graph), false)
     }
 
@@ -1800,6 +1938,12 @@ impl StoreReadSnapshot {
         graph: TermId,
         predicate: TermId,
     ) -> Result<Option<u64>> {
+        let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
+            return Ok(Some(0));
+        };
+        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
+            return Ok(Some(0));
+        };
         self.qv_count(
             store,
             QueryIndexCounterKey::GraphPredicate(graph, predicate),
@@ -1815,6 +1959,15 @@ impl StoreReadSnapshot {
         predicate: TermId,
         object: TermId,
     ) -> Result<Option<u64>> {
+        let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
+            return Ok(Some(0));
+        };
+        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
+            return Ok(Some(0));
+        };
+        let Some(object) = store.query_term_id_from_snapshot(&self.snapshot, object)? else {
+            return Ok(Some(0));
+        };
         self.qv_count(
             store,
             QueryIndexCounterKey::GraphPredicateObject(graph, predicate, object),
@@ -2082,7 +2235,7 @@ impl GraphStore {
         snapshot: &Snapshot,
     ) -> Result<QueryIndexHeaderRead> {
         Ok(
-            match snapshot.get(&self.qv1_meta, QUERY_INDEX_HEADER_KEY)? {
+            match snapshot.get(&self.qv2_meta, QUERY_INDEX_HEADER_KEY)? {
                 Some(bytes) => decode_query_index_header(bytes.as_ref()),
                 None => QueryIndexHeaderRead::Absent,
             },
@@ -2095,7 +2248,7 @@ impl GraphStore {
         header: &QueryIndexHeader,
     ) {
         batch.insert(
-            &self.qv1_meta,
+            &self.qv2_meta,
             QUERY_INDEX_HEADER_KEY,
             encode_query_index_header(header),
         );
@@ -2108,6 +2261,78 @@ impl GraphStore {
         reason: &'static str,
     ) {
         self.stage_query_index_header(batch, &QueryIndexHeader::failed_from(previous, reason));
+    }
+
+    fn query_term_id_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        term: TermId,
+    ) -> Result<Option<QueryTermId>> {
+        snapshot
+            .get(&self.qv2_term_to_query, term.to_be_bytes())?
+            .map(|value| decode_query_term_id_value(value.as_ref(), "term-to-query mapping"))
+            .transpose()
+    }
+
+    fn source_term_id_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        term: QueryTermId,
+    ) -> Result<Option<TermId>> {
+        snapshot
+            .get(&self.qv2_query_to_term, term.to_be_bytes())?
+            .map(|value| decode_query_source_term_value(value.as_ref(), "query-to-term mapping"))
+            .transpose()
+    }
+
+    fn query_quad_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        quad: EncodedQuad,
+    ) -> Result<Option<QueryQuad>> {
+        let Some(graph) = self.query_term_id_from_snapshot(snapshot, quad.graph)? else {
+            return Ok(None);
+        };
+        let Some(subject) = self.query_term_id_from_snapshot(snapshot, quad.subject)? else {
+            return Ok(None);
+        };
+        let Some(predicate) = self.query_term_id_from_snapshot(snapshot, quad.predicate)? else {
+            return Ok(None);
+        };
+        let Some(object) = self.query_term_id_from_snapshot(snapshot, quad.object)? else {
+            return Ok(None);
+        };
+        Ok(Some(QueryQuad {
+            graph,
+            subject,
+            predicate,
+            object,
+        }))
+    }
+
+    fn source_quad_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        quad: QueryQuad,
+    ) -> Result<Option<EncodedQuad>> {
+        let Some(graph) = self.source_term_id_from_snapshot(snapshot, quad.graph)? else {
+            return Ok(None);
+        };
+        let Some(subject) = self.source_term_id_from_snapshot(snapshot, quad.subject)? else {
+            return Ok(None);
+        };
+        let Some(predicate) = self.source_term_id_from_snapshot(snapshot, quad.predicate)? else {
+            return Ok(None);
+        };
+        let Some(object) = self.source_term_id_from_snapshot(snapshot, quad.object)? else {
+            return Ok(None);
+        };
+        Ok(Some(EncodedQuad {
+            graph,
+            subject,
+            predicate,
+            object,
+        }))
     }
 
     fn count_live_source_rows(&self, snapshot: &Snapshot) -> Result<u64> {
@@ -2135,17 +2360,22 @@ impl GraphStore {
                 .ok_or(StoreError::QueryIndexVerificationFailed(
                     "index-row-count-overflow",
                 ))?;
-            well_formed &= key.as_ref().len() == 64 && value.as_ref().is_empty();
+            well_formed &= key.as_ref().len() == 32 && value.as_ref().is_empty();
         }
         Ok((rows, well_formed))
     }
 
     fn query_index_keyspaces_are_empty(&self, snapshot: &Snapshot) -> Result<bool> {
         for keyspace in [
-            &self.qv1_gpos,
-            &self.qv1_spog,
-            &self.qv1_posg,
-            &self.qv1_meta,
+            &self.qv2_gspo,
+            &self.qv2_gpos,
+            &self.qv2_spog,
+            &self.qv2_posg,
+            &self.qv2_ospg,
+            &self.qv2_gosp,
+            &self.qv2_term_to_query,
+            &self.qv2_query_to_term,
+            &self.qv2_meta,
         ] {
             if let Some(guard) = snapshot.iter(keyspace).next() {
                 let _ = guard.into_inner()?;
@@ -2169,7 +2399,7 @@ impl GraphStore {
         self.read_snapshot().snapshot
     }
 
-    /// O(1) qv1 eligibility gate for a single execution snapshot. Full source
+    /// O(1) qv2 eligibility gate for a single execution snapshot. Full source
     /// and qv cross-checking belongs to open-time verification and explicit
     /// maintenance checks; doing it here would erase the index's query value.
     fn snapshot_admission(&self, snapshot: &Snapshot) -> Result<QueryIndexAdmission> {
@@ -2180,6 +2410,7 @@ impl GraphStore {
             QueryIndexHeaderRead::Absent => {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
+                    query_id_generation: None,
                     fallback_reason: Some("metadata-missing"),
                     header_reads: 1,
                     counter_reads: 0,
@@ -2188,6 +2419,7 @@ impl GraphStore {
             QueryIndexHeaderRead::Malformed => {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
+                    query_id_generation: None,
                     fallback_reason: Some("metadata-malformed"),
                     header_reads: 1,
                     counter_reads: 0,
@@ -2217,6 +2449,7 @@ impl GraphStore {
         if let Some(fallback_reason) = fallback_reason {
             return Ok(QueryIndexAdmission {
                 trusted: false,
+                query_id_generation: None,
                 fallback_reason: Some(fallback_reason),
                 header_reads: 1,
                 counter_reads: 0,
@@ -2235,6 +2468,7 @@ impl GraphStore {
         };
         Ok(QueryIndexAdmission {
             trusted,
+            query_id_generation: trusted.then_some(header.query_id_generation),
             fallback_reason,
             header_reads: 1,
             counter_reads: 1,
@@ -2243,10 +2477,27 @@ impl GraphStore {
 
     fn query_index_range(
         &self,
+        snapshot: &Snapshot,
         order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> (&Keyspace, Vec<u8>) {
+    ) -> Result<Option<(&Keyspace, Vec<u8>)>> {
         let terms = match order {
+            QueryIndexCursorOrder::Gspo => match (
+                pattern.graph,
+                pattern.subject,
+                pattern.predicate,
+                pattern.object,
+            ) {
+                (Some(graph), Some(subject), Some(predicate), Some(object)) => {
+                    vec![graph, subject, predicate, object]
+                }
+                (Some(graph), Some(subject), Some(predicate), None) => {
+                    vec![graph, subject, predicate]
+                }
+                (Some(graph), Some(subject), None, _) => vec![graph, subject],
+                (Some(graph), None, _, _) => vec![graph],
+                (None, _, _, _) => Vec::new(),
+            },
             QueryIndexCursorOrder::Gpos => match (pattern.graph, pattern.predicate, pattern.object)
             {
                 (Some(graph), Some(predicate), Some(object)) => vec![graph, predicate, object],
@@ -2269,13 +2520,49 @@ impl GraphStore {
                 (Some(predicate), None) => vec![predicate],
                 (None, _) => Vec::new(),
             },
+            QueryIndexCursorOrder::Ospg => {
+                match (pattern.object, pattern.subject, pattern.predicate) {
+                    (Some(object), Some(subject), Some(predicate)) => {
+                        vec![object, subject, predicate]
+                    }
+                    (Some(object), Some(subject), None) => vec![object, subject],
+                    (Some(object), None, _) => vec![object],
+                    (None, _, _) => Vec::new(),
+                }
+            }
+            QueryIndexCursorOrder::Gosp => match (
+                pattern.graph,
+                pattern.object,
+                pattern.subject,
+                pattern.predicate,
+            ) {
+                (Some(graph), Some(object), Some(subject), Some(predicate)) => {
+                    vec![graph, object, subject, predicate]
+                }
+                (Some(graph), Some(object), Some(subject), None) => {
+                    vec![graph, object, subject]
+                }
+                (Some(graph), Some(object), None, _) => vec![graph, object],
+                (Some(graph), None, _, _) => vec![graph],
+                (None, _, _, _) => Vec::new(),
+            },
         };
         let keyspace = match order {
-            QueryIndexCursorOrder::Gpos => &self.qv1_gpos,
-            QueryIndexCursorOrder::Spog => &self.qv1_spog,
-            QueryIndexCursorOrder::Posg => &self.qv1_posg,
+            QueryIndexCursorOrder::Gspo => &self.qv2_gspo,
+            QueryIndexCursorOrder::Gpos => &self.qv2_gpos,
+            QueryIndexCursorOrder::Spog => &self.qv2_spog,
+            QueryIndexCursorOrder::Posg => &self.qv2_posg,
+            QueryIndexCursorOrder::Ospg => &self.qv2_ospg,
+            QueryIndexCursorOrder::Gosp => &self.qv2_gosp,
         };
-        (keyspace, query_index_prefix(&terms))
+        let mut query_terms = Vec::with_capacity(terms.len());
+        for term in terms {
+            let Some(term) = self.query_term_id_from_snapshot(snapshot, term)? else {
+                return Ok(None);
+            };
+            query_terms.push(term);
+        }
+        Ok(Some((keyspace, query_index_prefix(&query_terms))))
     }
 
     pub(crate) fn query_index_status(&self) -> Result<QueryIndexStatus> {
@@ -2284,14 +2571,20 @@ impl GraphStore {
         let header = self.query_index_header_from_snapshot(&snapshot)?;
         let source_live_quads = self.count_live_source_rows(&snapshot)?;
         let (indexed_quads, gpos_well_formed) =
-            self.summarize_qv_rows(&snapshot, &self.qv1_gpos)?;
-        let (spog_quads, spog_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv1_spog)?;
-        let (posg_quads, posg_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv1_posg)?;
-        let (state, last_build_sequence) = match header {
-            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0),
-            QueryIndexHeaderRead::Malformed => {
-                (QueryIndexState::Failed("metadata-malformed".to_owned()), 0)
-            }
+            self.summarize_qv_rows(&snapshot, &self.qv2_gpos)?;
+        let (gspo_quads, gspo_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_gspo)?;
+        let (spog_quads, spog_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_spog)?;
+        let (posg_quads, posg_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_posg)?;
+        let (ospg_quads, ospg_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_ospg)?;
+        let (gosp_quads, gosp_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_gosp)?;
+        let (state, last_build_sequence, query_id_generation, query_term_ids) = match header {
+            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0),
+            QueryIndexHeaderRead::Malformed => (
+                QueryIndexState::Failed("metadata-malformed".to_owned()),
+                0,
+                0,
+                0,
+            ),
             QueryIndexHeaderRead::Valid(header) => {
                 let total_matches_header = matches!(
                     self.query_index_counter_from_snapshot(&snapshot, QueryIndexCounterKey::Total)?,
@@ -2301,25 +2594,40 @@ impl GraphStore {
                     && header.is_not_ahead_of_snapshot(snapshot_sequence)
                     && header.source_live_quads == source_live_quads
                     && header.indexed_quads == indexed_quads
+                    && indexed_quads == gspo_quads
                     && indexed_quads == spog_quads
                     && indexed_quads == posg_quads
+                    && indexed_quads == ospg_quads
+                    && indexed_quads == gosp_quads
+                    && gspo_well_formed
                     && gpos_well_formed
                     && spog_well_formed
                     && posg_well_formed
+                    && ospg_well_formed
+                    && gosp_well_formed
                     && total_matches_header;
                 if matches!(header.state, StoredQueryIndexState::Ready) && !ready_matches_snapshot {
                     (
                         QueryIndexState::Failed("ready-status-mismatch".to_owned()),
                         header.last_build_sequence,
+                        header.query_id_generation,
+                        header.next_query_id,
                     )
                 } else {
-                    (header.state(), header.last_build_sequence)
+                    (
+                        header.state(),
+                        header.last_build_sequence,
+                        header.query_id_generation,
+                        header.next_query_id,
+                    )
                 }
             }
         };
         Ok(QueryIndexStatus {
             schema_version: QUERY_INDEX_SCHEMA_VERSION,
             state,
+            query_id_generation,
+            query_term_ids,
             source_live_quads,
             indexed_quads,
             last_build_sequence,
@@ -2328,12 +2636,19 @@ impl GraphStore {
 
     pub(crate) fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
         let snapshot = self.query_index_snapshot();
-        let (state, source_live_quads, indexed_quads, last_build_sequence) = match self
-            .query_index_header_from_snapshot(&snapshot)?
-        {
-            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0),
+        let (
+            state,
+            query_id_generation,
+            query_term_ids,
+            source_live_quads,
+            indexed_quads,
+            last_build_sequence,
+        ) = match self.query_index_header_from_snapshot(&snapshot)? {
+            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0, 0, 0),
             QueryIndexHeaderRead::Malformed => (
                 QueryIndexState::Failed("metadata-malformed".to_owned()),
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -2356,6 +2671,8 @@ impl GraphStore {
                     };
                 (
                     state,
+                    header.query_id_generation,
+                    header.next_query_id,
                     header.source_live_quads,
                     header.indexed_quads,
                     header.last_build_sequence,
@@ -2365,6 +2682,8 @@ impl GraphStore {
         Ok(QueryIndexStatus {
             schema_version: QUERY_INDEX_SCHEMA_VERSION,
             state,
+            query_id_generation,
+            query_term_ids,
             source_live_quads,
             indexed_quads,
             last_build_sequence,
@@ -2404,7 +2723,7 @@ impl GraphStore {
                 }
                 let mut batch = self.buffered_batch();
                 self.stage_query_index_header(&mut batch, &QueryIndexHeader::empty_ready());
-                batch.insert(&self.qv1_meta, QUERY_INDEX_TOTAL_KEY, 0u64.to_be_bytes());
+                batch.insert(&self.qv2_meta, QUERY_INDEX_TOTAL_KEY, 0u64.to_be_bytes());
                 self.commit_fjall_batch(batch)
             }
             QueryIndexHeaderRead::Malformed => {
@@ -2435,7 +2754,7 @@ impl GraphStore {
         &self,
         snapshot: &Snapshot,
         keyspace: &Keyspace,
-        key: QuadKey,
+        key: QueryQuadKey,
     ) -> Result<bool> {
         Ok(snapshot
             .get(keyspace, key)?
@@ -2468,14 +2787,27 @@ impl GraphStore {
                 report.report.checked_source_rows.checked_add(1).ok_or(
                     StoreError::QueryIndexVerificationFailed("source-check-count-overflow"),
                 )?;
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv1_gpos, qv1_gpos_key(quad))? {
+            let Some(quad) = self.query_quad_from_snapshot(snapshot, quad)? else {
+                report.problem("source-query-id-mapping-missing");
+                continue;
+            };
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_gspo, qv2_gspo_key(quad))? {
+                report.problem("source-gspo-missing-or-nonempty");
+            }
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_gpos, qv2_gpos_key(quad))? {
                 report.problem("source-gpos-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv1_spog, qv1_spog_key(quad))? {
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_spog, qv2_spog_key(quad))? {
                 report.problem("source-spog-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv1_posg, qv1_posg_key(quad))? {
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_posg, qv2_posg_key(quad))? {
                 report.problem("source-posg-missing-or-nonempty");
+            }
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_ospg, qv2_ospg_key(quad))? {
+                report.problem("source-ospg-missing-or-nonempty");
+            }
+            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_gosp, qv2_gosp_key(quad))? {
+                report.problem("source-gosp-missing-or-nonempty");
             }
         }
         Ok(())
@@ -2489,23 +2821,41 @@ impl GraphStore {
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<u64> {
         let (keyspace, key_problem, value_problem, source_problem) = match order {
+            QueryIndexKeyOrder::Gspo => (
+                &self.qv2_gspo,
+                "qv-gspo-key-length",
+                "qv-gspo-value-nonempty",
+                "qv-gspo-source-missing",
+            ),
             QueryIndexKeyOrder::Gpos => (
-                &self.qv1_gpos,
+                &self.qv2_gpos,
                 "qv-gpos-key-length",
                 "qv-gpos-value-nonempty",
                 "qv-gpos-source-missing",
             ),
             QueryIndexKeyOrder::Spog => (
-                &self.qv1_spog,
+                &self.qv2_spog,
                 "qv-spog-key-length",
                 "qv-spog-value-nonempty",
                 "qv-spog-source-missing",
             ),
             QueryIndexKeyOrder::Posg => (
-                &self.qv1_posg,
+                &self.qv2_posg,
                 "qv-posg-key-length",
                 "qv-posg-value-nonempty",
                 "qv-posg-source-missing",
+            ),
+            QueryIndexKeyOrder::Ospg => (
+                &self.qv2_ospg,
+                "qv-ospg-key-length",
+                "qv-ospg-value-nonempty",
+                "qv-ospg-source-missing",
+            ),
+            QueryIndexKeyOrder::Gosp => (
+                &self.qv2_gosp,
+                "qv-gosp-key-length",
+                "qv-gosp-value-nonempty",
+                "qv-gosp-source-missing",
             ),
         };
         let mut rows = 0u64;
@@ -2531,12 +2881,19 @@ impl GraphStore {
                 report.problem(value_problem);
             }
             let quad = match order {
-                QueryIndexKeyOrder::Gpos => decode_qv1_gpos_key(key.as_ref()),
-                QueryIndexKeyOrder::Spog => decode_qv1_spog_key(key.as_ref()),
-                QueryIndexKeyOrder::Posg => decode_qv1_posg_key(key.as_ref()),
+                QueryIndexKeyOrder::Gspo => decode_qv2_gspo_key(key.as_ref()),
+                QueryIndexKeyOrder::Gpos => decode_qv2_gpos_key(key.as_ref()),
+                QueryIndexKeyOrder::Spog => decode_qv2_spog_key(key.as_ref()),
+                QueryIndexKeyOrder::Posg => decode_qv2_posg_key(key.as_ref()),
+                QueryIndexKeyOrder::Ospg => decode_qv2_ospg_key(key.as_ref()),
+                QueryIndexKeyOrder::Gosp => decode_qv2_gosp_key(key.as_ref()),
             };
             let Some(quad) = quad else {
                 report.problem(key_problem);
+                continue;
+            };
+            let Some(quad) = self.source_quad_from_snapshot(snapshot, quad)? else {
+                report.problem("qv-query-id-mapping-missing");
                 continue;
             };
             let source_key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
@@ -2559,7 +2916,7 @@ impl GraphStore {
         mismatch_problem: &'static str,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
-        match snapshot.get(&self.qv1_meta, key.bytes())? {
+        match snapshot.get(&self.qv2_meta, key.bytes())? {
             None => report.problem(missing_problem),
             Some(value) => match decode_query_index_u64(value.as_ref()) {
                 Some(actual) if actual == expected => {}
@@ -2573,7 +2930,7 @@ impl GraphStore {
         &self,
         snapshot: &Snapshot,
         dimension: usize,
-        terms: [TermId; 3],
+        terms: [QueryTermId; 3],
         expected: u64,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
@@ -2611,11 +2968,11 @@ impl GraphStore {
         dimension: usize,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
-        let mut current = None::<[TermId; 3]>;
+        let mut current = None::<[QueryTermId; 3]>;
         let mut count = 0u64;
-        for guard in snapshot.iter(&self.qv1_gpos) {
+        for guard in snapshot.iter(&self.qv2_gpos) {
             let (key, _) = guard.into_inner()?;
-            let Some(quad) = decode_qv1_gpos_key(key.as_ref()) else {
+            let Some(quad) = decode_qv2_gpos_key(key.as_ref()) else {
                 continue;
             };
             let terms = [quad.graph, quad.predicate, quad.object];
@@ -2641,7 +2998,7 @@ impl GraphStore {
     fn verify_predicate_mutation_epoch(
         &self,
         snapshot: &Snapshot,
-        predicate: TermId,
+        predicate: QueryTermId,
         source_epoch: Option<u64>,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
@@ -2650,7 +3007,7 @@ impl GraphStore {
             return Ok(());
         };
         match snapshot.get(
-            &self.qv1_meta,
+            &self.qv2_meta,
             QueryIndexCounterKey::PredicateMutationEpoch(predicate).bytes(),
         )? {
             None => report.problem("mutation-epoch-missing"),
@@ -2666,7 +3023,7 @@ impl GraphStore {
         &self,
         snapshot: &Snapshot,
         dimension: usize,
-        terms: [TermId; 2],
+        terms: [QueryTermId; 2],
         expected: u64,
         source_epoch: Option<u64>,
         report: &mut QueryIndexVerificationBuilder,
@@ -2705,11 +3062,11 @@ impl GraphStore {
         source_epoch: Option<u64>,
         report: &mut QueryIndexVerificationBuilder,
     ) -> Result<()> {
-        let mut current = None::<[TermId; 2]>;
+        let mut current = None::<[QueryTermId; 2]>;
         let mut count = 0u64;
-        for guard in snapshot.iter(&self.qv1_posg) {
+        for guard in snapshot.iter(&self.qv2_posg) {
             let (key, _) = guard.into_inner()?;
-            let Some(quad) = decode_qv1_posg_key(key.as_ref()) else {
+            let Some(quad) = decode_qv2_posg_key(key.as_ref()) else {
                 continue;
             };
             let terms = [quad.predicate, quad.object];
@@ -2753,21 +3110,21 @@ impl GraphStore {
     ) -> Result<bool> {
         let mut rows = match key {
             QueryIndexCounterKey::Graph(graph) => {
-                snapshot.prefix(&self.qv1_gpos, query_index_prefix(&[graph]))
+                snapshot.prefix(&self.qv2_gpos, query_index_prefix(&[graph]))
             }
             QueryIndexCounterKey::Predicate(predicate)
             | QueryIndexCounterKey::PredicateMutationEpoch(predicate) => {
-                snapshot.prefix(&self.qv1_posg, query_index_prefix(&[predicate]))
+                snapshot.prefix(&self.qv2_posg, query_index_prefix(&[predicate]))
             }
             QueryIndexCounterKey::GraphPredicate(graph, predicate) => {
-                snapshot.prefix(&self.qv1_gpos, query_index_prefix(&[graph, predicate]))
+                snapshot.prefix(&self.qv2_gpos, query_index_prefix(&[graph, predicate]))
             }
             QueryIndexCounterKey::PredicateObject(predicate, object) => {
-                snapshot.prefix(&self.qv1_posg, query_index_prefix(&[predicate, object]))
+                snapshot.prefix(&self.qv2_posg, query_index_prefix(&[predicate, object]))
             }
             QueryIndexCounterKey::GraphPredicateObject(graph, predicate, object) => snapshot
                 .prefix(
-                    &self.qv1_gpos,
+                    &self.qv2_gpos,
                     query_index_prefix(&[graph, predicate, object]),
                 ),
             QueryIndexCounterKey::Total => return Ok(true),
@@ -2789,7 +3146,7 @@ impl GraphStore {
     ) -> Result<()> {
         let mut headers = 0u64;
         let mut totals = 0u64;
-        for guard in snapshot.iter(&self.qv1_meta) {
+        for guard in snapshot.iter(&self.qv2_meta) {
             let (key, value) = guard.into_inner()?;
             match decode_query_index_counter_key(key.as_ref()) {
                 QueryIndexCounterKeyRead::Header => {
@@ -2857,6 +3214,73 @@ impl GraphStore {
         Ok(())
     }
 
+    fn verify_query_id_mappings(
+        &self,
+        snapshot: &Snapshot,
+        header: Option<&QueryIndexHeader>,
+        report: &mut QueryIndexVerificationBuilder,
+    ) -> Result<()> {
+        let mut forward_count = 0u64;
+        for guard in snapshot.iter(&self.qv2_term_to_query) {
+            let (key, value) = guard.into_inner()?;
+            let Ok(term_bytes) = <[u8; 16]>::try_from(key.as_ref()) else {
+                report.problem("term-to-query-key-length");
+                continue;
+            };
+            let Ok(query_bytes) = <[u8; 8]>::try_from(value.as_ref()) else {
+                report.problem("term-to-query-value-length");
+                continue;
+            };
+            let term = TermId::from_be_bytes(term_bytes);
+            let query = QueryTermId::from_be_bytes(query_bytes);
+            forward_count =
+                forward_count
+                    .checked_add(1)
+                    .ok_or(StoreError::QueryIndexVerificationFailed(
+                        "query-id-mapping-count-overflow",
+                    ))?;
+            match snapshot.get(&self.qv2_query_to_term, query.to_be_bytes())? {
+                Some(reverse) if reverse.as_ref() == term.to_be_bytes() => {}
+                _ => report.problem("term-to-query-reverse-mismatch"),
+            }
+            if header.is_some_and(|header| query.0 >= header.next_query_id) {
+                report.problem("query-id-outside-header-range");
+            }
+        }
+
+        let mut reverse_count = 0u64;
+        for guard in snapshot.iter(&self.qv2_query_to_term) {
+            let (key, value) = guard.into_inner()?;
+            let Ok(query_bytes) = <[u8; 8]>::try_from(key.as_ref()) else {
+                report.problem("query-to-term-key-length");
+                continue;
+            };
+            let Ok(term_bytes) = <[u8; 16]>::try_from(value.as_ref()) else {
+                report.problem("query-to-term-value-length");
+                continue;
+            };
+            let query = QueryTermId::from_be_bytes(query_bytes);
+            let term = TermId::from_be_bytes(term_bytes);
+            reverse_count =
+                reverse_count
+                    .checked_add(1)
+                    .ok_or(StoreError::QueryIndexVerificationFailed(
+                        "query-id-mapping-count-overflow",
+                    ))?;
+            match snapshot.get(&self.qv2_term_to_query, term.to_be_bytes())? {
+                Some(forward) if forward.as_ref() == query.to_be_bytes() => {}
+                _ => report.problem("query-to-term-forward-mismatch"),
+            }
+        }
+        if forward_count != reverse_count {
+            report.problem("query-id-mapping-total-mismatch");
+        }
+        if header.is_some_and(|header| header.next_query_id != forward_count) {
+            report.problem("query-id-header-total-mismatch");
+        }
+        Ok(())
+    }
+
     fn verify_query_index_snapshot(
         &self,
         snapshot: &Snapshot,
@@ -2874,14 +3298,25 @@ impl GraphStore {
         };
         let mut report = QueryIndexVerificationBuilder::new(full);
         self.verify_source_to_qv_rows(snapshot, full, &mut report)?;
+        let gspo_rows =
+            self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Gspo, full, &mut report)?;
         let gpos_rows =
             self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Gpos, full, &mut report)?;
         let spog_rows =
             self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Spog, full, &mut report)?;
         let posg_rows =
             self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Posg, full, &mut report)?;
+        let ospg_rows =
+            self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Ospg, full, &mut report)?;
+        let gosp_rows =
+            self.verify_qv_rows(snapshot, QueryIndexKeyOrder::Gosp, full, &mut report)?;
         report.report.indexed_quads = gpos_rows;
-        if gpos_rows != spog_rows || gpos_rows != posg_rows {
+        if gpos_rows != gspo_rows
+            || gpos_rows != spog_rows
+            || gpos_rows != posg_rows
+            || gpos_rows != ospg_rows
+            || gpos_rows != gosp_rows
+        {
             report.problem("qv-row-total-mismatch");
         }
 
@@ -2933,6 +3368,7 @@ impl GraphStore {
             self.verify_posg_counter_dimension(snapshot, 1, source_epoch, &mut report)?;
             self.verify_posg_counter_dimension(snapshot, 2, source_epoch, &mut report)?;
             self.verify_query_index_meta_records(snapshot, header, &mut report)?;
+            self.verify_query_id_mappings(snapshot, header, &mut report)?;
         }
         Ok(report.finish())
     }
@@ -3125,22 +3561,118 @@ impl GraphStore {
     }
 
     fn clear_query_index_derived_data(&self) -> Result<()> {
-        self.clear_query_index_keyspace(&self.qv1_gpos, false)?;
-        self.clear_query_index_keyspace(&self.qv1_spog, false)?;
-        self.clear_query_index_keyspace(&self.qv1_posg, false)?;
-        self.clear_query_index_keyspace(&self.qv1_meta, true)
+        self.clear_query_index_keyspace(&self.qv2_gspo, false)?;
+        self.clear_query_index_keyspace(&self.qv2_gpos, false)?;
+        self.clear_query_index_keyspace(&self.qv2_spog, false)?;
+        self.clear_query_index_keyspace(&self.qv2_posg, false)?;
+        self.clear_query_index_keyspace(&self.qv2_ospg, false)?;
+        self.clear_query_index_keyspace(&self.qv2_gosp, false)?;
+        self.clear_query_index_keyspace(&self.qv2_term_to_query, false)?;
+        self.clear_query_index_keyspace(&self.qv2_query_to_term, false)?;
+        self.clear_query_index_keyspace(&self.qv2_meta, true)
     }
 
-    fn build_query_index_chunk(&self, quads: &[EncodedQuad], source_epoch: u64) -> Result<()> {
+    fn rebuild_query_term_id(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        allocated: &mut HashMap<TermId, QueryTermId>,
+        next_query_id: &mut u64,
+        term: TermId,
+    ) -> Result<QueryTermId> {
+        if let Some(query) = allocated.get(&term) {
+            return Ok(*query);
+        }
+        if let Some(value) = self.qv2_term_to_query.get(term.to_be_bytes())? {
+            let query = decode_query_term_id_value(value.as_ref(), "term-to-query mapping")?;
+            let Some(reverse) = self.qv2_query_to_term.get(query.to_be_bytes())? else {
+                return Err(StoreError::QueryIndexVerificationFailed(
+                    "rebuild-query-id-reverse-missing",
+                ));
+            };
+            if reverse.as_ref() != term.to_be_bytes() {
+                return Err(StoreError::QueryIndexVerificationFailed(
+                    "rebuild-query-id-reverse-mismatch",
+                ));
+            }
+            allocated.insert(term, query);
+            return Ok(query);
+        }
+
+        let query = QueryTermId(*next_query_id);
+        *next_query_id =
+            next_query_id
+                .checked_add(1)
+                .ok_or(StoreError::QueryIndexVerificationFailed(
+                    "query-id-space-exhausted",
+                ))?;
+        if self.qv2_query_to_term.get(query.to_be_bytes())?.is_some() {
+            return Err(StoreError::QueryIndexVerificationFailed(
+                "rebuild-query-id-already-used",
+            ));
+        }
+        batch.insert(
+            &self.qv2_term_to_query,
+            term.to_be_bytes(),
+            query.to_be_bytes(),
+        );
+        batch.insert(
+            &self.qv2_query_to_term,
+            query.to_be_bytes(),
+            term.to_be_bytes(),
+        );
+        allocated.insert(term, query);
+        Ok(query)
+    }
+
+    fn build_query_index_chunk(
+        &self,
+        quads: &[EncodedQuad],
+        source_epoch: u64,
+        next_query_id: &mut u64,
+    ) -> Result<()> {
         let mut increments = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, u64)>::new();
         let mut predicates = BTreeSet::new();
+        let mut allocated = HashMap::new();
         let mut batch = self.buffered_batch();
         for quad in quads {
-            batch.insert(&self.qv1_gpos, qv1_gpos_key(*quad), Vec::<u8>::new());
-            batch.insert(&self.qv1_spog, qv1_spog_key(*quad), Vec::<u8>::new());
-            batch.insert(&self.qv1_posg, qv1_posg_key(*quad), Vec::<u8>::new());
+            let quad = QueryQuad {
+                graph: self.rebuild_query_term_id(
+                    &mut batch,
+                    &mut allocated,
+                    next_query_id,
+                    quad.graph,
+                )?,
+                subject: self.rebuild_query_term_id(
+                    &mut batch,
+                    &mut allocated,
+                    next_query_id,
+                    quad.subject,
+                )?,
+                predicate: self.rebuild_query_term_id(
+                    &mut batch,
+                    &mut allocated,
+                    next_query_id,
+                    quad.predicate,
+                )?,
+                object: self.rebuild_query_term_id(
+                    &mut batch,
+                    &mut allocated,
+                    next_query_id,
+                    quad.object,
+                )?,
+            };
+            for (keyspace, key) in [
+                (&self.qv2_gspo, qv2_gspo_key(quad)),
+                (&self.qv2_gpos, qv2_gpos_key(quad)),
+                (&self.qv2_spog, qv2_spog_key(quad)),
+                (&self.qv2_posg, qv2_posg_key(quad)),
+                (&self.qv2_ospg, qv2_ospg_key(quad)),
+                (&self.qv2_gosp, qv2_gosp_key(quad)),
+            ] {
+                batch.insert(keyspace, key, Vec::<u8>::new());
+            }
             predicates.insert(quad.predicate);
-            for counter in query_index_live_counter_keys(*quad) {
+            for counter in query_index_live_counter_keys(quad) {
                 let entry = increments.entry(counter.bytes()).or_insert((counter, 0));
                 entry.1 =
                     entry
@@ -3152,7 +3684,7 @@ impl GraphStore {
             }
         }
         for (_, (counter, increment)) in increments {
-            let current = match self.qv1_meta.get(counter.bytes())? {
+            let current = match self.qv2_meta.get(counter.bytes())? {
                 None => 0,
                 Some(value) => decode_query_index_u64(value.as_ref()).ok_or(
                     StoreError::QueryIndexVerificationFailed("rebuild-counter-malformed"),
@@ -3164,11 +3696,11 @@ impl GraphStore {
                     .ok_or(StoreError::QueryIndexVerificationFailed(
                         "rebuild-counter-overflow",
                     ))?;
-            batch.insert(&self.qv1_meta, counter.bytes(), next.to_be_bytes());
+            batch.insert(&self.qv2_meta, counter.bytes(), next.to_be_bytes());
         }
         for predicate in predicates {
             batch.insert(
-                &self.qv1_meta,
+                &self.qv2_meta,
                 QueryIndexCounterKey::PredicateMutationEpoch(predicate).bytes(),
                 source_epoch.to_be_bytes(),
             );
@@ -3176,8 +3708,9 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
-    fn build_query_index_rows(&self, snapshot: &Snapshot, source_epoch: u64) -> Result<u64> {
+    fn build_query_index_rows(&self, snapshot: &Snapshot, source_epoch: u64) -> Result<(u64, u64)> {
         let mut rows = 0u64;
+        let mut next_query_id = 0u64;
         let mut chunk = Vec::with_capacity(QUERY_INDEX_BUILD_CHUNK_ROWS);
         for guard in snapshot.iter(&self.quads) {
             let (key, value) = guard.into_inner()?;
@@ -3194,14 +3727,14 @@ impl GraphStore {
                 ))?;
             chunk.push(quad);
             if chunk.len() == QUERY_INDEX_BUILD_CHUNK_ROWS {
-                self.build_query_index_chunk(&chunk, source_epoch)?;
+                self.build_query_index_chunk(&chunk, source_epoch, &mut next_query_id)?;
                 chunk.clear();
             }
         }
         if !chunk.is_empty() {
-            self.build_query_index_chunk(&chunk, source_epoch)?;
+            self.build_query_index_chunk(&chunk, source_epoch, &mut next_query_id)?;
         }
-        Ok(rows)
+        Ok((rows, next_query_id))
     }
 
     fn mark_query_index_rebuild_failed(&self, reason: &'static str) -> Result<()> {
@@ -3250,7 +3783,12 @@ impl GraphStore {
                 .map(|header| header.source_epoch.max(header.index_epoch))
                 .and_then(|prior| prior.max(source_sequence).checked_add(1))
                 .unwrap_or(source_sequence);
-            let source_live_quads = self.build_query_index_rows(&source_snapshot, source_epoch)?;
+            let query_id_generation = previous
+                .as_ref()
+                .and_then(|header| header.query_id_generation.checked_add(1))
+                .unwrap_or(1);
+            let (source_live_quads, next_query_id) =
+                self.build_query_index_rows(&source_snapshot, source_epoch)?;
             let candidate = QueryIndexHeader {
                 state: StoredQueryIndexState::Building,
                 source_epoch,
@@ -3258,11 +3796,13 @@ impl GraphStore {
                 source_live_quads,
                 indexed_quads: source_live_quads,
                 last_build_sequence,
+                query_id_generation,
+                next_query_id,
             };
             {
                 let mut batch = self.buffered_batch();
                 batch.insert(
-                    &self.qv1_meta,
+                    &self.qv2_meta,
                     QUERY_INDEX_TOTAL_KEY,
                     source_live_quads.to_be_bytes(),
                 );
@@ -3434,7 +3974,7 @@ impl GraphStore {
         snapshot: &Snapshot,
         key: QueryIndexCounterKey,
     ) -> Result<QueryIndexCounterRead> {
-        Ok(match snapshot.get(&self.qv1_meta, key.bytes())? {
+        Ok(match snapshot.get(&self.qv2_meta, key.bytes())? {
             None => QueryIndexCounterRead::Missing,
             Some(value) => match decode_query_index_u64(value.as_ref()) {
                 Some(value) => QueryIndexCounterRead::Value(value),
@@ -3451,6 +3991,54 @@ impl GraphStore {
         }
     }
 
+    fn resolve_maintenance_query_term(
+        &self,
+        snapshot: &Snapshot,
+        term: TermId,
+        allow_allocate: bool,
+        resolved: &mut HashMap<TermId, QueryTermId>,
+        mappings: &mut Vec<(TermId, QueryTermId)>,
+        next_query_id: &mut u64,
+    ) -> Result<Option<QueryTermId>> {
+        if let Some(query) = resolved.get(&term) {
+            return Ok(Some(*query));
+        }
+        if let Some(value) = snapshot.get(&self.qv2_term_to_query, term.to_be_bytes())? {
+            let Ok(raw) = <[u8; 8]>::try_from(value.as_ref()) else {
+                return Ok(None);
+            };
+            let query = QueryTermId::from_be_bytes(raw);
+            if query.0 >= *next_query_id {
+                return Ok(None);
+            }
+            let Some(reverse) = snapshot.get(&self.qv2_query_to_term, query.to_be_bytes())? else {
+                return Ok(None);
+            };
+            if reverse.as_ref() != term.to_be_bytes() {
+                return Ok(None);
+            }
+            resolved.insert(term, query);
+            return Ok(Some(query));
+        }
+        if !allow_allocate {
+            return Ok(None);
+        }
+        let query = QueryTermId(*next_query_id);
+        let Some(next) = next_query_id.checked_add(1) else {
+            return Ok(None);
+        };
+        if snapshot
+            .get(&self.qv2_query_to_term, query.to_be_bytes())?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        *next_query_id = next;
+        resolved.insert(term, query);
+        mappings.push((term, query));
+        Ok(Some(query))
+    }
+
     fn plan_ready_query_index_maintenance(
         &self,
         snapshot: &Snapshot,
@@ -3465,11 +4053,69 @@ impl GraphStore {
                 | QueryIndexCounterRead::Value(_) => return Ok(None),
             };
 
-        for transition in &transitions {
+        let mut resolved = HashMap::new();
+        let mut mappings = Vec::new();
+        let mut next_query_id = header.next_query_id;
+        let mut query_transitions = Vec::with_capacity(transitions.len());
+        for transition in transitions {
+            let allow_allocate = transition.is_live;
+            let Some(graph) = self.resolve_maintenance_query_term(
+                snapshot,
+                transition.quad.graph,
+                allow_allocate,
+                &mut resolved,
+                &mut mappings,
+                &mut next_query_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(subject) = self.resolve_maintenance_query_term(
+                snapshot,
+                transition.quad.subject,
+                allow_allocate,
+                &mut resolved,
+                &mut mappings,
+                &mut next_query_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(predicate) = self.resolve_maintenance_query_term(
+                snapshot,
+                transition.quad.predicate,
+                allow_allocate,
+                &mut resolved,
+                &mut mappings,
+                &mut next_query_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(object) = self.resolve_maintenance_query_term(
+                snapshot,
+                transition.quad.object,
+                allow_allocate,
+                &mut resolved,
+                &mut mappings,
+                &mut next_query_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let quad = QueryQuad {
+                graph,
+                subject,
+                predicate,
+                object,
+            };
             for (keyspace, key) in [
-                (&self.qv1_gpos, qv1_gpos_key(transition.quad)),
-                (&self.qv1_spog, qv1_spog_key(transition.quad)),
-                (&self.qv1_posg, qv1_posg_key(transition.quad)),
+                (&self.qv2_gspo, qv2_gspo_key(quad)),
+                (&self.qv2_gpos, qv2_gpos_key(quad)),
+                (&self.qv2_spog, qv2_spog_key(quad)),
+                (&self.qv2_posg, qv2_posg_key(quad)),
+                (&self.qv2_ospg, qv2_ospg_key(quad)),
+                (&self.qv2_gosp, qv2_gosp_key(quad)),
             ] {
                 let current = snapshot.get(keyspace, key)?;
                 let expected = if transition.is_live {
@@ -3481,11 +4127,13 @@ impl GraphStore {
                     return Ok(None);
                 }
             }
+            query_transitions.push((quad, transition.is_live));
         }
 
-        if transitions.is_empty() {
+        if query_transitions.is_empty() {
             return Ok(Some(QueryIndexMaintenancePlan {
-                transitions,
+                transitions: query_transitions,
+                mappings,
                 counters: Vec::new(),
                 header: None,
             }));
@@ -3493,10 +4141,10 @@ impl GraphStore {
 
         let mut deltas = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, i128)>::new();
         let mut touched_predicates = BTreeSet::new();
-        for transition in &transitions {
-            let delta = if transition.is_live { 1 } else { -1 };
-            touched_predicates.insert(transition.quad.predicate);
-            for counter in query_index_live_counter_keys(transition.quad) {
+        for (quad, is_live) in &query_transitions {
+            let delta = if *is_live { 1 } else { -1 };
+            touched_predicates.insert(quad.predicate);
+            for counter in query_index_live_counter_keys(*quad) {
                 let entry = deltas.entry(counter.bytes()).or_insert((counter, 0));
                 let Some(next) = entry.1.checked_add(delta) else {
                     return Ok(None);
@@ -3608,7 +4256,8 @@ impl GraphStore {
             return Ok(None);
         }
         Ok(Some(QueryIndexMaintenancePlan {
-            transitions,
+            transitions: query_transitions,
+            mappings,
             counters,
             header: Some(QueryIndexHeader {
                 state: StoredQueryIndexState::Ready,
@@ -3617,6 +4266,8 @@ impl GraphStore {
                 source_live_quads,
                 indexed_quads,
                 last_build_sequence: header.last_build_sequence,
+                query_id_generation: header.query_id_generation,
+                next_query_id,
             }),
         }))
     }
@@ -3626,14 +4277,29 @@ impl GraphStore {
         batch: &mut fjall::OwnedWriteBatch,
         plan: QueryIndexMaintenancePlan,
     ) {
-        for transition in plan.transitions {
+        for (term, query) in plan.mappings {
+            batch.insert(
+                &self.qv2_term_to_query,
+                term.to_be_bytes(),
+                query.to_be_bytes(),
+            );
+            batch.insert(
+                &self.qv2_query_to_term,
+                query.to_be_bytes(),
+                term.to_be_bytes(),
+            );
+        }
+        for (quad, is_live) in plan.transitions {
             let keys = [
-                (&self.qv1_gpos, qv1_gpos_key(transition.quad)),
-                (&self.qv1_spog, qv1_spog_key(transition.quad)),
-                (&self.qv1_posg, qv1_posg_key(transition.quad)),
+                (&self.qv2_gspo, qv2_gspo_key(quad)),
+                (&self.qv2_gpos, qv2_gpos_key(quad)),
+                (&self.qv2_spog, qv2_spog_key(quad)),
+                (&self.qv2_posg, qv2_posg_key(quad)),
+                (&self.qv2_ospg, qv2_ospg_key(quad)),
+                (&self.qv2_gosp, qv2_gosp_key(quad)),
             ];
             for (keyspace, key) in keys {
-                if transition.is_live {
+                if is_live {
                     batch.insert(keyspace, key, Vec::<u8>::new());
                 } else {
                     batch.remove(keyspace, key);
@@ -3643,9 +4309,9 @@ impl GraphStore {
         for update in plan.counters {
             match update.value {
                 Some(value) => {
-                    batch.insert(&self.qv1_meta, update.key.bytes(), value.to_be_bytes())
+                    batch.insert(&self.qv2_meta, update.key.bytes(), value.to_be_bytes())
                 }
-                None => batch.remove(&self.qv1_meta, update.key.bytes()),
+                None => batch.remove(&self.qv2_meta, update.key.bytes()),
             }
         }
         if let Some(header) = plan.header {
@@ -4193,16 +4859,30 @@ impl GraphStore {
     pub(crate) fn decode_query_index_key(
         order: QueryIndexCursorOrder,
         bytes: &[u8],
-    ) -> Result<EncodedQuad> {
+    ) -> Result<QueryQuad> {
         let quad = match order {
-            QueryIndexCursorOrder::Gpos => decode_qv1_gpos_key(bytes),
-            QueryIndexCursorOrder::Spog => decode_qv1_spog_key(bytes),
-            QueryIndexCursorOrder::Posg => decode_qv1_posg_key(bytes),
+            QueryIndexCursorOrder::Gspo => decode_qv2_gspo_key(bytes),
+            QueryIndexCursorOrder::Gpos => decode_qv2_gpos_key(bytes),
+            QueryIndexCursorOrder::Spog => decode_qv2_spog_key(bytes),
+            QueryIndexCursorOrder::Posg => decode_qv2_posg_key(bytes),
+            QueryIndexCursorOrder::Ospg => decode_qv2_ospg_key(bytes),
+            QueryIndexCursorOrder::Gosp => decode_qv2_gosp_key(bytes),
         };
-        quad.ok_or_else(|| StoreError::InvalidEncoding {
-            context: "qv1 query index key",
-            message: format!("expected 64 bytes, found {}", bytes.len()),
+        quad.ok_or_else(|| StoreError::InvalidQueryIndexEncoding {
+            context: "qv2 query index key",
+            message: format!("expected 32 bytes, found {}", bytes.len()),
         })
+    }
+
+    pub(crate) fn decode_query_source_term(
+        snapshot: &Snapshot,
+        query_to_term: &Keyspace,
+        term: QueryTermId,
+    ) -> Result<TermId> {
+        let value = snapshot.get(query_to_term, term.to_be_bytes())?.ok_or(
+            StoreError::QueryIndexVerificationFailed("query-to-term-mapping-missing"),
+        )?;
+        decode_query_source_term_value(value.as_ref(), "query-to-term mapping")
     }
 
     pub(crate) fn quad_key(
@@ -4357,10 +5037,15 @@ impl GraphStore {
             quads: db.keyspace("quads", write_heavy)?,
             graphs: db.keyspace("graphs", point_read_heavy)?,
             log: db.keyspace("log", write_heavy)?,
-            qv1_gpos: db.keyspace("qv1_gpos", write_heavy)?,
-            qv1_spog: db.keyspace("qv1_spog", write_heavy)?,
-            qv1_posg: db.keyspace("qv1_posg", write_heavy)?,
-            qv1_meta: db.keyspace("qv1_meta", point_read_heavy)?,
+            qv2_gspo: db.keyspace("qv2_gspo", write_heavy)?,
+            qv2_gpos: db.keyspace("qv2_gpos", write_heavy)?,
+            qv2_spog: db.keyspace("qv2_spog", write_heavy)?,
+            qv2_posg: db.keyspace("qv2_posg", write_heavy)?,
+            qv2_ospg: db.keyspace("qv2_ospg", write_heavy)?,
+            qv2_gosp: db.keyspace("qv2_gosp", write_heavy)?,
+            qv2_term_to_query: db.keyspace("qv2_term_to_query", point_read_heavy)?,
+            qv2_query_to_term: db.keyspace("qv2_query_to_term", point_read_heavy)?,
+            qv2_meta: db.keyspace("qv2_meta", point_read_heavy)?,
             db,
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
@@ -4526,10 +5211,15 @@ impl GraphStore {
             &self.quads,
             &self.graphs,
             &self.log,
-            &self.qv1_gpos,
-            &self.qv1_spog,
-            &self.qv1_posg,
-            &self.qv1_meta,
+            &self.qv2_gspo,
+            &self.qv2_gpos,
+            &self.qv2_spog,
+            &self.qv2_posg,
+            &self.qv2_ospg,
+            &self.qv2_gosp,
+            &self.qv2_term_to_query,
+            &self.qv2_query_to_term,
+            &self.qv2_meta,
         ] {
             keyspace.rotate_memtable_and_wait()?;
             keyspace.major_compact()?;
@@ -6866,9 +7556,25 @@ mod tests {
     fn query_index_counter_for_test(store: &GraphStore, key: QueryIndexCounterKey) -> Option<u64> {
         let snapshot = store.db.snapshot();
         snapshot
-            .get(&store.qv1_meta, key.bytes())
+            .get(&store.qv2_meta, key.bytes())
             .unwrap()
             .map(|value| decode_query_index_u64(value.as_ref()).unwrap())
+    }
+
+    fn query_term_id_for_test(store: &GraphStore, term: TermId) -> QueryTermId {
+        let snapshot = store.db.snapshot();
+        store
+            .query_term_id_from_snapshot(&snapshot, term)
+            .unwrap()
+            .expect("live query-index term must have a dense id")
+    }
+
+    fn query_quad_for_test(store: &GraphStore, quad: EncodedQuad) -> QueryQuad {
+        let snapshot = store.db.snapshot();
+        store
+            .query_quad_from_snapshot(&snapshot, quad)
+            .unwrap()
+            .expect("live query-index quad must have dense ids")
     }
 
     fn assert_query_index_ready(store: &GraphStore, source_rows: u64) {
@@ -6978,7 +7684,7 @@ mod tests {
             commit_add(&store, &graph, quad);
             assert_query_index_ready(&store, 1);
 
-            remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+            remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
             store.persist().unwrap();
         }
 
@@ -6994,6 +7700,150 @@ mod tests {
                 .len(),
             1,
             "Missing must leave canonical fallback reads available"
+        );
+    }
+
+    #[test]
+    fn query_index_v2_keys_and_disk_space_are_smaller_than_u128_layout() {
+        const ROWS: u64 = 10_000;
+        let zero = QueryTermId(0);
+        assert_eq!(query_index_key([zero; 4]).len(), 32);
+
+        let (_dir, store) = setup_store();
+        let index_options = || {
+            KeyspaceCreateOptions::default()
+                .data_block_compression_policy(CompressionPolicy::disabled())
+                .index_block_compression_policy(CompressionPolicy::disabled())
+        };
+        let v2: Vec<_> = (0..6)
+            .map(|index| {
+                store
+                    .db
+                    .keyspace(&format!("test_qv2_{index}"), index_options)
+                    .unwrap()
+            })
+            .collect();
+        let u128_layout: Vec<_> = (0..6)
+            .map(|index| {
+                store
+                    .db
+                    .keyspace(&format!("test_qv1_{index}"), index_options)
+                    .unwrap()
+            })
+            .collect();
+        let term_to_query = store
+            .db
+            .keyspace("test_qv2_term_to_query", KeyspaceCreateOptions::default)
+            .unwrap();
+        let query_to_term = store
+            .db
+            .keyspace("test_qv2_query_to_term", KeyspaceCreateOptions::default)
+            .unwrap();
+
+        let graph = hash_term(&named("urn:test:qv2:size:graph"));
+        let query_graph = QueryTermId(0);
+        let mut batch = store.buffered_batch();
+        batch.insert(
+            &term_to_query,
+            graph.to_be_bytes(),
+            query_graph.to_be_bytes(),
+        );
+        batch.insert(
+            &query_to_term,
+            query_graph.to_be_bytes(),
+            graph.to_be_bytes(),
+        );
+        for row in 0..ROWS {
+            let subject = hash_term(&named(&format!("urn:test:qv2:size:s:{row}")));
+            let predicate_index = row % 16;
+            let predicate = hash_term(&named(&format!("urn:test:qv2:size:p:{predicate_index}")));
+            let object_index = row % 1_000;
+            let object = hash_term(&named(&format!("urn:test:qv2:size:o:{object_index}")));
+            let query_subject = QueryTermId(row + 1);
+            let query_predicate = QueryTermId(ROWS + 1 + predicate_index);
+            let query_object = QueryTermId(ROWS + 17 + object_index);
+            let query_quad = QueryQuad {
+                graph: query_graph,
+                subject: query_subject,
+                predicate: query_predicate,
+                object: query_object,
+            };
+            let v2_keys = [
+                qv2_gspo_key(query_quad),
+                qv2_gpos_key(query_quad),
+                qv2_spog_key(query_quad),
+                qv2_posg_key(query_quad),
+                qv2_ospg_key(query_quad),
+                qv2_gosp_key(query_quad),
+            ];
+            let u128_keys = [
+                GraphStore::quad_key(graph, subject, predicate, object),
+                GraphStore::quad_key(graph, predicate, object, subject),
+                GraphStore::quad_key(subject, predicate, object, graph),
+                GraphStore::quad_key(predicate, object, subject, graph),
+                GraphStore::quad_key(object, subject, predicate, graph),
+                GraphStore::quad_key(graph, object, subject, predicate),
+            ];
+            for ((keyspace, v2_key), (u128_keyspace, u128_key)) in v2
+                .iter()
+                .zip(v2_keys)
+                .zip(u128_layout.iter().zip(u128_keys))
+            {
+                batch.insert(keyspace, v2_key, []);
+                batch.insert(u128_keyspace, u128_key, []);
+            }
+            batch.insert(
+                &term_to_query,
+                subject.to_be_bytes(),
+                query_subject.to_be_bytes(),
+            );
+            batch.insert(
+                &query_to_term,
+                query_subject.to_be_bytes(),
+                subject.to_be_bytes(),
+            );
+            if row < 16 {
+                batch.insert(
+                    &term_to_query,
+                    predicate.to_be_bytes(),
+                    query_predicate.to_be_bytes(),
+                );
+                batch.insert(
+                    &query_to_term,
+                    query_predicate.to_be_bytes(),
+                    predicate.to_be_bytes(),
+                );
+            }
+            if row < 1_000 {
+                batch.insert(
+                    &term_to_query,
+                    object.to_be_bytes(),
+                    query_object.to_be_bytes(),
+                );
+                batch.insert(
+                    &query_to_term,
+                    query_object.to_be_bytes(),
+                    object.to_be_bytes(),
+                );
+            }
+        }
+        batch.commit().unwrap();
+        for keyspace in v2
+            .iter()
+            .chain(u128_layout.iter())
+            .chain([&term_to_query, &query_to_term])
+        {
+            keyspace.rotate_memtable_and_wait().unwrap();
+        }
+
+        let v2_bytes = v2.iter().map(Keyspace::disk_space).sum::<u64>()
+            + term_to_query.disk_space()
+            + query_to_term.disk_space();
+        let u128_bytes = u128_layout.iter().map(Keyspace::disk_space).sum::<u64>();
+        eprintln!("query_index_rows={ROWS} qv2_bytes={v2_bytes} u128_bytes={u128_bytes}");
+        assert!(
+            v2_bytes * 100 <= u128_bytes * 70,
+            "qv2 must use at least 30% less disk: qv2={v2_bytes}, u128={u128_bytes}"
         );
     }
 
@@ -7029,8 +7879,12 @@ mod tests {
 
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_meta,
-            QueryIndexCounterKey::GraphPredicate(quad.graph, quad.predicate).bytes(),
+            &store.qv2_meta,
+            QueryIndexCounterKey::GraphPredicate(
+                query_term_id_for_test(&store, quad.graph),
+                query_term_id_for_test(&store, quad.predicate),
+            )
+            .bytes(),
             [0_u8],
         );
         let view = StoreReadView::new(&store);
@@ -7093,7 +7947,7 @@ mod tests {
             .collect();
         let ready = query_index_header_for_test(&store);
 
-        remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+        remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
         for (shape, expected) in patterns.iter().zip(&trusted) {
             assert_eq!(
                 expected,
@@ -7206,7 +8060,7 @@ mod tests {
             }
         };
 
-        remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+        remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
         assert_unavailable("Missing");
         stage_query_index_header_for_test(&store, &ready);
 
@@ -7239,7 +8093,7 @@ mod tests {
         let expected = read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern);
         let ready = query_index_header_for_test(&store);
 
-        stage_query_index_value_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY, [0_u8]);
+        stage_query_index_value_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY, [0_u8]);
         assert_eq!(
             expected,
             read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern)
@@ -7266,12 +8120,19 @@ mod tests {
         commit_add(&store, &graph, second);
         settle_diagnostics(&store, &graph);
 
-        let (first, corrupt) = if qv1_spog_key(first) < qv1_spog_key(second) {
+        let (first, corrupt) = if qv2_gspo_key(query_quad_for_test(&store, first))
+            < qv2_gspo_key(query_quad_for_test(&store, second))
+        {
             (first, second)
         } else {
             (second, first)
         };
-        stage_query_index_value_for_test(&store, &store.qv1_spog, qv1_spog_key(corrupt), [1_u8]);
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv2_gspo,
+            qv2_gspo_key(query_quad_for_test(&store, corrupt)),
+            [1_u8],
+        );
 
         let view = StoreReadView::with_read_mode(&store, QueryReadMode::ForceQv);
         let context = ReadContext::default();
@@ -7288,7 +8149,7 @@ mod tests {
         assert!(matches!(cursor.next(), Some(Ok(quad)) if quad == first));
         assert!(matches!(
             cursor.next(),
-            Some(Err(StoreError::InvalidEncoding { .. }))
+            Some(Err(StoreError::InvalidQueryIndexEncoding { .. }))
         ));
         assert!(
             cursor.next().is_none(),
@@ -7300,28 +8161,34 @@ mod tests {
     fn query_index_insert_and_delete_survive_restart_ready() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:restart");
-        let (quad, dot) = {
+        let (quad, query_quad, dot) = {
             let store = GraphStore::open(dir.path()).unwrap();
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             let dot = commit_add(&store, &graph, quad);
             assert_query_index_ready(&store, 1);
+            let query_quad = query_quad_for_test(&store, quad);
+            let header = query_index_header_for_test(&store);
+            assert_eq!(header.next_query_id, 4);
             store.persist().unwrap();
-            (quad, dot)
+            (quad, query_quad, dot)
         };
 
         {
             let store = GraphStore::open(dir.path()).unwrap();
             assert_query_index_ready(&store, 1);
+            assert_eq!(query_quad_for_test(&store, quad), query_quad);
             let mut witnessed = VectorClock::new();
             witnessed.advance(dot.actor, dot.counter);
             commit_remove(&store, &graph, quad, &witnessed);
             assert_query_index_ready(&store, 0);
+            assert_eq!(query_quad_for_test(&store, quad), query_quad);
             store.persist().unwrap();
         }
 
         let reopened = GraphStore::open(dir.path()).unwrap();
         assert_query_index_ready(&reopened, 0);
+        assert_eq!(query_quad_for_test(&reopened, quad), query_quad);
     }
 
     #[test]
@@ -7412,40 +8279,45 @@ mod tests {
         second_writer.join().unwrap();
 
         assert_query_index_ready(&store, 2);
+        let first_query = query_quad_for_test(&store, first);
+        let second_query = query_quad_for_test(&store, second);
         assert_eq!(
             query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
             Some(2)
         );
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(first.graph)),
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(first_query.graph)),
             Some(1)
         );
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(second.graph)),
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(second_query.graph)),
             Some(1)
-        );
-        assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Predicate(first.predicate)),
-            Some(2)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::PredicateObject(first.predicate, first.object)
+                QueryIndexCounterKey::Predicate(first_query.predicate),
             ),
             Some(2)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::GraphPredicate(first.graph, first.predicate)
+                QueryIndexCounterKey::PredicateObject(first_query.predicate, first_query.object)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::GraphPredicate(first_query.graph, first_query.predicate)
             ),
             Some(1)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::GraphPredicate(second.graph, second.predicate)
+                QueryIndexCounterKey::GraphPredicate(second_query.graph, second_query.predicate)
             ),
             Some(1)
         );
@@ -7550,44 +8422,53 @@ mod tests {
         let three_dot = commit_add(&store, &graph_one, three);
         commit_add(&store, &graph_two, four);
         assert_query_index_ready(&store, 4);
+        let one_query = query_quad_for_test(&store, one);
+        let three_query = query_quad_for_test(&store, three);
 
         assert_eq!(
             query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
             Some(4)
         );
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(one.graph)),
-            Some(3)
-        );
-        assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Predicate(one.predicate)),
+            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(one_query.graph)),
             Some(3)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::GraphPredicate(one.graph, one.predicate)
+                QueryIndexCounterKey::Predicate(one_query.predicate),
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            query_index_counter_for_test(
+                &store,
+                QueryIndexCounterKey::GraphPredicate(one_query.graph, one_query.predicate)
             ),
             Some(2)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::PredicateObject(one.predicate, one.object)
+                QueryIndexCounterKey::PredicateObject(one_query.predicate, one_query.object)
             ),
             Some(2)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::GraphPredicateObject(one.graph, one.predicate, one.object,)
+                QueryIndexCounterKey::GraphPredicateObject(
+                    one_query.graph,
+                    one_query.predicate,
+                    one_query.object,
+                )
             ),
             Some(2)
         );
         assert_eq!(
             query_index_counter_for_test(
                 &store,
-                QueryIndexCounterKey::PredicateMutationEpoch(one.predicate)
+                QueryIndexCounterKey::PredicateMutationEpoch(one_query.predicate)
             ),
             Some(query_index_header_for_test(&store).source_epoch)
         );
@@ -7597,11 +8478,15 @@ mod tests {
         commit_remove(&store, &graph_one, three, &witnessed);
         assert_query_index_ready(&store, 3);
         for key in [
-            QueryIndexCounterKey::Predicate(three.predicate),
-            QueryIndexCounterKey::GraphPredicate(three.graph, three.predicate),
-            QueryIndexCounterKey::PredicateObject(three.predicate, three.object),
-            QueryIndexCounterKey::GraphPredicateObject(three.graph, three.predicate, three.object),
-            QueryIndexCounterKey::PredicateMutationEpoch(three.predicate),
+            QueryIndexCounterKey::Predicate(three_query.predicate),
+            QueryIndexCounterKey::GraphPredicate(three_query.graph, three_query.predicate),
+            QueryIndexCounterKey::PredicateObject(three_query.predicate, three_query.object),
+            QueryIndexCounterKey::GraphPredicateObject(
+                three_query.graph,
+                three_query.predicate,
+                three_query.object,
+            ),
+            QueryIndexCounterKey::PredicateMutationEpoch(three_query.predicate),
         ] {
             assert_eq!(query_index_counter_for_test(&store, key), None);
         }
@@ -7614,6 +8499,7 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         let dot = commit_add(&store, &graph, quad);
+        let query_quad = query_quad_for_test(&store, quad);
 
         let mut witnessed = VectorClock::new();
         witnessed.advance(dot.actor, dot.counter);
@@ -7628,17 +8514,28 @@ mod tests {
             Some(0)
         );
         for key in [
-            QueryIndexCounterKey::Graph(quad.graph),
-            QueryIndexCounterKey::Predicate(quad.predicate),
-            QueryIndexCounterKey::GraphPredicate(quad.graph, quad.predicate),
-            QueryIndexCounterKey::PredicateObject(quad.predicate, quad.object),
-            QueryIndexCounterKey::GraphPredicateObject(quad.graph, quad.predicate, quad.object),
-            QueryIndexCounterKey::PredicateMutationEpoch(quad.predicate),
+            QueryIndexCounterKey::Graph(query_quad.graph),
+            QueryIndexCounterKey::Predicate(query_quad.predicate),
+            QueryIndexCounterKey::GraphPredicate(query_quad.graph, query_quad.predicate),
+            QueryIndexCounterKey::PredicateObject(query_quad.predicate, query_quad.object),
+            QueryIndexCounterKey::GraphPredicateObject(
+                query_quad.graph,
+                query_quad.predicate,
+                query_quad.object,
+            ),
+            QueryIndexCounterKey::PredicateMutationEpoch(query_quad.predicate),
         ] {
             assert_eq!(query_index_counter_for_test(&store, key), None);
         }
         let snapshot = store.db.snapshot();
-        for keyspace in [&store.qv1_gpos, &store.qv1_spog, &store.qv1_posg] {
+        for keyspace in [
+            &store.qv2_gspo,
+            &store.qv2_gpos,
+            &store.qv2_spog,
+            &store.qv2_posg,
+            &store.qv2_ospg,
+            &store.qv2_gosp,
+        ] {
             assert!(snapshot.iter(keyspace).next().is_none());
         }
     }
@@ -7651,10 +8548,14 @@ mod tests {
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, quad);
         let snapshot = store.db.snapshot();
+        let query_quad = query_quad_for_test(&store, quad);
         for (keyspace, key) in [
-            (&store.qv1_gpos, qv1_gpos_key(quad)),
-            (&store.qv1_spog, qv1_spog_key(quad)),
-            (&store.qv1_posg, qv1_posg_key(quad)),
+            (&store.qv2_gspo, qv2_gspo_key(query_quad)),
+            (&store.qv2_gpos, qv2_gpos_key(query_quad)),
+            (&store.qv2_spog, qv2_spog_key(query_quad)),
+            (&store.qv2_posg, qv2_posg_key(query_quad)),
+            (&store.qv2_ospg, qv2_ospg_key(query_quad)),
+            (&store.qv2_gosp, qv2_gosp_key(query_quad)),
         ] {
             let value = snapshot.get(keyspace, key).unwrap().unwrap();
             assert!(value.as_ref().is_empty());
@@ -7664,7 +8565,7 @@ mod tests {
                 .unwrap()
                 .into_inner()
                 .unwrap();
-            assert_eq!(stored_key.as_ref().len(), 64);
+            assert_eq!(stored_key.as_ref().len(), 32);
             assert!(stored_value.as_ref().is_empty());
         }
     }
@@ -7677,7 +8578,11 @@ mod tests {
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, quad);
 
-        remove_query_index_key_for_test(&store, &store.qv1_spog, qv1_spog_key(quad));
+        remove_query_index_key_for_test(
+            &store,
+            &store.qv2_spog,
+            qv2_spog_key(query_quad_for_test(&store, quad)),
+        );
         assert_eq!(
             store.query_index_status().unwrap().state,
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
@@ -7685,11 +8590,16 @@ mod tests {
 
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_spog,
-            qv1_spog_key(quad),
+            &store.qv2_spog,
+            qv2_spog_key(query_quad_for_test(&store, quad)),
             Vec::<u8>::new(),
         );
-        stage_query_index_value_for_test(&store, &store.qv1_posg, qv1_posg_key(quad), vec![1]);
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv2_posg,
+            qv2_posg_key(query_quad_for_test(&store, quad)),
+            vec![1],
+        );
         assert_eq!(
             store.query_index_status().unwrap().state,
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
@@ -7697,27 +8607,31 @@ mod tests {
 
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_posg,
-            qv1_posg_key(quad),
+            &store.qv2_posg,
+            qv2_posg_key(query_quad_for_test(&store, quad)),
             Vec::<u8>::new(),
         );
-        remove_query_index_key_for_test(&store, &store.qv1_spog, qv1_spog_key(quad));
-        stage_query_index_value_for_test(&store, &store.qv1_spog, vec![0; 63], Vec::<u8>::new());
+        remove_query_index_key_for_test(
+            &store,
+            &store.qv2_spog,
+            qv2_spog_key(query_quad_for_test(&store, quad)),
+        );
+        stage_query_index_value_for_test(&store, &store.qv2_spog, vec![0; 31], Vec::<u8>::new());
         assert_eq!(
             store.query_index_status().unwrap().state,
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
         );
 
-        remove_query_index_key_for_test(&store, &store.qv1_spog, vec![0; 63]);
+        remove_query_index_key_for_test(&store, &store.qv2_spog, vec![0; 31]);
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_spog,
-            qv1_spog_key(quad),
+            &store.qv2_spog,
+            qv2_spog_key(query_quad_for_test(&store, quad)),
             Vec::<u8>::new(),
         );
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_meta,
+            &store.qv2_meta,
             QUERY_INDEX_TOTAL_KEY,
             2u64.to_be_bytes(),
         );
@@ -7770,7 +8684,7 @@ mod tests {
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             commit_add(&store, &graph, quad);
-            remove_query_index_key_for_test(&store, &store.qv1_meta, QUERY_INDEX_HEADER_KEY);
+            remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
             store.persist().unwrap();
         }
 
@@ -7794,6 +8708,7 @@ mod tests {
             let second = query_index_header_for_test(&store);
             assert!(second.last_build_sequence > first.last_build_sequence);
             assert!(second.source_epoch > first.source_epoch);
+            assert!(second.query_id_generation > first.query_id_generation);
             store.persist().unwrap();
         }
 
@@ -7813,7 +8728,11 @@ mod tests {
             let mut header = query_index_header_for_test(&store);
             header.state = StoredQueryIndexState::Building;
             stage_query_index_header_for_test(&store, &header);
-            remove_query_index_key_for_test(&store, &store.qv1_posg, qv1_posg_key(quad));
+            remove_query_index_key_for_test(
+                &store,
+                &store.qv2_posg,
+                qv2_posg_key(query_quad_for_test(&store, quad)),
+            );
             store.persist().unwrap();
             quad
         };
@@ -7872,7 +8791,7 @@ mod tests {
         assert_eq!(sample.source_live_quads, rows);
         assert_eq!(sample.indexed_quads, rows);
         assert_eq!(sample.checked_source_rows, QUERY_INDEX_SAMPLE_ROWS);
-        assert_eq!(sample.checked_index_rows, QUERY_INDEX_SAMPLE_ROWS * 3);
+        assert_eq!(sample.checked_index_rows, QUERY_INDEX_SAMPLE_ROWS * 6);
 
         let full = store.verify_query_indexes(true).unwrap();
         assert!(full.valid);
@@ -7880,7 +8799,7 @@ mod tests {
         assert_eq!(full.source_live_quads, rows);
         assert_eq!(full.indexed_quads, rows);
         assert_eq!(full.checked_source_rows, rows);
-        assert_eq!(full.checked_index_rows, rows * 3);
+        assert_eq!(full.checked_index_rows, rows * 6);
     }
 
     #[test]
@@ -7890,41 +8809,43 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, quad);
-        let extra = EncodedQuad {
-            subject: store
-                .resolve_term(&named("urn:test:qv:extra-subject"))
-                .unwrap(),
-            ..quad
+        let query_quad = query_quad_for_test(&store, quad);
+        let extra = QueryQuad {
+            subject: QueryTermId(query_index_header_for_test(&store).next_query_id),
+            ..query_quad
         };
 
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_gpos,
-            qv1_gpos_key(extra),
+            &store.qv2_gpos,
+            qv2_gpos_key(extra),
             Vec::<u8>::new(),
         );
-        stage_query_index_value_for_test(&store, &store.qv1_gpos, qv1_gpos_key(quad), vec![1]);
-        remove_query_index_key_for_test(&store, &store.qv1_spog, qv1_spog_key(quad));
-        stage_query_index_value_for_test(&store, &store.qv1_posg, vec![0; 63], Vec::<u8>::new());
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_meta,
+            &store.qv2_gpos,
+            qv2_gpos_key(query_quad),
+            vec![1],
+        );
+        remove_query_index_key_for_test(&store, &store.qv2_spog, qv2_spog_key(query_quad));
+        stage_query_index_value_for_test(&store, &store.qv2_posg, vec![0; 31], Vec::<u8>::new());
+        stage_query_index_value_for_test(
+            &store,
+            &store.qv2_meta,
             QUERY_INDEX_TOTAL_KEY,
             vec![0; 7],
         );
-        stage_query_index_value_for_test(&store, &store.qv1_meta, vec![b'Z'], 0u64.to_be_bytes());
+        stage_query_index_value_for_test(&store, &store.qv2_meta, vec![b'Z'], 0u64.to_be_bytes());
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_meta,
+            &store.qv2_meta,
             vec![b'G', 0],
             0u64.to_be_bytes(),
         );
-        let orphan_graph = store
-            .resolve_term(&named("urn:test:qv:orphan-counter-graph"))
-            .unwrap();
+        let orphan_graph = QueryTermId(query_index_header_for_test(&store).next_query_id);
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_meta,
+            &store.qv2_meta,
             QueryIndexCounterKey::Graph(orphan_graph).bytes(),
             1u64.to_be_bytes(),
         );
@@ -7935,7 +8856,7 @@ mod tests {
             "source-gpos-missing-or-nonempty",
             "source-spog-missing-or-nonempty",
             "qv-gpos-value-nonempty",
-            "qv-gpos-source-missing",
+            "qv-query-id-mapping-missing",
             "qv-posg-key-length",
             "meta-counter-value-length",
             "meta-unknown-tag",
@@ -7955,8 +8876,9 @@ mod tests {
         commit_add(&store, &graph, first);
         remove_query_index_key_for_test(
             &store,
-            &store.qv1_meta,
-            QueryIndexCounterKey::Predicate(first.predicate).bytes(),
+            &store.qv2_meta,
+            QueryIndexCounterKey::Predicate(query_term_id_for_test(&store, first.predicate))
+                .bytes(),
         );
 
         let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
@@ -7975,13 +8897,7 @@ mod tests {
             "the canonical source commit must survive a derived-index anomaly"
         );
         let snapshot = store.db.snapshot();
-        assert_eq!(snapshot.iter(&store.qv1_gpos).count(), 1);
-        assert!(
-            snapshot
-                .get(&store.qv1_gpos, qv1_gpos_key(second))
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(snapshot.iter(&store.qv2_gpos).count(), 1);
     }
 
     #[test]
@@ -8013,13 +8929,7 @@ mod tests {
             "the canonical source write must survive an ahead metadata hint"
         );
         let snapshot = store.db.snapshot();
-        assert_eq!(snapshot.iter(&store.qv1_gpos).count(), 1);
-        assert!(
-            snapshot
-                .get(&store.qv1_gpos, qv1_gpos_key(second))
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(snapshot.iter(&store.qv2_gpos).count(), 1);
     }
 
     #[test]
@@ -8030,10 +8940,14 @@ mod tests {
         let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p1", "urn:test:o"));
         commit_add(&store, &graph, first);
         let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p2", "urn:test:o"));
+        let orphan_predicate = query_index_header_for_test(&store)
+            .next_query_id
+            .checked_add(1)
+            .unwrap();
         stage_query_index_value_for_test(
             &store,
-            &store.qv1_meta,
-            QueryIndexCounterKey::Predicate(second.predicate).bytes(),
+            &store.qv2_meta,
+            QueryIndexCounterKey::Predicate(QueryTermId(orphan_predicate)).bytes(),
             1u64.to_be_bytes(),
         );
 
@@ -8052,13 +8966,7 @@ mod tests {
             "the canonical source write must survive an orphan counter"
         );
         let snapshot = store.db.snapshot();
-        assert_eq!(snapshot.iter(&store.qv1_gpos).count(), 1);
-        assert!(
-            snapshot
-                .get(&store.qv1_gpos, qv1_gpos_key(second))
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(snapshot.iter(&store.qv2_gpos).count(), 1);
     }
 
     #[test]
@@ -8076,7 +8984,7 @@ mod tests {
             commit_add(&store, &metadata_graph, quad);
             stage_query_index_value_for_test(
                 &store,
-                &store.qv1_meta,
+                &store.qv2_meta,
                 QUERY_INDEX_HEADER_KEY,
                 vec![0],
             );
@@ -8109,7 +9017,7 @@ mod tests {
             commit_add(&store, &counter_graph, quad);
             stage_query_index_value_for_test(
                 &store,
-                &store.qv1_meta,
+                &store.qv2_meta,
                 QUERY_INDEX_TOTAL_KEY,
                 vec![0; 7],
             );
@@ -8221,10 +9129,14 @@ mod tests {
             commit_add(&store, &graph, quad);
             store.manual_compact().unwrap();
             let snapshot = store.db.snapshot();
+            let query_quad = query_quad_for_test(&store, quad);
             for (keyspace, key) in [
-                (&store.qv1_gpos, qv1_gpos_key(quad)),
-                (&store.qv1_spog, qv1_spog_key(quad)),
-                (&store.qv1_posg, qv1_posg_key(quad)),
+                (&store.qv2_gspo, qv2_gspo_key(query_quad)),
+                (&store.qv2_gpos, qv2_gpos_key(query_quad)),
+                (&store.qv2_spog, qv2_spog_key(query_quad)),
+                (&store.qv2_posg, qv2_posg_key(query_quad)),
+                (&store.qv2_ospg, qv2_ospg_key(query_quad)),
+                (&store.qv2_gosp, qv2_gosp_key(query_quad)),
             ] {
                 assert!(
                     snapshot
@@ -8237,13 +9149,13 @@ mod tests {
             }
             assert!(
                 snapshot
-                    .get(&store.qv1_meta, QUERY_INDEX_HEADER_KEY)
+                    .get(&store.qv2_meta, QUERY_INDEX_HEADER_KEY)
                     .unwrap()
                     .is_some()
             );
             assert_eq!(
                 snapshot
-                    .get(&store.qv1_meta, QUERY_INDEX_TOTAL_KEY)
+                    .get(&store.qv2_meta, QUERY_INDEX_TOTAL_KEY)
                     .unwrap()
                     .unwrap()
                     .as_ref(),

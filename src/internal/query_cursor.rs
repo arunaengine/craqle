@@ -19,7 +19,8 @@ enum SourceIterator {
         iterator: fjall::Iter,
     },
     QueryIndex {
-        _snapshot: Snapshot,
+        snapshot: Snapshot,
+        query_to_term: Keyspace,
         iterator: fjall::Iter,
         order: QueryIndexCursorOrder,
     },
@@ -97,6 +98,7 @@ impl RawQuadCursor {
     pub(crate) fn query_index(
         snapshot: Snapshot,
         keyspace: &Keyspace,
+        query_to_term: &Keyspace,
         order: QueryIndexCursorOrder,
         prefix: Vec<u8>,
     ) -> Self {
@@ -107,7 +109,8 @@ impl RawQuadCursor {
         };
         Self {
             source: SourceIterator::QueryIndex {
-                _snapshot: snapshot,
+                snapshot,
+                query_to_term: query_to_term.clone(),
                 iterator,
                 order,
             },
@@ -173,7 +176,10 @@ impl RawQuadCursor {
                 }))
             }
             SourceIterator::QueryIndex {
-                iterator, order, ..
+                snapshot,
+                query_to_term,
+                iterator,
+                order,
             } => {
                 let guard = iterator.next()?;
                 let (key, value) = match guard.into_inner() {
@@ -181,12 +187,25 @@ impl RawQuadCursor {
                     Err(error) => return Some(Err(error.into())),
                 };
                 if !value.as_ref().is_empty() {
-                    return Some(Err(crate::store::StoreError::InvalidEncoding {
-                        context: "qv1 query index value",
+                    return Some(Err(crate::store::StoreError::InvalidQueryIndexEncoding {
+                        context: "qv2 query index value",
                         message: format!("expected empty value, found {} bytes", value.len()),
                     }));
                 }
-                let quad = match GraphStore::decode_query_index_key(*order, key.as_ref()) {
+                let query_quad = match GraphStore::decode_query_index_key(*order, key.as_ref()) {
+                    Ok(quad) => quad,
+                    Err(error) => return Some(Err(error)),
+                };
+                let decode =
+                    |term| GraphStore::decode_query_source_term(snapshot, query_to_term, term);
+                let quad = match (|| {
+                    Ok(EncodedQuad {
+                        graph: decode(query_quad.graph)?,
+                        subject: decode(query_quad.subject)?,
+                        predicate: decode(query_quad.predicate)?,
+                        object: decode(query_quad.object)?,
+                    })
+                })() {
                     Ok(quad) => quad,
                     Err(error) => return Some(Err(error)),
                 };

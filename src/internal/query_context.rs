@@ -70,6 +70,7 @@ pub struct ReadStatistics {
     pub qv_header_reads: u64,
     pub qv_counter_reads: u64,
     pub qv_trusted: bool,
+    pub query_id_generation: Option<u64>,
     pub fallback_reason: Option<String>,
     pub selected_access_paths: Vec<ReadAccessPath>,
     pub source_keys_read: u64,
@@ -90,9 +91,12 @@ pub struct ReadStatistics {
 #[non_exhaustive]
 pub enum ReadAccessPath {
     SourceGspo,
+    QvGspo,
     QvGpos,
     QvSpog,
     QvPosg,
+    QvOspg,
+    QvGosp,
     Empty,
 }
 
@@ -112,6 +116,7 @@ struct ReadCounters {
     qv_header_reads: Cell<u64>,
     qv_counter_reads: Cell<u64>,
     qv_trusted: Cell<bool>,
+    query_id_generation: Cell<Option<u64>>,
     fallback_reason: RefCell<Option<String>>,
     selected_access_paths: RefCell<Vec<ReadAccessPath>>,
     source_keys_read: Cell<u64>,
@@ -143,6 +148,7 @@ impl ReadCounters {
             qv_header_reads: self.qv_header_reads.get(),
             qv_counter_reads: self.qv_counter_reads.get(),
             qv_trusted: self.qv_trusted.get(),
+            query_id_generation: self.query_id_generation.get(),
             fallback_reason: self.fallback_reason.borrow().clone(),
             selected_access_paths: self.selected_access_paths.borrow().clone(),
             source_keys_read: self.source_keys_read.get(),
@@ -268,6 +274,7 @@ impl<'a> ReadContext<'a> {
     pub(crate) fn record_qv_admission(
         &self,
         trusted: bool,
+        query_id_generation: Option<u64>,
         fallback_reason: Option<&'static str>,
         header_reads: u64,
         counter_reads: u64,
@@ -275,7 +282,7 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.qv_admission_checks);
         ReadCounters::add(&self.counters.qv_header_reads, header_reads);
         ReadCounters::add(&self.counters.qv_counter_reads, counter_reads);
-        self.observe_qv_admission(trusted, fallback_reason);
+        self.observe_qv_admission(trusted, query_id_generation, fallback_reason);
     }
 
     pub(crate) fn record_qv_meta(&self) {
@@ -285,9 +292,13 @@ impl<'a> ReadContext<'a> {
     pub(crate) fn observe_qv_admission(
         &self,
         trusted: bool,
+        query_id_generation: Option<u64>,
         fallback_reason: Option<&'static str>,
     ) {
         self.counters.qv_trusted.set(trusted);
+        if let Some(generation) = query_id_generation {
+            self.counters.query_id_generation.set(Some(generation));
+        }
         if self.counters.fallback_reason.borrow().is_none()
             && let Some(reason) = fallback_reason
         {

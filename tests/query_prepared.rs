@@ -66,6 +66,22 @@ fn prepared_reads_fresh() {
     assert_eq!(first.results, old);
     assert_eq!(first.statistics.parse_time, std::time::Duration::ZERO);
 
+    let first_query_id_generation = first.statistics.query_id_generation.unwrap();
+    let rebuilt = node.rebuild_query_indexes().unwrap();
+    assert!(rebuilt.query_id_generation > first_query_id_generation);
+    let after_rebuild = node
+        .execute_prepared_graphs(
+            std::slice::from_ref(&graph),
+            &prepared,
+            &QueryExecutionOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(after_rebuild.results, old);
+    assert_eq!(
+        after_rebuild.statistics.query_id_generation,
+        Some(rebuilt.query_id_generation)
+    );
+
     node.apply_changes_unchecked(
         &graph,
         vec![insert(

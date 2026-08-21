@@ -380,7 +380,10 @@ pub craqle::QueryResults::Graph(alloc::vec::Vec<(craqle::EncodedTerm, craqle::En
 pub craqle::QueryResults::Solutions(alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, craqle::EncodedTerm>>)
 #[non_exhaustive] pub enum craqle::ReadAccessPath
 pub craqle::ReadAccessPath::Empty
+pub craqle::ReadAccessPath::QvGosp
 pub craqle::ReadAccessPath::QvGpos
+pub craqle::ReadAccessPath::QvGspo
+pub craqle::ReadAccessPath::QvOspg
 pub craqle::ReadAccessPath::QvPosg
 pub craqle::ReadAccessPath::QvSpog
 pub craqle::ReadAccessPath::SourceGspo
@@ -871,6 +874,7 @@ pub craqle::QueryExecutionStatistics::qv_counter_reads: u64
 pub craqle::QueryExecutionStatistics::qv_header_reads: u64
 pub craqle::QueryExecutionStatistics::qv_keys_read: u64
 pub craqle::QueryExecutionStatistics::qv_trusted: bool
+pub craqle::QueryExecutionStatistics::query_id_generation: core::option::Option<u64>
 pub craqle::QueryExecutionStatistics::result_cells: u64
 pub craqle::QueryExecutionStatistics::result_collection_time: core::time::Duration
 pub craqle::QueryExecutionStatistics::result_rows: u64
@@ -883,6 +887,8 @@ pub craqle::QueryExecutionStatistics::time_to_first_internal_result: core::optio
 #[non_exhaustive] pub struct craqle::QueryIndexStatus
 pub craqle::QueryIndexStatus::indexed_quads: u64
 pub craqle::QueryIndexStatus::last_build_sequence: u64
+pub craqle::QueryIndexStatus::query_id_generation: u64
+pub craqle::QueryIndexStatus::query_term_ids: u64
 pub craqle::QueryIndexStatus::schema_version: u32
 pub craqle::QueryIndexStatus::source_live_quads: u64
 pub craqle::QueryIndexStatus::state: craqle::QueryIndexState
@@ -923,6 +929,7 @@ pub craqle::ReadStatistics::qv_counter_reads: u64
 pub craqle::ReadStatistics::qv_header_reads: u64
 pub craqle::ReadStatistics::qv_keys_read: u64
 pub craqle::ReadStatistics::qv_trusted: bool
+pub craqle::ReadStatistics::query_id_generation: core::option::Option<u64>
 pub craqle::ReadStatistics::selected_access_paths: alloc::vec::Vec<craqle::ReadAccessPath>
 pub craqle::ReadStatistics::source_bytes_read: u64
 pub craqle::ReadStatistics::source_keys_read: u64
