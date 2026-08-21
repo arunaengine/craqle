@@ -243,21 +243,21 @@ is claimed; that long run remains deferred until explicitly authorized.
 ### Preliminary Oxigraph diagnostic
 
 Commit `d6ae463` adds a bounded same-corpus comparison against exact Oxigraph
-`0.5.9`. The table shows warm p50 from ten samples over 32 graphs with no
-duplicate copies; p95 values emitted by the harness are nearest-rank sample
-values. Results matched exactly after normalization except unordered `LIMIT`,
-where both engines returned a valid complete ten-row result from the same
-larger unordered solution.
+`0.5.9`; the corrected evidence below is from `3fe6ab2`. The table shows warm
+p50 from ten samples over 32 graphs with no duplicate copies; p95 values
+emitted by the harness are nearest-rank sample values. Results matched exactly
+after normalization except unordered `LIMIT`, where both engines returned a
+valid complete ten-row result from the same larger unordered solution.
 
 | 1M case | Craqle p50 | Oxigraph p50 |
 | --- | ---: | ---: |
-| Bound ASK hit | 0.171 ms | 0.032 ms |
+| Bound ASK hit | 0.174 ms | 0.030 ms |
 | Bound ASK miss | 0.131 ms | 0.033 ms |
-| Predicate-object `LIMIT 10` | 0.489 ms | 26.999 ms |
-| Exact common-predicate count | 60.396 ms | 62.307 ms |
-| Property star | 0.232 ms | 0.070 ms |
-| Rare-to-common join | 0.219 ms | 0.049 ms |
-| Common-to-rare written-order join | 0.212 ms | 0.047 ms |
+| Predicate-object `LIMIT 10` | 0.464 ms | 26.463 ms |
+| Exact common-predicate count | 61.349 ms | 64.218 ms |
+| Property star | 0.236 ms | 0.068 ms |
+| Rare-to-common join | 0.218 ms | 0.053 ms |
+| Common-to-rare written-order join | 0.208 ms | 0.047 ms |
 
 This is diagnostic evidence, not the final fair comparison: Craqle used its
 buffered Fjall temporary store while Oxigraph used its in-memory store. It
