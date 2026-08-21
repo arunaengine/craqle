@@ -343,6 +343,7 @@ pub craqle::QueryFastPathKind::CountDistinctObject
 pub craqle::QueryFastPathKind::CountDistinctSubject
 pub craqle::QueryFastPathKind::HashJoinCount
 pub craqle::QueryFastPathKind::NamedCount
+pub craqle::QueryFastPathKind::Projection
 pub craqle::QueryFastPathKind::PropertyStar
 pub craqle::QueryFastPathKind::SelectLimit
 pub craqle::QueryFastPathKind::SubjectStarCount

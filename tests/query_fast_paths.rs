@@ -156,6 +156,10 @@ fn fast_paths_match_generic() {
             QueryFastPathKind::SelectLimit,
         ),
         (
+            "SELECT ?s WHERE { ?s <urn:test:fast:p> <urn:test:fast:o:shared> }",
+            QueryFastPathKind::Projection,
+        ),
+        (
             "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:test:fast:p> ?o }",
             QueryFastPathKind::UnionCount,
         ),

@@ -37,6 +37,7 @@ pub enum QueryFastPathMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum QueryFastPathKind {
     Ask,
+    Projection,
     SelectLimit,
     NamedCount,
     UnionCount,
@@ -76,6 +77,10 @@ pub(crate) enum FastPathPlan {
         variables: Vec<String>,
         limit: usize,
     },
+    Projection {
+        triple: TriplePlan,
+        variables: Vec<String>,
+    },
     Count {
         triple: TriplePlan,
         output: String,
@@ -114,6 +119,7 @@ impl FastPathPlan {
     pub(crate) fn kind(&self) -> QueryFastPathKind {
         match self {
             Self::Ask(_) | Self::TriangleAsk(_) => QueryFastPathKind::Ask,
+            Self::Projection { .. } => QueryFastPathKind::Projection,
             Self::SelectLimit { .. } => QueryFastPathKind::SelectLimit,
             Self::Count {
                 domain: crate::count_plan::CountValueDomain::Subject,
@@ -183,13 +189,17 @@ pub(crate) fn analyze(query: &Query) -> Option<FastPathPlan> {
             }
             let (inner, variables, limit) = projection(pattern)?;
             if let Some(triple) = single_triple(inner) {
-                return Some(FastPathPlan::SelectLimit {
-                    triple,
-                    variables: variables
-                        .iter()
-                        .map(|variable| variable.as_str().to_owned())
-                        .collect(),
-                    limit: limit?,
+                let variables = variables
+                    .iter()
+                    .map(|variable| variable.as_str().to_owned())
+                    .collect();
+                return Some(match limit {
+                    Some(limit) => FastPathPlan::SelectLimit {
+                        triple,
+                        variables,
+                        limit,
+                    },
+                    None => FastPathPlan::Projection { triple, variables },
                 });
             }
             property_star_plan(
@@ -688,40 +698,24 @@ pub(crate) fn execute(
             triple,
             variables,
             limit,
-        } => {
-            let mut rows = Vec::with_capacity(*limit);
-            let mut collection_time = Duration::ZERO;
-            let mut time_to_first_result = None;
-            if let Some(triple) = triple.resolve(view, context)? {
-                let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
-                while rows.len() < *limit {
-                    let Some(quad) = cursor.next() else {
-                        break;
-                    };
-                    let quad = quad?;
-                    if time_to_first_result.is_none() {
-                        time_to_first_result = Some(started.elapsed());
-                    }
-                    let collecting = Instant::now();
-                    rows.push(collect_row(view, context, &triple, quad, variables)?);
-                    collection_time = collection_time.saturating_add(collecting.elapsed());
-                }
-            }
-            let result_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-            let result_cells = rows.iter().fold(0_u64, |total, row| {
-                total.saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX))
-            });
-            Ok(FastPathOutcome {
-                results: QueryResults::Solutions(rows),
-                kind: QueryFastPathKind::SelectLimit,
-                execution_time: started.elapsed().saturating_sub(collection_time),
-                collection_time,
-                time_to_first_result,
-                intermediate_rows: result_rows,
-                result_rows,
-                result_cells,
-            })
-        }
+        } => execute_projection(
+            triple,
+            variables,
+            *limit,
+            QueryFastPathKind::SelectLimit,
+            view,
+            context,
+            started,
+        ),
+        FastPathPlan::Projection { triple, variables } => execute_projection(
+            triple,
+            variables,
+            usize::MAX,
+            QueryFastPathKind::Projection,
+            view,
+            context,
+            started,
+        ),
         FastPathPlan::Count {
             triple,
             output,
@@ -804,6 +798,49 @@ pub(crate) fn execute(
             join_variables,
         } => hash_join_count(left, right, output, join_variables, view, context, limits),
     }
+}
+
+fn execute_projection(
+    triple: &TriplePlan,
+    variables: &[String],
+    limit: usize,
+    kind: QueryFastPathKind,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    started: Instant,
+) -> Result<FastPathOutcome> {
+    let mut rows = Vec::with_capacity(limit.min(1_024));
+    let mut collection_time = Duration::ZERO;
+    let mut time_to_first_result = None;
+    if let Some(triple) = triple.resolve(view, context)? {
+        let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+        while rows.len() < limit {
+            let Some(quad) = cursor.next() else {
+                break;
+            };
+            let quad = quad?;
+            if time_to_first_result.is_none() {
+                time_to_first_result = Some(started.elapsed());
+            }
+            let collecting = Instant::now();
+            rows.push(collect_row(view, context, &triple, quad, variables)?);
+            collection_time = collection_time.saturating_add(collecting.elapsed());
+        }
+    }
+    let result_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    let result_cells = rows.iter().fold(0_u64, |total, row| {
+        total.saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX))
+    });
+    Ok(FastPathOutcome {
+        results: QueryResults::Solutions(rows),
+        kind,
+        execution_time: started.elapsed().saturating_sub(collection_time),
+        collection_time,
+        time_to_first_result,
+        intermediate_rows: result_rows,
+        result_rows,
+        result_cells,
+    })
 }
 
 fn triangle_ask(
