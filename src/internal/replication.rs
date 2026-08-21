@@ -2398,6 +2398,11 @@ mod tests {
         );
         assert_eq!(store.pending_shacl_count().unwrap(), 1);
         assert_eq!(store.shacl_runtime_statistics().settlement_failures, 1);
+        store.persist().unwrap();
+        drop(engine);
+        drop(store);
+
+        let (store, engine) = engine_at(dir.path());
         engine.replay_pending_bindings().unwrap();
         assert_eq!(store.pending_shacl_count().unwrap(), 0);
     }
@@ -2482,6 +2487,44 @@ mod tests {
         assert_eq!(startup.statistics.pending_queue_entries_scanned, 0);
         assert_eq!(startup.statistics.graphs_settled, 0);
         assert_eq!(startup.statistics.reports_produced, 0);
+    }
+
+    #[test]
+    fn healthy_reopen_does_not_scan_binding_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        {
+            let (store, engine, _data, _binding) =
+                pending_engine(&store_path, ValidationPolicy::Advisory);
+            store.persist().unwrap();
+            drop(engine);
+            drop(store);
+        }
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            assert_eq!(
+                node.startup_pending_replay()
+                    .statistics
+                    .binding_records_scanned,
+                1
+            );
+        }
+
+        let reopened = crate::CraqleNode::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .startup_pending_replay()
+                .statistics
+                .binding_records_scanned,
+            0
+        );
+        assert_eq!(
+            reopened
+                .startup_pending_replay()
+                .statistics
+                .pending_queue_entries_scanned,
+            0
+        );
     }
 
     #[test]

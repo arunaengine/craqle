@@ -3596,10 +3596,25 @@ mod tests {
                 .settlement_failures,
             1
         );
-        let replay = node
-            .replay_pending_shacl(1, Duration::from_secs(1))
-            .unwrap();
-        assert_eq!(replay.statistics.graphs_settled, 1);
+        node.persist_fjall().unwrap();
+        drop(node);
+
+        let reopened = CraqleNode::open_with_options(
+            directory.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.startup_pending_replay().statistics.graphs_settled,
+            1
+        );
+        assert_eq!(
+            reopened
+                .shacl_binding_statuses(&AllowAllAuthorizer, &data)
+                .unwrap()[0]
+                .state,
+            ShaclValidationState::Valid
+        );
     }
 
     #[test]
