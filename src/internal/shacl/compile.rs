@@ -36,7 +36,7 @@ use super::resolve::{ResolvedSchema, ResolvedTarget, resolve};
 
 const CACHE_CAPACITY: usize = 32;
 const EXTENSION_PROFILE: u32 = 0;
-const RUDOF_VERSION: &str = "0.3.8";
+const RUDOF_VERSION: &str = "0.3.10";
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 const OWL_IMPORTS: &str = "<http://www.w3.org/2002/07/owl#imports>";
 const SH_CONSTRAINT_COMPONENT: &str = "<http://www.w3.org/ns/shacl#ConstraintComponent>";

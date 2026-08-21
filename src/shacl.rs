@@ -13,7 +13,7 @@ pub enum ShaclProfile {
 }
 
 /// Persisted model version used by the native SHACL compiler.
-pub const SHACL_COMPILER_MODEL_VERSION: u32 = 1;
+pub const SHACL_COMPILER_MODEL_VERSION: u32 = 2;
 
 /// Startup policy for durable SHACL work left pending by an earlier process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
