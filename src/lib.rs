@@ -247,6 +247,7 @@ impl From<sparql::SparqlError> for CraqleError {
     fn from(error: sparql::SparqlError) -> Self {
         match error {
             sparql::SparqlError::Cancelled => Self::QueryCancelled,
+            sparql::SparqlError::Store(store::StoreError::Cancelled) => Self::QueryCancelled,
             error => Self::Sparql(error),
         }
     }
