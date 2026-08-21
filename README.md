@@ -240,29 +240,31 @@ Historical 10M SPARQL rows remain access-path evidence only. No
 current-final-binary 10M SHACL, incremental-validation, or checked-write result
 is claimed; that long run remains deferred until explicitly authorized.
 
-### Preliminary Oxigraph diagnostic
+### Persistent Oxigraph diagnostic
 
-Commit `d6ae463` adds a bounded same-corpus comparison against exact Oxigraph
-`0.5.9`; the corrected evidence below is from `3fe6ab2`. The table shows warm
-p50 from ten samples over 32 graphs with no duplicate copies; p95 values
-emitted by the harness are nearest-rank sample values. Results matched exactly
-after normalization except unordered `LIMIT`, where both engines returned a
-valid complete ten-row result from the same larger unordered solution.
+Commit `78a54aa` adds an explicit persistent mode to the bounded same-corpus
+comparison against exact Oxigraph `0.5.9`. The table shows warm p50 at that
+published commit from ten samples over 32 graphs with no duplicate copies,
+using Craqle `SyncAll` Fjall and Oxigraph RocksDB temporary stores. Emitted p95
+values are nearest-rank sample values. Results matched exactly after
+normalization except unordered `LIMIT`, where both engines returned a valid
+complete ten-row result from the same larger unordered solution.
 
 | 1M case | Craqle p50 | Oxigraph p50 |
 | --- | ---: | ---: |
-| Bound ASK hit | 0.174 ms | 0.030 ms |
-| Bound ASK miss | 0.131 ms | 0.033 ms |
-| Predicate-object `LIMIT 10` | 0.464 ms | 26.463 ms |
-| Exact common-predicate count | 61.349 ms | 64.218 ms |
-| Property star | 0.236 ms | 0.068 ms |
-| Rare-to-common join | 0.218 ms | 0.053 ms |
-| Common-to-rare written-order join | 0.208 ms | 0.047 ms |
+| Bound ASK hit | 0.219 ms | 0.279 ms |
+| Bound ASK miss | 0.156 ms | 0.235 ms |
+| Predicate-object `LIMIT 10` | 0.236 ms | 0.288 ms |
+| Exact common-predicate count | 61.241 ms | 32.607 ms |
+| Property star | 0.279 ms | 0.564 ms |
+| Rare-to-common join | 0.300 ms | 0.454 ms |
+| Common-to-rare written-order join | 0.283 ms | 0.449 ms |
 
-This is diagnostic evidence, not the final fair comparison: Craqle used its
-buffered Fjall temporary store while Oxigraph used its in-memory store. It
-therefore does not support a general relative-performance claim or close the
-same-durability release gate. The harness rejects 10M inputs.
+Craqle was faster in six of these seven focused cases; broad exact count was
+1.878x slower. This remains diagnostic evidence, not a general
+relative-performance claim: the full generic and RO-Crate query matrix,
+fresh-process latency, allocations, database size, and equivalent load-cost
+measurements remain open. The harness rejects 10M inputs.
 
 ## Limitations
 

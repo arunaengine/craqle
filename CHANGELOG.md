@@ -36,9 +36,9 @@ All notable changes to Craqle are documented here.
   and small-bound-graph checked-write baselines are retained.
 - Current-final-binary 10M SHACL, incremental-validation, and checked-write
   evidence remains deferred until explicitly authorized.
-- The initial direct Oxigraph diagnostic verifies the focused query result
-  matrix at 10K and 1M but uses an in-memory Oxigraph store, so the
-  same-durability comparison gate remains open.
+- The direct Oxigraph diagnostic verifies the focused query result matrix at
+  10K and 1M using Craqle `SyncAll` Fjall and Oxigraph RocksDB temporary stores.
+  The complete generic and RO-Crate comparison matrix remains open.
 
 ### Compatibility
 
