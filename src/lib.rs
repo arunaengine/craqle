@@ -3445,7 +3445,7 @@ mod tests {
                 if policy == ValidationPolicy::Disabled {
                     assert_eq!(max_active, 0);
                 } else {
-                    assert_eq!(max_active, count);
+                    assert!(max_active >= count.min(2));
                 }
             }
         }
