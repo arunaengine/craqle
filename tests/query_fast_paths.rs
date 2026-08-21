@@ -379,6 +379,112 @@ fn count_fast_path_matches_every_triple_binding_shape() {
 }
 
 #[test]
+fn subject_star_count_preserves_multiplicity() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:fast:subject-star");
+    let mut changes = Vec::new();
+    for object in ["urn:o:a", "urn:o:b"] {
+        changes.push(insert(&graph, "urn:s:1", "urn:p:1", iri(object)));
+    }
+    for object in ["urn:o:c", "urn:o:d", "urn:o:e"] {
+        changes.push(insert(&graph, "urn:s:1", "urn:p:2", iri(object)));
+    }
+    changes.push(insert(&graph, "urn:s:1", "urn:p:3", iri("urn:o:f")));
+    changes.push(insert(&graph, "urn:s:2", "urn:p:1", iri("urn:o:g")));
+    changes.push(insert(&graph, "urn:s:2", "urn:p:2", iri("urn:o:h")));
+    for object in ["urn:o:i", "urn:o:j"] {
+        changes.push(insert(&graph, "urn:s:2", "urn:p:3", iri(object)));
+    }
+    node.apply_changes_unchecked(&graph, changes).unwrap();
+    node.rebuild_graph_diagnostics(&graph).unwrap();
+    node.ensure_query_indexes();
+
+    for query in [
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p:1> ?a ; <urn:p:2> ?b ; <urn:p:3> ?c }",
+        "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:subject-star> { \
+         ?s <urn:p:1> ?a ; <urn:p:2> ?b ; <urn:p:3> ?c } }",
+    ] {
+        let fast = run(
+            &node,
+            std::slice::from_ref(&graph),
+            query,
+            QueryFastPathMode::Auto,
+        );
+        let generic = run(
+            &node,
+            std::slice::from_ref(&graph),
+            query,
+            QueryFastPathMode::Disabled,
+        );
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(
+            fast.statistics.fast_path,
+            Some(QueryFastPathKind::SubjectStarCount)
+        );
+        assert_eq!(fast.statistics.encoded_quad_constructions, 0);
+        assert_eq!(fast.statistics.authoritative_terms_decoded, 0);
+    }
+}
+
+#[test]
+fn linear_chain_count_uses_explicit_cross_domains() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:fast:linear-chain");
+    node.apply_changes_unchecked(
+        &graph,
+        vec![
+            insert(&graph, "urn:a", "urn:p:1", iri("urn:k:1")),
+            insert(&graph, "urn:b", "urn:p:1", iri("urn:k:2")),
+            insert(&graph, "urn:k:1", "urn:q:1", iri("urn:x")),
+            insert(&graph, "urn:k:1", "urn:q:1", iri("urn:y")),
+            insert(&graph, "urn:k:2", "urn:q:1", iri("urn:z")),
+            insert(&graph, "urn:c", "urn:p:2", iri("urn:m:1")),
+            insert(&graph, "urn:d", "urn:p:2", iri("urn:m:1")),
+            insert(&graph, "urn:e", "urn:p:2", iri("urn:m:2")),
+            insert(&graph, "urn:m:1", "urn:q:2", iri("urn:u")),
+            insert(&graph, "urn:m:2", "urn:q:2", iri("urn:v")),
+        ],
+    )
+    .unwrap();
+    node.rebuild_graph_diagnostics(&graph).unwrap();
+    node.ensure_query_indexes();
+
+    for body in [
+        "?s <urn:p:1> ?key . ?key <urn:q:1> ?value",
+        "?s <urn:p:2> ?key . ?key <urn:q:2> ?value",
+    ] {
+        for query in [
+            format!("SELECT (COUNT(*) AS ?count) WHERE {{ {body} }}"),
+            format!(
+                "SELECT (COUNT(*) AS ?count) WHERE {{ GRAPH <{}> {{ {body} }} }}",
+                graph.as_str()
+            ),
+        ] {
+            let prepared = node.prepare_query(&query).unwrap();
+            let execute = |fast_paths| {
+                let mut options = QueryExecutionOptions::default();
+                options.fast_paths = fast_paths;
+                options.join_mode = JoinMode::ForceHash;
+                node.execute_prepared_graphs(std::slice::from_ref(&graph), &prepared, &options)
+                    .unwrap()
+            };
+            let fast = execute(QueryFastPathMode::Auto);
+            let generic = execute(QueryFastPathMode::Disabled);
+            assert_eq!(fast.results, generic.results, "{query}");
+            assert_eq!(
+                fast.statistics.fast_path,
+                Some(QueryFastPathKind::HashJoinCount)
+            );
+            assert_eq!(fast.statistics.encoded_quad_constructions, 0);
+            assert_eq!(fast.statistics.authoritative_terms_decoded, 0);
+        }
+    }
+}
+
+#[test]
 fn hash_count_multiplicity() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();

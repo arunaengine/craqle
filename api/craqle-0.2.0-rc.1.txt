@@ -345,6 +345,7 @@ pub craqle::QueryFastPathKind::HashJoinCount
 pub craqle::QueryFastPathKind::NamedCount
 pub craqle::QueryFastPathKind::PropertyStar
 pub craqle::QueryFastPathKind::SelectLimit
+pub craqle::QueryFastPathKind::SubjectStarCount
 pub craqle::QueryFastPathKind::UnionCount
 pub enum craqle::QueryFastPathMode
 pub craqle::QueryFastPathMode::Auto

@@ -3,7 +3,9 @@
 
 use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
 
-use crate::sparql_fast_path::{FastPathPlan, single_triple, two_joined_triples};
+use crate::sparql_fast_path::{
+    FastPathPlan, same_subject_triples, single_triple, two_joined_triples,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CountValueDomain {
@@ -51,6 +53,15 @@ pub(crate) fn analyze(pattern: &GraphPattern) -> Option<FastPathPlan> {
         aggregate,
         AggregateExpression::CountSolutions { distinct: false }
     );
+    if count_all
+        && let Some((_, triples)) = same_subject_triples(inner)
+        && triples.len() > 2
+    {
+        return Some(FastPathPlan::SubjectStarCount {
+            triples,
+            output: output.as_str().to_owned(),
+        });
+    }
     if count_all && let Some((left, right, join_variables)) = two_joined_triples(inner) {
         return Some(FastPathPlan::HashJoinCount {
             left,

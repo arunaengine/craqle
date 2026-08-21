@@ -29,6 +29,7 @@ pub enum QueryFastPathKind {
     UnionCount,
     CountDistinctSubject,
     CountDistinctObject,
+    SubjectStarCount,
     PropertyStar,
     HashJoinCount,
 }
@@ -66,6 +67,10 @@ pub(crate) enum FastPathPlan {
         output: String,
         domain: crate::count_plan::CountValueDomain,
     },
+    SubjectStarCount {
+        triples: Vec<TriplePlan>,
+        output: String,
+    },
     PropertyStar {
         triples: Vec<TriplePlan>,
         subject: PatternTerm,
@@ -97,6 +102,7 @@ impl FastPathPlan {
                 PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
                 PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
             },
+            Self::SubjectStarCount { .. } => QueryFastPathKind::SubjectStarCount,
             Self::PropertyStar { .. } => QueryFastPathKind::PropertyStar,
             Self::HashJoinCount { .. } => QueryFastPathKind::HashJoinCount,
         }
@@ -193,6 +199,18 @@ fn property_star_plan(
     variables: Vec<String>,
     limit: usize,
 ) -> Option<FastPathPlan> {
+    let (subject, triples) = same_subject_triples(pattern)?;
+    Some(FastPathPlan::PropertyStar {
+        triples,
+        subject,
+        variables,
+        limit,
+    })
+}
+
+pub(crate) fn same_subject_triples(
+    pattern: &GraphPattern,
+) -> Option<(PatternTerm, Vec<TriplePlan>)> {
     let (graph, patterns) = match pattern {
         GraphPattern::Bgp { patterns } => (PatternGraph::DefaultUnion, patterns.as_slice()),
         GraphPattern::Graph {
@@ -229,12 +247,7 @@ fn property_star_plan(
         }
         triples.push(triple_plan(graph.clone(), pattern)?);
     }
-    Some(FastPathPlan::PropertyStar {
-        triples,
-        subject,
-        variables,
-        limit,
-    })
+    Some((subject, triples))
 }
 
 pub(crate) fn two_joined_triples(
@@ -553,6 +566,9 @@ pub(crate) fn execute(
                 started,
             ))
         }
+        FastPathPlan::SubjectStarCount { triples, output } => {
+            subject_star_count(triples, output, view, context, started)
+        }
         FastPathPlan::PropertyStar {
             triples,
             subject,
@@ -566,6 +582,88 @@ pub(crate) fn execute(
             join_variables,
         } => hash_join_count(left, right, output, join_variables, view, context, started),
     }
+}
+
+fn subject_star_count(
+    triples: &[TriplePlan],
+    output: &str,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    started: Instant,
+) -> Result<FastPathOutcome> {
+    let mut resolved = Vec::with_capacity(triples.len());
+    for triple in triples {
+        let Some(triple) = triple.resolve(view, context)? else {
+            return Ok(count_outcome(
+                output,
+                0,
+                QueryFastPathKind::SubjectStarCount,
+                0,
+                started,
+            ));
+        };
+        resolved.push(triple);
+    }
+    let patterns: Vec<_> = resolved
+        .iter()
+        .map(|triple| (triple.selector, triple.pattern))
+        .collect();
+    if let Some((count, intermediate_rows)) =
+        crate::count_exec::subject_star_count(view, context, &patterns)?
+    {
+        return Ok(count_outcome(
+            output,
+            count.get(),
+            QueryFastPathKind::SubjectStarCount,
+            intermediate_rows,
+            started,
+        ));
+    }
+
+    let mut relations = Vec::with_capacity(resolved.len());
+    let mut intermediate_rows = 0_u64;
+    for triple in resolved {
+        let mut relation = HashMap::<TermId, u64>::new();
+        let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+        for quad in &mut cursor {
+            let count = relation.entry(quad?.subject).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+            })?;
+            intermediate_rows = intermediate_rows.saturating_add(1);
+        }
+        relations.push(relation);
+    }
+    let Some((base_index, base)) = relations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, relation)| relation.len())
+    else {
+        unreachable!("subject-star plans contain at least two triples")
+    };
+    let mut count = 0_u64;
+    for (subject, multiplicity) in base {
+        let mut product = *multiplicity;
+        for (index, relation) in relations.iter().enumerate() {
+            if index != base_index {
+                product = product
+                    .checked_mul(relation.get(subject).copied().unwrap_or(0))
+                    .ok_or_else(|| {
+                        crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                    })?;
+            }
+        }
+        count = count
+            .checked_add(product)
+            .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+    }
+    Ok(count_outcome(
+        output,
+        count,
+        QueryFastPathKind::SubjectStarCount,
+        intermediate_rows,
+        started,
+    ))
 }
 
 fn hash_join_count(
@@ -614,6 +712,28 @@ fn hash_join_count(
                 Some(crate::count_plan::CountValueDomain::Object),
                 Some(crate::count_plan::CountValueDomain::Object),
             ) => crate::count_exec::object_join_count(
+                view,
+                context,
+                build.selector,
+                build.pattern,
+                probe.selector,
+                probe.pattern,
+            )?,
+            (
+                Some(crate::count_plan::CountValueDomain::Object),
+                Some(crate::count_plan::CountValueDomain::Subject),
+            ) => crate::count_exec::object_subject_join_count(
+                view,
+                context,
+                build.selector,
+                build.pattern,
+                probe.selector,
+                probe.pattern,
+            )?,
+            (
+                Some(crate::count_plan::CountValueDomain::Subject),
+                Some(crate::count_plan::CountValueDomain::Object),
+            ) => crate::count_exec::subject_object_join_count(
                 view,
                 context,
                 build.selector,
@@ -916,6 +1036,7 @@ mod tests {
             "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o }",
             "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s <urn:p> <urn:o> }",
             "SELECT (COUNT(?s) AS ?count) WHERE { ?s <urn:p> ?o }",
+            "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?a ; <urn:q> ?b ; <urn:r> ?c }",
             "SELECT ?s ?a ?b WHERE { ?s <urn:p> ?o ; <urn:a> ?a ; <urn:b> ?b }",
             "SELECT ?a ?b WHERE { <urn:s> <urn:a> ?a ; <urn:b> ?b }",
             "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?key . ?s <urn:q> ?key }",

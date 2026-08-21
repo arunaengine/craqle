@@ -275,6 +275,145 @@ pub(crate) fn object_join_count(
     Ok(Some((count, intermediate_rows)))
 }
 
+pub(crate) fn object_subject_join_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    build_selector: GraphSelector,
+    build_pattern: QuadPattern,
+    probe_selector: GraphSelector,
+    probe_pattern: QuadPattern,
+) -> Result<Option<(ScalarCount, u64)>> {
+    let mut table = ObjectKeySet::default();
+    let mut intermediate_rows = 0_u64;
+    if for_each_join_key(
+        view,
+        context,
+        build_selector,
+        build_pattern,
+        JoinKeyDomain::Object,
+        |object| {
+            intermediate_rows = intermediate_rows.saturating_add(1);
+            table.observe(object)
+        },
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+
+    let mut count = ScalarCount::default();
+    if for_each_join_key(
+        view,
+        context,
+        probe_selector,
+        probe_pattern,
+        JoinKeyDomain::Subject,
+        |subject| {
+            intermediate_rows = intermediate_rows.saturating_add(1);
+            count.add(table.multiplicity(subject))
+        },
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some((count, intermediate_rows)))
+}
+
+pub(crate) fn subject_object_join_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    build_selector: GraphSelector,
+    build_pattern: QuadPattern,
+    probe_selector: GraphSelector,
+    probe_pattern: QuadPattern,
+) -> Result<Option<(ScalarCount, u64)>> {
+    let mut table = SubjectKeySet::default();
+    let mut intermediate_rows = 0_u64;
+    if for_each_join_key(
+        view,
+        context,
+        build_selector,
+        build_pattern,
+        JoinKeyDomain::Subject,
+        |subject| {
+            intermediate_rows = intermediate_rows.saturating_add(1);
+            table.observe(subject)
+        },
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+
+    let mut count = ScalarCount::default();
+    if for_each_join_key(
+        view,
+        context,
+        probe_selector,
+        probe_pattern,
+        JoinKeyDomain::Object,
+        |object| {
+            intermediate_rows = intermediate_rows.saturating_add(1);
+            count.add(table.multiplicity(object))
+        },
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some((count, intermediate_rows)))
+}
+
+pub(crate) fn subject_star_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    patterns: &[(GraphSelector, QuadPattern)],
+) -> Result<Option<(ScalarCount, u64)>> {
+    let mut relations = Vec::with_capacity(patterns.len());
+    let mut intermediate_rows = 0_u64;
+    for &(selector, pattern) in patterns {
+        let mut relation = SubjectKeySet::default();
+        if for_each_join_key(
+            view,
+            context,
+            selector,
+            pattern,
+            JoinKeyDomain::Subject,
+            |subject| {
+                intermediate_rows = intermediate_rows.saturating_add(1);
+                relation.observe(subject)
+            },
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        relations.push(relation);
+    }
+
+    let Some((base_index, base)) = relations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, relation)| relation.multiplicities.len())
+    else {
+        unreachable!("subject-star plans contain at least two triples")
+    };
+    let mut count = ScalarCount::default();
+    for (subject, multiplicity) in &base.multiplicities {
+        let mut product = *multiplicity;
+        for (index, relation) in relations.iter().enumerate() {
+            if index != base_index {
+                product = product
+                    .checked_mul(relation.multiplicity(*subject))
+                    .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+            }
+        }
+        count.add(product)?;
+    }
+    Ok(Some((count, intermediate_rows)))
+}
+
 #[derive(Clone, Copy)]
 enum JoinKeyDomain {
     Subject,
