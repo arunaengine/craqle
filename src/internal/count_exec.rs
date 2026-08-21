@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::count_plan::CountValueDomain;
+use crate::count_plan::{CountValueDomain, SubjectSetMode};
 use crate::query_context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{Result, SparqlError};
@@ -15,6 +15,16 @@ const PARALLEL_COUNT_MIN_ROWS: u64 = 65_536;
 const PARALLEL_COUNT_MIN_ROWS: u64 = 32;
 type GraphOrphanCache = HashMap<QueryTermId, Option<Rc<HashSet<TermId>>>>;
 type ParallelGraphOrphanCache = Arc<HashMap<QueryTermId, Option<Arc<HashSet<TermId>>>>>;
+
+fn enforce_hash_entries(entries: usize, limit: usize) -> Result<()> {
+    if entries > limit {
+        return Err(SparqlError::QueryLimit {
+            resource: "hash keys",
+            limit,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ScalarCount(u64);
@@ -55,12 +65,13 @@ pub(crate) struct SubjectKeySet {
 }
 
 impl SubjectKeySet {
-    fn observe(&mut self, subject: QueryTermId) -> Result<()> {
+    fn observe(&mut self, subject: QueryTermId) -> Result<bool> {
         let count = self.multiplicities.entry(subject).or_default();
+        let inserted = *count == 0;
         *count = count
             .checked_add(1)
             .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?;
-        Ok(())
+        Ok(inserted)
     }
 
     fn multiplicity(&self, subject: QueryTermId) -> u64 {
@@ -74,12 +85,13 @@ pub(crate) struct ObjectKeySet {
 }
 
 impl ObjectKeySet {
-    fn observe(&mut self, object: QueryTermId) -> Result<()> {
+    fn observe(&mut self, object: QueryTermId) -> Result<bool> {
         let count = self.multiplicities.entry(object).or_default();
+        let inserted = *count == 0;
         *count = count
             .checked_add(1)
             .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?;
-        Ok(())
+        Ok(inserted)
     }
 
     fn multiplicity(&self, object: QueryTermId) -> u64 {
@@ -279,8 +291,10 @@ pub(crate) fn subject_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
+    max_hash_entries: usize,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = SubjectKeySet::default();
+    let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
     if for_each_join_key(
         view,
@@ -290,7 +304,11 @@ pub(crate) fn subject_join_count(
         JoinKeyDomain::Subject,
         |key| {
             intermediate_rows = intermediate_rows.saturating_add(1);
-            table.observe(key)
+            if table.observe(key)? {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, max_hash_entries)?;
+            }
+            Ok(())
         },
     )?
     .is_none()
@@ -324,8 +342,10 @@ pub(crate) fn object_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
+    max_hash_entries: usize,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = ObjectKeySet::default();
+    let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
     if for_each_join_key(
         view,
@@ -335,7 +355,11 @@ pub(crate) fn object_join_count(
         JoinKeyDomain::Object,
         |key| {
             intermediate_rows = intermediate_rows.saturating_add(1);
-            table.observe(key)
+            if table.observe(key)? {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, max_hash_entries)?;
+            }
+            Ok(())
         },
     )?
     .is_none()
@@ -369,8 +393,10 @@ pub(crate) fn object_subject_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
+    max_hash_entries: usize,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = ObjectKeySet::default();
+    let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
     if for_each_join_key(
         view,
@@ -380,7 +406,11 @@ pub(crate) fn object_subject_join_count(
         JoinKeyDomain::Object,
         |object| {
             intermediate_rows = intermediate_rows.saturating_add(1);
-            table.observe(object)
+            if table.observe(object)? {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, max_hash_entries)?;
+            }
+            Ok(())
         },
     )?
     .is_none()
@@ -414,8 +444,10 @@ pub(crate) fn subject_object_join_count(
     build_pattern: QuadPattern,
     probe_selector: GraphSelector,
     probe_pattern: QuadPattern,
+    max_hash_entries: usize,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut table = SubjectKeySet::default();
+    let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
     if for_each_join_key(
         view,
@@ -425,7 +457,11 @@ pub(crate) fn subject_object_join_count(
         JoinKeyDomain::Subject,
         |subject| {
             intermediate_rows = intermediate_rows.saturating_add(1);
-            table.observe(subject)
+            if table.observe(subject)? {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, max_hash_entries)?;
+            }
+            Ok(())
         },
     )?
     .is_none()
@@ -456,9 +492,11 @@ pub(crate) fn subject_star_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     patterns: &[(GraphSelector, QuadPattern)],
+    max_hash_entries: usize,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut relations = Vec::with_capacity(patterns.len());
     let mut intermediate_rows = 0_u64;
+    let mut hash_entries = 0usize;
     for &(selector, pattern) in patterns {
         let mut relation = SubjectKeySet::default();
         if for_each_join_key(
@@ -469,7 +507,11 @@ pub(crate) fn subject_star_count(
             JoinKeyDomain::Subject,
             |subject| {
                 intermediate_rows = intermediate_rows.saturating_add(1);
-                relation.observe(subject)
+                if relation.observe(subject)? {
+                    hash_entries = hash_entries.saturating_add(1);
+                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                }
+                Ok(())
             },
         )?
         .is_none()
@@ -506,9 +548,11 @@ pub(crate) fn optional_subject_star_count(
     context: &ReadContext<'_>,
     mandatory: &[(GraphSelector, QuadPattern)],
     optional: &[(GraphSelector, QuadPattern)],
+    max_hash_entries: usize,
 ) -> Result<Option<(ScalarCount, u64)>> {
     let mut relations = Vec::with_capacity(mandatory.len() + optional.len());
     let mut intermediate_rows = 0_u64;
+    let mut hash_entries = 0usize;
     for &(selector, pattern) in mandatory.iter().chain(optional) {
         let mut relation = SubjectKeySet::default();
         if for_each_join_key(
@@ -519,7 +563,11 @@ pub(crate) fn optional_subject_star_count(
             JoinKeyDomain::Subject,
             |subject| {
                 intermediate_rows = intermediate_rows.saturating_add(1);
-                relation.observe(subject)
+                if relation.observe(subject)? {
+                    hash_entries = hash_entries.saturating_add(1);
+                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                }
+                Ok(())
             },
         )?
         .is_none()
@@ -570,6 +618,100 @@ pub(crate) fn optional_subject_star_count(
                 .checked_mul(optional_product)
                 .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?,
         )?;
+    }
+    Ok(Some((count, intermediate_rows)))
+}
+
+pub(crate) fn subject_set_count(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    outer: &[(GraphSelector, QuadPattern)],
+    inner: &[(GraphSelector, QuadPattern)],
+    mode: SubjectSetMode,
+    max_hash_entries: usize,
+) -> Result<Option<(ScalarCount, u64)>> {
+    let mut outer_relations = Vec::with_capacity(outer.len());
+    let mut intermediate_rows = 0_u64;
+    let mut hash_entries = 0usize;
+    for &(selector, pattern) in outer {
+        let mut relation = SubjectKeySet::default();
+        if for_each_join_key(
+            view,
+            context,
+            selector,
+            pattern,
+            JoinKeyDomain::Subject,
+            |subject| {
+                intermediate_rows = intermediate_rows.saturating_add(1);
+                if relation.observe(subject)? {
+                    hash_entries = hash_entries.saturating_add(1);
+                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                }
+                Ok(())
+            },
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        outer_relations.push(relation);
+    }
+    let mut inner_relations = Vec::with_capacity(inner.len());
+    for &(selector, pattern) in inner {
+        let mut relation = HashSet::new();
+        if for_each_join_key(
+            view,
+            context,
+            selector,
+            pattern,
+            JoinKeyDomain::Subject,
+            |subject| {
+                intermediate_rows = intermediate_rows.saturating_add(1);
+                if relation.insert(subject) {
+                    hash_entries = hash_entries.saturating_add(1);
+                    enforce_hash_entries(hash_entries, max_hash_entries)?;
+                }
+                Ok(())
+            },
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        inner_relations.push(relation);
+    }
+
+    let Some((base_index, base)) = outer_relations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, relation)| relation.multiplicities.len())
+    else {
+        unreachable!("subject-set plans have an outer relation")
+    };
+    let mut count = ScalarCount::default();
+    for (subject, multiplicity) in &base.multiplicities {
+        if outer_relations
+            .iter()
+            .enumerate()
+            .any(|(index, relation)| index != base_index && relation.multiplicity(*subject) == 0)
+        {
+            continue;
+        }
+        let inner_matches = inner_relations
+            .iter()
+            .all(|relation| relation.contains(subject));
+        if inner_matches != matches!(mode, SubjectSetMode::Include) {
+            continue;
+        }
+        let mut product = *multiplicity;
+        for (index, relation) in outer_relations.iter().enumerate() {
+            if index != base_index {
+                product = product
+                    .checked_mul(relation.multiplicity(*subject))
+                    .ok_or_else(|| SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+            }
+        }
+        count.add(product)?;
     }
     Ok(Some((count, intermediate_rows)))
 }

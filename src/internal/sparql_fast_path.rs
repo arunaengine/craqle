@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use oxrdf::{Literal, Term, Variable};
 use spargebra::Query;
-use spargebra::algebra::GraphPattern;
+use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
@@ -11,6 +11,16 @@ use crate::query_context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{QueryResults, Result};
 use crate::store::{EncodedQuad, TermId};
+
+fn enforce_hash_entries(entries: usize, limits: &crate::sparql::QueryLimits) -> Result<()> {
+    if entries > limits.max_hash_entries {
+        return Err(crate::sparql::SparqlError::QueryLimit {
+            resource: "hash keys",
+            limit: limits.max_hash_entries,
+        });
+    }
+    Ok(())
+}
 
 /// Same-binary control for guarded SPARQL fast paths.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -76,6 +86,12 @@ pub(crate) enum FastPathPlan {
         optional: Vec<TriplePlan>,
         output: String,
     },
+    SubjectSetCount {
+        outer: Vec<TriplePlan>,
+        inner: Vec<TriplePlan>,
+        output: String,
+        mode: crate::count_plan::SubjectSetMode,
+    },
     PropertyStar {
         triples: Vec<TriplePlan>,
         subject: PatternTerm,
@@ -110,6 +126,7 @@ impl FastPathPlan {
             Self::SubjectStarCount { .. } | Self::OptionalSubjectStarCount { .. } => {
                 QueryFastPathKind::SubjectStarCount
             }
+            Self::SubjectSetCount { .. } => QueryFastPathKind::HashJoinCount,
             Self::PropertyStar { .. } => QueryFastPathKind::PropertyStar,
             Self::HashJoinCount { .. } => QueryFastPathKind::HashJoinCount,
         }
@@ -283,11 +300,86 @@ pub(crate) fn optional_subject_triples(
     else {
         return None;
     };
+    subject_relation_triples(graph, left, right, false)
+}
+
+pub(crate) fn subject_set_triples(
+    pattern: &GraphPattern,
+) -> Option<(
+    Vec<TriplePlan>,
+    Vec<TriplePlan>,
+    crate::count_plan::SubjectSetMode,
+)> {
+    let (graph, inner) = match pattern {
+        GraphPattern::Graph {
+            name: NamedNodePattern::NamedNode(graph),
+            inner,
+        } => (
+            PatternGraph::Named(EncodedTerm::from_named_node(graph)),
+            inner.as_ref(),
+        ),
+        pattern => (PatternGraph::DefaultUnion, pattern),
+    };
+    let (left, right, mode, require_variable_subject) = match inner {
+        GraphPattern::Filter {
+            expr: Expression::Exists(right),
+            inner: left,
+        } => (
+            left.as_ref(),
+            right.as_ref(),
+            crate::count_plan::SubjectSetMode::Include,
+            false,
+        ),
+        GraphPattern::Filter {
+            expr: Expression::Not(expression),
+            inner: left,
+        } => {
+            let Expression::Exists(right) = expression.as_ref() else {
+                return None;
+            };
+            (
+                left.as_ref(),
+                right.as_ref(),
+                crate::count_plan::SubjectSetMode::Exclude,
+                false,
+            )
+        }
+        GraphPattern::Minus { left, right } => (
+            left.as_ref(),
+            right.as_ref(),
+            crate::count_plan::SubjectSetMode::Exclude,
+            true,
+        ),
+        _ => return None,
+    };
+    let (GraphPattern::Bgp { patterns: left }, GraphPattern::Bgp { patterns: right }) =
+        (left, right)
+    else {
+        return None;
+    };
+    let (left, right) = subject_relation_triples(
+        graph,
+        left.as_slice(),
+        right.as_slice(),
+        require_variable_subject,
+    )?;
+    Some((left, right, mode))
+}
+
+fn subject_relation_triples(
+    graph: PatternGraph,
+    left: &[TriplePattern],
+    right: &[TriplePattern],
+    require_variable_subject: bool,
+) -> Option<(Vec<TriplePlan>, Vec<TriplePlan>)> {
     let first = left.first()?;
     if right.is_empty() {
         return None;
     }
     let subject = pattern_term(&first.subject)?;
+    if require_variable_subject && !matches!(subject, PatternTerm::Variable(_)) {
+        return None;
+    }
     let mut object_variables = HashSet::new();
     let mut build = |patterns: &[TriplePattern]| {
         let mut triples = Vec::with_capacity(patterns.len());
@@ -516,6 +608,7 @@ pub(crate) fn execute(
     plan: &FastPathPlan,
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
+    limits: &crate::sparql::QueryLimits,
 ) -> Result<FastPathOutcome> {
     let started = Instant::now();
     match plan {
@@ -627,13 +720,21 @@ pub(crate) fn execute(
             ))
         }
         FastPathPlan::SubjectStarCount { triples, output } => {
-            subject_star_count(triples, output, view, context, started)
+            subject_star_count(triples, output, view, context, limits, started)
         }
         FastPathPlan::OptionalSubjectStarCount {
             mandatory,
             optional,
             output,
-        } => optional_subject_star_count(mandatory, optional, output, view, context, started),
+        } => {
+            optional_subject_star_count(mandatory, optional, output, view, context, limits, started)
+        }
+        FastPathPlan::SubjectSetCount {
+            outer,
+            inner,
+            output,
+            mode,
+        } => subject_set_count(outer, inner, output, *mode, view, context, limits),
         FastPathPlan::PropertyStar {
             triples,
             subject,
@@ -645,7 +746,7 @@ pub(crate) fn execute(
             right,
             output,
             join_variables,
-        } => hash_join_count(left, right, output, join_variables, view, context, started),
+        } => hash_join_count(left, right, output, join_variables, view, context, limits),
     }
 }
 
@@ -654,6 +755,7 @@ fn subject_star_count(
     output: &str,
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
+    limits: &crate::sparql::QueryLimits,
     started: Instant,
 ) -> Result<FastPathOutcome> {
     let mut resolved = Vec::with_capacity(triples.len());
@@ -674,7 +776,7 @@ fn subject_star_count(
         .map(|triple| (triple.selector, triple.pattern))
         .collect();
     if let Some((count, intermediate_rows)) =
-        crate::count_exec::subject_star_count(view, context, &patterns)?
+        crate::count_exec::subject_star_count(view, context, &patterns, limits.max_hash_entries)?
     {
         return Ok(count_outcome(
             output,
@@ -687,14 +789,20 @@ fn subject_star_count(
 
     let mut relations = Vec::with_capacity(resolved.len());
     let mut intermediate_rows = 0_u64;
+    let mut hash_entries = 0usize;
     for triple in resolved {
         let mut relation = HashMap::<TermId, u64>::new();
         let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
         for quad in &mut cursor {
+            let before = relation.len();
             let count = relation.entry(quad?.subject).or_default();
             *count = count.checked_add(1).ok_or_else(|| {
                 crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
             })?;
+            if relation.len() != before {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, limits)?;
+            }
             intermediate_rows = intermediate_rows.saturating_add(1);
         }
         relations.push(relation);
@@ -737,6 +845,7 @@ fn optional_subject_star_count(
     output: &str,
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
+    limits: &crate::sparql::QueryLimits,
     started: Instant,
 ) -> Result<FastPathOutcome> {
     let mut resolved = Vec::with_capacity(mandatory.len() + optional.len());
@@ -754,7 +863,7 @@ fn optional_subject_star_count(
     }
     for triple in optional {
         let Some(triple) = triple.resolve(view, context)? else {
-            return subject_star_count(mandatory, output, view, context, started);
+            return subject_star_count(mandatory, output, view, context, limits, started);
         };
         resolved.push(triple);
     }
@@ -767,6 +876,7 @@ fn optional_subject_star_count(
         context,
         &patterns[..mandatory.len()],
         &patterns[mandatory.len()..],
+        limits.max_hash_entries,
     )? {
         return Ok(count_outcome(
             output,
@@ -779,14 +889,20 @@ fn optional_subject_star_count(
 
     let mut relations = Vec::with_capacity(resolved.len());
     let mut intermediate_rows = 0_u64;
+    let mut hash_entries = 0usize;
     for triple in resolved {
         let mut relation = HashMap::<TermId, u64>::new();
         let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
         for quad in &mut cursor {
+            let before = relation.len();
             let count = relation.entry(quad?.subject).or_default();
             *count = count.checked_add(1).ok_or_else(|| {
                 crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
             })?;
+            if relation.len() != before {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, limits)?;
+            }
             intermediate_rows = intermediate_rows.saturating_add(1);
         }
         relations.push(relation);
@@ -850,6 +966,140 @@ fn optional_subject_star_count(
     ))
 }
 
+fn subject_set_count(
+    outer: &[TriplePlan],
+    inner: &[TriplePlan],
+    output: &str,
+    mode: crate::count_plan::SubjectSetMode,
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    limits: &crate::sparql::QueryLimits,
+) -> Result<FastPathOutcome> {
+    let started = Instant::now();
+    let mut resolved = Vec::with_capacity(outer.len() + inner.len());
+    for triple in outer {
+        let Some(triple) = triple.resolve(view, context)? else {
+            return Ok(count_outcome(
+                output,
+                0,
+                QueryFastPathKind::HashJoinCount,
+                0,
+                started,
+            ));
+        };
+        resolved.push(triple);
+    }
+    for triple in inner {
+        let Some(triple) = triple.resolve(view, context)? else {
+            return match mode {
+                crate::count_plan::SubjectSetMode::Include => Ok(count_outcome(
+                    output,
+                    0,
+                    QueryFastPathKind::HashJoinCount,
+                    0,
+                    started,
+                )),
+                crate::count_plan::SubjectSetMode::Exclude => {
+                    let mut outcome =
+                        subject_star_count(outer, output, view, context, limits, started)?;
+                    outcome.kind = QueryFastPathKind::HashJoinCount;
+                    Ok(outcome)
+                }
+            };
+        };
+        resolved.push(triple);
+    }
+    let patterns: Vec<_> = resolved
+        .iter()
+        .map(|triple| (triple.selector, triple.pattern))
+        .collect();
+    if let Some((count, intermediate_rows)) = crate::count_exec::subject_set_count(
+        view,
+        context,
+        &patterns[..outer.len()],
+        &patterns[outer.len()..],
+        mode,
+        limits.max_hash_entries,
+    )? {
+        return Ok(count_outcome(
+            output,
+            count.get(),
+            QueryFastPathKind::HashJoinCount,
+            intermediate_rows,
+            started,
+        ));
+    }
+
+    let mut outer_relations = Vec::with_capacity(outer.len());
+    let mut inner_relations = Vec::with_capacity(inner.len());
+    let mut intermediate_rows = 0_u64;
+    let mut hash_entries = 0usize;
+    for (index, triple) in resolved.into_iter().enumerate() {
+        let mut relation = HashMap::<TermId, u64>::new();
+        let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
+        for quad in &mut cursor {
+            let before = relation.len();
+            let count = relation.entry(quad?.subject).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+            })?;
+            if relation.len() != before {
+                hash_entries = hash_entries.saturating_add(1);
+                enforce_hash_entries(hash_entries, limits)?;
+            }
+            intermediate_rows = intermediate_rows.saturating_add(1);
+        }
+        if index < outer.len() {
+            outer_relations.push(relation);
+        } else {
+            inner_relations.push(relation);
+        }
+    }
+    let Some((base_index, base)) = outer_relations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, relation)| relation.len())
+    else {
+        unreachable!("subject-set plans have an outer relation")
+    };
+    let mut count = 0_u64;
+    for (subject, multiplicity) in base {
+        if outer_relations
+            .iter()
+            .enumerate()
+            .any(|(index, relation)| index != base_index && !relation.contains_key(subject))
+        {
+            continue;
+        }
+        let inner_matches = inner_relations
+            .iter()
+            .all(|relation| relation.contains_key(subject));
+        if inner_matches != matches!(mode, crate::count_plan::SubjectSetMode::Include) {
+            continue;
+        }
+        let mut product = *multiplicity;
+        for (index, relation) in outer_relations.iter().enumerate() {
+            if index != base_index {
+                product = product
+                    .checked_mul(relation.get(subject).copied().unwrap_or(0))
+                    .ok_or_else(|| {
+                        crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned())
+                    })?;
+            }
+        }
+        count = count
+            .checked_add(product)
+            .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+    }
+    Ok(count_outcome(
+        output,
+        count,
+        QueryFastPathKind::HashJoinCount,
+        intermediate_rows,
+        started,
+    ))
+}
+
 fn hash_join_count(
     left: &TriplePlan,
     right: &TriplePlan,
@@ -857,8 +1107,9 @@ fn hash_join_count(
     join_variables: &[String],
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    started: Instant,
+    limits: &crate::sparql::QueryLimits,
 ) -> Result<FastPathOutcome> {
+    let started = Instant::now();
     let (Some(left_resolved), Some(right_resolved)) =
         (left.resolve(view, context)?, right.resolve(view, context)?)
     else {
@@ -891,6 +1142,7 @@ fn hash_join_count(
                 build.pattern,
                 probe.selector,
                 probe.pattern,
+                limits.max_hash_entries,
             )?,
             (
                 Some(crate::count_plan::CountValueDomain::Object),
@@ -902,6 +1154,7 @@ fn hash_join_count(
                 build.pattern,
                 probe.selector,
                 probe.pattern,
+                limits.max_hash_entries,
             )?,
             (
                 Some(crate::count_plan::CountValueDomain::Object),
@@ -913,6 +1166,7 @@ fn hash_join_count(
                 build.pattern,
                 probe.selector,
                 probe.pattern,
+                limits.max_hash_entries,
             )?,
             (
                 Some(crate::count_plan::CountValueDomain::Subject),
@@ -924,6 +1178,7 @@ fn hash_join_count(
                 build.pattern,
                 probe.selector,
                 probe.pattern,
+                limits.max_hash_entries,
             )?,
             _ => None,
         };
@@ -942,10 +1197,14 @@ fn hash_join_count(
     let mut build_cursor = view.scan(context, build.selector, build.pattern)?;
     for quad in &mut build_cursor {
         let key = join_key(build_plan, quad?, join_variables);
+        let before = table.len();
         let multiplicity = table.entry(key).or_default();
         *multiplicity = multiplicity
             .checked_add(1)
             .ok_or_else(|| crate::sparql::SparqlError::Evaluation("COUNT overflow".to_owned()))?;
+        if table.len() != before {
+            enforce_hash_entries(table.len(), limits)?;
+        }
         intermediate_rows = intermediate_rows.saturating_add(1);
     }
     let mut count = 0_u64;

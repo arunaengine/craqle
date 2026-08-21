@@ -122,7 +122,7 @@ pub use crate::shacl::{
     ShaclValidationStatistics, ValidationPolicy,
 };
 pub use crate::sparql::{
-    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics,
+    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics, QueryLimits,
     QueryLogicalOperator, QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryResults,
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};

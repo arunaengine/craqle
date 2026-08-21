@@ -29,6 +29,11 @@ pub enum SparqlError {
     Evaluation(String),
     #[error("query planning error: {0}")]
     Planning(String),
+    #[error("query limit exceeded: {resource} is limited to {limit} entries")]
+    QueryLimit {
+        resource: &'static str,
+        limit: usize,
+    },
     #[error("SPARQL query cancelled")]
     Cancelled,
     #[error("unsupported SPARQL feature: {0}")]
@@ -47,6 +52,7 @@ impl SparqlError {
             Self::Parse(_) | Self::Evaluation(_) | Self::Planning(_) | Self::InvalidTerm(_) => {
                 crate::CraqleErrorKind::InvalidInput
             }
+            Self::QueryLimit { .. } => crate::CraqleErrorKind::QueryLimit,
             Self::Unsupported(_) => crate::CraqleErrorKind::Unsupported,
             Self::Cancelled => crate::CraqleErrorKind::Cancelled,
             Self::Store(error) => error.kind(),
@@ -82,6 +88,22 @@ impl fmt::Debug for PreparedQuery {
     }
 }
 
+/// Per-execution resource limits for guarded SPARQL operators.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct QueryLimits {
+    /// Maximum distinct keys retained by a guarded hash-based query operator.
+    pub max_hash_entries: usize,
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            max_hash_entries: 1_000_000,
+        }
+    }
+}
+
 /// Per-execution controls for a prepared SPARQL query.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -91,6 +113,7 @@ pub struct QueryExecutionOptions {
     pub optimize: bool,
     pub join_mode: JoinMode,
     pub fast_paths: QueryFastPathMode,
+    pub limits: QueryLimits,
 }
 
 impl Default for QueryExecutionOptions {
@@ -101,6 +124,7 @@ impl Default for QueryExecutionOptions {
             optimize: planner_enabled(),
             join_mode: JoinMode::Auto,
             fast_paths: QueryFastPathMode::Auto,
+            limits: QueryLimits::default(),
         }
     }
 }
@@ -498,6 +522,7 @@ impl SparqlEngine {
             optimize,
             join_mode: JoinMode::Auto,
             fast_paths: QueryFastPathMode::Auto,
+            limits: QueryLimits::default(),
         };
         let (execution, read_statistics) =
             self.execute_prepared_scope(&prepared, scope, &options, parse_time, false)?;
@@ -564,7 +589,7 @@ impl SparqlEngine {
         let (context, named_graphs) =
             scope_read_context(scope, view, options.cancellation.clone())?;
         if let Some(plan) = stages.fast_path.take() {
-            let outcome = crate::sparql_fast_path::execute(&plan, view, &context)?;
+            let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &options.limits)?;
             let read_statistics = context.snapshot();
             let mut statistics = build_execution_statistics(
                 stages,

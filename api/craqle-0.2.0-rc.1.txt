@@ -849,6 +849,7 @@ pub craqle::QueryExecution::statistics: craqle::QueryExecutionStatistics
 pub craqle::QueryExecutionOptions::cancellation: craqle::QueryCancellation
 pub craqle::QueryExecutionOptions::fast_paths: craqle::QueryFastPathMode
 pub craqle::QueryExecutionOptions::join_mode: craqle::JoinMode
+pub craqle::QueryExecutionOptions::limits: craqle::QueryLimits
 pub craqle::QueryExecutionOptions::optimize: bool
 pub craqle::QueryExecutionOptions::read_mode: craqle::QueryReadMode
 impl core::default::Default for craqle::QueryExecutionOptions
@@ -906,6 +907,10 @@ pub craqle::QueryIndexVerification::indexed_quads: u64
 pub craqle::QueryIndexVerification::problems: alloc::vec::Vec<alloc::string::String>
 pub craqle::QueryIndexVerification::source_live_quads: u64
 pub craqle::QueryIndexVerification::valid: bool
+#[non_exhaustive] pub struct craqle::QueryLimits
+pub craqle::QueryLimits::max_hash_entries: usize
+impl core::default::Default for craqle::QueryLimits
+pub fn craqle::QueryLimits::default() -> Self
 pub struct craqle::QueryPlan
 pub craqle::QueryPlan::fingerprint: alloc::string::String
 pub craqle::QueryPlan::root: craqle::QueryPlanNode

@@ -1,5 +1,5 @@
 use craqle::{
-    CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId, JoinKind, JoinMode,
+    CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId, JoinKind, JoinMode,
     MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
     QueryFastPathMode, QueryResults,
 };
@@ -538,6 +538,93 @@ fn optional_subject_star_count_preserves_left_join_multiplicity() {
 }
 
 #[test]
+fn subject_set_counts_cover_exists_not_exists_and_minus() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:fast:subject-set");
+    let duplicate = GraphId::new("urn:test:fast:subject-set-duplicate");
+    node.apply_changes_unchecked(
+        &graph,
+        vec![
+            insert(&graph, "urn:s:1", "urn:p", iri("urn:outer:1")),
+            insert(&graph, "urn:s:1", "urn:p", iri("urn:outer:2")),
+            insert(&graph, "urn:s:1", "urn:m", iri("urn:mandatory:1")),
+            insert(&graph, "urn:s:1", "urn:q", iri("urn:inner:1")),
+            insert(&graph, "urn:s:1", "urn:q", iri("urn:inner:2")),
+            insert(&graph, "urn:s:1", "urn:r", iri("urn:required:1")),
+            insert(&graph, "urn:s:2", "urn:p", iri("urn:outer:3")),
+            insert(&graph, "urn:s:2", "urn:m", iri("urn:mandatory:2")),
+            insert(&graph, "urn:s:3", "urn:p", iri("urn:outer:4")),
+            insert(&graph, "urn:s:3", "urn:q", iri("urn:inner:3")),
+        ],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &duplicate,
+        vec![insert(&duplicate, "urn:s:1", "urn:p", iri("urn:outer:1"))],
+    )
+    .unwrap();
+    node.rebuild_graph_diagnostics(&graph).unwrap();
+    node.ensure_query_indexes();
+    let graphs = vec![graph.clone(), duplicate];
+
+    for query in [
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?outer FILTER EXISTS { ?s <urn:q> ?inner } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?outer FILTER NOT EXISTS { ?s <urn:q> ?inner } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?outer MINUS { ?s <urn:q> ?inner } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:subject-set> { \
+         ?s <urn:p> ?outer FILTER EXISTS { ?s <urn:q> ?inner } } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?outer ; <urn:m> ?mandatory \
+         FILTER EXISTS { ?s <urn:q> ?inner ; <urn:r> ?required } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?outer FILTER NOT EXISTS { ?s <urn:missing> ?inner } }",
+    ] {
+        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
+        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(
+            fast.statistics.fast_path,
+            Some(QueryFastPathKind::HashJoinCount),
+            "{query}"
+        );
+        assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
+        assert_eq!(fast.statistics.authoritative_terms_decoded, 0, "{query}");
+    }
+
+    for query in [
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?value FILTER EXISTS { ?s <urn:q> ?value } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         <urn:s:1> <urn:p> ?outer MINUS { <urn:s:1> <urn:q> ?inner } }",
+        "SELECT (COUNT(*) AS ?count) WHERE { \
+         ?s <urn:p> ?outer FILTER EXISTS { ?s <urn:q> ?inner \
+         FILTER(?inner = <urn:inner:1>) } }",
+    ] {
+        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
+        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        assert_eq!(fast.results, generic.results, "{query}");
+        assert_eq!(fast.statistics.fast_path, None, "{query}");
+    }
+
+    let prepared = node
+        .prepare_query(
+            "SELECT (COUNT(*) AS ?count) WHERE { \
+             ?s <urn:p> ?outer FILTER EXISTS { ?s <urn:q> ?inner } }",
+        )
+        .unwrap();
+    let mut limited = QueryExecutionOptions::default();
+    limited.limits.max_hash_entries = 1;
+    let error = node
+        .execute_prepared_graphs(&graphs, &prepared, &limited)
+        .unwrap_err();
+    assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
+}
+
+#[test]
 fn linear_chain_count_uses_explicit_cross_domains() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
@@ -690,6 +777,14 @@ fn hash_count_multiplicity() {
             fast.statistics.qv_keys_read
         );
     }
+
+    let mut limited = QueryExecutionOptions::default();
+    limited.join_mode = JoinMode::ForceHash;
+    limited.limits.max_hash_entries = 1;
+    let error = node
+        .execute_prepared_graphs(std::slice::from_ref(&graph), &query, &limited)
+        .unwrap_err();
+    assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
 }
 
 #[test]

@@ -4,7 +4,8 @@
 use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
 
 use crate::sparql_fast_path::{
-    FastPathPlan, optional_subject_triples, same_subject_triples, single_triple, two_joined_triples,
+    FastPathPlan, optional_subject_triples, same_subject_triples, single_triple,
+    subject_set_triples, two_joined_triples,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +13,12 @@ pub(crate) enum CountValueDomain {
     Scalar,
     Subject,
     Object,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubjectSetMode {
+    Include,
+    Exclude,
 }
 
 pub(crate) fn analyze(pattern: &GraphPattern) -> Option<FastPathPlan> {
@@ -58,6 +65,14 @@ pub(crate) fn analyze(pattern: &GraphPattern) -> Option<FastPathPlan> {
             mandatory,
             optional,
             output: output.as_str().to_owned(),
+        });
+    }
+    if count_all && let Some((outer, inner, mode)) = subject_set_triples(inner) {
+        return Some(FastPathPlan::SubjectSetCount {
+            outer,
+            inner,
+            output: output.as_str().to_owned(),
+            mode,
         });
     }
     if count_all
