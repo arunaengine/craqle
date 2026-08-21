@@ -4,11 +4,12 @@ Craqle is an experimental Rust library for storing, validating, querying, search
 
 The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Irokle graph topics provide the durable operation log and sync obligations, while Craqle reduces those events into an OR-Set RDF projection. Invalid visible RO-Crates are not exported.
 
-This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. Search is intentionally minimal. The workspace currently depends on `intbio-ncl/ro-crate-rs` on branch `main` with the `rdf` feature enabled.
+This is still early work. Expect breaking changes to the API, storage layout, and replication behavior. Search is intentionally minimal. The workspace depends on `intbio-ncl/ro-crate-rs` tag `v0.6.0` with the `rdf` feature and a local compatibility patch in `vendor/ro-crate-rs-0.6.0`.
 
 - create and update RO-Crates as named RDF graphs
 - import and export RO-Crate JSON-LD
 - query and update with SPARQL
+- compile, bind, and evaluate the optional native `CraqleFastV1` SHACL profile
 - do full-text search with Tantivy
 - replicate changes over one Irokle topic per graph
 - reject invalid visible crate states on export
@@ -84,6 +85,49 @@ let rows = node.query(
 )?;
 ```
 
+Enable native SHACL with `--features shacl-core`. Given existing data and
+shapes graphs, compile once, validate directly, bind a policy, and read the
+persisted status:
+
+```rust
+use craqle::{
+    AllowAllAuthorizer, ShaclBinding, ShaclBindingOptions,
+    ShaclCompileOptions, ShaclValidationOptions, ValidationPolicy,
+};
+
+let auth = AllowAllAuthorizer;
+let schema = node.compile_shacl(&auth, &shapes_graph, &ShaclCompileOptions::default())?;
+let report = node.validate_shacl(
+    &auth,
+    &data_graph,
+    &schema,
+    &ShaclValidationOptions::default(),
+)?;
+
+let binding = ShaclBinding {
+    data_graph: data_graph.clone(),
+    shapes_graph: shapes_graph.clone(),
+    policy: ValidationPolicy::Enforce,
+    validation_options: ShaclBindingOptions::default(),
+};
+let initial = node.bind_shacl(&auth, &binding)?;
+let current = node.shacl_binding_statuses(&auth, &data_graph)?;
+```
+
+`Enforce` rejects an invalid local checked write before commit. `Advisory`
+commits the write and persists its complete report asynchronously with respect
+to the source transition. `Disabled` skips SHACL for that binding; the existing
+RO-Crate checks still apply. Replicated CRDT records always apply before local
+SHACL settlement.
+
+`CraqleFastV1` supports node, class, subjects-of, objects-of, and implicit-class
+targets; direct, inverse, sequence, alternative, zero-or-one, zero-or-more,
+and one-or-more paths; and the bounded native constraint set documented in
+[`docs/performance-v1/SHACL_SUPPORT.md`](docs/performance-v1/SHACL_SUPPORT.md).
+It returns one complete report or one error. SHACL-SPARQL, SHACL-JS, SHACL-AF,
+custom components and targets, reifier shapes, RDF-star shapes, remote imports,
+and the other components listed in that support document are not supported.
+
 Search it with Tantivy-backed full-text search:
 
 ```rust
@@ -103,7 +147,8 @@ let batch = node.apply_rocrate_document(&writer, graph.clone(), updated_jsonld)?
 - The API is still moving and there are no stability guarantees yet.
 - Search is intentionally minimal even though it uses Tantivy; for richer results you still hydrate metadata from RDF.
 - Irokle transport integration is library-level; Craqle does not provide a standalone sync server.
-- The workspace currently depends on `intbio-ncl/ro-crate-rs` on branch `main` with the `rdf` feature enabled.
+- The workspace uses `intbio-ncl/ro-crate-rs` tag `v0.6.0` plus the tracked local compatibility patch.
+- `CraqleFastV1` is a deliberately bounded profile, not unrestricted SHACL Core conformance.
 
 There is also a small demo in `examples/demo.rs`:
 

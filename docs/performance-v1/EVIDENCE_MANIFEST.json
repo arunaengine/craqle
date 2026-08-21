@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-21T10:25:25+02:00",
+  "final_commit": {
+    "release_hardening_code": "558037c760588e1f729e7e5e3b4159d2cc8a9f51",
+    "release_hardening_code_and_tests": "de78947472cead03c6655f14adcc22ede7b02050",
+    "release_hardening_verified_source": "6bb14edf6dcce9f508dd69eec838d1dd9291842d",
+    "published_documentation": "resolve with git rev-parse HEAD; the documentation-only commit does not alter the recorded source"
+  },
+  "accepted_run_roots": [
+    {
+      "path": ".claude/evidence/20260820T204125Z-89072e57",
+      "commit": "89072e5716913a8402a108177faecbe85aa53591",
+      "scope": "accepted 10K and 1M SPARQL, native SHACL, incremental, write, and non-benchmark matrix evidence",
+      "exceptions": [
+        "summaries/shacl-incremental-1m-prefx.jsonl is rejected calibration evidence"
+      ]
+    },
+    {
+      "path": ".claude/evidence/20260820T223551Z-20e0514a",
+      "commit": "20e0514a7446e7af6006b301729598d2d96d3732",
+      "scope": "accepted corrected 1M Auto, ForceDelta, and ForceFull crossover"
+    },
+    {
+      "path": ".claude/evidence/20260821T015954Z-4d2d8db",
+      "commit": "4d2d8db25fd183685efeda036415df332e6837e8",
+      "scope": "accepted exact-HEAD non-benchmark matrix before release hardening"
+    }
+  ],
+  "rejected_calibration_roots": [
+    {
+      "path": ".claude/evidence/20260820T204125Z-89072e57/summaries/shacl-incremental-1m-prefx.jsonl",
+      "reason": "Auto selected full too early at 100 and 250 changes"
+    },
+    {
+      "path": ".claude/evidence/20260820T223038Z-73512e14",
+      "commit": "73512e144a1f0c5bc180ee663b2cd1f1bb59f4b3",
+      "reason": "divisor-8 calibration retained delta too far into large batches"
+    }
+  ],
+  "binary_hashes": [
+    {
+      "binary": "sparql_hot_path",
+      "algorithm": "blake3",
+      "hash": "4b680b97e85028010743a9e7800f8f056e9581864a525ffc4428027f0c948bdc",
+      "commit": "89072e5716913a8402a108177faecbe85aa53591"
+    },
+    {
+      "binary": "sparql_access_path_scaling",
+      "algorithm": "blake3",
+      "hash": "d04502821f3c6a227988039bdaf9ab74f31e98dd3430f2b6a3e8e559757f003d",
+      "commit": "89072e5716913a8402a108177faecbe85aa53591"
+    },
+    {
+      "binary": "sparql_join_choice",
+      "algorithm": "blake3",
+      "hash": "14656c43de312271e65bc9737178b37e7f6a314ec77c1bc2476832d25a8555d3",
+      "commit": "89072e5716913a8402a108177faecbe85aa53591"
+    },
+    {
+      "binary": "historical_sparql_hot_path_10m",
+      "algorithm": "sha256",
+      "hash": "f4172795d3b79a79d2c90106bff69a3a7b6009c7d37ddbc4f71afa5585de98d5",
+      "commit": "17acd9466215a793614d537a2dd7b10d8ca2efb5",
+      "status": "historical only"
+    },
+    {
+      "binary": "historical_sparql_access_path_scaling_10m",
+      "algorithm": "sha256",
+      "hash": "1085a31d168761b8e51ab04a70415547916b507d1fe6d3c68c908586edc23cfb",
+      "commit": "17acd9466215a793614d537a2dd7b10d8ca2efb5",
+      "status": "historical incomplete run; no release result"
+    },
+    {
+      "binary": "shacl_native_comparison_and_incremental",
+      "hash": null,
+      "commit": "89072e5716913a8402a108177faecbe85aa53591",
+      "status": "accepted logs recorded source and fixture provenance but no executable hash; not represented as exact-final-binary evidence"
+    }
+  ],
+  "fixture_hashes": [
+    {
+      "fixture": "performance-corpus-v1-10k",
+      "algorithm": "blake3",
+      "hash": "7645bdacdd44a750e81404207cb5c55b024cec12f53e8ddd1f569f2fde2e52d5"
+    },
+    {
+      "fixture": "performance-corpus-v1-1m",
+      "algorithm": "blake3",
+      "hash": "a0c77b32cc75429307191b1271a1237af51faa0354308f3bb1508ee403fedbce"
+    },
+    {
+      "fixture": "native-shacl-data-10k",
+      "algorithm": "blake3",
+      "hash": "08707e3338a31555605e0410b50417f07d51273ae88856007fe7d9b83938ee96"
+    },
+    {
+      "fixture": "native-shacl-data-1m",
+      "algorithm": "blake3",
+      "hash": "c55f4e02fab863af495c632b8d0ea56906c4d3964a527387df4619ce8bcf7fa0"
+    },
+    {
+      "fixture": "write-cost-local-10k",
+      "algorithm": "blake3",
+      "hash": "6908f25bdb7606a1b4f89782ba23dd5d8900db4b653d6fd5a7baef760c77f421"
+    },
+    {
+      "fixture": "write-cost-replicated",
+      "algorithm": "blake3",
+      "hash": "b3900227cf61f9e95bf4f0535640223f59428606853850c6255f112667d50d49"
+    }
+  ],
+  "build_flags": {
+    "cargo_lock": true,
+    "benchmark_profile": "bench optimized",
+    "default_features": [
+      "search"
+    ],
+    "shacl_features": [
+      "shacl-core"
+    ],
+    "corpus_version": "performance-corpus-v1",
+    "seed": "0x435241514c455030",
+    "graphs": 32,
+    "duplicate_percent": 25
+  },
+  "sample_counts": {
+    "criterion_samples_per_case": 10,
+    "warmup_seconds": 1,
+    "measurement_seconds": 5,
+    "tail_label": "nearest-rank sample values, not production tail estimates"
+  },
+  "persistence_modes": [
+    {
+      "scope": "ordinary local write cases",
+      "mode": "buffer"
+    },
+    {
+      "scope": "durable single insert",
+      "mode": "sync_all",
+      "timed_scope": "apply plus persist"
+    },
+    {
+      "scope": "replicated merge",
+      "mode": "buffer on two peers",
+      "timed_scope": "sync pair; persistence outside timing"
+    }
+  ],
+  "historical_only_evidence": [
+    {
+      "scope": "10M SPARQL access paths",
+      "root": ".claude/evidence/20260820T191455Z-9d6bc52",
+      "reason": "valid historical access-path evidence, not current-final-binary evidence"
+    },
+    {
+      "scope": "qv1 PR2-to-PR3 single_insert p95",
+      "result": "139931 ns to 142956 ns (+2.16%)",
+      "reason": "raw executable and fixture provenance are unavailable"
+    }
+  ],
+  "deferred_10m_gates": [
+    {
+      "gate": "current-final-binary native SHACL full validation",
+      "status": "deferred by explicit user request"
+    },
+    {
+      "gate": "current-final-binary incremental SHACL validation",
+      "status": "deferred by explicit user request"
+    },
+    {
+      "gate": "current-final-binary checked write and policy settlement",
+      "status": "deferred by explicit user request"
+    }
+  ],
+  "authorized_later_command": "CRAQLE_ALLOW_10M_RUN=yes scripts/performance-v1-10m.sh",
+  "partial_run_policy": "A timeout, interrupt, missing provenance, or nonzero exit writes STOPPED and never COMPLETE; partial timing output is not a performance claim."
+}
