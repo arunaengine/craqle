@@ -217,6 +217,7 @@ of all authoritative keyspaces.
 | --- | --- | --- |
 | `search` | Yes | Tantivy full-text derived index |
 | `shacl-core` | No | Native bounded `CraqleFastV1` compilation, validation, and policy bindings |
+| `federation-routing` | No | Coordinator-facing exact graph topology and replica selection |
 | `iroh` | No | Irokle Iroh transport and asynchronous write-concern scheduling |
 
 There is also a small demo in `examples/demo.rs`:
