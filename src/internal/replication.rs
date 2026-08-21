@@ -37,6 +37,8 @@ pub enum UpdateError {
     Store(#[from] crate::store::StoreError),
     #[error("sync: {0}")]
     Sync(#[from] crate::sync::CraqleSyncError),
+    #[error("graph `{}` was permanently deleted by event {}", .tombstone.graph, .tombstone.delete_event)]
+    GraphDeleted { tombstone: GraphTombstone },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +64,7 @@ impl UpdateError {
             Self::StalePreparedState { .. } => crate::CraqleErrorKind::StalePreparedState,
             Self::Store(error) => error.kind(),
             Self::Sync(error) => error.kind(),
+            Self::GraphDeleted { .. } => crate::CraqleErrorKind::Conflict,
         }
     }
 }
@@ -355,17 +358,16 @@ impl ReplicationEngine {
         license: Option<String>,
         license_digest: Option<[u8; 32]>,
     ) -> Result<(), UpdateError> {
-        // Bind the topic before taking any lock. `ensure_graph_topic` reaches
-        // `GraphStore::set_irokle_topic_id`, which takes the graph commit guard
-        // itself; doing it under a lock we also hold would deadlock (addendum
-        // A1). It is idempotent and, after the first call, a memo hit.
+        // Guards the tombstone check, topic binding, tag mint and store write.
+        let _write_guard = graph_write_guard(graph);
+        if let Some(tombstone) = self.store.graph_tombstone(graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone });
+        }
+        // `ensure_graph_topic` takes the graph commit guard while this method
+        // holds the outer graph write lock, preserving the documented order.
         if let Some(sync) = &self.sync {
             sync.ensure_graph_topic(&self.store, graph)?;
         }
-
-        // Guards the context-tag mint through to the store write; see
-        // GRAPH_WRITE_LOCKS.
-        let _write_guard = graph_write_guard(graph);
 
         let tag = ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor);
         if let Some(sync) = &self.sync {
@@ -1397,19 +1399,16 @@ impl ReplicationEngine {
             prepared_fence,
         } = commit;
 
+        // Serializes the permanent tombstone check with every local write and
+        // graph delete, regardless of whether replication is configured.
+        let _write_guard = graph_write_guard(graph);
+        if let Some(tombstone) = self.store.graph_tombstone(graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone });
+        }
+
         if let Some(sync) = &self.sync {
             // Orders this graph's publish against its own apply; see
             // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
-            let _write_guard = graph_write_guard(graph);
-
-            // A deleted graph stays deleted. Publishing alone would resurrect
-            // it: binding the topic writes the graph's metadata record back.
-            // Every tombstone writer takes the lock held here, so a delete
-            // cannot land between this check and the publish.
-            if self.store.graph_tombstoned(graph)? {
-                return self.empty_batch(graph);
-            }
-
             // Validation and publication are serialized with every local CRDT
             // mutation of this graph.
             let _commit_guard = self.store.graph_commit_guard(graph);

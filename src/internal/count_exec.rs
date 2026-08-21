@@ -162,14 +162,8 @@ pub(crate) fn single_pattern_count(
             if matches!(selector, GraphSelector::DefaultUnion)
                 && !matches!(domain, CountValueDomain::Scalar) =>
         {
-            return source_union_distinct_count(
-                view,
-                context,
-                pattern,
-                domain,
-                max_hash_entries,
-            )
-            .map(Some);
+            return source_union_distinct_count(view, context, pattern, domain, max_hash_entries)
+                .map(Some);
         }
         Ok(None) => return Ok(None),
         Err(StoreError::QueryIndexUnavailable(_))

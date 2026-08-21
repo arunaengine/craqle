@@ -57,13 +57,15 @@ pub enum StoreError {
         supported_major: u16,
         supported_minor: u16,
     },
+    #[error("replication cursor changed before repair")]
+    CursorCompareFailed,
 }
 
 impl StoreError {
     pub(crate) fn kind(&self) -> CraqleErrorKind {
         match self {
             Self::Cancelled => CraqleErrorKind::Cancelled,
-            Self::TermCollision { .. } => CraqleErrorKind::Conflict,
+            Self::TermCollision { .. } | Self::CursorCompareFailed => CraqleErrorKind::Conflict,
             Self::GraphNotFound(_) => CraqleErrorKind::InvalidInput,
             Self::QueryIndexVerificationFailed(_)
             | Self::InvalidQueryIndexEncoding { .. }
@@ -146,6 +148,8 @@ const LOG_BATCH_PREFIX: u8 = b'B';
 const TOPIC_CLOCK_PREFIX: u8 = b'C';
 const TOPIC_BINDING_PREFIX: u8 = b'T';
 const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
+const REPLICATION_REJECTION_PREFIX: u8 = b'J';
+const CURSOR_REPAIR_AUDIT_PREFIX: u8 = b'A';
 /// Per-graph vector clock, split out of the graph meta record so a
 /// commit writes only the clock and never rewrites policy/context/topic bytes.
 const GRAPH_CLOCK_PREFIX: u8 = b'K';
@@ -238,6 +242,8 @@ fn recommended_db_cache_bytes() -> u64 {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct StoredGraphMeta {
     policy: GraphPolicy,
+    #[serde(default)]
+    policy_tag: PolicyTag,
     /// Legacy home of the per-graph vector clock. The clock now lives
     /// under its own `'K' || graph_id` key and this field is only read as a
     /// one-time migration fallback for stores written before the split; it is
@@ -1376,6 +1382,27 @@ fn graph_tombstone_key(graph: TermId) -> [u8; 17] {
     let mut key = [0u8; 17];
     key[0] = GRAPH_TOMBSTONE_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
+fn replication_rejection_key(topic: &irokle::TopicId, record: &irokle::OpId) -> [u8; 65] {
+    let mut key = [0u8; 65];
+    key[0] = REPLICATION_REJECTION_PREFIX;
+    key[1..33].copy_from_slice(topic.as_bytes());
+    key[33..65].copy_from_slice(record.as_bytes());
+    key
+}
+
+fn replication_rejection_prefix() -> [u8; 1] {
+    [REPLICATION_REJECTION_PREFIX]
+}
+
+fn cursor_repair_audit_key(audit: &crate::sync::TopicCursorRepairAudit) -> [u8; 97] {
+    let mut key = [0u8; 97];
+    key[0] = CURSOR_REPAIR_AUDIT_PREFIX;
+    key[1..33].copy_from_slice(audit.topic.as_bytes());
+    key[33..65].copy_from_slice(&audit.old_cursor_digest);
+    key[65..97].copy_from_slice(&audit.replacement_cursor_digest);
     key
 }
 
@@ -3951,7 +3978,7 @@ impl GraphStore {
     }
 
     /// Make exactly the next durable batch commit fail. Test-only.
-    #[cfg(all(test, feature = "shacl-core"))]
+    #[cfg(test)]
     pub(crate) fn arm_commit_failure(&self) {
         self.commit_failure.store(true, Ordering::SeqCst);
     }
@@ -5900,27 +5927,46 @@ impl GraphStore {
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn delete_graph(&self, graph: &GraphId) -> Result<()> {
-        self.delete_graph_inner(graph, false)
+        self.delete_graph_inner(graph, None)
     }
 
     /// Delete a graph and persist its tombstone in the same durable batch.
-    pub(crate) fn delete_graph_tombstoned(&self, graph: &GraphId) -> Result<()> {
-        self.delete_graph_inner(graph, true)
+    pub(crate) fn delete_graph_tombstoned(&self, tombstone: &GraphTombstone) -> Result<()> {
+        self.delete_graph_inner(&tombstone.graph, Some(tombstone))
     }
 
-    fn delete_graph_inner(&self, graph: &GraphId, tombstone: bool) -> Result<()> {
+    fn delete_graph_inner(
+        &self,
+        graph: &GraphId,
+        tombstone: Option<&GraphTombstone>,
+    ) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
         #[cfg(feature = "shacl-core")]
         let _binding_guard = self.binding_guard();
         let mut batch = self.new_batch();
         let graph_id = match self.graph_id_for(graph)? {
             Some(graph_id) => graph_id,
-            None if tombstone => self
+            None if tombstone.is_some() => self
                 .encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?,
             None => return Ok(()),
         };
-        if tombstone {
-            batch.insert(&self.graphs, graph_tombstone_key(graph_id), []);
+        if let Some(tombstone) = tombstone {
+            let retained = match self.graphs.get(graph_tombstone_key(graph_id))? {
+                Some(existing) => {
+                    let existing: GraphTombstone = postcard::from_bytes(existing.as_ref())?;
+                    if existing.delete_event >= tombstone.delete_event {
+                        existing
+                    } else {
+                        tombstone.clone()
+                    }
+                }
+                None => tombstone.clone(),
+            };
+            batch.insert(
+                &self.graphs,
+                graph_tombstone_key(graph_id),
+                postcard::to_allocvec(&retained)?,
+            );
         }
         self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
             self.write_quad_state(&mut batch, quad, Vec::new())?;
@@ -6230,7 +6276,11 @@ impl GraphStore {
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
-    pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
+    pub fn set_tagged_graph_policy(
+        &self,
+        graph: &GraphId,
+        tagged: &TaggedGraphPolicy,
+    ) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
         #[cfg(feature = "shacl-core")]
         let _binding_guard = self.binding_guard();
@@ -6238,7 +6288,8 @@ impl GraphStore {
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
         let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
-        meta.policy = policy.clone().normalized();
+        meta.policy = tagged.policy.clone().normalized();
+        meta.policy_tag = tagged.tag;
         batch.insert(
             &self.graphs,
             graph_meta_key(graph_id),
@@ -6247,14 +6298,34 @@ impl GraphStore {
         self.commit(batch)
     }
 
+    #[cfg(test)]
+    pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
+        let current = self.graph_tagged_policy(graph)?;
+        self.set_tagged_graph_policy(
+            graph,
+            &TaggedGraphPolicy {
+                policy: policy.clone(),
+                tag: current.tag,
+            },
+        )
+    }
+
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
+        Ok(self.graph_tagged_policy(graph)?.policy)
+    }
+
+    pub fn graph_tagged_policy(&self, graph: &GraphId) -> Result<TaggedGraphPolicy> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
-            return Ok(GraphPolicy::default());
+            return Ok(TaggedGraphPolicy {
+                policy: GraphPolicy::default(),
+                tag: PolicyTag::default(),
+            });
         };
-        Ok(self
-            .read_graph_meta_by_id(graph_id)?
-            .unwrap_or_default()
-            .policy)
+        let meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        Ok(TaggedGraphPolicy {
+            policy: meta.policy,
+            tag: meta.policy_tag,
+        })
     }
 
     pub fn irokle_topic_id(&self, graph: &GraphId) -> Result<Option<[u8; 32]>> {
@@ -6381,20 +6452,152 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn graph_tombstoned(&self, graph: &GraphId) -> Result<bool> {
-        let Some(graph_id) = self.graph_id_for(graph)? else {
+    pub fn record_replication_rejection(
+        &self,
+        mut record: crate::sync::RejectedReplicationRecord,
+        cursor: Option<&[u8]>,
+    ) -> Result<crate::sync::RejectedReplicationRecord> {
+        let key = replication_rejection_key(&record.topic, &record.record_id);
+        if let Some(existing) = self.graphs.get(key)? {
+            let existing: crate::sync::RejectedReplicationRecord =
+                postcard::from_bytes(existing.as_ref())?;
+            record.seen_count = existing.seen_count.saturating_add(1);
+            record.acknowledged = existing.acknowledged;
+        } else {
+            record.seen_count = 1;
+        }
+        let mut batch = self.new_batch();
+        batch.insert(&self.graphs, key, postcard::to_allocvec(&record)?);
+        if let Some(cursor) = cursor {
+            batch.insert(
+                &self.graphs,
+                topic_clock_key(record.topic.as_bytes()),
+                cursor,
+            );
+        }
+        self.commit(batch)?;
+        Ok(record)
+    }
+
+    pub fn replication_rejections(&self) -> Result<Vec<crate::sync::RejectedReplicationRecord>> {
+        self.graphs
+            .prefix(replication_rejection_prefix())
+            .map(|guard| {
+                let (_, value) = guard.into_inner()?;
+                postcard::from_bytes(value.as_ref()).map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn replication_rejection(
+        &self,
+        topic: &irokle::TopicId,
+        record: &irokle::OpId,
+    ) -> Result<Option<crate::sync::RejectedReplicationRecord>> {
+        self.graphs
+            .get(replication_rejection_key(topic, record))?
+            .map(|value| postcard::from_bytes(value.as_ref()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn acknowledge_replication_rejection(
+        &self,
+        topic: &irokle::TopicId,
+        record_id: &irokle::OpId,
+    ) -> Result<bool> {
+        let key = replication_rejection_key(topic, record_id);
+        let Some(value) = self.graphs.get(key)? else {
             return Ok(false);
         };
-        Ok(self.graphs.get(graph_tombstone_key(graph_id))?.is_some())
+        let mut record: crate::sync::RejectedReplicationRecord =
+            postcard::from_bytes(value.as_ref())?;
+        record.acknowledged = true;
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.graphs, key, postcard::to_allocvec(&record)?);
+        batch.commit()?;
+        Ok(true)
+    }
+
+    pub fn delete_replication_rejection(
+        &self,
+        topic: &irokle::TopicId,
+        record_id: &irokle::OpId,
+    ) -> Result<bool> {
+        let key = replication_rejection_key(topic, record_id);
+        if self.graphs.get(key)?.is_none() {
+            return Ok(false);
+        }
+        let mut batch = self.buffered_batch();
+        batch.remove(&self.graphs, key);
+        batch.commit()?;
+        Ok(true)
+    }
+
+    pub fn repair_topic_cursor(
+        &self,
+        topic: irokle::TopicId,
+        expected_old_digest: [u8; 32],
+        replacement: &[u8],
+        repaired_at_unix_nanos: i64,
+    ) -> Result<crate::sync::TopicCursorRepairAudit> {
+        let key = topic_clock_key(topic.as_bytes());
+        let old = self.graphs.get(key)?;
+        let old_digest =
+            crate::sync::topic_cursor_digest(old.as_ref().map_or(&[][..], |value| value.as_ref()));
+        if old_digest != expected_old_digest {
+            return Err(StoreError::CursorCompareFailed);
+        }
+        let audit = crate::sync::TopicCursorRepairAudit {
+            topic,
+            old_cursor_digest: old_digest,
+            replacement_cursor_digest: crate::sync::topic_cursor_digest(replacement),
+            repaired_at_unix_nanos,
+        };
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.graphs, key, replacement);
+        batch.insert(
+            &self.graphs,
+            cursor_repair_audit_key(&audit),
+            postcard::to_allocvec(&audit)?,
+        );
+        batch.commit()?;
+        Ok(audit)
+    }
+
+    pub fn graph_tombstoned(&self, graph: &GraphId) -> Result<bool> {
+        Ok(self.graph_tombstone(graph)?.is_some())
+    }
+
+    pub fn graph_tombstone(&self, graph: &GraphId) -> Result<Option<GraphTombstone>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(None);
+        };
+        self.graphs
+            .get(graph_tombstone_key(graph_id))?
+            .map(|bytes| postcard::from_bytes(bytes.as_ref()).map_err(Into::into))
+            .transpose()
     }
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
+    #[cfg(test)]
     pub fn set_graph_tombstone(&self, graph: &GraphId) -> Result<()> {
+        let actor = ActorId::from_bytes([0; 32]);
+        let clock = VectorClock::default();
+        let tombstone = GraphTombstone {
+            graph: graph.clone(),
+            delete_event: EventId::graph_delete(graph, actor, &clock),
+            delete_actor: actor,
+            delete_clock: clock,
+        };
         let _commit_guard = self.graph_commit_guard(graph);
         let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
         let mut batch = self.buffered_batch();
-        batch.insert(&self.graphs, graph_tombstone_key(graph_id), []);
+        batch.insert(
+            &self.graphs,
+            graph_tombstone_key(graph_id),
+            postcard::to_allocvec(&tombstone)?,
+        );
         batch.commit()?;
         Ok(())
     }

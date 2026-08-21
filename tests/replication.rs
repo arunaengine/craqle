@@ -28,6 +28,72 @@ mod tests {
         assert!(!net.peer(1).contains_graph(&graph).unwrap());
     }
 
+    #[test]
+    fn tagged_policy_convergence() {
+        let (_tmp, mut net) = setup_network(3);
+        let graph = GraphId::new("urn:test:tagged-policy-convergence");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+
+        net.partition(0, 1);
+        net.partition(0, 2);
+        net.partition(1, 2);
+        let policies = (0..3)
+            .map(|index| GraphPolicy {
+                public: index != 0,
+                permission_paths: vec![format!("/tests/policy-{index}")],
+            })
+            .collect::<Vec<_>>();
+        for (index, policy) in policies.iter().enumerate() {
+            net.peer(index)
+                .set_graph_policy(&writer_auth(), &graph, policy.clone())
+                .unwrap();
+        }
+        let topic = net.peer(0).irokle_topic_id(&graph).unwrap().unwrap();
+        let expected = (0..3)
+            .max_by_key(|index| {
+                ActorId::from_bytes(
+                    *irokle::actor_id_for(topic, net.irokle(*index).peer_id()).as_bytes(),
+                )
+            })
+            .map(|index| policies[index].clone())
+            .unwrap();
+
+        net.heal(0, 1);
+        net.heal(0, 2);
+        net.heal(1, 2);
+        net.sync_until_converged(10).unwrap();
+        for index in 0..3 {
+            assert_eq!(net.peer(index).graph_policy(&graph).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unauthorized_remote_policy_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let net =
+            CraqleCluster::new_with_options(2, tmp.path(), |_| CraqleOptions::default()).unwrap();
+        let graph = GraphId::new("urn:test:unauthorized-remote-policy");
+        create_test_crate(&net, 0, &graph);
+        for _ in 0..3 {
+            net.sync_round().unwrap();
+        }
+
+        let records = net
+            .peer(1)
+            .list_rejected_replication_records(&AllowAllAuthorizer)
+            .unwrap();
+        assert!(records.iter().any(|record| {
+            record.graph.as_ref() == Some(&graph)
+                && record.error_kind == CraqleErrorKind::Unauthorized
+        }));
+        assert_ne!(
+            net.peer(1).graph_policy(&graph).unwrap(),
+            net.peer(0).graph_policy(&graph).unwrap(),
+            "default remote policy authority must deny the incoming policy"
+        );
+    }
+
     // A graph topic is derived deterministically and minted by exactly one
     // node; every other node adopts that single genesis over sync instead of
     // forking a rival one, so the topic converges with no genesis collision.
@@ -167,6 +233,18 @@ mod tests {
 
         node.reconcile_irokle().unwrap();
         assert!(node.contains_graph(&graph).unwrap());
+        let rejected = node
+            .list_rejected_replication_records(&AllowAllAuthorizer)
+            .unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(
+            rejected[0].error_kind,
+            CraqleErrorKind::CorruptAuthoritativeData
+        );
+        assert_eq!(
+            rejected[0].reason,
+            "malformed or poison graph-event payload"
+        );
     }
 
     #[test]

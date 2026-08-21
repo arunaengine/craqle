@@ -59,6 +59,40 @@ impl std::fmt::Display for ActorId {
     }
 }
 
+/// Stable identifier for a graph lifecycle event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EventId(pub [u8; 32]);
+
+impl EventId {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub(crate) fn graph_delete(graph: &GraphId, actor: ActorId, clock: &VectorClock) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("craqle-graph-delete-v1");
+        hasher.update(graph.as_str().as_bytes());
+        hasher.update(actor.as_bytes());
+        for (clock_actor, counter) in &clock.0 {
+            hasher.update(clock_actor.as_bytes());
+            hasher.update(&counter.to_be_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Last-write-wins ordering tag for a graph's RO-Crate `@context` register.
 ///
 /// Ordered lexicographically by `(counter, actor)` so every peer converges on
@@ -94,6 +128,33 @@ impl ContextTag {
 }
 
 impl Default for ContextTag {
+    fn default() -> Self {
+        Self::GENESIS
+    }
+}
+
+/// Total-order tag for the replicated graph-policy register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PolicyTag {
+    pub counter: u64,
+    pub actor: ActorId,
+}
+
+impl PolicyTag {
+    pub const GENESIS: Self = Self {
+        counter: 0,
+        actor: ActorId([0u8; 32]),
+    };
+
+    pub fn next_local(previous: Self, actor: ActorId) -> Self {
+        Self {
+            counter: previous.counter.saturating_add(1),
+            actor,
+        }
+    }
+}
+
+impl Default for PolicyTag {
     fn default() -> Self {
         Self::GENESIS
     }
@@ -136,6 +197,15 @@ impl VectorClock {
             self.advance(actor, counter);
         }
     }
+}
+
+/// Permanent metadata retained after a graph is deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTombstone {
+    pub graph: GraphId,
+    pub delete_event: EventId,
+    pub delete_actor: ActorId,
+    pub delete_clock: VectorClock,
 }
 
 // ── Quad Operations (CRDT primitives) ───────────────────────────────────────
@@ -454,6 +524,13 @@ impl GraphPolicy {
         self.permission_paths.dedup();
         self
     }
+}
+
+/// A graph policy together with its deterministic replicated-register tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaggedGraphPolicy {
+    pub policy: GraphPolicy,
+    pub tag: PolicyTag,
 }
 
 // ── Materialized Changes (SPARQL evaluator output) ──────────────────────────

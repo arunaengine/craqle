@@ -4000,17 +4000,17 @@ mod tests {
             &self,
             store: &crate::store::GraphStore,
             graph: &GraphId,
-            policy: crate::core::GraphPolicy,
+            tagged: crate::core::TaggedGraphPolicy,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-            self.inner.publish_policy(store, graph, policy)
+            self.inner.publish_policy(store, graph, tagged)
         }
 
         fn publish_delete(
             &self,
             store: &crate::store::GraphStore,
-            graph: &GraphId,
+            tombstone: crate::core::GraphTombstone,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-            self.inner.publish_delete(store, graph)
+            self.inner.publish_delete(store, tombstone)
         }
 
         fn publish_context(
@@ -4091,6 +4091,14 @@ mod tests {
             cursor: Option<&[u8]>,
         ) -> SyncResult<TopicCatchup> {
             self.inner.topic_records_since(topic_id, cursor)
+        }
+
+        fn is_local_record(
+            &self,
+            topic_id: irokle::TopicId,
+            record: &EventRecord<CraqleGraphEvent>,
+        ) -> bool {
+            self.inner.is_local_record(topic_id, record)
         }
 
         fn add_peer(

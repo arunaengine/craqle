@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use craqle::{
     Authorizer, CraqleError, CraqleGraphEvent, CraqleIrokleOptions, CraqleNode, CraqleOptions,
@@ -40,7 +41,11 @@ pub struct CraqleCluster {
 
 impl CraqleCluster {
     pub fn new(peer_count: usize, data_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::new_with_options(peer_count, data_dir, |_| CraqleOptions::default())
+        Self::new_with_options(peer_count, data_dir, |_| {
+            CraqleOptions::default().with_remote_policy_authorizer(Arc::new(
+                |_: &GraphId, _: &craqle::ActorId, _: &craqle::GraphPolicy| true,
+            ))
+        })
     }
 
     pub fn new_with_options<F>(

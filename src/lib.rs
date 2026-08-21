@@ -71,8 +71,8 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::panic;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 #[cfg(feature = "shacl-core")]
 use std::time::Instant;
@@ -93,11 +93,13 @@ use crate::sparql::SparqlEngine;
 use crate::store::GraphStore;
 #[cfg(feature = "shacl-core")]
 use crate::store::hash_term;
+use chrono::Utc;
 use oxrdf::{NamedNode, Term};
 
 pub use crate::core::{
-    ActorId, Batch, CrateViolation, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy,
-    MaterializedQuadChange, PredicateFilter, VectorClock, vocab,
+    ActorId, Batch, CrateViolation, EncodedTerm, EventId, GraphDiagnostics, GraphId, GraphPolicy,
+    GraphTombstone, MaterializedQuadChange, PolicyTag, PredicateFilter, TaggedGraphPolicy,
+    VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
@@ -127,7 +129,11 @@ pub use crate::sparql::{
     UpdateLimits, UpdateOptions,
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
-pub use crate::sync::{CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, IrokleGraphSync};
+pub use crate::sync::{
+    CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, DenyRemotePolicyChanges,
+    IrokleGraphSync, RejectedReplicationRecord, RemotePolicyAuthorizer, TopicCursorRepairAudit,
+    topic_cursor_digest,
+};
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
@@ -138,7 +144,7 @@ pub use irokle;
 ///
 /// Detailed error variants may gain additional context during 0.2.x. Callers
 /// that need durable control flow should use [`CraqleError::kind`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[non_exhaustive]
 pub enum CraqleErrorKind {
     InvalidInput,
@@ -242,6 +248,11 @@ pub enum CraqleError {
     SearchWorker(String),
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
+    #[error("replication record rejected: {reason}")]
+    ReplicationRejected {
+        error_kind: CraqleErrorKind,
+        reason: String,
+    },
 }
 
 impl From<sparql::SparqlError> for CraqleError {
@@ -277,6 +288,7 @@ impl CraqleError {
             Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
             Self::Sync(error) => error.kind(),
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
+            Self::ReplicationRejected { error_kind, .. } => *error_kind,
         }
     }
 
@@ -285,6 +297,7 @@ impl CraqleError {
     pub fn rejects_record(&self) -> bool {
         match self {
             Self::Merge(MergeError::InputRejected(_)) | Self::SyncInputRejected(_) => true,
+            Self::ReplicationRejected { .. } => true,
             Self::Merge(MergeError::Store(error)) | Self::Store(error) => error.rejects_record(),
             Self::Sync(error) => error.rejects_record(),
             _ => false,
@@ -819,6 +832,9 @@ pub struct CraqleNode {
     replication: Arc<ReplicationEngine>,
     local_replication: Arc<ReplicationEngine>,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+    remote_policy_authorizer: Arc<dyn RemotePolicyAuthorizer>,
+    reconcile_guard: Mutex<()>,
+    replication_rejections: AtomicU64,
     /// Set by a test to hold a reindex between a graph's scan and the queue
     /// clear that covers it.
     #[cfg(test)]
@@ -863,6 +879,7 @@ impl Drop for DerivedIndexWarmer {
 pub struct CraqleOptions {
     actor: ActorId,
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
+    remote_policy_authorizer: Arc<dyn RemotePolicyAuthorizer>,
     search_storage: SearchStorage,
     graph_store_persist_mode: CraqleFjallPersistMode,
     #[cfg(feature = "shacl-core")]
@@ -882,6 +899,7 @@ impl Default for CraqleOptions {
         Self {
             actor: ActorId::random(),
             sync: None,
+            remote_policy_authorizer: Arc::new(DenyRemotePolicyChanges),
             search_storage: SearchStorage::default(),
             graph_store_persist_mode: CraqleFjallPersistMode::default(),
             #[cfg(feature = "shacl-core")]
@@ -929,8 +947,22 @@ impl CraqleOptions {
         self
     }
 
-    fn into_parts(self) -> (ActorId, Option<Arc<dyn sync::CraqleGraphSync>>) {
-        (self.actor, self.sync)
+    pub fn with_remote_policy_authorizer(
+        mut self,
+        authorizer: Arc<dyn RemotePolicyAuthorizer>,
+    ) -> Self {
+        self.remote_policy_authorizer = authorizer;
+        self
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        ActorId,
+        Option<Arc<dyn sync::CraqleGraphSync>>,
+        Arc<dyn RemotePolicyAuthorizer>,
+    ) {
+        (self.actor, self.sync, self.remote_policy_authorizer)
     }
 }
 
@@ -1049,7 +1081,7 @@ impl CraqleNode {
         search: Arc<SearchIndex>,
         options: CraqleOptions,
     ) -> Self {
-        let (actor, sync) = options.into_parts();
+        let (actor, sync, remote_policy_authorizer) = options.into_parts();
         // Cross-graph derived indexes are built off the boot path so the
         // first multi-graph query does not pay the build under a write lock.
         let index_warmer = DerivedIndexWarmer::start(&store);
@@ -1100,6 +1132,9 @@ impl CraqleNode {
             replication,
             local_replication,
             sync,
+            remote_policy_authorizer,
+            reconcile_guard: Mutex::new(()),
+            replication_rejections: AtomicU64::new(0),
             #[cfg(test)]
             reindex_gate: std::sync::Mutex::new(None),
         }
@@ -1790,6 +1825,10 @@ impl CraqleNode {
         let Some(sync) = &self.sync else {
             return Ok(HashSet::new());
         };
+        let _reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut applied = HashSet::new();
         let mut stalled = None;
@@ -1825,20 +1864,7 @@ impl CraqleNode {
         let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
         // A history read that fails is retryable, so it stalls its topic. A
         // silent skip would leave the topic unread for the rest of the process.
-        let catchup = match sync.topic_records_since(topic_id, stored_cursor.as_deref()) {
-            Ok(catchup) => catchup,
-            // Except when the stored history itself cannot be decoded: no retry
-            // clears that, so the topic is quarantined instead of stalled.
-            Err(error) if error.rejects_record() => {
-                tracing::warn!(
-                    topic = %topic_id,
-                    %error,
-                    "quarantined an undecodable craqle topic history",
-                );
-                return Ok(TopicPass::default());
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let catchup = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
 
         let sync::TopicCatchup {
             records,
@@ -1847,17 +1873,68 @@ impl CraqleNode {
 
         let mut applied = HashSet::new();
         let mut stalled = None;
-        for record in &records {
+        for topic_record in &records {
+            if let sync::TopicRecord::Rejected(record) = topic_record {
+                cursor.consume(topic_record);
+                let cursor_bytes = cursor
+                    .encode()?
+                    .expect("a consumed replication record has a cursor");
+                let graph = self
+                    .store
+                    .topic_graph_binding(topic_id.as_bytes())?
+                    .map(|graph| GraphId::new(&graph));
+                let rejection = RejectedReplicationRecord {
+                    topic: topic_id,
+                    record_id: record.meta.op_id,
+                    actor: record.meta.actor_id,
+                    sequence: record.meta.actor_seq,
+                    graph,
+                    payload_digest: record.payload_digest,
+                    error_kind: record.error_kind,
+                    reason: record.reason.clone(),
+                    seen_count: 0,
+                    acknowledged: false,
+                };
+                let rejection = self
+                    .store
+                    .record_replication_rejection(rejection, Some(&cursor_bytes))?;
+                self.store.persist()?;
+                self.replication_rejections.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    topic = %topic_id,
+                    record = %rejection.record_id,
+                    error_kind = ?rejection.error_kind,
+                    seen_count = rejection.seen_count,
+                    "persisted rejected craqle replication payload before cursor advance",
+                );
+                continue;
+            }
+            let sync::TopicRecord::Event(record) = topic_record else {
+                unreachable!()
+            };
             match self.apply_reconciled_record(sync, topic_id, record) {
                 Ok(Some(graph)) => {
                     applied.insert(graph);
+                    cursor.consume(topic_record);
                 }
-                Ok(None) => {}
+                Ok(None) => cursor.consume(topic_record),
                 Err(error) if error.rejects_record() => {
+                    cursor.consume(topic_record);
+                    let cursor_bytes = cursor
+                        .encode()?
+                        .expect("a consumed replication record has a cursor");
+                    let rejection = self.rejected_replication_record(topic_id, record, &error)?;
+                    let rejection = self
+                        .store
+                        .record_replication_rejection(rejection, Some(&cursor_bytes))?;
+                    self.store.persist()?;
+                    self.replication_rejections.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         topic = %topic_id,
-                        %error,
-                        "quarantined craqle record during reconcile",
+                        record = %rejection.record_id,
+                        error_kind = ?rejection.error_kind,
+                        seen_count = rejection.seen_count,
+                        "persisted rejected craqle replication record before cursor advance",
                     );
                 }
                 Err(error) => {
@@ -1870,7 +1947,6 @@ impl CraqleNode {
                     break;
                 }
             }
-            cursor.consume(record);
         }
 
         // Persisted even when the pass stalled: it covers exactly the prefix
@@ -1898,12 +1974,244 @@ impl CraqleNode {
                     claimed = %graph.as_str(),
                     "rejected craqle record targeting a graph outside its topic binding",
                 );
-                return Ok(None);
+                return Err(CraqleError::ReplicationRejected {
+                    error_kind: CraqleErrorKind::CorruptAuthoritativeData,
+                    reason: "record targets a graph outside its topic binding".to_owned(),
+                });
             }
             Some(_) => {}
             None => sync.bind_graph_topic(&self.store, graph, topic_id)?,
         }
-        Ok(self.apply_irokle_record(record)?.then(|| graph.clone()))
+        let local_record = sync.is_local_record(topic_id, record);
+        let _write_guard = replication::graph_write_guard(graph);
+        Ok(self
+            .apply_irokle_record_locked(record, local_record)?
+            .then(|| graph.clone()))
+    }
+
+    fn rejected_replication_record(
+        &self,
+        topic: irokle::TopicId,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+        error: &CraqleError,
+    ) -> Result<RejectedReplicationRecord> {
+        let payload = postcard::to_allocvec(&record.event)
+            .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
+        let reason = match error {
+            CraqleError::ReplicationRejected { reason, .. } => reason.clone(),
+            CraqleError::Merge(MergeError::InputRejected(_))
+            | CraqleError::SyncInputRejected(_) => "malformed graph event".to_owned(),
+            CraqleError::Merge(MergeError::Store(_)) | CraqleError::Store(_) => {
+                "record rejected for authoritative corruption".to_owned()
+            }
+            CraqleError::Sync(_) => "unsupported or malformed graph-event record".to_owned(),
+            _ => "replication record rejected".to_owned(),
+        };
+        Ok(RejectedReplicationRecord {
+            topic,
+            record_id: record.meta.op_id,
+            actor: record.meta.actor_id,
+            sequence: record.meta.actor_seq,
+            graph: Some(record.event.graph().clone()),
+            payload_digest: *blake3::hash(&payload).as_bytes(),
+            error_kind: error.kind(),
+            reason,
+            seen_count: 0,
+            acknowledged: false,
+        })
+    }
+
+    pub fn replication_rejection_count(&self) -> u64 {
+        self.replication_rejections.load(Ordering::Relaxed)
+    }
+
+    pub fn list_rejected_replication_records(
+        &self,
+        auth: &dyn Authorizer,
+    ) -> Result<Vec<RejectedReplicationRecord>> {
+        let records = self.store.replication_rejections()?;
+        for record in &records {
+            self.authorize_rejection_record(auth, record, Action::Read)?;
+        }
+        Ok(records)
+    }
+
+    pub fn inspect_rejected_replication_record(
+        &self,
+        auth: &dyn Authorizer,
+        topic: irokle::TopicId,
+        record_id: irokle::OpId,
+    ) -> Result<Option<RejectedReplicationRecord>> {
+        let Some(record) = self.store.replication_rejection(&topic, &record_id)? else {
+            return Ok(None);
+        };
+        self.authorize_rejection_record(auth, &record, Action::Read)?;
+        Ok(Some(record))
+    }
+
+    pub fn retry_rejected_replication_record(
+        &self,
+        auth: &dyn Authorizer,
+        topic: irokle::TopicId,
+        record_id: irokle::OpId,
+    ) -> Result<bool> {
+        let _reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(rejected) = self.store.replication_rejection(&topic, &record_id)? else {
+            return Ok(false);
+        };
+        self.authorize_rejection_record(auth, &rejected, Action::Write)?;
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let topic_record = sync
+            .topic_records_since(topic, None)?
+            .records
+            .into_iter()
+            .find(|record| record.meta().op_id == record_id)
+            .ok_or_else(|| {
+                CraqleError::SyncInputRejected(format!(
+                    "rejected record {record_id} is no longer available in topic {topic}"
+                ))
+            })?;
+        let record = match topic_record {
+            sync::TopicRecord::Event(record) => record,
+            sync::TopicRecord::Rejected(record) => {
+                let rejection = RejectedReplicationRecord {
+                    topic,
+                    record_id: record.meta.op_id,
+                    actor: record.meta.actor_id,
+                    sequence: record.meta.actor_seq,
+                    graph: rejected.graph,
+                    payload_digest: record.payload_digest,
+                    error_kind: record.error_kind,
+                    reason: record.reason.clone(),
+                    seen_count: 0,
+                    acknowledged: false,
+                };
+                self.store.record_replication_rejection(rejection, None)?;
+                self.persist_fjall()?;
+                self.replication_rejections.fetch_add(1, Ordering::Relaxed);
+                return Err(CraqleError::ReplicationRejected {
+                    error_kind: record.error_kind,
+                    reason: record.reason,
+                });
+            }
+        };
+        match self.apply_reconciled_record(sync, topic, &record) {
+            Ok(_) => {
+                self.store
+                    .delete_replication_rejection(&topic, &record_id)?;
+                self.persist_fjall()?;
+                Ok(true)
+            }
+            Err(error) if error.rejects_record() => {
+                let rejection = self.rejected_replication_record(topic, &record, &error)?;
+                self.store.record_replication_rejection(rejection, None)?;
+                self.persist_fjall()?;
+                self.replication_rejections.fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn acknowledge_rejected_replication_record(
+        &self,
+        auth: &dyn Authorizer,
+        topic: irokle::TopicId,
+        record_id: irokle::OpId,
+    ) -> Result<bool> {
+        let _reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = self.store.replication_rejection(&topic, &record_id)? else {
+            return Ok(false);
+        };
+        self.authorize_rejection_record(auth, &record, Action::Write)?;
+        let changed = self
+            .store
+            .acknowledge_replication_rejection(&topic, &record_id)?;
+        if changed {
+            self.persist_fjall()?;
+        }
+        Ok(changed)
+    }
+
+    pub fn delete_rejected_replication_record(
+        &self,
+        auth: &dyn Authorizer,
+        topic: irokle::TopicId,
+        record_id: irokle::OpId,
+    ) -> Result<bool> {
+        let _reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = self.store.replication_rejection(&topic, &record_id)? else {
+            return Ok(false);
+        };
+        self.authorize_rejection_record(auth, &record, Action::Write)?;
+        let changed = self
+            .store
+            .delete_replication_rejection(&topic, &record_id)?;
+        if changed {
+            self.persist_fjall()?;
+        }
+        Ok(changed)
+    }
+
+    pub fn repair_irokle_topic_cursor(
+        &self,
+        auth: &dyn Authorizer,
+        topic: irokle::TopicId,
+        expected_old_cursor_digest: [u8; 32],
+        replacement_position: irokle::ActorClock,
+    ) -> Result<TopicCursorRepairAudit> {
+        let _reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let graph = self
+            .store
+            .topic_graph_binding(topic.as_bytes())?
+            .map(|graph| GraphId::new(&graph))
+            .ok_or_else(|| {
+                CraqleError::SyncInputRejected(format!(
+                    "irokle topic {topic} is not bound to a graph"
+                ))
+            })?;
+        self.ensure_graph_action(&graph, auth, Action::Write)?;
+        let replacement = sync::encode_topic_cursor(topic, &replacement_position)?;
+        let audit = self.store.repair_topic_cursor(
+            topic,
+            expected_old_cursor_digest,
+            &replacement,
+            Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        )?;
+        self.persist_fjall()?;
+        tracing::warn!(
+            topic = %topic,
+            old_cursor_digest = ?audit.old_cursor_digest,
+            replacement_cursor_digest = ?audit.replacement_cursor_digest,
+            "repaired authoritative replication cursor",
+        );
+        Ok(audit)
+    }
+
+    fn authorize_rejection_record(
+        &self,
+        auth: &dyn Authorizer,
+        record: &RejectedReplicationRecord,
+        action: Action,
+    ) -> Result<()> {
+        let graph = record.graph.as_ref().ok_or_else(|| {
+            CraqleError::SyncInputRejected(
+                "unbound replication rejection requires graph context".to_owned(),
+            )
+        })?;
+        self.ensure_graph_action(graph, auth, action)
     }
 
     pub fn graph_policy(&self, graph: &GraphId) -> Result<GraphPolicy> {
@@ -3152,15 +3460,32 @@ impl CraqleNode {
         // before applying cannot race one halfway through.
         let _write_guard = replication::graph_write_guard(graph);
 
+        if self.store.graph_tombstoned(graph)? {
+            return Ok(());
+        }
+        let mut delete_clock = self.store.get_vector_clock(graph)?;
+        let delete_counter = delete_clock
+            .0
+            .get(&self.actor)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        delete_clock.advance(self.actor, delete_counter);
+        let tombstone = GraphTombstone {
+            graph: graph.clone(),
+            delete_event: EventId::graph_delete(graph, self.actor, &delete_clock),
+            delete_actor: self.actor,
+            delete_clock,
+        };
+
         if let Some(sync) = &self.sync
             && sync.graph_topic_id(&self.store, graph)?.is_some()
-            && !self.store.graph_tombstoned(graph)?
         {
-            let record = sync.publish_delete(&self.store, graph)?;
-            self.apply_irokle_record_locked(&record)?;
+            let record = sync.publish_delete(&self.store, tombstone)?;
+            self.apply_irokle_record_locked(&record, true)?;
             return self.persist_fjall();
         }
-        self.store.delete_graph_tombstoned(graph)?;
+        self.store.delete_graph_tombstoned(&tombstone)?;
         self.schedule_search_update();
         self.persist_fjall()
     }
@@ -3262,32 +3587,39 @@ impl CraqleNode {
         policy: GraphPolicy,
         durability: CraqleRequestDurability,
     ) -> Result<()> {
-        if !durability.publishes_irokle() {
-            return self.set_local_graph_policy(graph, policy);
+        let _write_guard = replication::graph_write_guard(graph);
+        if let Some(tombstone) = self.store.graph_tombstone(graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone }.into());
         }
+        let previous = self.store.graph_tagged_policy(graph)?;
+        let policy = policy.normalized();
+        if self.store.contains_graph(graph)? && previous.policy == policy {
+            return Ok(());
+        }
+        let tagged = TaggedGraphPolicy {
+            policy,
+            tag: PolicyTag::next_local(previous.tag, self.actor),
+        };
 
-        if let Some(sync) = &self.sync {
-            if self.store.contains_graph(graph)? && self.store.graph_policy(graph)? == policy {
-                return Ok(());
-            }
-            // Orders the publish against its own apply; see
-            // `replication::GRAPH_WRITE_LOCKS`. Policy has no ordering tag, so
-            // two writes that apply in the opposite order to their publish
-            // sequence leave this node on a policy its peers have replaced —
-            // the permissive one, if that is the one that lost (G8).
-            let _write_guard = replication::graph_write_guard(graph);
-            let record = sync.publish_policy(&self.store, graph, policy.clone())?;
+        if durability.publishes_irokle()
+            && let Some(sync) = &self.sync
+        {
+            let record = sync.publish_policy(&self.store, graph, tagged)?;
             stall_publish_apply();
-            self.apply_irokle_record_locked(&record)?;
+            self.apply_irokle_record_locked(&record, true)?;
             return Ok(());
         }
 
-        self.set_local_graph_policy(graph, policy)
+        self.store.set_tagged_graph_policy(graph, &tagged)?;
+        Ok(())
     }
 
     fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
-        self.store.set_graph_policy(graph, &policy)?;
-        Ok(())
+        self.persist_graph_policy_with_durability(
+            graph,
+            policy,
+            CraqleRequestDurability::WalAlreadyDurable,
+        )
     }
 
     fn orphaned_entities(&self, graph: &GraphId) -> Result<std::collections::HashSet<EncodedTerm>> {
@@ -3362,6 +3694,7 @@ impl CraqleNode {
     /// the one that lands second decides the outcome by arrival order; for the
     /// `@context` register that means the local value can end up superseded on
     /// every peer but this one, with no later event to correct it (G5, G8).
+    #[cfg(test)]
     fn apply_irokle_record(
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
@@ -3369,7 +3702,7 @@ impl CraqleNode {
         // Orders this apply against every other write to the same graph; see
         // `replication::GRAPH_WRITE_LOCKS`.
         let _write_guard = replication::graph_write_guard(record.event.graph());
-        self.apply_irokle_record_locked(record)
+        self.apply_irokle_record_locked(record, false)
     }
 
     /// **Call with the graph's write lock held**, so a publish and its own
@@ -3377,23 +3710,54 @@ impl CraqleNode {
     fn apply_irokle_record_locked(
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+        local_record: bool,
     ) -> Result<bool> {
-        if let CraqleGraphEvent::GraphDeleted { graph } = &record.event {
-            self.store.delete_graph_tombstoned(graph)?;
+        if let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event {
+            self.store.delete_graph_tombstoned(tombstone)?;
             self.schedule_search_update();
             return Ok(true);
         }
-        if self.store.graph_tombstoned(record.event.graph())? {
-            return Ok(false);
+        if let Some(tombstone) = self.store.graph_tombstone(record.event.graph())? {
+            return Err(CraqleError::ReplicationRejected {
+                error_kind: CraqleErrorKind::Conflict,
+                reason: format!(
+                    "graph {} was permanently deleted by event {}",
+                    tombstone.graph, tombstone.delete_event
+                ),
+            });
         }
         match &record.event {
             CraqleGraphEvent::GraphDeleted { .. } => unreachable!(),
-            CraqleGraphEvent::Policy { graph, policy } => {
-                let policy = policy.clone().normalized();
-                if self.store.graph_policy(graph)? == policy {
+            CraqleGraphEvent::Policy { graph, tagged } => {
+                let record_actor = ActorId::from_bytes(*record.meta.actor_id.as_bytes());
+                if tagged.tag.actor != record_actor {
+                    return Err(CraqleError::ReplicationRejected {
+                        error_kind: CraqleErrorKind::CorruptAuthoritativeData,
+                        reason: "policy tag actor does not match the signed record actor"
+                            .to_owned(),
+                    });
+                }
+                if !local_record
+                    && !self.remote_policy_authorizer.may_apply_policy(
+                        graph,
+                        &tagged.tag.actor,
+                        &tagged.policy,
+                    )
+                {
+                    return Err(CraqleError::ReplicationRejected {
+                        error_kind: CraqleErrorKind::Unauthorized,
+                        reason: "remote actor is not authorized to change graph policy".to_owned(),
+                    });
+                }
+                let current = self.store.graph_tagged_policy(graph)?;
+                if tagged.tag <= current.tag {
                     return Ok(false);
                 }
-                self.set_local_graph_policy(graph, policy)?;
+                let tagged = TaggedGraphPolicy {
+                    policy: tagged.policy.clone().normalized(),
+                    tag: tagged.tag,
+                };
+                self.store.set_tagged_graph_policy(graph, &tagged)?;
                 Ok(true)
             }
             CraqleGraphEvent::QuadChanges { graph, .. } => {
@@ -4739,6 +5103,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn corrupt_topic_cursor() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:corrupt-topic-cursor");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "cursor"))
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+
+        let corrupt = vec![0x81, 0x02, 0x03];
+        pair.replica
+            .store
+            .set_applied_topic_clock(topic.as_bytes(), &corrupt)
+            .unwrap();
+        let error = pair.replica.reconcile_irokle().unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::CorruptAuthoritativeData);
+        assert_eq!(
+            pair.replica
+                .store
+                .applied_topic_clock(topic.as_bytes())
+                .unwrap(),
+            Some(corrupt.clone()),
+            "a corrupt cursor must never be reset or advanced"
+        );
+
+        let wrong_digest = [9; 32];
+        let error = pair
+            .replica
+            .repair_irokle_topic_cursor(
+                &AllowAllAuthorizer,
+                topic,
+                wrong_digest,
+                irokle::ActorClock::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::Conflict);
+
+        let audit = pair
+            .replica
+            .repair_irokle_topic_cursor(
+                &AllowAllAuthorizer,
+                topic,
+                topic_cursor_digest(&corrupt),
+                irokle::ActorClock::default(),
+            )
+            .unwrap();
+        assert_eq!(audit.old_cursor_digest, topic_cursor_digest(&corrupt));
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(pair.replica.contains_graph(&graph).unwrap());
+    }
+
     /// An open must not fail on a reconcile a retry clears, or a node whose
     /// peer blipped once would refuse to start at all.
     #[test]
@@ -4813,18 +5229,25 @@ mod tests {
     /// A record no retry could ever accept stays quarantined: the pass skips
     /// it and still applies the records behind it.
     #[test]
-    fn rejection_skips_record() {
-        let pair = replica_pair();
+    fn rejection_ledger_before_cursor_advance() {
+        let ReplicaPair {
+            _dir,
+            irokle,
+            origin,
+            replica,
+        } = replica_pair();
         let graph = GraphId::new("urn:test:reconcile-rejection");
-        pair.origin
+        origin
             .create_crate(&writer_auth(), crate_request(&graph, "rejection"))
             .unwrap();
-        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        replica.reconcile_irokle().unwrap();
+        let topic = origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let baseline_cursor = topic_cursor(&replica, topic);
 
         // A change naming a graph its own event does not: rejected on decode,
         // every time it is offered.
         let elsewhere = GraphId::new("urn:test:reconcile-elsewhere");
-        pair.irokle
+        let rejected = irokle
             .open_topic::<CraqleGraphEvent>(topic)
             .unwrap()
             .publish(CraqleGraphEvent::QuadChanges {
@@ -4837,14 +5260,84 @@ mod tests {
                 }],
             })
             .unwrap();
-        write_keyword(&pair.origin, &graph, "after");
+        write_keyword(&origin, &graph, "after");
 
-        pair.replica.reconcile_irokle().unwrap();
+        replica.store.arm_commit_failure();
+        assert!(replica.reconcile_irokle().is_err());
+        assert_eq!(baseline_cursor, topic_cursor(&replica, topic));
+        assert!(replica.store.replication_rejections().unwrap().is_empty());
+
+        replica.reconcile_irokle().unwrap();
         assert!(
-            has_keyword(&pair.replica, &graph, "after"),
+            has_keyword(&replica, &graph, "after"),
             "a quarantined record must not hold back the ones behind it"
         );
-        assert!(!pair.replica.contains_graph(&elsewhere).unwrap());
+        assert!(!replica.contains_graph(&elsewhere).unwrap());
+        let records = replica
+            .list_rejected_replication_records(&AllowAllAuthorizer)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, rejected.meta.op_id);
+        assert_eq!(records[0].seen_count, 1);
+
+        let retry = replica.retry_rejected_replication_record(
+            &AllowAllAuthorizer,
+            topic,
+            rejected.meta.op_id,
+        );
+        assert!(retry.is_err(), "retry must repeat normal validation");
+        assert_eq!(
+            replica
+                .inspect_rejected_replication_record(
+                    &AllowAllAuthorizer,
+                    topic,
+                    rejected.meta.op_id,
+                )
+                .unwrap()
+                .unwrap()
+                .seen_count,
+            2
+        );
+
+        drop(replica);
+        let reopened = reopen_replica(&_dir.path().join("replica"), &irokle);
+        assert_eq!(
+            reopened
+                .list_rejected_replication_records(&AllowAllAuthorizer)
+                .unwrap()
+                .len(),
+            1,
+            "the rejection ledger must survive restart"
+        );
+        assert!(
+            reopened
+                .acknowledge_rejected_replication_record(
+                    &AllowAllAuthorizer,
+                    topic,
+                    rejected.meta.op_id,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .inspect_rejected_replication_record(
+                    &AllowAllAuthorizer,
+                    topic,
+                    rejected.meta.op_id,
+                )
+                .unwrap()
+                .unwrap()
+                .acknowledged
+        );
+        assert!(
+            reopened
+                .delete_rejected_replication_record(
+                    &AllowAllAuthorizer,
+                    topic,
+                    rejected.meta.op_id,
+                )
+                .unwrap()
+        );
     }
 
     /// A panic inside the indexer drain must not take the worker thread down.
@@ -5076,9 +5569,12 @@ mod tests {
             .unwrap()
             .records
             .into_iter()
-            .filter_map(|record| match record.event {
-                CraqleGraphEvent::Policy { policy, .. } => Some(policy.normalized()),
-                _ => None,
+            .filter_map(|record| match record {
+                sync::TopicRecord::Event(record) => match record.event {
+                    CraqleGraphEvent::Policy { tagged, .. } => Some(tagged.policy.normalized()),
+                    _ => None,
+                },
+                sync::TopicRecord::Rejected(_) => None,
             })
             .next_back()
             .expect("at least one published policy")
@@ -5116,7 +5612,9 @@ mod tests {
                     if racer == 0 {
                         node.delete_graph_unchecked(&graph).unwrap();
                     } else {
-                        seed_write(&node, &graph);
+                        if let Err(error) = seed_write_result(&node, &graph) {
+                            assert_eq!(error.kind(), CraqleErrorKind::Conflict);
+                        }
                     }
                     tx.send(()).unwrap();
                 });
@@ -5136,6 +5634,147 @@ mod tests {
                 "round {round} resurrected a tombstoned graph"
             );
         }
+    }
+
+    #[test]
+    fn local_write_after_delete_and_same_id_recreation_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            dir.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let graph = GraphId::new("urn:test:local-write-after-delete");
+        node.create_crate(&writer_auth(), crate_request(&graph, "deleted"))
+            .unwrap();
+        node.delete_graph(&writer_auth(), &graph).unwrap();
+        let tombstone = node.store.graph_tombstone(&graph).unwrap().unwrap();
+
+        let error = seed_write_result(&node, &graph).unwrap_err();
+        assert!(matches!(
+            error,
+            CraqleError::Update(UpdateError::GraphDeleted { .. })
+        ));
+        let error = node
+            .create_crate(&writer_auth(), crate_request(&graph, "recreated"))
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::Conflict);
+        assert!(!node.contains_graph(&graph).unwrap());
+        assert_eq!(node.store.graph_tombstone(&graph).unwrap(), Some(tombstone));
+    }
+
+    #[test]
+    fn post_delete_remote_record_rejection() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:post-delete-remote-record");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "deleted"))
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        pair.origin.delete_graph(&writer_auth(), &graph).unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+
+        let rejected = pair
+            .irokle
+            .open_topic::<CraqleGraphEvent>(topic)
+            .unwrap()
+            .publish(CraqleGraphEvent::QuadChanges {
+                graph: graph.clone(),
+                changes: vec![MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: EncodedTerm::from_named_node(&graph.0),
+                    predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    object: keyword_object("late"),
+                }],
+            })
+            .unwrap();
+
+        pair.replica.reconcile_irokle().unwrap();
+        let records = pair
+            .replica
+            .list_rejected_replication_records(&AllowAllAuthorizer)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, rejected.meta.op_id);
+        assert_eq!(records[0].error_kind, CraqleErrorKind::Conflict);
+        assert!(!pair.replica.contains_graph(&graph).unwrap());
+        assert_eq!(
+            seed_write_result(&pair.replica, &graph).unwrap_err().kind(),
+            CraqleErrorKind::Conflict,
+            "a partitioned writer must reject new local writes after learning the tombstone"
+        );
+        assert_eq!(
+            pair.origin.store.graph_tombstone(&graph).unwrap(),
+            pair.replica.store.graph_tombstone(&graph).unwrap()
+        );
+    }
+
+    #[test]
+    fn three_replica_delete_write_arrival_order_permutations_converge() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = sync_node(&source_dir);
+        let graph = GraphId::new("urn:test:delete-arrival-permutations");
+        let sync = source.sync.clone().unwrap();
+        let change = |value: &str| MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: EncodedTerm::from_named_node(&graph.0),
+            predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+            object: keyword_object(value),
+        };
+        let first = sync
+            .publish_changes(&source.store, &graph, vec![change("first")])
+            .unwrap();
+        let second = sync
+            .publish_changes(&source.store, &graph, vec![change("second")])
+            .unwrap();
+        let mut delete_clock = VectorClock::default();
+        delete_clock.advance(source.actor(), 1);
+        let tombstone = GraphTombstone {
+            graph: graph.clone(),
+            delete_event: EventId::graph_delete(&graph, source.actor(), &delete_clock),
+            delete_actor: source.actor(),
+            delete_clock,
+        };
+        let deleted = sync
+            .publish_delete(&source.store, tombstone.clone())
+            .unwrap();
+
+        let target_root = tempfile::tempdir().unwrap();
+        let targets: Vec<_> = (0..3)
+            .map(|index| {
+                CraqleNode::open_with_options(
+                    target_root.path().join(index.to_string()),
+                    CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+                )
+                .unwrap()
+            })
+            .collect();
+        let permutations = [
+            [&first, &second, &deleted],
+            [&deleted, &first, &second],
+            [&second, &deleted, &first],
+        ];
+        for (target, records) in targets.iter().zip(permutations) {
+            for record in records {
+                if let Err(error) = target.apply_irokle_record(record) {
+                    assert_eq!(error.kind(), CraqleErrorKind::Conflict);
+                }
+            }
+            assert!(!target.contains_graph(&graph).unwrap());
+            assert_eq!(
+                target.store.graph_tombstone(&graph).unwrap(),
+                Some(tombstone.clone())
+            );
+        }
+        assert_eq!(
+            targets[0].graph_fingerprint(&graph).unwrap(),
+            targets[1].graph_fingerprint(&graph).unwrap()
+        );
+        assert_eq!(
+            targets[1].graph_fingerprint(&graph).unwrap(),
+            targets[2].graph_fingerprint(&graph).unwrap()
+        );
     }
 
     #[cfg(feature = "shacl-core")]
@@ -5301,6 +5940,10 @@ mod tests {
     /// A bare quad write, skipping the crate-structure rules these tests are
     /// not about.
     fn seed_write(node: &CraqleNode, graph: &GraphId) {
+        seed_write_result(node, graph).unwrap();
+    }
+
+    fn seed_write_result(node: &CraqleNode, graph: &GraphId) -> Result<Batch> {
         node.apply_changes_unchecked(
             graph,
             vec![MaterializedQuadChange::Insert {
@@ -5310,6 +5953,5 @@ mod tests {
                 object: EncodedTerm("\"race\"".to_string()),
             }],
         )
-        .unwrap();
     }
 }
