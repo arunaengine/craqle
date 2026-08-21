@@ -4,6 +4,12 @@
 //! durable Fjall store. The comparison therefore covers warm, fully consumed
 //! query execution only; it does not claim database-size or durable-load
 //! parity. Ten million quads are deliberately rejected by this executable.
+//!
+//! Persistent comparison mode is explicit and benchmark-only:
+//! `RUSTFLAGS="--cfg oxigraph_persistent" cargo bench --bench
+//! oxigraph_comparison --features oxigraph/rocksdb`.
+
+#![allow(unexpected_cfgs)]
 
 mod support;
 
@@ -11,7 +17,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use craqle::{QueryExecutionOptions, QueryResults as CraqleResults};
+use craqle::{CraqleFjallPersistMode, QueryExecutionOptions, QueryResults as CraqleResults};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxigraph::sparql::{PreparedSparqlQuery, QueryResults as OxigraphResults, SparqlEvaluator};
 use oxigraph::store::Store;
@@ -21,6 +27,15 @@ use support::{DEFAULT_SEED, DeterministicCorpus, QUADS_1M, QUADS_10K, QuadSpec};
 
 const DEFAULT_GRAPHS: usize = 32;
 const DEFAULT_SAMPLES: usize = 10;
+
+#[cfg(oxigraph_persistent)]
+const CRAQLE_PERSISTENCE: &str = "fjall_sync_all_tempdir";
+#[cfg(not(oxigraph_persistent))]
+const CRAQLE_PERSISTENCE: &str = "fjall_buffered_tempdir";
+#[cfg(oxigraph_persistent)]
+const OXIGRAPH_PERSISTENCE: &str = "rocksdb_tempdir";
+#[cfg(not(oxigraph_persistent))]
+const OXIGRAPH_PERSISTENCE: &str = "in_memory";
 
 #[derive(Debug, PartialEq, Eq)]
 enum CanonicalResults {
@@ -33,6 +48,11 @@ enum CanonicalResults {
 struct ResultWork {
     rows: usize,
     bindings: usize,
+}
+
+struct OxigraphFixture {
+    store: Store,
+    _database: Option<tempfile::TempDir>,
 }
 
 fn main() {
@@ -53,6 +73,11 @@ fn main() {
         measurement: Duration::from_secs(1),
         sample_size: samples,
         load_batch: support::fixture::LOAD_BATCH_SIZE,
+        persist_mode: if cfg!(oxigraph_persistent) {
+            CraqleFjallPersistMode::SyncAll
+        } else {
+            CraqleFjallPersistMode::Buffer
+        },
     };
 
     let craqle_load_started = Instant::now();
@@ -67,7 +92,8 @@ fn main() {
     let oxigraph_load = oxigraph_load_started.elapsed();
     println!(
         "oxigraph_comparison setup: craqle_load_ms={:.3} oxigraph_load_ms={:.3} \
-         craqle_persistence=fjall_buffered_tempdir oxigraph_persistence=in_memory \
+         craqle_persistence={CRAQLE_PERSISTENCE} \
+         oxigraph_persistence={OXIGRAPH_PERSISTENCE} \
          oxigraph_version=0.5.9",
         millis(craqle_load),
         millis(oxigraph_load),
@@ -75,11 +101,24 @@ fn main() {
 
     fixture.print_hot_work();
     for index in 0..fixture.hot_path_count() {
-        compare_case(&fixture, &oxigraph, index, samples);
+        compare_case(&fixture, &oxigraph.store, index, samples);
     }
 }
 
-fn load_oxigraph(corpus: support::CorpusConfig) -> Store {
+fn load_oxigraph(corpus: support::CorpusConfig) -> OxigraphFixture {
+    #[cfg(oxigraph_persistent)]
+    let database = Some(tempfile::tempdir().expect("create Oxigraph temporary database"));
+    #[cfg(not(oxigraph_persistent))]
+    let database = None;
+    #[cfg(oxigraph_persistent)]
+    let store = Store::open(
+        database
+            .as_ref()
+            .expect("persistent Oxigraph database")
+            .path(),
+    )
+    .expect("open Oxigraph RocksDB store");
+    #[cfg(not(oxigraph_persistent))]
     let store = Store::new().expect("create Oxigraph in-memory store");
     let mut loader = store.bulk_loader();
     loader
@@ -91,7 +130,12 @@ fn load_oxigraph(corpus: support::CorpusConfig) -> Store {
         )
         .expect("load comparison corpus into Oxigraph");
     loader.commit().expect("commit Oxigraph bulk load");
-    store
+    #[cfg(oxigraph_persistent)]
+    store.flush().expect("flush Oxigraph RocksDB store");
+    OxigraphFixture {
+        store,
+        _database: database,
+    }
 }
 
 fn oxigraph_quad(record: QuadSpec) -> Quad {

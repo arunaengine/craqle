@@ -12,9 +12,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use craqle::{
-    ActorId, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange,
-    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryReadMode, QueryResults,
-    ReadStatistics,
+    ActorId, CraqleFjallPersistMode, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
+    MaterializedQuadChange, PreparedQuery, QueryExecution, QueryExecutionOptions, QueryReadMode,
+    QueryResults, ReadStatistics,
 };
 use oxrdf::Term;
 
@@ -37,6 +37,7 @@ pub struct BenchConfig {
     pub measurement: Duration,
     pub sample_size: usize,
     pub load_batch: usize,
+    pub persist_mode: CraqleFjallPersistMode,
 }
 
 impl BenchConfig {
@@ -73,6 +74,7 @@ impl BenchConfig {
             measurement: env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5),
             sample_size,
             load_batch,
+            persist_mode: CraqleFjallPersistMode::Buffer,
         }
     }
 }
@@ -184,7 +186,9 @@ impl Fixture {
         let database = tempfile::tempdir().expect("create benchmark temporary database");
         let node = CraqleNode::open_with_options(
             database.path(),
-            CraqleOptions::new().with_actor(ActorId::from_bytes([0x43; 32])),
+            CraqleOptions::new()
+                .with_actor(ActorId::from_bytes([0x43; 32]))
+                .with_graph_store_persist_mode(config.persist_mode),
         )
         .expect("open benchmark node");
 
