@@ -17,8 +17,8 @@ All notable changes to Craqle are documented here.
 
 - Craqle now publishes a defined 0.2.x source and authoritative disk-data
   compatibility contract.
-- Vendored dependency source trees were replaced by exact Git revisions for
-  the Git release candidate.
+- Vendored dependency source trees were replaced by released registry crates
+  where available and exact Git revisions otherwise.
 
 ### Fixed
 
@@ -46,8 +46,8 @@ All notable changes to Craqle are documented here.
 - `CraqleFastV1` is a bounded SHACL profile; full SHACL Core is not claimed.
 - SHACL-SPARQL, SHACL-JS, SHACL-AF, remote imports, RDF-star, and other listed
   unsupported forms fail explicitly.
-- The release candidate uses exact Git dependencies and is not yet eligible
-  for a crates.io publication.
+- The release candidate still uses exact Git dependencies and is not yet
+  eligible for a crates.io publication.
 ### Migration from 0.1.x
 
 The first 0.2 deployment uses a new empty database. Craqle does not silently

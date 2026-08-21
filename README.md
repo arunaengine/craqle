@@ -244,9 +244,9 @@ is claimed; that long run remains deferred until explicitly authorized.
 
 - Search is intentionally minimal even though it uses Tantivy; for richer results you still hydrate metadata from RDF.
 - Irokle transport integration is library-level; Craqle does not provide a standalone sync server.
-- The Git release candidate pins exact revisions of the maintained RO-Crate
-  fork and upstream Rudof master. It is not crates.io-ready until equivalent
-  registry releases exist.
+- The Git release candidate uses Rudof `0.3.10` from crates.io and pins exact
+  revisions of the maintained RO-Crate fork and Irokle. It is not
+  crates.io-ready until equivalent registry releases exist.
 - `CraqleFastV1` is a deliberately bounded profile, not unrestricted SHACL Core conformance.
 
 ## Disk data and recovery

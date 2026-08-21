@@ -83,9 +83,9 @@ oxsdatatypes = { workspace = true, optional = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
 regex = { workspace = true, optional = true }
-shacl = { git = "https://github.com/rudof-project/rudof.git", rev = "1edf9ca466945588e247b7c97ff5553d446bbb1e", default-features = false, optional = true }
-rudof_rdf = { git = "https://github.com/rudof-project/rudof.git", rev = "1edf9ca466945588e247b7c97ff5553d446bbb1e", default-features = false, optional = true }
-rudof_iri = { git = "https://github.com/rudof-project/rudof.git", rev = "1edf9ca466945588e247b7c97ff5553d446bbb1e", default-features = false, optional = true }
+shacl = { version = "=0.3.10", default-features = false, optional = true }
+rudof_rdf = { version = "=0.3.10", default-features = false, optional = true }
+rudof_iri = { version = "=0.3.10", default-features = false, optional = true }
 serde_json = { workspace = true }
 spargebra = { workspace = true }
 spareval = { workspace = true }
