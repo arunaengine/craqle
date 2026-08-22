@@ -1,13 +1,16 @@
 # Craqle
 
-Craqle 0.2 is a versioned Rust library for storing, querying, validating,
+Craqle is a Linux-first Rust library for storing, querying, validating,
 searching, and replicating RO-Crates as RDF named graphs.
+
+Craqle 0.2 defines its public storage, RO-Crate, SPARQL, and Craqle SHACL
+Core Subset v1 interfaces. A future 0.3 release may contain breaking changes.
 
 The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Irokle graph topics provide the durable operation log and sync obligations, while Craqle reduces those events into an OR-Set RDF projection. Invalid visible RO-Crates are not exported.
 
-`0.2.0-rc.1` is a release candidate for the supported 0.2 API, disk-data,
-SPARQL, `CoreSubsetV1` SHACL, and RO-Crate contracts. It is not the final 0.2
-release.
+Linux is the only supported platform for 0.2. Distribution is the `v0.2.0` Git
+tag with the exact Git dependency revisions recorded in `Cargo.toml` and
+`Cargo.lock`; Craqle 0.2 is not distributed through crates.io.
 
 Within the 0.2.x series:
 
@@ -18,8 +21,6 @@ Within the 0.2.x series:
 - derived qv indexes, search indexes, and compiled-schema caches may be
   rebuilt;
 - unsupported forms fail explicitly;
-- deprecated 0.2 APIs remain until 0.3 unless they create a correctness or
-  security issue, and their Rust documentation names the replacement;
 - a future 0.3 release may contain breaking changes with a migration note.
 
 | Area | 0.2 status |
@@ -29,7 +30,7 @@ Within the 0.2.x series:
 | RO-Crate 1.1, 1.2, and 1.3 import/export | Supported within documented behavior |
 | Local SPARQL | Supported |
 | qv query indexes | Supported derived data |
-| `CoreSubsetV1` SHACL | Supported bounded profile |
+| Craqle SHACL Core Subset v1 (`ShaclProfile::CoreSubsetV1`) | Supported bounded profile |
 | Enforce and Advisory policies | Supported |
 | Full SHACL Core | Not claimed |
 | SHACL-SPARQL, JS, AF, remote imports | Unsupported |
@@ -42,16 +43,14 @@ Within the 0.2.x series:
 | Stable in 0.2.x | Root storage, RO-Crate, authorization, local SPARQL, search, replication, error, and disk-format APIs documented in Rustdoc |
 | Feature-gated in 0.2.x | `shacl-core`, `search`, and `iroh` surfaces |
 | Internal | Everything under `src/internal/`, encoded storage IDs, physical forcing controls used only by tests and benchmarks |
-| Deprecated | APIs explicitly carrying a Rust `deprecated` attribute and a documented replacement; retained until 0.3 unless correctness or security requires removal |
 
 Public enums intended to grow are non-exhaustive. Existing names do not change
-semantics silently. The committed API snapshot is checked alongside a Rust
-semver analysis in CI.
+semantics silently.
 
 - create and update RO-Crates as named RDF graphs
 - import and export RO-Crate JSON-LD
 - query and update with SPARQL
-- compile, bind, and evaluate the optional native `CoreSubsetV1` SHACL profile
+- compile, bind, and evaluate the optional native Craqle SHACL Core Subset v1
 - do full-text search with Tantivy
 - replicate changes over one Irokle topic per graph
 - reject invalid visible crate states on export
@@ -96,7 +95,7 @@ node.create_crate(
         "Proteomics Study 2025",
         "Mass spectrometry analysis of 200 patient samples",
         "2025-03-26",
-        "https://creativecommons.org/licenses/by/4.0/",
+        Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
         GraphPolicy {
             public: true,
             permission_paths: vec!["/datasets/public/proteomics-study-2025".to_string()],
@@ -162,29 +161,44 @@ to the source transition. `Disabled` skips SHACL for that binding; the existing
 RO-Crate checks still apply. Replicated CRDT records always apply before local
 SHACL settlement.
 
-`CoreSubsetV1` supports node, class, subjects-of, objects-of, and implicit-class
-targets; direct, inverse, sequence, alternative, zero-or-one, zero-or-more,
-and one-or-more paths. Its constraints are min/max count; datatype, node kind,
-class, value and enumeration checks; numeric, string, pattern, and language
-checks; closed shapes; pairwise property checks; nested logical constraints;
-and qualified value constraints. It returns one complete report or one error.
-Local imports are opt-in and version-fenced. SHACL-SPARQL, SHACL-JS, SHACL-AF,
-custom components and targets, reifier shapes, RDF-star shapes, and remote
-imports are unsupported and fail explicitly. Defaults bound reports to 10,000
-results, paths to 1,000,000 edges, and path depth to 128.
+Craqle SHACL Core Subset v1 (`ShaclProfile::CoreSubsetV1`) supports node,
+class, subjects-of, objects-of, and implicit-class targets; direct, inverse,
+sequence, alternative, zero-or-one, zero-or-more, and one-or-more paths. Its
+constraints are min/max count; datatype, node kind, class, value and
+enumeration checks; numeric, string, pattern, and language checks; closed
+shapes; pairwise property checks; nested logical constraints; and qualified
+value constraints. It returns one complete report or one error.
+
+Local shape imports are opt-in and version-fenced. Recursive shapes,
+SHACL-SPARQL, SHACL-JS, SHACL-AF, custom components and targets, reifier
+shapes, RDF-star shapes, and remote imports are unsupported and fail
+explicitly. Defaults bound reports to 10,000 results, paths to 1,000,000 edges,
+and path depth to 128.
+
+`report.conforms` is true exactly when the report has no results. Write
+acceptance is separate: `Advisory` never rejects, while `Enforce` rejects at or
+above its `ShaclBlockingSeverity` threshold. The default threshold is
+`ViolationOnly`; unknown custom severities fail closed under `Enforce` unless
+explicitly mapped.
 
 Search it with Tantivy-backed full-text search:
 
 ```rust
-let hits = node.search(&reader, "proteomics", 10)?;
-let hydrated = node.search_resources(&reader, "proteomics", 10)?;
+let hits = node.search(
+    &reader,
+    SearchRequest { query: "proteomics", limit: 10 },
+)?;
+let hydrated = node.search_resources(
+    &reader,
+    SearchRequest { query: "proteomics", limit: 10 },
+)?;
 ```
 
 Preview and apply a full RO-Crate JSON-LD update:
 
 ```rust
-let changes = node.preview_rocrate_update(&writer, &graph, updated_jsonld)?;
-let batch = node.apply_rocrate_document(&writer, graph.clone(), updated_jsonld)?;
+let changes = node.preview_rocrate_update(&writer, &graph, &updated_jsonld)?;
+let batch = node.apply_rocrate_document(&writer, graph.clone(), &updated_jsonld)?;
 ```
 
 With `shacl-core`, a raw document can be parsed once, checked without changing
@@ -226,54 +240,35 @@ if report.conforms {
 ## Accepted performance snapshot
 
 These are retained same-fixture measurements, not promises for every workload.
-The Criterion p95/p99 values used ten samples and are nearest-rank sample
-values, not production tail estimates.
+The short 10K Craqle/Oxigraph diagnostic reported Craqle faster in every listed
+case, with typical gains of roughly 2.5x to 4.9x. One-or-more path was roughly
+1.7x faster and exact count was roughly 3.2x faster. The retained triangle
+times were 2.54 ms for Craqle and 12.28 ms for Oxigraph: the ratio is about
+0.207, so Craqle was about 4.8x faster. The incompatible earlier ratio was an
+arithmetic error and is not retained.
 
-| 1M case | Selected path | Comparison path |
-| --- | ---: | ---: |
-| Predicate-object ASK | Auto 0.263 ms | Forced source 17.612 ms |
-| Predicate-object LIMIT | Auto 0.165 ms | Forced source 16.840 ms |
-| Join | Auto/hash about 2.1 s | Forced lateral about 36.5 s |
-| Native cached SHACL | 9.9x faster than external copy | Zero data-graph copy bytes |
+Craqle's internal comparison measured the EXISTS count fast path at roughly
+25x faster than generic evaluation and NOT EXISTS at roughly 28x faster.
+Existing accepted SHACL evidence measured native cached validation at roughly
+40x faster at 10K and roughly 9.9x faster at 1M than the external-copy path.
 
-Historical 10M SPARQL rows remain access-path evidence only. No
-current-final-binary 10M SHACL, incremental-validation, or checked-write result
-is claimed; that long run remains deferred until explicitly authorized.
+The post-count-change 1M Craqle/Oxigraph comparison was not rerun. The short
+10K measurements are diagnostic rather than production-tail results. No new
+benchmark was required for the release, and no new benchmark was run.
 
-### Persistent Oxigraph diagnostic
-
-Commit `78a54aa` adds an explicit persistent mode to the bounded same-corpus
-comparison against exact Oxigraph `0.5.9`. The table shows warm p50 at that
-published commit from ten samples over 32 graphs with no duplicate copies,
-using Craqle `SyncAll` Fjall and Oxigraph RocksDB temporary stores. Emitted p95
-values are nearest-rank sample values. Results matched exactly after
-normalization except unordered `LIMIT`, where both engines returned a valid
-complete ten-row result from the same larger unordered solution.
-
-| 1M case | Craqle p50 | Oxigraph p50 |
-| --- | ---: | ---: |
-| Bound ASK hit | 0.219 ms | 0.279 ms |
-| Bound ASK miss | 0.156 ms | 0.235 ms |
-| Predicate-object `LIMIT 10` | 0.236 ms | 0.288 ms |
-| Exact common-predicate count | 61.241 ms | 32.607 ms |
-| Property star | 0.279 ms | 0.564 ms |
-| Rare-to-common join | 0.300 ms | 0.454 ms |
-| Common-to-rare written-order join | 0.283 ms | 0.449 ms |
-
-Craqle was faster in six of these seven focused cases; broad exact count was
-1.878x slower. This remains diagnostic evidence, not a general
-relative-performance claim: the full generic and RO-Crate query matrix,
-fresh-process latency, allocations, database size, and equivalent load-cost
-measurements remain open. The harness rejects 10M inputs.
+Tested release scale is therefore the ordinary regression suite plus retained
+10K query diagnostics and retained 10K/1M SHACL evidence. Historical 10M
+access-path runs are not a 0.2 release claim or gate.
 
 ## Limitations
 
 - Search is intentionally minimal even though it uses Tantivy; for richer results you still hydrate metadata from RDF.
 - Irokle transport integration is library-level; Craqle does not provide a standalone sync server.
-- The Git release candidate uses Rudof `0.3.10` from crates.io and pins exact
-  revisions of the maintained RO-Crate fork and Irokle. It is not
-  crates.io-ready until equivalent registry releases exist.
-- `CoreSubsetV1` is a deliberately bounded profile, not unrestricted SHACL Core conformance.
+- Linux is the only supported 0.2 platform.
+- Distribution uses Git tag `v0.2.0` and the exact Git revisions of the
+  maintained RO-Crate fork and Irokle; this release is not a crates.io package.
+- Craqle SHACL Core Subset v1 is deliberately bounded and does not claim full
+  SHACL Core conformance.
 
 ## Disk data and recovery
 
@@ -293,13 +288,15 @@ must preserve one consistent view of all authoritative keyspaces.
 | Feature | Default | Behavior |
 | --- | --- | --- |
 | `search` | Yes | Tantivy full-text derived index |
-| `shacl-core` | No | Native bounded `CoreSubsetV1` compilation, validation, and policy bindings |
+| `shacl-core` | No | Native Craqle SHACL Core Subset v1 compilation, validation, and policy bindings |
 | `iroh` | No | Irokle Iroh transport and asynchronous write-concern scheduling |
 
-There is also a small demo in `examples/demo.rs`:
+`examples/api_workflow.rs` is the compiled end-to-end API example. There is
+also a smaller demo in `examples/demo.rs`:
 
 ```bash
 cargo run --example demo
+cargo run --all-features --example api_workflow
 ```
 
 ## License

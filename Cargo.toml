@@ -50,7 +50,7 @@ tempfile = "3.27.0"
 
 [package]
 name = "craqle"
-version = "0.2.0-rc.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
