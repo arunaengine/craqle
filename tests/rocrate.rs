@@ -661,7 +661,11 @@ mod tests {
         assert_eq!(page.total_data_entities, 5);
         assert_eq!(page.returned_data_entities, 2);
         assert_eq!(page.next_offset, Some(3));
-        assert_eq!(page.next_cursor.as_deref(), Some("./data/page-2.dat"));
+        assert!(
+            page.next_cursor
+                .as_deref()
+                .is_some_and(|cursor| cursor.starts_with("craqle-rocrate-page:"))
+        );
         assert!(page.jsonld.contains("page-1.dat") || page.jsonld.contains("page-2.dat"));
     }
 
@@ -751,10 +755,7 @@ mod tests {
         assert_eq!(first_page.total_data_entities, 5);
         assert_eq!(first_page.returned_data_entities, 2);
         assert_eq!(first_page.next_offset, None);
-        assert_eq!(
-            first_page.next_cursor.as_deref(),
-            Some("./data/cursor-1.dat")
-        );
+        assert!(first_page.next_cursor.is_some());
         assert!(first_page.jsonld.contains("cursor-0.dat"));
         assert!(first_page.jsonld.contains("cursor-1.dat"));
 
@@ -763,13 +764,84 @@ mod tests {
             .unwrap();
         assert_eq!(second_page.total_data_entities, 5);
         assert_eq!(second_page.returned_data_entities, 2);
-        assert_eq!(
-            second_page.next_cursor.as_deref(),
-            Some("./data/cursor-3.dat")
-        );
+        assert!(second_page.next_cursor.is_some());
         assert!(second_page.jsonld.contains("cursor-2.dat"));
         assert!(second_page.jsonld.contains("cursor-3.dat"));
         assert!(!second_page.jsonld.contains("cursor-0.dat"));
+    }
+
+    #[test]
+    fn invalid_export_cursor() {
+        let (_tmp, net) = setup_network(1);
+        let mgr = manager(net.peer(0));
+        let graph = GraphId::new("urn:test:invalid-export-cursor");
+        let other = GraphId::new("urn:test:invalid-export-cursor:other");
+        for candidate in [&graph, &other] {
+            mgr.create_crate(
+                candidate.clone(),
+                "Cursor Crate",
+                "Opaque cursor validation",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+            )
+            .unwrap();
+        }
+        for index in 0..2 {
+            mgr.add_data_entity(
+                &graph,
+                &format!("data/{index}.dat"),
+                "http://schema.org/MediaObject",
+                &format!("Entity {index}"),
+                vec![],
+            )
+            .unwrap();
+        }
+        let cursor = mgr
+            .export_jsonld_page_after(&graph, None, 1)
+            .unwrap()
+            .next_cursor
+            .unwrap();
+
+        let unknown = mgr
+            .export_jsonld_page_after(&graph, Some("./data/0.dat"), 1)
+            .unwrap_err();
+        assert_eq!(unknown.kind(), CraqleErrorKind::InvalidInput);
+
+        let mut corrupt = cursor.clone().into_bytes();
+        let replacement = if corrupt.last() == Some(&b'0') {
+            b'1'
+        } else {
+            b'0'
+        };
+        *corrupt.last_mut().unwrap() = replacement;
+        let corrupt = String::from_utf8(corrupt).unwrap();
+        assert_eq!(
+            mgr.export_jsonld_page_after(&graph, Some(&corrupt), 1)
+                .unwrap_err()
+                .kind(),
+            CraqleErrorKind::InvalidInput
+        );
+        assert_eq!(
+            mgr.export_jsonld_page_after(&other, Some(&cursor), 1)
+                .unwrap_err()
+                .kind(),
+            CraqleErrorKind::InvalidInput
+        );
+
+        mgr.add_data_entity(
+            &graph,
+            "data/2.dat",
+            "http://schema.org/MediaObject",
+            "Entity 2",
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.export_jsonld_page_after(&graph, Some(&cursor), 1)
+                .unwrap_err()
+                .kind(),
+            CraqleErrorKind::InvalidInput
+        );
     }
 
     const PROTEOMICS_ASSAY_IRI: &str = "https://w3id.org/aruna/profiles/proteomics#assayType";
@@ -1338,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn null_context_defaults() {
+    fn null_context_is_rejected() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-null");
         let mgr = manager(net.peer(0));
@@ -1363,18 +1435,80 @@ mod tests {
             ]
         });
 
-        mgr.import_jsonld(graph.clone(), &document.to_string())
-            .unwrap();
+        let error = mgr.import_jsonld(graph, &document.to_string()).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::Unsupported);
+    }
 
-        // A degenerate `@context: null` carries no mappings; export must fall back
-        // to the bare default rather than round-tripping `null`.
-        let exported: serde_json::Value =
-            serde_json::from_str(&mgr.export_jsonld(&graph).unwrap()).unwrap();
-        assert_eq!(
-            exported["@context"],
-            serde_json::json!("https://w3id.org/ro/crate/1.2/context"),
-            "a null @context must export as the bare default, not null"
-        );
+    #[test]
+    fn invalid_date_lexical_value() {
+        fn document(date: serde_json::Value) -> String {
+            serde_json::json!({
+                "@context": "https://w3id.org/ro/crate/1.2/context",
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                        "about": {"@id": "./"}
+                    },
+                    {
+                        "@id": "./",
+                        "@type": "Dataset",
+                        "name": "Date Crate",
+                        "description": "Date validation",
+                        "datePublished": date,
+                        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+                    }
+                ]
+            })
+            .to_string()
+        }
+
+        for valid in [
+            serde_json::json!("2025-04-30"),
+            serde_json::json!("2024-02-29"),
+            serde_json::json!({
+                "@value": "2025-04-30",
+                "@type": "http://www.w3.org/2001/XMLSchema#date"
+            }),
+            serde_json::json!({
+                "@value": "2025-04-30T12:30:00+02:00",
+                "@type": "http://www.w3.org/2001/XMLSchema#dateTime"
+            }),
+            serde_json::json!({
+                "@value": "2025-04-30T10:30:00Z",
+                "@type": "http://www.w3.org/2001/XMLSchema#dateTime"
+            }),
+        ] {
+            validate_rocrate_jsonld(&document(valid)).unwrap();
+        }
+
+        for invalid in [
+            serde_json::json!("2023-02-29"),
+            serde_json::json!("2025-00-10"),
+            serde_json::json!("2025-13-10"),
+            serde_json::json!("2025-01-00"),
+            serde_json::json!("2025-04-31"),
+            serde_json::json!(" 2025-04-30"),
+            serde_json::json!("2025-04-30 "),
+            serde_json::json!(["2025-04-30", "2025-05-01"]),
+            serde_json::json!({
+                "@value": "2025-04-30T12:30:00+15:00",
+                "@type": "http://www.w3.org/2001/XMLSchema#dateTime"
+            }),
+        ] {
+            let error = validate_rocrate_jsonld(&document(invalid)).unwrap_err();
+            match error {
+                RoCrateError::Update(UpdateError::ValidationFailed(violations)) => {
+                    assert!(violations.iter().any(|violation| {
+                        violation.code == "invalid_date_published_lexical_value"
+                            || violation.code == "invalid_date_published_cardinality"
+                    }))
+                }
+                RoCrateError::JsonLd(_) | RoCrateError::Rdf(_) => {}
+                error => panic!("expected invalid date, got {error}"),
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -2368,11 +2502,8 @@ mod tests {
             .collect()
     }
 
-    /// Paging is a round trip: what a page emits as `next_cursor` is what the
-    /// next call must accept. A page ending on a blank-node entity emitted no
-    /// cursor at all, which silently truncated the walk; re-encoding such a
-    /// cursor as the IRI `<_:b0>` on the way back in matches no interned term,
-    /// and the store then restarts from offset 0 — the walk repeats page one.
+    /// Paging is a round trip for both named and blank-node subjects through
+    /// the opaque, graph-version-fenced cursor.
     #[test]
     fn blank_cursor_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
@@ -2407,19 +2538,12 @@ mod tests {
             );
             collected.extend(ids);
             let Some(next) = page.next_cursor else { break };
-            assert_eq!(
-                Some(&next),
-                collected.last(),
-                "the cursor must name the page's last entity"
-            );
+            assert!(next.starts_with("craqle-rocrate-page:"));
             cursors.push(next.clone());
             cursor = Some(next);
         }
 
-        assert!(
-            cursors.iter().any(|id| id.starts_with("_:")),
-            "the walk must actually round-trip a blank-node cursor: {cursors:?}"
-        );
+        assert!(!cursors.is_empty());
         assert_eq!(
             collected.len(),
             expected.len(),

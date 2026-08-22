@@ -96,8 +96,8 @@ impl std::fmt::Display for EventId {
 /// Last-write-wins ordering tag for a graph's RO-Crate `@context` register.
 ///
 /// Ordered lexicographically by `(counter, actor)` so every peer converges on
-/// the same winning context regardless of the order in which `ContextUpdated`
-/// events arrive. A local context write sets `counter = stored_counter + 1`
+/// the same winning context regardless of RO-Crate mutation arrival order. A
+/// local context write sets `counter = stored_counter + 1`
 /// (Lamport-style max-seen + 1) with the writer's [`ActorId`] as the tiebreaker,
 /// and an incoming tag only overwrites the stored one when it is strictly
 /// greater. Because the derived field order is `(counter, actor)`, a strictly
@@ -131,6 +131,19 @@ impl Default for ContextTag {
     fn default() -> Self {
         Self::GENESIS
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoCrateRenderHints {
+    pub(crate) context: Option<String>,
+    pub(crate) license: Option<String>,
+    pub(crate) license_digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaggedRoCrateRenderHints {
+    pub(crate) hints: RoCrateRenderHints,
+    pub(crate) tag: ContextTag,
 }
 
 /// Total-order tag for the replicated graph-policy register.
@@ -470,6 +483,16 @@ impl CrateViolation {
         Self {
             code: "invalid_date_published_cardinality",
             message: format!("datePublished must have exactly one value, found {count}"),
+            pointer: pointer.into(),
+            entity_id: None,
+        }
+    }
+
+    pub(crate) fn invalid_date_lexical(pointer: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_date_published_lexical_value",
+            message: "datePublished must be a lexically and calendrically valid date or dateTime"
+                .to_owned(),
             pointer: pointer.into(),
             entity_id: None,
         }

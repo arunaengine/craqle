@@ -108,12 +108,9 @@ pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
 pub use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
 pub use crate::replication::{CheckMode, DiagnosticsMode, MergeError, UpdateError, WriteChecks};
 pub use crate::rocrate::{
-    AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, RoCrateError, RoCratePage,
-    canonicalize_jsonld, validate_rocrate_jsonld,
-};
-#[cfg(feature = "shacl-core")]
-pub use crate::rocrate::{
-    PrepareRoCrateOptions, PreparedGraphBase, PreparedRoCrateDocument, PreparedRoCrateStatistics,
+    AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, PrepareRoCrateOptions,
+    PreparedGraphBase, PreparedRoCrateDocument, PreparedRoCrateStatistics, RoCrateError,
+    RoCrateImportLimits, RoCratePage, canonicalize_jsonld, validate_rocrate_jsonld,
 };
 pub use crate::search::SearchHit;
 #[cfg(feature = "shacl-core")]
@@ -1236,6 +1233,11 @@ impl CraqleNode {
         mode: PreparedCommitMode,
     ) -> Result<PreparedRoCrateCommitOutcome> {
         self.authorize_prepared_document(auth, &document, Action::Write)?;
+        if !document.structural_findings.is_empty() {
+            return Err(CraqleError::RoCrate(RoCrateError::Update(
+                UpdateError::ValidationFailed(document.structural_findings.clone()),
+            )));
+        }
         let policy_report = match mode {
             PreparedCommitMode::Enforce | PreparedCommitMode::Advisory => {
                 let policy = policy.ok_or(CraqleError::RoCratePolicyRequired { mode })?;
@@ -1250,14 +1252,7 @@ impl CraqleNode {
                 }
                 Some(report)
             }
-            PreparedCommitMode::StructuralOnly => {
-                if !document.structural_findings.is_empty() {
-                    return Err(CraqleError::RoCrate(RoCrateError::Update(
-                        UpdateError::ValidationFailed(document.structural_findings.clone()),
-                    )));
-                }
-                None
-            }
+            PreparedCommitMode::StructuralOnly => None,
         };
 
         let graph = document.graph.clone();
@@ -2594,18 +2589,19 @@ impl CraqleNode {
         Ok(self.manager().export_jsonld_page(graph, offset, limit)?)
     }
 
-    /// Export a paged JSON-LD view using an entity-id cursor.
+    /// Export a paged JSON-LD view using a versioned opaque cursor returned by
+    /// the preceding page.
     pub fn export_rocrate_page_after(
         &self,
         auth: &dyn Authorizer,
         graph: &GraphId,
-        after_entity_id: Option<&str>,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<RoCratePage> {
         self.ensure_graph_action(graph, auth, Action::Read)?;
         Ok(self
             .manager()
-            .export_jsonld_page_after(graph, after_entity_id, limit)?)
+            .export_jsonld_page_after(graph, cursor, limit)?)
     }
 
     /// Replace the current visible RO-Crate state from a JSON-LD document.
@@ -3725,7 +3721,8 @@ impl CraqleNode {
                 self.store.set_tagged_graph_policy(graph, &tagged)?;
                 Ok(true)
             }
-            CraqleGraphEvent::QuadChanges { graph, .. } => {
+            CraqleGraphEvent::QuadChanges { graph, .. }
+            | CraqleGraphEvent::RoCrateMutation { graph, .. } => {
                 let Some(result) = self.replication.apply_irokle_record(record)? else {
                     return Ok(false);
                 };
@@ -3733,30 +3730,6 @@ impl CraqleNode {
                     self.schedule_search_update_for_graph(graph)?;
                 }
                 Ok(result.applied)
-            }
-            CraqleGraphEvent::ContextUpdated {
-                graph,
-                context,
-                license,
-                license_digest,
-                tag,
-            } => {
-                // Deterministic last-write-wins: overwrite only when the incoming
-                // tag strictly dominates the stored one. This converges to the
-                // same context on every peer regardless of arrival order, since
-                // the `(counter, actor)` order is total and the winning tag is
-                // unique per distinct context value.
-                if *tag <= self.store.graph_context_tag(graph)? {
-                    return Ok(false);
-                }
-                self.store.set_graph_context(
-                    graph,
-                    context.as_deref(),
-                    license.as_deref(),
-                    *license_digest,
-                    *tag,
-                )?;
-                Ok(true)
             }
         }
     }
@@ -5408,7 +5381,7 @@ mod tests {
         );
     }
 
-    /// G5 — two `ContextUpdated` applies racing on one graph must converge on
+    /// G5 — two RO-Crate render-hint mutations racing on one graph must converge on
     /// the higher tag, not on whichever landed last.
     ///
     /// The apply is a compare-and-set: read the stored tag, decide, write. Run
@@ -5434,13 +5407,18 @@ mod tests {
                     counter,
                     actor: node.actor(),
                 };
-                sync.publish_context(
+                sync.publish_rocrate_mutation(
                     &node.store,
                     &graph,
-                    Some(value.to_string()),
-                    None,
-                    None,
-                    tag,
+                    Vec::new(),
+                    crate::core::TaggedRoCrateRenderHints {
+                        hints: crate::core::RoCrateRenderHints {
+                            context: Some(value.to_string()),
+                            license: None,
+                            license_digest: None,
+                        },
+                        tag,
+                    },
                 )
                 .unwrap()
             });

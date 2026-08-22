@@ -1,15 +1,17 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;
-#[cfg(feature = "shacl-core")]
 use std::time::{Duration, Instant};
 
 use crate::RoCrateVersion;
-use crate::core::{Batch, EncodedTerm, GraphId, MaterializedQuadChange, vocab};
-#[cfg(feature = "shacl-core")]
-use crate::core::{CrateViolation, GraphPolicy};
+use crate::core::{
+    Batch, CrateViolation, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
+    RoCrateRenderHints, vocab,
+};
 use crate::replication::ReplicationEngine;
-use crate::store::{EncodedQuad, GraphSubjectPredicate, PageCursor, PageRequest, TermId};
+use crate::store::{
+    EncodedQuad, GraphSubjectPredicate, PageCursor, PageRequest, TermId, hash_term,
+};
 use oxjsonld::{JsonLdParser, JsonLdRemoteDocument};
 use oxrdf::{NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use rocraters::ro_crate::constraints::{DataType, EntityValue, Id, License};
@@ -41,10 +43,14 @@ const XSD_BOOLEAN_IRI: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const XSD_DOUBLE_IRI: &str = "http://www.w3.org/2001/XMLSchema#double";
 const XSD_INTEGER_IRI: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_STRING_IRI: &str = "http://www.w3.org/2001/XMLSchema#string";
+const XSD_DATE_IRI: &str = "http://www.w3.org/2001/XMLSchema#date";
+const XSD_DATE_TIME_IRI: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 const PROF_HAS_ARTIFACT_IRI: &str = "http://www.w3.org/ns/dx/prof#hasArtifact";
 const PROF_RESOURCE_DESCRIPTOR_IRI: &str = "http://www.w3.org/ns/dx/prof#ResourceDescriptor";
 const METADATA_ID: &str = "ro-crate-metadata.json";
+const EXPORT_CURSOR_VERSION: u8 = 1;
+const EXPORT_CURSOR_PREFIX: &str = "craqle-rocrate-page:";
 type TripleKey = (EncodedTerm, EncodedTerm, EncodedTerm);
 
 fn root_id(graph_id: &GraphId) -> &str {
@@ -57,17 +63,6 @@ fn root_term(graph_id: &GraphId) -> EncodedTerm {
 
 fn crate_conforms_to() -> NamedNode {
     NamedNode::new_unchecked(DCTERMS_CONFORMS_TO_IRI)
-}
-
-enum AppendLikeCheckError {
-    Store(crate::store::StoreError),
-    NeedsFullDiff,
-}
-
-impl From<crate::store::StoreError> for AppendLikeCheckError {
-    fn from(value: crate::store::StoreError) -> Self {
-        Self::Store(value)
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,10 +96,14 @@ pub enum RoCrateError {
         first: RoCrateVersion,
         second: RoCrateVersion,
     },
-    #[cfg(feature = "shacl-core")]
-    #[error("RO-Crate document is {bytes} bytes, exceeding the {limit}-byte limit")]
-    DocumentTooLarge { bytes: usize, limit: usize },
-    #[cfg(feature = "shacl-core")]
+    #[error("RO-Crate import limit `{limit}` exceeded: {actual} > {maximum}")]
+    ImportLimitExceeded {
+        limit: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    #[error("invalid RO-Crate export cursor: {reason}")]
+    InvalidExportCursor { reason: String },
     #[error("prepared RO-Crate state is stale: {fence}")]
     StalePreparedState { fence: String },
 }
@@ -125,9 +124,8 @@ impl RoCrateError {
             | Self::InvalidBatch(_)
             | Self::MissingVersion
             | Self::VersionMismatch { .. } => crate::CraqleErrorKind::InvalidInput,
-            #[cfg(feature = "shacl-core")]
-            Self::DocumentTooLarge { .. } => crate::CraqleErrorKind::ValidationLimit,
-            #[cfg(feature = "shacl-core")]
+            Self::ImportLimitExceeded { .. } => crate::CraqleErrorKind::ValidationLimit,
+            Self::InvalidExportCursor { .. } => crate::CraqleErrorKind::InvalidInput,
             Self::StalePreparedState { .. } => crate::CraqleErrorKind::StalePreparedState,
         }
     }
@@ -143,6 +141,14 @@ pub struct RoCratePage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ExportCursorPayload {
+    format_version: u8,
+    graph: GraphId,
+    graph_version: [u8; 32],
+    last_subject: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalJsonLd {
     pub nquads: String,
@@ -150,7 +156,6 @@ pub struct CanonicalJsonLd {
 }
 
 /// Version fence captured while preparing a raw RO-Crate document.
-#[cfg(feature = "shacl-core")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PreparedGraphBase {
@@ -158,26 +163,56 @@ pub enum PreparedGraphBase {
     Existing { data_version: [u8; 32] },
 }
 
+/// Bounds applied before and while parsing and expanding a RO-Crate document.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RoCrateImportLimits {
+    pub max_input_bytes: usize,
+    pub max_entities: usize,
+    pub max_expanded_triples: usize,
+    pub max_context_entries: usize,
+    pub max_blank_nodes: usize,
+    pub max_literal_bytes: usize,
+    pub max_changes: usize,
+}
+
+impl RoCrateImportLimits {
+    pub fn production() -> Self {
+        Self {
+            max_input_bytes: 64 * 1_048_576,
+            max_entities: 1_000_000,
+            max_expanded_triples: 5_000_000,
+            max_context_entries: 16_384,
+            max_blank_nodes: 1_000_000,
+            max_literal_bytes: 64 * 1_048_576,
+            max_changes: 5_000_000,
+        }
+    }
+}
+
+impl Default for RoCrateImportLimits {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
 /// Bounds and new-graph authorization policy used during document preparation.
-#[cfg(feature = "shacl-core")]
 #[derive(Clone, Debug)]
 pub struct PrepareRoCrateOptions {
     pub new_graph_policy: GraphPolicy,
-    pub max_document_bytes: usize,
+    pub limits: RoCrateImportLimits,
 }
 
-#[cfg(feature = "shacl-core")]
 impl Default for PrepareRoCrateOptions {
     fn default() -> Self {
         Self {
             new_graph_policy: GraphPolicy::default(),
-            max_document_bytes: 64 * 1024 * 1024,
+            limits: RoCrateImportLimits::production(),
         }
     }
 }
 
 /// Work completed once while preparing a raw RO-Crate document.
-#[cfg(feature = "shacl-core")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PreparedRoCrateStatistics {
     pub parse_count: u64,
@@ -189,16 +224,13 @@ pub struct PreparedRoCrateStatistics {
     pub encoded_changes: u64,
 }
 
-#[cfg(feature = "shacl-core")]
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedRoCrateMetadata {
-    pub context: Option<String>,
-    pub license: Option<String>,
+    pub render_hints: RoCrateRenderHints,
     pub policy_to_persist: Option<GraphPolicy>,
 }
 
 /// Parse-once, encoded candidate for policy evaluation and version-fenced commit.
-#[cfg(feature = "shacl-core")]
 #[derive(Clone, Debug)]
 pub struct PreparedRoCrateDocument {
     pub graph: GraphId,
@@ -211,7 +243,6 @@ pub struct PreparedRoCrateDocument {
     pub(crate) metadata: PreparedRoCrateMetadata,
 }
 
-#[cfg(feature = "shacl-core")]
 impl PreparedRoCrateDocument {
     pub fn structural_findings(&self) -> &[CrateViolation] {
         &self.structural_findings
@@ -228,11 +259,14 @@ pub fn canonicalize_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError
 }
 
 pub fn validate_rocrate_jsonld(jsonld: &str) -> Result<CanonicalJsonLd, RoCrateError> {
+    let limits = RoCrateImportLimits::production();
+    enforce_import_limit("max_input_bytes", jsonld.len(), limits.max_input_bytes)?;
     let value: serde_json::Value = serde_json::from_str(jsonld)?;
+    validate_import_structure_limits(&value, &limits)?;
     validate_jsonld_import(&value)?;
     let context_version = detect_context_version(&value)?;
     let graph_id = GraphId::new(JSONLD_BASE_IRI);
-    let target = jsonld_triples(&graph_id, &value)?;
+    let target = jsonld_triples_limited(&graph_id, &value, &limits)?;
     let pointers = SubmittedPointers::new(&value, &graph_id);
     validate_crate_version(&graph_id, &target, context_version)?;
     validate_complete_import_triples(&graph_id, &target, Some(&pointers))?;
@@ -503,7 +537,15 @@ impl RoCrateManager {
                 license_value,
                 version,
             );
-            return Ok(self.engine.local_apply_changes(&graph_id, changes)?);
+            return Ok(self.engine.local_apply_changes_with_render_hints(
+                &graph_id,
+                changes,
+                RoCrateRenderHints {
+                    context: None,
+                    license: None,
+                    license_digest: None,
+                },
+            )?);
         }
 
         let changes = match license {
@@ -532,9 +574,15 @@ impl RoCrateManager {
                 diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
             }
         };
-        let batch = self.engine.local_apply_changes(&graph_id, changes)?;
-        self.reset_context_after_replacement(&graph_id)?;
-        Ok(batch)
+        Ok(self.engine.local_apply_changes_with_render_hints(
+            &graph_id,
+            changes,
+            RoCrateRenderHints {
+                context: None,
+                license: None,
+                license_digest: None,
+            },
+        )?)
     }
 
     /// Create-crate path for scaffold requests already validated at their
@@ -607,12 +655,16 @@ impl RoCrateManager {
         };
         let batch = self
             .engine
-            .local_apply_bulk_bypassing_structural_rules(&graph_id, changes)?;
+            .local_apply_bulk_bypassing_structural_rules_with_render_hints(
+                &graph_id,
+                changes,
+                RoCrateRenderHints {
+                    context: None,
+                    license: None,
+                    license_digest: None,
+                },
+            )?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        if is_replacement {
-            // Keep checked and prevalidated replacement paths in lockstep.
-            self.reset_context_after_replacement(&graph_id)?;
-        }
         Ok(batch)
     }
 
@@ -917,6 +969,7 @@ impl RoCrateManager {
         offset: usize,
         limit: usize,
     ) -> Result<RoCratePage, RoCrateError> {
+        let graph_version = self.engine.store().graph_version_digest(graph_id)?;
         let cx = self.crate_ctx(graph_id)?;
         let (total, page) = self.root_linked_data_entity_page(
             &cx,
@@ -934,9 +987,15 @@ impl RoCrateManager {
         )?;
         let returned = page.len();
         let has_more = offset + returned < total;
-        let next_cursor = has_more
-            .then(|| page.last().and_then(encoded_reference_value))
-            .flatten();
+        let next_cursor = if has_more {
+            page.last()
+                .map(|subject| encode_export_cursor(graph_id, graph_version, subject))
+                .transpose()?
+        } else {
+            None
+        };
+
+        self.ensure_export_version(graph_id, graph_version)?;
 
         Ok(RoCratePage {
             jsonld,
@@ -951,18 +1010,33 @@ impl RoCrateManager {
     pub(crate) fn export_jsonld_page_after(
         &self,
         graph_id: &GraphId,
-        after_entity_id: Option<&str>,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<RoCratePage, RoCrateError> {
+        let graph_version = self.engine.store().graph_version_digest(graph_id)?;
         let cx = self.crate_ctx(graph_id)?;
-        // Acceptor half of the cursor round trip: decode exactly what
-        // [`encoded_reference_value`] emits. A page whose last entity is a blank node
-        // hands back `_:b0`, and re-encoding that as the IRI `<_:b0>` matches no
-        // interned term — `objects_page` then silently restarts from offset 0 and
-        // the caller re-reads page one forever.
-        let after = after_entity_id
-            .map(normalize_entity_id)
-            .map(|id| encoded_subject(&id));
+        let after = cursor
+            .map(|cursor| decode_export_cursor(cursor, graph_id, graph_version))
+            .transpose()?
+            .map(|payload| EncodedTerm(payload.last_subject));
+        if let Some(after) = after.as_ref() {
+            let root = cx.root_term();
+            let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+            if cx.hides(after)
+                || !self.triple_is_live(
+                    &cx,
+                    TripleProbe {
+                        subject: &root,
+                        predicate: &has_part,
+                        object: after,
+                    },
+                )?
+            {
+                return Err(RoCrateError::InvalidExportCursor {
+                    reason: "last subject is not a visible entity in this graph".to_owned(),
+                });
+            }
+        }
         // One extra entry beyond `limit` is the has-more probe.
         let (total, mut page) = self.root_linked_data_entity_page(
             &cx,
@@ -976,9 +1050,13 @@ impl RoCrateManager {
             page.truncate(limit);
         }
         let returned = page.len();
-        let next_cursor = has_more
-            .then(|| page.last().and_then(encoded_reference_value))
-            .flatten();
+        let next_cursor = if has_more {
+            page.last()
+                .map(|subject| encode_export_cursor(graph_id, graph_version, subject))
+                .transpose()?
+        } else {
+            None
+        };
         let jsonld = self.render_export_view(
             &cx,
             ExportRender {
@@ -986,6 +1064,7 @@ impl RoCrateManager {
                 pretty: false,
             },
         )?;
+        self.ensure_export_version(graph_id, graph_version)?;
 
         Ok(RoCratePage {
             jsonld,
@@ -994,6 +1073,20 @@ impl RoCrateManager {
             next_offset: None,
             next_cursor,
         })
+    }
+
+    fn ensure_export_version(
+        &self,
+        graph_id: &GraphId,
+        expected: [u8; 32],
+    ) -> Result<(), RoCrateError> {
+        if self.engine.store().graph_version_digest(graph_id)? == expected {
+            Ok(())
+        } else {
+            Err(RoCrateError::InvalidExportCursor {
+                reason: "graph changed while the page was rendered".to_owned(),
+            })
+        }
     }
 
     /// Import a JSON-LD RO-Crate metadata file into a named graph.
@@ -1006,20 +1099,15 @@ impl RoCrateManager {
         graph_id: GraphId,
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        let context = extract_raw_context(&value);
-        let license = extract_raw_license(&value);
-        let cx = self.crate_ctx(&graph_id)?;
-        let batch = if self.graph_is_missing_or_empty(&graph_id)? {
-            let changes = self.plan_empty_import(&graph_id, value)?;
-            let batch = self.engine.local_apply_bulk(&graph_id, changes)?;
-            self.engine.rebuild_graph_diagnostics(&graph_id)?;
-            batch
-        } else {
-            self.replace_jsonld_in_existing_graph(&cx, value)?
-        };
-        self.store_import_context(&graph_id, context, license)?;
-        Ok(batch)
+        let document = self.prepare_jsonld(&graph_id, jsonld, &PrepareRoCrateOptions::default())?;
+        if !document.structural_findings.is_empty() {
+            return Err(RoCrateError::Update(
+                crate::replication::UpdateError::ValidationFailed(
+                    document.structural_findings.clone(),
+                ),
+            ));
+        }
+        self.commit_prepared(document, &[])
     }
 
     /// Strict import path that validates complete RO-Crate semantics even for
@@ -1029,15 +1117,7 @@ impl RoCrateManager {
         graph_id: GraphId,
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        let context = extract_raw_context(&value);
-        let license = extract_raw_license(&value);
-        let cx = self.crate_ctx(&graph_id)?;
-        let changes = self.plan_import_value_checked(&cx, value)?;
-        let batch = self.engine.local_apply_bulk(&graph_id, changes)?;
-        self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        self.store_import_context(&graph_id, context, license)?;
-        Ok(batch)
+        self.import_jsonld(graph_id, jsonld)
     }
 
     /// Import path for documents already validated at their origin.
@@ -1050,27 +1130,30 @@ impl RoCrateManager {
         graph_id: GraphId,
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
+        let limits = RoCrateImportLimits::production();
+        enforce_import_limit("max_input_bytes", jsonld.len(), limits.max_input_bytes)?;
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        let context = extract_raw_context(&value);
+        validate_import_structure_limits(&value, &limits)?;
         let license = extract_raw_license(&value);
         validate_jsonld_import(&value)?;
         let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples(&graph_id, &value)?;
+        let target = jsonld_triples_limited(&graph_id, &value, &limits)?;
         validate_crate_version(&graph_id, &target, context_version)?;
         let cx = self.crate_ctx(&graph_id)?;
-        let changes = if self.graph_is_missing_or_empty(&graph_id)? {
-            insert_changes(&graph_id, target)
-        } else {
-            match self.append_like_changes(&cx, &target)? {
-                Some(changes) => changes,
-                None => diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?,
-            }
+        let render_hints = RoCrateRenderHints {
+            context: normalized_import_context(&value, &graph_id, &target),
+            license_digest: license.as_ref().map(|_| triple_state_digest(&target)),
+            license,
         };
+        let changes = self.replacement_changes_bounded(&cx, target, limits.max_changes)?;
         let batch = self
             .engine
-            .local_apply_bulk_bypassing_structural_rules(&graph_id, changes)?;
+            .local_apply_bulk_bypassing_structural_rules_with_render_hints(
+                &graph_id,
+                changes,
+                render_hints,
+            )?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -1090,15 +1173,33 @@ impl RoCrateManager {
             )));
         }
 
+        let limits = RoCrateImportLimits::production();
+        enforce_import_limit("max_input_bytes", jsonld.len(), limits.max_input_bytes)?;
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        let context = extract_raw_context(&value);
+        validate_import_structure_limits(&value, &limits)?;
         let license = extract_raw_license(&value);
-        let changes = self.plan_empty_import(&graph_id, value)?;
+        validate_jsonld_import(&value)?;
+        let context_version = detect_context_version(&value)?;
+        let target = jsonld_triples_limited(&graph_id, &value, &limits)?;
+        validate_crate_version(&graph_id, &target, context_version)?;
+        let render_hints = RoCrateRenderHints {
+            context: normalized_import_context(&value, &graph_id, &target),
+            license_digest: license.as_ref().map(|_| triple_state_digest(&target)),
+            license,
+        };
+        let changes = self.replacement_changes_bounded(
+            &self.crate_ctx(&graph_id)?,
+            target,
+            limits.max_changes,
+        )?;
         let batch = self
             .engine
-            .local_apply_bulk_bypassing_structural_rules(&graph_id, changes)?;
+            .local_apply_bulk_bypassing_structural_rules_with_render_hints(
+                &graph_id,
+                changes,
+                render_hints,
+            )?;
         self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        self.store_import_context(&graph_id, context, license)?;
         Ok(batch)
     }
 
@@ -1108,8 +1209,9 @@ impl RoCrateManager {
         graph_id: &GraphId,
         jsonld: &str,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        self.plan_import_value(&self.crate_ctx(graph_id)?, value)
+        Ok(self
+            .prepare_jsonld(graph_id, jsonld, &PrepareRoCrateOptions::default())?
+            .encoded_changes)
     }
 
     /// Compute and validate the strict import change set without applying it.
@@ -1118,38 +1220,46 @@ impl RoCrateManager {
         graph_id: &GraphId,
         jsonld: &str,
     ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        self.plan_import_value_checked(&self.crate_ctx(graph_id)?, value)
+        let document = self.prepare_jsonld(graph_id, jsonld, &PrepareRoCrateOptions::default())?;
+        if !document.structural_findings.is_empty() {
+            return Err(RoCrateError::Update(
+                crate::replication::UpdateError::ValidationFailed(document.structural_findings),
+            ));
+        }
+        Ok(document.encoded_changes)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn prepare_jsonld(
         &self,
         graph_id: &GraphId,
         jsonld: &str,
         options: &PrepareRoCrateOptions,
     ) -> Result<PreparedRoCrateDocument, RoCrateError> {
-        if jsonld.len() > options.max_document_bytes {
-            return Err(RoCrateError::DocumentTooLarge {
-                bytes: jsonld.len(),
-                limit: options.max_document_bytes,
-            });
-        }
+        enforce_import_limit(
+            "max_input_bytes",
+            jsonld.len(),
+            options.limits.max_input_bytes,
+        )?;
 
         let parse_started = Instant::now();
         let value: serde_json::Value = serde_json::from_str(jsonld)?;
+        validate_import_structure_limits(&value, &options.limits)?;
         validate_jsonld_import(&value)?;
         let parse_time = parse_started.elapsed();
 
         let encode_started = Instant::now();
         let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples(graph_id, &value)?;
+        let target = jsonld_triples_limited(graph_id, &value, &options.limits)?;
         let detected_version = validate_crate_version(graph_id, &target, context_version)?;
         let document_digest = prepared_triple_digest(&target);
         let encoded_triples = target.len() as u64;
+        let license = extract_raw_license(&value);
         let metadata = PreparedRoCrateMetadata {
-            context: extract_raw_context(&value),
-            license: extract_raw_license(&value),
+            render_hints: RoCrateRenderHints {
+                context: normalized_import_context(&value, graph_id, &target),
+                license_digest: license.as_ref().map(|_| triple_state_digest(&target)),
+                license,
+            },
             policy_to_persist: None,
         };
         let encode_time = encode_started.elapsed();
@@ -1170,14 +1280,8 @@ impl RoCrateManager {
 
         let diff_started = Instant::now();
         let cx = self.crate_ctx(graph_id)?;
-        let encoded_changes = if self.graph_is_missing_or_empty(graph_id)? {
-            insert_changes(graph_id, target)
-        } else {
-            match self.append_like_changes(&cx, &target)? {
-                Some(changes) => changes,
-                None => diff_triples(graph_id, &self.replacement_base(&cx, &target)?, &target)?,
-            }
-        };
+        let encoded_changes =
+            self.replacement_changes_bounded(&cx, target, options.limits.max_changes)?;
         let diff_time = diff_started.elapsed();
 
         if !self.prepared_base_is_current(graph_id, &base)? {
@@ -1210,7 +1314,6 @@ impl RoCrateManager {
         })
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn commit_prepared(
         &self,
         document: PreparedRoCrateDocument,
@@ -1225,17 +1328,12 @@ impl RoCrateManager {
             document.encoded_changes,
             expected_data_version,
             shape_versions,
+            document.metadata.render_hints,
         )?;
         self.engine.rebuild_graph_diagnostics(&document.graph)?;
-        self.store_import_context(
-            &document.graph,
-            document.metadata.context,
-            document.metadata.license,
-        )?;
         Ok(batch)
     }
 
-    #[cfg(feature = "shacl-core")]
     fn prepared_base_is_current(
         &self,
         graph_id: &GraphId,
@@ -1755,141 +1853,8 @@ impl RoCrateManager {
         }
     }
 
-    /// A full crate replacement declares only the default RO-Crate context, so
-    /// any custom context left over from a prior import is now stale. Revert it
-    /// through the same store+publish path as an import (last write wins),
-    /// which no-ops when there is nothing custom to clear. Every full
-    /// replacement path (checked and prevalidated create alike) must call this
-    /// after a successful apply.
-    fn reset_context_after_replacement(&self, graph_id: &GraphId) -> Result<(), RoCrateError> {
-        self.store_import_context(graph_id, None, None)
-    }
-
-    fn plan_import_value(
-        &self,
-        cx: &CrateCtx,
-        value: serde_json::Value,
-    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let graph_id = &cx.graph;
-        validate_jsonld_import(&value)?;
-        let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples(graph_id, &value)?;
-        validate_crate_version(graph_id, &target, context_version)?;
-        let graph_exists = match cx.graph_tid {
-            Some(graph_tid) => self.engine.store().contains_graph_by_id(graph_tid)?,
-            None => false,
-        };
-        if !graph_exists {
-            return Ok(insert_changes(graph_id, target));
-        }
-
-        let current = self.replacement_base(cx, &target)?;
-        if current.is_empty() {
-            return Ok(insert_changes(graph_id, target));
-        }
-
-        diff_triples(graph_id, &current, &target)
-    }
-
-    fn plan_import_value_checked(
-        &self,
-        cx: &CrateCtx,
-        value: serde_json::Value,
-    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let graph_id = &cx.graph;
-        validate_jsonld_import(&value)?;
-        let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples(graph_id, &value)?;
-        let pointers = SubmittedPointers::new(&value, graph_id);
-        validate_crate_version(graph_id, &target, context_version)?;
-        validate_complete_import_triples(graph_id, &target, Some(&pointers))?;
-        if self.graph_is_missing_or_empty(graph_id)? {
-            return Ok(insert_changes(graph_id, target));
-        }
-
-        match self.append_like_changes(cx, &target)? {
-            Some(changes) => Ok(changes),
-            None => diff_triples(graph_id, &self.replacement_base(cx, &target)?, &target),
-        }
-    }
-
     fn graph_is_missing_or_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
         Ok(self.engine.store().graph_is_empty(graph_id)?)
-    }
-
-    fn replace_jsonld_in_existing_graph(
-        &self,
-        cx: &CrateCtx,
-        value: serde_json::Value,
-    ) -> Result<Batch, RoCrateError> {
-        let graph_id = &cx.graph;
-        let changes = self.plan_import_value_checked(cx, value)?;
-        let batch = self.engine.local_apply_bulk(graph_id, changes)?;
-        self.engine.rebuild_graph_diagnostics(graph_id)?;
-        Ok(batch)
-    }
-
-    fn plan_empty_import(
-        &self,
-        graph_id: &GraphId,
-        value: serde_json::Value,
-    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
-        let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples(graph_id, &value)?;
-        validate_crate_version(graph_id, &target, context_version)?;
-        Ok(insert_changes(graph_id, target))
-    }
-
-    /// Persist, and replicate when sync is configured, the render hints captured
-    /// from an import. Last-write-wins; only writes when a hint changed.
-    ///
-    /// Phase 2 of a two-phase import: the quads are already committed. A failure
-    /// here leaves the hints unchanged and self-heals, because re-importing the
-    /// same document produces an empty quad diff while the hints still differ, so
-    /// the store/publish is retried. Publish-first (G4), with a tag minted strictly
-    /// above the stored one (G5), so the retry also wins over what it is healing.
-    fn store_import_context(
-        &self,
-        graph_id: &GraphId,
-        context: Option<String>,
-        license: Option<String>,
-    ) -> Result<(), RoCrateError> {
-        let context = match context {
-            Some(raw) => {
-                let value: serde_json::Value = serde_json::from_str(&raw)?;
-                if is_bare_rocrate_context(&value)
-                    && !self
-                        .live_specification_versions(&self.crate_ctx(graph_id)?)?
-                        .is_empty()
-                {
-                    None
-                } else {
-                    Some(raw)
-                }
-            }
-            None => None,
-        };
-        let current = self.engine.store().graph_context(graph_id)?;
-        // Built fresh, not from the caller's operation context: this runs after
-        // the write, so the digest must describe the state the licence now
-        // annotates, not the state the operation started from.
-        let license_digest = match license.as_ref() {
-            Some(_) => Some(self.graph_digest(&self.crate_ctx(graph_id)?)?),
-            None => None,
-        };
-        let current_license = self.engine.store().graph_license(graph_id)?;
-        if current == context && current_license == license.clone().zip(license_digest) {
-            return Ok(());
-        }
-        if current.is_some() {
-            tracing::warn!(
-                graph = %graph_id.as_str(),
-                "replacing stored RO-Crate @context for graph (last write wins)"
-            );
-        }
-        self.engine
-            .set_graph_context(graph_id, context, license, license_digest)?;
-        Ok(())
     }
 
     fn plan_rocrate_replacement(
@@ -1951,55 +1916,70 @@ impl RoCrateManager {
     }
 
     fn graph_digest(&self, cx: &CrateCtx) -> Result<[u8; 32], RoCrateError> {
-        let mut hasher = blake3::Hasher::new();
-        for (subject, predicate, object) in self.current_triples(cx)? {
-            for term in [subject, predicate, object] {
-                let bytes = term.0.as_bytes();
-                hasher.update(&(bytes.len() as u64).to_be_bytes());
-                hasher.update(bytes);
-            }
-        }
-        Ok(*hasher.finalize().as_bytes())
+        Ok(triple_state_digest(&self.current_triples(cx)?))
     }
 
-    /// Shortcut for [`Self::replacement_base`] + `diff_triples` when the target
-    /// is a superset of that base, so both agree on which triples count.
-    fn append_like_changes(
+    /// Diff an encoded candidate against the durable GSPO stream without
+    /// decoding or retaining a complete copy of the current graph.
+    fn replacement_changes_bounded(
         &self,
         cx: &CrateCtx,
-        target: &BTreeSet<TripleKey>,
-    ) -> Result<Option<Vec<MaterializedQuadChange>>, RoCrateError> {
-        let graph_id = &cx.graph;
+        target: BTreeSet<TripleKey>,
+        max_changes: usize,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let store = self.engine.store();
-        let Some(graph_tid) = cx.graph_tid else {
-            return Ok(Some(insert_changes(graph_id, target.clone())));
-        };
-
-        let base = ReplacementBase::new(cx, target);
-        let mut remaining = target.clone();
-        let mut term_cache = HashMap::new();
-        let append_like =
-            match store.for_each_quad_in_graph::<AppendLikeCheckError, _>(graph_tid, |quad| {
-                let triple = (
-                    store.decode_term_cached(&mut term_cache, quad.subject)?,
-                    store.decode_term_cached(&mut term_cache, quad.predicate)?,
-                    store.decode_term_cached(&mut term_cache, quad.object)?,
-                );
-                if base.covers(&triple) && !remaining.remove(&triple) {
-                    return Err(AppendLikeCheckError::NeedsFullDiff);
-                }
-                Ok(())
-            }) {
-                Ok(()) => true,
-                Err(AppendLikeCheckError::NeedsFullDiff) => false,
-                Err(AppendLikeCheckError::Store(error)) => return Err(error.into()),
-            };
-
-        if append_like {
-            Ok(Some(insert_changes(graph_id, remaining)))
-        } else {
-            Ok(None)
+        let mut term_ids: HashMap<TermId, EncodedTerm> = HashMap::new();
+        let mut rewritten = HashSet::new();
+        let mut remaining = BTreeMap::new();
+        for triple in target {
+            let subject = checked_target_term_id(store, &mut term_ids, &triple.0)?;
+            let predicate = checked_target_term_id(store, &mut term_ids, &triple.1)?;
+            let object = checked_target_term_id(store, &mut term_ids, &triple.2)?;
+            rewritten.insert(subject);
+            remaining.insert((subject, predicate, object), triple);
         }
+
+        let hidden = cx.orphaned.iter().map(hash_term).collect::<HashSet<_>>();
+        let mut changes = Vec::new();
+        if let Some(graph_tid) = cx.graph_tid {
+            store.for_each_quad_in_graph::<RoCrateError, _>(graph_tid, |quad| {
+                if !rewritten.contains(&quad.subject)
+                    && (hidden.contains(&quad.subject) || hidden.contains(&quad.object))
+                {
+                    return Ok(());
+                }
+                if remaining
+                    .remove(&(quad.subject, quad.predicate, quad.object))
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                push_import_change(
+                    &mut changes,
+                    MaterializedQuadChange::Delete {
+                        graph: cx.graph.clone(),
+                        subject: store.decode_term(quad.subject)?,
+                        predicate: store.decode_term(quad.predicate)?,
+                        object: store.decode_term(quad.object)?,
+                    },
+                    max_changes,
+                )
+            })?;
+        }
+
+        for (_, (subject, predicate, object)) in remaining {
+            push_import_change(
+                &mut changes,
+                MaterializedQuadChange::Insert {
+                    graph: cx.graph.clone(),
+                    subject,
+                    predicate,
+                    object,
+                },
+                max_changes,
+            )?;
+        }
+        Ok(changes)
     }
 
     fn visible_subject_exists(
@@ -2309,7 +2289,6 @@ fn triples_from_insert_changes(changes: &[MaterializedQuadChange]) -> BTreeSet<T
         .collect()
 }
 
-#[cfg(feature = "shacl-core")]
 fn prepared_triple_digest(triples: &BTreeSet<TripleKey>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"craqle-rocrate-candidate-v1");
@@ -2320,6 +2299,49 @@ fn prepared_triple_digest(triples: &BTreeSet<TripleKey>) -> [u8; 32] {
         }
     }
     *hasher.finalize().as_bytes()
+}
+
+fn triple_state_digest(triples: &BTreeSet<TripleKey>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for (subject, predicate, object) in triples {
+        for term in [subject, predicate, object] {
+            let bytes = term.0.as_bytes();
+            hasher.update(&(bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn checked_target_term_id(
+    store: &crate::store::GraphStore,
+    seen: &mut HashMap<TermId, EncodedTerm>,
+    term: &EncodedTerm,
+) -> Result<TermId, RoCrateError> {
+    let id = hash_term(term);
+    if let Some(previous) = seen.get(&id) {
+        if previous != term {
+            return Err(crate::store::StoreError::TermCollision {
+                attempted: term.0.clone(),
+                existing: previous.0.clone(),
+            }
+            .into());
+        }
+    } else {
+        store.lookup_term(term)?;
+        seen.insert(id, term.clone());
+    }
+    Ok(id)
+}
+
+fn push_import_change(
+    changes: &mut Vec<MaterializedQuadChange>,
+    change: MaterializedQuadChange,
+    maximum: usize,
+) -> Result<(), RoCrateError> {
+    enforce_import_limit("max_changes", changes.len().saturating_add(1), maximum)?;
+    changes.push(change);
+    Ok(())
 }
 
 fn diff_triples(
@@ -2345,20 +2367,6 @@ fn diff_triples(
         });
     }
     Ok(changes)
-}
-
-fn insert_changes(graph_id: &GraphId, triples: BTreeSet<TripleKey>) -> Vec<MaterializedQuadChange> {
-    triples
-        .into_iter()
-        .map(
-            |(subject, predicate, object)| MaterializedQuadChange::Insert {
-                graph: graph_id.clone(),
-                subject,
-                predicate,
-                object,
-            },
-        )
-        .collect()
 }
 
 #[derive(Default)]
@@ -2699,7 +2707,7 @@ fn complete_import_violations(
     let mut has_metadata_type = false;
     let mut root_name_count = 0usize;
     let mut root_description_count = 0usize;
-    let mut root_date_published_count = 0usize;
+    let mut root_date_published_values = Vec::new();
 
     for (subject, predicate, object) in triples {
         subjects.insert(subject);
@@ -2711,7 +2719,7 @@ fn complete_import_violations(
             root_description_count += 1;
         }
         if subject == &root && predicate == &root_date_published {
-            root_date_published_count += 1;
+            root_date_published_values.push(object);
         }
         if predicate == &rdf_type {
             typed_subjects.insert(subject);
@@ -2764,16 +2772,20 @@ fn complete_import_violations(
             violation_pointer(pointers, &root, &root_description),
         ));
     }
-    if root_date_published_count < 1 {
+    if root_date_published_values.is_empty() {
         violations.push(crate::core::CrateViolation::missing_property(
             root_id(graph_id),
             "schema:datePublished",
             violation_pointer(pointers, &root, &root_date_published),
         ));
     }
-    if root_date_published_count != 1 {
+    if root_date_published_values.len() != 1 {
         violations.push(crate::core::CrateViolation::invalid_date(
-            root_date_published_count,
+            root_date_published_values.len(),
+            violation_pointer(pointers, &root, &root_date_published),
+        ));
+    } else if !valid_date_published(root_date_published_values[0]) {
+        violations.push(crate::core::CrateViolation::invalid_date_lexical(
             violation_pointer(pointers, &root, &root_date_published),
         ));
     }
@@ -2812,6 +2824,74 @@ fn complete_import_violations(
     }
 
     violations
+}
+
+fn valid_date_published(term: &EncodedTerm) -> bool {
+    let Some(Term::Literal(literal)) = term.to_term() else {
+        return false;
+    };
+    if literal.language().is_some() || literal.value().trim() != literal.value() {
+        return false;
+    }
+    match literal.datatype().as_str() {
+        XSD_DATE_IRI => valid_xsd_date(literal.value()),
+        XSD_DATE_TIME_IRI => valid_xsd_date_time(literal.value()),
+        XSD_STRING_IRI => {
+            if literal.value().contains('T') {
+                valid_xsd_date_time(literal.value())
+            } else {
+                valid_xsd_date(literal.value())
+            }
+        }
+        _ => false,
+    }
+}
+
+fn valid_xsd_date(value: &str) -> bool {
+    let Some(date) = value.get(..10) else {
+        return false;
+    };
+    if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return false;
+    }
+    valid_timezone_suffix(&value[10..])
+}
+
+fn valid_xsd_date_time(value: &str) -> bool {
+    if value.ends_with('Z') {
+        return chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    }
+    if let Some(timezone) = value.get(value.len().saturating_sub(6)..)
+        && matches!(timezone.as_bytes().first(), Some(b'+' | b'-'))
+    {
+        return valid_timezone_suffix(timezone)
+            && chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+}
+
+fn valid_timezone_suffix(value: &str) -> bool {
+    if value.is_empty() || value == "Z" {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+        return false;
+    }
+    let Some(hours) = parse_two_digits(&bytes[1..3]) else {
+        return false;
+    };
+    let Some(minutes) = parse_two_digits(&bytes[4..6]) else {
+        return false;
+    };
+    minutes < 60 && (hours < 14 || (hours == 14 && minutes == 0))
+}
+
+fn parse_two_digits(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((bytes[0] - b'0') * 10 + (bytes[1] - b'0'))
 }
 
 fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError> {
@@ -2859,6 +2939,66 @@ fn validate_jsonld_import(value: &serde_json::Value) -> Result<(), RoCrateError>
     Ok(())
 }
 
+fn enforce_import_limit(
+    limit: &'static str,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), RoCrateError> {
+    if actual > maximum {
+        Err(RoCrateError::ImportLimitExceeded {
+            limit,
+            actual,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn context_entry_count(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(context_entry_count)
+            .fold(0usize, usize::saturating_add),
+        serde_json::Value::Object(entries) => entries
+            .values()
+            .map(context_entry_count)
+            .fold(entries.len(), usize::saturating_add),
+        serde_json::Value::String(_) => 1,
+        _ => 0,
+    }
+}
+
+fn validate_import_structure_limits(
+    value: &serde_json::Value,
+    limits: &RoCrateImportLimits,
+) -> Result<(), RoCrateError> {
+    let object = value.as_object().ok_or_else(|| {
+        RoCrateError::UnsupportedJsonLd("top-level JSON-LD document must be an object".to_owned())
+    })?;
+    let mut terms = HashMap::new();
+    if let Some(context) = object.get("@context") {
+        enforce_import_limit(
+            "max_context_entries",
+            context_entry_count(context),
+            limits.max_context_entries,
+        )?;
+        collect_context_terms(context, &mut terms, false);
+    }
+    if let Some(entities) = object
+        .iter()
+        .find_map(|(key, value)| {
+            (key == "@graph" || key == "graph" || terms.get(key).is_some_and(|iri| iri == "@graph"))
+                .then_some(value)
+        })
+        .and_then(serde_json::Value::as_array)
+    {
+        enforce_import_limit("max_entities", entities.len(), limits.max_entities)?;
+    }
+    Ok(())
+}
+
 fn canonicalize_value(value: &serde_json::Value) -> Result<CanonicalJsonLd, RoCrateError> {
     let mut lines = BTreeSet::new();
     for quad in jsonld_quads(value)? {
@@ -2876,6 +3016,20 @@ fn canonicalize_value(value: &serde_json::Value) -> Result<CanonicalJsonLd, RoCr
 }
 
 fn jsonld_quads(value: &serde_json::Value) -> Result<Vec<Quad>, RoCrateError> {
+    jsonld_quads_with_limits(value, None)
+}
+
+fn jsonld_quads_limited(
+    value: &serde_json::Value,
+    limits: &RoCrateImportLimits,
+) -> Result<Vec<Quad>, RoCrateError> {
+    jsonld_quads_with_limits(value, Some(limits))
+}
+
+fn jsonld_quads_with_limits(
+    value: &serde_json::Value,
+    limits: Option<&RoCrateImportLimits>,
+) -> Result<Vec<Quad>, RoCrateError> {
     // rocraters requires a root scalar license and string-only context maps, so
     // caller JSON-LD uses oxjsonld; typed internal crates still use rocraters.
     let mut prepared = value.clone();
@@ -2901,9 +3055,46 @@ fn jsonld_quads(value: &serde_json::Value) -> Result<Vec<Quad>, RoCrateError> {
         .for_slice(&jsonld)
         .with_load_document_callback(|url, _| load_context(url));
 
-    parser
-        .map(|quad| quad.map_err(|error| RoCrateError::JsonLd(error.to_string())))
-        .collect()
+    let mut quads = Vec::new();
+    let mut blank_nodes = HashSet::new();
+    let mut literal_bytes = 0usize;
+    for quad in parser {
+        let quad = quad.map_err(|error| RoCrateError::JsonLd(error.to_string()))?;
+        if let Some(limits) = limits {
+            enforce_import_limit(
+                "max_expanded_triples",
+                quads.len().saturating_add(1),
+                limits.max_expanded_triples,
+            )?;
+            collect_quad_import_usage(&quad, &mut blank_nodes, &mut literal_bytes);
+            enforce_import_limit("max_blank_nodes", blank_nodes.len(), limits.max_blank_nodes)?;
+            enforce_import_limit("max_literal_bytes", literal_bytes, limits.max_literal_bytes)?;
+        }
+        quads.push(quad);
+    }
+    Ok(quads)
+}
+
+fn collect_quad_import_usage(
+    quad: &Quad,
+    blank_nodes: &mut HashSet<String>,
+    literal_bytes: &mut usize,
+) {
+    if let NamedOrBlankNode::BlankNode(node) = &quad.subject {
+        blank_nodes.insert(node.as_str().to_owned());
+    }
+    match &quad.object {
+        Term::BlankNode(node) => {
+            blank_nodes.insert(node.as_str().to_owned());
+        }
+        Term::Literal(literal) => {
+            *literal_bytes = literal_bytes.saturating_add(literal.value().len());
+        }
+        _ => {}
+    }
+    if let oxrdf::GraphName::BlankNode(node) = &quad.graph_name {
+        blank_nodes.insert(node.as_str().to_owned());
+    }
 }
 
 fn load_context(
@@ -2981,11 +3172,18 @@ fn escape_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
-fn jsonld_triples(
+fn jsonld_triples_limited(
     graph_id: &GraphId,
     value: &serde_json::Value,
+    limits: &RoCrateImportLimits,
 ) -> Result<BTreeSet<TripleKey>, RoCrateError> {
-    let quads = jsonld_quads(value)?;
+    jsonld_triples_from_quads(graph_id, jsonld_quads_limited(value, limits)?)
+}
+
+fn jsonld_triples_from_quads(
+    graph_id: &GraphId,
+    quads: Vec<Quad>,
+) -> Result<BTreeSet<TripleKey>, RoCrateError> {
     let metadata = format!("{JSONLD_BASE_IRI}{METADATA_ID}");
     let about = vocab::schema_about();
     let import_root = quads.iter().find_map(|quad| {
@@ -3335,16 +3533,112 @@ fn object_named_node_value(object: &EncodedTerm) -> Option<String> {
 
 /// The bare id an entity reference denotes: an IRI unwrapped from its angle
 /// brackets, a blank node kept as its `_:b0` label.
-///
-/// Also the emit half of the page-cursor round trip. `export_jsonld_page_after`
-/// re-encodes whatever this returns with [`encoded_subject`], so the two must
-/// stay inverses; a page ending on a blank-node entity used to emit no cursor at
-/// all, silently truncating the caller's walk.
 fn encoded_reference_value(object: &EncodedTerm) -> Option<String> {
     match object.to_term() {
         Some(Term::NamedNode(node)) => Some(node.as_str().to_string()),
         Some(Term::BlankNode(node)) => Some(format!("_:{}", node.as_str())),
         _ => None,
+    }
+}
+
+fn encode_export_cursor(
+    graph: &GraphId,
+    graph_version: [u8; 32],
+    last_subject: &EncodedTerm,
+) -> Result<String, RoCrateError> {
+    let payload = postcard::to_allocvec(&ExportCursorPayload {
+        format_version: EXPORT_CURSOR_VERSION,
+        graph: graph.clone(),
+        graph_version,
+        last_subject: last_subject.0.clone(),
+    })
+    .map_err(|error| RoCrateError::InvalidExportCursor {
+        reason: error.to_string(),
+    })?;
+    let mut bytes = payload.clone();
+    bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+    Ok(format!("{EXPORT_CURSOR_PREFIX}{}", encode_hex(&bytes)))
+}
+
+fn decode_export_cursor(
+    cursor: &str,
+    expected_graph: &GraphId,
+    expected_version: [u8; 32],
+) -> Result<ExportCursorPayload, RoCrateError> {
+    let encoded = cursor.strip_prefix(EXPORT_CURSOR_PREFIX).ok_or_else(|| {
+        RoCrateError::InvalidExportCursor {
+            reason: "unknown cursor format".to_owned(),
+        }
+    })?;
+    let bytes = decode_hex(encoded)?;
+    if bytes.len() <= 32 {
+        return Err(RoCrateError::InvalidExportCursor {
+            reason: "cursor is truncated".to_owned(),
+        });
+    }
+    let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+    if blake3::hash(payload).as_bytes() != checksum {
+        return Err(RoCrateError::InvalidExportCursor {
+            reason: "checksum mismatch".to_owned(),
+        });
+    }
+    let payload: ExportCursorPayload =
+        postcard::from_bytes(payload).map_err(|error| RoCrateError::InvalidExportCursor {
+            reason: format!("malformed payload: {error}"),
+        })?;
+    if payload.format_version != EXPORT_CURSOR_VERSION {
+        return Err(RoCrateError::InvalidExportCursor {
+            reason: format!("unsupported format version {}", payload.format_version),
+        });
+    }
+    if &payload.graph != expected_graph {
+        return Err(RoCrateError::InvalidExportCursor {
+            reason: "cursor belongs to another graph".to_owned(),
+        });
+    }
+    if payload.graph_version != expected_version {
+        return Err(RoCrateError::InvalidExportCursor {
+            reason: "cursor graph version is stale".to_owned(),
+        });
+    }
+    Ok(payload)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(DIGITS[usize::from(byte >> 4)] as char);
+        encoded.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, RoCrateError> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(RoCrateError::InvalidExportCursor {
+            reason: "cursor has odd-length encoding".to_owned(),
+        });
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = decode_hex_digit(pair[0])?;
+            let low = decode_hex_digit(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn decode_hex_digit(digit: u8) -> Result<u8, RoCrateError> {
+    match digit {
+        b'0'..=b'9' => Ok(digit - b'0'),
+        b'a'..=b'f' => Ok(digit - b'a' + 10),
+        b'A'..=b'F' => Ok(digit - b'A' + 10),
+        _ => Err(RoCrateError::InvalidExportCursor {
+            reason: "cursor contains non-hex data".to_owned(),
+        }),
     }
 }
 
@@ -3690,8 +3984,7 @@ fn is_bare_rocrate_context(context: &serde_json::Value) -> bool {
 }
 
 /// Serialize the submitted `@context` verbatim for storage, or `None` when it is
-/// absent or degenerate. Bare supported contexts are elided after import only
-/// when the live scaffold marker carries the same version evidence.
+/// absent or degenerate.
 ///
 /// Only strings, arrays, and objects can carry a usable JSON-LD context.
 /// Degenerate values (`null`, numbers, booleans) carry no mappings and are
@@ -3712,6 +4005,34 @@ fn extract_raw_context(value: &serde_json::Value) -> Option<String> {
             None
         }
     }
+}
+
+fn normalized_import_context(
+    value: &serde_json::Value,
+    graph_id: &GraphId,
+    target: &BTreeSet<TripleKey>,
+) -> Option<String> {
+    let raw = extract_raw_context(value)?;
+    let context = serde_json::from_str(&raw).ok()?;
+    if !is_bare_rocrate_context(&context) {
+        return Some(raw);
+    }
+
+    let metadata = EncodedTerm::from_named_node(&vocab::metadata_descriptor());
+    let root = root_term(graph_id);
+    let conforms_to = EncodedTerm::from_named_node(&crate_conforms_to());
+    let has_supported_specification = target.iter().any(|(subject, predicate, object)| {
+        (subject == &metadata || subject == &root)
+            && predicate == &conforms_to
+            && object.to_named_node().is_some_and(|specification| {
+                matches!(
+                    specification.as_str(),
+                    ROCRATE_1_1_SPEC_URL | ROCRATE_1_2_SPEC_URL | ROCRATE_1_3_SPEC_URL
+                )
+            })
+    });
+
+    (!has_supported_specification).then_some(raw)
 }
 
 fn extract_raw_license(value: &serde_json::Value) -> Option<String> {
@@ -3961,12 +4282,8 @@ mod tests {
     };
     use irokle::reducer::EventRecord;
 
-    /// A [`CraqleGraphSync`] decorator that delegates every call to `inner`,
-    /// except the two publishes an import performs, each of which fails while
-    /// its flag is set. `fail_changes` injects a phase-1 (quad) failure, which
-    /// under publish-first must leave no local trace at all; `fail_context`
-    /// injects a phase-2 (context) failure after phase 1 has already committed
-    /// and published.
+    /// A [`CraqleGraphSync`] decorator that can fail ordinary change events or
+    /// the single atomic RO-Crate data-plus-render-hints event.
     struct FlakySync {
         inner: Arc<dyn CraqleGraphSync>,
         fail_changes: AtomicBool,
@@ -3998,6 +4315,23 @@ mod tests {
             self.inner.publish_changes(store, graph, changes)
         }
 
+        fn publish_rocrate_mutation(
+            &self,
+            store: &crate::store::GraphStore,
+            graph: &GraphId,
+            changes: Vec<MaterializedQuadChange>,
+            render_hints: crate::core::TaggedRoCrateRenderHints,
+        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            if self.fail_changes.load(Ordering::SeqCst) || self.fail_context.load(Ordering::SeqCst)
+            {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "injected atomic RO-Crate publish failure".to_owned(),
+                ));
+            }
+            self.inner
+                .publish_rocrate_mutation(store, graph, changes, render_hints)
+        }
+
         fn publish_policy(
             &self,
             store: &crate::store::GraphStore,
@@ -4013,24 +4347,6 @@ mod tests {
             tombstone: crate::core::GraphTombstone,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
             self.inner.publish_delete(store, tombstone)
-        }
-
-        fn publish_context(
-            &self,
-            store: &crate::store::GraphStore,
-            graph: &GraphId,
-            context: Option<String>,
-            license: Option<String>,
-            license_digest: Option<[u8; 32]>,
-            tag: crate::core::ContextTag,
-        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-            if self.fail_context.load(Ordering::SeqCst) {
-                return Err(CraqleSyncError::InvalidEvent(
-                    "injected context publish failure".to_string(),
-                ));
-            }
-            self.inner
-                .publish_context(store, graph, context, license, license_digest, tag)
         }
 
         fn graph_topic_id(
@@ -4130,8 +4446,7 @@ mod tests {
         }
     }
 
-    /// A store plus a manager whose sync layer can be made to fail either
-    /// publish phase on demand.
+    /// A store plus a manager whose sync layer can fail publication on demand.
     fn flaky_manager() -> (
         tempfile::TempDir,
         Arc<crate::store::GraphStore>,
@@ -4183,14 +4498,8 @@ mod tests {
         }
     }
 
-    /// G4 publish-first for the *quad* phase: a `publish_changes` that fails
-    /// must move no local state whatsoever.
-    ///
-    /// The context phase already had fault injection; this is the phase that
-    /// matters more, because applying before publishing would leave this node
-    /// holding quads and a clock entry no peer will ever be told about — a
-    /// divergence nothing later reconciles. Every field a write can touch is
-    /// compared, not just the quad count.
+    /// G4 publish-first: a failed graph-event publication moves no local state.
+    /// Every field a write can touch is compared, not just the quad count.
     #[test]
     fn publish_persists_nothing() {
         let (_dir, store, flaky, manager) = flaky_manager();
@@ -4292,16 +4601,86 @@ mod tests {
         assert_eq!(
             crate::core::ContextTag::GENESIS,
             store.graph_context_tag(&graph).unwrap(),
-            "phase 2 must never run when phase 1 failed"
+            "failed atomic publication must not mint a render-hint tag"
         );
     }
 
-    /// A failed context publish (phase 2) leaves the already-applied quads
-    /// (phase 1) in place with the stored context unchanged, and re-importing the
-    /// same document heals it: the empty quad diff is a no-op while the context
-    /// store/publish is retried.
     #[test]
-    fn context_publish_failure_leaves_quads_and_heals_on_reimport() {
+    fn rocrate_import_limits() {
+        let (_dir, _store, _flaky, manager) = flaky_manager();
+        let graph = GraphId::new("urn:test:rocrate-import-limits");
+        let document = serde_json::json!({
+            "@context": [ROCRATE_CONTEXT_URL, {"custom": "urn:custom:"}],
+            "@graph": [
+                {
+                    "@id": METADATA_ID,
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": ROCRATE_SPEC_URL},
+                    "about": {"@id": graph.as_str()}
+                },
+                {
+                    "@id": graph.as_str(),
+                    "@type": "Dataset",
+                    "name": "Bounded import",
+                    "description": "literal allocation is bounded",
+                    "datePublished": "2025-01-01",
+                    "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+                    "hasPart": {"@id": "_:part"}
+                },
+                {"@id": "_:part", "@type": "File", "name": "part"}
+            ]
+        })
+        .to_string();
+
+        let mut cases = Vec::new();
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_input_bytes = document.len() - 1;
+        cases.push(("max_input_bytes", limits));
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_entities = 2;
+        cases.push(("max_entities", limits));
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_expanded_triples = 1;
+        cases.push(("max_expanded_triples", limits));
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_context_entries = 1;
+        cases.push(("max_context_entries", limits));
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_blank_nodes = 0;
+        cases.push(("max_blank_nodes", limits));
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_literal_bytes = 1;
+        cases.push(("max_literal_bytes", limits));
+        let mut limits = RoCrateImportLimits::production();
+        limits.max_changes = 1;
+        cases.push(("max_changes", limits));
+
+        for (expected, limits) in cases {
+            let error = manager
+                .prepare_jsonld(
+                    &graph,
+                    &document,
+                    &PrepareRoCrateOptions {
+                        limits,
+                        ..PrepareRoCrateOptions::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RoCrateError::ImportLimitExceeded { limit, .. } if limit == expected
+                ),
+                "expected {expected}, got {error}"
+            );
+        }
+    }
+
+    /// Render hints and their RDF candidate are one published and committed
+    /// mutation: failure leaves the old pair intact, never new data plus old
+    /// hints.
+    #[test]
+    fn atomic_rocrate_render_hints() {
         let (_dir, store, flaky, manager) = flaky_manager();
         flaky.fail_context.store(true, Ordering::SeqCst);
 
@@ -4331,17 +4710,32 @@ mod tests {
             ]
         });
 
-        // Phase 1 (quads) succeeds; phase 2 (context publish) is forced to fail.
         let first = manager.import_jsonld(graph.clone(), &document.to_string());
         assert!(
             first.is_err(),
-            "import should surface the injected context publish failure"
+            "import should surface the injected atomic publish failure"
         );
 
-        // The quads were applied (phase 1 committed and published) ...
         assert!(
-            !store.graph_is_empty(&graph).unwrap(),
-            "quads should remain after the context publish failure"
+            store.graph_is_empty(&graph).unwrap(),
+            "failed publication must leave no candidate quads"
+        );
+        assert_eq!(store.graph_context(&graph).unwrap(), None);
+        assert_eq!(
+            store.graph_context_tag(&graph).unwrap(),
+            crate::core::ContextTag::GENESIS
+        );
+
+        flaky.fail_context.store(false, Ordering::SeqCst);
+        let second = manager.import_jsonld(graph.clone(), &document.to_string());
+        assert!(second.is_ok(), "retry should commit the pair: {second:?}");
+
+        let stored = store.graph_context(&graph).unwrap();
+        assert!(
+            stored
+                .as_deref()
+                .is_some_and(|context| context.contains(organism_iri)),
+            "healed context should carry the profile IRI: {stored:?}"
         );
         assert!(
             manager
@@ -4351,49 +4745,42 @@ mod tests {
                 .any(|(_, predicate, _)| predicate
                     .to_named_node()
                     .is_some_and(|node| node.as_str() == organism_iri)),
-            "the custom-profile organism predicate should be present"
+            "the committed data must match the committed custom context"
         );
-        // ... but the stored context register is unchanged (publish-first).
-        assert_eq!(store.graph_context(&graph).unwrap(), None);
-        assert_eq!(
-            store.graph_context_tag(&graph).unwrap(),
-            crate::core::ContextTag::GENESIS
-        );
-
-        // Clear the fault and re-import the SAME document. The quad diff is empty
-        // (a no-op batch), and because the stored context still differs, the
-        // `current == context` guard does not trip, so the context is retried.
-        flaky.fail_context.store(false, Ordering::SeqCst);
-        let second = manager.import_jsonld(graph.clone(), &document.to_string());
-        assert!(second.is_ok(), "re-import should heal: {second:?}");
-
-        let stored = store.graph_context(&graph).unwrap();
-        assert!(
-            stored
-                .as_deref()
-                .is_some_and(|context| context.contains(organism_iri)),
-            "healed context should carry the profile IRI: {stored:?}"
-        );
-        // Exactly one: the failed publish persisted nothing, so the heal mints
-        // `next_local(GENESIS)`. `>= 1` would also accept a double-mint, which is
-        // the bug G5's publish-first ordering exists to prevent.
         let healed_tag = store.graph_context_tag(&graph).unwrap();
         assert_eq!(
             1, healed_tag.counter,
             "the heal must mint exactly one tag past genesis"
         );
 
-        // Healing converges rather than oscillating: a third import of the same
-        // document now finds `current == context`, so it neither republishes nor
-        // mints a new tag. The LWW register (G5) has reached a fixpoint.
-        manager
+        let unchanged = manager
             .import_jsonld(graph.clone(), &document.to_string())
             .unwrap();
+        assert!(unchanged.ops.is_empty());
+        assert_eq!(unchanged.counter, 0);
         assert_eq!(store.graph_context(&graph).unwrap(), stored);
         assert_eq!(
             store.graph_context_tag(&graph).unwrap(),
             healed_tag,
             "an unchanged re-import must not mint a new context tag"
+        );
+
+        let before_failed_commit = LocalState::read(&store, &graph);
+        let mut amended = document.clone();
+        amended["@graph"][1]["description"] =
+            serde_json::Value::String("durable commit must be atomic".to_owned());
+        amended["@context"][1]["organism"] =
+            serde_json::Value::String("https://example.org/replacement-organism".to_owned());
+        store.arm_commit_failure();
+        assert!(
+            manager
+                .import_jsonld(graph.clone(), &amended.to_string())
+                .is_err()
+        );
+        assert_eq!(
+            before_failed_commit,
+            LocalState::read(&store, &graph),
+            "failed Fjall commit must retain old data plus old render hints"
         );
     }
 

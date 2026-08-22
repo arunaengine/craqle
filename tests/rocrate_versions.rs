@@ -453,9 +453,13 @@ fn context_only_and_specification_only_versions_survive_round_trips() {
     );
 
     let specification_only_graph = GraphId::new("urn:test:version-specification-only");
+    let specification_only_context = json!({
+        "@vocab": "http://schema.org/",
+        "conformsTo": "http://purl.org/dc/terms/conformsTo"
+    });
     let specification_only = crate_document(
         &specification_only_graph,
-        None,
+        Some(specification_only_context.clone()),
         None,
         Some(specification_url(RoCrateVersion::V1_1)),
     );
@@ -484,7 +488,7 @@ fn context_only_and_specification_only_versions_survive_round_trips() {
     let specification_only_value: Value = serde_json::from_str(&specification_only_export).unwrap();
     assert_eq!(
         specification_only_value["@context"],
-        json!(context_url(RoCrateVersion::V1_1))
+        specification_only_context
     );
     assert!(
         metadata(&specification_only_value)

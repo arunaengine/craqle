@@ -30,7 +30,6 @@ pub enum UpdateError {
     ShaclValidationFailed(Vec<crate::ShaclValidationReport>),
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
-    #[cfg(feature = "shacl-core")]
     #[error("prepared state is stale: {fence}")]
     StalePreparedState { fence: String },
     #[error("store: {0}")]
@@ -60,7 +59,6 @@ impl UpdateError {
             Self::Shacl(error) => error.kind(),
             #[cfg(feature = "shacl-core")]
             Self::ShaclValidationFailed(_) => crate::CraqleErrorKind::InvalidInput,
-            #[cfg(feature = "shacl-core")]
             Self::StalePreparedState { .. } => crate::CraqleErrorKind::StalePreparedState,
             Self::Store(error) => error.kind(),
             Self::Sync(error) => error.kind(),
@@ -199,11 +197,10 @@ struct LocalCommit<'a> {
     graph: &'a GraphId,
     changes: Vec<MaterializedQuadChange>,
     checks: WriteChecks,
-    #[cfg(feature = "shacl-core")]
     prepared_fence: Option<PreparedCommitFence<'a>>,
+    render_hints: Option<RoCrateRenderHints>,
 }
 
-#[cfg(feature = "shacl-core")]
 struct PreparedCommitFence<'a> {
     data_version: Option<[u8; 32]>,
     shape_versions: &'a [(GraphId, [u8; 32])],
@@ -380,13 +377,9 @@ impl ReplicationEngine {
         }
     }
 
-    /// Persist a graph's render hints (last-write-wins) and replicate them when
-    /// sync is configured, minting one tag for both the local write and the event.
-    ///
-    /// Publish-first, and load-bearing (G4): storing locally first would leave a
-    /// failed publish looking like success, so the retry would trip
-    /// `store_import_context`'s unchanged-state short-circuit and peers would
-    /// never receive the update.
+    /// Test helper for exercising concurrent render-hint tag minting through
+    /// the same atomic graph-mutation path used by imports.
+    #[cfg(test)]
     pub(crate) fn set_graph_context(
         &self,
         graph: &GraphId,
@@ -394,36 +387,36 @@ impl ReplicationEngine {
         license: Option<String>,
         license_digest: Option<[u8; 32]>,
     ) -> Result<(), UpdateError> {
-        // Guards the tombstone check, topic binding, tag mint and store write.
-        let _write_guard = graph_write_guard(graph);
-        if let Some(tombstone) = self.store.graph_tombstone(graph)? {
-            return Err(UpdateError::GraphDeleted { tombstone });
-        }
-        // `ensure_graph_topic` takes the graph commit guard while this method
-        // holds the outer graph write lock, preserving the documented order.
-        if let Some(sync) = &self.sync {
-            sync.ensure_graph_topic(&self.store, graph)?;
-        }
-
-        let tag = ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor);
-        if let Some(sync) = &self.sync {
-            sync.publish_context(
-                &self.store,
-                graph,
-                context.clone(),
-                license.clone(),
-                license_digest,
-                tag,
-            )?;
-        }
-        self.store.set_graph_context(
+        self.local_apply_bulk_bypassing_structural_rules_with_render_hints(
             graph,
-            context.as_deref(),
-            license.as_deref(),
-            license_digest,
-            tag,
-        )?;
-        Ok(())
+            Vec::new(),
+            RoCrateRenderHints {
+                context,
+                license,
+                license_digest,
+            },
+        )
+        .map(|_| ())
+    }
+
+    fn changed_render_hints(
+        &self,
+        graph: &GraphId,
+        desired: Option<RoCrateRenderHints>,
+    ) -> Result<Option<TaggedRoCrateRenderHints>, UpdateError> {
+        let Some(desired) = desired else {
+            return Ok(None);
+        };
+        let desired_license = desired.license.clone().zip(desired.license_digest);
+        if self.store.graph_context(graph)? == desired.context
+            && self.store.graph_license(graph)? == desired_license
+        {
+            return Ok(None);
+        }
+        Ok(Some(TaggedRoCrateRenderHints {
+            tag: ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor),
+            hints: desired,
+        }))
     }
 
     /// Insert raw quads (bypasses SPARQL, still validates).
@@ -461,6 +454,22 @@ impl ReplicationEngine {
         self.commit_changes(graph, changes)
     }
 
+    pub(crate) fn local_apply_changes_with_render_hints(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: RoCrateRenderHints,
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            checks: WriteChecks::normal(DiagnosticsMode::Immediate),
+            prepared_fence: None,
+            render_hints: Some(render_hints),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn local_apply_changes_bypassing_structural_rules(
         &self,
@@ -477,13 +486,14 @@ impl ReplicationEngine {
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Immediate),
-            #[cfg(feature = "shacl-core")]
             prepared_fence: None,
+            render_hints: None,
         })
     }
 
     /// Apply a trusted bulk change set locally and defer graph-diagnostics
     /// recomputation until the caller explicitly rebuilds diagnostics.
+    #[cfg(test)]
     pub(crate) fn local_apply_bulk_bypassing_structural_rules(
         &self,
         graph: &GraphId,
@@ -499,8 +509,24 @@ impl ReplicationEngine {
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
-            #[cfg(feature = "shacl-core")]
             prepared_fence: None,
+            render_hints: None,
+        })
+    }
+
+    pub(crate) fn local_apply_bulk_bypassing_structural_rules_with_render_hints(
+        &self,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: RoCrateRenderHints,
+    ) -> Result<Batch, UpdateError> {
+        self.ensure_change_set_targets(graph, &changes)?;
+        self.commit_changes_with_plan(LocalCommit {
+            graph,
+            changes,
+            checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
+            prepared_fence: None,
+            render_hints: Some(render_hints),
         })
     }
 
@@ -517,37 +543,33 @@ impl ReplicationEngine {
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Deferred),
-            #[cfg(feature = "shacl-core")]
             prepared_fence: None,
+            render_hints: None,
         })
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn local_apply_bulk_prepared(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
         data_version: Option<[u8; 32]>,
         shape_versions: &[(GraphId, [u8; 32])],
+        render_hints: RoCrateRenderHints,
     ) -> Result<Batch, UpdateError> {
         self.ensure_change_set_targets(graph, &changes)?;
         let fence = PreparedCommitFence {
             data_version,
             shape_versions,
         };
-        if changes.is_empty() {
-            let _write_guard = graph_write_guard(graph);
-            let _commit_guard = self.store.graph_commit_guard(graph);
-            self.ensure_prepared_data_current(graph, &fence)?;
-            let _binding_guard = self.store.binding_guard();
-            self.ensure_prepared_shapes_current(&fence)?;
-            return self.empty_batch(graph);
-        }
         self.commit_changes_with_plan(LocalCommit {
             graph,
             changes,
-            checks: WriteChecks::normal(DiagnosticsMode::Deferred),
+            // Structural rules were evaluated over the exact encoded
+            // candidate during preparation; do not rebuild a decoded current
+            // graph and re-evaluate a different orphan-inclusive view here.
+            checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: Some(fence),
+            render_hints: Some(render_hints),
         })
     }
 
@@ -1364,7 +1386,6 @@ impl ReplicationEngine {
         Ok(())
     }
 
-    #[cfg(feature = "shacl-core")]
     fn ensure_prepared_data_current(
         &self,
         graph: &GraphId,
@@ -1384,7 +1405,6 @@ impl ReplicationEngine {
         }
     }
 
-    #[cfg(feature = "shacl-core")]
     fn ensure_prepared_shapes_current(
         &self,
         fence: &PreparedCommitFence<'_>,
@@ -1411,8 +1431,8 @@ impl ReplicationEngine {
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
-            #[cfg(feature = "shacl-core")]
             prepared_fence: None,
+            render_hints: None,
         })
     }
 
@@ -1422,8 +1442,8 @@ impl ReplicationEngine {
             graph,
             changes,
             checks,
-            #[cfg(feature = "shacl-core")]
             prepared_fence,
+            render_hints,
         } = commit;
 
         // Serializes the permanent tombstone check with every local write and
@@ -1439,9 +1459,12 @@ impl ReplicationEngine {
             // Validation and publication are serialized with every local CRDT
             // mutation of this graph.
             let _commit_guard = self.store.graph_commit_guard(graph);
-            #[cfg(feature = "shacl-core")]
             if let Some(fence) = prepared_fence.as_ref() {
                 self.ensure_prepared_data_current(graph, fence)?;
+            }
+            let render_hints = self.changed_render_hints(graph, render_hints)?;
+            if changes.is_empty() && render_hints.is_none() {
+                return self.empty_batch(graph);
             }
             if checks.structural_rules.enabled() {
                 self.validate(graph, &changes)?;
@@ -1452,7 +1475,6 @@ impl ReplicationEngine {
                 &changes,
                 checks.shacl_enforcement.enabled(),
             )?;
-            #[cfg(feature = "shacl-core")]
             if let Some(fence) = prepared_fence.as_ref() {
                 self.ensure_prepared_shapes_current(fence)?;
             }
@@ -1470,14 +1492,20 @@ impl ReplicationEngine {
             // Publish-first (G4): no source state changes until the event is
             // durable in the topic. A failed publish therefore leaves the
             // validated candidate unapplied.
-            let record = sync.publish_changes(&self.store, graph, changes)?;
-            let Some(batch) = crate::sync::batch_from_owned(record)? else {
+            let record = match render_hints {
+                Some(render_hints) => {
+                    sync.publish_rocrate_mutation(&self.store, graph, changes, render_hints)?
+                }
+                None => sync.publish_changes(&self.store, graph, changes)?,
+            };
+            let Some(mutation) = crate::sync::batch_from_owned(record)? else {
                 return Err(UpdateError::InvalidChangeSet(
                     "irokle changes publish did not return a quad-change record".to_string(),
                 ));
             };
+            let batch = mutation.batch;
             let _merged = self
-                .apply_irokle_guarded(&batch, checks.diagnostics)
+                .apply_irokle_guarded(&batch, mutation.render_hints.as_ref(), checks.diagnostics)
                 .map_err(update_error_from_merge)?;
             #[cfg(feature = "shacl-core")]
             {
@@ -1509,9 +1537,12 @@ impl ReplicationEngine {
         // (G1, G2, G5, G6).
         let _commit_guard = self.store.graph_commit_guard(graph);
 
-        #[cfg(feature = "shacl-core")]
         if let Some(fence) = prepared_fence.as_ref() {
             self.ensure_prepared_data_current(graph, fence)?;
+        }
+        let render_hints = self.changed_render_hints(graph, render_hints)?;
+        if changes.is_empty() && render_hints.is_none() {
+            return self.empty_batch(graph);
         }
 
         if checks.structural_rules.enabled() {
@@ -1523,7 +1554,6 @@ impl ReplicationEngine {
             &changes,
             checks.shacl_enforcement.enabled(),
         )?;
-        #[cfg(feature = "shacl-core")]
         if let Some(fence) = prepared_fence.as_ref() {
             self.ensure_prepared_shapes_current(fence)?;
         }
@@ -1662,6 +1692,10 @@ impl ReplicationEngine {
                 subjects: &affected_subjects,
             },
         )?;
+        if let Some(render_hints) = &render_hints {
+            self.store
+                .stage_graph_context(&mut batch, graph_id, render_hints)?;
+        }
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(&vector_clock)?)?;
@@ -1716,8 +1750,9 @@ impl ReplicationEngine {
     /// they are not contiguous over Craqle domain events. The Irokle DAG already
     /// enforces causal delivery; this path intentionally bypasses Craqle's old
     /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
+    #[cfg(all(test, feature = "shacl-core"))]
     pub(crate) fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
-        self.apply_irokle_batch_with_plan(&incoming, DiagnosticsMode::Immediate)
+        self.apply_irokle_batch_with_plan(&incoming, None, DiagnosticsMode::Immediate)
     }
 
     /// **Call with the graph's write lock held.** Every caller does, and so
@@ -1727,6 +1762,7 @@ impl ReplicationEngine {
     fn apply_irokle_batch_with_plan(
         &self,
         incoming: &Batch,
+        render_hints: Option<&TaggedRoCrateRenderHints>,
         plan: DiagnosticsMode,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
@@ -1769,7 +1805,7 @@ impl ReplicationEngine {
                 .as_ref()
                 .map(|_| batch_changes(self.store.as_ref(), incoming))
                 .transpose()?;
-            let merged = self.apply_irokle_guarded(incoming, plan)?;
+            let merged = self.apply_irokle_guarded(incoming, render_hints, plan)?;
             let data_version = merged
                 .applied
                 .then(|| self.store.graph_version_digest(graph))
@@ -1785,7 +1821,7 @@ impl ReplicationEngine {
         #[cfg(not(feature = "shacl-core"))]
         let merged = {
             let _commit_guard = self.store.graph_commit_guard(graph);
-            self.apply_irokle_guarded(incoming, plan)?
+            self.apply_irokle_guarded(incoming, render_hints, plan)?
         };
         #[cfg(feature = "shacl-core")]
         let source_settled = if merged.applied {
@@ -1807,6 +1843,7 @@ impl ReplicationEngine {
     fn apply_irokle_guarded(
         &self,
         incoming: &Batch,
+        render_hints: Option<&TaggedRoCrateRenderHints>,
         plan: DiagnosticsMode,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
@@ -1826,7 +1863,7 @@ impl ReplicationEngine {
             })
         })?;
 
-        self.apply_single_batch(incoming, &mut vector_clock)?;
+        self.apply_single_batch(incoming, render_hints, &mut vector_clock)?;
 
         if let Some(pending) = &pending {
             self.settle_diagnostics(graph, pending)?;
@@ -1844,10 +1881,16 @@ impl ReplicationEngine {
                 fjall::Error::Io(std::io::Error::other("injected apply failure")),
             )));
         }
-        let batch = crate::sync::batch_from_record(record)
+        let mutation = crate::sync::batch_from_record(record)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
-        batch
-            .map(|batch| self.apply_irokle_batch(batch))
+        mutation
+            .map(|mutation| {
+                self.apply_irokle_batch_with_plan(
+                    &mutation.batch,
+                    mutation.render_hints.as_ref(),
+                    DiagnosticsMode::Immediate,
+                )
+            })
             .transpose()
     }
 
@@ -1855,6 +1898,7 @@ impl ReplicationEngine {
     fn apply_single_batch(
         &self,
         incoming: &Batch,
+        render_hints: Option<&TaggedRoCrateRenderHints>,
         vector_clock: &mut VectorClock,
     ) -> Result<(), MergeError> {
         let graph = &incoming.graph;
@@ -1946,6 +1990,10 @@ impl ReplicationEngine {
                 subjects: &affected_subjects,
             },
         )?;
+        if let Some(render_hints) = render_hints {
+            self.store
+                .stage_graph_context(&mut batch, graph_id, render_hints)?;
+        }
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(vector_clock)?)?;

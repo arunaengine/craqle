@@ -3,7 +3,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
     ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
-    QuadOp, TaggedGraphPolicy, VectorClock,
+    QuadOp, RoCrateRenderHints, TaggedGraphPolicy, TaggedRoCrateRenderHints, VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
@@ -20,6 +20,14 @@ pub enum CraqleGraphEvent {
         graph: GraphId,
         changes: Vec<MaterializedQuadChange>,
     },
+    RoCrateMutation {
+        graph: GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        context: Option<String>,
+        license: Option<String>,
+        license_digest: Option<[u8; 32]>,
+        tag: ContextTag,
+    },
     Policy {
         graph: GraphId,
         tagged: TaggedGraphPolicy,
@@ -27,27 +35,14 @@ pub enum CraqleGraphEvent {
     GraphDeleted {
         tombstone: GraphTombstone,
     },
-    /// Last-write-wins update of a graph's raw RO-Crate render hints.
-    ///
-    /// `context` and `license` hold the raw submitted JSON shapes. `tag` is the
-    /// last-write-wins ordering tag: a receiving peer overwrites its stored hints
-    /// only when this tag strictly dominates its own, so all peers converge on
-    /// the same rendering regardless of event arrival order.
-    ContextUpdated {
-        graph: GraphId,
-        context: Option<String>,
-        license: Option<String>,
-        license_digest: Option<[u8; 32]>,
-        tag: ContextTag,
-    },
 }
 
 impl CraqleGraphEvent {
     pub fn graph(&self) -> &GraphId {
         match self {
             Self::QuadChanges { graph, .. }
-            | Self::Policy { graph, .. }
-            | Self::ContextUpdated { graph, .. } => graph,
+            | Self::RoCrateMutation { graph, .. }
+            | Self::Policy { graph, .. } => graph,
             Self::GraphDeleted { tombstone } => &tombstone.graph,
         }
     }
@@ -118,6 +113,11 @@ pub struct TopicCursorRepairAudit {
 pub(crate) struct TopicCatchup {
     pub records: Vec<TopicRecord>,
     pub cursor: TopicCursor,
+}
+
+pub(crate) struct ReplicatedGraphMutation {
+    pub(crate) batch: Batch,
+    pub(crate) render_hints: Option<TaggedRoCrateRenderHints>,
 }
 
 pub(crate) enum TopicRecord {
@@ -346,6 +346,14 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         changes: Vec<MaterializedQuadChange>,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
+    fn publish_rocrate_mutation(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: TaggedRoCrateRenderHints,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
+
     fn publish_policy(
         &self,
         store: &GraphStore,
@@ -357,16 +365,6 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         &self,
         store: &GraphStore,
         tombstone: GraphTombstone,
-    ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
-
-    fn publish_context(
-        &self,
-        store: &GraphStore,
-        graph: &GraphId,
-        context: Option<String>,
-        license: Option<String>,
-        license_digest: Option<[u8; 32]>,
-        tag: ContextTag,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
     fn graph_topic_id(
@@ -620,6 +618,28 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         )?)
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
+    fn publish_rocrate_mutation(
+        &self,
+        store: &GraphStore,
+        graph: &GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: TaggedRoCrateRenderHints,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        let topic = self.open_graph_topic(store, graph)?;
+        Ok(topic.publish_with(
+            CraqleGraphEvent::RoCrateMutation {
+                graph: graph.clone(),
+                changes,
+                context: render_hints.hints.context,
+                license: render_hints.hints.license,
+                license_digest: render_hints.hints.license_digest,
+                tag: render_hints.tag,
+            },
+            self.publish_options(),
+        )?)
+    }
+
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str()))]
     fn publish_policy(
         &self,
@@ -653,29 +673,6 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         // (which carries the stored binding) is about to go away everywhere.
         self.forget_topic(&graph);
         Ok(record)
-    }
-
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str()))]
-    fn publish_context(
-        &self,
-        store: &GraphStore,
-        graph: &GraphId,
-        context: Option<String>,
-        license: Option<String>,
-        license_digest: Option<[u8; 32]>,
-        tag: ContextTag,
-    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
-        let topic = self.open_graph_topic(store, graph)?;
-        Ok(topic.publish_with(
-            CraqleGraphEvent::ContextUpdated {
-                graph: graph.clone(),
-                context,
-                license,
-                license_digest,
-                tag,
-            },
-            self.publish_options(),
-        )?)
     }
 
     fn graph_topic_id(
@@ -1031,31 +1028,79 @@ fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
 /// (catch-up and reconcile replay both re-read their records afterwards).
 pub(crate) fn batch_from_record(
     record: &EventRecord<CraqleGraphEvent>,
-) -> SyncResult<Option<Batch>> {
-    let CraqleGraphEvent::QuadChanges { graph, changes } = &record.event else {
-        return Ok(None);
+) -> SyncResult<Option<ReplicatedGraphMutation>> {
+    let (graph, changes, render_hints) = match &record.event {
+        CraqleGraphEvent::QuadChanges { graph, changes } => (graph, changes, None),
+        CraqleGraphEvent::RoCrateMutation {
+            graph,
+            changes,
+            context,
+            license,
+            license_digest,
+            tag,
+        } => (
+            graph,
+            changes,
+            Some(TaggedRoCrateRenderHints {
+                hints: RoCrateRenderHints {
+                    context: context.clone(),
+                    license: license.clone(),
+                    license_digest: *license_digest,
+                },
+                tag: *tag,
+            }),
+        ),
+        _ => return Ok(None),
     };
     check_changes(changes)?;
     let cx = EventBatchCtx {
         graph,
         meta: &record.meta,
     };
-    batch_from_changes(cx, changes.iter().cloned()).map(Some)
+    Ok(Some(ReplicatedGraphMutation {
+        batch: batch_from_changes(cx, changes.iter().cloned())?,
+        render_hints,
+    }))
 }
 
 /// Consuming variant: moves every term string out of the record instead of
 /// cloning it, for callers that drop the record right after.
-pub(crate) fn batch_from_owned(record: EventRecord<CraqleGraphEvent>) -> SyncResult<Option<Batch>> {
+pub(crate) fn batch_from_owned(
+    record: EventRecord<CraqleGraphEvent>,
+) -> SyncResult<Option<ReplicatedGraphMutation>> {
     let EventRecord { event, meta } = record;
-    let CraqleGraphEvent::QuadChanges { graph, changes } = event else {
-        return Ok(None);
+    let (graph, changes, render_hints) = match event {
+        CraqleGraphEvent::QuadChanges { graph, changes } => (graph, changes, None),
+        CraqleGraphEvent::RoCrateMutation {
+            graph,
+            changes,
+            context,
+            license,
+            license_digest,
+            tag,
+        } => (
+            graph,
+            changes,
+            Some(TaggedRoCrateRenderHints {
+                hints: RoCrateRenderHints {
+                    context,
+                    license,
+                    license_digest,
+                },
+                tag,
+            }),
+        ),
+        _ => return Ok(None),
     };
     check_changes(&changes)?;
     let cx = EventBatchCtx {
         graph: &graph,
         meta: &meta,
     };
-    batch_from_changes(cx, changes).map(Some)
+    Ok(Some(ReplicatedGraphMutation {
+        batch: batch_from_changes(cx, changes)?,
+        render_hints,
+    }))
 }
 
 fn ensure_change_graph(expected: &GraphId, actual: &GraphId) -> SyncResult<()> {

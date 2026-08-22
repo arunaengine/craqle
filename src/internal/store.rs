@@ -1906,7 +1906,6 @@ impl StoreReadSnapshot {
             .is_some())
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn graph_version(&self, store: &GraphStore, graph: TermId) -> Result<[u8; 32]> {
         let clock = store.snapshot_vector_clock(&self.snapshot, graph)?;
         Ok(*blake3::hash(&postcard::to_allocvec(&clock)?).as_bytes())
@@ -5520,7 +5519,6 @@ impl GraphStore {
         Ok(self.graphs.contains_key(graph_meta_key(graph_id))?)
     }
 
-    #[cfg(feature = "shacl-core")]
     pub(crate) fn graph_version_digest(&self, graph: &GraphId) -> Result<[u8; 32]> {
         let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
         self.read_snapshot().graph_version(self, graph)
@@ -6372,6 +6370,7 @@ impl GraphStore {
     ///
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
+    #[cfg(test)]
     pub fn set_graph_context(
         &self,
         graph: &GraphId,
@@ -6384,17 +6383,43 @@ impl GraphStore {
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
+        self.stage_graph_context(
+            &mut batch,
+            graph_id,
+            &TaggedRoCrateRenderHints {
+                hints: RoCrateRenderHints {
+                    context: context.map(str::to_owned),
+                    license: license.map(str::to_owned),
+                    license_digest,
+                },
+                tag,
+            },
+        )?;
+        self.commit(batch)
+    }
+
+    /// Stage render hints in the same durable batch as their graph mutation.
+    /// Caller holds the graph commit guard.
+    pub(crate) fn stage_graph_context(
+        &self,
+        batch: &mut WriteBatch,
+        graph_id: TermId,
+        tagged: &TaggedRoCrateRenderHints,
+    ) -> Result<bool> {
         let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
-        meta.rocrate_context = context.map(str::to_string);
-        meta.rocrate_license = license.map(str::to_string);
-        meta.rocrate_license_digest = license_digest;
-        meta.context_tag = tag;
+        if tagged.tag <= meta.context_tag {
+            return Ok(false);
+        }
+        meta.rocrate_context = tagged.hints.context.clone();
+        meta.rocrate_license = tagged.hints.license.clone();
+        meta.rocrate_license_digest = tagged.hints.license_digest;
+        meta.context_tag = tagged.tag;
         batch.insert(
             &self.graphs,
             graph_meta_key(graph_id),
             postcard::to_allocvec(&meta)?,
         );
-        self.commit(batch)
+        Ok(true)
     }
 
     pub fn topic_graph_binding(&self, topic_id: &[u8; 32]) -> Result<Option<String>> {

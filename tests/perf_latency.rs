@@ -136,8 +136,12 @@ mod tests {
             );
 
             if config.entities_per_crate > PAGE_SIZE {
-                let deep_cursor =
-                    format!("./bulk/entity-{:06}.dat", config.entities_per_crate / 2 - 1);
+                let deep_cursor = net
+                    .peer(1)
+                    .export_rocrate_page_after(&reader, graph, None, config.entities_per_crate / 2)
+                    .unwrap()
+                    .next_cursor
+                    .expect("midpoint page must have a continuation cursor");
                 let page_deep_start = Instant::now();
                 let deep_page = net
                     .peer(1)
