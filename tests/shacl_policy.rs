@@ -11,7 +11,7 @@ use craqle::{
     Action, ActorId, AllowAllAuthorizer, AuthorizationError, CraqleError, CraqleNode,
     CraqleOptions, DenyAllAuthorizer, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
     MaterializedQuadChange, PermissionGrant, PermissionLevel, ShaclBinding, ShaclBindingOptions,
-    ShaclCompileOptions, ShaclValidationOptions, ShaclValidationState, ValidationPolicy,
+    ShaclCompileOptions, ShaclValidationOptions, ShaclValidationState, ShaclWritePolicy,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -89,7 +89,7 @@ fn grants(values: &[(&str, PermissionLevel)]) -> GrantAuthorizer {
     )
 }
 
-fn binding(data: &GraphId, shapes: &GraphId, policy: ValidationPolicy) -> ShaclBinding {
+fn binding(data: &GraphId, shapes: &GraphId, policy: ShaclWritePolicy) -> ShaclBinding {
     ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: shapes.clone(),
@@ -255,7 +255,7 @@ fn auth_blocks_leaks() {
         ("/root", PermissionLevel::Read),
         ("/import", PermissionLevel::Read),
     ]);
-    let bound = binding(&data, &root, ValidationPolicy::Enforce);
+    let bound = binding(&data, &root, ShaclWritePolicy::Enforce);
     let split = |graph: &GraphId, _: &GraphPolicy, action: Action| {
         if (graph == &data && action == Action::Write)
             || ((graph == &root || graph == &imported) && action == Action::Read)
@@ -305,7 +305,7 @@ fn auth_blocks_leaks() {
     ));
     assert!(!error.to_string().contains(FOCUS));
     assert!(!error.to_string().contains(secret));
-    let disabled = binding(&data, &root, ValidationPolicy::Disabled);
+    let disabled = binding(&data, &root, ShaclWritePolicy::Disabled);
     let status = node.bind_shacl(&split, &disabled).unwrap();
     assert_eq!(status.state, ShaclValidationState::Pending);
     assert!(status.report.is_none());
@@ -569,7 +569,7 @@ fn status_reads_release_binding_lock_before_authorization() {
     .unwrap();
     node.bind_shacl(
         &AllowAllAuthorizer,
-        &binding(&data, &shapes, ValidationPolicy::Advisory),
+        &binding(&data, &shapes, ShaclWritePolicy::Advisory),
     )
     .unwrap();
 
@@ -659,11 +659,11 @@ fn bindings_share_versions() {
     )
     .unwrap();
     for (root, policy) in [
-        (&enforce_one, ValidationPolicy::Enforce),
-        (&enforce_two, ValidationPolicy::Enforce),
-        (&advisory_one, ValidationPolicy::Advisory),
-        (&advisory_two, ValidationPolicy::Advisory),
-        (&disabled, ValidationPolicy::Disabled),
+        (&enforce_one, ShaclWritePolicy::Enforce),
+        (&enforce_two, ShaclWritePolicy::Enforce),
+        (&advisory_one, ShaclWritePolicy::Advisory),
+        (&advisory_two, ShaclWritePolicy::Advisory),
+        (&disabled, ShaclWritePolicy::Disabled),
     ] {
         node.bind_shacl(&AllowAllAuthorizer, &binding(&data, root, policy))
             .unwrap();

@@ -6,7 +6,7 @@ mod allocation;
 mod support;
 
 use allocation::AllocationInterval;
-use craqle::{QueryExecutionOptions, QueryFastPathMode};
+use craqle::{QueryFastPathMode, QueryOptions};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::Fixture;
 
@@ -107,9 +107,9 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     }
     group.finish();
 
-    let mut fast_options = QueryExecutionOptions::default();
+    let mut fast_options = QueryOptions::default();
     fast_options.fast_paths = QueryFastPathMode::Auto;
-    let mut generic_options = QueryExecutionOptions::default();
+    let mut generic_options = QueryOptions::default();
     generic_options.fast_paths = QueryFastPathMode::Disabled;
     let mut group = c.benchmark_group("sparql_fast_path_comparison");
     group.sample_size(config.sample_size);
@@ -178,7 +178,7 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     group.finish();
 
     let prepared = fixture.prepare_hot_path(0);
-    let options = QueryExecutionOptions::default();
+    let options = QueryOptions::default();
     let parsed_result = fixture.measure_hot_path(0);
     let prepared_result = fixture.run_hot_prepared(&prepared, &options);
     assert_eq!(parsed_result.results, prepared_result.results);

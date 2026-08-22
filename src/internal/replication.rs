@@ -30,6 +30,8 @@ pub enum UpdateError {
     ShaclValidationFailed(Vec<crate::ShaclValidationReport>),
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
+    #[error(transparent)]
+    UnsupportedRdfStarTerm(#[from] UnsupportedRdfStarTerm),
     #[error("prepared state is stale: {fence}")]
     StalePreparedState { fence: String },
     #[error("store: {0}")]
@@ -55,6 +57,7 @@ impl UpdateError {
             Self::ValidationFailed(_) | Self::InvalidChangeSet(_) => {
                 crate::CraqleErrorKind::InvalidInput
             }
+            Self::UnsupportedRdfStarTerm(_) => crate::CraqleErrorKind::Unsupported,
             #[cfg(feature = "shacl-core")]
             Self::Shacl(error) => error.kind(),
             #[cfg(feature = "shacl-core")]
@@ -627,7 +630,7 @@ impl ReplicationEngine {
                 self.evaluate_binding(status, work.data_version, shapes_version, changes);
             match evaluated {
                 Ok((binding, schema, report)) => {
-                    if !report.conforms {
+                    if !report.accepted_by_write_policy {
                         violations.push(report.clone());
                     }
                     let schema_fingerprint = schema.plan_fingerprint();
@@ -656,7 +659,7 @@ impl ReplicationEngine {
     fn binding_work(
         &self,
         graph: &GraphId,
-        policies: &[crate::ValidationPolicy],
+        policies: &[crate::ShaclWritePolicy],
     ) -> crate::store::Result<BindingWork<'_>> {
         let data_version = self.store.graph_version_digest(graph)?;
         let statuses = self
@@ -689,7 +692,7 @@ impl ReplicationEngine {
         let base = StoreReadView::new(&self.store);
         let advisory_statuses = statuses
             .iter()
-            .filter(|status| status.binding.policy == crate::ValidationPolicy::Advisory)
+            .filter(|status| status.binding.policy == crate::ShaclWritePolicy::Advisory)
             .cloned()
             .collect::<Vec<_>>();
         let advisory_work = (!advisory_statuses.is_empty()).then(|| BindingWork {
@@ -703,7 +706,7 @@ impl ReplicationEngine {
                 data_version,
                 statuses: statuses
                     .iter()
-                    .filter(|status| status.binding.policy == crate::ValidationPolicy::Enforce)
+                    .filter(|status| status.binding.policy == crate::ShaclWritePolicy::Enforce)
                     .cloned()
                     .collect(),
             };
@@ -884,7 +887,7 @@ impl ReplicationEngine {
             let previous_versions = status.shape_versions;
             let binding = status.binding;
             let shapes_graph = binding.shapes_graph.to_string();
-            if binding.policy == crate::ValidationPolicy::Disabled {
+            if binding.policy == crate::ShaclWritePolicy::Disabled {
                 continue;
             }
             let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
@@ -1184,7 +1187,7 @@ impl ReplicationEngine {
             self.store.stage_binding_status(&mut batch, &status)?;
         }
         if !current.iter().any(|status| {
-            status.binding.policy != crate::ValidationPolicy::Disabled
+            status.binding.policy != crate::ShaclWritePolicy::Disabled
                 && status.state == crate::ShaclValidationState::Pending
         }) {
             self.store.stage_shacl_settled(&mut batch, graph)?;
@@ -1371,9 +1374,19 @@ impl ReplicationEngine {
         changes: &[MaterializedQuadChange],
     ) -> Result<(), UpdateError> {
         for change in changes {
-            let change_graph = match change {
-                MaterializedQuadChange::Insert { graph, .. }
-                | MaterializedQuadChange::Delete { graph, .. } => graph,
+            let (change_graph, subject, predicate, object) = match change {
+                MaterializedQuadChange::Insert {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                }
+                | MaterializedQuadChange::Delete {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                } => (graph, subject, predicate, object),
             };
             if change_graph != graph {
                 return Err(UpdateError::InvalidChangeSet(format!(
@@ -1381,6 +1394,15 @@ impl ReplicationEngine {
                     graph.as_str(),
                     change_graph.as_str()
                 )));
+            }
+            if let Some(term) = [subject, predicate, object]
+                .into_iter()
+                .find(|term| term.is_rdf_star())
+            {
+                return Err(UnsupportedRdfStarTerm {
+                    term: term.0.clone(),
+                }
+                .into());
             }
         }
         Ok(())
@@ -1795,8 +1817,8 @@ impl ReplicationEngine {
                 let work = self.binding_work(
                     graph,
                     &[
-                        crate::ValidationPolicy::Advisory,
-                        crate::ValidationPolicy::Enforce,
+                        crate::ShaclWritePolicy::Advisory,
+                        crate::ShaclWritePolicy::Enforce,
                     ],
                 )?;
                 (!work.statuses.is_empty()).then_some(work)
@@ -2270,7 +2292,7 @@ mod tests {
     use super::*;
     use crate::search::SearchIndex;
     use crate::sync::{CraqleGraphSync, CraqleIrokleOptions, IrokleGraphSync};
-    use crate::{ShaclBinding, ShaclBindingOptions, ValidationPolicy};
+    use crate::{ShaclBinding, ShaclBindingOptions, ShaclWritePolicy};
 
     fn engine_at(dir: &std::path::Path) -> (Arc<GraphStore>, ReplicationEngine) {
         let store = Arc::new(GraphStore::open(dir).unwrap());
@@ -2282,7 +2304,7 @@ mod tests {
 
     fn pending_engine(
         dir: &std::path::Path,
-        policy: ValidationPolicy,
+        policy: ShaclWritePolicy,
     ) -> (Arc<GraphStore>, ReplicationEngine, GraphId, ShaclBinding) {
         let (store, engine) = engine_at(dir);
         let data = GraphId::new("urn:test:pending-data");
@@ -2356,9 +2378,22 @@ mod tests {
     }
 
     fn report(conforms: bool) -> crate::ShaclValidationReport {
+        let results = (!conforms)
+            .then(|| crate::ShaclValidationResult {
+                focus_node: crate::EncodedTerm("<urn:test:focus>".to_owned()),
+                value: None,
+                result_path: None,
+                source_shape: crate::EncodedTerm("<urn:test:shape>".to_owned()),
+                source_constraint_component: "urn:test:constraint".to_owned(),
+                severity: crate::EncodedTerm("<http://www.w3.org/ns/shacl#Violation>".to_owned()),
+                messages: Vec::new(),
+            })
+            .into_iter()
+            .collect();
         crate::ShaclValidationReport {
             conforms,
-            results: Vec::new(),
+            accepted_by_write_policy: conforms,
+            results,
             statistics: crate::ShaclValidationStatistics::default(),
         }
     }
@@ -2375,7 +2410,7 @@ mod tests {
                 binding: ShaclBinding {
                     data_graph: data.clone(),
                     shapes_graph: shapes.clone(),
-                    policy: ValidationPolicy::Advisory,
+                    policy: ShaclWritePolicy::Advisory,
                     validation_options: ShaclBindingOptions::default(),
                 },
                 state: crate::ShaclValidationState::Pending,
@@ -2469,7 +2504,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, engine, _data, _binding) =
-                pending_engine(dir.path(), ValidationPolicy::Advisory);
+                pending_engine(dir.path(), ShaclWritePolicy::Advisory);
             store.persist().unwrap();
             drop(engine);
             drop(store);
@@ -2490,7 +2525,7 @@ mod tests {
     fn settle_failure() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine, data, _binding) =
-            pending_engine(dir.path(), ValidationPolicy::Advisory);
+            pending_engine(dir.path(), ShaclWritePolicy::Advisory);
         let before = store.graph_snapshot(&data).unwrap();
 
         engine.arm_settle_failure();
@@ -2519,7 +2554,7 @@ mod tests {
 
     #[test]
     fn committed_local_settlement_failures_stay_pending_across_restart() {
-        for policy in [ValidationPolicy::Enforce, ValidationPolicy::Advisory] {
+        for policy in [ShaclWritePolicy::Enforce, ShaclWritePolicy::Advisory] {
             let dir = tempfile::tempdir().unwrap();
             let (data, snapshot) = {
                 let (store, engine, data, _binding) = pending_engine(dir.path(), policy);
@@ -2568,7 +2603,7 @@ mod tests {
     #[test]
     fn affected_graph_settlement_failure_does_not_reject_shape_write() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, engine, data, binding) = pending_engine(dir.path(), ValidationPolicy::Advisory);
+        let (store, engine, data, binding) = pending_engine(dir.path(), ShaclWritePolicy::Advisory);
         engine.replay_pending_bindings().unwrap();
         engine.arm_settle_failure();
         let shapes = binding.shapes_graph;
@@ -2605,7 +2640,7 @@ mod tests {
         let store_path = dir.path().join("store");
         let data = {
             let (store, engine, data, _binding) =
-                pending_engine(&store_path, ValidationPolicy::Advisory);
+                pending_engine(&store_path, ShaclWritePolicy::Advisory);
             store.persist().unwrap();
             drop(engine);
             drop(store);
@@ -2637,7 +2672,7 @@ mod tests {
         let store_path = dir.path().join("store");
         let data = {
             let (store, engine, data, _binding) =
-                pending_engine(&store_path, ValidationPolicy::Advisory);
+                pending_engine(&store_path, ShaclWritePolicy::Advisory);
             store.persist().unwrap();
             drop(engine);
             drop(store);
@@ -2687,7 +2722,7 @@ mod tests {
         let store_path = dir.path().join("store");
         {
             let (store, engine, _data, _binding) =
-                pending_engine(&store_path, ValidationPolicy::Advisory);
+                pending_engine(&store_path, ShaclWritePolicy::Advisory);
             store.persist().unwrap();
             drop(engine);
             drop(store);
@@ -2725,7 +2760,7 @@ mod tests {
         let receiver_dir = tempfile::tempdir().unwrap();
         let (_sender_store, sender) = engine_at(sender_dir.path());
         let (store, receiver, data, _binding) =
-            pending_engine(receiver_dir.path(), ValidationPolicy::Advisory);
+            pending_engine(receiver_dir.path(), ShaclWritePolicy::Advisory);
         receiver.replay_pending_bindings().unwrap();
         let shapes = GraphId::new("urn:test:pending-shapes");
         let batch = sender
@@ -2773,7 +2808,7 @@ mod tests {
         let store_path = receiver_dir.path().join("store");
         let (source, data, shapes) = {
             let (store, receiver, data, _binding) =
-                pending_engine(&store_path, ValidationPolicy::Advisory);
+                pending_engine(&store_path, ShaclWritePolicy::Advisory);
             receiver.replay_pending_bindings().unwrap();
             let shapes = GraphId::new("urn:test:pending-shapes");
             let batch = sender
@@ -2858,7 +2893,7 @@ mod tests {
     fn disabled_stamp() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine, data, _binding) =
-            pending_engine(dir.path(), ValidationPolicy::Disabled);
+            pending_engine(dir.path(), ShaclWritePolicy::Disabled);
         let before = store.graph_version_digest(&data).unwrap();
 
         engine
@@ -2886,7 +2921,7 @@ mod tests {
     #[test]
     fn commit_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, engine, data, _binding) = pending_engine(dir.path(), ValidationPolicy::Enforce);
+        let (store, engine, data, _binding) = pending_engine(dir.path(), ShaclWritePolicy::Enforce);
         engine.replay_pending_bindings().unwrap();
         let before = (
             store.graph_snapshot(&data).unwrap(),
@@ -2928,7 +2963,7 @@ mod tests {
     #[test]
     fn sync_reject() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, setup, data, binding) = pending_engine(dir.path(), ValidationPolicy::Enforce);
+        let (store, setup, data, binding) = pending_engine(dir.path(), ShaclWritePolicy::Enforce);
         let shapes = binding.shapes_graph.clone();
         let shape = EncodedTerm("<urn:test:pending-shape>".to_owned());
         let property = EncodedTerm("<urn:test:pending-property>".to_owned());
@@ -3068,7 +3103,7 @@ mod tests {
         let binding = ShaclBinding {
             data_graph: data.clone(),
             shapes_graph: root.clone(),
-            policy: ValidationPolicy::Advisory,
+            policy: ShaclWritePolicy::Advisory,
             validation_options: ShaclBindingOptions {
                 allow_local_imports: true,
                 ..ShaclBindingOptions::default()
@@ -3196,7 +3231,7 @@ mod tests {
         let binding = ShaclBinding {
             data_graph: data.clone(),
             shapes_graph: root.clone(),
-            policy: ValidationPolicy::Advisory,
+            policy: ShaclWritePolicy::Advisory,
             validation_options: ShaclBindingOptions {
                 allow_local_imports: true,
                 ..ShaclBindingOptions::default()
@@ -3358,7 +3393,7 @@ mod tests {
             let binding = ShaclBinding {
                 data_graph: data.clone(),
                 shapes_graph: root.clone(),
-                policy: ValidationPolicy::Advisory,
+                policy: ShaclWritePolicy::Advisory,
                 validation_options: ShaclBindingOptions {
                     allow_local_imports: imported,
                     ..ShaclBindingOptions::default()
@@ -3446,7 +3481,7 @@ mod tests {
         let binding = ShaclBinding {
             data_graph: data.clone(),
             shapes_graph: shapes.clone(),
-            policy: ValidationPolicy::Advisory,
+            policy: ShaclWritePolicy::Advisory,
             validation_options: ShaclBindingOptions::default(),
         };
         let old_versions = vec![(shapes.clone(), shapes_version)];

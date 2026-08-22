@@ -101,7 +101,7 @@ use oxrdf::{NamedNode, Term};
 pub use crate::core::{
     ActorId, Batch, CrateViolation, EncodedTerm, EventId, GraphDiagnostics, GraphId, GraphPolicy,
     GraphTombstone, MaterializedQuadChange, PolicyTag, PredicateFilter, TaggedGraphPolicy,
-    VectorClock, vocab,
+    UnsupportedRdfStarTerm, VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
@@ -117,15 +117,15 @@ pub use crate::search::SearchHit;
 pub use crate::shacl::{
     CompiledShaclSchema, PendingReplayFailure, PendingReplayOutcome, PendingReplayPolicy,
     PendingReplayStatistics, PendingShaclQueueStatus, SHACL_COMPILER_MODEL_VERSION, ShaclBinding,
-    ShaclBindingOptions, ShaclBindingStatus, ShaclCompileOptions, ShaclCompileStatistics,
-    ShaclError, ShaclExecutionMode, ShaclMessage, ShaclProfile, ShaclRuntimeStatistics,
-    ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult, ShaclValidationState,
-    ShaclValidationStatistics, ValidationPolicy,
+    ShaclBindingOptions, ShaclBindingStatus, ShaclBlockingSeverity, ShaclCompileOptions,
+    ShaclCompileStatistics, ShaclError, ShaclEvaluationMode, ShaclMessage, ShaclProfile,
+    ShaclRuntimeStatistics, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
+    ShaclValidationState, ShaclValidationStatistics, ShaclWritePolicy,
 };
 pub use crate::sparql::{
-    PreparedQuery, QueryExecution, QueryExecutionOptions, QueryExecutionStatistics, QueryLimits,
-    QueryLogicalOperator, QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryResults,
-    UpdateLimits, UpdateOptions,
+    PreparedQuery, QueryExecution, QueryExecutionStatistics, QueryLimits, QueryLogicalOperator,
+    QueryOptions, QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryResults, UpdateLimits,
+    UpdateOptions,
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{
@@ -247,6 +247,8 @@ pub enum CraqleError {
     SearchWorker(String),
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
+    #[error(transparent)]
+    UnsupportedRdfStarTerm(#[from] UnsupportedRdfStarTerm),
     #[error("replication record rejected: {reason}")]
     ReplicationRejected {
         error_kind: CraqleErrorKind,
@@ -287,6 +289,7 @@ impl CraqleError {
             Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
             Self::Sync(error) => error.kind(),
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
+            Self::UnsupportedRdfStarTerm(_) => CraqleErrorKind::Unsupported,
             Self::ReplicationRejected { error_kind, .. } => *error_kind,
         }
     }
@@ -506,6 +509,7 @@ pub struct RoCratePolicyStatistics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoCratePolicyReport {
     pub conforms: bool,
+    pub accepted_by_write_policy: bool,
     pub detected_version: RoCrateVersion,
     pub document_digest: [u8; 32],
     pub rocrate_violations: Vec<CrateViolation>,
@@ -1202,8 +1206,12 @@ impl CraqleNode {
 
         self.ensure_prepared_document_current(document)?;
         self.ensure_rocrate_policy_current(policy)?;
+        let conforms = document.structural_findings.is_empty() && shacl.conforms;
+        let accepted_by_write_policy =
+            document.structural_findings.is_empty() && shacl.accepted_by_write_policy;
         Ok(RoCratePolicyReport {
-            conforms: document.structural_findings.is_empty() && shacl.conforms,
+            conforms,
+            accepted_by_write_policy,
             detected_version: document.detected_version,
             document_digest: document.document_digest,
             rocrate_violations: document.structural_findings.clone(),
@@ -1247,7 +1255,7 @@ impl CraqleNode {
                     policy,
                     &RoCratePolicyOptions::default(),
                 )?;
-                if mode == PreparedCommitMode::Enforce && !report.conforms {
+                if mode == PreparedCommitMode::Enforce && !report.accepted_by_write_policy {
                     return Err(CraqleError::RoCratePolicyRejected(Box::new(report)));
                 }
                 Some(report)
@@ -1323,7 +1331,7 @@ impl CraqleNode {
     ) -> Result<ShaclBindingStatus> {
         let _commit_guard = self.store.graph_commit_guard(&binding.data_graph);
         self.ensure_graph_action(&binding.data_graph, auth, Action::Write)?;
-        if binding.policy != ValidationPolicy::Disabled {
+        if binding.policy != ShaclWritePolicy::Disabled {
             self.ensure_graph_action(&binding.data_graph, auth, Action::Read)?;
         }
         self.authorize_shape_graphs(auth, &binding.shapes_graph)?;
@@ -1337,7 +1345,7 @@ impl CraqleNode {
         for _ in 0..3 {
             let data_version = self.store.graph_version_digest(&binding.data_graph)?;
             let shapes_version = self.store.graph_version_digest(&binding.shapes_graph)?;
-            let status = if binding.policy == ValidationPolicy::Disabled {
+            let status = if binding.policy == ShaclWritePolicy::Disabled {
                 ShaclBindingStatus {
                     binding: binding.clone(),
                     state: ShaclValidationState::Pending,
@@ -1447,7 +1455,7 @@ impl CraqleNode {
                     self.ensure_graph_action(graph, auth, Action::Read)?;
                 }
             }
-            if status.binding.policy == ValidationPolicy::Disabled {
+            if status.binding.policy == ShaclWritePolicy::Disabled {
                 if matches!(
                     status.state,
                     ShaclValidationState::Valid | ShaclValidationState::Invalid
@@ -2932,7 +2940,7 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         query: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryExecution> {
         Ok(self.sparql.execute_prepared_with_snapshot_visibility(
             query,
@@ -2954,7 +2962,7 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         query: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryPlan> {
         Ok(self.sparql.explain_prepared_with_snapshot_visibility(
             query,
@@ -2974,7 +2982,7 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         query: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryPlan> {
         Ok(self.execute_prepared(auth, query, options)?.statistics.plan)
     }
@@ -2990,7 +2998,7 @@ impl CraqleNode {
         sparql: &str,
     ) -> Result<QueryResults> {
         Ok(self
-            .query_in_graphs_with_options(auth, graphs, sparql, &QueryExecutionOptions::default())?
+            .query_in_graphs_with_options(auth, graphs, sparql, &QueryOptions::default())?
             .results)
     }
 
@@ -3000,7 +3008,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         graphs: &[GraphId],
         sparql: &str,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryExecution> {
         let query = self.prepare_query(sparql)?;
         self.execute_prepared_in_graphs(auth, graphs, &query, options)
@@ -3012,7 +3020,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         graphs: &[GraphId],
         query: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryExecution> {
         Ok(self
             .sparql
@@ -3025,7 +3033,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         graphs: &[GraphId],
         query: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryPlan> {
         Ok(self
             .sparql
@@ -3038,7 +3046,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         graphs: &[GraphId],
         query: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryPlan> {
         Ok(self
             .execute_prepared_in_graphs(auth, graphs, query, options)?
@@ -3977,7 +3985,7 @@ mod tests {
         node: &CraqleNode,
         prefix: &str,
         count: usize,
-        policy: ValidationPolicy,
+        policy: ShaclWritePolicy,
     ) -> Vec<(GraphId, String)> {
         let data_graphs = independent_graph_ids(prefix, count);
         let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -4039,10 +4047,10 @@ mod tests {
     fn independent_shacl_writers_validate_concurrently() {
         for count in [1usize, 2, 4, 8, 16] {
             for (label, policy, rejected) in [
-                ("disabled", ValidationPolicy::Disabled, false),
-                ("advisory", ValidationPolicy::Advisory, false),
-                ("enforce-valid", ValidationPolicy::Enforce, false),
-                ("enforce-rejected", ValidationPolicy::Enforce, true),
+                ("disabled", ShaclWritePolicy::Disabled, false),
+                ("advisory", ShaclWritePolicy::Advisory, false),
+                ("enforce-valid", ShaclWritePolicy::Enforce, false),
+                ("enforce-rejected", ShaclWritePolicy::Enforce, true),
             ] {
                 let directory = tempfile::tempdir().unwrap();
                 let node = Arc::new(
@@ -4089,7 +4097,7 @@ mod tests {
                 let max_active = node.store.validation_max_active();
                 node.store.set_validation_stall(Duration::ZERO);
                 assert!(results.iter().all(|accepted| *accepted != rejected));
-                if policy == ValidationPolicy::Disabled {
+                if policy == ShaclWritePolicy::Disabled {
                     assert_eq!(max_active, 0);
                 } else {
                     assert!(max_active >= count.min(2));
@@ -4110,7 +4118,7 @@ mod tests {
             .unwrap(),
         );
         let (graph, focus) =
-            bound_policy_graphs(&node, "same-graph-writers", 1, ValidationPolicy::Enforce)
+            bound_policy_graphs(&node, "same-graph-writers", 1, ShaclWritePolicy::Enforce)
                 .pop()
                 .unwrap();
         node.store.set_validation_stall(Duration::from_millis(40));
@@ -4238,7 +4246,7 @@ mod tests {
                 &ShaclBinding {
                     data_graph: data.clone(),
                     shapes_graph: root,
-                    policy: ValidationPolicy::Enforce,
+                    policy: ShaclWritePolicy::Enforce,
                     validation_options: ShaclBindingOptions {
                         allow_local_imports: imported,
                         ..ShaclBindingOptions::default()
@@ -4295,7 +4303,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let node = sync_node(&directory);
         let (data, focus) =
-            bound_policy_graphs(&node, "sync-settlement", 1, ValidationPolicy::Enforce)
+            bound_policy_graphs(&node, "sync-settlement", 1, ShaclWritePolicy::Enforce)
                 .pop()
                 .unwrap();
         node.replication.arm_settle_failure();
@@ -5775,7 +5783,7 @@ mod tests {
                 &ShaclBinding {
                     data_graph: data.clone(),
                     shapes_graph: shapes.clone(),
-                    policy: ValidationPolicy::Advisory,
+                    policy: ShaclWritePolicy::Advisory,
                     validation_options: ShaclBindingOptions::default(),
                 },
             )
@@ -5839,12 +5847,13 @@ mod tests {
                             binding: ShaclBinding {
                                 data_graph: data.clone(),
                                 shapes_graph: shapes.clone(),
-                                policy: ValidationPolicy::Advisory,
+                                policy: ShaclWritePolicy::Advisory,
                                 validation_options: ShaclBindingOptions::default(),
                             },
                             state: ShaclValidationState::Valid,
                             report: Some(ShaclValidationReport {
                                 conforms: true,
+                                accepted_by_write_policy: true,
                                 results: Vec::new(),
                                 statistics: ShaclValidationStatistics::default(),
                             }),

@@ -3,11 +3,12 @@ resolver = "3"
 
 [workspace.dependencies]
 # RDF ecosystem
-oxrdf = { version = "0.3.3", features = ["serde"] }
+oxrdf = { version = "0.3.3", features = ["rdf-12", "serde"] }
+oxrdfio = { version = "0.2.5", features = ["rdf-12"] }
 oxjsonld = "0.2.5"
 oxsdatatypes = "0.2.2"
-spargebra = "0.4.6"
-spareval = { version = "0.2.6", features = ["sep-0006"] }
+spargebra = { version = "0.4.6", features = ["sparql-12"] }
+spareval = { version = "0.2.6", features = ["sep-0006", "sparql-12"] }
 
 # Storage
 fjall = "3.1.8"
@@ -79,6 +80,7 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f
     "fjall",
 ] }
 oxrdf = { workspace = true }
+oxrdfio = { workspace = true }
 oxjsonld = { workspace = true }
 oxsdatatypes = { workspace = true, optional = true }
 postcard = { workspace = true }
@@ -104,7 +106,7 @@ criterion = "0.8.2"
 proptest = { workspace = true }
 tempfile = { workspace = true }
 iroh = "1.0.3"
-oxigraph = { version = "=0.5.9", default-features = false }
+oxigraph = { version = "=0.5.9", default-features = false, features = ["rdf-12"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]

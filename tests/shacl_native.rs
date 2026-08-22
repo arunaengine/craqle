@@ -36,6 +36,7 @@ fn literal(value: &str) -> String {
     EncodedTerm::from_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
         value,
     )))
+    .unwrap()
     .0
 }
 
@@ -82,7 +83,7 @@ fn insert_ntriples(node: &CraqleNode, graph: &GraphId, text: &str) {
             graph: graph.clone(),
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
-            object: EncodedTerm::from_term(&quad.object),
+            object: EncodedTerm::from_term(&quad.object).unwrap(),
         })
         .collect();
     node.apply_changes_unchecked(graph, changes).unwrap();
@@ -181,9 +182,11 @@ fn encode_rudof_object(object: &Object) -> String {
                     oxrdf::NamedNode::new_unchecked(datatype.as_str()),
                 )
             };
-            EncodedTerm::from_term(&oxrdf::Term::Literal(value)).0
+            EncodedTerm::from_term(&oxrdf::Term::Literal(value))
+                .unwrap()
+                .0
         }
-        Object::Triple { .. } => panic!("RDF-star is outside CraqleFastV1"),
+        Object::Triple { .. } => panic!("RDF-star is outside CoreSubsetV1"),
     }
 }
 
@@ -1279,7 +1282,7 @@ fn skip_deactivated_shapes() {
 }
 
 #[test]
-fn reject_logical_cycles() {
+fn recursive_shape_rejection() {
     let (_database, node) = node();
     let shapes = GraphId::new("urn:test:shacl:native:cycle:shapes");
     let shape = iri("urn:test:cycle:shape");
@@ -1302,7 +1305,32 @@ fn reject_logical_cycles() {
         .unwrap_err();
     assert!(matches!(
         error,
-        CraqleError::Shacl(ShaclError::IllFormedShapes { .. })
+        CraqleError::Shacl(ShaclError::UnsupportedRecursiveShape { .. })
+    ));
+
+    let indirect = GraphId::new("urn:test:shacl:native:cycle:indirect");
+    let other = iri("urn:test:cycle:other");
+    insert(
+        &node,
+        &indirect,
+        &[
+            (&shape, RDF_TYPE, &sh("NodeShape")),
+            (&shape, &sh("targetNode"), &focus),
+            (&shape, &sh("node"), &other),
+            (&other, RDF_TYPE, &sh("NodeShape")),
+            (&other, &sh("node"), &shape),
+        ],
+    );
+    let error = node
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &indirect,
+            &ShaclCompileOptions::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CraqleError::Shacl(ShaclError::UnsupportedRecursiveShape { .. })
     ));
 }
 

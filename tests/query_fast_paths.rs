@@ -3,8 +3,8 @@ mod support;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId,
-    JoinKind, JoinMode, MaterializedQuadChange, QueryExecution, QueryExecutionOptions,
-    QueryFastPathKind, QueryFastPathMode, QueryResults,
+    JoinKind, JoinMode, MaterializedQuadChange, QueryExecution, QueryFastPathKind,
+    QueryFastPathMode, QueryOptions, QueryResults,
 };
 
 fn iri(value: &str) -> EncodedTerm {
@@ -36,7 +36,7 @@ fn run(
     fast_paths: QueryFastPathMode,
 ) -> QueryExecution {
     let query = node.prepare_query(query).unwrap();
-    let mut options = QueryExecutionOptions::default();
+    let mut options = QueryOptions::default();
     options.fast_paths = fast_paths;
     node.execute_prepared_in_graphs(&AllowAllAuthorizer, graphs, &query, &options)
         .unwrap()
@@ -274,11 +274,7 @@ fn fast_paths_fail_closed() {
         .prepare_query("ASK { <urn:test:fast:s> <urn:test:fast:p> <urn:test:fast:o> }")
         .unwrap();
     let denied = node
-        .execute_prepared(
-            &DenyAllAuthorizer,
-            &prepared,
-            &QueryExecutionOptions::default(),
-        )
+        .execute_prepared(&DenyAllAuthorizer, &prepared, &QueryOptions::default())
         .unwrap();
     assert_eq!(denied.results, QueryResults::Boolean(false));
     assert_eq!(denied.statistics.fast_path, Some(QueryFastPathKind::Ask));
@@ -286,7 +282,7 @@ fn fast_paths_fail_closed() {
     let star = node
         .prepare_query("SELECT ?s WHERE { ?s <urn:test:fast:p> ?o ; <urn:test:fast:q> ?q }")
         .unwrap();
-    let mut property_options = QueryExecutionOptions::default();
+    let mut property_options = QueryOptions::default();
     property_options.join_mode = craqle::JoinMode::ForcePropertyStar;
     node.execute_prepared_in_graphs(
         &AllowAllAuthorizer,
@@ -406,7 +402,7 @@ fn fixed_predicate_triangle_ask_uses_bounded_query_ids() {
     let prepared = node
         .prepare_query("ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a }")
         .unwrap();
-    let mut limited = QueryExecutionOptions::default();
+    let mut limited = QueryOptions::default();
     limited.limits.max_hash_entries = 1;
     let error = node
         .execute_prepared_in_graphs(&AllowAllAuthorizer, &graphs, &prepared, &limited)
@@ -709,7 +705,7 @@ fn subject_set_counts_cover_exists_not_exists_and_minus() {
              ?s <urn:p> ?outer FILTER EXISTS { ?s <urn:q> ?inner } }",
         )
         .unwrap();
-    let mut limited = QueryExecutionOptions::default();
+    let mut limited = QueryOptions::default();
     limited.limits.max_hash_entries = 1;
     let error = node
         .execute_prepared_in_graphs(&AllowAllAuthorizer, &graphs, &prepared, &limited)
@@ -754,7 +750,7 @@ fn linear_chain_count_uses_explicit_cross_domains() {
         ] {
             let prepared = node.prepare_query(&query).unwrap();
             let execute = |fast_paths| {
-                let mut options = QueryExecutionOptions::default();
+                let mut options = QueryOptions::default();
                 options.fast_paths = fast_paths;
                 options.join_mode = JoinMode::ForceHash;
                 node.execute_prepared_in_graphs(
@@ -811,7 +807,7 @@ fn hash_count_multiplicity() {
         .unwrap();
 
     let execute = |join_mode| {
-        let mut options = QueryExecutionOptions::default();
+        let mut options = QueryOptions::default();
         options.join_mode = join_mode;
         node.execute_prepared_in_graphs(
             &AllowAllAuthorizer,
@@ -881,7 +877,7 @@ fn hash_count_multiplicity() {
         );
     }
 
-    let mut limited = QueryExecutionOptions::default();
+    let mut limited = QueryOptions::default();
     limited.join_mode = JoinMode::ForceHash;
     limited.limits.max_hash_entries = 1;
     let error = node
@@ -976,7 +972,7 @@ fn randomized_paths_match() {
             ))
             .unwrap();
         let execute_hash = |fast_paths| {
-            let mut options = QueryExecutionOptions::default();
+            let mut options = QueryOptions::default();
             options.fast_paths = fast_paths;
             options.join_mode = JoinMode::ForceHash;
             node.execute_prepared_in_graphs(

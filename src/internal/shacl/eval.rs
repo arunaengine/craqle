@@ -122,9 +122,12 @@ pub(crate) fn validate_view<V: RdfReadView>(
         }
     }
     validator.statistics.constraint_time = constraint_start.elapsed();
-    validator
-        .report
-        .finish(validator.view, validator.context, validator.statistics)
+    validator.report.finish(
+        validator.view,
+        validator.context,
+        validator.statistics,
+        options.blocking_severity,
+    )
 }
 
 struct Validator<'view, 'context, 'options, V> {

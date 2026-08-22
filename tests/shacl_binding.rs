@@ -6,7 +6,7 @@ use crate::support::TestWriteExt as _;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
     MaterializedQuadChange, ShaclBinding, ShaclBindingOptions, ShaclValidationState,
-    ValidationPolicy,
+    ShaclWritePolicy,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -116,7 +116,7 @@ fn imports_settle_invalid() {
     let binding = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: root.clone(),
-        policy: ValidationPolicy::Advisory,
+        policy: ShaclWritePolicy::Advisory,
         validation_options: ShaclBindingOptions {
             allow_local_imports: true,
             ..ShaclBindingOptions::default()
@@ -212,7 +212,7 @@ fn deleted_shapes_block() {
         let binding = ShaclBinding {
             data_graph: data.clone(),
             shapes_graph: root.clone(),
-            policy: ValidationPolicy::Enforce,
+            policy: ShaclWritePolicy::Enforce,
             validation_options: ShaclBindingOptions {
                 allow_local_imports: imported_shapes,
                 ..ShaclBindingOptions::default()
@@ -307,7 +307,7 @@ fn import_data_settles() {
     let binding = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: root,
-        policy: ValidationPolicy::Enforce,
+        policy: ShaclWritePolicy::Enforce,
         validation_options: ShaclBindingOptions {
             allow_local_imports: true,
             ..ShaclBindingOptions::default()
@@ -403,7 +403,7 @@ fn data_binding_cleanup() {
     let binding = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: root.clone(),
-        policy: ValidationPolicy::Advisory,
+        policy: ShaclWritePolicy::Advisory,
         validation_options: ShaclBindingOptions {
             allow_local_imports: true,
             ..ShaclBindingOptions::default()
@@ -447,23 +447,28 @@ fn data_binding_cleanup() {
     )
     .unwrap();
 
+    let replacement = GraphId::new("urn:test:delete-binding-replacement");
     node.apply_changes_unchecked(
-        &data,
+        &replacement,
         vec![add(
-            &data,
-            "urn:test:delete-binding-recreated",
+            &replacement,
+            "urn:test:delete-binding-replacement",
             "urn:test:delete-binding-note",
-            iri("urn:test:delete-binding-recreated-value"),
+            iri("urn:test:delete-binding-replacement-value"),
         )],
     )
     .unwrap();
-    assert!(node.contains_graph(&data).unwrap());
+    assert!(node.contains_graph(&replacement).unwrap());
     assert!(
-        node.shacl_binding_statuses(&craqle::AllowAllAuthorizer, &data)
+        node.shacl_binding_statuses(&craqle::AllowAllAuthorizer, &replacement)
             .unwrap()
             .is_empty()
     );
 
+    let binding = ShaclBinding {
+        data_graph: replacement,
+        ..binding
+    };
     let fresh = node
         .bind_shacl(&craqle::AllowAllAuthorizer, &binding)
         .unwrap();

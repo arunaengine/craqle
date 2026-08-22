@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleFjallPersistMode, CraqleNode, CraqleOptions, EncodedTerm,
-    GraphId, MaterializedQuadChange, PreparedQuery, QueryExecution, QueryExecutionOptions,
-    QueryExecutionStatistics, QueryReadMode, QueryResults,
+    GraphId, MaterializedQuadChange, PreparedQuery, QueryExecution, QueryExecutionStatistics,
+    QueryOptions, QueryReadMode, QueryResults,
 };
 use oxrdf::Term;
 
@@ -581,7 +581,7 @@ impl Fixture {
                 &AllowAllAuthorizer,
                 &self.visible_graphs,
                 &case.sparql,
-                &QueryExecutionOptions::default(),
+                &QueryOptions::default(),
             )
             .unwrap_or_else(|_| panic!("{} diagnostic query failed", case.label))
     }
@@ -589,7 +589,7 @@ impl Fixture {
     pub fn run_hot_prepared(
         &self,
         prepared: &PreparedQuery,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> QueryExecution {
         self.node
             .execute_prepared_in_graphs(
@@ -614,7 +614,7 @@ impl Fixture {
             .node
             .prepare_query(&case.sparql)
             .unwrap_or_else(|_| panic!("{} query preparation failed", case.label));
-        let mut options = QueryExecutionOptions::default();
+        let mut options = QueryOptions::default();
         options.read_mode = read_mode;
         let execution = self
             .node

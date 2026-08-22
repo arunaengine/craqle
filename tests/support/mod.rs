@@ -244,7 +244,7 @@ where
         }
     };
     let query = node.prepare_query(sparql)?;
-    let mut options = QueryExecutionOptions::default();
+    let mut options = QueryOptions::default();
     options.optimize = optimize;
     Ok(node.execute_prepared(&auth, &query, &options)?.results)
 }

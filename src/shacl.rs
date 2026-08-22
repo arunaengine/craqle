@@ -9,7 +9,15 @@ use crate::{CrateViolation, EncodedTerm, QueryCancellation, ReadStatistics, RoCr
 /// SHACL feature profile implemented by Craqle's native validator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ShaclProfile {
-    CraqleFastV1,
+    /// Craqle SHACL Core Subset v1.
+    ///
+    /// Supports node, class, subjects-of, objects-of, and implicit-class
+    /// targets; direct, inverse, sequence, alternative, zero-or-one,
+    /// zero-or-more, and one-or-more paths; and the native constraint forms
+    /// documented in the README. Recursive shapes, SHACL-SPARQL, SHACL-JS,
+    /// SHACL-AF, custom components and targets, reifier shapes, RDF-star, and
+    /// remote imports are unsupported.
+    CoreSubsetV1,
 }
 
 /// Persisted model version used by the native SHACL compiler.
@@ -88,11 +96,11 @@ pub struct ShaclRuntimeStatistics {
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
 )]
-pub enum ShaclExecutionMode {
+pub enum ShaclEvaluationMode {
     #[default]
     Auto,
-    ForceDelta,
-    ForceFull,
+    Delta,
+    Full,
 }
 
 /// Policy applied to local writes for one data/shapes graph binding.
@@ -100,11 +108,23 @@ pub enum ShaclExecutionMode {
     Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[non_exhaustive]
-pub enum ValidationPolicy {
+pub enum ShaclWritePolicy {
     Enforce,
     Advisory,
     #[default]
     Disabled,
+}
+
+/// Minimum result severity that rejects an enforcing write.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum ShaclBlockingSeverity {
+    AnyResult,
+    WarningOrViolation,
+    #[default]
+    ViolationOnly,
 }
 
 /// Persistable limits and compiler options for one SHACL binding.
@@ -115,6 +135,7 @@ pub struct ShaclBindingOptions {
     pub max_results: usize,
     pub max_path_edges: u64,
     pub max_path_depth: usize,
+    pub blocking_severity: ShaclBlockingSeverity,
 }
 
 impl Default for ShaclBindingOptions {
@@ -126,6 +147,7 @@ impl Default for ShaclBindingOptions {
             max_results: validation.max_results,
             max_path_edges: validation.max_path_edges,
             max_path_depth: validation.max_path_depth,
+            blocking_severity: validation.blocking_severity,
         }
     }
 }
@@ -144,7 +166,8 @@ impl ShaclBindingOptions {
             max_results: self.max_results,
             max_path_edges: self.max_path_edges,
             max_path_depth: self.max_path_depth,
-            execution_mode: ShaclExecutionMode::Auto,
+            execution_mode: ShaclEvaluationMode::Auto,
+            blocking_severity: self.blocking_severity,
         }
     }
 }
@@ -154,7 +177,7 @@ impl ShaclBindingOptions {
 pub struct ShaclBinding {
     pub data_graph: crate::GraphId,
     pub shapes_graph: crate::GraphId,
-    pub policy: ValidationPolicy,
+    pub policy: ShaclWritePolicy,
     pub validation_options: ShaclBindingOptions,
 }
 
@@ -206,7 +229,8 @@ pub struct ShaclValidationOptions {
     pub max_results: usize,
     pub max_path_edges: u64,
     pub max_path_depth: usize,
-    pub execution_mode: ShaclExecutionMode,
+    pub execution_mode: ShaclEvaluationMode,
+    pub blocking_severity: ShaclBlockingSeverity,
 }
 
 impl Default for ShaclValidationOptions {
@@ -216,7 +240,8 @@ impl Default for ShaclValidationOptions {
             max_results: 10_000,
             max_path_edges: 1_000_000,
             max_path_depth: 128,
-            execution_mode: ShaclExecutionMode::Auto,
+            execution_mode: ShaclEvaluationMode::Auto,
+            blocking_severity: ShaclBlockingSeverity::ViolationOnly,
         }
     }
 }
@@ -225,7 +250,7 @@ impl Default for ShaclValidationOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclValidationStatistics {
     /// Concrete path that completed this validation.
-    pub selected_mode: ShaclExecutionMode,
+    pub selected_mode: ShaclEvaluationMode,
     pub estimated_delta_work: u64,
     pub estimated_full_work: u64,
     pub estimated_affected_shapes: u64,
@@ -274,11 +299,20 @@ pub struct ShaclValidationResult {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclValidationReport {
     pub conforms: bool,
+    pub accepted_by_write_policy: bool,
     pub results: Vec<ShaclValidationResult>,
     pub statistics: ShaclValidationStatistics,
 }
 
 impl ShaclValidationReport {
+    pub(crate) fn refresh_outcomes(&mut self, threshold: ShaclBlockingSeverity) {
+        self.conforms = self.results.is_empty();
+        self.accepted_by_write_policy = !self
+            .results
+            .iter()
+            .any(|result| severity_blocks(&result.severity, threshold));
+    }
+
     pub fn crate_violations(&self) -> Vec<CrateViolation> {
         self.results
             .iter()
@@ -307,6 +341,23 @@ impl ShaclValidationReport {
     }
 }
 
+fn severity_blocks(severity: &EncodedTerm, threshold: ShaclBlockingSeverity) -> bool {
+    let rank = match severity.0.as_str() {
+        concat!("<", "http://www.w3.org/ns/shacl#", "Trace>") => Some(0),
+        concat!("<", "http://www.w3.org/ns/shacl#", "Debug>") => Some(1),
+        concat!("<", "http://www.w3.org/ns/shacl#", "Info>") => Some(2),
+        concat!("<", "http://www.w3.org/ns/shacl#", "Warning>") => Some(3),
+        concat!("<", "http://www.w3.org/ns/shacl#", "Violation>") => Some(4),
+        _ => None,
+    };
+    let minimum = match threshold {
+        ShaclBlockingSeverity::AnyResult => 0,
+        ShaclBlockingSeverity::WarningOrViolation => 3,
+        ShaclBlockingSeverity::ViolationOnly => 4,
+    };
+    rank.is_none_or(|rank| rank >= minimum)
+}
+
 /// Immutable, portable SHACL plan produced through Rudof's parser.
 #[derive(Clone, Debug)]
 pub struct CompiledShaclSchema {
@@ -333,7 +384,7 @@ impl CompiledShaclSchema {
     }
 
     pub fn profile(&self) -> ShaclProfile {
-        ShaclProfile::CraqleFastV1
+        ShaclProfile::CoreSubsetV1
     }
 
     pub fn shape_count(&self) -> usize {
@@ -364,7 +415,9 @@ pub enum ShaclError {
     ImportNotLocal { graph: String, import: String },
     #[error("owl:imports cycle: {graphs:?}")]
     ImportCycle { graphs: Vec<String> },
-    #[error("RDF-star term is unsupported in SHACL Performance v1: {term}")]
+    #[error("recursive SHACL shape `{shape}` is unsupported")]
+    UnsupportedRecursiveShape { shape: String },
+    #[error("RDF-star term is unsupported in Craqle SHACL Core Subset v1: {term}")]
     UnsupportedRdfStarTerm { term: String },
     #[error("SHACL data graph `{graph}` does not exist")]
     DataGraphNotFound { graph: String },
@@ -399,6 +452,7 @@ impl ShaclError {
             Self::UnsupportedComponent { .. }
             | Self::ImportsDisabled { .. }
             | Self::ImportNotLocal { .. }
+            | Self::UnsupportedRecursiveShape { .. }
             | Self::UnsupportedRdfStarTerm { .. }
             | Self::ShapesGraphMutationUnsupported { .. }
             | Self::DeltaExecutionUnavailable { .. } => crate::CraqleErrorKind::Unsupported,

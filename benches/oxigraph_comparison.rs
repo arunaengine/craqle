@@ -18,7 +18,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use craqle::{CraqleFjallPersistMode, QueryExecutionOptions, QueryResults as CraqleResults};
+use craqle::{CraqleFjallPersistMode, QueryOptions, QueryResults as CraqleResults};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxigraph::sparql::{PreparedSparqlQuery, QueryResults as OxigraphResults, SparqlEvaluator};
 use oxigraph::store::Store;
@@ -270,7 +270,7 @@ fn compare_query(
     let craqle_digest = canonical_digest(&craqle_canonical);
     let oxigraph_digest = canonical_digest(&oxigraph_canonical);
 
-    let options = QueryExecutionOptions::default();
+    let options = QueryOptions::default();
     black_box(fixture.run_hot_prepared(&craqle_prepared, &options).results);
     black_box(consume_oxigraph(
         oxigraph_prepared
@@ -331,7 +331,7 @@ fn prepare_oxigraph(query: &str, fixture: &Fixture) -> PreparedSparqlQuery {
 fn time_craqle(
     fixture: &Fixture,
     prepared: &craqle::PreparedQuery,
-    options: &QueryExecutionOptions,
+    options: &QueryOptions,
 ) -> Duration {
     let started = Instant::now();
     let execution = fixture.run_hot_prepared(prepared, options);

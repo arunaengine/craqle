@@ -6,7 +6,7 @@ searching, and replicating RO-Crates as RDF named graphs.
 The model is simple: one RO-Crate is one named RDF graph. RO-Crate JSON-LD and SPARQL both work against that same graph state. Full-text search is built on Tantivy. Irokle graph topics provide the durable operation log and sync obligations, while Craqle reduces those events into an OR-Set RDF projection. Invalid visible RO-Crates are not exported.
 
 `0.2.0-rc.1` is a release candidate for the supported 0.2 API, disk-data,
-SPARQL, `CraqleFastV1` SHACL, and RO-Crate contracts. It is not the final 0.2
+SPARQL, `CoreSubsetV1` SHACL, and RO-Crate contracts. It is not the final 0.2
 release.
 
 Within the 0.2.x series:
@@ -29,7 +29,7 @@ Within the 0.2.x series:
 | RO-Crate 1.1, 1.2, and 1.3 import/export | Supported within documented behavior |
 | Local SPARQL | Supported |
 | qv query indexes | Supported derived data |
-| `CraqleFastV1` SHACL | Supported bounded profile |
+| `CoreSubsetV1` SHACL | Supported bounded profile |
 | Enforce and Advisory policies | Supported |
 | Full SHACL Core | Not claimed |
 | SHACL-SPARQL, JS, AF, remote imports | Unsupported |
@@ -51,7 +51,7 @@ semver analysis in CI.
 - create and update RO-Crates as named RDF graphs
 - import and export RO-Crate JSON-LD
 - query and update with SPARQL
-- compile, bind, and evaluate the optional native `CraqleFastV1` SHACL profile
+- compile, bind, and evaluate the optional native `CoreSubsetV1` SHACL profile
 - do full-text search with Tantivy
 - replicate changes over one Irokle topic per graph
 - reject invalid visible crate states on export
@@ -134,7 +134,7 @@ persisted status:
 ```rust
 use craqle::{
     AllowAllAuthorizer, ShaclBinding, ShaclBindingOptions,
-    ShaclCompileOptions, ShaclValidationOptions, ValidationPolicy,
+    ShaclCompileOptions, ShaclValidationOptions, ShaclWritePolicy,
 };
 
 let auth = AllowAllAuthorizer;
@@ -149,7 +149,7 @@ let report = node.validate_shacl(
 let binding = ShaclBinding {
     data_graph: data_graph.clone(),
     shapes_graph: shapes_graph.clone(),
-    policy: ValidationPolicy::Enforce,
+    policy: ShaclWritePolicy::Enforce,
     validation_options: ShaclBindingOptions::default(),
 };
 let initial = node.bind_shacl(&auth, &binding)?;
@@ -162,7 +162,7 @@ to the source transition. `Disabled` skips SHACL for that binding; the existing
 RO-Crate checks still apply. Replicated CRDT records always apply before local
 SHACL settlement.
 
-`CraqleFastV1` supports node, class, subjects-of, objects-of, and implicit-class
+`CoreSubsetV1` supports node, class, subjects-of, objects-of, and implicit-class
 targets; direct, inverse, sequence, alternative, zero-or-one, zero-or-more,
 and one-or-more paths. Its constraints are min/max count; datatype, node kind,
 class, value and enumeration checks; numeric, string, pattern, and language
@@ -273,7 +273,7 @@ measurements remain open. The harness rejects 10M inputs.
 - The Git release candidate uses Rudof `0.3.10` from crates.io and pins exact
   revisions of the maintained RO-Crate fork and Irokle. It is not
   crates.io-ready until equivalent registry releases exist.
-- `CraqleFastV1` is a deliberately bounded profile, not unrestricted SHACL Core conformance.
+- `CoreSubsetV1` is a deliberately bounded profile, not unrestricted SHACL Core conformance.
 
 ## Disk data and recovery
 
@@ -293,7 +293,7 @@ must preserve one consistent view of all authoritative keyspaces.
 | Feature | Default | Behavior |
 | --- | --- | --- |
 | `search` | Yes | Tantivy full-text derived index |
-| `shacl-core` | No | Native bounded `CraqleFastV1` compilation, validation, and policy bindings |
+| `shacl-core` | No | Native bounded `CoreSubsetV1` compilation, validation, and policy bindings |
 | `iroh` | No | Irokle Iroh transport and asynchronous write-concern scheduling |
 
 There is also a small demo in `examples/demo.rs`:

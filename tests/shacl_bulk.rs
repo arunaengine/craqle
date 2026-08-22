@@ -7,7 +7,7 @@ use crate::support::TestWriteExt as _;
 use craqle::{
     CraqleError, CraqleNode, CreateCrateRequest, EncodedTerm, GraphId, MaterializedQuadChange,
     NewDataEntity, RoCrateError, ShaclBinding, ShaclBindingOptions, ShaclValidationState,
-    UpdateError, ValidationPolicy, vocab,
+    ShaclWritePolicy, UpdateError, vocab,
 };
 
 use crate::support::{benchmark_rocrate_document, public_policy, setup_network, writer_auth};
@@ -126,7 +126,7 @@ fn checked_bulk_enforces() {
             &ShaclBinding {
                 data_graph: data.clone(),
                 shapes_graph: shapes,
-                policy: ValidationPolicy::Enforce,
+                policy: ShaclWritePolicy::Enforce,
                 validation_options: ShaclBindingOptions::default(),
             },
         )
@@ -165,7 +165,7 @@ fn checked_bulk_enforces() {
 }
 
 #[test]
-fn unchecked_bulk_invalid() {
+fn structural_bypass_keeps_advisory_shacl_diagnostics() {
     let (_directory, net) = setup_network(1);
     let node = net.peer(0);
     let data = GraphId::new("urn:test:bulk-unchecked-data");
@@ -176,8 +176,8 @@ fn unchecked_bulk_invalid() {
         &writer,
         CreateCrateRequest::new(
             data.clone(),
-            "Unchecked bulk policy",
-            "Explicitly unchecked writes are trusted bypasses.",
+            "Structural bypass policy",
+            "Structural bypasses retain advisory SHACL diagnostics.",
             "2026-08-20",
             None,
             public_policy(),
@@ -191,7 +191,7 @@ fn unchecked_bulk_invalid() {
             &ShaclBinding {
                 data_graph: data.clone(),
                 shapes_graph: shapes,
-                policy: ValidationPolicy::Enforce,
+                policy: ShaclWritePolicy::Advisory,
                 validation_options: ShaclBindingOptions::default(),
             },
         )
@@ -303,7 +303,7 @@ fn import_enforce_empty() {
             &ShaclBinding {
                 data_graph: data.clone(),
                 shapes_graph: shapes,
-                policy: ValidationPolicy::Enforce,
+                policy: ShaclWritePolicy::Enforce,
                 validation_options: ShaclBindingOptions::default(),
             }
         )

@@ -3,7 +3,7 @@ mod support;
 use craqle::*;
 use serde::{Deserialize, Serialize};
 
-use support::{CraqleCluster, QueryOptions, with_watchdog};
+use support::{CraqleCluster, SimulationQueryOptions, with_watchdog};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
 #[irokle(type_id = "craqle.test.other-app.v1")]
@@ -685,14 +685,17 @@ fn patch_preserves_properties() {
         .unwrap();
     assert!(properties.contains(&(
         EncodedTerm::from_named_node(&vocab::schema_description()),
-        EncodedTerm::from_term(&description),
+        EncodedTerm::from_term(&description).unwrap(),
     )));
-    assert!(properties.contains(&(
-        EncodedTerm::from_named_node(&vocab::schema_name()),
-        EncodedTerm::from_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
-            "after"
-        ),)),
-    )));
+    assert!(
+        properties.contains(&(
+            EncodedTerm::from_named_node(&vocab::schema_name()),
+            EncodedTerm::from_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                "after"
+            ),))
+            .unwrap(),
+        ))
+    );
 
     node.patch_data_with(
         &writer_auth(),
@@ -1197,7 +1200,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
             0,
             &anonymous,
             "SELECT ?name WHERE { ?s schema:name ?name }",
-            QueryOptions { local_only: true },
+            SimulationQueryOptions { local_only: true },
         )
         .unwrap()
     {
@@ -1211,7 +1214,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
             0,
             &anonymous,
             "SELECT ?name WHERE { ?s schema:name ?name }",
-            QueryOptions { local_only: false },
+            SimulationQueryOptions { local_only: false },
         )
         .unwrap()
     {
@@ -1229,7 +1232,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
                 &anonymous,
                 "peer",
                 10,
-                QueryOptions { local_only: false },
+                SimulationQueryOptions { local_only: false },
             )
             .unwrap();
         assert!(hits.iter().any(|hit| hit.graph_id == "urn:test:peer1"));
@@ -1283,7 +1286,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
             0,
             &anonymous,
             "SELECT ?name WHERE { ?s schema:name ?name }",
-            QueryOptions { local_only: false },
+            SimulationQueryOptions { local_only: false },
         )
         .unwrap()
     {
@@ -1315,7 +1318,7 @@ fn federated_queries_do_not_leak_remote_private_graphs() {
                 &anonymous,
                 "federated",
                 10,
-                QueryOptions { local_only: false },
+                SimulationQueryOptions { local_only: false },
             )
             .unwrap();
         assert!(

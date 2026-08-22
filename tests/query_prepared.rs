@@ -4,8 +4,8 @@ use crate::support::TestWriteExt as _;
 use craqle::{
     Action, AllowAllAuthorizer, AuthorizationError, CraqleError, CraqleErrorKind, CraqleNode,
     DenyAllAuthorizer, EncodedTerm, GraphId, GraphPolicy, JoinKind, JoinMode,
-    MaterializedQuadChange, QueryExecutionOptions, QueryLogicalOperator, QueryPhysicalOperator,
-    QueryPlan, QueryResults,
+    MaterializedQuadChange, QueryLogicalOperator, QueryOptions, QueryPhysicalOperator, QueryPlan,
+    QueryResults,
 };
 
 fn iri(value: &str) -> EncodedTerm {
@@ -45,7 +45,7 @@ fn prepared_reads_fresh() {
             &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             sparql,
-            &QueryExecutionOptions::default(),
+            &QueryOptions::default(),
         )
         .unwrap();
     assert_eq!(diagnostic.results, old);
@@ -70,7 +70,7 @@ fn prepared_reads_fresh() {
             &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             &prepared,
-            &QueryExecutionOptions::default(),
+            &QueryOptions::default(),
         )
         .unwrap();
     assert_eq!(first.results, old);
@@ -84,7 +84,7 @@ fn prepared_reads_fresh() {
             &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             &prepared,
-            &QueryExecutionOptions::default(),
+            &QueryOptions::default(),
         )
         .unwrap();
     assert_eq!(after_rebuild.results, old);
@@ -107,7 +107,7 @@ fn prepared_reads_fresh() {
             &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
             &prepared,
-            &QueryExecutionOptions::default(),
+            &QueryOptions::default(),
         )
         .unwrap();
     assert_eq!(second.statistics.result_rows, 2);
@@ -132,7 +132,7 @@ fn prepared_cancellation() {
     let prepared = node
         .prepare_query("SELECT ?s WHERE { ?s <urn:test:prepared:p> ?o }")
         .unwrap();
-    let options = QueryExecutionOptions::default();
+    let options = QueryOptions::default();
     options.cancellation.cancel();
 
     let error = node
@@ -219,7 +219,7 @@ fn explicit_graph_query_authorization_fails_the_whole_request() {
 
     let mixed = [readable.clone(), hidden.clone()];
     let prepared = node.prepare_query(sparql).unwrap();
-    let options = QueryExecutionOptions::default();
+    let options = QueryOptions::default();
     assert_eq!(
         CraqleErrorKind::Unauthorized,
         node.query_in_graphs_with_options(&auth, &mixed, sparql, &options)
@@ -282,7 +282,7 @@ fn forced_join_results() {
             "SELECT ?s ?o ?x WHERE { ?s <urn:test:prepared:p> ?o . ?s <urn:test:prepared:q> ?x }",
         )
         .unwrap();
-    let mut lateral_options = QueryExecutionOptions::default();
+    let mut lateral_options = QueryOptions::default();
     lateral_options.join_mode = JoinMode::ForceLateral;
     let lateral = node
         .execute_prepared_in_graphs(
@@ -292,7 +292,7 @@ fn forced_join_results() {
             &lateral_options,
         )
         .unwrap();
-    let mut hash_options = QueryExecutionOptions::default();
+    let mut hash_options = QueryOptions::default();
     hash_options.join_mode = JoinMode::ForceHash;
     let hash = node
         .execute_prepared_in_graphs(

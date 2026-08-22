@@ -85,6 +85,8 @@ pub enum RoCrateError {
     UnsupportedJsonLd(String),
     #[error("unsupported compact IRI or property name: {0}")]
     UnsupportedTerm(String),
+    #[error(transparent)]
+    UnsupportedRdfStarTerm(#[from] crate::UnsupportedRdfStarTerm),
     #[error("invalid batch: {0}")]
     InvalidBatch(String),
     #[error("RO-Crate version marker is missing")]
@@ -116,6 +118,7 @@ impl RoCrateError {
             Self::UnsupportedJsonLd(_) | Self::UnsupportedTerm(_) | Self::UnknownVersion(_) => {
                 crate::CraqleErrorKind::Unsupported
             }
+            Self::UnsupportedRdfStarTerm(_) => crate::CraqleErrorKind::Unsupported,
             Self::Json(_)
             | Self::Rdf(_)
             | Self::JsonLd(_)
@@ -476,6 +479,8 @@ impl RoCrateManager {
 
         for subject_id in [METADATA_ID, cx.root_id()] {
             for (predicate, object) in self.stored_subject_triples(cx, subject_id)? {
+                ensure_non_star(&predicate)?;
+                ensure_non_star(&object)?;
                 if predicate != conforms_to {
                     continue;
                 }
@@ -1716,11 +1721,13 @@ impl RoCrateManager {
         })?;
 
         let extra = self.collect_partial_view_entities(cx, view.page_entities)?;
-        let mut has_part: Vec<String> = view
-            .page_entities
-            .iter()
-            .filter_map(encoded_reference_value)
-            .collect();
+        let mut has_part = Vec::new();
+        for entity in view.page_entities {
+            ensure_non_star(entity)?;
+            if let Some(reference) = encoded_reference_value(entity) {
+                has_part.push(reference);
+            }
+        }
         let mut entities = Vec::with_capacity(extra.contextual.len() + extra.artifacts.len());
         for subject_id in extra.contextual.iter().chain(extra.artifacts.iter()) {
             let triples = self.subject_triples(cx, subject_id)?;
@@ -1750,6 +1757,7 @@ impl RoCrateManager {
         graph.extend(entities);
 
         for entity in view.page_entities {
+            ensure_non_star(entity)?;
             let Some(subject_id) = encoded_reference_value(entity) else {
                 continue;
             };
@@ -3002,6 +3010,7 @@ fn validate_import_structure_limits(
 fn canonicalize_value(value: &serde_json::Value) -> Result<CanonicalJsonLd, RoCrateError> {
     let mut lines = BTreeSet::new();
     for quad in jsonld_quads(value)? {
+        EncodedTerm::from_term(&quad.object)?;
         lines.insert(format!("{quad} ."));
     }
     let nquads = if lines.is_empty() {
@@ -3199,16 +3208,16 @@ fn jsonld_triples_from_quads(
         Some(root.as_str().to_string())
     });
 
-    Ok(quads
+    quads
         .into_iter()
         .map(|quad| {
-            (
+            Ok((
                 remap_subject(quad.subject, import_root.as_deref(), graph_id),
                 EncodedTerm::from_named_node(&quad.predicate),
-                remap_object(quad.object, import_root.as_deref(), graph_id),
-            )
+                remap_object(quad.object, import_root.as_deref(), graph_id)?,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 fn remap_subject(
@@ -3222,11 +3231,15 @@ fn remap_subject(
     }
 }
 
-fn remap_object(object: Term, import_root: Option<&str>, graph_id: &GraphId) -> EncodedTerm {
-    match object {
+fn remap_object(
+    object: Term,
+    import_root: Option<&str>,
+    graph_id: &GraphId,
+) -> Result<EncodedTerm, RoCrateError> {
+    Ok(match object {
         Term::NamedNode(node) => remap_node(node, import_root, graph_id),
-        object => EncodedTerm::from_term(&object),
-    }
+        object => EncodedTerm::from_term(&object)?,
+    })
 }
 
 fn remap_node(node: NamedNode, import_root: Option<&str>, graph_id: &GraphId) -> EncodedTerm {
@@ -3264,7 +3277,7 @@ fn entity_subject_triples(
     for (predicate, object) in spec.additional_triples {
         triples.push((
             EncodedTerm::from_named_node(predicate),
-            EncodedTerm::from_term(object),
+            EncodedTerm::from_term(object)?,
         ));
     }
 
@@ -3338,7 +3351,7 @@ fn encoded_subject(value: &str) -> EncodedTerm {
 }
 
 fn encoded_literal(value: &str) -> EncodedTerm {
-    EncodedTerm::from_term(&Term::Literal(oxrdf::Literal::new_simple_literal(value)))
+    EncodedTerm::from_non_star_term(&Term::Literal(oxrdf::Literal::new_simple_literal(value)))
 }
 
 fn encoded_reference_term(value: &str) -> Result<EncodedTerm, RoCrateError> {
@@ -3394,6 +3407,8 @@ fn export_metadata_descriptor(
     let mut dynamic = HashMap::new();
 
     for (predicate, object) in view.triples {
+        ensure_non_star(&predicate)?;
+        ensure_non_star(&object)?;
         let key = predicate_key(&predicate, view.ctx);
         match key.as_str() {
             "type" | "@type" => {
@@ -3429,6 +3444,8 @@ fn export_root_entity(view: RootExportView<'_>) -> Result<RootDataEntity, RoCrat
     let mut dynamic = HashMap::new();
 
     for (predicate, object) in view.triples {
+        ensure_non_star(&predicate)?;
+        ensure_non_star(&object)?;
         let key = predicate_key(&predicate, view.ctx);
         match key.as_str() {
             "type" | "@type" => {
@@ -3484,6 +3501,8 @@ fn export_graph_entity(
     let mut dynamic = HashMap::new();
 
     for (predicate, object) in triples {
+        ensure_non_star(&predicate)?;
+        ensure_non_star(&object)?;
         let key = predicate_key(&predicate, ctx);
         match key.as_str() {
             "type" | "@type" => {
@@ -3538,6 +3557,17 @@ fn encoded_reference_value(object: &EncodedTerm) -> Option<String> {
         Some(Term::NamedNode(node)) => Some(node.as_str().to_string()),
         Some(Term::BlankNode(node)) => Some(format!("_:{}", node.as_str())),
         _ => None,
+    }
+}
+
+fn ensure_non_star(term: &EncodedTerm) -> Result<(), RoCrateError> {
+    if term.is_rdf_star() {
+        Err(crate::UnsupportedRdfStarTerm {
+            term: term.0.clone(),
+        }
+        .into())
+    } else {
+        Ok(())
     }
 }
 
@@ -4165,17 +4195,17 @@ fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateErro
 
     let mut triples = BTreeSet::new();
     for triple in rdf_graph {
-        triples.insert(triple_key_from_rdf(&triple));
+        triples.insert(triple_key_from_rdf(&triple)?);
     }
     Ok(triples)
 }
 
-fn triple_key_from_rdf(triple: &Triple) -> TripleKey {
-    (
+fn triple_key_from_rdf(triple: &Triple) -> Result<TripleKey, RoCrateError> {
+    Ok((
         EncodedTerm::from(&triple.subject),
         EncodedTerm::from_named_node(&triple.predicate),
-        EncodedTerm::from_term(&triple.object),
-    )
+        EncodedTerm::from_term(&triple.object)?,
+    ))
 }
 
 fn normalize_rocrate(rocrate: &mut RoCrate) {

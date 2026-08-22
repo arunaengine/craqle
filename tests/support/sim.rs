@@ -11,7 +11,7 @@ use craqle::{
 use irokle::Event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct QueryOptions {
+pub struct SimulationQueryOptions {
     pub local_only: bool,
 }
 
@@ -185,7 +185,7 @@ impl CraqleCluster {
         peer: usize,
         auth: &dyn Authorizer,
         sparql: &str,
-        options: QueryOptions,
+        options: SimulationQueryOptions,
     ) -> Result<QueryResults> {
         if options.local_only {
             return Ok(self.peers[peer].query(auth, sparql)?);
@@ -204,7 +204,7 @@ impl CraqleCluster {
         auth: &dyn Authorizer,
         query: &str,
         limit: usize,
-        options: QueryOptions,
+        options: SimulationQueryOptions,
     ) -> Result<Vec<SearchHit>> {
         if options.local_only {
             return Ok(self.peers[peer].search(auth, SearchRequest { query, limit })?);

@@ -41,6 +41,8 @@ pub enum SparqlError {
     Unsupported(String),
     #[error("invalid RDF term: {0}")]
     InvalidTerm(String),
+    #[error(transparent)]
+    UnsupportedRdfStarTerm(#[from] crate::UnsupportedRdfStarTerm),
     #[error("authorization: {0}")]
     Authorization(#[from] crate::AuthorizationError),
     #[error("store error: {0}")]
@@ -58,6 +60,7 @@ impl SparqlError {
             Self::QueryLimit { .. } => crate::CraqleErrorKind::QueryLimit,
             Self::Authorization(_) => crate::CraqleErrorKind::Unauthorized,
             Self::Unsupported(_) => crate::CraqleErrorKind::Unsupported,
+            Self::UnsupportedRdfStarTerm(_) => crate::CraqleErrorKind::Unsupported,
             Self::Cancelled => crate::CraqleErrorKind::Cancelled,
             Self::Store(error) => error.kind(),
             Self::Search(error) => error.kind(),
@@ -518,7 +521,7 @@ fn property_path_depth(path: &spargebra::algebra::PropertyPathExpression) -> usi
 /// Per-execution controls for a prepared SPARQL query.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct QueryExecutionOptions {
+pub struct QueryOptions {
     pub cancellation: QueryCancellation,
     pub read_mode: QueryReadMode,
     pub optimize: bool,
@@ -527,7 +530,7 @@ pub struct QueryExecutionOptions {
     pub limits: QueryLimits,
 }
 
-impl Default for QueryExecutionOptions {
+impl Default for QueryOptions {
     fn default() -> Self {
         Self {
             cancellation: QueryCancellation::new(),
@@ -741,7 +744,7 @@ impl SparqlEngine {
         auth: &dyn crate::Authorizer,
         prepared: &PreparedQuery,
         graphs: &[GraphId],
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryPlan> {
         self.explain_prepared_scope(
             prepared,
@@ -756,7 +759,7 @@ impl SparqlEngine {
         &self,
         prepared: &PreparedQuery,
         policy_visible: &SnapshotVisibleFn<'_>,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryPlan> {
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
@@ -774,7 +777,7 @@ impl SparqlEngine {
         prepared: &PreparedQuery,
         scope: GraphScope<'_>,
         post_raw_visibility: Option<(&GraphStore, &SnapshotVisibleFn<'_>)>,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
         explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<QueryPlan> {
         enforce_query_bytes(prepared.query_bytes, &options.limits)?;
@@ -830,7 +833,7 @@ impl SparqlEngine {
         auth: &dyn crate::Authorizer,
         prepared: &PreparedQuery,
         graphs: &[GraphId],
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
     ) -> Result<QueryExecution> {
         self.execute_prepared_scope(
             prepared,
@@ -857,7 +860,7 @@ impl SparqlEngine {
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryResults> {
-        let options = QueryExecutionOptions::default();
+        let options = QueryOptions::default();
         let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
         self.execute_prepared_with_snapshot_visibility(
             &prepared,
@@ -874,7 +877,7 @@ impl SparqlEngine {
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryExecution> {
-        let options = QueryExecutionOptions::default();
+        let options = QueryOptions::default();
         let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
         self.execute_prepared_with_snapshot_visibility(
             &prepared,
@@ -889,7 +892,7 @@ impl SparqlEngine {
         &self,
         prepared: &PreparedQuery,
         policy_visible: &SnapshotVisibleFn<'_>,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
         parse_time: Duration,
         collect_plan_statistics: bool,
     ) -> Result<QueryExecution> {
@@ -958,7 +961,7 @@ impl SparqlEngine {
         optimize: bool,
         read_mode: QueryReadMode,
     ) -> Result<(QueryResults, ReadStatistics)> {
-        let options = QueryExecutionOptions {
+        let options = QueryOptions {
             cancellation: QueryCancellation::new(),
             read_mode,
             optimize,
@@ -976,7 +979,7 @@ impl SparqlEngine {
         &self,
         prepared: &PreparedQuery,
         scope: GraphScope<'_>,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
         parse_time: Duration,
         collect_plan_statistics: bool,
         explicit_auth: Option<&dyn crate::Authorizer>,
@@ -1028,7 +1031,7 @@ impl SparqlEngine {
         query: Query,
         scope: GraphScope<'_>,
         view: &StoreReadView<'_>,
-        options: &QueryExecutionOptions,
+        options: &QueryOptions,
         mut stages: QueryStageStatistics,
         collect_plan_statistics: bool,
     ) -> Result<(QueryExecution, ReadStatistics)> {
@@ -1152,6 +1155,7 @@ impl SparqlEngine {
                 limit: options.limits.max_update_bytes,
             });
         }
+        reject_sparql_rdf_star(sparql)?;
         let started = Instant::now();
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let update = SparqlParser::new()
@@ -1699,6 +1703,7 @@ struct CollectionMetrics {
 
 fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQuery, Duration)> {
     enforce_query_bytes(sparql.len(), limits)?;
+    reject_sparql_rdf_star(sparql)?;
     let started = Instant::now();
     let full = format!("{COMMON_PREFIXES}{sparql}");
     let query = SparqlParser::new()
@@ -1711,6 +1716,56 @@ fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQ
         },
         started.elapsed(),
     ))
+}
+
+fn reject_sparql_rdf_star(sparql: &str) -> Result<()> {
+    let bytes = sparql.as_bytes();
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut iri = false;
+    let mut comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if comment {
+            comment = byte != b'\n';
+        } else if let Some((delimiter, width)) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter
+                && (width == 1
+                    || (bytes.get(index + 1) == Some(&delimiter)
+                        && bytes.get(index + 2) == Some(&delimiter)))
+            {
+                quote = None;
+                index += width - 1;
+            }
+        } else if iri {
+            iri = byte != b'>';
+        } else if byte == b'#' {
+            comment = true;
+        } else if byte == b'\'' || byte == b'"' {
+            let width =
+                if bytes.get(index + 1) == Some(&byte) && bytes.get(index + 2) == Some(&byte) {
+                    3
+                } else {
+                    1
+                };
+            quote = Some((byte, width));
+            index += width - 1;
+        } else if byte == b'<' && bytes.get(index + 1) == Some(&b'<') {
+            return Err(crate::UnsupportedRdfStarTerm {
+                term: "SPARQL quoted triple".to_owned(),
+            }
+            .into());
+        } else if byte == b'<' {
+            iri = true;
+        }
+        index += 1;
+    }
+    Ok(())
 }
 
 fn enforce_query_bytes(bytes: usize, limits: &QueryLimits) -> Result<()> {
@@ -1732,7 +1787,7 @@ fn query_fingerprint(query: &Query) -> String {
 fn plan_query(
     query: &mut Query,
     store: &GraphStore,
-    options: &QueryExecutionOptions,
+    options: &QueryOptions,
     fast_path: Option<&FastPathPlan>,
 ) -> Result<PlannerTrace> {
     if fast_path.is_some_and(|plan| !plan.is_hash_join())
@@ -1763,7 +1818,7 @@ fn plan_query(
         .map_err(|error| SparqlError::Planning(error.to_string()))
 }
 
-fn fast_path_plan(query: &Query, options: &QueryExecutionOptions) -> Option<FastPathPlan> {
+fn fast_path_plan(query: &Query, options: &QueryOptions) -> Option<FastPathPlan> {
     if matches!(options.fast_paths, QueryFastPathMode::Disabled) {
         return None;
     }
@@ -2545,6 +2600,8 @@ enum StoreDatasetError {
     QueryLimit(#[from] QueryLimitExceeded),
     #[error("invalid RDF term: {0}")]
     InvalidTerm(String),
+    #[error(transparent)]
+    UnsupportedRdfStarTerm(#[from] crate::UnsupportedRdfStarTerm),
 }
 
 enum ResolvedPatternTerm {
@@ -2906,7 +2963,7 @@ where
             self.default_union_marker_pending.set(false);
             return Ok(StoreTerm::DefaultUnion);
         }
-        let encoded = EncodedTerm::from_term(&term);
+        let encoded = EncodedTerm::from_term(&term)?;
         Ok(match self.view.lookup_term(self.context, &encoded)? {
             Some(id) => StoreTerm::Existing(Self::stored_term(self.view, self.context, id, false)?),
             None => StoreTerm::Missing(encoded),
@@ -2973,7 +3030,7 @@ fn collect_query_results(
                 let collecting = Instant::now();
                 let mut row = HashMap::with_capacity(solution.len());
                 for (variable, term) in solution.iter() {
-                    row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term));
+                    row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term)?);
                     context.increment_result_terms_decoded();
                 }
                 metrics.result_rows = metrics.result_rows.saturating_add(1);
@@ -3022,7 +3079,7 @@ fn collect_query_results(
                 let triple = (
                     EncodedTerm::from(&subject),
                     EncodedTerm::from_named_node(&predicate),
-                    EncodedTerm::from_term(&object),
+                    EncodedTerm::from_term(&object)?,
                 );
                 budget.observe_graph_triple(&triple)?;
                 graph.push(triple);
@@ -3064,6 +3121,21 @@ fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
         {
             SparqlError::Cancelled
         }
+        QueryEvaluationError::Dataset(error)
+            if error
+                .downcast_ref::<StoreDatasetError>()
+                .is_some_and(|error| {
+                    matches!(error, StoreDatasetError::UnsupportedRdfStarTerm(_))
+                }) =>
+        {
+            let StoreDatasetError::UnsupportedRdfStarTerm(error) = error
+                .downcast_ref::<StoreDatasetError>()
+                .expect("RDF-star dataset error was matched")
+            else {
+                unreachable!("RDF-star dataset error was matched")
+            };
+            error.clone().into()
+        }
         error => SparqlError::Evaluation(error.to_string()),
     }
 }
@@ -3073,7 +3145,7 @@ fn quad_to_insert(quad: &spargebra::term::Quad) -> Result<MaterializedQuadChange
         graph: spargebra_graph_name_to_graph_id(&quad.graph_name)?,
         subject: EncodedTerm::from(&quad.subject),
         predicate: EncodedTerm::from_named_node(&quad.predicate),
-        object: EncodedTerm::from_term(&quad.object),
+        object: EncodedTerm::from_term(&quad.object)?,
     })
 }
 
@@ -3082,7 +3154,7 @@ fn ground_quad_to_delete(quad: &spargebra::term::GroundQuad) -> Result<Materiali
         graph: spargebra_graph_name_to_graph_id(&quad.graph_name)?,
         subject: EncodedTerm::from_named_node(&quad.subject),
         predicate: EncodedTerm::from_named_node(&quad.predicate),
-        object: ground_term_to_encoded(&quad.object),
+        object: ground_term_to_encoded(&quad.object)?,
     })
 }
 
@@ -3092,13 +3164,13 @@ fn delete_insert_quad_to_change(quad: DeleteInsertQuad) -> Result<MaterializedQu
             graph: oxrdf_graph_name_to_graph_id(&quad.graph_name)?,
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
-            object: EncodedTerm::from_term(&quad.object),
+            object: EncodedTerm::from_term(&quad.object)?,
         }),
         DeleteInsertQuad::Insert(quad) => Ok(MaterializedQuadChange::Insert {
             graph: oxrdf_graph_name_to_graph_id(&quad.graph_name)?,
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
-            object: EncodedTerm::from_term(&quad.object),
+            object: EncodedTerm::from_term(&quad.object)?,
         }),
     }
 }
@@ -3125,13 +3197,17 @@ fn oxrdf_graph_name_to_graph_id(graph_name: &oxrdf::GraphName) -> Result<GraphId
     }
 }
 
-fn ground_term_to_encoded(term: &spargebra::term::GroundTerm) -> EncodedTerm {
-    #[allow(unreachable_patterns)]
-    match term {
+fn ground_term_to_encoded(term: &spargebra::term::GroundTerm) -> Result<EncodedTerm> {
+    Ok(match term {
         spargebra::term::GroundTerm::NamedNode(node) => EncodedTerm::from_named_node(node),
         spargebra::term::GroundTerm::Literal(literal) => EncodedTerm(literal.to_string()),
-        _ => EncodedTerm(term.to_string()),
-    }
+        spargebra::term::GroundTerm::Triple(_) => {
+            return Err(crate::UnsupportedRdfStarTerm {
+                term: term.to_string(),
+            }
+            .into());
+        }
+    })
 }
 
 fn materialize_graph_target_removals(
@@ -3291,7 +3367,7 @@ mod tests {
                 &graph,
                 &format!("urn:test:dataset:early-stop:{index:03}"),
                 "urn:test:dataset:early-stop:p",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                     index.to_string(),
                 ))),
             );
@@ -3482,7 +3558,7 @@ mod tests {
             cancellation: QueryCancellation,
         ) -> Result<QueryExecution> {
             let prepared = engine.prepare_query(query)?;
-            let mut options = QueryExecutionOptions::default();
+            let mut options = QueryOptions::default();
             options.read_mode = read_mode;
             options.fast_paths = fast_paths;
             options.limits.max_hash_entries = max_hash_entries;
@@ -3595,7 +3671,7 @@ mod tests {
                 &graph,
                 &format!("urn:test:dataset:named:{index:03}"),
                 "urn:test:dataset:named:p",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                     index.to_string(),
                 ))),
             );
@@ -3605,7 +3681,7 @@ mod tests {
             &graph,
             "urn:test:dataset:named:other",
             "urn:test:dataset:named:other-p",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("other"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("other"))),
         );
         settle_diagnostics(&store, &graph);
 
@@ -3705,7 +3781,8 @@ mod tests {
         let visible_graph = GraphId::new("urn:test:dataset:visible");
         let hidden_graph = GraphId::new("urn:test:dataset:hidden");
         let predicate = "urn:test:dataset:visibility:p";
-        let object = EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("shared")));
+        let object =
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("shared")));
         insert_quad(
             &store,
             &visible_graph,
@@ -3773,7 +3850,8 @@ mod tests {
         let (_dir, store, _search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:dataset:copies:1");
         let graph2 = GraphId::new("urn:test:dataset:copies:2");
-        let object = EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("same")));
+        let object =
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("same")));
         for graph in [&graph1, &graph2] {
             insert_quad(
                 &store,
@@ -3845,11 +3923,13 @@ mod tests {
             &graph,
             "urn:test:dataset:marker:s",
             "urn:test:dataset:marker:p",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("marker"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("marker"))),
         );
         let marker = BlankNode::default();
         let marker_id = store
-            .encode_term(&EncodedTerm::from_term(&Term::BlankNode(marker.clone())))
+            .encode_term(&EncodedTerm::from_non_star_term(&Term::BlankNode(
+                marker.clone(),
+            )))
             .unwrap();
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
@@ -3895,7 +3975,7 @@ mod tests {
                 &graph,
                 &format!("urn:test:dataset:limit:{index:03}"),
                 "urn:test:dataset:limit:p",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                     index.to_string(),
                 ))),
             );
@@ -3997,14 +4077,18 @@ mod tests {
             &graph1,
             "urn:test:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset One",
+            ))),
         );
         insert_quad(
             &store,
             &graph2,
             "urn:test:e2",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset Two"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset Two",
+            ))),
         );
 
         let rows = solution_rows(
@@ -4025,14 +4109,18 @@ mod tests {
             &graph1,
             "urn:test:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset One",
+            ))),
         );
         insert_quad(
             &store,
             &graph2,
             "urn:test:e2",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset Two"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset Two",
+            ))),
         );
 
         let rows = solution_rows(
@@ -4081,7 +4169,9 @@ mod tests {
                 &graph,
                 "urn:test:dataset-boundary:s",
                 "urn:test:dataset-boundary:p",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("same"))),
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                    "same",
+                ))),
             );
             graphs.push(graph);
         }
@@ -4200,16 +4290,16 @@ mod tests {
                 &graph,
                 &format!("urn:test:large:{idx:03}:e"),
                 "http://schema.org/name",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
-                    "Dataset {idx:03}"
-                )))),
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                    format!("Dataset {idx:03}"),
+                ))),
             );
             insert_quad(
                 &store,
                 &graph,
                 shared_subject,
                 "http://schema.org/position",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                     idx.to_string(),
                 ))),
             );
@@ -4221,7 +4311,7 @@ mod tests {
             &hidden,
             "urn:test:hidden:e",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Hidden Dataset",
             ))),
         );
@@ -4230,7 +4320,7 @@ mod tests {
             &hidden,
             shared_subject,
             "http://schema.org/position",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("hidden"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("hidden"))),
         );
 
         let rows = solution_rows(
@@ -4322,9 +4412,9 @@ mod tests {
                 &graph,
                 &format!("urn:test:orphan:{idx:03}:e"),
                 "http://schema.org/name",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
-                    "Visible {idx:03}"
-                )))),
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                    format!("Visible {idx:03}"),
+                ))),
             );
             graphs.push(graph);
         }
@@ -4333,7 +4423,9 @@ mod tests {
             &graphs[0],
             "./data/orphan.txt",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Orphaned File"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Orphaned File",
+            ))),
         );
         store
             .set_graph_diagnostics(
@@ -4366,16 +4458,16 @@ mod tests {
                 &graph,
                 &format!("urn:test:pred:{idx:03}:e"),
                 "http://schema.org/name",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
-                    "Dataset {idx:03}"
-                )))),
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                    format!("Dataset {idx:03}"),
+                ))),
             );
             insert_quad(
                 &store,
                 &graph,
                 shared_subject,
                 "http://schema.org/position",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                     idx.to_string(),
                 ))),
             );
@@ -4386,7 +4478,7 @@ mod tests {
             &hidden,
             "urn:test:hidden:e",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Hidden Dataset",
             ))),
         );
@@ -4395,7 +4487,7 @@ mod tests {
             &hidden,
             shared_subject,
             "http://schema.org/position",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("hidden"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("hidden"))),
         );
 
         let visible = |graph: &GraphId| graph.as_str() != "urn:test:pred:hidden";
@@ -4489,9 +4581,9 @@ mod tests {
                 &graph,
                 &format!("urn:test:predorphan:{idx:03}:e"),
                 "http://schema.org/name",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
-                    "Visible {idx:03}"
-                )))),
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                    format!("Visible {idx:03}"),
+                ))),
             );
             graphs.push(graph);
         }
@@ -4500,7 +4592,9 @@ mod tests {
             &graphs[0],
             "./data/orphan.txt",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Orphaned File"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Orphaned File",
+            ))),
         );
         store
             .set_graph_diagnostics(
@@ -4535,9 +4629,9 @@ mod tests {
                 &graph,
                 &format!("urn:test:memo:{idx:03}:e"),
                 "http://schema.org/name",
-                EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(format!(
-                    "Dataset {idx:03}"
-                )))),
+                EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                    format!("Dataset {idx:03}"),
+                ))),
             );
         }
 
@@ -4572,14 +4666,16 @@ mod tests {
             &visible_graph,
             "urn:test:join:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset One",
+            ))),
         );
         insert_quad(
             &store,
             &hidden_graph,
             "urn:test:join:e1",
             "http://schema.org/hidden",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("true"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("true"))),
         );
 
         let query = "SELECT ?name WHERE { ?s schema:name ?name . \
@@ -4611,14 +4707,16 @@ mod tests {
             &graph,
             "urn:test:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset One",
+            ))),
         );
         insert_quad(
             &store,
             &graph,
             "urn:test:e1",
             "http://schema.org/description",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Primary record",
             ))),
         );
@@ -4627,7 +4725,9 @@ mod tests {
             &graph,
             "urn:test:e2",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset Two"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset Two",
+            ))),
         );
 
         let query = r#"
@@ -4667,7 +4767,9 @@ mod tests {
             &graph,
             "urn:test:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Dataset One"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Dataset One",
+            ))),
         );
 
         assert_eq!(
@@ -4701,35 +4803,37 @@ mod tests {
             &graph1,
             "urn:test:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Alpha"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("Alpha"))),
         );
         insert_quad(
             &store,
             &graph1,
             "urn:test:e1",
             "http://schema.org/keywords",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("omics"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("omics"))),
         );
         insert_quad(
             &store,
             &graph2,
             "urn:test:e2",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Beta"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("Beta"))),
         );
         insert_quad(
             &store,
             &graph2,
             "urn:test:e2",
             "http://schema.org/keywords",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("omics"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal("omics"))),
         );
         insert_quad(
             &store,
             &graph2,
             "urn:test:e2",
             "http://schema.org/keywords",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("proteomics"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "proteomics",
+            ))),
         );
 
         let query = r#"
@@ -4773,7 +4877,9 @@ mod tests {
             &graph,
             graph.as_str(),
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Root Dataset"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Root Dataset",
+            ))),
         );
         insert_quad(
             &store,
@@ -4789,7 +4895,7 @@ mod tests {
             &graph,
             "./data/",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Hidden Dataset",
             ))),
         );
@@ -4807,7 +4913,9 @@ mod tests {
             &graph,
             "./data/file.txt",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal("Hidden File"))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
+                "Hidden File",
+            ))),
         );
         insert_quad(
             &store,
@@ -4853,7 +4961,7 @@ mod tests {
             &graph,
             "urn:test:e1",
             "http://schema.org/position",
-            EncodedTerm::from_term(&Term::Literal(Literal::from(0_i32))),
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::from(0_i32))),
         );
 
         let changes = engine
@@ -4883,7 +4991,7 @@ mod tests {
             &graph,
             "urn:test:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Proteomics Atlas",
             ))),
         );
@@ -4892,7 +5000,7 @@ mod tests {
             &graph,
             "urn:test:e1",
             "http://schema.org/description",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Large-scale proteomics experiment",
             ))),
         );
@@ -4950,7 +5058,7 @@ mod tests {
             &graph1,
             "urn:test:fts:e1",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Proteomics Atlas",
             ))),
         );
@@ -4959,7 +5067,7 @@ mod tests {
             &graph2,
             "urn:test:fts:e2",
             "http://schema.org/name",
-            EncodedTerm::from_term(&Term::Literal(Literal::new_simple_literal(
+            EncodedTerm::from_non_star_term(&Term::Literal(Literal::new_simple_literal(
                 "Proteomics Archive",
             ))),
         );

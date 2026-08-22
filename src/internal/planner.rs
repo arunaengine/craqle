@@ -653,9 +653,10 @@ enum Slot {
 fn term_slot(term: &TermPattern, bound: &HashSet<String>, cx: &PlanCtx<'_>) -> Slot {
     match term {
         TermPattern::NamedNode(node) => const_slot(cx, &EncodedTerm::from_named_node(node)),
-        TermPattern::Literal(literal) => {
-            const_slot(cx, &EncodedTerm::from_term(&Term::Literal(literal.clone())))
-        }
+        TermPattern::Literal(literal) => const_slot(
+            cx,
+            &EncodedTerm::from_non_star_term(&Term::Literal(literal.clone())),
+        ),
         TermPattern::Variable(v) => {
             if bound.contains(v.as_str()) {
                 Slot::BoundVar

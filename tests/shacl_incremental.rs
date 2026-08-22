@@ -6,8 +6,8 @@ use crate::support::TestWriteExt as _;
 use craqle::{
     ActorId, AllowAllAuthorizer, CompiledShaclSchema, CraqleError, CraqleNode, CraqleOptions,
     EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding, ShaclBindingOptions,
-    ShaclCompileOptions, ShaclError, ShaclExecutionMode, ShaclValidationOptions,
-    ShaclValidationState, UpdateError, ValidationPolicy,
+    ShaclCompileOptions, ShaclError, ShaclEvaluationMode, ShaclValidationOptions,
+    ShaclValidationState, ShaclWritePolicy, UpdateError,
 };
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
@@ -202,7 +202,7 @@ fn insert_shape_text(node: &CraqleNode, graph: &GraphId, shapes: &str) {
             graph: graph.clone(),
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
-            object: EncodedTerm::from_term(&quad.object),
+            object: EncodedTerm::from_term(&quad.object).unwrap(),
         })
         .collect();
     node.apply_changes_unchecked(graph, changes).unwrap();
@@ -237,7 +237,7 @@ fn change(
     }
 }
 
-fn mode_options(execution_mode: ShaclExecutionMode) -> ShaclValidationOptions {
+fn mode_options(execution_mode: ShaclEvaluationMode) -> ShaclValidationOptions {
     ShaclValidationOptions {
         execution_mode,
         ..ShaclValidationOptions::default()
@@ -275,7 +275,7 @@ fn assert_mode_case(case: &ModeCase) {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
     let delta = node.validate_shacl_delta(
@@ -283,14 +283,14 @@ fn assert_mode_case(case: &ModeCase) {
         &data,
         &schema,
         &changes,
-        &mode_options(ShaclExecutionMode::ForceDelta),
+        &mode_options(ShaclEvaluationMode::Delta),
     );
     if let Ok(delta) = &delta {
         assert_eq!(delta.conforms, full.conforms, "{}", case.name);
         assert_eq!(delta.results, full.results, "{}", case.name);
         assert_eq!(
             delta.statistics.selected_mode,
-            ShaclExecutionMode::ForceDelta,
+            ShaclEvaluationMode::Delta,
             "{}",
             case.name
         );
@@ -308,14 +308,14 @@ fn assert_mode_case(case: &ModeCase) {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::Auto),
+            &mode_options(ShaclEvaluationMode::Auto),
         )
         .unwrap();
     assert_eq!(auto.conforms, full.conforms, "{}", case.name);
     assert_eq!(auto.results, full.results, "{}", case.name);
     assert_ne!(
         auto.statistics.selected_mode,
-        ShaclExecutionMode::Auto,
+        ShaclEvaluationMode::Auto,
         "{}",
         case.name
     );
@@ -354,7 +354,7 @@ fn delta_matches_full() {
         .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
         .unwrap();
     let options = ShaclValidationOptions::default();
-    let delta_options = mode_options(ShaclExecutionMode::ForceDelta);
+    let delta_options = mode_options(ShaclEvaluationMode::Delta);
     let baseline = node
         .validate_shacl(&AUTH, &data, &schema, &options)
         .unwrap();
@@ -428,7 +428,7 @@ fn modes_match_reports() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap();
     let full = node
@@ -437,22 +437,19 @@ fn modes_match_reports() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
     assert_eq!(delta.results, full.results);
     assert_eq!(delta.conforms, full.conforms);
-    assert_eq!(
-        delta.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
-    assert_eq!(full.statistics.selected_mode, ShaclExecutionMode::ForceFull);
+    assert_eq!(delta.statistics.selected_mode, ShaclEvaluationMode::Delta);
+    assert_eq!(full.statistics.selected_mode, ShaclEvaluationMode::Full);
     let error = node
         .validate_shacl(
             &AUTH,
             &data,
             &schema,
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap_err();
     assert!(matches!(
@@ -763,7 +760,7 @@ fn auto_handles_skewed_high_frequency_predicates() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap();
     let full = node
@@ -772,7 +769,7 @@ fn auto_handles_skewed_high_frequency_predicates() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
     let auto = node
@@ -781,15 +778,12 @@ fn auto_handles_skewed_high_frequency_predicates() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::Auto),
+            &mode_options(ShaclEvaluationMode::Auto),
         )
         .unwrap();
     assert_eq!(delta.results, full.results);
     assert_eq!(auto.results, full.results);
-    assert_eq!(
-        auto.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Delta);
     assert!(auto.statistics.estimated_delta_work < auto.statistics.estimated_full_work);
     assert!(auto.statistics.read.candidate_quads < 100);
 }
@@ -839,7 +833,7 @@ fn imported_shape_change_invalidates_then_reestimates() {
             &data,
             &old_schema,
             &changes,
-            &mode_options(ShaclExecutionMode::Auto),
+            &mode_options(ShaclEvaluationMode::Auto),
         )
         .unwrap_err();
     assert!(matches!(
@@ -856,7 +850,7 @@ fn imported_shape_change_invalidates_then_reestimates() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap();
     let full = node
@@ -865,7 +859,7 @@ fn imported_shape_change_invalidates_then_reestimates() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
     let auto = node
@@ -874,12 +868,12 @@ fn imported_shape_change_invalidates_then_reestimates() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::Auto),
+            &mode_options(ShaclEvaluationMode::Auto),
         )
         .unwrap();
     assert_eq!(delta.results, full.results);
     assert_eq!(auto.results, full.results);
-    assert_ne!(auto.statistics.selected_mode, ShaclExecutionMode::Auto);
+    assert_ne!(auto.statistics.selected_mode, ShaclEvaluationMode::Auto);
 }
 
 #[test]
@@ -927,7 +921,7 @@ fn cold_delta_limit() {
             "urn:test:two",
         ),
     ];
-    let mut delta_options = mode_options(ShaclExecutionMode::ForceDelta);
+    let mut delta_options = mode_options(ShaclEvaluationMode::Delta);
     delta_options.max_results = 1;
     let error = node
         .validate_shacl_delta(&AUTH, &data, &schema, &changes, &delta_options)
@@ -937,7 +931,7 @@ fn cold_delta_limit() {
         CraqleError::Shacl(ShaclError::DeltaExecutionUnavailable { .. })
     ));
 
-    let mut full_options = mode_options(ShaclExecutionMode::ForceFull);
+    let mut full_options = mode_options(ShaclEvaluationMode::Full);
     full_options.max_results = 1;
     let full = node
         .validate_shacl_delta(&AUTH, &data, &schema, &changes, &full_options)
@@ -988,10 +982,10 @@ fn cold_auto_full() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
-    assert_eq!(auto.statistics.selected_mode, ShaclExecutionMode::ForceFull);
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Full);
     assert_eq!(auto.results, full.results);
     assert_eq!(auto.conforms, full.conforms);
 }
@@ -1035,10 +1029,7 @@ fn zero_auto_delta() {
             &ShaclValidationOptions::default(),
         )
         .unwrap();
-    assert_eq!(
-        auto.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Delta);
     assert!(auto.statistics.estimated_full_work > 0);
     assert!(auto.statistics.read.qv_counter_reads >= 4);
 }
@@ -1082,10 +1073,7 @@ fn auto_selects_paths() {
             &ShaclValidationOptions::default(),
         )
         .unwrap();
-    assert_eq!(
-        small.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(small.statistics.selected_mode, ShaclEvaluationMode::Delta);
     assert!(small.statistics.estimated_delta_work < small.statistics.estimated_full_work);
 
     let unrelated = [change(
@@ -1106,7 +1094,7 @@ fn auto_selects_paths() {
         .unwrap();
     assert_eq!(
         unrelated.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
+        ShaclEvaluationMode::Delta
     );
 
     for count in [100usize, 1_000] {
@@ -1136,10 +1124,10 @@ fn auto_selects_paths() {
                 &data,
                 &schema,
                 &changes,
-                &mode_options(ShaclExecutionMode::ForceFull),
+                &mode_options(ShaclEvaluationMode::Full),
             )
             .unwrap();
-        assert_eq!(auto.statistics.selected_mode, ShaclExecutionMode::ForceFull);
+        assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Full);
         assert!(auto.statistics.estimated_delta_work > auto.statistics.estimated_full_work);
         assert_eq!(auto.results, full.results, "batch {count}");
     }
@@ -1206,7 +1194,7 @@ fn auto_scales() {
             &large_data,
             &large_schema,
             &changes(&large_data, 100),
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap();
     let large_full = large_node
@@ -1215,7 +1203,7 @@ fn auto_scales() {
             &large_data,
             &large_schema,
             &changes(&large_data, 100),
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
     let large = large_node
@@ -1233,10 +1221,7 @@ fn auto_scales() {
     assert_eq!(large.results, large_delta.results);
     assert_eq!(large.conforms, large_delta.conforms);
     assert!(large.statistics.estimated_full_work > small.statistics.estimated_full_work);
-    assert_eq!(
-        large.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(large.statistics.selected_mode, ShaclEvaluationMode::Delta);
 
     let batch = changes(&large_data, 1_000);
     let large_batch_delta = large_node
@@ -1245,7 +1230,7 @@ fn auto_scales() {
             &large_data,
             &large_schema,
             &batch,
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap();
     let large_batch_full = large_node
@@ -1254,7 +1239,7 @@ fn auto_scales() {
             &large_data,
             &large_schema,
             &batch,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
     let large_batch = large_node
@@ -1272,7 +1257,7 @@ fn auto_scales() {
     assert_eq!(large_batch.conforms, large_batch_delta.conforms);
     assert_eq!(
         large_batch.statistics.selected_mode,
-        ShaclExecutionMode::ForceFull
+        ShaclEvaluationMode::Full
     );
 }
 
@@ -1325,13 +1310,10 @@ fn duplicate_auto_delta() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
-    assert_eq!(
-        auto.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Delta);
     assert_eq!(auto.results, baseline.results);
     assert_eq!(auto.conforms, baseline.conforms);
     assert_eq!(auto.results, full.results);
@@ -1401,13 +1383,10 @@ fn absent_noop_delta() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
-    assert_eq!(
-        auto.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Delta);
     assert_eq!(auto.statistics.shapes_executed, 0);
     assert_eq!(auto.statistics.constraints_evaluated, 0);
     assert_eq!(auto.statistics.read.index_seeks, 1);
@@ -1480,13 +1459,10 @@ fn present_noop_delta() {
             &data,
             &schema,
             &changes,
-            &mode_options(ShaclExecutionMode::ForceFull),
+            &mode_options(ShaclEvaluationMode::Full),
         )
         .unwrap();
-    assert_eq!(
-        auto.statistics.selected_mode,
-        ShaclExecutionMode::ForceDelta
-    );
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Delta);
     assert_eq!(auto.statistics.shapes_executed, 0);
     assert_eq!(auto.statistics.constraints_evaluated, 0);
     assert_eq!(auto.statistics.read.index_seeks, 1);
@@ -1532,10 +1508,7 @@ fn schema_changes_error() {
             &ShaclValidationOptions::default(),
         )
         .unwrap();
-    assert_eq!(
-        global.statistics.selected_mode,
-        ShaclExecutionMode::ForceFull
-    );
+    assert_eq!(global.statistics.selected_mode, ShaclEvaluationMode::Full);
     assert!(global.statistics.estimated_delta_work > global.statistics.estimated_full_work);
     assert!(global.statistics.estimated_affected_shapes >= 2);
 
@@ -1586,7 +1559,7 @@ fn schema_changes_error() {
             &data,
             &imported_schema,
             &import_change,
-            &mode_options(ShaclExecutionMode::ForceDelta),
+            &mode_options(ShaclEvaluationMode::Delta),
         )
         .unwrap_err();
     assert!(matches!(
@@ -1617,7 +1590,7 @@ fn generated_delta_matches() {
         .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
         .unwrap();
     let options = ShaclValidationOptions::default();
-    let delta_options = mode_options(ShaclExecutionMode::ForceDelta);
+    let delta_options = mode_options(ShaclEvaluationMode::Delta);
     node.validate_shacl(&AUTH, &data, &schema, &options)
         .unwrap();
 
@@ -1697,7 +1670,7 @@ fn class_delta_matches() {
         .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
         .unwrap();
     let options = ShaclValidationOptions::default();
-    let delta_options = mode_options(ShaclExecutionMode::ForceDelta);
+    let delta_options = mode_options(ShaclEvaluationMode::Delta);
     assert!(
         node.validate_shacl(&AUTH, &data, &schema, &options)
             .unwrap()
@@ -1726,7 +1699,7 @@ fn class_delta_matches() {
             &ShaclValidationOptions::default(),
         )
         .unwrap();
-    assert_eq!(auto.statistics.selected_mode, ShaclExecutionMode::ForceFull);
+    assert_eq!(auto.statistics.selected_mode, ShaclEvaluationMode::Full);
     let incremental = node
         .validate_shacl_delta(
             &AUTH,
@@ -1778,7 +1751,7 @@ fn batch_state_matches() {
         &ShaclBinding {
             data_graph: data.clone(),
             shapes_graph: shapes.clone(),
-            policy: ValidationPolicy::Enforce,
+            policy: ShaclWritePolicy::Enforce,
             validation_options: ShaclBindingOptions::default(),
         },
     )
@@ -1855,7 +1828,7 @@ fn policy_report_persistence() {
     let binding = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: shapes.clone(),
-        policy: ValidationPolicy::Enforce,
+        policy: ShaclWritePolicy::Enforce,
         validation_options: ShaclBindingOptions::default(),
     };
     let bound = node.bind_shacl(&AUTH, &binding).unwrap();
@@ -1891,7 +1864,7 @@ fn policy_report_persistence() {
 
     node.unbind_shacl(&AUTH, &data, &shapes).unwrap();
     let advisory = ShaclBinding {
-        policy: ValidationPolicy::Advisory,
+        policy: ShaclWritePolicy::Advisory,
         ..binding
     };
     node.bind_shacl(&AUTH, &advisory).unwrap();

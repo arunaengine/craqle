@@ -9,8 +9,8 @@ use std::sync::{Arc, Barrier, mpsc};
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
     GraphPolicy, GraphReplicaSnapshot, MaterializedQuadChange, NewDataEntity, QueryIndexStatus,
-    ShaclBinding, ShaclBindingOptions, ShaclBindingStatus, ShaclValidationState, UpdateError,
-    ValidationPolicy, VectorClock,
+    ShaclBinding, ShaclBindingOptions, ShaclBindingStatus, ShaclBlockingSeverity,
+    ShaclValidationState, ShaclWritePolicy, UpdateError, VectorClock,
 };
 
 use crate::support::with_watchdog;
@@ -23,6 +23,7 @@ const SH_PROPERTY: &str = "http://www.w3.org/ns/shacl#property";
 const SH_PATH: &str = "http://www.w3.org/ns/shacl#path";
 const SH_MIN: &str = "http://www.w3.org/ns/shacl#minCount";
 const SH_MAX: &str = "http://www.w3.org/ns/shacl#maxCount";
+const SH_SEVERITY: &str = "http://www.w3.org/ns/shacl#severity";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const FOCUS: &str = "urn:test:shacl-write-focus";
 const VALUE: &str = "urn:test:shacl-write-value";
@@ -125,7 +126,7 @@ fn bind(
     node: &CraqleNode,
     data: &GraphId,
     shapes: &GraphId,
-    policy: ValidationPolicy,
+    policy: ShaclWritePolicy,
 ) -> ShaclBindingStatus {
     node.bind_shacl(
         &craqle::AllowAllAuthorizer,
@@ -167,7 +168,7 @@ fn enforce_insert_atomic() {
     limit_shape(&node, &shapes, SH_MAX, 1, VALUE, FOCUS);
     node.apply_changes_unchecked(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:one"))])
         .unwrap();
-    let bound = bind(&node, &data, &shapes, ValidationPolicy::Enforce);
+    let bound = bind(&node, &data, &shapes, ShaclWritePolicy::Enforce);
     assert_eq!(bound.state, ShaclValidationState::Valid);
 
     let before = state(&node, &data);
@@ -224,7 +225,7 @@ fn enforce_delete_atomic() {
     limit_shape(&node, &shapes, SH_MIN, 1, VALUE, FOCUS);
     node.apply_changes_unchecked(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:one"))])
         .unwrap();
-    let bound = bind(&node, &data, &shapes, ValidationPolicy::Enforce);
+    let bound = bind(&node, &data, &shapes, ShaclWritePolicy::Enforce);
     assert_eq!(bound.state, ShaclValidationState::Valid);
 
     let before = state(&node, &data);
@@ -250,7 +251,7 @@ fn enforce_valid_status() {
     limit_shape(&node, &shapes, SH_MAX, 2, VALUE, FOCUS);
     node.apply_changes_unchecked(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:one"))])
         .unwrap();
-    let bound = bind(&node, &data, &shapes, ValidationPolicy::Enforce);
+    let bound = bind(&node, &data, &shapes, ShaclWritePolicy::Enforce);
     assert_eq!(bound.state, ShaclValidationState::Valid);
 
     let before = node.graph_snapshot(&data).unwrap();
@@ -285,7 +286,7 @@ fn checked_writes_serialize() {
         )
         .unwrap();
         assert_eq!(
-            bind(&node, &data, &shapes, ValidationPolicy::Enforce).state,
+            bind(&node, &data, &shapes, ShaclWritePolicy::Enforce).state,
             ShaclValidationState::Valid
         );
 
@@ -354,7 +355,7 @@ fn advisory_invalid_commits() {
     node.apply_changes_unchecked(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:one"))])
         .unwrap();
     assert_eq!(
-        bind(&node, &data, &shapes, ValidationPolicy::Enforce).state,
+        bind(&node, &data, &shapes, ShaclWritePolicy::Enforce).state,
         ShaclValidationState::Valid
     );
     let change = add(&data, FOCUS, VALUE, iri("urn:test:two"));
@@ -371,7 +372,7 @@ fn advisory_invalid_commits() {
     node.unbind_shacl(&AllowAllAuthorizer, &data, &shapes)
         .unwrap();
     assert_eq!(
-        bind(&node, &data, &shapes, ValidationPolicy::Advisory).state,
+        bind(&node, &data, &shapes, ShaclWritePolicy::Advisory).state,
         ShaclValidationState::Valid
     );
 
@@ -395,6 +396,120 @@ fn advisory_invalid_commits() {
 }
 
 #[test]
+fn shacl_blocking_severity() {
+    let (_directory, node) = open_node();
+    let data = GraphId::new("urn:test:shacl-severity-data");
+    let shapes = GraphId::new("urn:test:shacl-severity-shapes");
+    limit_shape(&node, &shapes, SH_MAX, 1, VALUE, FOCUS);
+    node.apply_changes_unchecked(
+        &shapes,
+        vec![add(
+            &shapes,
+            "urn:test:shacl-write-property",
+            SH_SEVERITY,
+            iri("http://www.w3.org/ns/shacl#Warning"),
+        )],
+    )
+    .unwrap();
+    let first = add(&data, FOCUS, VALUE, iri("urn:test:severity-one"));
+    let second = add(&data, FOCUS, VALUE, iri("urn:test:severity-two"));
+    node.apply_changes_unchecked(&data, vec![first]).unwrap();
+
+    let initial = bind(&node, &data, &shapes, ShaclWritePolicy::Enforce);
+    assert_eq!(
+        initial.binding.validation_options.blocking_severity,
+        ShaclBlockingSeverity::ViolationOnly
+    );
+    node.apply_changes(&AllowAllAuthorizer, &data, vec![second.clone()])
+        .unwrap();
+    let warning = status(&node, &data).report.unwrap();
+    assert!(!warning.conforms);
+    assert!(warning.accepted_by_write_policy);
+
+    let stricter = node
+        .bind_shacl(
+            &AllowAllAuthorizer,
+            &ShaclBinding {
+                data_graph: data.clone(),
+                shapes_graph: shapes.clone(),
+                policy: ShaclWritePolicy::Enforce,
+                validation_options: ShaclBindingOptions {
+                    blocking_severity: ShaclBlockingSeverity::WarningOrViolation,
+                    ..ShaclBindingOptions::default()
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stricter.binding.validation_options.blocking_severity,
+        ShaclBlockingSeverity::WarningOrViolation
+    );
+    assert!(!stricter.report.unwrap().accepted_by_write_policy);
+    node.apply_changes(
+        &AllowAllAuthorizer,
+        &data,
+        vec![del(&data, FOCUS, VALUE, iri("urn:test:severity-two"))],
+    )
+    .unwrap();
+    assert!(matches!(
+        node.apply_changes(&AllowAllAuthorizer, &data, vec![second.clone()]),
+        Err(CraqleError::Update(UpdateError::ShaclValidationFailed(_)))
+    ));
+
+    node.bind_shacl(
+        &AllowAllAuthorizer,
+        &ShaclBinding {
+            data_graph: data.clone(),
+            shapes_graph: shapes.clone(),
+            policy: ShaclWritePolicy::Advisory,
+            validation_options: ShaclBindingOptions {
+                blocking_severity: ShaclBlockingSeverity::AnyResult,
+                ..ShaclBindingOptions::default()
+            },
+        },
+    )
+    .unwrap();
+    node.apply_changes(&AllowAllAuthorizer, &data, vec![second])
+        .unwrap();
+    let advisory = status(&node, &data).report.unwrap();
+    assert!(!advisory.conforms);
+    assert!(!advisory.accepted_by_write_policy);
+
+    let custom_data = GraphId::new("urn:test:shacl-custom-severity-data");
+    let custom_shapes = GraphId::new("urn:test:shacl-custom-severity-shapes");
+    limit_shape(&node, &custom_shapes, SH_MAX, 1, VALUE, FOCUS);
+    node.apply_changes_unchecked(
+        &custom_shapes,
+        vec![add(
+            &custom_shapes,
+            "urn:test:shacl-write-property",
+            SH_SEVERITY,
+            iri("urn:test:custom-severity"),
+        )],
+    )
+    .unwrap();
+    node.apply_changes_unchecked(
+        &custom_data,
+        vec![add(&custom_data, FOCUS, VALUE, iri("urn:test:custom-one"))],
+    )
+    .unwrap();
+    bind(
+        &node,
+        &custom_data,
+        &custom_shapes,
+        ShaclWritePolicy::Enforce,
+    );
+    assert!(matches!(
+        node.apply_changes(
+            &AllowAllAuthorizer,
+            &custom_data,
+            vec![add(&custom_data, FOCUS, VALUE, iri("urn:test:custom-two"),)],
+        ),
+        Err(CraqleError::Update(UpdateError::ShaclValidationFailed(_)))
+    ));
+}
+
+#[test]
 fn disabled_keeps_rocrate() {
     let (_directory, node) = open_node();
     let data = GraphId::new("urn:test:shacl-write-disabled-data");
@@ -413,7 +528,7 @@ fn disabled_keeps_rocrate() {
     .unwrap();
     limit_shape(&node, &shapes, SH_MAX, 0, VALUE, FOCUS);
     assert_eq!(
-        bind(&node, &data, &shapes, ValidationPolicy::Disabled).state,
+        bind(&node, &data, &shapes, ShaclWritePolicy::Disabled).state,
         ShaclValidationState::Pending
     );
 
@@ -456,7 +571,7 @@ fn separate_structural_and_shacl_write_checks() {
     .unwrap();
     limit_shape(&node, &shapes, SH_MAX, 0, HAS_PART, data.as_str());
     assert_eq!(
-        bind(&node, &data, &shapes, ValidationPolicy::Enforce).state,
+        bind(&node, &data, &shapes, ShaclWritePolicy::Enforce).state,
         ShaclValidationState::Valid
     );
 
@@ -495,7 +610,7 @@ fn separate_structural_and_shacl_write_checks() {
     )
     .unwrap();
     assert_eq!(
-        bind(&node, &raw, &raw_shapes, ValidationPolicy::Enforce).state,
+        bind(&node, &raw, &raw_shapes, ShaclWritePolicy::Enforce).state,
         ShaclValidationState::Valid
     );
     let before = state(&node, &raw);
@@ -536,7 +651,7 @@ fn enforce_search_atomic() {
     node.apply_changes_unchecked(&data, vec![add(&data, FOCUS, VALUE, iri("urn:test:one"))])
         .unwrap();
     assert_eq!(
-        bind(&node, &data, &shapes, ValidationPolicy::Enforce).state,
+        bind(&node, &data, &shapes, ShaclWritePolicy::Enforce).state,
         ShaclValidationState::Valid
     );
     node.flush_search_updates().unwrap();

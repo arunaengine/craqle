@@ -11,7 +11,7 @@ use support::BenchWriteExt as _;
 use allocation::AllocationInterval;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind,
-    JoinMode, MaterializedQuadChange, QueryExecution, QueryExecutionOptions, QueryFastPathKind,
+    JoinMode, MaterializedQuadChange, QueryExecution, QueryFastPathKind, QueryOptions,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::{binary_blake3, env_duration, repository_commit};
@@ -82,7 +82,7 @@ impl JoinFixture {
     }
 
     fn run(&self, mode: JoinMode) -> QueryExecution {
-        let mut options = QueryExecutionOptions::default();
+        let mut options = QueryOptions::default();
         options.join_mode = mode;
         self.node
             .execute_prepared_in_graphs(

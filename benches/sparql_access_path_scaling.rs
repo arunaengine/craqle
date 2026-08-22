@@ -6,7 +6,7 @@ mod allocation;
 mod support;
 
 use allocation::{AllocationInterval, AllocationSample};
-use craqle::{PreparedQuery, QueryExecution, QueryExecutionOptions, QueryReadMode};
+use craqle::{PreparedQuery, QueryExecution, QueryOptions, QueryReadMode};
 use criterion::{Criterion, criterion_group, criterion_main};
 use support::{QUADS_1M, fixture::Fixture};
 
@@ -16,7 +16,7 @@ struct ScalingCase {
 }
 
 fn execute(fixture: &Fixture, query: &PreparedQuery, mode: QueryReadMode) -> QueryExecution {
-    let mut options = QueryExecutionOptions::default();
+    let mut options = QueryOptions::default();
     options.read_mode = mode;
     fixture.run_hot_prepared(query, &options)
 }

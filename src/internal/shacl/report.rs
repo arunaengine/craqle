@@ -3,7 +3,7 @@ use std::time::Instant;
 use crate::query_context::ReadContext;
 use crate::rdf_read::RdfReadView;
 use crate::shacl::{
-    ShaclError, ShaclMessage, ShaclValidationReport, ShaclValidationResult,
+    ShaclBlockingSeverity, ShaclError, ShaclMessage, ShaclValidationReport, ShaclValidationResult,
     ShaclValidationStatistics,
 };
 use crate::store::TermId;
@@ -98,6 +98,7 @@ impl ReportBuilder {
         view: &V,
         context: &ReadContext<'_>,
         mut statistics: ShaclValidationStatistics,
+        blocking_severity: ShaclBlockingSeverity,
     ) -> Result<ShaclValidationReport> {
         let start = Instant::now();
         let mut results = Vec::with_capacity(self.results.len());
@@ -127,11 +128,14 @@ impl ReportBuilder {
         statistics.report_time = start.elapsed();
         statistics.read = context.snapshot();
         statistics.terms_decoded = statistics.read.terms_decoded;
-        Ok(ShaclValidationReport {
-            conforms: results.is_empty(),
+        let mut report = ShaclValidationReport {
+            conforms: false,
+            accepted_by_write_policy: false,
             results,
             statistics,
-        })
+        };
+        report.refresh_outcomes(blocking_severity);
+        Ok(report)
     }
 }
 

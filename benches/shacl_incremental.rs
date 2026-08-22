@@ -14,8 +14,8 @@ use allocation::AllocationInterval;
 use craqle::{
     AllowAllAuthorizer, CompiledShaclSchema, CreateCrateRequest, EncodedTerm, GraphId, GraphPolicy,
     MaterializedQuadChange, ShaclBinding, ShaclBindingOptions, ShaclCompileOptions,
-    ShaclExecutionMode, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
-    ShaclValidationState, ValidationPolicy,
+    ShaclEvaluationMode, ShaclValidationOptions, ShaclValidationReport, ShaclValidationResult,
+    ShaclValidationState, ShaclWritePolicy,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use support::fixture::Fixture;
@@ -110,9 +110,9 @@ fn shacl_incremental(c: &mut Criterion) {
     );
     for case in &data.cases {
         for mode in [
-            ShaclExecutionMode::ForceDelta,
-            ShaclExecutionMode::ForceFull,
-            ShaclExecutionMode::Auto,
+            ShaclEvaluationMode::Delta,
+            ShaclEvaluationMode::Full,
+            ShaclEvaluationMode::Auto,
         ] {
             let (duration, report, allocations) = run_mode(&data, &case.changes, mode);
             let equal = report.results == case.expected && report.conforms == case.conforms;
@@ -152,9 +152,9 @@ fn shacl_incremental(c: &mut Criterion) {
     });
     for case in &data.cases {
         for (label, mode) in [
-            ("force_delta", ShaclExecutionMode::ForceDelta),
-            ("force_full", ShaclExecutionMode::ForceFull),
-            ("auto", ShaclExecutionMode::Auto),
+            ("force_delta", ShaclEvaluationMode::Delta),
+            ("force_full", ShaclEvaluationMode::Full),
+            ("auto", ShaclEvaluationMode::Auto),
         ] {
             let options = mode_options(&data.options, mode);
             group.bench_function(format!("{label}/{}", case.label), |b| {
@@ -244,7 +244,7 @@ fn shacl_incremental(c: &mut Criterion) {
     print_case(
         "checked_write",
         "valid_enforce_write",
-        ShaclExecutionMode::Auto,
+        ShaclEvaluationMode::Auto,
         1,
         duration,
         &report,
@@ -358,9 +358,9 @@ fn smoke(data: &mut BenchData) {
     for index in 0..data.cases.len() {
         let label = data.cases[index].label;
         let changes = data.cases[index].changes.clone();
-        let (_, delta, _) = run_mode(data, &changes, ShaclExecutionMode::ForceDelta);
-        let (_, candidate_full, _) = run_mode(data, &changes, ShaclExecutionMode::ForceFull);
-        let (_, auto, _) = run_mode(data, &changes, ShaclExecutionMode::Auto);
+        let (_, delta, _) = run_mode(data, &changes, ShaclEvaluationMode::Delta);
+        let (_, candidate_full, _) = run_mode(data, &changes, ShaclEvaluationMode::Full);
+        let (_, auto, _) = run_mode(data, &changes, ShaclEvaluationMode::Auto);
         data.fixture
             .node()
             .apply_changes_unchecked(&data.data, changes.clone())
@@ -423,7 +423,7 @@ fn run_full(
 fn run_mode(
     data: &BenchData,
     changes: &[MaterializedQuadChange],
-    execution_mode: ShaclExecutionMode,
+    execution_mode: ShaclEvaluationMode,
 ) -> (
     Duration,
     ShaclValidationReport,
@@ -507,7 +507,7 @@ fn run_write(
             &ShaclBinding {
                 data_graph: graph.clone(),
                 shapes_graph: shapes.clone(),
-                policy: ValidationPolicy::Enforce,
+                policy: ShaclWritePolicy::Enforce,
                 validation_options: ShaclBindingOptions::default(),
             },
         )
@@ -549,35 +549,35 @@ fn policy_bench(c: &mut Criterion, data: &BenchData) {
     let specs = [
         (
             "disabled_write",
-            ValidationPolicy::Disabled,
+            ShaclWritePolicy::Disabled,
             2usize,
             true,
             VALUE,
         ),
         (
             "unrelated_advisory",
-            ValidationPolicy::Advisory,
+            ShaclWritePolicy::Advisory,
             2usize,
             true,
             UNRELATED,
         ),
         (
             "relevant_advisory",
-            ValidationPolicy::Advisory,
+            ShaclWritePolicy::Advisory,
             2usize,
             true,
             VALUE,
         ),
         (
             "valid_enforce",
-            ValidationPolicy::Enforce,
+            ShaclWritePolicy::Enforce,
             1usize,
             true,
             VALUE,
         ),
         (
             "rejected_enforce",
-            ValidationPolicy::Enforce,
+            ShaclWritePolicy::Enforce,
             2usize,
             false,
             VALUE,
@@ -699,7 +699,7 @@ fn policy_setup(
     label: &str,
     predicate: &str,
     minimum: usize,
-    policy: ValidationPolicy,
+    policy: ShaclWritePolicy,
 ) {
     data.fixture
         .node()
@@ -739,7 +739,7 @@ fn policy_setup(
     policy_bind(data, graph, shapes, policy);
 }
 
-fn policy_bind(data: &BenchData, graph: &GraphId, shapes: &GraphId, policy: ValidationPolicy) {
+fn policy_bind(data: &BenchData, graph: &GraphId, shapes: &GraphId, policy: ShaclWritePolicy) {
     data.fixture
         .node()
         .bind_shacl(
@@ -758,7 +758,7 @@ fn policy_sample(
     data: &BenchData,
     graph: &GraphId,
     label: &str,
-    policy: ValidationPolicy,
+    policy: ShaclWritePolicy,
     accepts: bool,
     predicate: &str,
 ) -> PolicySample {
@@ -792,32 +792,32 @@ fn policy_sample(
     assert!(!statuses.is_empty(), "policy benchmark status is missing");
     let status = &statuses[0];
     let (validation_scope, statistics) = match policy {
-        ValidationPolicy::Disabled => {
+        ShaclWritePolicy::Disabled => {
             assert!(status.report.is_none(), "disabled write produced a report");
             ("skipped", None)
         }
-        ValidationPolicy::Advisory if accepts && predicate == VALUE => {
+        ShaclWritePolicy::Advisory if accepts && predicate == VALUE => {
             assert_eq!(status.state, ShaclValidationState::Invalid);
             let report = status.report.as_ref().expect("advisory report is missing");
             assert!(!report.conforms, "advisory report unexpectedly conforms");
             assert_eq!(report.results.len(), 1, "advisory report is incomplete");
             ("persisted_report", Some(&report.statistics))
         }
-        ValidationPolicy::Advisory if accepts => {
+        ShaclWritePolicy::Advisory if accepts => {
             assert_eq!(status.state, ShaclValidationState::Valid);
             let report = status.report.as_ref().expect("advisory report is missing");
             assert!(report.conforms, "advisory report is invalid");
             assert!(report.results.is_empty(), "advisory report is not empty");
             ("persisted_report", Some(&report.statistics))
         }
-        ValidationPolicy::Enforce if accepts => {
+        ShaclWritePolicy::Enforce if accepts => {
             assert_eq!(status.state, ShaclValidationState::Valid);
             let report = status.report.as_ref().expect("enforce report is missing");
             assert!(report.conforms, "enforce report is invalid");
             assert!(report.results.is_empty(), "enforce report is not empty");
             ("persisted_report", Some(&report.statistics))
         }
-        ValidationPolicy::Enforce => {
+        ShaclWritePolicy::Enforce => {
             let after_graph = data
                 .fixture
                 .node()
@@ -830,7 +830,7 @@ fn policy_sample(
             assert_eq!(statuses, before_statuses, "rejected write changed status");
             ("rejected_error_unavailable", None)
         }
-        ValidationPolicy::Advisory => unreachable!(),
+        ShaclWritePolicy::Advisory => unreachable!(),
         _ => unreachable!(),
     };
     let read = statistics.map(|statistics| &statistics.read);
@@ -880,7 +880,7 @@ fn policy_changes(
 
 fn mode_options(
     options: &ShaclValidationOptions,
-    execution_mode: ShaclExecutionMode,
+    execution_mode: ShaclEvaluationMode,
 ) -> ShaclValidationOptions {
     ShaclValidationOptions {
         execution_mode,
@@ -1275,7 +1275,7 @@ fn print_provenance(data: &BenchData) {
 fn print_case(
     operation: &str,
     label: &str,
-    requested_mode: ShaclExecutionMode,
+    requested_mode: ShaclEvaluationMode,
     delta_size: usize,
     duration: Duration,
     report: &ShaclValidationReport,

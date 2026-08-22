@@ -7,7 +7,7 @@ All notable changes to Craqle are documented here.
 ### Added
 
 - Persistent qv query indexes and prepared SPARQL execution.
-- Native bounded `CraqleFastV1` SHACL compilation, validation, policy binding,
+- Native bounded `CoreSubsetV1` SHACL compilation, validation, policy binding,
   status, and bounded recovery APIs.
 - RO-Crate 1.1, 1.2, and 1.3 import and export handling.
 - Stable high-level public error categories and an authoritative disk-format
@@ -48,7 +48,7 @@ All notable changes to Craqle are documented here.
 
 ### Known limits
 
-- `CraqleFastV1` is a bounded SHACL profile; full SHACL Core is not claimed.
+- `CoreSubsetV1` is a bounded SHACL profile; full SHACL Core is not claimed.
 - SHACL-SPARQL, SHACL-JS, SHACL-AF, remote imports, RDF-star, and other listed
   unsupported forms fail explicitly.
 - The release candidate still uses exact Git dependencies and is not yet

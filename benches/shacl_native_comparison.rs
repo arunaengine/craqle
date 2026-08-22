@@ -273,7 +273,7 @@ fn insert_shapes(fixture: &Fixture, graph: &GraphId) {
             graph: graph.clone(),
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
-            object: EncodedTerm::from_term(&quad.object),
+            object: EncodedTerm::from_term(&quad.object).unwrap(),
         })
         .collect();
     fixture

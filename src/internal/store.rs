@@ -5582,7 +5582,7 @@ impl GraphStore {
                 });
             }
             let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
-            if status.binding.policy == crate::shacl::ValidationPolicy::Disabled
+            if status.binding.policy == crate::shacl::ShaclWritePolicy::Disabled
                 || status.state != crate::shacl::ShaclValidationState::Pending
             {
                 continue;
@@ -5696,7 +5696,7 @@ impl GraphStore {
                 });
             };
             let status: crate::shacl::ShaclBindingStatus = postcard::from_bytes(value.as_ref())?;
-            if status.binding.policy != crate::shacl::ValidationPolicy::Disabled {
+            if status.binding.policy != crate::shacl::ShaclWritePolicy::Disabled {
                 graphs.push(status.binding.data_graph);
             }
         }
@@ -5830,7 +5830,7 @@ impl GraphStore {
             if status.binding.data_graph == *changed_graph {
                 status.data_version = data_version;
             }
-            if status.binding.policy == crate::shacl::ValidationPolicy::Disabled {
+            if status.binding.policy == crate::shacl::ShaclWritePolicy::Disabled {
                 if status.binding.data_graph == *changed_graph {
                     self.stage_binding_status(batch, &status)?;
                 }
@@ -5951,7 +5951,7 @@ impl GraphStore {
                     &status.binding.data_graph,
                     &status.binding.shapes_graph,
                 )?;
-            } else if status.binding.policy != crate::shacl::ValidationPolicy::Disabled {
+            } else if status.binding.policy != crate::shacl::ShaclWritePolicy::Disabled {
                 status.state = crate::shacl::ShaclValidationState::Pending;
                 status.report = None;
                 status.error = None;
@@ -7670,12 +7670,13 @@ mod tests {
                         binding: crate::ShaclBinding {
                             data_graph: data.clone(),
                             shapes_graph: shapes.clone(),
-                            policy: crate::ValidationPolicy::Advisory,
+                            policy: crate::ShaclWritePolicy::Advisory,
                             validation_options: crate::ShaclBindingOptions::default(),
                         },
                         state: crate::ShaclValidationState::Valid,
                         report: Some(crate::ShaclValidationReport {
                             conforms: true,
+                            accepted_by_write_policy: true,
                             results: Vec::new(),
                             statistics: crate::ShaclValidationStatistics::default(),
                         }),

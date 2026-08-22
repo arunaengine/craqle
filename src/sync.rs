@@ -980,6 +980,11 @@ pub(crate) const MAX_TERM_BYTES: usize = 4 * 1024 * 1024;
 /// N-Triples shapes craqle encodes.
 fn check_term(term: &EncodedTerm) -> SyncResult<()> {
     let text = term.0.as_str();
+    if term.is_rdf_star() {
+        return Err(CraqleSyncError::InvalidEvent(format!(
+            "UnsupportedRdfStarTerm: `{text}`"
+        )));
+    }
     if text.len() > MAX_TERM_BYTES {
         return Err(CraqleSyncError::InvalidEvent(format!(
             "term of {} bytes exceeds the {MAX_TERM_BYTES} byte limit",

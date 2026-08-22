@@ -228,13 +228,46 @@ pub struct GraphTombstone {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EncodedTerm(pub String);
 
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("UnsupportedRdfStarTerm: RDF-star term `{term}` is unsupported")]
+pub struct UnsupportedRdfStarTerm {
+    pub term: String,
+}
+
+impl UnsupportedRdfStarTerm {
+    pub fn kind(&self) -> crate::CraqleErrorKind {
+        crate::CraqleErrorKind::Unsupported
+    }
+}
+
 impl EncodedTerm {
     pub fn from_named_node(n: &NamedNode) -> Self {
         Self(n.to_string())
     }
 
-    pub fn from_term(t: &oxrdf::Term) -> Self {
-        Self(t.to_string())
+    pub fn from_term(t: &oxrdf::Term) -> Result<Self, UnsupportedRdfStarTerm> {
+        match t {
+            oxrdf::Term::Triple(_) => Err(UnsupportedRdfStarTerm {
+                term: t.to_string(),
+            }),
+            _ => Ok(Self(t.to_string())),
+        }
+    }
+
+    pub fn from_literal(literal: &oxrdf::Literal) -> Self {
+        Self(literal.to_string())
+    }
+
+    pub fn from_blank_node(node: &oxrdf::BlankNode) -> Self {
+        Self(node.to_string())
+    }
+
+    pub(crate) fn from_non_star_term(t: &oxrdf::Term) -> Self {
+        Self::from_term(t).expect("caller supplied a non-RDF-star term")
+    }
+
+    pub(crate) fn is_rdf_star(&self) -> bool {
+        self.0.starts_with("<<")
     }
 
     /// Encode a subject id that may name an IRI or a blank node.
@@ -657,7 +690,7 @@ mod tests {
             "Quote: \" slash: \\\\ newline:\n snowman:\u{2603}",
             NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#string"),
         );
-        let encoded = EncodedTerm::from_term(&Term::Literal(literal.clone()));
+        let encoded = EncodedTerm::from_non_star_term(&Term::Literal(literal.clone()));
         let decoded = encoded.to_term().unwrap();
 
         assert_eq!(decoded, Term::Literal(literal));
@@ -666,7 +699,7 @@ mod tests {
     #[test]
     fn encoded_term_round_trips_language_literals() {
         let literal = Literal::new_language_tagged_literal_unchecked("bonjour", "fr-ca");
-        let encoded = EncodedTerm::from_term(&Term::Literal(literal.clone()));
+        let encoded = EncodedTerm::from_non_star_term(&Term::Literal(literal.clone()));
         let decoded = encoded.to_term().unwrap();
 
         assert_eq!(decoded, Term::Literal(literal));

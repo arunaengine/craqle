@@ -568,9 +568,9 @@ fn pattern_term(term: &TermPattern) -> Option<PatternTerm> {
         TermPattern::NamedNode(node) => {
             Some(PatternTerm::Constant(EncodedTerm::from_named_node(node)))
         }
-        TermPattern::Literal(literal) => Some(PatternTerm::Constant(EncodedTerm::from_term(
-            &Term::Literal(literal.clone()),
-        ))),
+        TermPattern::Literal(literal) => Some(PatternTerm::Constant(
+            EncodedTerm::from_non_star_term(&Term::Literal(literal.clone())),
+        )),
         TermPattern::Variable(variable) => {
             Some(PatternTerm::Variable(variable.as_str().to_owned()))
         }
@@ -1618,7 +1618,7 @@ fn count_outcome(
     let collecting = Instant::now();
     let row = HashMap::from([(
         output.to_owned(),
-        EncodedTerm::from_term(&Term::Literal(Literal::from(count))),
+        EncodedTerm::from_non_star_term(&Term::Literal(Literal::from(count))),
     )]);
     budget.observe_solution(&row)?;
     let collection_time = collecting.elapsed();

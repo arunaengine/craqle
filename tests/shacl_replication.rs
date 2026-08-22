@@ -6,7 +6,7 @@ use crate::support::TestWriteExt as _;
 
 use craqle::{
     AllowAllAuthorizer, EncodedTerm, GraphId, MaterializedQuadChange, ShaclBinding,
-    ShaclBindingOptions, ShaclValidationState, ValidationPolicy,
+    ShaclBindingOptions, ShaclValidationState, ShaclWritePolicy,
 };
 
 use crate::support::setup_network;
@@ -92,7 +92,7 @@ fn remote_violation_converges() {
     let enforce = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: shapes.clone(),
-        policy: ValidationPolicy::Enforce,
+        policy: ShaclWritePolicy::Enforce,
         validation_options: ShaclBindingOptions::default(),
     };
     assert_eq!(
@@ -107,7 +107,7 @@ fn remote_violation_converges() {
             .bind_shacl(
                 &craqle::AllowAllAuthorizer,
                 &ShaclBinding {
-                    policy: ValidationPolicy::Advisory,
+                    policy: ShaclWritePolicy::Advisory,
                     ..enforce.clone()
                 }
             )
@@ -149,8 +149,8 @@ fn remote_violation_converges() {
         .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(right.len(), 1);
-    assert_eq!(left[0].binding.policy, ValidationPolicy::Enforce);
-    assert_eq!(right[0].binding.policy, ValidationPolicy::Advisory);
+    assert_eq!(left[0].binding.policy, ShaclWritePolicy::Enforce);
+    assert_eq!(right[0].binding.policy, ShaclWritePolicy::Advisory);
     assert_eq!(left[0].state, ShaclValidationState::Invalid);
     assert_eq!(right[0].state, ShaclValidationState::Invalid);
     assert!(left[0].error.is_none());
@@ -236,7 +236,7 @@ fn remove_keeps_dot() {
     let binding = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: shapes.clone(),
-        policy: ValidationPolicy::Advisory,
+        policy: ShaclWritePolicy::Advisory,
         validation_options: ShaclBindingOptions::default(),
     };
     net.peer(0)
@@ -394,7 +394,7 @@ fn import_change_settles() {
     let binding = ShaclBinding {
         data_graph: data.clone(),
         shapes_graph: shapes.clone(),
-        policy: ValidationPolicy::Advisory,
+        policy: ShaclWritePolicy::Advisory,
         validation_options: ShaclBindingOptions {
             allow_local_imports: true,
             ..ShaclBindingOptions::default()

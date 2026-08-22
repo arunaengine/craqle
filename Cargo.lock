@@ -705,6 +705,7 @@ dependencies = [
  "oxigraph",
  "oxjsonld",
  "oxrdf",
+ "oxrdfio",
  "oxsdatatypes",
  "postcard",
  "proptest",

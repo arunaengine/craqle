@@ -1068,7 +1068,8 @@ mod tests {
                 )),
                 object: EncodedTerm::from_term(&oxrdf::Term::Literal(
                     oxrdf::Literal::new_simple_literal("an unrelated note"),
-                )),
+                ))
+                .unwrap(),
             }],
         )
         .unwrap();

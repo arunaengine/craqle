@@ -5,8 +5,7 @@ use std::time::Duration;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleErrorKind, CraqleNode, EncodedTerm, GraphId, MaterializedQuadChange,
-    QueryExecutionOptions, QueryFastPathMode, QueryLimits, QueryResults, UpdateLimits,
-    UpdateOptions,
+    QueryFastPathMode, QueryLimits, QueryOptions, QueryResults, UpdateLimits, UpdateOptions,
 };
 
 fn insert(graph: &GraphId, subject: &str, predicate: &str, object: &str) -> MaterializedQuadChange {
@@ -42,10 +41,10 @@ fn expect_query_limit(
     node: &CraqleNode,
     graph: &GraphId,
     query: &str,
-    configure: impl FnOnce(&mut QueryExecutionOptions),
+    configure: impl FnOnce(&mut QueryOptions),
 ) {
     let prepared = node.prepare_query(query).unwrap();
-    let mut options = QueryExecutionOptions::default();
+    let mut options = QueryOptions::default();
     configure(&mut options);
     let error = node
         .execute_prepared_in_graphs(

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use oxrdf::graph::CanonicalizationAlgorithm;
-use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, TermRef, Triple};
 use rudof_iri::IriS;
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_core::SHACLPath;
@@ -17,7 +17,7 @@ use crate::query_context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::shacl::{
     CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError,
-    ShaclExecutionMode, ShaclValidationOptions, ShaclValidationReport,
+    ShaclEvaluationMode, ShaclValidationOptions, ShaclValidationReport,
 };
 use crate::store::{GraphStore, StoreError, TermId, hash_term};
 use crate::validation_delta::{DeltaIndex, DeltaReadView};
@@ -46,6 +46,16 @@ const SH_PROPERTY_SHAPE: &str = "<http://www.w3.org/ns/shacl#PropertyShape>";
 const SH_PROPERTY: &str = "<http://www.w3.org/ns/shacl#property>";
 const SH_TARGET_TYPE: &str = "<http://www.w3.org/ns/shacl#TargetType>";
 const SH_PATH: &str = "<http://www.w3.org/ns/shacl#path>";
+const SH_NODE: &str = "http://www.w3.org/ns/shacl#node";
+const SH_NOT: &str = "http://www.w3.org/ns/shacl#not";
+const SH_QUALIFIED_VALUE_SHAPE: &str = "http://www.w3.org/ns/shacl#qualifiedValueShape";
+const SH_PROPERTY_IRI: &str = "http://www.w3.org/ns/shacl#property";
+const SH_AND: &str = "http://www.w3.org/ns/shacl#and";
+const SH_OR: &str = "http://www.w3.org/ns/shacl#or";
+const SH_XONE: &str = "http://www.w3.org/ns/shacl#xone";
+const RDF_FIRST_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
+const RDF_REST_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
+const RDF_NIL_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
 const SH_SPARQL: &str = "<http://www.w3.org/ns/shacl#sparql>";
 const SH_RULE: &str = "<http://www.w3.org/ns/shacl#rule>";
 const SH_EXPRESSION: &str = "<http://www.w3.org/ns/shacl#expression>";
@@ -67,6 +77,7 @@ struct ValidationCacheKey {
     data_version: [u8; 32],
     max_path_edges: u64,
     max_path_depth: usize,
+    blocking_severity: crate::ShaclBlockingSeverity,
 }
 
 pub(crate) struct ShaclCompiler {
@@ -257,7 +268,7 @@ impl ShaclCompiler {
             store: &self.store,
             started: Instant::now(),
         };
-        if options.execution_mode == ShaclExecutionMode::ForceDelta {
+        if options.execution_mode == ShaclEvaluationMode::Delta {
             return Err(ShaclError::DeltaExecutionUnavailable {
                 reason: "a candidate change set was not supplied".to_owned(),
             }
@@ -290,7 +301,7 @@ impl ShaclCompiler {
             result => result?,
         };
         self.ensure_schema_current(schema)?;
-        stamp_execution(&mut report, ShaclExecutionMode::ForceFull, estimate);
+        stamp_execution(&mut report, ShaclEvaluationMode::Full, estimate);
         if !stop_after_first {
             self.cache_validation(cache_key, report.clone());
         }
@@ -351,7 +362,7 @@ impl ShaclCompiler {
         self.ensure_schema_current(schema)?;
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
         if let Some(graph) = changed_schema(schema, changes) {
-            let error = if options.execution_mode == ShaclExecutionMode::ForceDelta {
+            let error = if options.execution_mode == ShaclEvaluationMode::Delta {
                 ShaclError::DeltaExecutionUnavailable {
                     reason: format!(
                         "the candidate changes compiled shapes graph `{}`",
@@ -388,16 +399,14 @@ impl ShaclCompiler {
                 result => result?,
             };
         let selected = match options.execution_mode {
-            ShaclExecutionMode::Auto if auto_delta(base_available, estimate) => {
-                ShaclExecutionMode::ForceDelta
+            ShaclEvaluationMode::Auto if auto_delta(base_available, estimate) => {
+                ShaclEvaluationMode::Delta
             }
-            ShaclExecutionMode::Auto | ShaclExecutionMode::ForceFull => {
-                ShaclExecutionMode::ForceFull
-            }
-            ShaclExecutionMode::ForceDelta => ShaclExecutionMode::ForceDelta,
+            ShaclEvaluationMode::Auto | ShaclEvaluationMode::Full => ShaclEvaluationMode::Full,
+            ShaclEvaluationMode::Delta => ShaclEvaluationMode::Delta,
         };
         let mut report = match selected {
-            ShaclExecutionMode::ForceDelta => self.validate_incremental(
+            ShaclEvaluationMode::Delta => self.validate_incremental(
                 base,
                 data_graph,
                 schema,
@@ -410,7 +419,7 @@ impl ShaclCompiler {
                 &changed,
                 &context,
             )?,
-            ShaclExecutionMode::ForceFull => self.validate_candidate_full(
+            ShaclEvaluationMode::Full => self.validate_candidate_full(
                 base,
                 data_graph,
                 options,
@@ -420,7 +429,7 @@ impl ShaclCompiler {
                 &index,
                 &context,
             )?,
-            ShaclExecutionMode::Auto => unreachable!("auto always selects a concrete path"),
+            ShaclEvaluationMode::Auto => unreachable!("auto always selects a concrete path"),
         };
         self.ensure_schema_current(schema)?;
         stamp_execution(&mut report, selected, estimate);
@@ -465,7 +474,7 @@ impl ShaclCompiler {
                             return Err(ShaclError::ValidationCancelled.into());
                         }
                         Err(CraqleError::Shacl(ShaclError::ResultLimitExceeded { .. }))
-                            if options.execution_mode == ShaclExecutionMode::ForceDelta =>
+                            if options.execution_mode == ShaclEvaluationMode::Delta =>
                         {
                             return Err(ShaclError::DeltaExecutionUnavailable {
                                 reason: "the uncached base report exceeds the result limit"
@@ -492,6 +501,7 @@ impl ShaclCompiler {
             };
         if selection.affected_pairs.is_empty() {
             let mut report = base_report;
+            report.refresh_outcomes(options.blocking_severity);
             report.statistics = Default::default();
             report.statistics.shape_compile_cache_hit = cache_hit;
             report.statistics.shapes_considered = resolved.shapes.len() as u64;
@@ -525,7 +535,7 @@ impl ShaclCompiler {
                     .contains(&(result.source_shape.clone(), result.focus_node.clone()))
             }));
         report.results.sort();
-        report.conforms = report.results.is_empty();
+        report.refresh_outcomes(options.blocking_severity);
         report.statistics.violations = report.results.len() as u64;
         report.statistics.full_graph_fallbacks = selection.full_graph_fallbacks;
         enforce_result_limit(&report, options)?;
@@ -803,6 +813,7 @@ impl ShaclCompiler {
             data_version: view.snapshot().graph_version(&self.store, graph)?,
             max_path_edges: options.max_path_edges,
             max_path_depth: options.max_path_depth,
+            blocking_severity: options.blocking_severity,
         })
     }
 
@@ -837,6 +848,7 @@ impl ShaclCompiler {
                 data_version,
                 max_path_edges: options.max_path_edges,
                 max_path_depth: options.max_path_depth,
+                blocking_severity: options.blocking_severity,
             },
             report,
         );
@@ -889,7 +901,7 @@ fn auto_delta(base_available: bool, estimate: ExecutionEstimate) -> bool {
 
 fn stamp_execution(
     report: &mut ShaclValidationReport,
-    selected: ShaclExecutionMode,
+    selected: ShaclEvaluationMode,
     estimate: ExecutionEstimate,
 ) {
     report.statistics.selected_mode = selected;
@@ -1306,6 +1318,7 @@ fn materialize_shapes(
         }
         .into());
     }
+    reject_recursive_shapes(&graph_union)?;
     graph_union.canonicalize(CanonicalizationAlgorithm::Unstable);
     let mut triples = graph_union
         .iter()
@@ -1328,6 +1341,90 @@ fn materialize_shapes(
         triple_count: triples.len(),
         graph_versions,
     })
+}
+
+fn reject_recursive_shapes(graph: &Graph) -> Result<()> {
+    let mut edges = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut list_first = HashMap::<String, String>::new();
+    let mut list_rest = HashMap::<String, String>::new();
+    let mut list_references = Vec::new();
+
+    for triple in graph.iter() {
+        let subject = triple.subject.to_string();
+        let object = match triple.object {
+            TermRef::NamedNode(node) => node.to_string(),
+            TermRef::BlankNode(node) => node.to_string(),
+            TermRef::Literal(_) => continue,
+            TermRef::Triple(value) => {
+                return Err(ShaclError::UnsupportedRdfStarTerm {
+                    term: value.to_string(),
+                }
+                .into());
+            }
+        };
+        match triple.predicate.as_str() {
+            SH_NODE | SH_NOT | SH_QUALIFIED_VALUE_SHAPE | SH_PROPERTY_IRI => {
+                edges.entry(subject).or_default().insert(object);
+            }
+            SH_AND | SH_OR | SH_XONE => list_references.push((subject, object)),
+            RDF_FIRST_IRI => {
+                list_first.insert(subject, object);
+            }
+            RDF_REST_IRI => {
+                list_rest.insert(subject, object);
+            }
+            _ => {}
+        }
+    }
+
+    for (shape, mut list) in list_references {
+        let mut visited = HashSet::new();
+        while list != format!("<{RDF_NIL_IRI}>") && visited.insert(list.clone()) {
+            let Some(referenced) = list_first.get(&list) else {
+                break;
+            };
+            edges
+                .entry(shape.clone())
+                .or_default()
+                .insert(referenced.clone());
+            let Some(next) = list_rest.get(&list) else {
+                break;
+            };
+            list.clone_from(next);
+        }
+    }
+
+    let mut complete = HashSet::new();
+    let mut active = HashSet::new();
+    for shape in edges.keys() {
+        if let Some(shape) = recursive_shape(shape, &edges, &mut active, &mut complete) {
+            return Err(ShaclError::UnsupportedRecursiveShape { shape }.into());
+        }
+    }
+    Ok(())
+}
+
+fn recursive_shape(
+    shape: &str,
+    edges: &BTreeMap<String, BTreeSet<String>>,
+    active: &mut HashSet<String>,
+    complete: &mut HashSet<String>,
+) -> Option<String> {
+    if active.contains(shape) {
+        return Some(shape.to_owned());
+    }
+    if complete.contains(shape) {
+        return None;
+    }
+    active.insert(shape.to_owned());
+    for nested in edges.get(shape).into_iter().flatten() {
+        if let Some(recursive) = recursive_shape(nested, edges, active, complete) {
+            return Some(recursive);
+        }
+    }
+    active.remove(shape);
+    complete.insert(shape.to_owned());
+    None
 }
 
 fn ill_formed_term(snapshot: &GraphReplicaSnapshot, term: &EncodedTerm) -> ShaclError {
@@ -1777,7 +1874,7 @@ fn encoded_object(object: &Object) -> Result<EncodedTerm> {
     match object {
         Object::Iri(iri) => Ok(encoded_iri(iri)),
         Object::BlankNode(label) => BlankNode::new(label.clone())
-            .map(|node| EncodedTerm::from_term(&Term::BlankNode(node)))
+            .map(|node| EncodedTerm::from_non_star_term(&Term::BlankNode(node)))
             .map_err(|error| {
                 ShaclError::IllFormedShapes {
                     graph: "Rudof term conversion".to_owned(),
@@ -1816,7 +1913,7 @@ fn encoded_literal(
             NamedNode::new_unchecked(datatype.as_str()),
         )
     };
-    Ok(EncodedTerm::from_term(&Term::Literal(value)))
+    Ok(EncodedTerm::from_non_star_term(&Term::Literal(value)))
 }
 
 #[cfg(test)]
