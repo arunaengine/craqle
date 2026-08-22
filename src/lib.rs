@@ -2997,6 +2997,7 @@ impl CraqleNode {
     /// Clamps the limit, authorizes hits against stored policy, and drops
     /// duplicates so each graph-and-subject pair fills at most one page slot.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
+        self.search.ensure_available()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 {
             return Ok(Vec::new());
@@ -3044,6 +3045,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         req: GraphSearchRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
+        self.search.ensure_available()?;
         // Clamped once here, so both arms and the final ordering agree on it.
         let req = GraphSearchRequest {
             limit: req.limit.min(MAX_SEARCH_LIMIT),

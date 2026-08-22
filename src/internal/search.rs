@@ -277,6 +277,10 @@ fn recreate_index_dir(dir: &Path, schema: &Schema) -> tantivy::Result<Index> {
 }
 
 impl SearchIndex {
+    pub fn ensure_available(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Create or open a persistent index at the given directory path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let schema = build_schema();

@@ -42,6 +42,10 @@ pub struct GraphSetQuery<'a> {
 pub struct SearchIndex;
 
 impl SearchIndex {
+    pub fn ensure_available(&self) -> Result<()> {
+        Err(SearchError::Disabled)
+    }
+
     pub fn open(_path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self)
     }
@@ -76,7 +80,7 @@ impl SearchIndex {
     }
 
     pub fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>> {
-        Ok(Vec::new())
+        Err(SearchError::Disabled)
     }
 
     pub fn search_in_graph(
@@ -85,11 +89,11 @@ impl SearchIndex {
         _query: &str,
         _limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        Ok(Vec::new())
+        Err(SearchError::Disabled)
     }
 
     pub fn search_in_graphs(&self, _req: GraphSetQuery<'_>) -> Result<Vec<SearchHit>> {
-        Ok(Vec::new())
+        Err(SearchError::Disabled)
     }
 
     pub fn commit(&self) -> Result<()> {
