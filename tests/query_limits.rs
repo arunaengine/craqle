@@ -197,13 +197,13 @@ fn update_limits() {
     assert_eq!(production, UpdateLimits::default());
     assert!(production.deadline.is_some());
 
-    let mut change_limits = production.clone();
+    let mut change_limits = production;
     change_limits.max_changes = 1;
-    let mut binding_limits = production.clone();
+    let mut binding_limits = production;
     binding_limits.max_materialized_bindings = 0;
-    let mut graph_limits = production.clone();
+    let mut graph_limits = production;
     graph_limits.max_graphs = 1;
-    let mut byte_limits = production.clone();
+    let mut byte_limits = production;
     byte_limits.max_update_bytes = 1;
     let mut deadline_limits = production;
     deadline_limits.deadline = Some(Duration::ZERO);

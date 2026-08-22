@@ -1153,7 +1153,7 @@ mod tests {
         );
         assert_eq!(
             1,
-            axolotl_hits(&node),
+            axolotl_hits(node),
             "the re-linked entity must come back to search"
         );
     }

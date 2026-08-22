@@ -423,6 +423,7 @@ fn versions_jsonld_terms_authorization_and_unsupported_shapes_fail_or_report_exa
         RoCrateVersion::V1_3,
     ] {
         let data = GraphId::new(&format!("urn:test:rocrate-policy:{version:?}"));
+        #[allow(clippy::obfuscated_if_else)]
         let extras = (version == RoCrateVersion::V1_3)
             .then(|| {
                 vec![

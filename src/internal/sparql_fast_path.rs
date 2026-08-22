@@ -825,6 +825,7 @@ pub(crate) fn execute(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_projection(
     triple: &TriplePlan,
     variables: &[String],
@@ -1634,6 +1635,7 @@ fn count_outcome(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_property_star(
     triples: &[TriplePlan],
     subject_term: &PatternTerm,

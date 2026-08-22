@@ -1267,7 +1267,7 @@ impl SparqlEngine {
                     let target_graphs =
                         update_graph_target_graphs(&self.store, graph, options.limits.max_graphs)?;
                     for graph in &target_graphs {
-                        authorize_update_graph(&view, auth, &graph, crate::Action::Write, false)?;
+                        authorize_update_graph(&view, auth, graph, crate::Action::Write, false)?;
                     }
                     materialize_graph_target_removals(
                         &self.store,
@@ -3548,6 +3548,7 @@ mod tests {
             )
         }
 
+        #[allow(clippy::field_reassign_with_default)]
         fn execute(
             engine: &SparqlEngine,
             graphs: &[GraphId],

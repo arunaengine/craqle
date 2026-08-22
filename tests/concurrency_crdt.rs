@@ -569,7 +569,7 @@ mod tests {
         .unwrap();
         net.sync_until_converged(8).unwrap();
         node.flush_search_updates().unwrap();
-        assert_eq!(1, search_hits(&node, "salamander"), "seeded and searchable");
+        assert_eq!(1, search_hits(node, "salamander"), "seeded and searchable");
 
         net.partition(0, 1);
         net.peer(0)

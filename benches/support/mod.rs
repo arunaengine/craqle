@@ -13,6 +13,7 @@ use std::fmt;
 
 use craqle::{AllowAllAuthorizer, Batch, CraqleNode, GraphId, GraphPolicy, MaterializedQuadChange};
 
+#[allow(clippy::result_large_err)]
 pub trait BenchWriteExt {
     fn apply_changes_unchecked(
         &self,

@@ -551,6 +551,7 @@ impl WriteBatch {
 
 /// Bounded cache state published after a durable graph commit.
 struct IndexState {
+    #[allow(clippy::type_complexity)]
     quad_subjects: BoundedCache<(TermId, TermId, u64), Arc<Vec<(TermId, TermId)>>>,
     object_order: ObjectOrderCache,
     planner_distinct: BoundedCache<(u64, Option<QueryTermId>, DistinctDomain), usize>,
@@ -4396,6 +4397,7 @@ impl GraphStore {
 
     /// Commit without holding the global cache lock, then publish only the
     /// affected cache generations under a short write section.
+    #[allow(clippy::collapsible_if)]
     fn commit_with_index(&self, mut commit: DurableCommit, publish: &PendingPublish) -> Result<()> {
         let maintains_query_index = self.begin_query_index_commit();
         if maintains_query_index {

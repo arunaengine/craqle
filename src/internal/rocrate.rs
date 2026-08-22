@@ -206,6 +206,7 @@ pub struct PrepareRoCrateOptions {
     pub limits: RoCrateImportLimits,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for PrepareRoCrateOptions {
     fn default() -> Self {
         Self {
