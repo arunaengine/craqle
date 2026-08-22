@@ -2310,42 +2310,6 @@ impl CraqleNode {
         self.finish_batch_with_durability(&graph, batch, durability)
     }
 
-    /// Create a crate from a scaffold request that was already validated at
-    /// its origin, skipping post-state rule re-validation.
-    ///
-    /// The request fields must be identical to ones that passed
-    /// `validate_create_crate` (or the checked create) at the origin. Use the
-    /// checked variant for any untrusted input.
-    pub fn create_crate_prevalidated_with_durability_as(
-        &self,
-        auth: &dyn Authorizer,
-        request: CreateCrateRequest,
-        durability: CraqleRequestDurability,
-        actor: Option<ActorId>,
-    ) -> Result<Batch> {
-        let CreateCrateRequest {
-            graph,
-            name,
-            description,
-            date_published,
-            license,
-            policy,
-        } = request;
-        let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self
-            .manager_with(durability, actor)
-            .create_crate_prevalidated(
-                graph.clone(),
-                &name,
-                &description,
-                &date_published,
-                license.as_deref(),
-            )?;
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
-    }
-
     /// Validate and materialize a create-crate request without applying it.
     ///
     /// Returns the changes that would be applied, but does not mutate the graph
@@ -2625,9 +2589,7 @@ impl CraqleNode {
     }
 
     /// Create or replace a visible RO-Crate state from a JSON-LD document and
-    /// persist graph policy when bootstrapping a new graph.
-    ///
-    /// New or empty graphs automatically take the trusted bootstrap fast path.
+    /// persist graph policy for a new graph.
     pub fn apply_rocrate_document_with_policy(
         &self,
         auth: &dyn Authorizer,
@@ -2714,32 +2676,6 @@ impl CraqleNode {
         self.finish_batch_with_durability(&graph, batch, durability)
     }
 
-    /// Apply a RO-Crate document that was already strictly validated at its
-    /// origin, skipping semantic re-validation.
-    ///
-    /// The event-log payload replicated to this node must be byte-identical to
-    /// a document that passed `validate_rocrate_document_checked_with_policy`
-    /// (or the checked apply) at the origin. Structural JSON-LD errors are
-    /// still rejected; RO-Crate semantic rules are not re-checked. Use the
-    /// checked variant for any untrusted input.
-    pub fn apply_rocrate_document_prevalidated_with_policy_and_durability_as(
-        &self,
-        auth: &dyn Authorizer,
-        graph: GraphId,
-        jsonld: &str,
-        policy: GraphPolicy,
-        durability: CraqleRequestDurability,
-        actor: Option<ActorId>,
-    ) -> Result<Batch> {
-        let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self
-            .manager_with(durability, actor)
-            .import_jsonld_prevalidated(graph.clone(), jsonld)?;
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
-    }
-
     /// Strictly validate and materialize a RO-Crate document without applying it.
     ///
     /// Returns the changes that would be applied, but does not mutate the graph
@@ -2754,26 +2690,6 @@ impl CraqleNode {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
         Ok(self.manager().plan_import_jsonld_checked(&graph, jsonld)?)
-    }
-
-    /// Fast path for trusted RO-Crate bootstrap into a new or empty graph.
-    ///
-    /// This skips semantic RO-Crate validation and graph diffing, so it should
-    /// only be used when the input document is already trusted.
-    pub fn bootstrap_rocrate_document(
-        &self,
-        auth: &dyn Authorizer,
-        graph: GraphId,
-        jsonld: &str,
-        policy: GraphPolicy,
-    ) -> Result<Batch> {
-        let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self
-            .manager()
-            .bootstrap_jsonld_trusted(graph.clone(), jsonld)?;
-        self.persist_graph_policy(&graph, policy)?;
-        self.finish_batch(&graph, batch)
     }
 
     /// Preview the canonical RDF changes implied by a JSON-LD document.
@@ -4040,6 +3956,42 @@ mod tests {
             result.push((data, focus));
         }
         result
+    }
+
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn separate_structural_and_shacl_write_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            directory.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let mut graphs =
+            bound_policy_graphs(&node, "separate-write-checks", 1, ShaclWritePolicy::Enforce);
+        let (data, focus) = graphs.pop().unwrap();
+        let before = (
+            node.graph_snapshot(&data).unwrap(),
+            node.vector_clock(&data).unwrap(),
+        );
+
+        let error = node
+            .apply_changes_bypassing_structural_rules(
+                &data,
+                vec![shacl_change(
+                    &data,
+                    &focus,
+                    "urn:test:unrelated-write",
+                    "urn:test:value",
+                )],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CraqleError::Update(UpdateError::ShaclValidationFailed(_))
+        ));
+        assert_eq!(node.graph_snapshot(&data).unwrap(), before.0);
+        assert_eq!(node.vector_clock(&data).unwrap(), before.1);
     }
 
     #[cfg(feature = "shacl-core")]

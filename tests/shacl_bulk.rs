@@ -165,7 +165,7 @@ fn checked_bulk_enforces() {
 }
 
 #[test]
-fn structural_bypass_keeps_advisory_shacl_diagnostics() {
+fn checked_write_keeps_advisory_shacl_diagnostics() {
     let (_directory, net) = setup_network(1);
     let node = net.peer(0);
     let data = GraphId::new("urn:test:bulk-unchecked-data");

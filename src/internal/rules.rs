@@ -1174,7 +1174,7 @@ pub(crate) fn validate_change_set(
     for rule in rules {
         if rule
             .rule_id()
-            .is_some_and(|id| plan.is_some_and(|plan| !plan.contains(&id)))
+            .is_some_and(|id| plan.is_none_or(|plan| !plan.contains(&id)))
         {
             continue;
         }
@@ -1221,7 +1221,7 @@ pub(crate) fn post_merge_violations_from_store(
     for rule in &rules {
         if rule
             .rule_id()
-            .is_some_and(|id| plan.is_some_and(|plan| !plan.contains(&id)))
+            .is_some_and(|id| plan.is_none_or(|plan| !plan.contains(&id)))
         {
             continue;
         }
@@ -1570,6 +1570,72 @@ mod tests {
             }
             assert_eq!(recomputed(&graph, &triples), observed);
             assert!(!observed.has_orphans());
+        }
+
+        #[test]
+        fn deep_chain_terminates() {
+            const DEPTH: usize = 10_000;
+
+            let graph = GraphId::new("urn:test:crate-deep-chain");
+            let dir = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(dir.path()).unwrap();
+            let root = iri(graph.as_str());
+            let metadata = METADATA_DESCRIPTOR.clone();
+            let mut triples = vec![
+                (root.clone(), RDF_TYPE.clone(), SCHEMA_DATASET.clone()),
+                (root.clone(), SCHEMA_NAME.clone(), text("Reachability")),
+                (
+                    root.clone(),
+                    SCHEMA_DESCRIPTION.clone(),
+                    text("Reachability fixtures"),
+                ),
+                (
+                    root.clone(),
+                    SCHEMA_DATE_PUBLISHED.clone(),
+                    text("2025-01-01"),
+                ),
+                (
+                    metadata.clone(),
+                    RDF_TYPE.clone(),
+                    SCHEMA_CREATIVE_WORK.clone(),
+                ),
+                (metadata.clone(), SCHEMA_ABOUT.clone(), root.clone()),
+                (
+                    metadata,
+                    DCTERMS_CONFORMS_TO.clone(),
+                    iri("https://w3id.org/ro/crate/1.3"),
+                ),
+            ];
+            triples.reserve(DEPTH * 2);
+            for link in 0..DEPTH {
+                let entity = iri(&format!("urn:test:crate-deep-chain:link-{link}"));
+                let parent = if link == 0 {
+                    root.clone()
+                } else {
+                    iri(&format!("urn:test:crate-deep-chain:link-{}", link - 1))
+                };
+                triples.extend([
+                    (parent, SCHEMA_HAS_PART.clone(), entity.clone()),
+                    (entity, RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+                ]);
+            }
+            let deepest = iri(&format!("urn:test:crate-deep-chain:link-{}", DEPTH - 1));
+            let leaf = iri("urn:test:crate-deep-chain:leaf");
+            triples.extend([
+                (deepest, SCHEMA_HAS_PART.clone(), leaf.clone()),
+                (leaf, RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
+            ]);
+            let changes = inserts(&graph, &triples);
+
+            validate_change_set(
+                &default_rules(),
+                ChangeSet {
+                    store: &store,
+                    graph: &graph,
+                    delta: &changes,
+                },
+            )
+            .unwrap();
         }
     }
 

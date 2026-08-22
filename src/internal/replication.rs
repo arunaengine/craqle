@@ -517,6 +517,7 @@ impl ReplicationEngine {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn local_apply_bulk_bypassing_structural_rules_with_render_hints(
         &self,
         graph: &GraphId,

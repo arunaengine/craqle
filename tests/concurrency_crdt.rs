@@ -502,17 +502,13 @@ mod tests {
 
     // ── F3: a read that writes destroys the search re-queue baseline ────────
 
-    /// F3 — the search worker reads a graph's diagnostics to know which
-    /// subjects to hide. If that read also persisted what it recomputed, it
-    /// would move the baseline `rebuild_graph_diagnostics` diffs against
-    /// *without* indexing anything, and an entity a bulk write re-linked —
-    /// never named by the write, so never enqueued by it — would stay out of
-    /// the index forever (G6, G7).
+    /// F3 — a replicated orphan must be removed from search and re-enqueued
+    /// when a later checked write restores reachability (G6, G7).
     #[test]
     #[cfg(feature = "search")]
-    fn relink_keeps_search() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = standalone_node(&dir);
+    fn replicated_orphan_relink_keeps_search() {
+        let (_dir, mut net) = setup_network(2);
+        let node = net.peer(0);
         let graph = GraphId::new("urn:test:f3-requeue-baseline");
         node.create_crate(
             &writer_auth(),
@@ -529,16 +525,26 @@ mod tests {
 
         let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
         let root = EncodedTerm::from_named_node(&graph.0);
+        let folder = entity(&graph, "folder");
         let child = entity(&graph, "salamander.dat");
-        let link = Change::Insert {
+        let direct_link = Change::Insert {
             graph: graph.clone(),
             subject: root.clone(),
             predicate: has_part.clone(),
             object: child.clone(),
         };
-        node.apply_changes_unchecked(
+        node.apply_changes(
+            &AllowAllAuthorizer,
             &graph,
             vec![
+                insert(
+                    &graph,
+                    (
+                        folder.clone(),
+                        EncodedTerm::from_named_node(&vocab::rdf_type()),
+                        EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                    ),
+                ),
                 insert(
                     &graph,
                     (
@@ -555,43 +561,62 @@ mod tests {
                         literal_term("salamander"),
                     ),
                 ),
-                link.clone(),
+                insert(&graph, (root.clone(), has_part.clone(), folder.clone())),
+                insert(&graph, (folder.clone(), has_part.clone(), child.clone())),
+                direct_link.clone(),
             ],
         )
         .unwrap();
+        net.sync_until_converged(8).unwrap();
         node.flush_search_updates().unwrap();
         assert_eq!(1, search_hits(&node, "salamander"), "seeded and searchable");
 
-        // Orphan it, so it is correctly absent from the index.
-        node.apply_changes_unchecked(
-            &graph,
-            vec![Change::Delete {
-                graph: graph.clone(),
-                subject: root,
-                predicate: has_part,
-                object: child,
-            }],
-        )
-        .unwrap();
-        node.flush_search_updates().unwrap();
-        assert_eq!(0, search_hits(&node, "salamander"), "orphans are hidden");
-
-        // Re-link it through the bulk path, which defers diagnostics and
-        // enqueues only the subjects it names — the root, never the child.
-        node.apply_changes_bulk_unchecked(&graph, vec![link])
+        net.partition(0, 1);
+        net.peer(0)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                &graph,
+                vec![Change::Delete {
+                    graph: graph.clone(),
+                    subject: root.clone(),
+                    predicate: has_part.clone(),
+                    object: child.clone(),
+                }],
+            )
             .unwrap();
-        // The worker wins the race to the diagnostics read.
-        node.flush_search_updates().unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
-        node.flush_search_updates().unwrap();
+        net.peer(1)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                &graph,
+                vec![Change::Delete {
+                    graph: graph.clone(),
+                    subject: folder,
+                    predicate: has_part.clone(),
+                    object: child,
+                }],
+            )
+            .unwrap();
+        net.heal(0, 1);
+        net.sync_until_converged(8).unwrap();
+        assert_eq!(
+            0,
+            search_hits(net.peer(0), "salamander"),
+            "orphans are hidden"
+        );
+
+        net.peer(0)
+            .apply_changes(&AllowAllAuthorizer, &graph, vec![direct_link])
+            .unwrap();
+        net.sync_until_converged(8).unwrap();
+        net.peer(0).flush_search_updates().unwrap();
 
         assert!(
-            !node.graph_diagnostics(&graph).unwrap().has_orphans(),
+            !net.peer(0).graph_diagnostics(&graph).unwrap().has_orphans(),
             "the re-linked entity is reachable again"
         );
         assert_eq!(
             1,
-            search_hits(&node, "salamander"),
+            search_hits(net.peer(0), "salamander"),
             "the re-linked entity must be searchable again"
         );
     }

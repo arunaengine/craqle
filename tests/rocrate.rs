@@ -113,7 +113,7 @@ mod tests {
 
         let jsonld =
             benchmark_rocrate_document(&graph, 250, "trusted-bulk-keyword", "Trusted Dataset");
-        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+        node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
         node.flush_search_updates().unwrap();
 
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_rejects_nonempty() {
+    fn replacement_import_accepts_nonempty_graph() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:trusted-bootstrap-non-empty");
@@ -204,14 +204,13 @@ mod tests {
 
         let jsonld =
             benchmark_rocrate_document(&graph, 5, "trusted-existing-keyword", "Trusted Existing");
-        let err = node
-            .bootstrap_rocrate_document(&writer, graph, &jsonld, public_policy())
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            CraqleError::RoCrate(RoCrateError::InvalidGraph(_))
-        ));
+        node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
+            .unwrap();
+        let exported = node
+            .export_rocrate(&GrantAuthorizer::default(), &graph)
+            .unwrap();
+        assert!(exported.contains("Trusted Existing"));
+        assert!(!exported.contains("Existing Dataset"));
     }
 
     /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
@@ -1361,9 +1360,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_crate_prevalidated_over_custom_context_resets_to_default() {
+    fn test_create_crate_with_durability_over_custom_context_resets_to_default() {
         let (_tmp, net) = setup_network(1);
-        let graph = GraphId::new("urn:test:ctx-create-prevalidated-reset");
+        let graph = GraphId::new("urn:test:ctx-create-durability-reset");
         let mgr = manager(net.peer(0));
 
         // Import a crate that stores a custom array context.
@@ -1382,15 +1381,15 @@ mod tests {
             "custom context should be stored after import"
         );
 
-        // The prevalidated create path must revert the stale custom context on a
-        // full replacement exactly like the checked create path.
+        // The explicit-durability create path must revert the stale custom
+        // context on a full replacement exactly like the default create path.
         net.peer(0)
-            .create_crate_prevalidated_with_durability_as(
+            .create_crate_with_durability_as(
                 &writer_auth(),
                 CreateCrateRequest::new(
                     graph.clone(),
                     "Replacement Crate",
-                    "Replaces the custom-context crate (prevalidated)",
+                    "Replaces the custom-context crate",
                     "2025-02-02",
                     Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public_policy(),
@@ -1405,7 +1404,7 @@ mod tests {
         assert_eq!(
             exported["@context"],
             serde_json::json!("https://w3id.org/ro/crate/1.3/context"),
-            "prevalidated create replacement must revert to the bare default context"
+            "explicit-durability create replacement must revert to the bare default context"
         );
     }
 
@@ -1565,6 +1564,114 @@ mod tests {
         ]
     }
 
+    /// Produce orphans through two individually valid writes: each replica
+    /// removes one of two reachability paths while partitioned, and the merge
+    /// removes both paths.
+    fn make_replicated_orphans(
+        net: &mut CraqleCluster,
+        graph: &GraphId,
+        entities: &[EncodedTerm],
+        mut seed: Vec<MaterializedQuadChange>,
+    ) {
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let root = named(graph.as_str());
+        let parent = named(&format!("{}#orphan-staging-parent", graph.as_str()));
+        seed.extend(inserts(
+            graph,
+            vec![
+                (
+                    parent.clone(),
+                    EncodedTerm::from_named_node(&vocab::rdf_type()),
+                    EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                ),
+                (
+                    parent.clone(),
+                    EncodedTerm::from_named_node(&vocab::schema_name()),
+                    literal_term("Orphan staging parent"),
+                ),
+                (root.clone(), has_part.clone(), parent.clone()),
+            ],
+        ));
+        for entity in entities {
+            seed.extend([
+                MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: root.clone(),
+                    predicate: has_part.clone(),
+                    object: entity.clone(),
+                },
+                MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: parent.clone(),
+                    predicate: has_part.clone(),
+                    object: entity.clone(),
+                },
+            ]);
+        }
+        net.peer(0)
+            .apply_changes(&AllowAllAuthorizer, graph, seed)
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        net.partition(0, 1);
+        let direct_removals = entities
+            .iter()
+            .cloned()
+            .map(|entity| MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: root.clone(),
+                predicate: has_part.clone(),
+                object: entity,
+            })
+            .collect();
+        net.peer(0)
+            .apply_changes(&AllowAllAuthorizer, graph, direct_removals)
+            .unwrap();
+        let nested_removals = entities
+            .iter()
+            .cloned()
+            .map(|entity| MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: parent.clone(),
+                predicate: has_part.clone(),
+                object: entity,
+            })
+            .collect();
+        net.peer(1)
+            .apply_changes(&AllowAllAuthorizer, graph, nested_removals)
+            .unwrap();
+        net.heal(0, 1);
+        net.sync_until_converged(10).unwrap();
+
+        net.peer(0)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                graph,
+                vec![
+                    MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: root,
+                        predicate: has_part,
+                        object: parent.clone(),
+                    },
+                    MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: parent.clone(),
+                        predicate: EncodedTerm::from_named_node(&vocab::rdf_type()),
+                        object: EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                    },
+                    MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: parent,
+                        predicate: EncodedTerm::from_named_node(&vocab::schema_name()),
+                        object: literal_term("Orphan staging parent"),
+                    },
+                ],
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+    }
+
     struct OrphanFixture {
         /// Root-linked entity ids in the order export must emit them.
         visible: Vec<String>,
@@ -1576,8 +1683,8 @@ mod tests {
     /// the graph's diagnostics carry a non-empty orphan set. The first visible
     /// entity also points at the first orphan through a non-`hasPart`
     /// predicate, which pins the object side of orphan hiding.
-    fn orphan_fixture(node: &CraqleNode, graph: &GraphId) -> OrphanFixture {
-        manager(node)
+    fn orphan_fixture(net: &mut CraqleCluster, graph: &GraphId) -> OrphanFixture {
+        manager(net.peer(0))
             .create_crate(
                 graph.clone(),
                 "Orphan Fixture",
@@ -1608,11 +1715,18 @@ mod tests {
         // reachability, so the target stays orphaned and must stay hidden.
         triples.push((named(&visible[0]), named(MENTIONS_IRI), named(&orphans[0])));
 
-        node.apply_changes_bulk_unchecked(graph, inserts(graph, triples))
-            .unwrap();
-        node.rebuild_graph_diagnostics(graph).unwrap();
+        make_replicated_orphans(
+            net,
+            graph,
+            &orphans.iter().map(|id| named(id)).collect::<Vec<_>>(),
+            inserts(graph, triples),
+        );
 
-        let mut reported = node.graph_diagnostics(graph).unwrap().orphaned_entities;
+        let mut reported = net
+            .peer(0)
+            .graph_diagnostics(graph)
+            .unwrap()
+            .orphaned_entities;
         reported.sort();
         assert_eq!(
             reported, orphans,
@@ -1722,11 +1836,10 @@ mod tests {
     /// concatenate to exactly the full visible sequence.
     #[test]
     fn export_hides_orphans() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-export");
-        let fixture = orphan_fixture(&node, &graph);
-        let mgr = manager(&node);
+        let fixture = orphan_fixture(&mut net, &graph);
+        let mgr = manager(net.peer(0));
 
         let full = parsed(&mgr.export_jsonld(&graph).unwrap());
         assert_hides_orphans(&full, &fixture);
@@ -1798,11 +1911,10 @@ mod tests {
     /// export, so the paged and unpaged views cannot drift apart.
     #[test]
     fn export_matches_page() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-export-equivalence");
-        orphan_fixture(&node, &graph);
-        let mgr = manager(&node);
+        orphan_fixture(&mut net, &graph);
+        let mgr = manager(net.peer(0));
 
         let full = parsed(&mgr.export_jsonld(&graph).unwrap());
         let paged = parsed(
@@ -1828,26 +1940,27 @@ mod tests {
     /// answering that way (WS2-T2 hazard, G6).
     #[test]
     fn append_rejects_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-parent");
-        let mgr = manager(&node);
-        mgr.create_crate(
-            graph.clone(),
-            "Orphan Parent Crate",
-            "Appending under an invisible parent must fail",
-            "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
-        )
-        .unwrap();
+        manager(net.peer(0))
+            .create_crate(
+                graph.clone(),
+                "Orphan Parent Crate",
+                "Appending under an invisible parent must fail",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+            )
+            .unwrap();
 
         let orphan_parent = "./orphan/parent.dat";
-        node.apply_changes_bulk_unchecked(
+        make_replicated_orphans(
+            &mut net,
             &graph,
+            &[named(orphan_parent)],
             inserts(&graph, data_entity_triples(orphan_parent, "Orphan Parent")),
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
+        );
+        let node = net.peer(0);
+        let mgr = manager(node);
         assert_eq!(
             node.graph_diagnostics(&graph).unwrap().orphaned_entities,
             vec![orphan_parent.to_string()]
@@ -1891,46 +2004,32 @@ mod tests {
     const REWRITTEN_ID: &str = "./data/rewritten.dat";
     const STALE_NAME: &str = "Stale Name";
     const FRESH_NAME: &str = "Fresh Name";
-    const STALE_TYPE: &str = "http://schema.org/MediaObject";
     const FRESH_TYPE: &str = "http://schema.org/Dataset";
 
     /// A crate whose one data entity is orphaned by cutting the root's
     /// `hasPart` edge, leaving its stale triples stored but hidden.
-    fn orphaned_entity_crate(node: &CraqleNode, graph: &GraphId) {
-        let mgr = manager(node);
-        mgr.create_crate(
-            graph.clone(),
-            "Orphan Rewrite Crate",
-            "Writing to an orphan must replace its stored triples",
-            "2025-01-01",
-            "https://creativecommons.org/licenses/by/4.0/",
-        )
-        .unwrap();
-        mgr.add_data_entity(
-            graph,
-            REWRITTEN_ID,
-            STALE_TYPE,
-            STALE_NAME,
-            vec![(
-                vocab::schema_keywords(),
-                oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal("stale")),
-            )],
-        )
-        .unwrap();
-
-        node.apply_changes_bulk_unchecked(
-            graph,
-            vec![MaterializedQuadChange::Delete {
-                graph: graph.clone(),
-                subject: named(graph.as_str()),
-                predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
-                object: named(REWRITTEN_ID),
-            }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(graph).unwrap();
+    fn orphaned_entity_crate(net: &mut CraqleCluster, graph: &GraphId) {
+        manager(net.peer(0))
+            .create_crate(
+                graph.clone(),
+                "Orphan Rewrite Crate",
+                "Writing to an orphan must replace its stored triples",
+                "2025-01-01",
+                "https://creativecommons.org/licenses/by/4.0/",
+            )
+            .unwrap();
+        let mut triples = data_entity_triples(REWRITTEN_ID, STALE_NAME);
+        triples.push((
+            named(REWRITTEN_ID),
+            EncodedTerm::from_named_node(&vocab::schema_keywords()),
+            literal_term("stale"),
+        ));
+        make_replicated_orphans(net, graph, &[named(REWRITTEN_ID)], inserts(graph, triples));
         assert_eq!(
-            node.graph_diagnostics(graph).unwrap().orphaned_entities,
+            net.peer(0)
+                .graph_diagnostics(graph)
+                .unwrap()
+                .orphaned_entities,
             vec![REWRITTEN_ID.to_string()],
             "the fixture must actually orphan the entity"
         );
@@ -1991,26 +2090,26 @@ mod tests {
     /// re-attachment cannot resurface the ones it replaced.
     #[test]
     fn replace_rewrites_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-replace");
-        orphaned_entity_crate(&node, &graph);
+        orphaned_entity_crate(&mut net, &graph);
+        let node = net.peer(0);
 
-        manager(&node)
+        manager(node)
             .add_data_entity(&graph, REWRITTEN_ID, FRESH_TYPE, FRESH_NAME, vec![])
             .unwrap();
 
-        assert_fresh_entity(&node, &graph);
+        assert_fresh_entity(node, &graph);
     }
 
     /// Same for the incremental path: a patch clears the predicates it names
     /// even when orphan hiding makes the subject look empty.
     #[test]
     fn patch_rewrites_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-patch");
-        orphaned_entity_crate(&node, &graph);
+        orphaned_entity_crate(&mut net, &graph);
+        let node = net.peer(0);
 
         node.patch_data_with(
             &writer_auth(),
@@ -2029,17 +2128,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_fresh_entity(&node, &graph);
+        assert_fresh_entity(node, &graph);
     }
 
     /// Same for a full replacement: a document that re-links the orphan must
     /// replace its stored triples rather than merge with them.
     #[test]
     fn import_rewrites_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-import");
-        orphaned_entity_crate(&node, &graph);
+        orphaned_entity_crate(&mut net, &graph);
+        let node = net.peer(0);
 
         let document = serde_json::json!({
             "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -2056,11 +2155,11 @@ mod tests {
                 {"@id": REWRITTEN_ID, "@type": "Dataset", "name": FRESH_NAME}
             ]
         });
-        manager(&node)
+        manager(node)
             .import_jsonld(graph.clone(), &document.to_string())
             .unwrap();
 
-        assert_fresh_entity(&node, &graph);
+        assert_fresh_entity(node, &graph);
     }
 
     // ---------------------------------------------------------------------
@@ -2115,7 +2214,11 @@ mod tests {
     /// becomes an orphan while a live triple still points at it. `inline`
     /// selects whether the nested entities are written inline (which the
     /// importer mints as blank nodes) or with explicit `@id`s.
-    fn nested_entity_fixture(node: &CraqleNode, graph: &GraphId, inline: bool) -> NestedEntities {
+    fn nested_entity_fixture(
+        net: &mut CraqleCluster,
+        graph: &GraphId,
+        inline: bool,
+    ) -> NestedEntities {
         let nested = |slug: &str, name: &str| {
             let mut entity = serde_json::json!({"@type": "Person", "name": name});
             if !inline {
@@ -2150,13 +2253,13 @@ mod tests {
                 }
             ]
         });
-        manager(node)
+        manager(net.peer(0))
             .import_jsonld(graph.clone(), &document.to_string())
             .unwrap();
 
         let entities = NestedEntities {
-            orphan: subject_named(node, graph, DETACHED_NAME),
-            linked: subject_named(node, graph, LINKED_NAME),
+            orphan: subject_named(net.peer(0), graph, DETACHED_NAME),
+            linked: subject_named(net.peer(0), graph, LINKED_NAME),
         };
         assert_eq!(
             entities.orphan.term.0.starts_with("_:"),
@@ -2166,20 +2269,23 @@ mod tests {
             entities.orphan.term.0
         );
 
-        node.apply_changes_bulk_unchecked(
+        make_replicated_orphans(
+            net,
             graph,
+            std::slice::from_ref(&entities.orphan.term),
             vec![MaterializedQuadChange::Insert {
                 graph: graph.clone(),
                 subject: entities.orphan.term.clone(),
                 predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
                 object: named(REFERRER_ID),
             }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(graph).unwrap();
+        );
 
         assert_eq!(
-            node.graph_diagnostics(graph).unwrap().orphaned_entities,
+            net.peer(0)
+                .graph_diagnostics(graph)
+                .unwrap()
+                .orphaned_entities,
             vec![entities.orphan.id.clone()],
             "the fixture must produce exactly the orphan the assertions rely on"
         );
@@ -2263,8 +2369,9 @@ mod tests {
     /// Export, SPARQL, search and describe must all hide the orphan, drop the
     /// live `mentions` triple that still points at it, and keep the reachable
     /// sibling — whether the nested entities are blank nodes or named nodes.
-    fn assert_orphan_hidden_everywhere(node: &CraqleNode, graph: &GraphId, inline: bool) {
-        let entities = nested_entity_fixture(node, graph, inline);
+    fn assert_orphan_hidden_everywhere(net: &mut CraqleCluster, graph: &GraphId, inline: bool) {
+        let entities = nested_entity_fixture(net, graph, inline);
+        let node = net.peer(0);
 
         let exported = manager(node).export_jsonld(graph).unwrap();
         assert!(
@@ -2324,19 +2431,17 @@ mod tests {
     /// An orphan imported as a blank node — the path that was uncovered.
     #[test]
     fn orphan_blank_hidden() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-blank-node");
-        assert_orphan_hidden_everywhere(&node, &graph, true);
+        assert_orphan_hidden_everywhere(&mut net, &graph, true);
     }
 
     /// The named-node twin, so the two encodings stay pinned side by side.
     #[test]
     fn orphan_named_hidden() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-named-node");
-        assert_orphan_hidden_everywhere(&node, &graph, false);
+        assert_orphan_hidden_everywhere(&mut net, &graph, false);
     }
 
     /// The inverse of orphan hiding: a blank node that no diagnostics entry
@@ -2344,16 +2449,16 @@ mod tests {
     /// into hiding every blank node.
     #[test]
     fn linked_blank_visible() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:visible-blank-node");
-        let entities = nested_entity_fixture(&node, &graph, true);
+        let entities = nested_entity_fixture(&mut net, &graph, true);
+        let node = net.peer(0);
 
         assert!(
             entities.linked.id.starts_with("_:"),
             "fixture must keep a blank node reachable from the root"
         );
-        let described = described(&node, &graph, &entities.linked.id);
+        let described = described(node, &graph, &entities.linked.id);
         assert!(
             described
                 .iter()
@@ -2361,11 +2466,11 @@ mod tests {
             "a non-orphaned blank node must describe its own triples: {described:?}"
         );
         assert!(
-            queried_terms(&node, &graph).contains(&entities.linked.term.0),
+            queried_terms(node, &graph).contains(&entities.linked.term.0),
             "a non-orphaned blank node must stay queryable"
         );
         assert!(
-            manager(&node)
+            manager(node)
                 .export_jsonld(&graph)
                 .unwrap()
                 .contains(LINKED_NAME),
@@ -2403,21 +2508,21 @@ mod tests {
     /// a new one nothing can see.
     #[test]
     fn blank_update_visible() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(dir.path()).unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:blank-node-write");
-        let entities = nested_entity_fixture(&node, &graph, true);
+        let entities = nested_entity_fixture(&mut net, &graph, true);
+        let node = net.peer(0);
         assert!(
             entities.linked.id.starts_with("_:"),
             "fixture must offer a reachable blank-node entity, got `{}`",
             entities.linked.id
         );
 
-        manager(&node)
+        manager(node)
             .update_property(&graph, &entities.linked.id, "name", None, RENAMED)
             .unwrap();
 
-        let described = described(&node, &graph, &entities.linked.id);
+        let described = described(node, &graph, &entities.linked.id);
         assert!(
             described
                 .iter()
@@ -2431,17 +2536,17 @@ mod tests {
             "replace-all must delete the previous value, not shadow it: {described:?}"
         );
 
-        let exported = manager(&node).export_jsonld(&graph).unwrap();
+        let exported = manager(node).export_jsonld(&graph).unwrap();
         assert!(
             exported.contains(RENAMED) && !exported.contains(LINKED_NAME),
             "the update must be readable back through export: {exported}"
         );
         assert!(
-            queried_terms(&node, &graph).contains(&literal_term(RENAMED).0),
+            queried_terms(node, &graph).contains(&literal_term(RENAMED).0),
             "the update must be readable back through SPARQL"
         );
 
-        let mangled: Vec<_> = snapshot_terms(&node, &graph)
+        let mangled: Vec<_> = snapshot_terms(node, &graph)
             .into_iter()
             .filter(|(subject, _, object)| subject.starts_with("<_:") || object.starts_with("<_:"))
             .collect();
@@ -2614,8 +2719,7 @@ mod tests {
     /// permanently losing every orphan the graph really has.
     #[test]
     fn reimport_preserves_orphans() {
-        let (_tmp, net) = setup_network(1);
-        let node = net.peer(0);
+        let (_tmp, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:f1-orphan-wipe");
         let doc = serde_json::json!({
             "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -2630,26 +2734,27 @@ mod tests {
         })
         .to_string();
 
-        node.apply_rocrate_document_with_policy(
-            &writer_auth(),
-            graph.clone(),
-            &doc,
-            public_policy(),
-        )
-        .unwrap();
+        net.peer(0)
+            .apply_rocrate_document_with_policy(
+                &writer_auth(),
+                graph.clone(),
+                &doc,
+                public_policy(),
+            )
+            .unwrap();
 
-        // Introduce a genuine orphan directly.
-        node.apply_changes_bulk_unchecked(
+        make_replicated_orphans(
+            &mut net,
             &graph,
+            &[named("urn:test:stray")],
             vec![MaterializedQuadChange::Insert {
                 graph: graph.clone(),
                 subject: EncodedTerm("<urn:test:stray>".into()),
                 predicate: EncodedTerm("<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".into()),
                 object: EncodedTerm("<http://schema.org/MediaObject>".into()),
             }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
+        );
+        let node = net.peer(0);
         assert_eq!(
             node.graph_diagnostics(&graph).unwrap().orphaned_entities,
             vec!["urn:test:stray".to_string()],

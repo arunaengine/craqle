@@ -22,8 +22,8 @@ mod tests {
     const EXPLICIT_DATASET_GRAPH_LIMIT: usize = 32;
     const SMALL_VISIBLE: usize = 5;
     const LARGE_VISIBLE: usize = 40;
-    /// `empty`, `deleted` and `orphaned` are visible on top of the populated ones.
-    const FIXTURE_GRAPHS: usize = 3;
+    /// `empty` and `orphaned` are visible on top of the populated ones.
+    const FIXTURE_GRAPHS: usize = 2;
 
     // The two visible-set sizes really must straddle the regime boundary, or
     // this whole file would test one code path twice.
@@ -89,7 +89,6 @@ mod tests {
         fn visible(&self) -> Vec<GraphId> {
             let mut graphs = self.populated.clone();
             graphs.push(self.empty.clone());
-            graphs.push(self.deleted.clone());
             graphs.push(self.orphaned.clone());
             graphs
         }

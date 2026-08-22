@@ -8,9 +8,9 @@ use std::sync::{Arc, Barrier, mpsc};
 
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, CraqleOptions, EncodedTerm, GraphId,
-    GraphPolicy, GraphReplicaSnapshot, MaterializedQuadChange, NewDataEntity, QueryIndexStatus,
-    ShaclBinding, ShaclBindingOptions, ShaclBindingStatus, ShaclBlockingSeverity,
-    ShaclValidationState, ShaclWritePolicy, UpdateError, VectorClock,
+    GraphPolicy, GraphReplicaSnapshot, MaterializedQuadChange, QueryIndexStatus, ShaclBinding,
+    ShaclBindingOptions, ShaclBindingStatus, ShaclBlockingSeverity, ShaclValidationState,
+    ShaclWritePolicy, UpdateError, VectorClock,
 };
 
 use crate::support::with_watchdog;
@@ -29,7 +29,6 @@ const FOCUS: &str = "urn:test:shacl-write-focus";
 const VALUE: &str = "urn:test:shacl-write-value";
 #[cfg(feature = "search")]
 const NAME: &str = "http://schema.org/name";
-const HAS_PART: &str = "http://schema.org/hasPart";
 
 type State = (
     GraphReplicaSnapshot,
@@ -190,17 +189,27 @@ fn enforce_insert_atomic() {
 fn new_graph_atomic() {
     let (_directory, node) = open_node();
     let graph = GraphId::new("urn:test:shacl-write-invalid-new");
-    let error = node
-        .apply_changes(
+    let mut changes = node
+        .validate_create_crate(
             &AllowAllAuthorizer,
-            &graph,
-            vec![add(
-                &graph,
-                "urn:test:shacl-write-invalid",
-                VALUE,
-                iri("urn:test:value"),
-            )],
+            craqle::CreateCrateRequest::new(
+                graph.clone(),
+                "Invalid new graph",
+                "Atomic validation",
+                "2026-08-22",
+                None,
+                GraphPolicy::default(),
+            ),
         )
+        .unwrap();
+    changes.push(add(
+        &graph,
+        "urn:test:shacl-write-invalid",
+        VALUE,
+        iri("urn:test:value"),
+    ));
+    let error = node
+        .apply_changes(&AllowAllAuthorizer, &graph, changes)
         .unwrap_err();
 
     assert!(matches!(
@@ -550,83 +559,6 @@ fn disabled_keeps_rocrate() {
         CraqleError::Update(UpdateError::ValidationFailed(_))
     ));
     assert_eq!(state(&node, &data), before);
-}
-
-#[test]
-fn separate_structural_and_shacl_write_checks() {
-    let (_directory, node) = open_node();
-    let data = GraphId::new("urn:test:shacl-write-bulk-data");
-    let shapes = GraphId::new("urn:test:shacl-write-bulk-shapes");
-    node.create_crate(
-        &AllowAllAuthorizer,
-        craqle::CreateCrateRequest::new(
-            data.clone(),
-            "Bulk policy",
-            "Checked and trusted bulk paths differ.",
-            "2026-08-20",
-            None,
-            GraphPolicy::default(),
-        ),
-    )
-    .unwrap();
-    limit_shape(&node, &shapes, SH_MAX, 0, HAS_PART, data.as_str());
-    assert_eq!(
-        bind(&node, &data, &shapes, ShaclWritePolicy::Enforce).state,
-        ShaclValidationState::Valid
-    );
-
-    let before = state(&node, &data);
-    let error = node
-        .append_new_root_data_entities(
-            &AllowAllAuthorizer,
-            &data,
-            vec![NewDataEntity {
-                entity_id: "./blocked.txt".to_string(),
-                entity_type: "http://schema.org/MediaObject".to_string(),
-                name: "Blocked".to_string(),
-                additional_triples: Vec::new(),
-            }],
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        CraqleError::RoCrate(craqle::RoCrateError::Update(
-            UpdateError::ShaclValidationFailed(_)
-        ))
-    ));
-    assert_eq!(state(&node, &data), before);
-
-    let raw = GraphId::new("urn:test:shacl-write-raw-data");
-    let raw_shapes = GraphId::new("urn:test:shacl-write-raw-shapes");
-    limit_shape(&node, &raw_shapes, SH_MAX, 0, VALUE, FOCUS);
-    node.apply_changes_unchecked(
-        &raw,
-        vec![add(
-            &raw,
-            "urn:test:shacl-write-raw-seed",
-            "urn:test:shacl-write-raw-unrelated",
-            iri("urn:test:seed"),
-        )],
-    )
-    .unwrap();
-    assert_eq!(
-        bind(&node, &raw, &raw_shapes, ShaclWritePolicy::Enforce).state,
-        ShaclValidationState::Valid
-    );
-    let before = state(&node, &raw);
-    let error = node
-        .apply_changes_bulk_unchecked(&raw, vec![add(&raw, FOCUS, VALUE, iri("urn:test:trusted"))])
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            CraqleError::RoCrate(craqle::RoCrateError::Update(
-                UpdateError::ShaclValidationFailed(_)
-            ))
-        ),
-        "unexpected trusted-import error: {error:?}"
-    );
-    assert_eq!(state(&node, &raw), before);
 }
 
 #[cfg(feature = "search")]

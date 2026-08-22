@@ -76,10 +76,10 @@ mod tests {
             .unwrap();
         let strict_import_elapsed = strict_import_start.elapsed();
 
-        let trusted_dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open(trusted_dir.path()).unwrap();
+        let import_dir = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(import_dir.path()).unwrap();
         let import_start = Instant::now();
-        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+        node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
         let import_elapsed = import_start.elapsed();
 
@@ -111,7 +111,7 @@ mod tests {
         );
 
         println!(
-            "all-at-once import: {} entities, document build {:?}, plan {:?}, validated apply {}, strict bootstrap {:?}, trusted bootstrap {:?}, first search {:?}",
+            "all-at-once import: {} entities, document build {:?}, plan {:?}, validated apply {}, checked import {:?}, ordinary import {:?}, first search {:?}",
             entity_count,
             build_elapsed,
             plan_elapsed,
@@ -223,7 +223,7 @@ mod tests {
             "Workflow Replace Dataset",
         );
 
-        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+        node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
 
         let replace_build_start = Instant::now();
@@ -269,7 +269,7 @@ mod tests {
             "Workflow Incremental Dataset",
         );
 
-        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+        node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
 
         let update_start = Instant::now();
@@ -318,7 +318,7 @@ mod tests {
             "Workflow Append-Like Dataset",
         );
 
-        node.bootstrap_rocrate_document(&writer, graph.clone(), &jsonld, public_policy())
+        node.apply_rocrate_document_with_policy(&writer, graph.clone(), &jsonld, public_policy())
             .unwrap();
 
         let replace_build_start = Instant::now();

@@ -400,7 +400,7 @@ fn hidden_graphs_and_recorded_orphans_are_not_query_visible() {
             .unwrap()
             .orphaned_entities,
         vec![ORPHAN_SUBJECT.to_string()],
-        "the public unchecked-write fixture must construct a recorded orphan"
+        "the public checked-write fixture must construct a recorded orphan"
     );
     let orphan_query = format!("SELECT ?s WHERE {{ ?s <{NAME}> \"stray\" }}");
     assert_eq!(

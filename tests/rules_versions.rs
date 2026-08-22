@@ -1,9 +1,7 @@
-mod support;
-
-use crate::support::TestWriteExt as _;
 use craqle::{
-    AllowAllAuthorizer, CraqleError, CraqleNode, CreateCrateOptions, CreateCrateRequest,
-    EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange, RoCrateError, RoCrateVersion, vocab,
+    AllowAllAuthorizer, CraqleError, CraqleNode, CrateViolation, CreateCrateOptions,
+    CreateCrateRequest, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange, RoCrateError,
+    RoCrateVersion, UpdateError, vocab,
 };
 
 const DCTERMS_CONFORMS_TO: &str = "<http://purl.org/dc/terms/conformsTo>";
@@ -25,6 +23,13 @@ fn drop_name(graph: &GraphId) -> MaterializedQuadChange {
         subject: EncodedTerm::from_named_node(&graph.0),
         predicate: EncodedTerm::from_named_node(&vocab::schema_name()),
         object: EncodedTerm("\"Rules version coverage\"".to_string()),
+    }
+}
+
+fn validation_findings(error: CraqleError) -> Vec<CrateViolation> {
+    match error {
+        CraqleError::Update(UpdateError::ValidationFailed(findings)) => findings,
+        error => panic!("expected structural validation failure, got {error}"),
     }
 }
 
@@ -87,14 +92,13 @@ fn rules_match_versions() {
         .unwrap();
         assert_eq!(node.crate_version(&graph).unwrap(), version);
 
-        node.apply_changes_unchecked(&graph, vec![drop_name(&graph)])
-            .unwrap();
-        let codes: Vec<_> = node
-            .graph_violations(&graph)
-            .unwrap()
-            .into_iter()
-            .map(|violation| violation.code)
-            .collect();
+        let codes: Vec<_> = validation_findings(
+            node.apply_changes(&AllowAllAuthorizer, &graph, vec![drop_name(&graph)])
+                .unwrap_err(),
+        )
+        .into_iter()
+        .map(|violation| violation.code)
+        .collect();
         assert_eq!(codes, ["missing_required_property"]);
         if let Some(expected) = &expected {
             assert_eq!(&codes, expected);
@@ -209,9 +213,10 @@ fn version_fixture_results() {
             },
             _ => unreachable!("unsupported version in test"),
         };
-        node.apply_changes_unchecked(&graph, vec![change]).unwrap();
-
-        let violations = node.graph_violations(&graph).unwrap();
+        let violations = validation_findings(
+            node.apply_changes(&AllowAllAuthorizer, &graph, vec![change])
+                .unwrap_err(),
+        );
         assert_eq!(violations.len(), 1, "unexpected violations for {version:?}");
         match version {
             RoCrateVersion::V1_1 => {

@@ -1280,6 +1280,7 @@ mod tests {
                     "@type": "Dataset",
                     "name": "HTTPS Context Crate",
                     "description": "Contains contextneedle in its description",
+                    "http://schema.org/description": "Contains contextneedle in its description",
                     "datePublished": "2025-01-01",
                     "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
                 }
@@ -1552,6 +1553,7 @@ mod tests {
                     "@id": graph.as_str(),
                     "@type": "Dataset",
                     "name": "Crate holding poisonneedle",
+                    "description": "Search writer recovery fixture",
                     "datePublished": "2025-01-01",
                     "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}
                 }

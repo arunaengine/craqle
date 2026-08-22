@@ -3,7 +3,7 @@ use craqle::*;
 fn policy() -> GraphPolicy {
     GraphPolicy {
         public: true,
-        permission_paths: vec!["/tests/prevalidated".to_string()],
+        permission_paths: vec!["/tests/import".to_string()],
     }
 }
 
@@ -23,8 +23,8 @@ fn doc(graph: &GraphId, file_count: usize) -> String {
         serde_json::json!({
             "@id": root,
             "@type": "Dataset",
-            "name": "Prevalidated Dataset",
-            "description": "Prevalidated apply test",
+            "name": "Import Dataset",
+            "description": "Import apply test",
             "datePublished": "2026-06-10",
             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
             "hasPart": (0..file_count)
@@ -47,11 +47,11 @@ fn doc(graph: &GraphId, file_count: usize) -> String {
 }
 
 #[test]
-fn prevalidated_apply_matches_checked_apply() {
+fn checked_apply_with_explicit_actor_is_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
     let checked = CraqleNode::open(tmp.path().join("checked")).unwrap();
-    let trusted = CraqleNode::open(tmp.path().join("trusted")).unwrap();
-    let graph = GraphId::new("https://w3id.org/aruna/prevalidated-equivalence");
+    let second = CraqleNode::open(tmp.path().join("second")).unwrap();
+    let graph = GraphId::new("https://w3id.org/aruna/import-equivalence");
     let jsonld = doc(&graph, 2);
 
     let checked_batch = checked
@@ -64,8 +64,8 @@ fn prevalidated_apply_matches_checked_apply() {
             Some(actor(7)),
         )
         .unwrap();
-    let trusted_batch = trusted
-        .apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+    let second_batch = second
+        .apply_rocrate_document_checked_with_policy_and_durability_as(
             &AllowAllAuthorizer,
             graph.clone(),
             &jsonld,
@@ -77,29 +77,29 @@ fn prevalidated_apply_matches_checked_apply() {
 
     assert_eq!(
         format!("{:?}", checked_batch.ops),
-        format!("{:?}", trusted_batch.ops)
+        format!("{:?}", second_batch.ops)
     );
-    assert_eq!(checked_batch.actor, trusted_batch.actor);
-    assert_eq!(checked_batch.counter, trusted_batch.counter);
+    assert_eq!(checked_batch.actor, second_batch.actor);
+    assert_eq!(checked_batch.counter, second_batch.counter);
 
     let checked_export = checked.export_rocrate(&AllowAllAuthorizer, &graph).unwrap();
-    let trusted_export = trusted.export_rocrate(&AllowAllAuthorizer, &graph).unwrap();
-    assert_eq!(checked_export, trusted_export);
+    let second_export = second.export_rocrate(&AllowAllAuthorizer, &graph).unwrap();
+    assert_eq!(checked_export, second_export);
     assert_eq!(
         checked.graph_fingerprint(&graph).unwrap(),
-        trusted.graph_fingerprint(&graph).unwrap()
+        second.graph_fingerprint(&graph).unwrap()
     );
-    assert!(trusted.graph_violations(&graph).unwrap().is_empty());
-    assert!(!trusted.graph_diagnostics(&graph).unwrap().has_orphans());
+    assert!(second.graph_violations(&graph).unwrap().is_empty());
+    assert!(!second.graph_diagnostics(&graph).unwrap().has_orphans());
 }
 
 #[test]
-fn prevalidated_apply_replaces_existing_graph() {
+fn checked_apply_replaces_existing_graph() {
     let tmp = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(tmp.path()).unwrap();
-    let graph = GraphId::new("https://w3id.org/aruna/prevalidated-replace");
+    let graph = GraphId::new("https://w3id.org/aruna/import-replace");
 
-    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+    node.apply_rocrate_document_checked_with_policy_and_durability_as(
         &AllowAllAuthorizer,
         graph.clone(),
         &doc(&graph, 1),
@@ -108,7 +108,7 @@ fn prevalidated_apply_replaces_existing_graph() {
         Some(actor(1)),
     )
     .unwrap();
-    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+    node.apply_rocrate_document_checked_with_policy_and_durability_as(
         &AllowAllAuthorizer,
         graph.clone(),
         &doc(&graph, 3),
@@ -124,14 +124,14 @@ fn prevalidated_apply_replaces_existing_graph() {
 }
 
 #[test]
-fn prevalidated_apply_rejects_structurally_invalid_jsonld() {
+fn checked_apply_rejects_structurally_invalid_jsonld() {
     let tmp = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(tmp.path()).unwrap();
-    let graph = GraphId::new("https://w3id.org/aruna/prevalidated-structural");
+    let graph = GraphId::new("https://w3id.org/aruna/import-structural");
 
     let missing_graph = r#"{"@context": "https://w3id.org/ro/crate/1.2/context"}"#;
     assert!(
-        node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        node.apply_rocrate_document_checked_with_policy_and_durability_as(
             &AllowAllAuthorizer,
             graph.clone(),
             missing_graph,
@@ -142,7 +142,7 @@ fn prevalidated_apply_rejects_structurally_invalid_jsonld() {
         .is_err()
     );
     assert!(
-        node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        node.apply_rocrate_document_checked_with_policy_and_durability_as(
             &AllowAllAuthorizer,
             graph.clone(),
             "not json",
@@ -159,7 +159,7 @@ fn prevalidated_apply_rejects_structurally_invalid_jsonld() {
 fn checked_apply_still_validates_semantics() {
     let tmp = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(tmp.path()).unwrap();
-    let graph = GraphId::new("https://w3id.org/aruna/prevalidated-checked-guard");
+    let graph = GraphId::new("https://w3id.org/aruna/import-checked-guard");
 
     // No metadata descriptor / root dataset: checked path must reject.
     let invalid = serde_json::json!({
@@ -183,11 +183,11 @@ fn checked_apply_still_validates_semantics() {
 }
 
 #[test]
-fn prevalidated_create_matches_checked_create() {
+fn create_with_explicit_actor_is_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
     let checked = CraqleNode::open(tmp.path().join("checked")).unwrap();
-    let trusted = CraqleNode::open(tmp.path().join("trusted")).unwrap();
-    let graph = GraphId::new("https://w3id.org/aruna/prevalidated-create");
+    let second = CraqleNode::open(tmp.path().join("second")).unwrap();
+    let graph = GraphId::new("https://w3id.org/aruna/create-equivalence");
     let request = || {
         CreateCrateRequest::new(
             graph.clone(),
@@ -207,8 +207,8 @@ fn prevalidated_create_matches_checked_create() {
             Some(actor(5)),
         )
         .unwrap();
-    let trusted_batch = trusted
-        .create_crate_prevalidated_with_durability_as(
+    let second_batch = second
+        .create_crate_with_durability_as(
             &AllowAllAuthorizer,
             request(),
             CraqleRequestDurability::WalAlreadyDurable,
@@ -218,11 +218,11 @@ fn prevalidated_create_matches_checked_create() {
 
     assert_eq!(
         format!("{:?}", checked_batch.ops),
-        format!("{:?}", trusted_batch.ops)
+        format!("{:?}", second_batch.ops)
     );
     assert_eq!(
         checked.graph_fingerprint(&graph).unwrap(),
-        trusted.graph_fingerprint(&graph).unwrap()
+        second.graph_fingerprint(&graph).unwrap()
     );
-    assert!(trusted.graph_violations(&graph).unwrap().is_empty());
+    assert!(second.graph_violations(&graph).unwrap().is_empty());
 }

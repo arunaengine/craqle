@@ -357,7 +357,7 @@ mod tests {
         );
 
         node.delete_graph(&writer, &graph).unwrap();
-        node.create_crate(
+        let recreate = node.create_crate(
             &writer,
             CreateCrateRequest::new(
                 graph.clone(),
@@ -367,8 +367,8 @@ mod tests {
                 Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public_policy(),
             ),
-        )
-        .unwrap();
+        );
+        assert_eq!(recreate.unwrap_err().kind(), CraqleErrorKind::Conflict);
         node.flush_search_updates().unwrap();
 
         assert!(
@@ -383,16 +383,15 @@ mod tests {
             .is_empty()
         );
         assert!(
-            !node
-                .search(
-                    &reader,
-                    SearchRequest {
-                        query: "replacement",
-                        limit: 10
-                    }
-                )
-                .unwrap()
-                .is_empty()
+            node.search(
+                &reader,
+                SearchRequest {
+                    query: "replacement",
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -571,6 +570,121 @@ mod tests {
         });
     }
 
+    /// Produce an orphan through two individually valid writes: each replica
+    /// removes one of two reachability paths while partitioned, and the merge
+    /// removes both paths.
+    fn make_replicated_orphan(net: &mut CraqleCluster, graph: &GraphId) -> SnapshotQuadState {
+        let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        let root = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(graph.as_str()));
+        let edge = net
+            .peer(0)
+            .graph_snapshot(graph)
+            .unwrap()
+            .quads
+            .into_iter()
+            .find(|quad| quad.subject == root && quad.predicate == has_part)
+            .expect("root must link the child");
+        let parent = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(format!(
+            "{}#orphan-staging-parent",
+            graph.as_str()
+        )));
+        let parent_name = EncodedTerm::from_term(&oxrdf::Term::Literal(
+            oxrdf::Literal::new_simple_literal("Orphan staging parent"),
+        ))
+        .unwrap();
+
+        net.peer(0)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                graph,
+                vec![
+                    MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: parent.clone(),
+                        predicate: EncodedTerm::from_named_node(&vocab::rdf_type()),
+                        object: EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: parent.clone(),
+                        predicate: EncodedTerm::from_named_node(&vocab::schema_name()),
+                        object: parent_name.clone(),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: root.clone(),
+                        predicate: has_part.clone(),
+                        object: parent.clone(),
+                    },
+                    MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: parent.clone(),
+                        predicate: has_part.clone(),
+                        object: edge.object.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        net.partition(0, 1);
+        net.peer(0)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                graph,
+                vec![MaterializedQuadChange::Delete {
+                    graph: graph.clone(),
+                    subject: edge.subject.clone(),
+                    predicate: edge.predicate.clone(),
+                    object: edge.object.clone(),
+                }],
+            )
+            .unwrap();
+        net.peer(1)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                graph,
+                vec![MaterializedQuadChange::Delete {
+                    graph: graph.clone(),
+                    subject: parent.clone(),
+                    predicate: has_part.clone(),
+                    object: edge.object.clone(),
+                }],
+            )
+            .unwrap();
+        net.heal(0, 1);
+        net.sync_until_converged(10).unwrap();
+
+        net.peer(0)
+            .apply_changes(
+                &AllowAllAuthorizer,
+                graph,
+                vec![
+                    MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: root,
+                        predicate: has_part,
+                        object: parent.clone(),
+                    },
+                    MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: parent.clone(),
+                        predicate: EncodedTerm::from_named_node(&vocab::rdf_type()),
+                        object: EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                    },
+                    MaterializedQuadChange::Delete {
+                        graph: graph.clone(),
+                        subject: parent,
+                        predicate: EncodedTerm::from_named_node(&vocab::schema_name()),
+                        object: parent_name,
+                    },
+                ],
+            )
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+        edge
+    }
+
     /// An entity that becomes orphaned by a write that never touches it must leave
     /// the search index (G6, G7).
     ///
@@ -581,83 +695,61 @@ mod tests {
     /// unrelated write happens to dirty that subject.
     #[test]
     fn orphan_leaves_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open_with_options(
-            dir.path(),
-            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
-        )
-        .unwrap();
+        let (_dir, mut net) = setup_network(2);
         let auth =
             GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
         let graph = GraphId::new("urn:test:orphan-requeue");
 
-        node.create_crate(
-            &auth,
-            CreateCrateRequest::new(
-                graph.clone(),
-                "requeue crate",
-                "description",
-                "2025-01-01",
-                None,
-                GraphPolicy {
-                    public: true,
-                    permission_paths: vec!["/t/x".to_string()],
-                },
-            ),
-        )
-        .unwrap();
-        node.append_new_root_data_entities(
-            &auth,
-            &graph,
-            vec![NewDataEntity {
-                entity_id: "data/pufferfish.dat".to_string(),
-                entity_type: "http://schema.org/MediaObject".to_string(),
-                name: "pufferfish".to_string(),
-                additional_triples: Vec::new(),
-            }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
-        node.flush_search_updates().unwrap();
+        net.peer(0)
+            .create_crate(
+                &auth,
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "requeue crate",
+                    "description",
+                    "2025-01-01",
+                    None,
+                    GraphPolicy {
+                        public: true,
+                        permission_paths: vec!["/t/x".to_string()],
+                    },
+                ),
+            )
+            .unwrap();
+        net.peer(0)
+            .append_new_root_data_entities(
+                &auth,
+                &graph,
+                vec![NewDataEntity {
+                    entity_id: "data/pufferfish.dat".to_string(),
+                    entity_type: "http://schema.org/MediaObject".to_string(),
+                    name: "pufferfish".to_string(),
+                    additional_triples: Vec::new(),
+                }],
+            )
+            .unwrap();
+        net.peer(0).flush_search_updates().unwrap();
 
         assert_eq!(
-            node.search(
-                &auth,
-                SearchRequest {
-                    query: "pufferfish",
-                    limit: 10
-                }
-            )
-            .unwrap()
-            .len(),
+            net.peer(0)
+                .search(
+                    &auth,
+                    SearchRequest {
+                        query: "pufferfish",
+                        limit: 10
+                    }
+                )
+                .unwrap()
+                .len(),
             1,
             "the child must be searchable before it is orphaned"
         );
 
-        // Cut the only edge to the child, naming just the edge — never the child.
-        let has_part = "<http://schema.org/hasPart>";
-        let edge = node
-            .graph_snapshot(&graph)
-            .unwrap()
-            .quads
-            .into_iter()
-            .find(|quad| quad.predicate.0 == has_part)
-            .expect("root must link the child");
-        node.apply_changes_bulk_unchecked(
-            &graph,
-            vec![MaterializedQuadChange::Delete {
-                graph: graph.clone(),
-                subject: edge.subject,
-                predicate: edge.predicate,
-                object: edge.object,
-            }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
-        node.flush_search_updates().unwrap();
+        make_replicated_orphan(&mut net, &graph);
 
         assert_eq!(
-            node.graph_diagnostics(&graph)
+            net.peer(0)
+                .graph_diagnostics(&graph)
                 .unwrap()
                 .orphaned_entities
                 .len(),
@@ -665,15 +757,16 @@ mod tests {
             "the child must now be recorded as orphaned"
         );
         assert_eq!(
-            node.search(
-                &auth,
-                SearchRequest {
-                    query: "pufferfish",
-                    limit: 10
-                }
-            )
-            .unwrap()
-            .len(),
+            net.peer(0)
+                .search(
+                    &auth,
+                    SearchRequest {
+                        query: "pufferfish",
+                        limit: 10
+                    }
+                )
+                .unwrap()
+                .len(),
             0,
             "an orphaned entity must not remain searchable"
         );
@@ -692,12 +785,7 @@ mod tests {
     /// and the entity has to come back to search on the write alone (G7).
     #[test]
     fn append_restores_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open_with_options(
-            dir.path(),
-            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
-        )
-        .unwrap();
+        let (_dir, mut net) = setup_network(2);
         let auth =
             GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
         let graph = GraphId::new("urn:test:append-requeue");
@@ -708,24 +796,44 @@ mod tests {
             additional_triples: Vec::new(),
         };
 
-        node.create_crate(
-            &auth,
-            CreateCrateRequest::new(
-                graph.clone(),
-                "append crate",
-                "description",
-                "2025-01-01",
-                None,
-                GraphPolicy {
-                    public: true,
-                    permission_paths: vec!["/t/x".to_string()],
-                },
-            ),
-        )
-        .unwrap();
-        node.append_new_root_data_entities(&auth, &graph, vec![entity()])
+        net.peer(0)
+            .create_crate(
+                &auth,
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "append crate",
+                    "description",
+                    "2025-01-01",
+                    None,
+                    GraphPolicy {
+                        public: true,
+                        permission_paths: vec!["/t/x".to_string()],
+                    },
+                ),
+            )
+            .unwrap();
+        net.peer(0)
+            .append_new_root_data_entities(&auth, &graph, vec![entity()])
             .unwrap();
 
+        net.peer(0).flush_search_updates().unwrap();
+        assert_eq!(
+            1,
+            net.peer(0)
+                .search(
+                    &auth,
+                    SearchRequest {
+                        query: "nautilus",
+                        limit: 10,
+                    },
+                )
+                .unwrap()
+                .len(),
+            "the appended entity starts out searchable"
+        );
+
+        make_replicated_orphan(&mut net, &graph);
+        let node = net.peer(0);
         let searchable = || {
             node.flush_search_updates().unwrap();
             node.search(
@@ -738,27 +846,6 @@ mod tests {
             .unwrap()
             .len()
         };
-
-        assert_eq!(1, searchable(), "the appended entity starts out searchable");
-
-        let edge = node
-            .graph_snapshot(&graph)
-            .unwrap()
-            .quads
-            .into_iter()
-            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
-            .expect("root must link the child");
-        node.apply_changes_bulk_unchecked(
-            &graph,
-            vec![MaterializedQuadChange::Delete {
-                graph: graph.clone(),
-                subject: edge.subject.clone(),
-                predicate: edge.predicate.clone(),
-                object: edge.object.clone(),
-            }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
         assert_eq!(0, searchable(), "the orphan must leave the index");
 
         // Re-append the same id. This is the only write, and it must settle
@@ -781,43 +868,57 @@ mod tests {
     /// entity, so only a settled orphan record can return it to search (G7).
     #[test]
     fn append_adopts_orphan() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open_with_options(
-            dir.path(),
-            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
-        )
-        .unwrap();
+        let (_dir, mut net) = setup_network(2);
         let auth =
             GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
         let graph = GraphId::new("urn:test:append-adopt");
 
-        node.create_crate(
-            &auth,
-            CreateCrateRequest::new(
-                graph.clone(),
-                "adopt crate",
-                "description",
-                "2025-01-01",
-                None,
-                GraphPolicy {
-                    public: true,
-                    permission_paths: vec!["/t/x".to_string()],
-                },
-            ),
-        )
-        .unwrap();
-        node.append_new_root_data_entities(
-            &auth,
-            &graph,
-            vec![NewDataEntity {
-                entity_id: "data/pangolin.dat".to_string(),
-                entity_type: "http://schema.org/MediaObject".to_string(),
-                name: "pangolin".to_string(),
-                additional_triples: Vec::new(),
-            }],
-        )
-        .unwrap();
+        net.peer(0)
+            .create_crate(
+                &auth,
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "adopt crate",
+                    "description",
+                    "2025-01-01",
+                    None,
+                    GraphPolicy {
+                        public: true,
+                        permission_paths: vec!["/t/x".to_string()],
+                    },
+                ),
+            )
+            .unwrap();
+        net.peer(0)
+            .append_new_root_data_entities(
+                &auth,
+                &graph,
+                vec![NewDataEntity {
+                    entity_id: "data/pangolin.dat".to_string(),
+                    entity_type: "http://schema.org/MediaObject".to_string(),
+                    name: "pangolin".to_string(),
+                    additional_triples: Vec::new(),
+                }],
+            )
+            .unwrap();
+        net.peer(0).flush_search_updates().unwrap();
+        assert_eq!(
+            1,
+            net.peer(0)
+                .search(
+                    &auth,
+                    SearchRequest {
+                        query: "pangolin",
+                        limit: 10,
+                    },
+                )
+                .unwrap()
+                .len(),
+            "the entity starts out searchable"
+        );
 
+        make_replicated_orphan(&mut net, &graph);
+        let node = net.peer(0);
         let searchable = || {
             node.flush_search_updates().unwrap();
             node.search(
@@ -830,27 +931,6 @@ mod tests {
             .unwrap()
             .len()
         };
-
-        assert_eq!(1, searchable(), "the entity starts out searchable");
-
-        let edge = node
-            .graph_snapshot(&graph)
-            .unwrap()
-            .quads
-            .into_iter()
-            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
-            .expect("root must link the child");
-        node.apply_changes_bulk_unchecked(
-            &graph,
-            vec![MaterializedQuadChange::Delete {
-                graph: graph.clone(),
-                subject: edge.subject.clone(),
-                predicate: edge.predicate.clone(),
-                object: edge.object.clone(),
-            }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(&graph).unwrap();
         assert_eq!(0, searchable(), "the orphan must leave the index");
 
         // Adopt the orphan from a brand-new sibling. The orphan itself is
@@ -882,42 +962,39 @@ mod tests {
 
     #[test]
     fn reattach_restores_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open_with_options(
-            dir.path(),
-            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
-        )
-        .unwrap();
+        let (_dir, mut net) = setup_network(2);
         let auth =
             GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)]);
         let graph = GraphId::new("urn:test:orphan-requeue-back");
 
-        node.create_crate(
-            &auth,
-            CreateCrateRequest::new(
-                graph.clone(),
-                "requeue crate",
-                "description",
-                "2025-01-01",
-                None,
-                GraphPolicy {
-                    public: true,
-                    permission_paths: vec!["/t/x".to_string()],
-                },
-            ),
-        )
-        .unwrap();
-        node.append_new_root_data_entities(
-            &auth,
-            &graph,
-            vec![NewDataEntity {
-                entity_id: "data/coelacanth.dat".to_string(),
-                entity_type: "http://schema.org/MediaObject".to_string(),
-                name: "coelacanth".to_string(),
-                additional_triples: Vec::new(),
-            }],
-        )
-        .unwrap();
+        net.peer(0)
+            .create_crate(
+                &auth,
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "requeue crate",
+                    "description",
+                    "2025-01-01",
+                    None,
+                    GraphPolicy {
+                        public: true,
+                        permission_paths: vec!["/t/x".to_string()],
+                    },
+                ),
+            )
+            .unwrap();
+        net.peer(0)
+            .append_new_root_data_entities(
+                &auth,
+                &graph,
+                vec![NewDataEntity {
+                    entity_id: "data/coelacanth.dat".to_string(),
+                    entity_type: "http://schema.org/MediaObject".to_string(),
+                    name: "coelacanth".to_string(),
+                    additional_triples: Vec::new(),
+                }],
+            )
+            .unwrap();
 
         let searchable = |node: &CraqleNode| {
             node.search(
@@ -935,39 +1012,27 @@ mod tests {
             node.flush_search_updates().unwrap();
         };
 
-        settle(&node);
-        assert_eq!(1, searchable(&node), "the child starts out searchable");
+        settle(net.peer(0));
+        assert_eq!(
+            1,
+            searchable(net.peer(0)),
+            "the child starts out searchable"
+        );
 
-        // The only edge to the child. Cut it, then restore it — naming the edge
-        // both times and the child neither time.
-        let edge = node
-            .graph_snapshot(&graph)
-            .unwrap()
-            .quads
-            .into_iter()
-            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
-            .expect("root must link the child");
+        let edge = make_replicated_orphan(&mut net, &graph);
+        let node = net.peer(0);
         let link = |graph: &GraphId| MaterializedQuadChange::Insert {
             graph: graph.clone(),
             subject: edge.subject.clone(),
             predicate: edge.predicate.clone(),
             object: edge.object.clone(),
         };
-        let unlink = |graph: &GraphId| MaterializedQuadChange::Delete {
-            graph: graph.clone(),
-            subject: edge.subject.clone(),
-            predicate: edge.predicate.clone(),
-            object: edge.object.clone(),
-        };
+        settle(node);
+        assert_eq!(0, searchable(node), "the orphan must leave the index");
 
-        node.apply_changes_bulk_unchecked(&graph, vec![unlink(&graph)])
+        node.apply_changes(&AllowAllAuthorizer, &graph, vec![link(&graph)])
             .unwrap();
-        settle(&node);
-        assert_eq!(0, searchable(&node), "the orphan must leave the index");
-
-        node.apply_changes_bulk_unchecked(&graph, vec![link(&graph)])
-            .unwrap();
-        settle(&node);
+        settle(node);
         assert!(
             node.graph_diagnostics(&graph)
                 .unwrap()
@@ -977,7 +1042,7 @@ mod tests {
         );
         assert_eq!(
             1,
-            searchable(&node),
+            searchable(node),
             "a re-attached entity must come back to search without being touched"
         );
     }
@@ -1001,47 +1066,40 @@ mod tests {
     /// settle takes its re-stamp path — and re-stamping a read that already
     /// reflects the bulk write would move the re-queue baseline past the
     /// re-link without queueing it.
-    fn interleave_relink(node: &CraqleNode, graph: &GraphId) {
-        node.create_crate(
-            &writer_auth(),
-            CreateCrateRequest::new(
-                graph.clone(),
-                "interleave crate",
-                "description",
-                "2025-01-01",
-                None,
-                public_policy(),
-            ),
-        )
-        .unwrap();
-        node.append_new_root_data_entities(
-            &writer_auth(),
-            graph,
-            vec![NewDataEntity {
-                entity_id: "data/axolotl.dat".to_string(),
-                entity_type: "http://schema.org/MediaObject".to_string(),
-                name: "axolotl".to_string(),
-                additional_triples: Vec::new(),
-            }],
-        )
-        .unwrap();
-        node.rebuild_graph_diagnostics(graph).unwrap();
-        node.flush_search_updates().unwrap();
-        assert_eq!(1, axolotl_hits(node), "the child starts out searchable");
+    fn interleave_relink(net: &mut CraqleCluster, graph: &GraphId) {
+        net.peer(0)
+            .create_crate(
+                &writer_auth(),
+                CreateCrateRequest::new(
+                    graph.clone(),
+                    "interleave crate",
+                    "description",
+                    "2025-01-01",
+                    None,
+                    public_policy(),
+                ),
+            )
+            .unwrap();
+        net.peer(0)
+            .append_new_root_data_entities(
+                &writer_auth(),
+                graph,
+                vec![NewDataEntity {
+                    entity_id: "data/axolotl.dat".to_string(),
+                    entity_type: "http://schema.org/MediaObject".to_string(),
+                    name: "axolotl".to_string(),
+                    additional_triples: Vec::new(),
+                }],
+            )
+            .unwrap();
+        net.peer(0).flush_search_updates().unwrap();
+        assert_eq!(
+            1,
+            axolotl_hits(net.peer(0)),
+            "the child starts out searchable"
+        );
 
-        let edge = node
-            .graph_snapshot(graph)
-            .unwrap()
-            .quads
-            .into_iter()
-            .find(|quad| quad.predicate.0 == "<http://schema.org/hasPart>")
-            .expect("root must link the child");
-        let unlink = MaterializedQuadChange::Delete {
-            graph: graph.clone(),
-            subject: edge.subject.clone(),
-            predicate: edge.predicate.clone(),
-            object: edge.object.clone(),
-        };
+        let edge = make_replicated_orphan(net, graph);
         let link = MaterializedQuadChange::Insert {
             graph: graph.clone(),
             subject: edge.subject.clone(),
@@ -1049,16 +1107,14 @@ mod tests {
             object: edge.object.clone(),
         };
 
-        node.apply_changes_bulk_unchecked(graph, vec![unlink])
-            .unwrap();
-        node.rebuild_graph_diagnostics(graph).unwrap();
-        node.flush_search_updates().unwrap();
+        let node = net.peer(0);
         assert_eq!(0, axolotl_hits(node), "the orphan must leave the index");
 
         // Re-link without rebuilding, then commit something unrelated.
-        node.apply_changes_bulk_unchecked(graph, vec![link])
+        node.apply_changes(&AllowAllAuthorizer, graph, vec![link])
             .unwrap();
-        node.apply_changes_unchecked(
+        node.apply_changes(
+            &AllowAllAuthorizer,
             graph,
             vec![MaterializedQuadChange::Insert {
                 graph: graph.clone(),
@@ -1082,15 +1138,11 @@ mod tests {
     /// the re-queue baseline past the re-link it happens to observe (G7).
     #[test]
     fn interleaved_relink_searchable() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = CraqleNode::open_with_options(
-            dir.path(),
-            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
-        )
-        .unwrap();
+        let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:interleaved-relink");
 
-        interleave_relink(&node, &graph);
+        interleave_relink(&mut net, &graph);
+        let node = net.peer(0);
 
         assert!(
             node.graph_diagnostics(&graph)
@@ -1110,15 +1162,13 @@ mod tests {
     /// correct and freshly clock-tagged, so a reopen finds nothing to fix.
     #[test]
     fn interleaved_relink_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:interleaved-relink-restart");
 
-        {
-            let node = CraqleNode::open(dir.path()).unwrap();
-            interleave_relink(&node, &graph);
-        }
+        interleave_relink(&mut net, &graph);
+        drop(net);
 
-        let reopened = CraqleNode::open(dir.path()).unwrap();
+        let reopened = CraqleNode::open(dir.path().join("peer_0")).unwrap();
         reopened.flush_search_updates().unwrap();
         assert_eq!(
             1,

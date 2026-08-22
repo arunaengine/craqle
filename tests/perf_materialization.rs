@@ -104,7 +104,7 @@ mod tests {
         let graph = doc_graph(nonce, idx);
         let jsonld = production_shaped_doc(&graph);
         let started = Instant::now();
-        node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        node.apply_rocrate_document_checked_with_policy_and_durability_as(
             &AllowAllAuthorizer,
             graph,
             &jsonld,
@@ -148,7 +148,7 @@ mod tests {
             doc_policy(),
         );
         let started = Instant::now();
-        node.create_crate_prevalidated_with_durability_as(
+        node.create_crate_with_durability_as(
             &AllowAllAuthorizer,
             request,
             CraqleRequestDurability::WalAlreadyDurable,

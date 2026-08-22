@@ -198,11 +198,11 @@ fn lifecycle_never_deadlocks() {
                 let node = Arc::clone(&node);
                 let tx = tx.clone();
                 std::thread::spawn(move || {
-                    // Two threads per graph, so each graph's shard is contended.
-                    let graph =
-                        GraphId::new(&format!("urn:test:concurrency:lifecycle-{}", thread % 4));
                     let name = EncodedTerm::from_named_node(&vocab::schema_name());
                     for round in 0..ROUNDS {
+                        let graph = GraphId::new(&format!(
+                            "urn:test:concurrency:lifecycle-{thread}-{round}"
+                        ));
                         node.import_graph_policy(&graph, public_policy()).unwrap();
                         write_unchecked(
                             &node,

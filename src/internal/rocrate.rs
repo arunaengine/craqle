@@ -590,89 +590,6 @@ impl RoCrateManager {
         )?)
     }
 
-    /// Create-crate path for scaffold requests already validated at their
-    /// origin. Skips post-state rule validation; scaffold output is
-    /// structurally valid by construction.
-    pub(crate) fn create_crate_prevalidated(
-        &self,
-        graph_id: GraphId,
-        name: &str,
-        description: &str,
-        date_published: &str,
-        license: Option<&str>,
-    ) -> Result<Batch, RoCrateError> {
-        self.create_crate_prevalidated_with_version(
-            graph_id,
-            name,
-            description,
-            date_published,
-            license,
-            RoCrateVersion::default(),
-        )
-    }
-
-    pub(crate) fn create_crate_prevalidated_with_version(
-        &self,
-        graph_id: GraphId,
-        name: &str,
-        description: &str,
-        date_published: &str,
-        license: Option<&str>,
-        version: RoCrateVersion,
-    ) -> Result<Batch, RoCrateError> {
-        let cx = self.crate_ctx(&graph_id)?;
-        let is_replacement = !self.graph_is_empty(&cx)?;
-        let changes = if is_replacement {
-            match license {
-                Some(license) => {
-                    let mut rocrate = create_crate_rocrate_with_license(
-                        &graph_id,
-                        name,
-                        description,
-                        date_published,
-                        license_from_str(license)?,
-                        version,
-                    );
-                    self.plan_rocrate_replacement(&cx, &mut rocrate)?
-                }
-                None => {
-                    let target =
-                        triples_from_insert_changes(&create_crate_scaffold_changes_with_license(
-                            &graph_id,
-                            name,
-                            description,
-                            date_published,
-                            None,
-                            version,
-                        ));
-                    diff_triples(&graph_id, &self.replacement_base(&cx, &target)?, &target)?
-                }
-            }
-        } else {
-            create_crate_scaffold_changes_with_license(
-                &graph_id,
-                name,
-                description,
-                date_published,
-                license.map(encoded_license_value).transpose()?,
-                version,
-            )
-        };
-        let batch = self
-            .engine
-            .local_apply_bulk_bypassing_structural_rules_with_render_hints(
-                &graph_id,
-                changes,
-                RoCrateRenderHints {
-                    context: None,
-                    license: None,
-                    license_digest: None,
-                },
-            )?;
-        self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        Ok(batch)
-    }
-
     /// Validate and materialize the changes for creating a crate without applying them.
     pub(crate) fn validate_create_crate(
         &self,
@@ -1123,89 +1040,6 @@ impl RoCrateManager {
         jsonld: &str,
     ) -> Result<Batch, RoCrateError> {
         self.import_jsonld(graph_id, jsonld)
-    }
-
-    /// Import path for documents already validated at their origin.
-    ///
-    /// Skips complete RO-Crate semantic validation but keeps replace/diff
-    /// semantics, CRDT authoring, and structural JSON-LD error handling. Only
-    /// callers replaying origin-validated documents may use this.
-    pub(crate) fn import_jsonld_prevalidated(
-        &self,
-        graph_id: GraphId,
-        jsonld: &str,
-    ) -> Result<Batch, RoCrateError> {
-        let limits = RoCrateImportLimits::production();
-        enforce_import_limit("max_input_bytes", jsonld.len(), limits.max_input_bytes)?;
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        validate_import_structure_limits(&value, &limits)?;
-        let license = extract_raw_license(&value);
-        validate_jsonld_import(&value)?;
-        let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples_limited(&graph_id, &value, &limits)?;
-        validate_crate_version(&graph_id, &target, context_version)?;
-        let cx = self.crate_ctx(&graph_id)?;
-        let render_hints = RoCrateRenderHints {
-            context: normalized_import_context(&value, &graph_id, &target),
-            license_digest: license.as_ref().map(|_| triple_state_digest(&target)),
-            license,
-        };
-        let changes = self.replacement_changes_bounded(&cx, target, limits.max_changes)?;
-        let batch = self
-            .engine
-            .local_apply_bulk_bypassing_structural_rules_with_render_hints(
-                &graph_id,
-                changes,
-                render_hints,
-            )?;
-        self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        Ok(batch)
-    }
-
-    /// Fast path for trusted bootstrap imports into a new or empty graph.
-    ///
-    /// This skips semantic RO-Crate validation and current-state diffing, and
-    /// is intended for callers that already trust the input document.
-    pub(crate) fn bootstrap_jsonld_trusted(
-        &self,
-        graph_id: GraphId,
-        jsonld: &str,
-    ) -> Result<Batch, RoCrateError> {
-        if !self.graph_is_missing_or_empty(&graph_id)? {
-            return Err(RoCrateError::InvalidGraph(format!(
-                "trusted bootstrap requires graph `{}` to be new or empty",
-                graph_id.as_str()
-            )));
-        }
-
-        let limits = RoCrateImportLimits::production();
-        enforce_import_limit("max_input_bytes", jsonld.len(), limits.max_input_bytes)?;
-        let value: serde_json::Value = serde_json::from_str(jsonld)?;
-        validate_import_structure_limits(&value, &limits)?;
-        let license = extract_raw_license(&value);
-        validate_jsonld_import(&value)?;
-        let context_version = detect_context_version(&value)?;
-        let target = jsonld_triples_limited(&graph_id, &value, &limits)?;
-        validate_crate_version(&graph_id, &target, context_version)?;
-        let render_hints = RoCrateRenderHints {
-            context: normalized_import_context(&value, &graph_id, &target),
-            license_digest: license.as_ref().map(|_| triple_state_digest(&target)),
-            license,
-        };
-        let changes = self.replacement_changes_bounded(
-            &self.crate_ctx(&graph_id)?,
-            target,
-            limits.max_changes,
-        )?;
-        let batch = self
-            .engine
-            .local_apply_bulk_bypassing_structural_rules_with_render_hints(
-                &graph_id,
-                changes,
-                render_hints,
-            )?;
-        self.engine.rebuild_graph_diagnostics(&graph_id)?;
-        Ok(batch)
     }
 
     /// Compute the canonical change set for replacing a graph with a JSON-LD RO-Crate.
@@ -1859,10 +1693,6 @@ impl RoCrateManager {
             None => Ok(serde_json::to_string(&document)?),
             Some(raw) => splice_context_json(document, &raw, render.pretty),
         }
-    }
-
-    fn graph_is_missing_or_empty(&self, graph_id: &GraphId) -> Result<bool, RoCrateError> {
-        Ok(self.engine.store().graph_is_empty(graph_id)?)
     }
 
     fn plan_rocrate_replacement(

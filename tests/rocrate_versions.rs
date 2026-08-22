@@ -98,13 +98,7 @@ fn assert_unknown_on_every_import_route(jsonld: &str, expected: &str) {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
 
-    for route in [
-        "default",
-        "existing",
-        "checked",
-        "prevalidated",
-        "bootstrap",
-    ] {
+    for route in ["default", "existing", "checked", "explicit-durability"] {
         let graph = GraphId::new(&format!("urn:test:version-error:{route}"));
         let error = match route {
             "default" => node
@@ -124,18 +118,14 @@ fn assert_unknown_on_every_import_route(jsonld: &str, expected: &str) {
                     policy(),
                 )
                 .unwrap_err(),
-            "prevalidated" => node
-                .apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+            "explicit-durability" => node
+                .apply_rocrate_document_with_policy_and_durability(
                     &AllowAllAuthorizer,
                     graph,
                     jsonld,
                     policy(),
                     CraqleRequestDurability::Durable,
-                    None,
                 )
-                .unwrap_err(),
-            "bootstrap" => node
-                .bootstrap_rocrate_document(&AllowAllAuthorizer, graph, jsonld, policy())
                 .unwrap_err(),
             _ => unreachable!(),
         };
