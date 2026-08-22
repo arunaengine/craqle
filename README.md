@@ -1,11 +1,21 @@
 # Craqle
 
-Craqle is a Rust library for storing and working with RO-Crates as RDF named
-graphs.
+Craqle is a Rust library for storing, editing, validating, searching, and replicating RO-Crates as RDF named graphs. It supports SPARQL queries and updates, SHACL validation, Tantivy full-text search, and RO-Crate JSON-LD import and export.
 
-Use it to create, import, query, update, validate, search, export, and
-synchronize RO-Crates. Every read and write accepts an `Authorizer`, so graph
-access follows the application's permissions.
+Each graph is stored in an Observed-Remove Set (OR-Set) RDF CRDT Database that can be asynchronously synchronized between machines. Inserts are tagged with actor-and-counter dots, while deletions remove only the dots included in their observed vector clock. This preserves concurrent inserts, makes event replay idempotent, and ensures that replicas with the same causal event history converge without a central write coordinator.
+
+Every graph maps to a deterministic Irokle topic. Craqle publishes local operation batches durably before applying them to its RDF projection, allowing recovery after restarts and reconciliation with peers. Authorization remains under the host application’s control, and visible crates that fail validation are not exported.
+
+## Features
+
+- Store RO-Crates as named RDF graphs backed by a durable, convergent OR-Set
+  CRDT.
+- Query and update authorized graph sets with SPARQL.
+- Validate graph state with SHACL and ensure that Crates adhere to a specific shape.
+- Run full-text search with Tantivy and hydrate matches from RDF properties.
+- Synchronize graph state across machines with convergent replication through
+  durable per-graph Irokle topics.
+- Control graph access through host-provided authorizers and persisted policies.
 
 ## Open a node
 
