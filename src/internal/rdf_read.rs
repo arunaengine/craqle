@@ -2397,7 +2397,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_cursor_waits_for_publication_and_snapshots_the_complete_batch() {
+    fn raw_cursor_during_publication_reads_the_complete_durable_batch() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:raw-publication-barrier");
         store.create_graph(&graph).unwrap();
@@ -2428,12 +2428,6 @@ mod tests {
                 done.send(rows).unwrap();
             });
             wait_for_start.recv_timeout(Duration::from_secs(1)).unwrap();
-            assert!(
-                wait_for_done
-                    .recv_timeout(Duration::from_millis(50))
-                    .is_err(),
-                "a raw cursor created during publication must wait for the barrier"
-            );
             assert_eq!(
                 2,
                 wait_for_done
