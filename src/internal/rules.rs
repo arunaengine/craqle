@@ -1957,7 +1957,12 @@ mod tests {
                 let directory = tempfile::tempdir().unwrap();
                 let store = GraphStore::open(directory.path()).unwrap();
                 let graph = GraphId::new("urn:test:delta-rule-differential");
-                let base = valid_base(&graph);
+                let mut base = valid_base(&graph);
+                base.push((
+                    METADATA_DESCRIPTOR.clone(),
+                    DCTERMS_CONFORMS_TO.clone(),
+                    version_iri(RoCrateVersion::V1_3),
+                ));
                 for triple in &base {
                     put(&store, &graph, triple);
                 }
