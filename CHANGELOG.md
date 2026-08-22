@@ -18,6 +18,8 @@ All notable changes to Craqle are documented here.
 
 ### Changed
 
+- `SyncAll` is the default local persistence mode. `Buffer` is available only
+  through an explicit caller choice.
 - Explicit graph query, prepared execution, explain, analyze, statistics, and
   SPARQL Update entry points require an `Authorizer` and fail the whole request
   if any selected graph is unreadable or missing.
@@ -77,6 +79,7 @@ All notable changes to Craqle are documented here.
 
 ### Compatibility
 
+- v0.2.0 begins the documented 0.2.x compatibility line.
 - Linux is the only supported platform. Rust 1.91 is the measured all-feature
   MSRV.
 - Authoritative disk format `1.0` fails closed for missing, malformed, or

@@ -28,6 +28,10 @@ let node = CraqleNode::open("./data/craqle")?;
 let auth = AllowAllAuthorizer;
 ```
 
+Craqle uses SyncAll local persistence by default. Buffer mode is an explicit
+choice for tests, bulk fixture loading, or deployments whose external log
+already provides the required durability guarantee.
+
 ## Create a crate
 
 ```rust

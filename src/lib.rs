@@ -312,7 +312,7 @@ pub type Result<T> = std::result::Result<T, CraqleError>;
 /// Request-path durability policy for callers with an external durable WAL.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CraqleRequestDurability {
-    /// Persist Craqle's Fjall graph store before returning.
+    /// Persist Craqle's Fjall graph store with its configured mode before returning.
     #[default]
     Durable,
     /// Apply locally but let the caller's already-durable WAL drive recovery.
@@ -330,14 +330,16 @@ impl CraqleRequestDurability {
 }
 
 /// Fjall persistence mode used when Craqle explicitly persists its graph store.
+/// Defaults to [`CraqleFjallPersistMode::SyncAll`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CraqleFjallPersistMode {
     /// Flush to Fjall's configured buffer without forcing an OS sync.
-    #[default]
+    /// This mode must be selected explicitly.
     Buffer,
     /// Sync file data but not necessarily metadata.
     SyncData,
     /// Sync file data and metadata before returning.
+    #[default]
     SyncAll,
 }
 
@@ -3865,6 +3867,59 @@ mod tests {
                 permission_paths: vec!["/t/x".to_string()],
             },
         )
+    }
+
+    fn empty_test_batch(graph: &GraphId, actor: ActorId) -> Batch {
+        Batch {
+            graph: graph.clone(),
+            actor,
+            counter: 0,
+            base_clock: VectorClock::default(),
+            ops: Vec::new(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn durable_request_persists_with_configured_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            directory.path(),
+            CraqleOptions::new().with_graph_store_persist_mode(CraqleFjallPersistMode::Buffer),
+        )
+        .unwrap();
+        let graph = GraphId::new("urn:test:durability:configured");
+        let persists = node.store.persists();
+
+        node.finish_batch_with_durability(
+            &graph,
+            empty_test_batch(&graph, node.actor()),
+            CraqleRequestDurability::Durable,
+        )
+        .unwrap();
+
+        assert_eq!(
+            CraqleFjallPersistMode::Buffer,
+            node.graph_store_persist_mode()
+        );
+        assert_eq!(persists + 1, node.store.persists());
+    }
+
+    #[test]
+    fn wal_already_durable_does_not_force_local_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(directory.path()).unwrap();
+        let graph = GraphId::new("urn:test:durability:external-wal");
+        let persists = node.store.persists();
+
+        node.finish_batch_with_durability(
+            &graph,
+            empty_test_batch(&graph, node.actor()),
+            CraqleRequestDurability::WalAlreadyDurable,
+        )
+        .unwrap();
+
+        assert_eq!(persists, node.store.persists());
     }
 
     #[cfg(feature = "shacl-core")]
