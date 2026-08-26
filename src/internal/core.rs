@@ -439,6 +439,99 @@ pub struct Batch {
     pub timestamp: DateTime<Utc>,
 }
 
+/// A change carried a graph other than the batch's own graph.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("batch graph `{expected}` contained change for `{actual}`")]
+pub struct CrossGraphChange {
+    pub expected: GraphId,
+    pub actual: GraphId,
+}
+
+impl CrossGraphChange {
+    pub fn kind(&self) -> crate::CraqleErrorKind {
+        crate::CraqleErrorKind::InvalidInput
+    }
+}
+
+impl Batch {
+    /// Build a replication batch from a materialized change set, without
+    /// touching any store.
+    ///
+    /// Every insert shares the single dot `(actor, counter)`; every delete
+    /// becomes an OR-Set remove that witnesses `base_clock`, so it drops
+    /// exactly the dots the author had seen. Op order is the change order,
+    /// which a delete-then-add pair on the same quad depends on.
+    ///
+    /// `counter` must not repeat for `actor` in `graph`: a merge that already
+    /// saw `(actor, counter)` treats the batch as applied and skips it.
+    ///
+    /// Fails when a change targets a graph other than `graph`.
+    pub fn from_changes(
+        graph: GraphId,
+        actor: ActorId,
+        counter: u64,
+        base_clock: VectorClock,
+        changes: impl IntoIterator<Item = MaterializedQuadChange>,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Self, CrossGraphChange> {
+        let dot = Dot { actor, counter };
+        let changes = changes.into_iter();
+        let mut ops = Vec::with_capacity(changes.size_hint().0);
+        for change in changes {
+            match change {
+                MaterializedQuadChange::Insert {
+                    graph: change_graph,
+                    subject,
+                    predicate,
+                    object,
+                } => {
+                    ensure_change_graph(&graph, change_graph)?;
+                    ops.push(QuadOp::Add {
+                        subject,
+                        predicate,
+                        object,
+                        dot,
+                    });
+                }
+                MaterializedQuadChange::Delete {
+                    graph: change_graph,
+                    subject,
+                    predicate,
+                    object,
+                } => {
+                    ensure_change_graph(&graph, change_graph)?;
+                    ops.push(QuadOp::Remove {
+                        subject,
+                        predicate,
+                        object,
+                        witnessed: base_clock.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            graph,
+            actor,
+            counter,
+            base_clock,
+            ops,
+            timestamp,
+        })
+    }
+}
+
+fn ensure_change_graph(expected: &GraphId, actual: GraphId) -> Result<(), CrossGraphChange> {
+    if *expected == actual {
+        Ok(())
+    } else {
+        Err(CrossGraphChange {
+            expected: expected.clone(),
+            actual,
+        })
+    }
+}
+
 /// Read-only state of a live quad and its OR-Set dot set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotQuadState {

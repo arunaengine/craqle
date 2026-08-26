@@ -99,14 +99,16 @@ use chrono::Utc;
 use oxrdf::{NamedNode, Term};
 
 pub use crate::core::{
-    ActorId, Batch, CrateViolation, EncodedTerm, EventId, GraphDiagnostics, GraphId, GraphPolicy,
-    GraphTombstone, MaterializedQuadChange, PolicyTag, PredicateFilter, TaggedGraphPolicy,
-    UnsupportedRdfStarTerm, VectorClock, vocab,
+    ActorId, Batch, CrateViolation, CrossGraphChange, EncodedTerm, EventId, GraphDiagnostics,
+    GraphId, GraphPolicy, GraphTombstone, MaterializedQuadChange, PolicyTag, PredicateFilter,
+    TaggedGraphPolicy, UnsupportedRdfStarTerm, VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
 pub use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
-pub use crate::replication::{CheckMode, DiagnosticsMode, MergeError, UpdateError, WriteChecks};
+pub use crate::replication::{
+    CheckMode, DiagnosticsMode, MergeError, MergeResult, UpdateError, WriteChecks,
+};
 pub use crate::rocrate::{
     AppendDataEntitiesReport, CanonicalJsonLd, NewDataEntity, PrepareRoCrateOptions,
     PreparedGraphBase, PreparedRoCrateDocument, PreparedRoCrateStatistics, RoCrateError,
@@ -2694,6 +2696,73 @@ impl CraqleNode {
         Ok(self.manager().plan_import_jsonld_checked(&graph, jsonld)?)
     }
 
+    /// Change set the strict RO-Crate replacement would commit for `jsonld`,
+    /// without applying it.
+    ///
+    /// Runs the same complete-RO-Crate validation as
+    /// [`CraqleNode::apply_rocrate_document_checked_with_policy`] and requires
+    /// the same write authorization as
+    /// [`CraqleNode::apply_rocrate_document`]. Mutates nothing: no quads, no
+    /// policy, no search queue, no replication record.
+    ///
+    /// The change set describes the state visible now, so a concurrent write
+    /// to `graph` can still invalidate it.
+    pub fn plan_rocrate_document_checked(
+        &self,
+        auth: &dyn Authorizer,
+        graph: &GraphId,
+        jsonld: &str,
+    ) -> Result<Vec<MaterializedQuadChange>> {
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        Ok(self.manager().plan_import_jsonld_checked(graph, jsonld)?)
+    }
+
+    /// Change set [`CraqleNode::patch_data_with`] would commit for `request`,
+    /// without applying it.
+    ///
+    /// Structurally validated exactly as the applying variant is, against the
+    /// state visible now, which a concurrent write to the graph can still
+    /// invalidate. Mutates nothing.
+    pub fn plan_patch_data(
+        &self,
+        auth: &dyn Authorizer,
+        request: &PatchEntityRequest,
+    ) -> Result<Vec<MaterializedQuadChange>> {
+        let graph = &request.entity.graph;
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let changes = self.manager().plan_patch_data(
+            graph,
+            &request.entity.entity_id,
+            &request.entity.entity_type,
+            &request.entity.name,
+            &request.entity.additional_triples,
+            &request.replaced_predicates,
+        )?;
+        self.replication.check_planned_changes(graph, &changes)?;
+        Ok(changes)
+    }
+
+    /// Change set [`CraqleNode::patch_contextual_with`] would commit for
+    /// `request`, without applying it. See [`CraqleNode::plan_patch_data`].
+    pub fn plan_patch_contextual(
+        &self,
+        auth: &dyn Authorizer,
+        request: &PatchEntityRequest,
+    ) -> Result<Vec<MaterializedQuadChange>> {
+        let graph = &request.entity.graph;
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let changes = self.manager().plan_patch_contextual(
+            graph,
+            &request.entity.entity_id,
+            &request.entity.entity_type,
+            &request.entity.name,
+            &request.entity.additional_triples,
+            &request.replaced_predicates,
+        )?;
+        self.replication.check_planned_changes(graph, &changes)?;
+        Ok(changes)
+    }
+
     /// Preview the canonical RDF changes implied by a JSON-LD document.
     pub fn preview_rocrate_update(
         &self,
@@ -3386,10 +3455,75 @@ impl CraqleNode {
         Ok(self.store.graph_fingerprint(graph)?)
     }
 
-    /// Read-only dump of one graph's quad and dot state, for diagnostics and
-    /// test assertions. Not a sync mechanism.
+    /// Read-only dump of one graph's quad and dot state.
+    ///
+    /// Quads and each quad's dots are sorted by value, so two replicas holding
+    /// the same state produce equal snapshots regardless of local term ids or
+    /// arrival order. That makes this both a diagnostic and the state an
+    /// application replicates with [`CraqleNode::install_graph_snapshot`].
+    ///
+    /// A graph this node does not hold reports an empty clock and no quads.
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
         Ok(self.store.graph_snapshot(graph)?)
+    }
+
+    /// Merge a batch authored on another replica that reached this node
+    /// through the application's own transport instead of irokle.
+    ///
+    /// Applies the batch's ops in order under the graph's write lock with the
+    /// OR-Set semantics of replicated records: adds carry the batch dot,
+    /// removes drop exactly the dots they witnessed, and the graph is created
+    /// when it is missing. Nothing is published back to irokle.
+    ///
+    /// Idempotent by the batch dot: merging a batch whose `(actor, counter)`
+    /// this graph's clock already contains reports `applied: false`, as does
+    /// merging into a graph this node has tombstoned.
+    ///
+    /// Fails when an op carries a term the store cannot hold: an RDF-star
+    /// term, a term over four megabytes, or one that is not an encoded IRI,
+    /// literal or blank node.
+    pub fn merge_batch(&self, batch: &Batch) -> Result<MergeResult> {
+        // Orders this merge against every other write to the same graph; see
+        // `replication::GRAPH_WRITE_LOCKS`.
+        let _write_guard = replication::graph_write_guard(&batch.graph);
+        let merged = self.replication.merge_batch(batch)?;
+        if merged.applied {
+            self.schedule_search_update_for_graph(&batch.graph)?;
+        }
+        self.persist_fjall()?;
+        Ok(merged)
+    }
+
+    /// Install a snapshot taken on another replica, seeding or repairing a
+    /// local copy of that graph.
+    ///
+    /// The result is the state-based OR-Set join of the two states: a snapshot
+    /// dot joins a quad's local dot set only when this graph's clock does not
+    /// already cover it, the graph clock then becomes the element-wise maximum
+    /// of the two clocks, and a graph this node does not hold is created.
+    ///
+    /// A dot the local clock covers but the local quad no longer carries is a
+    /// removal this node has already seen, so it stays removed: installing a
+    /// lagging replica's snapshot never resurrects a quad, and a device may be
+    /// seeded from several holders in any order.
+    ///
+    /// Later [`CraqleNode::merge_batch`] calls compose with the join, so a
+    /// remove that witnessed the snapshot's dots still removes them.
+    ///
+    /// Installing the same snapshot twice reports `applied: false`, as does
+    /// installing a snapshot this node's clock already covers or installing
+    /// into a graph this node has tombstoned.
+    ///
+    /// Fails when a quad carries a term the store cannot hold, as for
+    /// [`CraqleNode::merge_batch`].
+    pub fn install_graph_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<MergeResult> {
+        let _write_guard = replication::graph_write_guard(&snapshot.graph);
+        let merged = self.replication.install_snapshot(snapshot)?;
+        if merged.applied {
+            self.schedule_search_update_for_graph(&snapshot.graph)?;
+        }
+        self.persist_fjall()?;
+        Ok(merged)
     }
 
     /// Build the per-graph state `describe_in_ctx` needs.
