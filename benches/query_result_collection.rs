@@ -26,6 +26,8 @@ fn record_allocation(bytes: usize) {
     PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
 }
 
+// `try_update` needs Rust 1.95; the deprecated name stays until the MSRV moves.
+#[allow(deprecated)]
 fn record_deallocation(bytes: usize) {
     let _ = LIVE_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         Some(live.saturating_sub(bytes))

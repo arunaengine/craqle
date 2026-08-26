@@ -6618,13 +6618,25 @@ impl GraphStore {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
+            let mut dots = decode_dots(value.as_ref())?;
+            // Term ids and dot arrival order are node-local, so both are sorted
+            // by value: two replicas holding the same state must produce equal
+            // snapshots.
+            dots.sort_unstable_by_key(|dot| (dot.actor, dot.counter));
             quads.push(SnapshotQuadState {
                 subject: self.decode_term_arc(quad.subject)?.as_ref().clone(),
                 predicate: self.decode_term_arc(quad.predicate)?.as_ref().clone(),
                 object: self.decode_term_arc(quad.object)?.as_ref().clone(),
-                dots: decode_dots(value.as_ref())?,
+                dots,
             });
         }
+        quads.sort_unstable_by(|left, right| {
+            (&left.subject, &left.predicate, &left.object).cmp(&(
+                &right.subject,
+                &right.predicate,
+                &right.object,
+            ))
+        });
 
         Ok(GraphReplicaSnapshot {
             graph: graph.clone(),

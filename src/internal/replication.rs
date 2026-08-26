@@ -79,8 +79,12 @@ impl MergeError {
     }
 }
 
+/// Outcome of merging replicated state into local state.
 #[derive(Debug)]
-pub(crate) struct MergeResult {
+pub struct MergeResult {
+    /// `true` when the merge changed local state. `false` when there was
+    /// nothing left to do: the batch was already applied, the snapshot added
+    /// no dot and no clock entry, or the graph is tombstoned.
     pub applied: bool,
 }
 
@@ -594,6 +598,19 @@ impl ReplicationEngine {
             ops: vec![],
             timestamp: Utc::now(),
         })
+    }
+
+    /// Run the checks a local apply of `changes` would run, without writing.
+    ///
+    /// The verdict describes the state visible now; a concurrent write to
+    /// `graph` can still invalidate the planned change set.
+    pub(crate) fn check_planned_changes(
+        &self,
+        graph: &GraphId,
+        changes: &[MaterializedQuadChange],
+    ) -> Result<(), UpdateError> {
+        self.ensure_change_set_targets(graph, changes)?;
+        self.validate(graph, changes)
     }
 
     fn validate(
@@ -1778,6 +1795,17 @@ impl ReplicationEngine {
         self.apply_irokle_batch_with_plan(&incoming, None, DiagnosticsMode::Immediate)
     }
 
+    /// Merge a batch that reached this node outside irokle.
+    /// **Call with the graph's write lock held.**
+    ///
+    /// The ops are term-checked first, exactly as a replicated record is, so a
+    /// foreign transport cannot hand the store content it could only fail on.
+    pub(crate) fn merge_batch(&self, incoming: &Batch) -> Result<MergeResult, MergeError> {
+        crate::sync::check_ops(&incoming.ops)
+            .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        self.apply_irokle_batch_with_plan(incoming, None, DiagnosticsMode::Immediate)
+    }
+
     /// **Call with the graph's write lock held.** Every caller does, and so
     /// does every writer of a graph tombstone, which is what makes the check
     /// below atomic against a concurrent delete.
@@ -1915,6 +1943,127 @@ impl ReplicationEngine {
                 )
             })
             .transpose()
+    }
+
+    /// Join a snapshot taken on another replica into local state.
+    /// **Call with the graph's write lock held.**
+    ///
+    /// State-based OR-Set join: a snapshot dot joins a quad's local dot set
+    /// only when the local graph clock does not already cover it, because a
+    /// covered dot the local quad lacks is a removal this node has already
+    /// seen. The graph clock then becomes the element-wise maximum.
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %snapshot.graph.as_str(), quad_count = snapshot.quads.len()))]
+    pub(crate) fn install_snapshot(
+        &self,
+        snapshot: &GraphReplicaSnapshot,
+    ) -> Result<MergeResult, MergeError> {
+        let graph = &snapshot.graph;
+        crate::sync::check_snapshot(snapshot)
+            .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        if self.store.graph_tombstoned(graph)? {
+            return Ok(MergeResult { applied: false });
+        }
+        // Self-guarding, so it must run before the commit guard is taken.
+        if !self.store.contains_graph(graph)? {
+            self.store.create_graph(graph)?;
+        }
+
+        #[cfg(feature = "shacl-core")]
+        let pending_graphs;
+        let applied = {
+            let _commit_guard = self.store.graph_commit_guard(graph);
+            #[cfg(feature = "shacl-core")]
+            {
+                pending_graphs = self.store.affected_shacl_graphs(graph)?;
+            }
+            self.join_snapshot(snapshot)?
+        };
+
+        #[cfg(feature = "shacl-core")]
+        if applied {
+            let settled = self.settle_current_post_commit(graph);
+            self.settle_shacl_graphs(&pending_graphs, (!settled).then_some(graph));
+        }
+        Ok(MergeResult { applied })
+    }
+
+    /// Write the OR-Set join of local state and `snapshot`, reporting whether
+    /// anything changed. **Call with the graph commit guard held.**
+    fn join_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<bool, MergeError> {
+        let graph = &snapshot.graph;
+        // The causal context of this node's state, read before the join: it
+        // decides which snapshot dots are new and which are already-seen
+        // removals.
+        let seen = self.store.get_vector_clock(graph)?;
+        let mut changed = false;
+        for (actor, counter) in &snapshot.clock.0 {
+            changed |= seen.0.get(actor).is_none_or(|local| local < counter);
+        }
+        let mut clock = seen.clone();
+        clock.merge(&snapshot.clock);
+
+        let mut batch = self.store.new_batch();
+        let mut affected_subjects = HashSet::new();
+        let mut term_cache = HashMap::new();
+        let mut cx = BatchTermCtx {
+            batch: &mut batch,
+            cache: &mut term_cache,
+        };
+        self.store.seed_term_cache(
+            &mut cx,
+            snapshot
+                .quads
+                .iter()
+                .flat_map(|quad| [&quad.subject, &quad.predicate, &quad.object]),
+        )?;
+        let graph_id = self
+            .store
+            .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
+
+        for state in &snapshot.quads {
+            let quad = self.resolve_quad(
+                &mut cx,
+                QuadTerms {
+                    graph_id,
+                    subject: &state.subject,
+                    predicate: &state.predicate,
+                    object: &state.object,
+                },
+            )?;
+            for dot in state.dots.iter().filter(|dot| !seen.contains(dot)) {
+                changed |= self
+                    .store
+                    .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+            }
+            affected_subjects.insert(quad.subject);
+        }
+
+        // Nothing to commit: the staged term interning is content-addressed, so
+        // discarding the batch loses no state.
+        if !changed {
+            return Ok(false);
+        }
+
+        self.store.set_vector_clock(
+            &mut batch,
+            ClockUpdate {
+                graph_id,
+                clock: &clock,
+            },
+        )?;
+        self.store.enqueue_fts_subjects(
+            &mut batch,
+            FtsEnqueue {
+                graph_id,
+                subjects: &affected_subjects,
+            },
+        )?;
+        #[cfg(feature = "shacl-core")]
+        self.store
+            .stage_pending_bindings(&mut batch, graph, clock_digest(&clock)?)?;
+        self.store.commit(batch)?;
+        self.recompute_graph_diagnostics(graph)?;
+        Ok(true)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]

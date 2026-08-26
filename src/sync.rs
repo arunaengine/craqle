@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
-    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
+    ActorId, Batch, ContextTag, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
     QuadOp, RoCrateRenderHints, TaggedGraphPolicy, TaggedRoCrateRenderHints, VectorClock,
 };
 use crate::store::GraphStore;
@@ -922,54 +922,15 @@ where
     I: IntoIterator<Item = MaterializedQuadChange>,
 {
     let EventBatchCtx { graph, meta } = cx;
-    let actor = actor_from_irokle(meta.actor_id);
-    let counter = meta.actor_seq;
-    let base_clock = clock_from_irokle(&meta.observed_clock);
-    let dot = Dot { actor, counter };
-
-    let changes = changes.into_iter();
-    let mut ops = Vec::with_capacity(changes.size_hint().0);
-    for change in changes {
-        match change {
-            MaterializedQuadChange::Insert {
-                graph: change_graph,
-                subject,
-                predicate,
-                object,
-            } => {
-                ensure_change_graph(graph, &change_graph)?;
-                ops.push(QuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    dot,
-                });
-            }
-            MaterializedQuadChange::Delete {
-                graph: change_graph,
-                subject,
-                predicate,
-                object,
-            } => {
-                ensure_change_graph(graph, &change_graph)?;
-                ops.push(QuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    witnessed: base_clock.clone(),
-                });
-            }
-        }
-    }
-
-    Ok(Batch {
-        graph: graph.clone(),
-        actor,
-        counter,
-        base_clock,
-        ops,
-        timestamp: Utc::now(),
-    })
+    Batch::from_changes(
+        graph.clone(),
+        actor_from_irokle(meta.actor_id),
+        meta.actor_seq,
+        clock_from_irokle(&meta.observed_clock),
+        changes,
+        Utc::now(),
+    )
+    .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))
 }
 
 /// Largest term craqle accepts from a topic. Well past any real IRI or literal,
@@ -1023,6 +984,41 @@ fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
             } => [subject, predicate, object],
         };
         for term in terms {
+            check_term(term)?;
+        }
+    }
+    Ok(())
+}
+
+/// Same guard for a batch that reached craqle outside irokle: no op may carry
+/// content the store could only fail on.
+pub(crate) fn check_ops(ops: &[QuadOp]) -> SyncResult<()> {
+    for op in ops {
+        let terms = match op {
+            QuadOp::Add {
+                subject,
+                predicate,
+                object,
+                ..
+            }
+            | QuadOp::Remove {
+                subject,
+                predicate,
+                object,
+                ..
+            } => [subject, predicate, object],
+        };
+        for term in terms {
+            check_term(term)?;
+        }
+    }
+    Ok(())
+}
+
+/// Same guard for a replica snapshot handed to craqle by an application.
+pub(crate) fn check_snapshot(snapshot: &crate::GraphReplicaSnapshot) -> SyncResult<()> {
+    for quad in &snapshot.quads {
+        for term in [&quad.subject, &quad.predicate, &quad.object] {
             check_term(term)?;
         }
     }
@@ -1106,18 +1102,6 @@ pub(crate) fn batch_from_owned(
         batch: batch_from_changes(cx, changes)?,
         render_hints,
     }))
-}
-
-fn ensure_change_graph(expected: &GraphId, actual: &GraphId) -> SyncResult<()> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(CraqleSyncError::InvalidEvent(format!(
-            "event graph `{}` contained change for `{}`",
-            expected.as_str(),
-            actual.as_str()
-        )))
-    }
 }
 
 fn actor_from_irokle(actor: irokle::ActorId) -> ActorId {

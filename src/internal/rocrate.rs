@@ -695,6 +695,28 @@ impl RoCrateManager {
         additional_triples: Vec<(NamedNode, oxrdf::Term)>,
         replaced_predicates: &[NamedNode],
     ) -> Result<Batch, RoCrateError> {
+        let changes = self.plan_patch_data(
+            graph_id,
+            entity_id,
+            entity_type,
+            name,
+            &additional_triples,
+            replaced_predicates,
+        )?;
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
+    /// Change set [`Self::patch_data_entity`] would commit against the state
+    /// visible now. Mutates nothing.
+    pub(crate) fn plan_patch_data(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: &[(NamedNode, oxrdf::Term)],
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let entity_id = normalize_entity_id(entity_id);
         let cx = self.crate_ctx(graph_id)?;
         self.require_rocrate_initialized(&cx)?;
@@ -710,7 +732,7 @@ impl RoCrateManager {
                     entity_id: &entity_id,
                     entity_type,
                     name,
-                    additional_triples: &additional_triples,
+                    additional_triples,
                 })?,
                 replaced_predicates,
             },
@@ -729,7 +751,7 @@ impl RoCrateManager {
                 encoded_subject(&entity_id),
             ));
         }
-        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+        Ok(changes)
     }
 
     pub(crate) fn append_new_root_data_entities(
@@ -833,10 +855,32 @@ impl RoCrateManager {
         additional_triples: Vec<(NamedNode, oxrdf::Term)>,
         replaced_predicates: &[NamedNode],
     ) -> Result<Batch, RoCrateError> {
+        let changes = self.plan_patch_contextual(
+            graph_id,
+            entity_id,
+            entity_type,
+            name,
+            &additional_triples,
+            replaced_predicates,
+        )?;
+        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+    }
+
+    /// Change set [`Self::patch_contextual_entity`] would commit against the
+    /// state visible now. Mutates nothing.
+    pub(crate) fn plan_patch_contextual(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+        entity_type: &str,
+        name: &str,
+        additional_triples: &[(NamedNode, oxrdf::Term)],
+        replaced_predicates: &[NamedNode],
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
         let cx = self.crate_ctx(graph_id)?;
         self.require_rocrate_initialized(&cx)?;
         let entity_id = normalize_entity_id(entity_id);
-        let changes = self.patch_subject_changes(
+        self.patch_subject_changes(
             &cx,
             SubjectPatch {
                 subject_id: &entity_id,
@@ -844,12 +888,11 @@ impl RoCrateManager {
                     entity_id: &entity_id,
                     entity_type,
                     name,
-                    additional_triples: &additional_triples,
+                    additional_triples,
                 })?,
                 replaced_predicates,
             },
-        )?;
-        Ok(self.engine.local_apply_changes(graph_id, changes)?)
+        )
     }
 
     /// Export a graph to RO-Crate JSON-LD.
@@ -3483,7 +3526,9 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, RoCrateError> {
     }
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = decode_hex_digit(pair[0])?;
             let low = decode_hex_digit(pair[1])?;
