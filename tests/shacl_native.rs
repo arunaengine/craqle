@@ -14,9 +14,9 @@ use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 use shacl::ir::IRSchema;
 use shacl::rdf::ShaclParser;
 use shacl::types::Severity;
-use shacl::validator::ShaclValidationMode;
 use shacl::validator::processor::{GraphValidation, ShaclProcessor};
 use shacl::validator::store::Graph;
+use shacl::validator::{ShaclConfig, ShaclValidationMode};
 
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 const RDF_FIRST: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#first>";
@@ -111,7 +111,11 @@ fn rudof_validate(shape_text: &str, data_text: &str) -> shacl::validator::report
             .unwrap();
     let mut validator: GraphValidation = Graph::from(data_graph).into();
     validator
-        .validate(&schema, &ShaclValidationMode::Native)
+        .validate(
+            &schema,
+            &ShaclValidationMode::Native,
+            &ShaclConfig::default(),
+        )
         .unwrap()
 }
 

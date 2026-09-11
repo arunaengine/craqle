@@ -18,10 +18,10 @@ use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 use shacl::ir::IRSchema;
 use shacl::rdf::ShaclParser;
-use shacl::validator::ShaclValidationMode;
 use shacl::validator::processor::{GraphValidation, ShaclProcessor};
 use shacl::validator::report::ValidationReport;
 use shacl::validator::store::Graph;
+use shacl::validator::{ShaclConfig, ShaclValidationMode};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -194,7 +194,11 @@ fn compile_shapes(shapes: &str) -> IRSchema {
 fn validate_native(data: OxigraphInMemory, schema: &IRSchema) -> ValidationReport {
     let mut validator: GraphValidation = Graph::from(data).into();
     validator
-        .validate(schema, &ShaclValidationMode::Native)
+        .validate(
+            schema,
+            &ShaclValidationMode::Native,
+            &ShaclConfig::default(),
+        )
         .expect("run Rudof Native SHACL validation")
 }
 

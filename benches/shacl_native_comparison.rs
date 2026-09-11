@@ -19,10 +19,10 @@ use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 use shacl::ir::IRSchema;
 use shacl::rdf::ShaclParser;
-use shacl::validator::ShaclValidationMode;
 use shacl::validator::processor::{GraphValidation, ShaclProcessor};
 use shacl::validator::report::ValidationReport;
 use shacl::validator::store::Graph;
+use shacl::validator::{ShaclConfig, ShaclValidationMode};
 use support::fixture::Fixture;
 
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -330,7 +330,11 @@ fn compile_rudof_shapes() -> IRSchema {
 fn validate_rudof(data: OxigraphInMemory, schema: &IRSchema) -> ValidationReport {
     let mut validator: GraphValidation = Graph::from(data).into();
     validator
-        .validate(schema, &ShaclValidationMode::Native)
+        .validate(
+            schema,
+            &ShaclValidationMode::Native,
+            &ShaclConfig::default(),
+        )
         .expect("run paired Rudof validation")
 }
 

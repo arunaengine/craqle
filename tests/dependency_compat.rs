@@ -7,9 +7,9 @@ use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 use shacl::ir::IRSchema;
 use shacl::rdf::ShaclParser;
-use shacl::validator::ShaclValidationMode;
 use shacl::validator::processor::{GraphValidation, ShaclProcessor};
 use shacl::validator::store::Graph;
+use shacl::validator::{ShaclConfig, ShaclValidationMode};
 
 #[test]
 fn rocrate_rdf_star_term_is_rejected() {
@@ -60,7 +60,11 @@ fn rudof_native_validation_runs_without_sparql() {
             .expect("parse fixed test data");
     let mut validator: GraphValidation = Graph::from(data_graph).into();
     let report = validator
-        .validate(&schema, &ShaclValidationMode::Native)
+        .validate(
+            &schema,
+            &ShaclValidationMode::Native,
+            &ShaclConfig::default(),
+        )
         .expect("run Rudof Native validation without the sparql feature");
 
     assert!(!report.conforms());

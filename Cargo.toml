@@ -86,9 +86,9 @@ oxsdatatypes = { workspace = true, optional = true }
 postcard = { workspace = true }
 rocraters = { workspace = true }
 regex = { workspace = true, optional = true }
-shacl = { version = "=0.3.10", default-features = false, optional = true }
-rudof_rdf = { version = "=0.3.10", default-features = false, optional = true }
-rudof_iri = { version = "=0.3.10", default-features = false, optional = true }
+shacl = { version = "=0.3.19", default-features = false, optional = true }
+rudof_rdf = { version = "=0.3.19", default-features = false, optional = true }
+rudof_iri = { version = "=0.3.19", default-features = false, optional = true }
 serde_json = { workspace = true }
 spargebra = { workspace = true }
 spareval = { workspace = true }
