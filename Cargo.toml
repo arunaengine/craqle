@@ -11,7 +11,7 @@ spargebra = { version = "0.4.6", features = ["sparql-12"] }
 spareval = { version = "0.2.6", features = ["sep-0006", "sparql-12"] }
 
 # Storage
-fjall = "3.1.8"
+fjall = "3.1.10"
 postcard = { version = "1.1.3", features = ["alloc"] }
 
 # Search
@@ -76,7 +76,7 @@ shacl-core = [
 blake3 = { workspace = true }
 chrono = { workspace = true }
 fjall = { workspace = true }
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "59e787058667bb6b400ab01fbd9a1698b88256f5", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "278e3650f01f78bb35e6e2ed6b9b7fcda01da715", features = [
     "fjall",
 ] }
 oxrdf = { workspace = true }
@@ -105,7 +105,7 @@ anyhow = { workspace = true }
 criterion = "0.8.2"
 proptest = { workspace = true }
 tempfile = { workspace = true }
-iroh = "1.0.3"
+iroh = "1.2.0"
 oxigraph = { version = "=0.5.9", default-features = false, features = ["rdf-12"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
