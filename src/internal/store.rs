@@ -7950,6 +7950,171 @@ mod tests {
         store.commit(batch).unwrap();
     }
 
+    /// Builds one add exactly as a writer does, but hands back the parts so a
+    /// test can commit source rows without their query-view maintenance.
+    fn source_only_batch(
+        store: &GraphStore,
+        quad: EncodedQuad,
+    ) -> (fjall::OwnedWriteBatch, PendingPublish, PendingFts) {
+        let actor = ActorId::random();
+        let dot = Dot { actor, counter: 1 };
+        let mut batch = store.new_batch();
+        store
+            .insert_quad(&mut batch, QuadAdd { quad, dot })
+            .unwrap();
+        let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
+        clock.advance(actor, 1);
+        store
+            .set_vector_clock(
+                &mut batch,
+                ClockUpdate {
+                    graph_id: quad.graph,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        let WriteBatch {
+            inner,
+            pending_quad_states: _,
+            pending_terms: _,
+            publish,
+            pending_fts,
+        } = batch;
+        (inner, publish, pending_fts)
+    }
+
+    /// A read view captured while a contending commit published source rows
+    /// without query-view maintenance must never be admitted, and it must keep
+    /// that answer after the maintenance lands. Admission is a property of the
+    /// captured snapshot, not of a current process flag.
+    #[test]
+    fn uncovered_snapshot_is_never_admitted() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-coverage-gap");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o"));
+        commit_add(&store, &graph, first);
+        assert_query_index_ready(&store, 1);
+
+        // Hold maintenance so the next commit takes the contender path.
+        let held = store.qv_gate.try_acquire().expect("gate starts free");
+        let second = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
+        let (mut inner, publish, pending_fts) = source_only_batch(&store, second);
+        let debt = store.stage_projection_debt(&mut inner);
+        store
+            .commit_durable(DurableCommit {
+                batch: inner,
+                pending_fts,
+            })
+            .unwrap();
+        store.indexes_write().publish(&publish);
+
+        // The gap: source holds two rows, the query view holds one.
+        let captured = store.read_snapshot();
+        let admission = store.snapshot_admission(&captured.snapshot).unwrap();
+        assert!(!admission.trusted);
+        assert_eq!(
+            admission.fallback_reason,
+            Some("source-commit-projection-pending")
+        );
+
+        held.finish();
+        store.repair_projection_debt(&publish, debt).unwrap();
+
+        let admission = store.snapshot_admission(&captured.snapshot).unwrap();
+        assert!(
+            !admission.trusted,
+            "an old view must keep its own answer after the repair"
+        );
+        assert_query_index_ready(&store, 2);
+    }
+
+    /// A source-only commit that survives to disk without its maintenance must
+    /// not be admitted after reopen. The pending delta is gone, so the store
+    /// records a durable failure that a rebuild clears.
+    #[test]
+    fn unrepaired_debt_survives_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv-persisted-gap");
+        {
+            let store = GraphStore::open(directory.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let first = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o"));
+            commit_add(&store, &graph, first);
+            let _held = store.qv_gate.try_acquire().expect("gate starts free");
+
+            let second = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
+            let (mut inner, publish, pending_fts) = source_only_batch(&store, second);
+            store.stage_projection_debt(&mut inner);
+            store
+                .commit_durable(DurableCommit {
+                    batch: inner,
+                    pending_fts,
+                })
+                .unwrap();
+            store.indexes_write().publish(&publish);
+            store.persist().unwrap();
+            // Stop here: the maintenance for this commit never runs.
+        }
+
+        let reopened = GraphStore::open(directory.path()).unwrap();
+        let captured = reopened.read_snapshot();
+        let admission = reopened.snapshot_admission(&captured.snapshot).unwrap();
+        assert!(
+            !admission.trusted,
+            "an uncovered query view must not be admitted after reopen"
+        );
+        assert_eq!(
+            reopened.query_index_status().unwrap().state,
+            QueryIndexState::Failed("projection-debt-unrepaired".to_owned())
+        );
+        reopened.rebuild_query_indexes().unwrap();
+        assert_query_index_ready(&reopened, 2);
+    }
+
+    /// A finished rebuild leaves no owner behind, so later writes still proceed.
+    #[test]
+    fn rebuild_leaves_no_owner() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-rebuild-owner");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        store.rebuild_query_indexes().unwrap();
+        assert_eq!(store.qv_gate.owner_count(), 0);
+        let second = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
+        commit_add(&store, &graph, second);
+        assert_query_index_ready(&store, 2);
+    }
+
+    /// A failed commit releases maintenance ownership, so a healthy write that
+    /// follows it can own the gate instead of waiting for an absent owner.
+    #[test]
+    fn failed_commit_releases_ownership() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-failed-commit");
+        store.create_graph(&graph).unwrap();
+        let rejected = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o"));
+        let mut batch = store.new_batch();
+        let actor = ActorId::random();
+        store
+            .insert_quad(
+                &mut batch,
+                QuadAdd {
+                    quad: rejected,
+                    dot: Dot { actor, counter: 1 },
+                },
+            )
+            .unwrap();
+        store.arm_commit_failure();
+        assert!(store.commit(batch).is_err());
+        assert_eq!(store.qv_gate.owner_count(), 0);
+
+        let accepted = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
+        commit_add(&store, &graph, accepted);
+        assert_query_index_ready(&store, 1);
+    }
+
     #[test]
     fn planner_distinct_counts() {
         let (_dir, store) = setup_store();
