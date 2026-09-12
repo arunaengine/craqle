@@ -8111,6 +8111,95 @@ mod tests {
         assert_query_index_ready(&store, 1);
     }
 
+    /// Warming unrelated cache entries must not make a write pay for them.
+    /// Publication bumps one generation per changed graph, so the caches are
+    /// never scanned per changed quad and their recency order is never rebuilt.
+    #[test]
+    fn writes_never_scan_warm_caches() {
+        let (_dir, store) = setup_store();
+        let warm = GraphId::new("urn:test:cache-warm");
+        let changed = GraphId::new("urn:test:cache-changed");
+        store.create_graph(&warm).unwrap();
+        store.create_graph(&changed).unwrap();
+
+        let mut warmed_quads = Vec::new();
+        for index in 0..256 {
+            let quad = encode_quad(&store, &warm, (&format!("urn:s:{index}"), "urn:p", "urn:o"));
+            commit_add(&store, &warm, quad);
+            warmed_quads.push(quad);
+        }
+        for quad in &warmed_quads {
+            store.triples_for_subject(quad.graph, quad.subject).unwrap();
+            store
+                .ordered_objects_for_subject_predicate(quad.graph, quad.subject, quad.predicate)
+                .unwrap();
+        }
+        let warmed = store.cache_statistics();
+        assert!(warmed[0].entries > 0, "subject cache must be warm");
+        assert!(warmed[1].entries > 0, "object-order cache must be warm");
+
+        let before = store.cache_statistics();
+        for index in 0..64 {
+            let quad = encode_quad(
+                &store,
+                &changed,
+                (&format!("urn:c:{index}"), "urn:p", "urn:o"),
+            );
+            commit_add(&store, &changed, quad);
+        }
+        let after = store.cache_statistics();
+
+        assert_eq!(
+            after[0].inspections, before[0].inspections,
+            "publication inspected warmed subject-cache keys"
+        );
+        assert_eq!(
+            after[0].compactions, before[0].compactions,
+            "publication rebuilt the subject-cache recency order"
+        );
+        assert_eq!(
+            after[1].inspections, before[1].inspections,
+            "publication inspected warmed object-order keys"
+        );
+        assert_eq!(
+            after[1].compactions, before[1].compactions,
+            "publication rebuilt the object-order recency order"
+        );
+
+        let first_warm = warmed_quads[0];
+        assert_eq!(
+            1,
+            store
+                .triples_for_subject(first_warm.graph, first_warm.subject)
+                .unwrap()
+                .len()
+        );
+        let first_changed = encode_quad(&store, &changed, ("urn:c:0", "urn:p", "urn:o"));
+        assert_eq!(
+            1,
+            store
+                .triples_for_subject(first_changed.graph, first_changed.subject)
+                .unwrap()
+                .len()
+        );
+    }
+
+    /// A removal that matches nothing must not rebuild the recency order.
+    #[test]
+    fn empty_removal_skips_compaction() {
+        let mut cache: BoundedCache<u64, u64> = BoundedCache::new(64, 4_096);
+        for key in 0..16u64 {
+            cache.insert(key, key, 8);
+        }
+        let before = cache.statistics().compactions;
+        cache.remove_where(|key| *key > 1_000);
+        assert_eq!(cache.statistics().compactions, before);
+        assert_eq!(cache.statistics().entries, 16);
+        cache.remove_where(|key| *key == 0);
+        assert_eq!(cache.statistics().compactions, before + 1);
+        assert_eq!(cache.statistics().entries, 15);
+    }
+
     #[test]
     fn planner_distinct_counts() {
         let (_dir, store) = setup_store();
