@@ -1,5 +1,6 @@
 //! Snapshot-join and external-batch causality contracts.
 
+use chrono::Utc;
 use craqle::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,6 +29,49 @@ fn dot(entry: (u8, u64)) -> Dot {
         actor: actor(entry.0),
         counter: entry.1,
     }
+}
+
+fn change(graph: &GraphId, object: &str, insert: bool) -> MaterializedQuadChange {
+    let subject = EncodedTerm(SUBJECT.to_owned());
+    let predicate = EncodedTerm(PREDICATE.to_owned());
+    let object = EncodedTerm(format!("\"{object}\""));
+    if insert {
+        MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject,
+            predicate,
+            object,
+        }
+    } else {
+        MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject,
+            predicate,
+            object,
+        }
+    }
+}
+
+/// One external batch: its graph, its event identity, its causal base and the
+/// single change it carries.
+struct Event<'a> {
+    graph: &'a GraphId,
+    dot: Dot,
+    base: VectorClock,
+    object: &'a str,
+    insert: bool,
+}
+
+fn batch(event: Event<'_>) -> Batch {
+    Batch::from_changes(
+        event.graph.clone(),
+        event.dot.actor,
+        event.dot.counter,
+        event.base,
+        [change(event.graph, event.object, event.insert)],
+        Utc::now(),
+    )
+    .unwrap()
 }
 
 fn quad(object: &str, dots: &[(u8, u64)]) -> SnapshotQuadState {
@@ -425,4 +469,268 @@ fn join_keeps_tombstone() {
     assert!(!node.install_graph_snapshot(&seeded).unwrap().applied);
     assert_eq!(deleted, durable(&node, &graph));
     assert!(objects(&node, &graph).is_empty());
+}
+
+#[test]
+fn batch_gap_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "gap", 19);
+    let graph = GraphId::new("urn:test:merge:batch-gap");
+    let first = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[]),
+        object: "x",
+        insert: true,
+    });
+    let second = batch(Event {
+        graph: &graph,
+        dot: dot((1, 2)),
+        base: clock(&[(1, 1)]),
+        object: "y",
+        insert: true,
+    });
+
+    let before = durable(&node, &graph);
+    let error = node.merge_batch(&second).unwrap_err();
+    assert!(
+        matches!(&error, CraqleError::Merge(MergeError::MissingDependencies(missing))
+            if missing == &vec![dot((1, 1))]),
+        "expected a named missing dependency, got {error}"
+    );
+    assert_eq!(before, durable(&node, &graph));
+
+    assert!(node.merge_batch(&first).unwrap().applied);
+    assert!(node.merge_batch(&second).unwrap().applied);
+    assert_eq!(objects(&node, &graph), vec!["\"x\"", "\"y\""]);
+}
+
+#[test]
+fn remove_waits_add() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "remove", 20);
+    let graph = GraphId::new("urn:test:merge:causal-remove");
+    let add = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[]),
+        object: "x",
+        insert: true,
+    });
+    let remove = batch(Event {
+        graph: &graph,
+        dot: dot((2, 1)),
+        base: clock(&[(1, 1)]),
+        object: "x",
+        insert: false,
+    });
+
+    let before = durable(&node, &graph);
+    assert!(node.merge_batch(&remove).is_err());
+    assert_eq!(before, durable(&node, &graph));
+
+    assert!(node.merge_batch(&add).unwrap().applied);
+    assert!(node.merge_batch(&remove).unwrap().applied);
+    assert!(objects(&node, &graph).is_empty());
+}
+
+#[test]
+fn noncontiguous_counters_apply() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "control", 21);
+    let graph = GraphId::new("urn:test:merge:noncontiguous");
+    let first = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[]),
+        object: "x",
+        insert: true,
+    });
+    // Counter two belongs to a control record that carries no quad change, so
+    // the next quad batch must not be treated as a gap.
+    let third = batch(Event {
+        graph: &graph,
+        dot: dot((1, 3)),
+        base: clock(&[(1, 1)]),
+        object: "y",
+        insert: true,
+    });
+    assert!(node.merge_batch(&first).unwrap().applied);
+    assert!(node.merge_batch(&third).unwrap().applied);
+    assert_eq!(objects(&node, &graph), vec!["\"x\"", "\"y\""]);
+}
+
+#[test]
+fn permanent_gap_explicit() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "permanent", 22);
+    let graph = GraphId::new("urn:test:merge:permanent-gap");
+    let orphan = batch(Event {
+        graph: &graph,
+        dot: dot((1, 4)),
+        base: clock(&[(9, 7)]),
+        object: "orphan",
+        insert: true,
+    });
+    let ready = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[]),
+        object: "ready",
+        insert: true,
+    });
+
+    for _ in 0..3 {
+        let before = durable(&node, &graph);
+        assert!(node.merge_batch(&orphan).is_err());
+        assert_eq!(before, durable(&node, &graph));
+    }
+    assert!(node.merge_batch(&ready).unwrap().applied);
+    assert_eq!(objects(&node, &graph), vec!["\"ready\""]);
+    assert!(node.merge_batch(&orphan).is_err());
+    assert_eq!(objects(&node, &graph), vec!["\"ready\""]);
+}
+
+#[test]
+fn gap_survives_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("reopen");
+    let graph = GraphId::new("urn:test:merge:gap-reopen");
+    let first = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[]),
+        object: "x",
+        insert: true,
+    });
+    let second = batch(Event {
+        graph: &graph,
+        dot: dot((1, 2)),
+        base: clock(&[(1, 1)]),
+        object: "y",
+        insert: true,
+    });
+    {
+        let node = CraqleNode::open_with_actor(&root, actor(23)).unwrap();
+        assert!(node.merge_batch(&second).is_err());
+    }
+
+    let node = CraqleNode::open_with_actor(&root, actor(23)).unwrap();
+    assert!(node.merge_batch(&second).is_err());
+    assert!(objects(&node, &graph).is_empty());
+    assert!(node.merge_batch(&first).unwrap().applied);
+    assert!(node.merge_batch(&second).unwrap().applied);
+    assert_eq!(objects(&node, &graph), vec!["\"x\"", "\"y\""]);
+}
+
+#[test]
+fn reused_id_differs() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "reused", 24);
+    let graph = GraphId::new("urn:test:merge:reused-id");
+    let genuine = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[]),
+        object: "x",
+        insert: true,
+    });
+    // Same event identity, a payload that depends on state this node has never
+    // seen: that is a different event, not a redelivery.
+    let impostor = batch(Event {
+        graph: &graph,
+        dot: dot((1, 1)),
+        base: clock(&[(5, 3)]),
+        object: "y",
+        insert: true,
+    });
+    assert!(node.merge_batch(&genuine).unwrap().applied);
+    assert!(!node.merge_batch(&genuine).unwrap().applied);
+
+    let before = durable(&node, &graph);
+    assert!(node.merge_batch(&impostor).is_err());
+    assert_eq!(before, durable(&node, &graph));
+    assert_eq!(objects(&node, &graph), vec!["\"x\""]);
+}
+
+#[test]
+fn shuffled_history_converges() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "shuffled", 25);
+    let orders: [[usize; 5]; 4] = [
+        [0, 1, 2, 3, 4],
+        [4, 3, 2, 1, 0],
+        [2, 0, 4, 1, 3],
+        [1, 3, 0, 4, 2],
+    ];
+    let mut settled: Option<(VectorClock, Vec<SnapshotQuadState>)> = None;
+    for (round, order) in orders.iter().enumerate() {
+        let graph = GraphId::new(&format!("urn:test:merge:shuffled-{round}"));
+        let history = [
+            batch(Event {
+                graph: &graph,
+                dot: dot((1, 1)),
+                base: clock(&[]),
+                object: "a",
+                insert: true,
+            }),
+            batch(Event {
+                graph: &graph,
+                dot: dot((1, 2)),
+                base: clock(&[(1, 1)]),
+                object: "b",
+                insert: true,
+            }),
+            batch(Event {
+                graph: &graph,
+                dot: dot((2, 1)),
+                base: clock(&[(1, 1)]),
+                object: "a",
+                insert: false,
+            }),
+            batch(Event {
+                graph: &graph,
+                dot: dot((2, 2)),
+                base: clock(&[(1, 2), (2, 1)]),
+                object: "c",
+                insert: true,
+            }),
+            batch(Event {
+                graph: &graph,
+                dot: dot((3, 1)),
+                base: clock(&[]),
+                object: "d",
+                insert: true,
+            }),
+        ];
+
+        // Duplicates are delivered too, and a rejected batch is retried until
+        // no pass makes progress: a bounded number of passes, never a sleep.
+        let mut queue = order.iter().flat_map(|&step| [step, step]).collect::<Vec<_>>();
+        for _ in 0..=queue.len() {
+            if queue.is_empty() {
+                break;
+            }
+            let mut blocked = Vec::new();
+            let mut progressed = false;
+            for step in queue {
+                match node.merge_batch(&history[step]) {
+                    Ok(_) => progressed = true,
+                    Err(_) => blocked.push(step),
+                }
+            }
+            queue = blocked;
+            if !progressed {
+                break;
+            }
+        }
+        assert!(queue.is_empty(), "every batch must become applicable");
+        assert_eq!(objects(&node, &graph), vec!["\"b\"", "\"c\"", "\"d\""]);
+
+        let observed = content(&node.graph_snapshot(&graph).unwrap());
+        match &settled {
+            Some(previous) => assert_eq!(*previous, observed, "order {order:?} diverged"),
+            None => settled = Some(observed),
+        }
+    }
 }
