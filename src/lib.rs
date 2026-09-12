@@ -622,9 +622,8 @@ pub struct DescribeRequest<'a> {
 
 /// Hard cap on a caller-supplied search limit, applied at every entry point.
 ///
-/// Tantivy's top-k collector pre-allocates `limit * 2` and the over-fetch
-/// multiplies the limit again before that, so an unbounded limit is an
-/// allocation the caller picks — `fts:limit 10000000000000` from a remote
+/// Tantivy's top-k collector pre-allocates `limit * 2`, so an unbounded limit
+/// is an allocation the caller picks: `fts:limit 10000000000000` from a remote
 /// query aborted the process. Ten thousand rows is well past any real page
 /// and still a trivially sized collector.
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -632,8 +631,6 @@ pub const MAX_SEARCH_LIMIT: usize = 10_000;
 #[cfg(test)]
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
-/// Smallest Tantivy over-fetch before authorization filtering.
-const SEARCH_MIN_FETCH: usize = 64;
 /// Above this many selected graphs, `search_graphs` runs one filtered search
 /// instead of one full top-k collection per graph.
 const SEARCH_GRAPHS_PER_GRAPH_LIMIT: usize = 8;
@@ -3065,8 +3062,16 @@ impl CraqleNode {
 
     /// Search visible resources in the local search index.
     ///
-    /// Clamps the limit, authorizes hits against stored policy, and drops
-    /// duplicates so each graph-and-subject pair fills at most one page slot.
+    /// Readable-graph membership is resolved before the index retains a page,
+    /// so the result is one top-k collection over exactly the graphs this
+    /// caller may read. Filtering afterwards instead meant asking the index
+    /// for a multiple of the requested page and asking again, four times
+    /// larger, whenever too few hits survived authorization: a one-row page
+    /// over an unreadable corpus walked up to the whole matching corpus, once
+    /// per pass, on a different reader each time (G8).
+    ///
+    /// The page is complete for the policy read at the start of the call. A
+    /// permission granted concurrently is picked up by the next call.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         self.search.ensure_available()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
@@ -3075,31 +3080,23 @@ impl CraqleNode {
         }
 
         let mut readable = ReadableGraphs::new(self, auth);
-        // Bounded by the clamp above: escalation only widens while the index
-        // actually filled the previous fetch, so it tracks the corpus.
-        let mut fetch = limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
-        loop {
-            let raw_hits = self.search.search(req.query, fetch)?;
-            // Fewer hits than asked for means the index has nothing more to
-            // give; widening again cannot produce another readable hit.
-            let index_exhausted = raw_hits.len() < fetch;
-
-            let mut seen = SeenHits::default();
-            let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
-            for hit in raw_hits {
-                if seen.admits(&hit) && readable.allows(&hit.graph_id)? {
-                    hits.push(hit);
-                }
+        let mut selected = Vec::new();
+        for graph in self.store.graphs()? {
+            if readable.allows(graph.as_str())? {
+                selected.push(graph);
             }
-
-            if hits.len() >= limit || index_exhausted {
-                // Score-descending order arrives from the index and both
-                // filters preserve it, so no re-sort is needed here.
-                hits.truncate(limit);
-                return Ok(hits);
-            }
-            fetch = fetch.saturating_mul(4);
         }
+        // No readable graph is a complete empty page, not an exhausted budget.
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hits = self.search.search_in_graphs(search::GraphSetQuery {
+            graphs: &selected,
+            query: req.query,
+            limit,
+        })?;
+        Ok(limit_search_hits(hits, limit))
     }
 
     /// Search visible resources in an explicit set of graph IRIs.
