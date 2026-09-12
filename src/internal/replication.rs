@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 #[cfg(feature = "shacl-core")]
 use std::time::{Duration, Instant};
@@ -48,6 +48,17 @@ pub enum MergeError {
     Store(#[from] crate::store::StoreError),
     #[error("input rejected: {0}")]
     InputRejected(String),
+    /// Events the batch declares as its causal base that this replica has not
+    /// applied. The transport must fetch them and retry.
+    #[error("missing causal dependencies: {}", render_dots(.0))]
+    MissingDependencies(Vec<Dot>),
+}
+
+fn render_dots(dots: &[Dot]) -> String {
+    dots.iter()
+        .map(|dot| format!("{}:{}", dot.actor, dot.counter))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl UpdateError {
@@ -75,6 +86,7 @@ impl MergeError {
         match self {
             Self::Store(error) => error.kind(),
             Self::InputRejected(_) => crate::CraqleErrorKind::InvalidInput,
+            Self::MissingDependencies(_) => crate::CraqleErrorKind::Conflict,
         }
     }
 }
@@ -1798,12 +1810,44 @@ impl ReplicationEngine {
     /// Merge a batch that reached this node outside irokle.
     /// **Call with the graph's write lock held.**
     ///
-    /// The ops are term-checked first, exactly as a replicated record is, so a
-    /// foreign transport cannot hand the store content it could only fail on.
+    /// Unlike the irokle replay path above, an externally supplied batch is not
+    /// assumed to arrive in causal order, so it is checked instead: the whole
+    /// envelope is validated, and the batch is applied only once this replica
+    /// holds every event its `base_clock` declares. A gap returns
+    /// [`MergeError::MissingDependencies`] naming those events and leaves
+    /// source rows, dots and the applied clock untouched, so the transport can
+    /// fetch them and retry. Nothing is buffered here.
     pub(crate) fn merge_batch(&self, incoming: &Batch) -> Result<MergeResult, MergeError> {
-        crate::sync::check_ops(&incoming.ops)
+        crate::sync::check_batch(incoming)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        self.check_causal_base(incoming)?;
         self.apply_irokle_batch_with_plan(incoming, None, DiagnosticsMode::Immediate)
+    }
+
+    /// Refuse an external batch this replica cannot order yet.
+    ///
+    /// The graph clock only ever grows, and the caller holds the graph write
+    /// lock, so a readiness verdict still holds when the apply below reads the
+    /// clock again. A stale gap verdict costs one retry, never a lost event.
+    fn check_causal_base(&self, incoming: &Batch) -> Result<(), MergeError> {
+        let identity = Dot {
+            actor: incoming.actor,
+            counter: incoming.counter,
+        };
+        // Counter zero marks a batch that carries no event of its own.
+        if incoming.counter > 0 && incoming.base_clock.contains(&identity) {
+            return Err(MergeError::InputRejected(format!(
+                "batch event {}:{} declares itself as its own dependency",
+                identity.actor, identity.counter
+            )));
+        }
+        let applied = self.store.get_vector_clock(&incoming.graph)?;
+        let missing = crate::sync::missing_dots(&incoming.base_clock, &applied);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(MergeError::MissingDependencies(missing))
+        }
     }
 
     /// **Call with the graph's write lock held.** Every caller does, and so
@@ -1991,16 +2035,13 @@ impl ReplicationEngine {
     /// anything changed. **Call with the graph commit guard held.**
     fn join_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<bool, MergeError> {
         let graph = &snapshot.graph;
-        // The causal context of this node's state, read before the join: it
-        // decides which snapshot dots are new and which are already-seen
-        // removals.
-        let seen = self.store.get_vector_clock(graph)?;
-        let mut changed = false;
-        for (actor, counter) in &snapshot.clock.0 {
-            changed |= seen.0.get(actor).is_none_or(|local| local < counter);
-        }
-        let mut clock = seen.clone();
+        // Both pre-merge contexts are read before either is joined: a dot the
+        // other side's context covers but its live set omits is a removal that
+        // side has already seen, not an addition this side is missing.
+        let local = self.store.graph_snapshot(graph)?;
+        let mut clock = local.clock.clone();
         clock.merge(&snapshot.clock);
+        let mut changed = clock != local.clock;
 
         let mut batch = self.store.new_batch();
         let mut affected_subjects = HashSet::new();
@@ -2011,29 +2052,65 @@ impl ReplicationEngine {
         };
         self.store.seed_term_cache(
             &mut cx,
-            snapshot
+            local
                 .quads
                 .iter()
+                .chain(&snapshot.quads)
                 .flat_map(|quad| [&quad.subject, &quad.predicate, &quad.object]),
         )?;
         let graph_id = self
             .store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
 
-        for state in &snapshot.quads {
+        for (terms, (here, there)) in join_union(&local, snapshot) {
+            let joined = join_dots(here, there, (&local.clock, &snapshot.clock));
+            let dropped = here
+                .iter()
+                .copied()
+                .filter(|dot| !joined.contains(dot))
+                .collect::<Vec<_>>();
+            let added = joined
+                .iter()
+                .copied()
+                .filter(|dot| !here.contains(dot))
+                .collect::<Vec<_>>();
+            if dropped.is_empty() && added.is_empty() {
+                continue;
+            }
+            changed = true;
             let quad = self.resolve_quad(
                 &mut cx,
                 QuadTerms {
                     graph_id,
-                    subject: &state.subject,
-                    predicate: &state.predicate,
-                    object: &state.object,
+                    subject: terms.0,
+                    predicate: terms.1,
+                    object: terms.2,
                 },
             )?;
-            for dot in state.dots.iter().filter(|dot| !seen.contains(dot)) {
-                changed |= self
-                    .store
+            // Adds first: a quad the join keeps must not look removed in
+            // between, so the derived state sees one liveness transition.
+            for dot in &added {
+                self.store
                     .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+            }
+            if !dropped.is_empty() {
+                let mut witnessed = VectorClock::new();
+                for dot in &dropped {
+                    witnessed.advance(dot.actor, dot.counter);
+                }
+                self.store.remove_quad(
+                    cx.batch,
+                    QuadRemove {
+                        quad,
+                        witnessed: &witnessed,
+                    },
+                )?;
+                // A witnessed clock covers whole counter ranges, so restore any
+                // kept dot it took with it.
+                for dot in joined.iter().filter(|dot| witnessed.contains(dot)) {
+                    self.store
+                        .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+                }
             }
             affected_subjects.insert(quad.subject);
         }
@@ -2428,10 +2505,53 @@ fn map_update_error(error: crate::CraqleError) -> UpdateError {
     }
 }
 
+type TermTriple<'a> = (&'a EncodedTerm, &'a EncodedTerm, &'a EncodedTerm);
+
+/// Local and remote dot sets for every quad identity either side holds. A quad
+/// only one side holds is still considered, because the other side's context
+/// may prove it was removed.
+fn join_union<'a>(
+    local: &'a GraphReplicaSnapshot,
+    remote: &'a GraphReplicaSnapshot,
+) -> BTreeMap<TermTriple<'a>, (&'a [Dot], &'a [Dot])> {
+    let mut rows: BTreeMap<TermTriple<'a>, (&'a [Dot], &'a [Dot])> = BTreeMap::new();
+    for quad in &local.quads {
+        rows.insert(
+            (&quad.subject, &quad.predicate, &quad.object),
+            (&quad.dots, &[]),
+        );
+    }
+    for quad in &remote.quads {
+        rows.entry((&quad.subject, &quad.predicate, &quad.object))
+            .or_insert((&[], &[]))
+            .1 = &quad.dots;
+    }
+    rows
+}
+
+/// Dots the OR-Set join keeps for one quad: the dots both sides hold, plus
+/// each side's dots the other side's pre-merge context does not cover.
+fn join_dots(local: &[Dot], remote: &[Dot], contexts: (&VectorClock, &VectorClock)) -> Vec<Dot> {
+    let (here, there) = contexts;
+    let mut joined = local
+        .iter()
+        .copied()
+        .filter(|dot| remote.contains(dot) || !there.contains(dot))
+        .collect::<Vec<_>>();
+    joined.extend(
+        remote
+            .iter()
+            .copied()
+            .filter(|dot| !local.contains(dot) && !here.contains(dot)),
+    );
+    joined
+}
+
 fn update_error_from_merge(error: MergeError) -> UpdateError {
     match error {
         MergeError::Store(error) => UpdateError::Store(error),
         MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
+        MergeError::MissingDependencies(_) => UpdateError::InvalidChangeSet(error.to_string()),
     }
 }
 
