@@ -3250,6 +3250,11 @@ impl CraqleNode {
     }
 
     /// Block until the background full-text indexer has processed queued work.
+    ///
+    /// Without the `search` feature there is no index and no reader, so this
+    /// reports only that the indexer had nothing it could do. It does not
+    /// claim that any search state is current: the queued updates stay owed
+    /// until a search-enabled build indexes them.
     pub fn flush_search_updates(&self) -> Result<()> {
         self.search_worker.flush()
     }
