@@ -15,13 +15,23 @@ use tantivy::tokenizer::{
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::core::{EncodedTerm, GraphId};
-pub(crate) use crate::search_queue::QueueBound;
-use crate::search_queue::drain_upto;
+pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
+use crate::search_queue::{DirtySubject, DrainProgress, drain_upto};
 use crate::store::{GraphStore, TermId};
 
 const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
 const MEMORY_INDEX_WRITER_HEAP_BYTES: usize = 64_000_000;
 const REINDEX_FLUSH_CHUNK: usize = 2_048;
+/// Prepared subject text one drain pass may hold before it stops and leaves
+/// the rest queued for a continuation.
+///
+/// Checked before each subject rather than after, so one subject larger than
+/// the whole budget is still prepared: the cap is overshot by that one entry
+/// instead of the pass making no progress at all.
+const PREPARED_TEXT_BUDGET: usize = 64_000_000;
+/// Attempts one failing queue entry gets before this process stops retrying
+/// it. The durable entry stays, so the obligation outlives the quarantine.
+const MAX_ITEM_ATTEMPTS: u32 = 8;
 /// Rebuild-lock shards. Comfortably above the indexer's concurrency while
 /// staying a fixed, tiny allocation.
 const REBUILD_SHARDS: usize = 64;
@@ -63,6 +73,36 @@ impl SearchError {
 }
 
 pub(crate) type Result<T> = std::result::Result<T, SearchError>;
+
+/// Identity of one failing queue entry.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FailureKey {
+    graph: String,
+    subject: Option<TermId>,
+}
+
+impl FailureKey {
+    fn graph(graph: &GraphId) -> Self {
+        Self {
+            graph: graph.as_str().to_string(),
+            subject: None,
+        }
+    }
+
+    fn subject(graph: &GraphId, subject: TermId) -> Self {
+        Self {
+            graph: graph.as_str().to_string(),
+            subject: Some(subject),
+        }
+    }
+}
+
+/// One drain pass: what it may read, and what it has covered so far.
+struct DrainPass<'a> {
+    store: &'a GraphStore,
+    bound: QueueBound,
+    progress: DrainProgress,
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -108,6 +148,12 @@ pub struct SearchIndex {
     /// Set when a poisoned writer was rolled back and the index therefore owes
     /// the store a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
+    /// Attempts and last diagnostic per failing queue entry.
+    ///
+    /// In memory only. The durable queue entry is what keeps the coverage
+    /// obligation; this exists so one entry that always fails is not retried
+    /// in a tight loop, and so a flush can name what it could not cover.
+    item_failures: Mutex<HashMap<FailureKey, DrainFailure>>,
     #[cfg(test)]
     hooks: TestHooks,
     needs_rebuild: bool,
@@ -128,6 +174,28 @@ struct TestHooks {
     rebuild: StallHook,
     /// Pauses a commit just before the Tantivy commit it is about to run.
     commit: StallHook,
+    /// Index searches run, so a test can prove one request runs one search.
+    searches: std::sync::atomic::AtomicUsize,
+    /// Stored documents decoded, so a test can bound what a page retains.
+    decoded: std::sync::atomic::AtomicUsize,
+    /// Every queue entry naming this graph fails, modelling a bad item.
+    fail_graph: Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    fn fail_item(&self, graph: &GraphId) -> Result<()> {
+        let armed = self
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if armed.as_deref() == Some(graph.as_str()) {
+            return Err(SearchError::Tantivy(tantivy::TantivyError::SystemError(
+                "injected item failure".to_string(),
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// A one-shot pause. `run` sleeps once armed and publishes `entered` for the
@@ -202,6 +270,16 @@ enum PreparedDocOp {
         doc: DocIdentity,
         all_text: Option<String>,
     },
+}
+
+impl PreparedDocOp {
+    /// Prepared text this op holds, charged against the pass byte budget.
+    fn text_bytes(&self) -> usize {
+        match self {
+            Self::Delete { .. } => 0,
+            Self::Upsert { all_text, .. } => all_text.as_ref().map_or(0, String::len),
+        }
+    }
 }
 
 struct DocIdentity {
@@ -311,6 +389,7 @@ impl SearchIndex {
             commit_lock: Mutex::new(()),
             rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
             rebuild_owed: AtomicBool::new(false),
+            item_failures: Mutex::new(HashMap::new()),
             #[cfg(test)]
             hooks: TestHooks::default(),
             needs_rebuild,
@@ -340,6 +419,7 @@ impl SearchIndex {
             commit_lock: Mutex::new(()),
             rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
             rebuild_owed: AtomicBool::new(false),
+            item_failures: Mutex::new(HashMap::new()),
             #[cfg(test)]
             hooks: TestHooks::default(),
             needs_rebuild: false,
@@ -440,15 +520,23 @@ impl SearchIndex {
     ///
     /// Runs at the top of every drain, so the indexer's one-second tick is the
     /// detection point. The reindex is queued rather than run inline so it stays
-    /// crash-safe and keeps G7's acknowledge-after-commit rule. The returned
-    /// bound is widened once, on this pass only, so a caller's own flush cannot
-    /// return while the rebuild it triggered is still pending.
-    fn settle_poisoned_writer(&self, store: &GraphStore, bound: QueueBound) -> Result<QueueBound> {
+    /// crash-safe and keeps G7's acknowledge-after-commit rule.
+    ///
+    /// The rebuild it queues carries tokens above the caller's bound, so the
+    /// raised target is returned alongside the bound and travels back to the
+    /// owning flush in [`DrainProgress::recovery`]. Widening only this call's
+    /// local bound lost that obligation as soon as a higher-priority queue
+    /// class ended the pass, and the next pass rebuilt the original cutoff.
+    fn settle_poisoned_writer(
+        &self,
+        store: &GraphStore,
+        bound: QueueBound,
+    ) -> Result<(QueueBound, Option<u64>)> {
         if self.writer.is_poisoned() {
             drop(self.writer()?);
         }
         if !self.rebuild_owed.swap(false, Ordering::SeqCst) {
-            return Ok(bound);
+            return Ok((bound, None));
         }
 
         if let Err(error) = self.enqueue_full_rebuild(store) {
@@ -457,10 +545,47 @@ impl SearchIndex {
             return Err(error);
         }
 
-        Ok(QueueBound {
-            chunk: bound.chunk,
-            max_token: bound.max_token.map(|_| store.current_dirty_token()),
-        })
+        let raised = bound.max_token.map(|_| store.current_dirty_token());
+        Ok((
+            QueueBound {
+                max_token: raised.or(bound.max_token),
+                ..bound
+            },
+            raised,
+        ))
+    }
+
+    /// Note that one entry failed, and report it with its attempt count.
+    fn record_failure(&self, key: FailureKey, error: &SearchError) -> DrainFailure {
+        let mut failures = self
+            .item_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = failures.entry(key.clone()).or_insert_with(|| DrainFailure {
+            graph: GraphId::new(&key.graph),
+            attempts: 0,
+            diagnostic: String::new(),
+        });
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.diagnostic = error.to_string();
+        entry.clone()
+    }
+
+    /// A failing entry this process has stopped retrying, with its last state.
+    fn quarantined(&self, key: &FailureKey) -> Option<DrainFailure> {
+        self.item_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .filter(|failure| failure.attempts >= MAX_ITEM_ATTEMPTS)
+            .cloned()
+    }
+
+    fn clear_failure(&self, key: &FailureKey) {
+        self.item_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 
     fn enqueue_full_rebuild(&self, store: &GraphStore) -> Result<()> {
@@ -607,6 +732,11 @@ impl SearchIndex {
     fn collect_top_docs(&self, query: &dyn Query, limit: usize) -> Result<Vec<SearchHit>> {
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
+        #[cfg(test)]
+        {
+            self.hooks.searches.fetch_add(1, Ordering::SeqCst);
+            self.hooks.decoded.fetch_add(top_docs.len(), Ordering::SeqCst);
+        }
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -655,91 +785,235 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Sync queued subject updates from the RDF store into Tantivy.
+    /// Sync queued updates from the RDF store into Tantivy.
     ///
-    /// The three durable queues are drained in priority order: graph deletes,
-    /// whole-graph reindexes, then individual subjects. Each branch commits the
-    /// index *before* acknowledging the queue entries it covered — a crash in
-    /// between only re-does work, whereas acknowledging first would silently
-    /// drop updates Tantivy never committed (G7).
+    /// All three durable queues get a share of the pass, in delete, then
+    /// whole-graph, then per-subject order. Returning as soon as one class had
+    /// work let a steady stream of deletes starve every queued subject, and a
+    /// single failing entry aborted the pass before any commit, so the work
+    /// prepared ahead of it was thrown away and redone on every retry.
+    ///
+    /// Each branch commits the index *before* acknowledging the entries it
+    /// covered: a crash in between only re-does work, whereas acknowledging
+    /// first would silently drop updates Tantivy never committed (G7). An
+    /// entry that fails is left unacknowledged and named in the result, so a
+    /// flush covering it cannot report success.
+    /// Entries this drain committed and acknowledged.
+    ///
+    /// A count only. [`SearchIndex::drain_queues`] carries the rest of the
+    /// outcome: work still owed, entries that failed, and a recovery target a
+    /// repair raised.
     pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
-        let bound = self.settle_poisoned_writer(store, bound)?;
+        Ok(self.drain_queues(store, bound)?.covered)
+    }
 
-        let queued_deletes = drain_upto(&bound, |chunk| store.drain_fts_delete_queue(chunk))?;
-        if !queued_deletes.is_empty() {
-            for entry in &queued_deletes {
-                // Taken before the probe: read outside the shard, the answer can
-                // already be stale by the time its branch runs.
-                let _rebuild = self.lock_graph(entry.graph.as_str());
-                if store.contains_graph(&entry.graph)? {
-                    self.reindex_locked(store, &entry.graph)?;
-                } else {
-                    self.delete_documents_locked(entry.graph.as_str())?;
+    pub fn drain_queues(&self, store: &GraphStore, bound: QueueBound) -> Result<DrainProgress> {
+        let (bound, recovery) = self.settle_poisoned_writer(store, bound)?;
+        // One share per class, so no class can consume the whole pass.
+        let quota = bound.chunk.div_ceil(3).max(1);
+        let mut pass = DrainPass {
+            store,
+            bound: QueueBound { chunk: quota, ..bound },
+            progress: DrainProgress {
+                recovery,
+                ..DrainProgress::default()
+            },
+        };
+
+        self.drain_deleted_graphs(&mut pass)?;
+        self.drain_rebuilt_graphs(&mut pass)?;
+        self.drain_dirty_subjects(&mut pass)?;
+        Ok(pass.progress)
+    }
+
+    /// Settle the graphs whose search documents a removal invalidated.
+    fn drain_deleted_graphs(&self, pass: &mut DrainPass<'_>) -> Result<()> {
+        let slice = drain_upto(&pass.bound, |chunk| {
+            pass.store.drain_fts_delete_queue(chunk)
+        })?;
+        pass.progress.remaining |= slice.remaining;
+        if slice.entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut covered = Vec::with_capacity(slice.entries.len());
+        for entry in &slice.entries {
+            let key = FailureKey::graph(&entry.graph);
+            if let Some(failure) = self.quarantined(&key) {
+                pass.progress.failures.push(failure);
+                continue;
+            }
+            match self.settle_deleted_graph(pass.store, &entry.graph) {
+                Ok(()) => {
+                    self.clear_failure(&key);
+                    covered.push(entry.clone());
                 }
+                Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
             }
-
-            self.commit()?;
-            store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
-            store.acknowledge_fts_delete_queue(&queued_deletes)?;
-            return Ok(queued_deletes.len());
+        }
+        if covered.is_empty() {
+            return Ok(());
         }
 
-        let queued_graphs = drain_upto(&bound, |chunk| store.drain_fts_reindex_queue(chunk))?;
-        if !queued_graphs.is_empty() {
-            for entry in &queued_graphs {
-                self.reindex_from_store(store, &entry.graph)?;
-            }
+        self.commit()?;
+        pass.store
+            .acknowledge_fts_queues_for_deleted_graphs(&covered)?;
+        pass.store.acknowledge_fts_delete_queue(&covered)?;
+        pass.progress.covered += covered.len();
+        Ok(())
+    }
 
-            self.commit()?;
-            store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_graphs)?;
-            store.acknowledge_fts_reindex_queue(&queued_graphs)?;
-            return Ok(queued_graphs.len());
+    /// Drop or re-derive one graph whose removal was queued.
+    fn settle_deleted_graph(&self, store: &GraphStore, graph: &GraphId) -> Result<()> {
+        #[cfg(test)]
+        self.hooks.fail_item(graph)?;
+        // Taken before the probe: read outside the shard, the answer can
+        // already be stale by the time its branch runs.
+        let _rebuild = self.lock_graph(graph.as_str());
+        if store.contains_graph(graph)? {
+            self.reindex_locked(store, graph)?;
+        } else {
+            self.delete_documents_locked(graph.as_str())?;
+        }
+        Ok(())
+    }
+
+    /// Re-derive the graphs queued for a whole-graph rebuild.
+    fn drain_rebuilt_graphs(&self, pass: &mut DrainPass<'_>) -> Result<()> {
+        let slice = drain_upto(&pass.bound, |chunk| {
+            pass.store.drain_fts_reindex_queue(chunk)
+        })?;
+        pass.progress.remaining |= slice.remaining;
+        if slice.entries.is_empty() {
+            return Ok(());
         }
 
-        let queued = drain_upto(&bound, |chunk| store.drain_fts_queue(chunk))?;
-        if queued.is_empty() {
-            return Ok(0);
+        let mut covered = Vec::with_capacity(slice.entries.len());
+        for entry in &slice.entries {
+            let key = FailureKey::graph(&entry.graph);
+            if let Some(failure) = self.quarantined(&key) {
+                pass.progress.failures.push(failure);
+                continue;
+            }
+            match self.rebuild_queued_graph(pass.store, &entry.graph) {
+                Ok(()) => {
+                    self.clear_failure(&key);
+                    covered.push(entry.clone());
+                }
+                Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+            }
+        }
+        if covered.is_empty() {
+            return Ok(());
+        }
+
+        self.commit()?;
+        pass.store
+            .acknowledge_fts_subjects_for_reindexed_graphs(&covered)?;
+        pass.store.acknowledge_fts_reindex_queue(&covered)?;
+        pass.progress.covered += covered.len();
+        Ok(())
+    }
+
+    /// Re-derive one queued graph, unless it has since been removed.
+    fn rebuild_queued_graph(&self, store: &GraphStore, graph: &GraphId) -> Result<()> {
+        #[cfg(test)]
+        self.hooks.fail_item(graph)?;
+        // A graph removed after its rebuild was queued stays removed: a scan
+        // that ran anyway would republish documents for a deleted graph.
+        if !store.contains_graph(graph)? {
+            let _rebuild = self.lock_graph(graph.as_str());
+            return self.delete_documents_locked(graph.as_str());
+        }
+        self.reindex_from_store(store, graph)?;
+        Ok(())
+    }
+
+    /// Apply the queued per-subject updates.
+    fn drain_dirty_subjects(&self, pass: &mut DrainPass<'_>) -> Result<()> {
+        let slice = drain_upto(&pass.bound, |chunk| pass.store.drain_fts_queue(chunk))?;
+        pass.progress.remaining |= slice.remaining;
+        if slice.entries.is_empty() {
+            return Ok(());
         }
 
         // Held across both phases: a rebuild of one of these graphs must not
         // clear and refill it from a scan that straddles the read below and
         // the apply that follows it.
-        let rebuild_guards = self.lock_graphs(queued.iter().map(|entry| entry.graph.as_str()));
+        let rebuild_guards = self.lock_graphs(slice.entries.iter().map(|entry| entry.graph.as_str()));
 
-        // Phase 1: read every update from the store with NO writer lock held.
-        // This walks up to `bound.chunk` subjects and used to run under the
-        // Tantivy writer mutex, blocking every other indexer for the whole
-        // scan.
-        let mut seen = HashSet::with_capacity(queued.len());
+        // Phase 1: read every update from the store with NO writer lock held,
+        // stopping once the prepared text reaches the pass budget.
+        let mut seen = HashSet::with_capacity(slice.entries.len());
         let mut caches = StoreSyncCaches::default();
-        let mut prepared = Vec::with_capacity(queued.len());
-        for entry in &queued {
+        let mut prepared: Vec<(PreparedDocOp, DirtySubject)> = Vec::new();
+        let mut duplicates = Vec::new();
+        let mut prepared_bytes = 0usize;
+        for entry in &slice.entries {
+            if prepared_bytes >= PREPARED_TEXT_BUDGET {
+                // The rest stays queued: acknowledging entries this pass never
+                // prepared would drop their updates permanently.
+                pass.progress.remaining = true;
+                break;
+            }
             if !seen.insert((entry.graph.clone(), entry.subject)) {
+                duplicates.push(entry.clone());
                 continue;
             }
-            prepared.push(prepare_subject_op(
-                PrepareSubject {
-                    store,
-                    graph: &entry.graph,
-                    subject: entry.subject,
-                },
-                &mut caches,
-            )?);
+            let key = FailureKey::subject(&entry.graph, entry.subject);
+            if let Some(failure) = self.quarantined(&key) {
+                pass.progress.failures.push(failure);
+                continue;
+            }
+            match self.prepare_queued_entry(&mut caches, PrepareSubject {
+                store: pass.store,
+                graph: &entry.graph,
+                subject: entry.subject,
+            }) {
+                Ok(op) => {
+                    prepared_bytes = prepared_bytes.saturating_add(op.text_bytes());
+                    self.clear_failure(&key);
+                    prepared.push((op, entry.clone()));
+                }
+                Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+            }
         }
 
         // Phase 2: apply the prepared ops in queue order under the writer lock.
+        let mut covered = Vec::with_capacity(prepared.len());
         {
             // Guards the Tantivy writer; no store reads happen inside.
             let mut writer = self.writer()?;
-            for op in &prepared {
-                self.apply_prepared_op(&mut writer, op)?;
+            for (op, entry) in &prepared {
+                let key = FailureKey::subject(&entry.graph, entry.subject);
+                match self.apply_prepared_op(&mut writer, op) {
+                    Ok(()) => covered.push(entry.clone()),
+                    Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+                }
             }
         }
         drop(rebuild_guards);
 
+        if covered.is_empty() && duplicates.is_empty() {
+            return Ok(());
+        }
+        covered.extend(duplicates);
+
         self.commit()?;
-        store.acknowledge_fts_queue(&queued)?;
-        Ok(prepared.len())
+        pass.store.acknowledge_fts_queue(&covered)?;
+        pass.progress.covered += covered.len();
+        Ok(())
+    }
+
+    /// Read one queued subject, with the per-entry failure hook applied first.
+    fn prepare_queued_entry(
+        &self,
+        caches: &mut StoreSyncCaches,
+        req: PrepareSubject<'_>,
+    ) -> Result<PreparedDocOp> {
+        #[cfg(test)]
+        self.hooks.fail_item(req.graph)?;
+        prepare_subject_op(req, caches)
     }
 
     fn apply_prepared_op(&self, writer: &mut IndexWriter, op: &PreparedDocOp) -> Result<()> {
@@ -1601,5 +1875,181 @@ mod tests {
             found(&node),
             "the recovery must re-derive the index from the store, in one pass"
         );
+    }
+
+    fn writer_auth() -> crate::GrantAuthorizer {
+        crate::GrantAuthorizer::new(vec![crate::PermissionGrant::new(
+            "/t/**",
+            crate::PermissionLevel::Write,
+        )])
+    }
+
+    fn crate_request(graph: &GraphId, description: &str, public: bool) -> crate::CreateCrateRequest {
+        crate::CreateCrateRequest::new(
+            graph.clone(),
+            "Search Fixture",
+            description,
+            "2025-01-01",
+            None,
+            crate::core::GraphPolicy {
+                public,
+                permission_paths: vec!["/t/search-fixture".to_string()],
+            },
+        )
+    }
+
+    /// One request must run one search over one pinned reader. Escalating the
+    /// Tantivy fetch until enough hits survive authorization asks the index for
+    /// a multiple of the page the caller wanted, once per pass.
+    #[test]
+    fn search_runs_once() {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+
+        // Comfortably past the smallest over-fetch, so one pass cannot see the
+        // whole matching corpus and call itself exhausted.
+        for index in 0..80 {
+            let graph = GraphId::new(&format!("urn:test:hidden-{index}"));
+            node.create_crate(&writer, crate_request(&graph, "clusterneedle", false))
+                .unwrap();
+        }
+        // Padded, so BM25 length normalization ranks the only readable match
+        // below every hidden one.
+        let padding = "filler ".repeat(200);
+        let visible = GraphId::new("urn:test:visible-match");
+        node.create_crate(
+            &writer,
+            crate_request(&visible, &format!("clusterneedle {padding}"), true),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        node.search.hooks.searches.store(0, Ordering::SeqCst);
+        node.search.hooks.decoded.store(0, Ordering::SeqCst);
+        let hits = node
+            .search(
+                &crate::GrantAuthorizer::default(),
+                crate::SearchRequest {
+                    query: "clusterneedle",
+                    limit: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(1, hits.len(), "the one readable match must be returned");
+        assert_eq!(visible.as_str(), hits[0].graph_id);
+        assert_eq!(
+            1,
+            node.search.hooks.searches.load(Ordering::SeqCst),
+            "a one-row page must not re-issue the query"
+        );
+        assert!(
+            node.search.hooks.decoded.load(Ordering::SeqCst) <= 8,
+            "decoded {} stored documents for a one-row page",
+            node.search.hooks.decoded.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Reopen the store a dropped node left behind, so a drain can be stepped
+    /// through without a background indexer racing it.
+    fn reopen_store(dir: &Path) -> Arc<GraphStore> {
+        Arc::new(GraphStore::open(dir.join("store")).unwrap())
+    }
+
+    fn graph_term(store: &GraphStore, graph: &GraphId) -> TermId {
+        store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .expect("the fixture graph must be interned")
+    }
+
+    /// A flush that triggers its own recovery owes the whole rebuild, not the
+    /// one queue entry that happened to land on its original cutoff.
+    #[test]
+    fn flush_covers_recovery() {
+        let dir = tempdir().unwrap();
+        let first = GraphId::new("urn:test:recovery-first");
+        let second = GraphId::new("urn:test:recovery-second");
+        let removed = GraphId::new("urn:test:recovery-removed");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            for graph in [&first, &second, &removed] {
+                node.create_crate(&writer_auth(), crate_request(graph, "recoveryneedle", true))
+                    .unwrap();
+            }
+            node.flush_search_updates().unwrap();
+        }
+
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open(dir.path().join("search")).unwrap());
+        assert_eq!(3, search.search("recoveryneedle", 50).unwrap().len());
+
+        // An older queue entry, so it consumes the first drain pass on its own.
+        store.delete_graph(&removed).unwrap();
+        // Strip every document behind the store's back: only a re-derivation
+        // from the store can bring the survivors back.
+        for graph in [&first, &second, &removed] {
+            search.delete_graph_documents(graph.as_str()).unwrap();
+        }
+        search.commit().unwrap();
+        assert_eq!(0, search.search("recoveryneedle", 50).unwrap().len());
+
+        poison_writer(search.clone());
+        crate::flush_search_queue(&store, &search).unwrap();
+
+        assert_eq!(
+            2,
+            search.search("recoveryneedle", 50).unwrap().len(),
+            "the flush reported success with part of its own rebuild unindexed"
+        );
+    }
+
+    /// One entry that always fails must not stop a different graph's queued
+    /// work, and the flush that covered it must say so.
+    #[test]
+    fn drain_isolates_failure() {
+        let dir = tempdir().unwrap();
+        let healthy = GraphId::new("urn:test:isolation-healthy");
+        let broken = GraphId::new("urn:test:isolation-broken");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            for graph in [&healthy, &broken] {
+                node.create_crate(
+                    &writer_auth(),
+                    crate_request(graph, "isolationneedle", true),
+                )
+                .unwrap();
+            }
+            node.flush_search_updates().unwrap();
+        }
+
+        // A fresh index, so only what this drain rebuilds can be found.
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let mut batch = store.new_batch();
+        for graph in [&healthy, &broken] {
+            let term = graph_term(&store, graph);
+            store.enqueue_fts_reindex(&mut batch, term).unwrap();
+        }
+        store.commit(batch).unwrap();
+        *search
+            .hooks
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(broken.as_str().to_string());
+
+        assert!(
+            crate::flush_search_queue(&store, &search).is_err(),
+            "a flush covering a failed entry must not report success"
+        );
+
+        let hits = search.search("isolationneedle", 50).unwrap();
+        assert_eq!(
+            1,
+            hits.len(),
+            "the healthy graph stayed unindexed behind a permanently failing entry"
+        );
+        assert_eq!(healthy.as_str(), hits[0].graph_id);
     }
 }

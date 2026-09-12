@@ -624,9 +624,8 @@ pub struct DescribeRequest<'a> {
 
 /// Hard cap on a caller-supplied search limit, applied at every entry point.
 ///
-/// Tantivy's top-k collector pre-allocates `limit * 2` and the over-fetch
-/// multiplies the limit again before that, so an unbounded limit is an
-/// allocation the caller picks — `fts:limit 10000000000000` from a remote
+/// Tantivy's top-k collector pre-allocates `limit * 2`, so an unbounded limit
+/// is an allocation the caller picks: `fts:limit 10000000000000` from a remote
 /// query aborted the process. Ten thousand rows is well past any real page
 /// and still a trivially sized collector.
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -634,8 +633,13 @@ pub const MAX_SEARCH_LIMIT: usize = 10_000;
 #[cfg(test)]
 const MAX_SYNC_POLICY_PATHS: usize = 1_024;
 const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
-/// Smallest Tantivy over-fetch before authorization filtering.
-const SEARCH_MIN_FETCH: usize = 64;
+/// Control messages one worker cycle collects before it goes back to work.
+/// Anything past this stays in the channel for the next cycle.
+const SEARCH_MAX_CONTROL_MESSAGES: usize = 1_024;
+/// How long [`SearchUpdateWorker::shutdown`] waits for the indexer thread.
+const SEARCH_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+/// Poll interval while waiting for the indexer thread to finish.
+const SEARCH_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 /// Above this many selected graphs, `search_graphs` runs one filtered search
 /// instead of one full top-k collection per graph.
 const SEARCH_GRAPHS_PER_GRAPH_LIMIT: usize = 8;
@@ -654,6 +658,11 @@ struct SearchUpdateWorker {
     /// Collapses a burst of writes into a single channel message instead of
     /// one unbounded-channel send per write.
     wake_pending: Arc<AtomicBool>,
+    /// Set by [`SearchUpdateWorker::shutdown`]. The indexer reads this between
+    /// work slices, so shutdown is observable without it first having to
+    /// consume however many control messages callers have queued ahead of the
+    /// stop request.
+    stopping: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -661,10 +670,12 @@ impl SearchUpdateWorker {
     fn start(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let wake_pending = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::new(AtomicBool::new(false));
         let ctx = SearchWorkerCtx {
             store,
             search,
             wake_pending: wake_pending.clone(),
+            stopping: stopping.clone(),
         };
         let handle = std::thread::spawn(move || {
             run_search_update_worker(receiver, ctx);
@@ -673,8 +684,38 @@ impl SearchUpdateWorker {
         Self {
             sender,
             wake_pending,
+            stopping,
             handle: Some(handle),
         }
+    }
+
+    /// Ask the indexer to stop and wait up to `deadline` for its thread.
+    ///
+    /// Reports whether the thread finished. The stop flag is checked between
+    /// work slices, so a slice already inside a Tantivy or store call finishes
+    /// that call first: the bound is cooperative, not hard. Nothing here can
+    /// terminate a dependency call that does not return, and abandoning the
+    /// thread would leave a detached index writer able to race a reopened
+    /// store, so a timeout is reported rather than forced. A timed-out
+    /// shutdown loses no queue obligation: every entry it had not
+    /// acknowledged is still owed.
+    fn shutdown(&mut self, deadline: Duration) -> bool {
+        self.stopping.store(true, Ordering::SeqCst);
+        let _ = self.sender.send(SearchWorkerMessage::Stop);
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+
+        let give_up = std::time::Instant::now() + deadline;
+        while !handle.is_finished() {
+            if std::time::Instant::now() >= give_up {
+                // Kept, not detached: see the note above.
+                self.handle = Some(handle);
+                return false;
+            }
+            std::thread::sleep(SEARCH_SHUTDOWN_POLL);
+        }
+        handle.join().is_ok()
     }
 
     /// Ask the worker to drain the FTS queues.
@@ -706,10 +747,7 @@ impl SearchUpdateWorker {
 
 impl Drop for SearchUpdateWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(SearchWorkerMessage::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        let _ = self.shutdown(SEARCH_SHUTDOWN_DEADLINE);
     }
 }
 
@@ -718,12 +756,16 @@ struct SearchWorkerCtx {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
     wake_pending: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
 }
 
 fn run_search_update_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
     loop {
         let mut flush_replies = Vec::new();
-        if collect_search_worker_messages(&receiver, &mut flush_replies) {
+        let stop_message = collect_search_worker_messages(&receiver, &mut flush_replies);
+        // The flag is read alongside the channel, so a stop request queued
+        // behind a large control backlog is still seen this cycle.
+        if stop_message || ctx.stopping.load(Ordering::SeqCst) {
             for reply in flush_replies {
                 let _ = reply.send(Err("stopped".to_string()));
             }
@@ -755,11 +797,19 @@ fn collect_search_worker_messages(
         Ok(SearchWorkerMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
     }
 
-    while let Ok(message) = receiver.try_recv() {
-        match message {
-            SearchWorkerMessage::Wake => {}
-            SearchWorkerMessage::Flush(reply) => flush_replies.push(reply),
-            SearchWorkerMessage::Stop => return true,
+    // Bounded, so a caller loop cannot make one cycle collect an unbounded
+    // backlog before any indexing happens. Whatever is left stays in the
+    // channel for the next cycle, so no waiter is dropped, and a stop request
+    // behind the cap is caught by the flag the worker loop also reads.
+    for _ in 0..SEARCH_MAX_CONTROL_MESSAGES {
+        if flush_replies.len() >= SEARCH_MAX_CONTROL_MESSAGES {
+            break;
+        }
+        match receiver.try_recv() {
+            Ok(SearchWorkerMessage::Wake) => {}
+            Ok(SearchWorkerMessage::Flush(reply)) => flush_replies.push(reply),
+            Ok(SearchWorkerMessage::Stop) => return true,
+            Err(_) => break,
         }
     }
 
@@ -792,31 +842,78 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Drains the FTS queues until everything enqueued *before this call* is indexed.
 ///
-/// Bounded by the dirty token observed on entry: without that, a writer that
-/// keeps enqueueing holds the loop open and `flush_search_updates()` never
-/// returns.
+/// The target is captured once, here, at the accepted submission boundary.
+/// Without it a writer that keeps enqueueing holds the loop open and
+/// `flush_search_updates()` never returns. A recovery discovered while
+/// draining raises that target once, and it is never lowered again: rebuilding
+/// the original cutoff on every pass dropped the rebuild work whose tokens
+/// landed above it, so the flush reported success with part of its own
+/// recovery still queued. Recomputing the target from the newest source token
+/// instead would put the moving target back.
+///
+/// Returning `Ok` means every entry at or below that target was committed to
+/// the index and the reader reloaded before those entries were acknowledged.
+/// Entries that failed, and a scan that spent its row budget before reaching
+/// eligible work, are reported as errors rather than counted as an empty
+/// queue.
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
     #[cfg(test)]
     if search.take_armed_drain_panic() {
         panic!("injected drain panic");
     }
 
-    let max_token = store.current_dirty_token();
+    let mut target = store.current_dirty_token();
     let mut processed_any = false;
-    loop {
-        let bound = search::QueueBound {
-            chunk: SEARCH_QUEUE_FLUSH_CHUNK,
-            max_token: Some(max_token),
-        };
-        let processed = search.process_queued_updates(store, bound)?;
-        if processed == 0 {
-            if processed_any {
-                store.persist()?;
-            }
-            return Ok(());
+    let (incomplete, failures) = loop {
+        let progress = search.drain_queues(
+            store,
+            search::QueueBound {
+                chunk: SEARCH_QUEUE_FLUSH_CHUNK,
+                max_token: Some(target),
+            },
+        )?;
+        if let Some(raised) = progress.recovery {
+            target = target.max(raised);
+        }
+        if progress.covered == 0 {
+            // Nothing moved this pass. Either no eligible work is left, or a
+            // budget stopped the scan short of it; only the second still owes
+            // the caller a continuation. Entries that failed an earlier pass
+            // are retried, so the pass that ends the loop is the one that
+            // knows what is still owed.
+            break (progress.remaining, progress.failures);
         }
         processed_any = true;
+    };
+
+    if processed_any {
+        store.persist()?;
     }
+    if !failures.is_empty() {
+        return Err(CraqleError::SearchWorker(describe_search_failures(
+            &failures,
+        )));
+    }
+    if incomplete {
+        return Err(CraqleError::SearchWorker(
+            "search queue scan spent its row budget with work still owed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Name what a flush could not cover, with the first entry's diagnostic.
+fn describe_search_failures(failures: &[search::DrainFailure]) -> String {
+    let mut message = format!("{} search queue entries still owed", failures.len());
+    if let Some(first) = failures.first() {
+        message.push_str(&format!(
+            "; {} failed {} times: {}",
+            first.graph.as_str(),
+            first.attempts,
+            first.diagnostic
+        ));
+    }
+    message
 }
 
 /// A graph whose reindex scan was pinned at `upto`. Only queue entries at or
@@ -3067,8 +3164,16 @@ impl CraqleNode {
 
     /// Search visible resources in the local search index.
     ///
-    /// Clamps the limit, authorizes hits against stored policy, and drops
-    /// duplicates so each graph-and-subject pair fills at most one page slot.
+    /// Readable-graph membership is resolved before the index retains a page,
+    /// so the result is one top-k collection over exactly the graphs this
+    /// caller may read. Filtering afterwards instead meant asking the index
+    /// for a multiple of the requested page and asking again, four times
+    /// larger, whenever too few hits survived authorization: a one-row page
+    /// over an unreadable corpus walked up to the whole matching corpus, once
+    /// per pass, on a different reader each time (G8).
+    ///
+    /// The page is complete for the policy read at the start of the call. A
+    /// permission granted concurrently is picked up by the next call.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         self.search.ensure_available()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
@@ -3077,31 +3182,23 @@ impl CraqleNode {
         }
 
         let mut readable = ReadableGraphs::new(self, auth);
-        // Bounded by the clamp above: escalation only widens while the index
-        // actually filled the previous fetch, so it tracks the corpus.
-        let mut fetch = limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
-        loop {
-            let raw_hits = self.search.search(req.query, fetch)?;
-            // Fewer hits than asked for means the index has nothing more to
-            // give; widening again cannot produce another readable hit.
-            let index_exhausted = raw_hits.len() < fetch;
-
-            let mut seen = SeenHits::default();
-            let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
-            for hit in raw_hits {
-                if seen.admits(&hit) && readable.allows(&hit.graph_id)? {
-                    hits.push(hit);
-                }
+        let mut selected = Vec::new();
+        for graph in self.store.graphs()? {
+            if readable.allows(graph.as_str())? {
+                selected.push(graph);
             }
-
-            if hits.len() >= limit || index_exhausted {
-                // Score-descending order arrives from the index and both
-                // filters preserve it, so no re-sort is needed here.
-                hits.truncate(limit);
-                return Ok(hits);
-            }
-            fetch = fetch.saturating_mul(4);
         }
+        // No readable graph is a complete empty page, not an exhausted budget.
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hits = self.search.search_in_graphs(search::GraphSetQuery {
+            graphs: &selected,
+            query: req.query,
+            limit,
+        })?;
+        Ok(limit_search_hits(hits, limit))
     }
 
     /// Search visible resources in an explicit set of graph IRIs.
@@ -3255,6 +3352,11 @@ impl CraqleNode {
     }
 
     /// Block until the background full-text indexer has processed queued work.
+    ///
+    /// Without the `search` feature there is no index and no reader, so this
+    /// reports only that the indexer had nothing it could do. It does not
+    /// claim that any search state is current: the queued updates stay owed
+    /// until a search-enabled build indexes them.
     pub fn flush_search_updates(&self) -> Result<()> {
         self.search_worker.flush()
     }
@@ -6059,5 +6161,64 @@ mod tests {
                 object: EncodedTerm("\"race\"".to_string()),
             }],
         )
+    }
+
+    /// One work slice must not queue an unbounded number of control replies:
+    /// a client loop calling `flush_search_updates` can outrun the indexer.
+    /// What is left over stays queued rather than being dropped.
+    #[test]
+    fn control_messages_bounded() {
+        let (sender, receiver) = mpsc::channel();
+        let mut keep_alive = Vec::new();
+        for _ in 0..10_000 {
+            let (reply, waiter) = mpsc::channel();
+            sender.send(SearchWorkerMessage::Flush(reply)).unwrap();
+            keep_alive.push(waiter);
+        }
+
+        let mut replies = Vec::new();
+        collect_search_worker_messages(&receiver, &mut replies);
+
+        assert!(
+            replies.len() <= SEARCH_MAX_CONTROL_MESSAGES,
+            "collected {} pending flush replies in one cycle",
+            replies.len()
+        );
+
+        let mut later = Vec::new();
+        collect_search_worker_messages(&receiver, &mut later);
+        assert!(
+            !later.is_empty(),
+            "waiters past the cap must stay queued for the next cycle"
+        );
+    }
+
+    /// Shutdown must not be reachable only by consuming the control channel:
+    /// a caller flooding flush requests would otherwise delay it without
+    /// bound. The indexer reads a flag, so the backlog cannot starve it.
+    #[test]
+    fn shutdown_outruns_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(store::GraphStore::open(dir.path().join("store")).unwrap());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let mut worker = SearchUpdateWorker::start(store, search);
+
+        let mut keep_alive = Vec::new();
+        for _ in 0..10_000 {
+            let (reply, waiter) = mpsc::channel();
+            if worker
+                .sender
+                .send(SearchWorkerMessage::Flush(reply))
+                .is_err()
+            {
+                break;
+            }
+            keep_alive.push(waiter);
+        }
+
+        assert!(
+            worker.shutdown(PROGRESS_TIMEOUT),
+            "the indexer thread did not observe shutdown behind the backlog"
+        );
     }
 }

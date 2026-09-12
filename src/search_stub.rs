@@ -1,8 +1,7 @@
 use std::path::Path;
 
 use crate::core::GraphId;
-pub(crate) use crate::search_queue::QueueBound;
-use crate::search_queue::drain_upto;
+pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
 use crate::store::GraphStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -100,29 +99,59 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Drain and acknowledge without indexing. The token bound is honoured so
-    /// the caller's flush contract behaves the same with the feature off.
+    /// Retain every queued update without indexing it.
+    ///
+    /// This build has no index, so it cannot cover any queue entry. Draining
+    /// and acknowledging them anyway destroyed the only durable record of what
+    /// a later search-enabled build still owed: that build finds a
+    /// schema-compatible index and an empty queue, certifies the index it
+    /// wrote before the feature was turned off, and serves text the store no
+    /// longer holds. The entries coalesce per `(graph, subject)`, so the
+    /// retained debt is bounded by the corpus rather than by the write count.
     pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
-        let queued_deletes = drain_upto(&bound, |chunk| store.drain_fts_delete_queue(chunk))?;
-        if !queued_deletes.is_empty() {
-            store.acknowledge_fts_queues_for_deleted_graphs(&queued_deletes)?;
-            store.acknowledge_fts_delete_queue(&queued_deletes)?;
-            return Ok(queued_deletes.len());
-        }
+        Ok(self.drain_queues(store, bound)?.covered)
+    }
 
-        let queued_reindexes = drain_upto(&bound, |chunk| store.drain_fts_reindex_queue(chunk))?;
-        if !queued_reindexes.is_empty() {
-            store.acknowledge_fts_subjects_for_reindexed_graphs(&queued_reindexes)?;
-            store.acknowledge_fts_reindex_queue(&queued_reindexes)?;
-            return Ok(queued_reindexes.len());
-        }
-
-        let queued = drain_upto(&bound, |chunk| store.drain_fts_queue(chunk))?;
-        store.acknowledge_fts_queue(&queued)?;
-        Ok(queued.len())
+    pub fn drain_queues(
+        &self,
+        _store: &GraphStore,
+        _bound: QueueBound,
+    ) -> Result<crate::search_queue::DrainProgress> {
+        Ok(crate::search_queue::DrainProgress::default())
     }
 
     pub fn reindex_from_store(&self, _store: &GraphStore, _graph: &GraphId) -> Result<usize> {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A build without an index must not acknowledge queue rows it never
+    /// indexed: those rows are the only record of what a later search-enabled
+    /// build still owes.
+    #[test]
+    fn drain_keeps_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        node.create_crate(
+            &crate::AllowAllAuthorizer,
+            crate::CreateCrateRequest::new(
+                crate::core::GraphId::new("urn:test:disabled-debt"),
+                "Disabled Debt Crate",
+                "needlebody",
+                "2025-01-01",
+                None,
+                crate::core::GraphPolicy::default(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        let owed = node.store.drain_fts_queue(usize::MAX).unwrap();
+        assert!(
+            !owed.is_empty(),
+            "the disabled build erased the search debt it could not index"
+        );
     }
 }
