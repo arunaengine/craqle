@@ -1810,13 +1810,44 @@ impl ReplicationEngine {
     /// Merge a batch that reached this node outside irokle.
     /// **Call with the graph's write lock held.**
     ///
-    /// The whole envelope is validated first, exactly as a replicated record
-    /// is, so a foreign transport cannot hand the store content it could only
-    /// fail on, and nothing is staged for a rejected batch.
+    /// Unlike the irokle replay path above, an externally supplied batch is not
+    /// assumed to arrive in causal order, so it is checked instead: the whole
+    /// envelope is validated, and the batch is applied only once this replica
+    /// holds every event its `base_clock` declares. A gap returns
+    /// [`MergeError::MissingDependencies`] naming those events and leaves
+    /// source rows, dots and the applied clock untouched, so the transport can
+    /// fetch them and retry. Nothing is buffered here.
     pub(crate) fn merge_batch(&self, incoming: &Batch) -> Result<MergeResult, MergeError> {
         crate::sync::check_batch(incoming)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        self.check_causal_base(incoming)?;
         self.apply_irokle_batch_with_plan(incoming, None, DiagnosticsMode::Immediate)
+    }
+
+    /// Refuse an external batch this replica cannot order yet.
+    ///
+    /// The graph clock only ever grows, and the caller holds the graph write
+    /// lock, so a readiness verdict still holds when the apply below reads the
+    /// clock again. A stale gap verdict costs one retry, never a lost event.
+    fn check_causal_base(&self, incoming: &Batch) -> Result<(), MergeError> {
+        let identity = Dot {
+            actor: incoming.actor,
+            counter: incoming.counter,
+        };
+        // Counter zero marks a batch that carries no event of its own.
+        if incoming.counter > 0 && incoming.base_clock.contains(&identity) {
+            return Err(MergeError::InputRejected(format!(
+                "batch event {}:{} declares itself as its own dependency",
+                identity.actor, identity.counter
+            )));
+        }
+        let applied = self.store.get_vector_clock(&incoming.graph)?;
+        let missing = crate::sync::missing_dots(&incoming.base_clock, &applied);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(MergeError::MissingDependencies(missing))
+        }
     }
 
     /// **Call with the graph's write lock held.** Every caller does, and so
