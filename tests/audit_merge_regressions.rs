@@ -117,7 +117,8 @@ fn content(snapshot: &GraphReplicaSnapshot) -> (VectorClock, Vec<SnapshotQuadSta
 
 fn normalize(snapshot: &mut GraphReplicaSnapshot) {
     for quad in &mut snapshot.quads {
-        quad.dots.sort_unstable_by_key(|dot| (dot.actor, dot.counter));
+        quad.dots
+            .sort_unstable_by_key(|dot| (dot.actor, dot.counter));
         quad.dots.dedup();
     }
     snapshot.quads.retain(|quad| !quad.dots.is_empty());
@@ -218,10 +219,7 @@ fn family() -> Vec<State> {
     vec![
         state(clock(&[(1, 1)]), vec![quad("x", &[(1, 1)])]),
         state(clock(&[(1, 2)]), Vec::new()),
-        state(
-            clock(&[(1, 1), (2, 1)]),
-            vec![quad("x", &[(1, 1), (2, 1)])],
-        ),
+        state(clock(&[(1, 1), (2, 1)]), vec![quad("x", &[(1, 1), (2, 1)])]),
         state(clock(&[(3, 1)]), vec![quad("y", &[(3, 1)])]),
     ]
 }
@@ -254,10 +252,7 @@ fn join_keeps_concurrent() {
     let graph = GraphId::new("urn:test:merge:join-concurrent");
     let concurrent = snap(
         &graph,
-        &state(
-            clock(&[(1, 1), (2, 1)]),
-            vec![quad("x", &[(1, 1), (2, 1)])],
-        ),
+        &state(clock(&[(1, 1), (2, 1)]), vec![quad("x", &[(1, 1), (2, 1)])]),
     );
     let removed = snap(&graph, &state(clock(&[(1, 2)]), Vec::new()));
 
@@ -315,7 +310,10 @@ fn join_covers_union() {
     );
     normalize(&mut expected);
     assert_eq!(node.graph_snapshot(&graph).unwrap(), expected);
-    assert_eq!(node.graph_snapshot(&graph).unwrap(), oracle(&local, &remote));
+    assert_eq!(
+        node.graph_snapshot(&graph).unwrap(),
+        oracle(&local, &remote)
+    );
 }
 
 #[test]
@@ -368,8 +366,7 @@ fn join_laws_hold() {
                     continue;
                 }
                 let order = [first, second, third];
-                let graph =
-                    GraphId::new(&format!("urn:test:merge:law-{first}-{second}-{third}"));
+                let graph = GraphId::new(&format!("urn:test:merge:law-{first}-{second}-{third}"));
                 let mut expected = empty(&graph);
                 for step in order {
                     let incoming = snap(&graph, &states[step]);
@@ -377,7 +374,10 @@ fn join_laws_hold() {
                     expected = oracle(&expected, &incoming);
                 }
                 let observed = node.graph_snapshot(&graph).unwrap();
-                assert_eq!(observed, expected, "engine must match the model for {order:?}");
+                assert_eq!(
+                    observed, expected,
+                    "engine must match the model for {order:?}"
+                );
 
                 let mut key = order.to_vec();
                 key.sort_unstable();
@@ -706,7 +706,10 @@ fn shuffled_history_converges() {
 
         // Duplicates are delivered too, and a rejected batch is retried until
         // no pass makes progress: a bounded number of passes, never a sleep.
-        let mut queue = order.iter().flat_map(|&step| [step, step]).collect::<Vec<_>>();
+        let mut queue = order
+            .iter()
+            .flat_map(|&step| [step, step])
+            .collect::<Vec<_>>();
         for _ in 0..=queue.len() {
             if queue.is_empty() {
                 break;

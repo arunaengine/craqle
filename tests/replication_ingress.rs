@@ -86,11 +86,7 @@ fn poison(incoming: &mut Batch, place: Place, term: &str) {
 fn durable(
     node: &CraqleNode,
     graph: &GraphId,
-) -> (
-    GraphReplicaSnapshot,
-    VectorClock,
-    (u64, [u8; 32], [u8; 32]),
-) {
+) -> (GraphReplicaSnapshot, VectorClock, (u64, [u8; 32], [u8; 32])) {
     (
         node.graph_snapshot(graph).unwrap(),
         node.vector_clock(graph).unwrap(),
@@ -188,7 +184,11 @@ fn rejects_trailing_data() {
     let temp = tempfile::tempdir().unwrap();
     let node = open(temp.path(), "trailing", 34);
     let graph = GraphId::new("urn:test:ingress:trailing-data");
-    for term in ["\"x\" and more", "\"x\"^^<urn:test:d> junk", "<urn:a> <urn:b>"] {
+    for term in [
+        "\"x\" and more",
+        "\"x\"^^<urn:test:d> junk",
+        "<urn:a> <urn:b>",
+    ] {
         let mut incoming = valid(&graph);
         poison(&mut incoming, Place::Object, term);
         rejects(&node, &incoming);
@@ -232,11 +232,7 @@ fn rejects_star_term() {
     let node = open(temp.path(), "star", 36);
     let graph = GraphId::new("urn:test:ingress:star");
     let mut incoming = valid(&graph);
-    poison(
-        &mut incoming,
-        Place::Subject,
-        "<<<urn:a> <urn:b> <urn:c>>>",
-    );
+    poison(&mut incoming, Place::Subject, "<<<urn:a> <urn:b> <urn:c>>>");
     rejects(&node, &incoming);
 }
 

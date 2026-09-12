@@ -2,9 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
-    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphTombstone,
-    MaterializedQuadChange, QuadOp, RoCrateRenderHints, TaggedGraphPolicy,
-    TaggedRoCrateRenderHints, VectorClock,
+    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
+    QuadOp, RoCrateRenderHints, TaggedGraphPolicy, TaggedRoCrateRenderHints, VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
@@ -1050,7 +1049,10 @@ fn literal_ok(text: &str) -> bool {
     if let Some(tag) = rest.strip_prefix('@') {
         return language_ok(tag);
     }
-    match rest.strip_prefix("^^<").and_then(|iri| iri.strip_suffix('>')) {
+    match rest
+        .strip_prefix("^^<")
+        .and_then(|iri| iri.strip_suffix('>'))
+    {
         Some(datatype) => iri_body_ok(datatype),
         None => false,
     }
@@ -1074,7 +1076,10 @@ fn check_term(term: &EncodedTerm) -> SyncResult<TermShape> {
             text.len()
         )));
     }
-    if let Some(body) = text.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')) {
+    if let Some(body) = text
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
         if iri_body_ok(body) {
             return Ok(TermShape::Iri);
         }
