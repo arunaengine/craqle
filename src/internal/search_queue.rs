@@ -4,7 +4,9 @@
 //! same flush contract.
 
 use crate::core::GraphId;
-use crate::store::{Result, TermId};
+#[cfg(any(feature = "search", test))]
+use crate::store::Result;
+use crate::store::TermId;
 
 /// Bounds one drain pass over the durable FTS queues.
 pub struct QueueBound {
@@ -23,6 +25,7 @@ pub struct QueueBound {
 /// Derived from `chunk` rather than configured separately so every caller gets
 /// the same bound. `chunk` caps what the caller has to prepare and hold; this
 /// caps what the scan underneath it materializes on the way there.
+#[cfg(any(feature = "search", test))]
 const ROW_BUDGET_FACTOR: usize = 4;
 
 /// The dirty tokens one coalesced queue entry carries.
@@ -78,16 +81,19 @@ pub struct DirtyGraph {
 }
 
 /// A durable FTS queue entry, tagged with the dirty tokens it accumulated.
+#[cfg(any(feature = "search", test))]
 pub(crate) trait QueueEntry {
     fn token(&self) -> u64;
 }
 
+#[cfg(any(feature = "search", test))]
 impl QueueEntry for DirtyGraph {
     fn token(&self) -> u64 {
         self.tokens.oldest
     }
 }
 
+#[cfg(any(feature = "search", test))]
 impl QueueEntry for DirtySubject {
     fn token(&self) -> u64 {
         self.tokens.oldest
@@ -95,6 +101,7 @@ impl QueueEntry for DirtySubject {
 }
 
 /// What one bounded drain pass found.
+#[cfg(any(feature = "search", test))]
 pub(crate) struct DrainSlice<T> {
     /// Eligible entries, never more than [`QueueBound::chunk`] of them.
     pub entries: Vec<T>,
@@ -110,6 +117,7 @@ pub(crate) struct DrainSlice<T> {
     pub remaining: bool,
 }
 
+#[cfg(any(feature = "search", test))]
 impl<T> DrainSlice<T> {
     /// Borrow the eligible entries. Used by queue tests in other modules.
     #[allow(dead_code)]
@@ -139,6 +147,7 @@ impl<T> DrainSlice<T> {
 /// Terminates because the requested size grows until either the queue returns
 /// fewer entries than requested, which means the whole queue was scanned, or
 /// the row budget is reached.
+#[cfg(any(feature = "search", test))]
 pub(crate) fn drain_upto<T, D>(bound: &QueueBound, drain: D) -> Result<DrainSlice<T>>
 where
     T: QueueEntry,
