@@ -48,6 +48,17 @@ pub enum MergeError {
     Store(#[from] crate::store::StoreError),
     #[error("input rejected: {0}")]
     InputRejected(String),
+    /// Events the batch declares as its causal base that this replica has not
+    /// applied. The transport must fetch them and retry.
+    #[error("missing causal dependencies: {}", missing_dots(.0))]
+    MissingDependencies(Vec<Dot>),
+}
+
+fn missing_dots(dots: &[Dot]) -> String {
+    dots.iter()
+        .map(|dot| format!("{}:{}", dot.actor, dot.counter))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl UpdateError {
@@ -75,6 +86,7 @@ impl MergeError {
         match self {
             Self::Store(error) => error.kind(),
             Self::InputRejected(_) => crate::CraqleErrorKind::InvalidInput,
+            Self::MissingDependencies(_) => crate::CraqleErrorKind::Conflict,
         }
     }
 }
@@ -2432,6 +2444,7 @@ fn update_error_from_merge(error: MergeError) -> UpdateError {
     match error {
         MergeError::Store(error) => UpdateError::Store(error),
         MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
+        MergeError::MissingDependencies(_) => UpdateError::InvalidChangeSet(error.to_string()),
     }
 }
 
