@@ -142,7 +142,9 @@ struct QueryFeatures {
     property_path: bool,
     property_path_depth: usize,
     guarded_hash: bool,
-    static_rows: usize,
+    /// Statically derivable row estimate, not a measured count. Leaves whose
+    /// cardinality only the store knows count as one row.
+    estimated_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -161,9 +163,58 @@ impl From<QueryLimitExceeded> for SparqlError {
     }
 }
 
+/// Retained bytes per buffered row. An estimate, not a measurement.
+const HASH_ROW_BYTES_ESTIMATE: usize = 128;
+
+/// One deadline and cancellation context for a whole request.
+///
+/// `started` may predate construction so an already measured stage, such as
+/// parsing, stays inside the same deadline.
+#[derive(Clone)]
+pub(crate) struct RequestClock {
+    started: Instant,
+    deadline: Option<Duration>,
+    cancellation: QueryCancellation,
+}
+
+impl RequestClock {
+    fn start(
+        deadline: Option<Duration>,
+        cancellation: QueryCancellation,
+        started: Instant,
+    ) -> Self {
+        Self {
+            started,
+            deadline,
+            cancellation,
+        }
+    }
+
+    fn check(&self) -> std::result::Result<(), QueryLimitExceeded> {
+        if self
+            .deadline
+            .is_some_and(|deadline| self.started.elapsed() >= deadline)
+        {
+            return Err(QueryLimitExceeded {
+                resource: "query deadline",
+                limit: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Stage boundary check. A caller's cancellation outranks the deadline.
+    fn check_stage(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(SparqlError::Cancelled);
+        }
+        Ok(self.check()?)
+    }
+}
+
 pub(crate) struct QueryBudget {
     limits: QueryLimits,
-    started: Instant,
+    clock: RequestClock,
     features: QueryFeatures,
     intermediate_rows: AtomicUsize,
     property_path_edges: AtomicUsize,
@@ -174,8 +225,11 @@ pub(crate) struct QueryBudget {
 }
 
 impl QueryBudget {
-    fn new(query: &Query, limits: QueryLimits) -> std::result::Result<Self, QueryLimitExceeded> {
-        let features = query_features(query);
+    fn new(
+        features: QueryFeatures,
+        limits: QueryLimits,
+        clock: RequestClock,
+    ) -> std::result::Result<Self, QueryLimitExceeded> {
         if features.property_path_depth > limits.max_property_path_depth {
             return Err(QueryLimitExceeded {
                 resource: "property path depth",
@@ -184,7 +238,7 @@ impl QueryBudget {
         }
         let budget = Self {
             limits,
-            started: Instant::now(),
+            clock,
             features,
             intermediate_rows: AtomicUsize::new(0),
             property_path_edges: AtomicUsize::new(0),
@@ -193,22 +247,13 @@ impl QueryBudget {
             result_bytes: AtomicUsize::new(0),
             graph_triples: AtomicUsize::new(0),
         };
-        budget.observe_intermediate(features.static_rows)?;
+        // The plan's own row estimate is charged before the first pull.
+        budget.observe_intermediate(features.estimated_rows)?;
         Ok(budget)
     }
 
     pub(crate) fn check(&self) -> std::result::Result<(), QueryLimitExceeded> {
-        if self
-            .limits
-            .deadline
-            .is_some_and(|deadline| self.started.elapsed() >= deadline)
-        {
-            return Err(QueryLimitExceeded {
-                resource: "query deadline",
-                limit: 0,
-            });
-        }
-        Ok(())
+        self.clock.check()
     }
 
     pub(crate) fn observe_intermediate(
@@ -229,7 +274,7 @@ impl QueryBudget {
                     limit: self.limits.max_hash_entries,
                 });
             }
-            let bytes = total.saturating_mul(128);
+            let bytes = total.saturating_mul(HASH_ROW_BYTES_ESTIMATE);
             if bytes > self.limits.max_hash_bytes {
                 return Err(QueryLimitExceeded {
                     resource: "hash bytes",
@@ -365,7 +410,7 @@ fn merge_features(left: QueryFeatures, right: QueryFeatures) -> QueryFeatures {
         property_path: left.property_path || right.property_path,
         property_path_depth: left.property_path_depth.max(right.property_path_depth),
         guarded_hash: left.guarded_hash || right.guarded_hash,
-        static_rows: left.static_rows.saturating_add(right.static_rows),
+        estimated_rows: left.estimated_rows.saturating_add(right.estimated_rows),
     }
 }
 
@@ -373,20 +418,32 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
     match pattern {
         GraphPattern::Bgp { patterns } => QueryFeatures {
             guarded_hash: patterns.len() > 1,
+            estimated_rows: 1,
             ..QueryFeatures::default()
         },
         GraphPattern::Path { path, .. } => QueryFeatures {
             property_path: true,
             property_path_depth: property_path_depth(path),
             guarded_hash: true,
-            ..QueryFeatures::default()
+            estimated_rows: 1,
         },
         GraphPattern::Join { left, right }
         | GraphPattern::Lateral { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Minus { left, right } => {
-            let mut features = merge_features(pattern_features(left), pattern_features(right));
+            let sides = (pattern_features(left), pattern_features(right));
+            let mut features = merge_features(sides.0, sides.1);
             features.guarded_hash = true;
+            // Independent sides multiply. Sharing a variable cannot produce
+            // more rows than the larger side under this estimate.
+            features.estimated_rows = if shares_variable(left, right) {
+                sides.0.estimated_rows.max(sides.1.estimated_rows)
+            } else {
+                sides
+                    .0
+                    .estimated_rows
+                    .saturating_mul(sides.1.estimated_rows)
+            };
             if let GraphPattern::LeftJoin {
                 expression: Some(expression),
                 ..
@@ -410,7 +467,7 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
             inner, expression, ..
         } => merge_features(pattern_features(inner), expression_features(expression)),
         GraphPattern::Values { bindings, .. } => QueryFeatures {
-            static_rows: bindings.len(),
+            estimated_rows: bindings.len(),
             ..QueryFeatures::default()
         },
         GraphPattern::OrderBy { inner, expression } => {
@@ -445,9 +502,23 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
         #[allow(unreachable_patterns)]
         _ => QueryFeatures {
             guarded_hash: true,
+            estimated_rows: 1,
             ..QueryFeatures::default()
         },
     }
+}
+
+/// Whether a join of these sides can multiply instead of matching.
+fn shares_variable(left: &GraphPattern, right: &GraphPattern) -> bool {
+    let mut bound = HashSet::new();
+    left.on_in_scope_variable(|variable| {
+        bound.insert(variable.as_str());
+    });
+    let mut shared = false;
+    right.on_in_scope_variable(|variable| {
+        shared = shared || bound.contains(variable.as_str());
+    });
+    shared
 }
 
 fn expression_features(expression: &Expression) -> QueryFeatures {
@@ -781,6 +852,7 @@ impl SparqlEngine {
         explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<QueryPlan> {
         enforce_query_bytes(prepared.query_bytes, &options.limits)?;
+        let clock = request_clock(options, Duration::ZERO);
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
@@ -790,12 +862,15 @@ impl SparqlEngine {
                 search: self.search.as_ref(),
                 scope,
                 post_raw_visibility,
+                clock: &clock,
             },
         )?;
+        clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
-        QueryBudget::new(&query, options.limits)?;
+        clock.check_stage()?;
+        QueryBudget::new(query_features(&query), options.limits, clock)?;
         Ok(explain_query_plan(
             &query,
             query_fingerprint(&query),
@@ -897,6 +972,7 @@ impl SparqlEngine {
         collect_plan_statistics: bool,
     ) -> Result<QueryExecution> {
         enforce_query_bytes(prepared.query_bytes, &options.limits)?;
+        let clock = request_clock(options, parse_time);
         let mut query = prepared.query.as_ref().clone();
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
@@ -909,9 +985,11 @@ impl SparqlEngine {
                 search: self.search.as_ref(),
                 scope,
                 post_raw_visibility: Some((self.store.as_ref(), policy_visible)),
+                clock: &clock,
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
+        clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
         let planning_started = Instant::now();
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
@@ -920,6 +998,7 @@ impl SparqlEngine {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
         let craqle_planning_time = planning_started.elapsed();
+        clock.check_stage()?;
         let plan_fingerprint = query_fingerprint(&query);
         let logical_operator = query_logical_operator(&query);
         self.execute_query(
@@ -928,6 +1007,7 @@ impl SparqlEngine {
             &view,
             options,
             QueryStageStatistics {
+                clock,
                 parse_time,
                 rewrite_time,
                 craqle_planning_time,
@@ -985,6 +1065,7 @@ impl SparqlEngine {
         explicit_auth: Option<&dyn crate::Authorizer>,
     ) -> Result<(QueryExecution, ReadStatistics)> {
         enforce_query_bytes(prepared.query_bytes, &options.limits)?;
+        let clock = request_clock(options, parse_time);
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
@@ -995,9 +1076,11 @@ impl SparqlEngine {
                 search: self.search.as_ref(),
                 scope,
                 post_raw_visibility: None,
+                clock: &clock,
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
+        clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
         let planning_started = Instant::now();
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
@@ -1006,6 +1089,7 @@ impl SparqlEngine {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
         }
         let craqle_planning_time = planning_started.elapsed();
+        clock.check_stage()?;
         let plan_fingerprint = query_fingerprint(&query);
         let logical_operator = query_logical_operator(&query);
         self.execute_query(
@@ -1014,6 +1098,7 @@ impl SparqlEngine {
             &view,
             options,
             QueryStageStatistics {
+                clock,
                 parse_time,
                 rewrite_time,
                 craqle_planning_time,
@@ -1038,7 +1123,11 @@ impl SparqlEngine {
         let (context, named_graphs) =
             scope_read_context(scope, view, options.cancellation.clone())?;
         context.check_cancelled()?;
-        let budget = Arc::new(QueryBudget::new(&query, options.limits)?);
+        let budget = Arc::new(QueryBudget::new(
+            query_features(&query),
+            options.limits,
+            stages.clock.clone(),
+        )?);
         if let Some(plan) = stages.fast_path.take() {
             let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &budget)?;
             let read_statistics = context.snapshot();
@@ -1155,7 +1244,7 @@ impl SparqlEngine {
                 limit: options.limits.max_update_bytes,
             });
         }
-        reject_sparql_rdf_star(sparql)?;
+        check_query_shape(sparql)?;
         let started = Instant::now();
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let update = SparqlParser::new()
@@ -1209,7 +1298,30 @@ impl SparqlEngine {
                     for quad in insert {
                         authorize_update_template_graph(&view, auth, &quad.graph_name)?;
                     }
-                    let evaluator = QueryEvaluator::new();
+                    let cancellation = QueryCancellation::new();
+                    let clock =
+                        RequestClock::start(options.limits.deadline, cancellation.clone(), started);
+                    let template_width = delete.len().saturating_add(insert.len()).max(1);
+                    let max_materialized_quads = options
+                        .limits
+                        .max_materialized_bindings
+                        .saturating_mul(template_width);
+                    let features = pattern_features(pattern);
+                    // A statically known product must fit what this update is
+                    // allowed to materialize at all.
+                    if features.estimated_rows > max_materialized_quads {
+                        return Err(SparqlError::QueryLimit {
+                            resource: "materialized update bindings",
+                            limit: options.limits.max_materialized_bindings,
+                        });
+                    }
+                    let budget = Arc::new(QueryBudget::new(
+                        features,
+                        update_read_limits(&options.limits),
+                        clock,
+                    )?);
+                    let evaluator = QueryEvaluator::new()
+                        .with_cancellation_token(cancellation.evaluator_token());
                     let mut prepared = evaluator.prepare_delete_insert(
                         delete.clone(),
                         insert.clone(),
@@ -1226,24 +1338,21 @@ impl SparqlEngine {
                             )]);
                     }
                     let context = ReadContext::with_visible_graphs(
-                        QueryCancellation::new(),
+                        cancellation,
                         readable_graphs.iter().cloned(),
                     );
                     let iter = prepared
-                        .execute(StoreDataset::with_default_union_marker(
+                        .execute(StoreDataset::with_query_budget(
                             &view,
                             &context,
                             default_union_marker,
+                            Arc::clone(&budget),
                         ))
                         .map_err(map_eval_error)?;
 
-                    let template_width = delete.len().saturating_add(insert.len()).max(1);
-                    let max_materialized_quads = options
-                        .limits
-                        .max_materialized_bindings
-                        .saturating_mul(template_width);
                     let mut materialized_quads = 0_usize;
                     for quad in iter {
+                        budget.check()?;
                         materialized_quads = materialized_quads.saturating_add(1);
                         if materialized_quads > max_materialized_quads {
                             return Err(SparqlError::QueryLimit {
@@ -1297,6 +1406,14 @@ impl SparqlEngine {
         }
 
         Ok(changes)
+    }
+}
+
+/// Query-shaped limits for an update's read side, under the update deadline.
+fn update_read_limits(limits: &UpdateLimits) -> QueryLimits {
+    QueryLimits {
+        deadline: limits.deadline,
+        ..QueryLimits::production()
     }
 }
 
@@ -1676,6 +1793,7 @@ fn authorize_explicit_graph_scope(
 }
 
 struct QueryStageStatistics {
+    clock: RequestClock,
     parse_time: Duration,
     rewrite_time: Duration,
     craqle_planning_time: Duration,
@@ -1701,9 +1819,19 @@ struct CollectionMetrics {
     result_cells: u64,
 }
 
+/// Starts the request deadline with the already measured parse time charged.
+fn request_clock(options: &QueryOptions, parse_time: Duration) -> RequestClock {
+    let now = Instant::now();
+    RequestClock::start(
+        options.limits.deadline,
+        options.cancellation.clone(),
+        now.checked_sub(parse_time).unwrap_or(now),
+    )
+}
+
 fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQuery, Duration)> {
     enforce_query_bytes(sparql.len(), limits)?;
-    reject_sparql_rdf_star(sparql)?;
+    check_query_shape(sparql)?;
     let started = Instant::now();
     let full = format!("{COMMON_PREFIXES}{sparql}");
     let query = SparqlParser::new()
@@ -1718,13 +1846,18 @@ fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQ
     ))
 }
 
-fn reject_sparql_rdf_star(sparql: &str) -> Result<()> {
+/// Nesting the parser is allowed to build. Mid-parse cancellation does not
+/// exist, so the input shape is bounded before parsing starts.
+const MAX_PARSE_DEPTH: usize = 64;
+
+fn check_query_shape(sparql: &str) -> Result<()> {
     let bytes = sparql.as_bytes();
     let mut index = 0;
     let mut quote = None;
     let mut escaped = false;
     let mut iri = false;
     let mut comment = false;
+    let mut depth = 0_usize;
     while index < bytes.len() {
         let byte = bytes[index];
         if comment {
@@ -1762,6 +1895,16 @@ fn reject_sparql_rdf_star(sparql: &str) -> Result<()> {
             .into());
         } else if byte == b'<' {
             iri = true;
+        } else if matches!(byte, b'{' | b'(' | b'[') {
+            depth += 1;
+            if depth > MAX_PARSE_DEPTH {
+                return Err(SparqlError::QueryLimit {
+                    resource: "query nesting depth",
+                    limit: MAX_PARSE_DEPTH,
+                });
+            }
+        } else if matches!(byte, b'}' | b')' | b']') {
+            depth = depth.saturating_sub(1);
         }
         index += 1;
     }
@@ -2059,6 +2202,8 @@ struct FtsServiceSpec {
     subject: Option<FtsSubjectPattern>,
     query: Option<String>,
     limit: usize,
+    /// The caller asked for more than [`crate::MAX_SEARCH_LIMIT`] hits.
+    limit_clamped: bool,
     score_var: Option<Variable>,
     graph: Option<FtsGraphBinding>,
 }
@@ -2070,6 +2215,7 @@ struct FtsRewriteCtx<'a> {
     search: &'a SearchIndex,
     scope: GraphScope<'a>,
     post_raw_visibility: Option<(&'a GraphStore, &'a SnapshotVisibleFn<'a>)>,
+    clock: &'a RequestClock,
 }
 
 fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
@@ -2261,6 +2407,9 @@ impl FtsHitFilter<'_> {
 struct FtsSearchRequest<'a> {
     query: &'a str,
     limit: usize,
+    clock: &'a RequestClock,
+    /// A filled page under a clamped limit is an incomplete answer.
+    clamped: bool,
     /// `Some` restricts the index query to a single, already-visible graph.
     graph: Option<&'a str>,
     filter: FtsHitFilter<'a>,
@@ -2277,6 +2426,7 @@ fn search_visible_hits(
         .saturating_mul(FTS_OVERFETCH_FACTOR)
         .max(FTS_MIN_FETCH);
     loop {
+        request.clock.check_stage()?;
         let raw = match request.graph {
             Some(graph) => search.search_in_graph(graph, request.query, fetch)?,
             None => search.search(request.query, fetch)?,
@@ -2300,6 +2450,12 @@ fn search_visible_hits(
             }
             kept.push(hit);
             if kept.len() == request.limit {
+                if request.clamped {
+                    return Err(SparqlError::QueryLimit {
+                        resource: "fts hits",
+                        limit: request.limit,
+                    });
+                }
                 return Ok(kept);
             }
         }
@@ -2311,7 +2467,13 @@ fn search_visible_hits(
         }
         match fetch.checked_mul(FTS_OVERFETCH_FACTOR) {
             Some(next) => fetch = next,
-            None => return Ok(kept),
+            // Widening any further would overflow, so completeness is unknown.
+            None => {
+                return Err(SparqlError::QueryLimit {
+                    resource: "fts over-fetch",
+                    limit: fetch,
+                });
+            }
         }
     }
 }
@@ -2357,6 +2519,8 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
         &FtsSearchRequest {
             query: spec.query.as_deref().unwrap_or(""),
             limit: spec.limit,
+            clock: cx.clock,
+            clamped: spec.limit_clamped,
             graph,
             filter: FtsHitFilter {
                 visibility: &visibility,
@@ -2381,7 +2545,8 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
 }
 
 /// Read one FTS SERVICE block's arguments. `fts:limit` is clamped to
-/// [`crate::MAX_SEARCH_LIMIT`] (10_000), never rejected.
+/// [`crate::MAX_SEARCH_LIMIT`] (10_000); a clamp that truncates the answer is
+/// reported by [`search_visible_hits`].
 fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     let GraphPattern::Bgp { patterns } = pattern else {
         return Err(SparqlError::Unsupported(
@@ -2421,16 +2586,14 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
                         "fts:limit must be bound to an integer literal".into(),
                     ));
                 };
-                // Clamped, not rejected: a large limit is a legitimate "give
-                // me everything" and the other fts: arguments only error on
-                // input they cannot interpret at all.
-                spec.limit = literal
-                    .value()
-                    .parse::<usize>()
-                    .map_err(|_| {
-                        SparqlError::Unsupported("fts:limit must be a positive integer".into())
-                    })?
-                    .min(crate::MAX_SEARCH_LIMIT);
+                // Clamped rather than rejected outright: a large limit is a
+                // legitimate "give me everything". A clamp that truncates the
+                // answer is reported when the page actually fills.
+                let requested = literal.value().parse::<usize>().map_err(|_| {
+                    SparqlError::Unsupported("fts:limit must be a positive integer".into())
+                })?;
+                spec.limit = requested.min(crate::MAX_SEARCH_LIMIT);
+                spec.limit_clamped = requested > spec.limit;
             }
             FTS_SCORE_IRI => {
                 let TermPattern::Variable(variable) = pattern.object else {
@@ -2634,6 +2797,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
         }
     }
 
+    #[cfg(test)]
     fn with_default_union_marker(
         view: &'context StoreReadView<'store>,
         context: &'context ReadContext<'visibility>,
@@ -2913,20 +3077,25 @@ where
     {
         let view = self.view;
         let context = self.context;
-        Box::new(
-            view.graph_term_id_iter()
-                .filter_map(move |graph_id| match graph_id {
-                    Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
-                        Ok(true) => Some(
-                            Self::stored_term(view, context, graph_id, false)
-                                .map(StoreTerm::Existing),
-                        ),
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error.into())),
-                    },
+        let query_budget = self.query_budget.clone();
+        Box::new(view.graph_term_id_iter().filter_map(move |graph_id| {
+            match graph_id {
+                Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
+                    Ok(true) => Some(
+                        query_budget
+                            .as_ref()
+                            .map_or(Ok(()), |budget| budget.check().map_err(Into::into))
+                            .and_then(|()| {
+                                Self::stored_term(view, context, graph_id, false)
+                                    .map(StoreTerm::Existing)
+                            }),
+                    ),
+                    Ok(false) => None,
                     Err(error) => Some(Err(error.into())),
-                }),
-        )
+                },
+                Err(error) => Some(Err(error.into())),
+            }
+        }))
     }
 
     /// Graph existence for `GRAPH <g> { ... }` (charter G9).
@@ -4045,7 +4214,14 @@ mod tests {
         prepared
             .dataset_mut()
             .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
-        let budget = Arc::new(QueryBudget::new(&limit, QueryLimits::default()).unwrap());
+        let budget = Arc::new(
+            QueryBudget::new(
+                query_features(&limit),
+                QueryLimits::default(),
+                RequestClock::start(None, QueryCancellation::new(), Instant::now()),
+            )
+            .unwrap(),
+        );
         let rows = collect_query_results(
             prepared
                 .execute(StoreDataset::with_query_budget(
