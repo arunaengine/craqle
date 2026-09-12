@@ -168,24 +168,49 @@ where
         }
     }
 
+    /// Drops superseded recency records. Stamps only increase and records are
+    /// only appended, so the deque is already ascending and one pass is enough;
+    /// rebuilding it from the unordered map forced a sort that changed nothing.
     fn compact_order(&mut self) {
         #[cfg(test)]
         {
             self.compactions = self.compactions.saturating_add(1);
         }
-        let mut order = self
-            .entries
-            .iter()
-            .map(|(key, entry)| (entry.stamp, key.clone()))
-            .collect::<Vec<_>>();
-        order.sort_unstable_by_key(|(stamp, _)| *stamp);
-        self.order = order.into();
+        let entries = &self.entries;
+        self.order
+            .retain(|(stamp, key)| entries.get(key).is_some_and(|entry| entry.stamp == *stamp));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_keeps_recency_order() {
+        let mut cache: BoundedCache<u64, u64> = BoundedCache::new(8, 4_096);
+        for key in 0..8u64 {
+            cache.insert(key, key, 8);
+        }
+        // Touch in a deliberately different order than insertion.
+        for key in [3u64, 0, 7, 1] {
+            assert_eq!(cache.get_cloned(&key), Some(key));
+        }
+        // Force compaction, then check the oldest entry is evicted first.
+        cache.compact_order();
+        assert_eq!(cache.order.len(), cache.entries.len());
+        let stamps: Vec<u64> = cache.order.iter().map(|(stamp, _)| *stamp).collect();
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable();
+        assert_eq!(stamps, sorted, "compaction must keep ascending recency");
+        cache.insert(100, 100, 8);
+        assert_eq!(
+            cache.get_cloned(&2),
+            None,
+            "the least recent entry is evicted"
+        );
+        assert_eq!(cache.get_cloned(&3), Some(3));
+    }
 
     #[test]
     fn bounded_cache_eviction() {
