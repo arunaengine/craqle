@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 #[cfg(feature = "shacl-core")]
 use std::time::{Duration, Instant};
@@ -2004,16 +2004,13 @@ impl ReplicationEngine {
     /// anything changed. **Call with the graph commit guard held.**
     fn join_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<bool, MergeError> {
         let graph = &snapshot.graph;
-        // The causal context of this node's state, read before the join: it
-        // decides which snapshot dots are new and which are already-seen
-        // removals.
-        let seen = self.store.get_vector_clock(graph)?;
-        let mut changed = false;
-        for (actor, counter) in &snapshot.clock.0 {
-            changed |= seen.0.get(actor).is_none_or(|local| local < counter);
-        }
-        let mut clock = seen.clone();
+        // Both pre-merge contexts are read before either is joined: a dot the
+        // other side's context covers but its live set omits is a removal that
+        // side has already seen, not an addition this side is missing.
+        let local = self.store.graph_snapshot(graph)?;
+        let mut clock = local.clock.clone();
         clock.merge(&snapshot.clock);
+        let mut changed = clock != local.clock;
 
         let mut batch = self.store.new_batch();
         let mut affected_subjects = HashSet::new();
@@ -2024,29 +2021,65 @@ impl ReplicationEngine {
         };
         self.store.seed_term_cache(
             &mut cx,
-            snapshot
+            local
                 .quads
                 .iter()
+                .chain(&snapshot.quads)
                 .flat_map(|quad| [&quad.subject, &quad.predicate, &quad.object]),
         )?;
         let graph_id = self
             .store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
 
-        for state in &snapshot.quads {
+        for (terms, (here, there)) in join_union(&local, snapshot) {
+            let joined = join_dots(here, there, (&local.clock, &snapshot.clock));
+            let dropped = here
+                .iter()
+                .copied()
+                .filter(|dot| !joined.contains(dot))
+                .collect::<Vec<_>>();
+            let added = joined
+                .iter()
+                .copied()
+                .filter(|dot| !here.contains(dot))
+                .collect::<Vec<_>>();
+            if dropped.is_empty() && added.is_empty() {
+                continue;
+            }
+            changed = true;
             let quad = self.resolve_quad(
                 &mut cx,
                 QuadTerms {
                     graph_id,
-                    subject: &state.subject,
-                    predicate: &state.predicate,
-                    object: &state.object,
+                    subject: terms.0,
+                    predicate: terms.1,
+                    object: terms.2,
                 },
             )?;
-            for dot in state.dots.iter().filter(|dot| !seen.contains(dot)) {
-                changed |= self
-                    .store
+            // Adds first: a quad the join keeps must not look removed in
+            // between, so the derived state sees one liveness transition.
+            for dot in &added {
+                self.store
                     .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+            }
+            if !dropped.is_empty() {
+                let mut witnessed = VectorClock::new();
+                for dot in &dropped {
+                    witnessed.advance(dot.actor, dot.counter);
+                }
+                self.store.remove_quad(
+                    cx.batch,
+                    QuadRemove {
+                        quad,
+                        witnessed: &witnessed,
+                    },
+                )?;
+                // A witnessed clock covers whole counter ranges, so restore any
+                // kept dot it took with it.
+                for dot in joined.iter().filter(|dot| witnessed.contains(dot)) {
+                    self.store
+                        .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+                }
             }
             affected_subjects.insert(quad.subject);
         }
@@ -2439,6 +2472,48 @@ fn map_update_error(error: crate::CraqleError) -> UpdateError {
         crate::CraqleError::Shacl(error) => UpdateError::Shacl(error),
         error => UpdateError::InvalidChangeSet(error.to_string()),
     }
+}
+
+type TermTriple<'a> = (&'a EncodedTerm, &'a EncodedTerm, &'a EncodedTerm);
+
+/// Local and remote dot sets for every quad identity either side holds. A quad
+/// only one side holds is still considered, because the other side's context
+/// may prove it was removed.
+fn join_union<'a>(
+    local: &'a GraphReplicaSnapshot,
+    remote: &'a GraphReplicaSnapshot,
+) -> BTreeMap<TermTriple<'a>, (&'a [Dot], &'a [Dot])> {
+    let mut rows: BTreeMap<TermTriple<'a>, (&'a [Dot], &'a [Dot])> = BTreeMap::new();
+    for quad in &local.quads {
+        rows.insert(
+            (&quad.subject, &quad.predicate, &quad.object),
+            (&quad.dots, &[]),
+        );
+    }
+    for quad in &remote.quads {
+        rows.entry((&quad.subject, &quad.predicate, &quad.object))
+            .or_insert((&[], &[]))
+            .1 = &quad.dots;
+    }
+    rows
+}
+
+/// Dots the OR-Set join keeps for one quad: the dots both sides hold, plus
+/// each side's dots the other side's pre-merge context does not cover.
+fn join_dots(local: &[Dot], remote: &[Dot], contexts: (&VectorClock, &VectorClock)) -> Vec<Dot> {
+    let (here, there) = contexts;
+    let mut joined = local
+        .iter()
+        .copied()
+        .filter(|dot| remote.contains(dot) || !there.contains(dot))
+        .collect::<Vec<_>>();
+    joined.extend(
+        remote
+            .iter()
+            .copied()
+            .filter(|dot| !local.contains(dot) && !here.contains(dot)),
+    );
+    joined
 }
 
 fn update_error_from_merge(error: MergeError) -> UpdateError {
