@@ -8326,6 +8326,143 @@ mod tests {
         assert_eq!(cache.statistics().entries, 15);
     }
 
+    fn write_limit(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("limit file has a parent")).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn cgroup_version_two_limits_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cgroup");
+        let mapping = dir.path().join("self-cgroup");
+        std::fs::write(&mapping, "0::/service.slice/craqle.service\n").unwrap();
+        write_limit(&root.join("memory.max"), "max\n");
+        write_limit(&root.join("service.slice/memory.max"), "536870912\n");
+        write_limit(
+            &root.join("service.slice/craqle.service/memory.max"),
+            "268435456\n",
+        );
+        assert_eq!(
+            cgroup_memory_limit(&mapping, &root),
+            Some(268_435_456),
+            "the closest numeric ceiling applies"
+        );
+    }
+
+    #[test]
+    fn ancestor_limit_beats_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cgroup");
+        let mapping = dir.path().join("self-cgroup");
+        std::fs::write(&mapping, "0::/outer/inner\n").unwrap();
+        write_limit(&root.join("outer/memory.max"), "134217728\n");
+        write_limit(&root.join("outer/inner/memory.max"), "1073741824\n");
+        assert_eq!(
+            cgroup_memory_limit(&mapping, &root),
+            Some(134_217_728),
+            "an ancestor ceiling also binds this process"
+        );
+    }
+
+    #[test]
+    fn cgroup_version_one_limits_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cgroup");
+        let mapping = dir.path().join("self-cgroup");
+        std::fs::write(
+            &mapping,
+            "7:cpu,cpuacct:/user.slice\n6:memory:/user.slice/craqle\n",
+        )
+        .unwrap();
+        write_limit(
+            &root.join("memory/user.slice/craqle/memory.limit_in_bytes"),
+            "402653184\n",
+        );
+        assert_eq!(cgroup_memory_limit(&mapping, &root), Some(402_653_184));
+    }
+
+    #[test]
+    fn unreadable_limits_bind_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cgroup");
+        let mapping = dir.path().join("self-cgroup");
+        std::fs::write(&mapping, "0::/only\n").unwrap();
+
+        // Missing file.
+        assert_eq!(cgroup_memory_limit(&mapping, &root), None);
+
+        // Malformed value.
+        write_limit(&root.join("only/memory.max"), "not-a-number\n");
+        assert_eq!(cgroup_memory_limit(&mapping, &root), None);
+
+        // Explicitly unlimited, both spellings.
+        std::fs::write(root.join("only/memory.max"), "max\n").unwrap();
+        assert_eq!(cgroup_memory_limit(&mapping, &root), None);
+        std::fs::write(root.join("only/memory.max"), "9223372036854771712\n").unwrap();
+        assert_eq!(cgroup_memory_limit(&mapping, &root), None);
+
+        // Absent mapping file.
+        assert_eq!(cgroup_memory_limit(&dir.path().join("absent"), &root), None);
+
+        // Denied read.
+        let denied = root.join("only/memory.max");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let observed = cgroup_memory_limit(&mapping, &root);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(observed, None, "a denied read contributes no ceiling");
+    }
+
+    #[test]
+    fn small_budget_has_no_gibibyte_floor() {
+        let tight = CacheBudget::from_limit(Some(256 * 1_048_576));
+        assert!(
+            tight.database < DEFAULT_DB_CACHE_BYTES,
+            "a 256 MiB process must not be given a 1 GiB block cache"
+        );
+        assert!(tight.database >= MIN_DB_CACHE_BYTES);
+        assert!(tight.terms < TERM_DECODE_CACHE_BYTES);
+        assert!(tight.subjects < QUAD_SUBJECT_CACHE_BYTES);
+        assert!(tight.objects < OBJECT_ORDER_CACHE_BYTES);
+        assert!(tight.terms >= MIN_APP_CACHE_BYTES);
+
+        let application = tight.terms + tight.subjects + tight.objects + tight.planner;
+        assert!(
+            application <= 256 * 1_048_576,
+            "application caches must stay inside the process budget"
+        );
+    }
+
+    #[test]
+    fn large_budget_keeps_defaults() {
+        let roomy = CacheBudget::from_limit(Some(64 * 1_024 * 1_048_576));
+        assert_eq!(roomy.database, MAX_DB_CACHE_BYTES);
+        assert_eq!(roomy.terms, TERM_DECODE_CACHE_BYTES);
+        assert_eq!(roomy.subjects, QUAD_SUBJECT_CACHE_BYTES);
+        assert_eq!(roomy.objects, OBJECT_ORDER_CACHE_BYTES);
+        assert_eq!(roomy.planner, PLANNER_DISTINCT_CACHE_BYTES);
+
+        // No ceiling readable keeps the historical sizes rather than guessing.
+        let unknown = CacheBudget::from_limit(None);
+        assert_eq!(unknown.database, DEFAULT_DB_CACHE_BYTES);
+        assert_eq!(unknown.terms, TERM_DECODE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn meminfo_available_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meminfo");
+        std::fs::write(
+            &path,
+            "MemTotal:       65536000 kB\nMemAvailable:    1048576 kB\n",
+        )
+        .unwrap();
+        assert_eq!(meminfo_available(&path), Some(1_073_741_824));
+        std::fs::write(&path, "MemTotal: 1 kB\n").unwrap();
+        assert_eq!(meminfo_available(&path), None);
+        assert_eq!(meminfo_available(&dir.path().join("absent")), None);
+    }
+
     #[test]
     fn planner_distinct_counts() {
         let (_dir, store) = setup_store();
