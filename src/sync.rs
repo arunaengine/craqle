@@ -1,9 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
-    ActorId, Batch, ContextTag, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
-    QuadOp, RoCrateRenderHints, TaggedGraphPolicy, TaggedRoCrateRenderHints, VectorClock,
+    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphTombstone,
+    MaterializedQuadChange, QuadOp, RoCrateRenderHints, TaggedGraphPolicy,
+    TaggedRoCrateRenderHints, VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
@@ -937,9 +938,130 @@ where
 /// and small enough that one record cannot be an allocation attack.
 pub(crate) const MAX_TERM_BYTES: usize = 4 * 1024 * 1024;
 
-/// Reject a term the store could only fail on: oversized, or outside the three
-/// N-Triples shapes craqle encodes.
-fn check_term(term: &EncodedTerm) -> SyncResult<()> {
+/// Aggregate limits for one record or snapshot. A per-term cap bounds a single
+/// string, never the total work an envelope can demand.
+const MAX_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ENVELOPE_ROWS: usize = 1 << 20;
+const MAX_ENVELOPE_DOTS: usize = 1 << 20;
+const MAX_ENVELOPE_ACTORS: usize = 1 << 16;
+
+/// Which RDF term form an encoded string holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TermShape {
+    Iri,
+    Blank,
+    Literal,
+}
+
+/// A quad position, with the term forms RDF allows there.
+#[derive(Clone, Copy)]
+enum Place {
+    Subject,
+    Predicate,
+    Object,
+}
+
+impl Place {
+    fn allows(self, shape: TermShape) -> bool {
+        match self {
+            Self::Subject => shape != TermShape::Literal,
+            Self::Predicate => shape == TermShape::Iri,
+            Self::Object => true,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::Predicate => "predicate",
+            Self::Object => "object",
+        }
+    }
+}
+
+const PLACES: [Place; 3] = [Place::Subject, Place::Predicate, Place::Object];
+
+fn rejected(text: &str) -> CraqleSyncError {
+    CraqleSyncError::InvalidEvent(format!(
+        "term `{}` is not a complete encoded IRI, literal or blank node",
+        text.chars().take(64).collect::<String>()
+    ))
+}
+
+/// N-Triples IRIREF body: no control character, space, or delimiter that would
+/// end the term early, so the encoded form has exactly one reading.
+///
+/// Relative references are accepted: RO-Crate entity ids such as
+/// `ro-crate-metadata.json` are stored in that form.
+fn iri_body_ok(body: &str) -> bool {
+    !body.is_empty()
+        && !body.chars().any(|ch| {
+            ch <= ' ' || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+        })
+}
+
+/// N-Triples LANGTAG.
+fn language_ok(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let primary = parts.next().unwrap_or_default();
+    !primary.is_empty()
+        && primary.chars().all(|ch| ch.is_ascii_alphabetic())
+        && parts.all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
+}
+
+/// Consume an N-Triples literal completely: a quoted value with legal escapes,
+/// then an optional language tag or datatype IRI and nothing after it.
+fn literal_ok(text: &str) -> bool {
+    let Some(mut rest) = text.strip_prefix('"') else {
+        return false;
+    };
+    loop {
+        let Some(next) = rest.chars().next() else {
+            return false;
+        };
+        rest = &rest[next.len_utf8()..];
+        match next {
+            '"' => break,
+            '\\' => {
+                let Some(escape) = rest.chars().next() else {
+                    return false;
+                };
+                rest = &rest[escape.len_utf8()..];
+                let width = match escape {
+                    't' | 'b' | 'n' | 'r' | 'f' | '"' | '\'' | '\\' => 0,
+                    'u' => 4,
+                    'U' => 8,
+                    _ => return false,
+                };
+                if rest.len() < width
+                    || !rest.is_char_boundary(width)
+                    || !rest[..width].chars().all(|ch| ch.is_ascii_hexdigit())
+                {
+                    return false;
+                }
+                rest = &rest[width..];
+            }
+            _ => {}
+        }
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    if let Some(tag) = rest.strip_prefix('@') {
+        return language_ok(tag);
+    }
+    match rest.strip_prefix("^^<").and_then(|iri| iri.strip_suffix('>')) {
+        Some(datatype) => iri_body_ok(datatype),
+        None => false,
+    }
+}
+
+/// Parse a term completely and report which quad positions may hold it.
+///
+/// Delimiters alone are not enough: an unterminated literal, a term with
+/// trailing data, and an IRI holding a raw space all pass a prefix test but no
+/// RDF reader would accept them.
+fn check_term(term: &EncodedTerm) -> SyncResult<TermShape> {
     let text = term.0.as_str();
     if term.is_rdf_star() {
         return Err(CraqleSyncError::InvalidEvent(format!(
@@ -952,22 +1074,123 @@ fn check_term(term: &EncodedTerm) -> SyncResult<()> {
             text.len()
         )));
     }
-    let shaped = (text.starts_with('<') && text.ends_with('>'))
-        || (text.starts_with('"') && text.len() > 1)
-        || text.starts_with("_:");
-    if shaped {
-        Ok(())
-    } else {
-        Err(CraqleSyncError::InvalidEvent(format!(
-            "term `{}` is not an encoded IRI, literal or blank node",
-            text.chars().take(64).collect::<String>()
-        )))
+    if let Some(body) = text.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')) {
+        if iri_body_ok(body) {
+            return Ok(TermShape::Iri);
+        }
+    } else if let Some(label) = text.strip_prefix("_:") {
+        if oxrdf::BlankNode::new(label).is_ok() {
+            return Ok(TermShape::Blank);
+        }
+    } else if text.starts_with('"') && literal_ok(text) {
+        return Ok(TermShape::Literal);
     }
+    Err(rejected(text))
+}
+
+/// Every dot a claimed context holds that `known` does not cover.
+pub(crate) fn missing_dots(claim: &VectorClock, known: &VectorClock) -> Vec<Dot> {
+    claim
+        .0
+        .iter()
+        .map(|(&actor, &counter)| Dot { actor, counter })
+        .filter(|dot| !known.contains(dot))
+        .collect()
+}
+
+/// Running checks for one record or snapshot: each distinct term is parsed
+/// once, and the totals a per-term cap cannot bound are accumulated.
+struct Envelope<'a> {
+    shapes: HashMap<&'a str, TermShape>,
+    actors: HashSet<ActorId>,
+    bytes: usize,
+    rows: usize,
+    dots: usize,
+}
+
+impl<'a> Envelope<'a> {
+    fn new() -> Self {
+        Self {
+            shapes: HashMap::new(),
+            actors: HashSet::new(),
+            bytes: 0,
+            rows: 0,
+            dots: 0,
+        }
+    }
+
+    /// Validate one quad's three terms in their own positions.
+    fn quad(&mut self, terms: [&'a EncodedTerm; 3]) -> SyncResult<()> {
+        self.rows += 1;
+        if self.rows > MAX_ENVELOPE_ROWS {
+            return Err(CraqleSyncError::InvalidEvent(format!(
+                "envelope exceeds the {MAX_ENVELOPE_ROWS} row limit"
+            )));
+        }
+        for (term, place) in terms.into_iter().zip(PLACES) {
+            self.bytes = self.bytes.saturating_add(term.0.len());
+            if self.bytes > MAX_ENVELOPE_BYTES {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "envelope exceeds the {MAX_ENVELOPE_BYTES} byte limit"
+                )));
+            }
+            let shape = match self.shapes.get(term.0.as_str()) {
+                Some(shape) => *shape,
+                None => {
+                    let shape = check_term(term)?;
+                    self.shapes.insert(term.0.as_str(), shape);
+                    shape
+                }
+            };
+            if !place.allows(shape) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "term `{}` is not a legal RDF {}",
+                    term.0.chars().take(64).collect::<String>(),
+                    place.label()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Count the actors one declared context names.
+    fn clock(&mut self, clock: &VectorClock) -> SyncResult<()> {
+        self.actors.extend(clock.0.keys().copied());
+        self.limit()
+    }
+
+    /// Count one dot set.
+    fn dots(&mut self, dots: &[Dot]) -> SyncResult<()> {
+        self.dots = self.dots.saturating_add(dots.len());
+        if self.dots > MAX_ENVELOPE_DOTS {
+            return Err(CraqleSyncError::InvalidEvent(format!(
+                "envelope exceeds the {MAX_ENVELOPE_DOTS} dot limit"
+            )));
+        }
+        self.actors.extend(dots.iter().map(|dot| dot.actor));
+        self.limit()
+    }
+
+    fn limit(&self) -> SyncResult<()> {
+        if self.actors.len() > MAX_ENVELOPE_ACTORS {
+            return Err(CraqleSyncError::InvalidEvent(format!(
+                "envelope exceeds the {MAX_ENVELOPE_ACTORS} actor limit"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A graph name keys every row of the graph, so it must itself be a complete
+/// encoded IRI that any peer can reproduce.
+fn check_graph(graph: &GraphId) -> SyncResult<()> {
+    check_term(&EncodedTerm::from_named_node(&graph.0)).map(|_| ())
 }
 
 /// Validate every term a record carries before any of it reaches the store, so
 /// content a retry could never accept is rejected here.
 fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
+    let mut envelope = Envelope::new();
     for change in changes {
         let terms = match change {
             MaterializedQuadChange::Insert {
@@ -983,43 +1206,96 @@ fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
                 ..
             } => [subject, predicate, object],
         };
-        for term in terms {
-            check_term(term)?;
-        }
+        envelope.quad(terms)?;
     }
     Ok(())
 }
 
-/// Same guard for a batch that reached craqle outside irokle: no op may carry
-/// content the store could only fail on.
-pub(crate) fn check_ops(ops: &[QuadOp]) -> SyncResult<()> {
-    for op in ops {
-        let terms = match op {
+/// Same guard for a batch that reached craqle outside irokle, plus the
+/// invariants a foreign transport could otherwise contradict: an add carries
+/// its own batch event, and a remove witnesses only what the batch declares.
+pub(crate) fn check_batch(batch: &Batch) -> SyncResult<()> {
+    check_graph(&batch.graph)?;
+    let mut envelope = Envelope::new();
+    envelope.clock(&batch.base_clock)?;
+    let identity = Dot {
+        actor: batch.actor,
+        counter: batch.counter,
+    };
+    for op in &batch.ops {
+        match op {
             QuadOp::Add {
                 subject,
                 predicate,
                 object,
-                ..
+                dot,
+            } => {
+                envelope.quad([subject, predicate, object])?;
+                envelope.dots(std::slice::from_ref(dot))?;
+                // One event dot may cover several quads of the same batch, but
+                // it is always that batch's own event.
+                if *dot != identity {
+                    return Err(CraqleSyncError::InvalidEvent(format!(
+                        "add dot {}:{} does not match the batch event {}:{}",
+                        dot.actor, dot.counter, identity.actor, identity.counter
+                    )));
+                }
             }
-            | QuadOp::Remove {
+            QuadOp::Remove {
                 subject,
                 predicate,
                 object,
-                ..
-            } => [subject, predicate, object],
-        };
-        for term in terms {
-            check_term(term)?;
+                witnessed,
+            } => {
+                envelope.quad([subject, predicate, object])?;
+                envelope.clock(witnessed)?;
+                if let Some(dot) = missing_dots(witnessed, &batch.base_clock).first() {
+                    return Err(CraqleSyncError::InvalidEvent(format!(
+                        "remove witnessed {}:{} beyond the batch base clock",
+                        dot.actor, dot.counter
+                    )));
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Same guard for a replica snapshot handed to craqle by an application.
+/// Same guard for a replica snapshot handed to craqle by an application. A
+/// live dot outside the snapshot context, a repeated quad, or a repeated dot
+/// would each describe a state no replica can hold.
 pub(crate) fn check_snapshot(snapshot: &crate::GraphReplicaSnapshot) -> SyncResult<()> {
+    check_graph(&snapshot.graph)?;
+    let mut envelope = Envelope::new();
+    envelope.clock(&snapshot.clock)?;
+    let mut keys = HashSet::new();
     for quad in &snapshot.quads {
-        for term in [&quad.subject, &quad.predicate, &quad.object] {
-            check_term(term)?;
+        envelope.quad([&quad.subject, &quad.predicate, &quad.object])?;
+        envelope.dots(&quad.dots)?;
+        if quad.dots.is_empty() {
+            return Err(CraqleSyncError::InvalidEvent(
+                "snapshot holds a live quad with no dot".to_string(),
+            ));
+        }
+        if !keys.insert((&quad.subject.0, &quad.predicate.0, &quad.object.0)) {
+            return Err(CraqleSyncError::InvalidEvent(
+                "snapshot repeats a quad identity".to_string(),
+            ));
+        }
+        let mut seen = HashSet::with_capacity(quad.dots.len());
+        for dot in &quad.dots {
+            if !seen.insert(*dot) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "snapshot repeats dot {}:{}",
+                    dot.actor, dot.counter
+                )));
+            }
+            if !snapshot.clock.contains(dot) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "live dot {}:{} is not covered by the snapshot clock",
+                    dot.actor, dot.counter
+                )));
+            }
         }
     }
     Ok(())

@@ -50,11 +50,11 @@ pub enum MergeError {
     InputRejected(String),
     /// Events the batch declares as its causal base that this replica has not
     /// applied. The transport must fetch them and retry.
-    #[error("missing causal dependencies: {}", missing_dots(.0))]
+    #[error("missing causal dependencies: {}", render_dots(.0))]
     MissingDependencies(Vec<Dot>),
 }
 
-fn missing_dots(dots: &[Dot]) -> String {
+fn render_dots(dots: &[Dot]) -> String {
     dots.iter()
         .map(|dot| format!("{}:{}", dot.actor, dot.counter))
         .collect::<Vec<_>>()
@@ -1810,10 +1810,11 @@ impl ReplicationEngine {
     /// Merge a batch that reached this node outside irokle.
     /// **Call with the graph's write lock held.**
     ///
-    /// The ops are term-checked first, exactly as a replicated record is, so a
-    /// foreign transport cannot hand the store content it could only fail on.
+    /// The whole envelope is validated first, exactly as a replicated record
+    /// is, so a foreign transport cannot hand the store content it could only
+    /// fail on, and nothing is staged for a rejected batch.
     pub(crate) fn merge_batch(&self, incoming: &Batch) -> Result<MergeResult, MergeError> {
-        crate::sync::check_ops(&incoming.ops)
+        crate::sync::check_batch(incoming)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
         self.apply_irokle_batch_with_plan(incoming, None, DiagnosticsMode::Immediate)
     }

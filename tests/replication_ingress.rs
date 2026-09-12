@@ -155,14 +155,21 @@ fn rejects_literal_subject() {
 }
 
 #[test]
-fn rejects_relative_iri() {
+fn rejects_broken_iri() {
     let temp = tempfile::tempdir().unwrap();
-    let node = open(temp.path(), "relative", 32);
-    let graph = GraphId::new("urn:test:ingress:relative-iri");
+    let node = open(temp.path(), "broken", 32);
+    let graph = GraphId::new("urn:test:ingress:broken-iri");
+    // A relative reference stays legal: RO-Crate entity ids are stored that
+    // way. A raw space or delimiter gives the term a second reading.
     for place in [Place::Subject, Place::Predicate, Place::Object] {
-        let mut incoming = valid(&graph);
-        poison(&mut incoming, place, "<not-absolute>");
-        rejects(&node, &incoming);
+        for term in ["<urn:test:has space>", "<urn:a\"b>", "<urn:a|b>"] {
+            let mut incoming = valid(&graph);
+            poison(&mut incoming, place, term);
+            rejects(&node, &incoming);
+        }
+        let mut allowed = valid(&graph);
+        poison(&mut allowed, place, "<ro-crate-metadata.json>");
+        assert!(node.merge_batch(&allowed).is_ok());
     }
 }
 
@@ -201,7 +208,7 @@ fn rejects_malformed_terms() {
         "\"",
         "\"x\"@",
         "\"x\"^^<>",
-        "\"x\"^^<not-absolute>",
+        "\"x\"^^<has space>",
         "\"x\"@not a tag",
         "_:",
         "_:has space",
