@@ -191,8 +191,20 @@ const OBJECT_ORDER_CACHE_BYTES: usize = 64 * 1_048_576;
 const PLANNER_DISTINCT_CACHE_CAP: usize = 4_096;
 const PLANNER_DISTINCT_CACHE_BYTES: usize = 1_048_576;
 const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
+/// Used only when no memory ceiling can be established.
 const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const MAX_DB_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
+/// Smallest useful block cache. Applied instead of the former 1 GiB floor, which
+/// exceeded the whole budget of a small container.
+const MIN_DB_CACHE_BYTES: u64 = 16 * 1_048_576;
+/// Share of the process budget for the storage block cache, and again for all
+/// application caches together.
+const CACHE_BUDGET_SHARE: u64 = 8;
+/// Control groups report an unlimited controller as a very large number rather
+/// than as `max`, so anything at or above this is treated as no ceiling.
+const CGROUP_UNLIMITED_BYTES: u64 = 1 << 62;
+/// Floor for one application cache, so a tight budget still caches something.
+const MIN_APP_CACHE_BYTES: usize = 262_144;
 /// Memtable ceiling for the append-heavy keyspaces (`quads`, `log`).
 ///
 /// This is the *only* knob that makes fjall 3.1.6 flush at all, and therefore
@@ -241,19 +253,136 @@ fn decode_disk_format(bytes: &[u8]) -> Result<DiskFormatVersion> {
     })
 }
 
-fn recommended_db_cache_bytes() -> u64 {
-    let available = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|meminfo| {
-            meminfo.lines().find_map(|line| {
-                let value = line.strip_prefix("MemAvailable:")?.trim();
-                let kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
-                Some(kib * 1024)
-            })
-        })
-        .unwrap_or(DEFAULT_DB_CACHE_BYTES);
+/// Byte ceilings for one store's caches, derived from the memory this process may
+/// use. Each ceiling keeps its historical value when the budget allows it and is
+/// scaled down in proportion otherwise; none is ever scaled up. These are
+/// accounted value bytes only, so they bound the caches, not resident memory.
+#[derive(Clone, Copy)]
+struct CacheBudget {
+    database: u64,
+    terms: usize,
+    subjects: usize,
+    objects: usize,
+    planner: usize,
+}
 
-    (available / 8).clamp(DEFAULT_DB_CACHE_BYTES, MAX_DB_CACHE_BYTES)
+impl CacheBudget {
+    fn from_limit(limit: Option<u64>) -> Self {
+        let Some(limit) = limit else {
+            return Self {
+                database: DEFAULT_DB_CACHE_BYTES,
+                terms: TERM_DECODE_CACHE_BYTES,
+                subjects: QUAD_SUBJECT_CACHE_BYTES,
+                objects: OBJECT_ORDER_CACHE_BYTES,
+                planner: PLANNER_DISTINCT_CACHE_BYTES,
+            };
+        };
+        let allowed = limit / CACHE_BUDGET_SHARE;
+        let total = (TERM_DECODE_CACHE_BYTES
+            + QUAD_SUBJECT_CACHE_BYTES
+            + OBJECT_ORDER_CACHE_BYTES
+            + PLANNER_DISTINCT_CACHE_BYTES) as u64;
+        Self {
+            database: (limit / CACHE_BUDGET_SHARE).clamp(MIN_DB_CACHE_BYTES, MAX_DB_CACHE_BYTES),
+            terms: scaled_ceiling(TERM_DECODE_CACHE_BYTES, allowed, total),
+            subjects: scaled_ceiling(QUAD_SUBJECT_CACHE_BYTES, allowed, total),
+            objects: scaled_ceiling(OBJECT_ORDER_CACHE_BYTES, allowed, total),
+            planner: scaled_ceiling(PLANNER_DISTINCT_CACHE_BYTES, allowed, total),
+        }
+    }
+
+    fn current() -> Self {
+        Self::from_limit(process_memory_limit())
+    }
+}
+
+fn scaled_ceiling(bytes: usize, allowed: u64, total: u64) -> usize {
+    if allowed >= total || total == 0 {
+        return bytes;
+    }
+    let scaled = (bytes as u64).saturating_mul(allowed) / total;
+    usize::try_from(scaled)
+        .unwrap_or(bytes)
+        .max(MIN_APP_CACHE_BYTES)
+}
+
+/// Memory available to this process, as the smaller of the host's available
+/// memory and any control-group ceiling. `None` when neither can be read, which
+/// keeps the historical fixed sizes rather than guessing a small budget.
+fn process_memory_limit() -> Option<u64> {
+    let host = meminfo_available(Path::new("/proc/meminfo"));
+    let cgroup = cgroup_memory_limit(Path::new("/proc/self/cgroup"), Path::new("/sys/fs/cgroup"));
+    match (host, cgroup) {
+        (Some(host), Some(cgroup)) => Some(host.min(cgroup)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn meminfo_available(path: &Path) -> Option<u64> {
+    let meminfo = std::fs::read_to_string(path).ok()?;
+    meminfo.lines().find_map(|line| {
+        let value = line.strip_prefix("MemAvailable:")?.trim();
+        let kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        kib.checked_mul(1024)
+    })
+}
+
+/// Smallest memory ceiling that applies to this process. Control-group version 2
+/// keeps `memory.max` in the process's own directory and in every ancestor;
+/// version 1 keeps `memory.limit_in_bytes` under the memory controller mount. A
+/// missing, unreadable, or non-numeric file contributes no ceiling.
+fn cgroup_memory_limit(mapping: &Path, root: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(mapping).ok()?;
+    let mut limit: Option<u64> = None;
+    for line in text.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(hierarchy), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let found = if hierarchy == "0" && controllers.is_empty() {
+            smallest_limit(root, Path::new(path), "memory.max")
+        } else if controllers.split(',').any(|name| name == "memory") {
+            smallest_limit(
+                &root.join("memory"),
+                Path::new(path),
+                "memory.limit_in_bytes",
+            )
+        } else {
+            continue;
+        };
+        if let Some(value) = found {
+            limit = Some(limit.map_or(value, |current: u64| current.min(value)));
+        }
+    }
+    limit
+}
+
+/// Reads `file` in `root` and in each directory along `relative`, keeping the
+/// smallest ceiling found, because an ancestor's limit also binds this process.
+fn smallest_limit(root: &Path, relative: &Path, file: &str) -> Option<u64> {
+    let mut limit = numeric_limit(&root.join(file));
+    let mut directory = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        directory.push(name);
+        if let Some(value) = numeric_limit(&directory.join(file)) {
+            limit = Some(limit.map_or(value, |found: u64| found.min(value)));
+        }
+    }
+    limit
+}
+
+/// `max`, an absent file, a denied read, and a malformed value all mean "no
+/// ceiling here". Version 1 reports an unlimited controller as a huge sentinel.
+fn numeric_limit(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = text.trim().parse::<u64>().ok()?;
+    (value < CGROUP_UNLIMITED_BYTES).then_some(value)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -576,15 +705,12 @@ struct IndexState {
     clocks: HashMap<TermId, VectorClock>,
 }
 
-impl Default for IndexState {
-    fn default() -> Self {
+impl IndexState {
+    fn with_budget(budget: &CacheBudget) -> Self {
         Self {
-            quad_subjects: BoundedCache::new(QUAD_SUBJECT_CACHE_CAP, QUAD_SUBJECT_CACHE_BYTES),
-            object_order: ObjectOrderCache::default(),
-            planner_distinct: BoundedCache::new(
-                PLANNER_DISTINCT_CACHE_CAP,
-                PLANNER_DISTINCT_CACHE_BYTES,
-            ),
+            quad_subjects: BoundedCache::new(QUAD_SUBJECT_CACHE_CAP, budget.subjects),
+            object_order: ObjectOrderCache::with_budget(budget),
+            planner_distinct: BoundedCache::new(PLANNER_DISTINCT_CACHE_CAP, budget.planner),
             generations: HashMap::new(),
             clocks: HashMap::new(),
         }
@@ -610,10 +736,10 @@ struct ObjectOrderCache {
     entries: BoundedCache<(ObjectOrderKey, u64), ObjectOrderValues>,
 }
 
-impl Default for ObjectOrderCache {
-    fn default() -> Self {
+impl ObjectOrderCache {
+    fn with_budget(budget: &CacheBudget) -> Self {
         Self {
-            entries: BoundedCache::new(OBJECT_ORDER_CACHE_CAP, OBJECT_ORDER_CACHE_BYTES),
+            entries: BoundedCache::new(OBJECT_ORDER_CACHE_CAP, budget.objects),
         }
     }
 }
@@ -5210,9 +5336,10 @@ impl GraphStore {
         // alone left 218 MiB of journal and an 8.7 s reopen, because the
         // eviction that enforces the cap only runs after a flush and the 1 GiB
         // memtables never produced one. See [`MAX_JOURNALING_BYTES`].
+        let budget = CacheBudget::current();
         let db = Database::builder(path.as_ref())
             .manual_journal_persist(true)
-            .cache_size(recommended_db_cache_bytes())
+            .cache_size(budget.database)
             .journal_compression(CompressionType::None)
             .max_journaling_size(MAX_JOURNALING_BYTES)
             .worker_threads(worker_threads)
@@ -5227,6 +5354,7 @@ impl GraphStore {
     /// Build a store on an already-open database with an explicit durability
     /// mode; [`GraphStore::open_with_persist_mode`] opens the database first.
     pub fn with_persist_mode(db: Database, persist_mode: PersistMode) -> Result<Self> {
+        let budget = CacheBudget::current();
         let point_read_heavy = || {
             KeyspaceCreateOptions::default()
                 .expect_point_read_hits(true)
@@ -5294,12 +5422,9 @@ impl GraphStore {
             validation_active: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, feature = "shacl-core"))]
             validation_max_active: std::sync::atomic::AtomicUsize::new(0),
-            indexes: RwLock::new(IndexState::default()),
+            indexes: RwLock::new(IndexState::with_budget(&budget)),
             diagnostics_cache: RwLock::new(HashMap::new()),
-            term_decode_cache: RwLock::new(BoundedCache::new(
-                TERM_DECODE_CACHE_CAP,
-                TERM_DECODE_CACHE_BYTES,
-            )),
+            term_decode_cache: RwLock::new(BoundedCache::new(TERM_DECODE_CACHE_CAP, budget.terms)),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
             #[cfg(test)]
@@ -7655,6 +7780,7 @@ mod tests {
     use crate::query_context::{QueryReadMode, ReadContext};
     use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
     use crate::search_queue::{QueueBound, drain_upto};
+    use std::os::unix::fs::PermissionsExt;
 
     fn setup_store() -> (tempfile::TempDir, GraphStore) {
         let dir = tempfile::tempdir().unwrap();
