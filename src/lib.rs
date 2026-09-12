@@ -33,6 +33,8 @@ mod query_context;
 mod query_cursor;
 #[path = "internal/query_worker.rs"]
 mod query_worker;
+#[path = "internal/qv_gate.rs"]
+mod qv_gate;
 #[allow(dead_code)]
 #[path = "internal/rdf_read.rs"]
 mod rdf_read;
