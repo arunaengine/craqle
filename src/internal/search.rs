@@ -128,6 +128,28 @@ struct TestHooks {
     rebuild: StallHook,
     /// Pauses a commit just before the Tantivy commit it is about to run.
     commit: StallHook,
+    /// Index searches run, so a test can prove one request runs one search.
+    searches: std::sync::atomic::AtomicUsize,
+    /// Stored documents decoded, so a test can bound what a page retains.
+    decoded: std::sync::atomic::AtomicUsize,
+    /// Every queue entry naming this graph fails, modelling a bad item.
+    fail_graph: Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    fn fail_item(&self, graph: &GraphId) -> Result<()> {
+        let armed = self
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if armed.as_deref() == Some(graph.as_str()) {
+            return Err(SearchError::Tantivy(tantivy::TantivyError::SystemError(
+                "injected item failure".to_string(),
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// A one-shot pause. `run` sleeps once armed and publishes `entered` for the
@@ -607,6 +629,11 @@ impl SearchIndex {
     fn collect_top_docs(&self, query: &dyn Query, limit: usize) -> Result<Vec<SearchHit>> {
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
+        #[cfg(test)]
+        {
+            self.hooks.searches.fetch_add(1, Ordering::SeqCst);
+            self.hooks.decoded.fetch_add(top_docs.len(), Ordering::SeqCst);
+        }
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -687,6 +714,8 @@ impl SearchIndex {
         let queued_graphs = drain_upto(&bound, |chunk| store.drain_fts_reindex_queue(chunk))?;
         if !queued_graphs.is_empty() {
             for entry in &queued_graphs {
+                #[cfg(test)]
+                self.hooks.fail_item(&entry.graph)?;
                 self.reindex_from_store(store, &entry.graph)?;
             }
 
@@ -717,6 +746,8 @@ impl SearchIndex {
             if !seen.insert((entry.graph.clone(), entry.subject)) {
                 continue;
             }
+            #[cfg(test)]
+            self.hooks.fail_item(&entry.graph)?;
             prepared.push(prepare_subject_op(
                 PrepareSubject {
                     store,
@@ -1601,5 +1632,181 @@ mod tests {
             found(&node),
             "the recovery must re-derive the index from the store, in one pass"
         );
+    }
+
+    fn writer_auth() -> crate::GrantAuthorizer {
+        crate::GrantAuthorizer::new(vec![crate::PermissionGrant::new(
+            "/t/**",
+            crate::PermissionLevel::Write,
+        )])
+    }
+
+    fn crate_request(graph: &GraphId, description: &str, public: bool) -> crate::CreateCrateRequest {
+        crate::CreateCrateRequest::new(
+            graph.clone(),
+            "Search Fixture",
+            description,
+            "2025-01-01",
+            None,
+            crate::core::GraphPolicy {
+                public,
+                permission_paths: vec!["/t/search-fixture".to_string()],
+            },
+        )
+    }
+
+    /// One request must run one search over one pinned reader. Escalating the
+    /// Tantivy fetch until enough hits survive authorization asks the index for
+    /// a multiple of the page the caller wanted, once per pass.
+    #[test]
+    fn search_runs_once() {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let writer = writer_auth();
+
+        // Comfortably past the smallest over-fetch, so one pass cannot see the
+        // whole matching corpus and call itself exhausted.
+        for index in 0..80 {
+            let graph = GraphId::new(&format!("urn:test:hidden-{index}"));
+            node.create_crate(&writer, crate_request(&graph, "clusterneedle", false))
+                .unwrap();
+        }
+        // Padded, so BM25 length normalization ranks the only readable match
+        // below every hidden one.
+        let padding = "filler ".repeat(200);
+        let visible = GraphId::new("urn:test:visible-match");
+        node.create_crate(
+            &writer,
+            crate_request(&visible, &format!("clusterneedle {padding}"), true),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        node.search.hooks.searches.store(0, Ordering::SeqCst);
+        node.search.hooks.decoded.store(0, Ordering::SeqCst);
+        let hits = node
+            .search(
+                &crate::GrantAuthorizer::default(),
+                crate::SearchRequest {
+                    query: "clusterneedle",
+                    limit: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(1, hits.len(), "the one readable match must be returned");
+        assert_eq!(visible.as_str(), hits[0].graph_id);
+        assert_eq!(
+            1,
+            node.search.hooks.searches.load(Ordering::SeqCst),
+            "a one-row page must not re-issue the query"
+        );
+        assert!(
+            node.search.hooks.decoded.load(Ordering::SeqCst) <= 8,
+            "decoded {} stored documents for a one-row page",
+            node.search.hooks.decoded.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Reopen the store a dropped node left behind, so a drain can be stepped
+    /// through without a background indexer racing it.
+    fn reopen_store(dir: &Path) -> Arc<GraphStore> {
+        Arc::new(GraphStore::open(dir.join("store")).unwrap())
+    }
+
+    fn graph_term(store: &GraphStore, graph: &GraphId) -> TermId {
+        store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .expect("the fixture graph must be interned")
+    }
+
+    /// A flush that triggers its own recovery owes the whole rebuild, not the
+    /// one queue entry that happened to land on its original cutoff.
+    #[test]
+    fn flush_covers_recovery() {
+        let dir = tempdir().unwrap();
+        let first = GraphId::new("urn:test:recovery-first");
+        let second = GraphId::new("urn:test:recovery-second");
+        let removed = GraphId::new("urn:test:recovery-removed");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            for graph in [&first, &second, &removed] {
+                node.create_crate(&writer_auth(), crate_request(graph, "recoveryneedle", true))
+                    .unwrap();
+            }
+            node.flush_search_updates().unwrap();
+        }
+
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open(dir.path().join("search")).unwrap());
+        assert_eq!(3, search.search("recoveryneedle", 50).unwrap().len());
+
+        // An older queue entry, so it consumes the first drain pass on its own.
+        store.delete_graph(&removed).unwrap();
+        // Strip every document behind the store's back: only a re-derivation
+        // from the store can bring the survivors back.
+        for graph in [&first, &second, &removed] {
+            search.delete_graph_documents(graph.as_str()).unwrap();
+        }
+        search.commit().unwrap();
+        assert_eq!(0, search.search("recoveryneedle", 50).unwrap().len());
+
+        poison_writer(search.clone());
+        crate::flush_search_queue(&store, &search).unwrap();
+
+        assert_eq!(
+            2,
+            search.search("recoveryneedle", 50).unwrap().len(),
+            "the flush reported success with part of its own rebuild unindexed"
+        );
+    }
+
+    /// One entry that always fails must not stop a different graph's queued
+    /// work, and the flush that covered it must say so.
+    #[test]
+    fn drain_isolates_failure() {
+        let dir = tempdir().unwrap();
+        let healthy = GraphId::new("urn:test:isolation-healthy");
+        let broken = GraphId::new("urn:test:isolation-broken");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            for graph in [&healthy, &broken] {
+                node.create_crate(
+                    &writer_auth(),
+                    crate_request(graph, "isolationneedle", true),
+                )
+                .unwrap();
+            }
+            node.flush_search_updates().unwrap();
+        }
+
+        // A fresh index, so only what this drain rebuilds can be found.
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let mut batch = store.new_batch();
+        for graph in [&healthy, &broken] {
+            let term = graph_term(&store, graph);
+            store.enqueue_fts_reindex(&mut batch, term).unwrap();
+        }
+        store.commit(batch).unwrap();
+        *search
+            .hooks
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(broken.as_str().to_string());
+
+        assert!(
+            crate::flush_search_queue(&store, &search).is_err(),
+            "a flush covering a failed entry must not report success"
+        );
+
+        let hits = search.search("isolationneedle", 50).unwrap();
+        assert_eq!(
+            1,
+            hits.len(),
+            "the healthy graph stayed unindexed behind a permanently failing entry"
+        );
+        assert_eq!(healthy.as_str(), hits[0].graph_id);
     }
 }

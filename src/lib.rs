@@ -6058,4 +6058,28 @@ mod tests {
             }],
         )
     }
+
+    /// One work slice must not queue an unbounded number of control replies:
+    /// a client loop calling `flush_search_updates` can outrun the indexer.
+    #[test]
+    fn control_messages_bounded() {
+        let (sender, receiver) = mpsc::channel();
+        let mut keep_alive = Vec::new();
+        for _ in 0..10_000 {
+            let (reply, waiter) = mpsc::channel();
+            sender.send(SearchWorkerMessage::Flush(reply)).unwrap();
+            keep_alive.push(waiter);
+        }
+        sender.send(SearchWorkerMessage::Stop).unwrap();
+
+        let mut replies = Vec::new();
+        let stopping = collect_search_worker_messages(&receiver, &mut replies);
+
+        assert!(
+            replies.len() <= 1_024,
+            "collected {} pending flush replies in one cycle",
+            replies.len()
+        );
+        assert!(stopping, "Stop must be observed in the same cycle");
+    }
 }

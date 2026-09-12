@@ -178,4 +178,60 @@ mod tests {
 
         assert_eq!(2, drained.len());
     }
+
+    /// A bounded drain must never hand back more rows than the caller asked
+    /// for: the widening below reads past the chunk to find eligible work, and
+    /// everything it finds used to be returned.
+    #[test]
+    fn drain_bounds_rows() {
+        let bound = QueueBound {
+            chunk: 2,
+            max_token: Some(10),
+        };
+
+        let drained = drain_upto(&bound, queue(&[99, 99, 99, 99, 99, 7, 3, 5])).unwrap();
+
+        assert!(
+            drained.len() <= bound.chunk,
+            "returned {} rows for a chunk of {}",
+            drained.len(),
+            bound.chunk
+        );
+    }
+
+    /// Widening must not let a single pass read an unbounded number of rows
+    /// beyond the caller's chunk without reporting how many it touched.
+    #[test]
+    fn drain_reports_reads() {
+        let reads = std::cell::RefCell::new(Vec::new());
+        let tokens: Vec<u64> = (0..64).map(|_| 99).chain([7]).collect();
+        let bound = QueueBound {
+            chunk: 2,
+            max_token: Some(10),
+        };
+
+        let drained = drain_upto(&bound, |chunk| {
+            reads.borrow_mut().push(chunk);
+            Ok(tokens
+                .iter()
+                .take(chunk)
+                .map(|&token| DirtyGraph {
+                    graph: GraphId::new("urn:test:queue"),
+                    tokens: DirtyTokens {
+                        oldest: token,
+                        latest: token,
+                    },
+                })
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(vec![7], oldest(&drained));
+        let total: usize = reads.borrow().iter().sum();
+        assert!(
+            total <= tokens.len(),
+            "re-read the same prefix head {total} times over {} rows",
+            tokens.len()
+        );
+    }
 }

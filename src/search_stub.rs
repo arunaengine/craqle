@@ -126,3 +126,34 @@ impl SearchIndex {
         Ok(0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// A build without an index must not acknowledge queue rows it never
+    /// indexed: those rows are the only record of what a later search-enabled
+    /// build still owes.
+    #[test]
+    fn drain_keeps_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        node.create_crate(
+            &crate::AllowAllAuthorizer,
+            crate::CreateCrateRequest::new(
+                crate::core::GraphId::new("urn:test:disabled-debt"),
+                "Disabled Debt Crate",
+                "needlebody",
+                "2025-01-01",
+                None,
+                crate::core::GraphPolicy::default(),
+            ),
+        )
+        .unwrap();
+        node.flush_search_updates().unwrap();
+
+        let owed = node.store.drain_fts_queue(usize::MAX).unwrap();
+        assert!(
+            !owed.is_empty(),
+            "the disabled build erased the search debt it could not index"
+        );
+    }
+}
