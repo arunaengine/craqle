@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 mod support;
 
 use crate::support::TestWriteExt as _;
@@ -225,10 +227,11 @@ fn cancel_during_evaluation() {
         .node
         .prepare_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }")
         .unwrap();
-    let authorizer = move |_: &GraphId, _: &GraphPolicy, _: Action| -> Result<(), AuthorizationError> {
-        cancellation.cancel();
-        Ok(())
-    };
+    let authorizer =
+        move |_: &GraphId, _: &GraphPolicy, _: Action| -> Result<(), AuthorizationError> {
+            cancellation.cancel();
+            Ok(())
+        };
     let error = fixture
         .node
         .execute_prepared_in_graphs(

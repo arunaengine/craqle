@@ -426,7 +426,6 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
             property_path_depth: property_path_depth(path),
             guarded_hash: true,
             estimated_rows: 1,
-            ..QueryFeatures::default()
         },
         GraphPattern::Join { left, right }
         | GraphPattern::Lateral { left, right }
@@ -1300,11 +1299,8 @@ impl SparqlEngine {
                         authorize_update_template_graph(&view, auth, &quad.graph_name)?;
                     }
                     let cancellation = QueryCancellation::new();
-                    let clock = RequestClock::start(
-                        options.limits.deadline,
-                        cancellation.clone(),
-                        started,
-                    );
+                    let clock =
+                        RequestClock::start(options.limits.deadline, cancellation.clone(), started);
                     let template_width = delete.len().saturating_add(insert.len()).max(1);
                     let max_materialized_quads = options
                         .limits
@@ -1324,8 +1320,8 @@ impl SparqlEngine {
                         update_read_limits(&options.limits),
                         clock,
                     )?);
-                    let evaluator =
-                        QueryEvaluator::new().with_cancellation_token(cancellation.evaluator_token());
+                    let evaluator = QueryEvaluator::new()
+                        .with_cancellation_token(cancellation.evaluator_token());
                     let mut prepared = evaluator.prepare_delete_insert(
                         delete.clone(),
                         insert.clone(),
@@ -3082,26 +3078,24 @@ where
         let view = self.view;
         let context = self.context;
         let query_budget = self.query_budget.clone();
-        Box::new(
-            view.graph_term_id_iter()
-                .filter_map(move |graph_id| match graph_id {
-                    Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
-                        Ok(true) => Some(
-                            query_budget
-                                .as_ref()
-                                .map_or(Ok(()), |budget| budget.check().map_err(Into::into))
-                                .and_then(|()| {
-                                    Self::stored_term(view, context, graph_id, false)
-                                        .map(StoreTerm::Existing)
-                                        .map_err(Into::into)
-                                }),
-                        ),
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error.into())),
-                    },
+        Box::new(view.graph_term_id_iter().filter_map(move |graph_id| {
+            match graph_id {
+                Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
+                    Ok(true) => Some(
+                        query_budget
+                            .as_ref()
+                            .map_or(Ok(()), |budget| budget.check().map_err(Into::into))
+                            .and_then(|()| {
+                                Self::stored_term(view, context, graph_id, false)
+                                    .map(StoreTerm::Existing)
+                            }),
+                    ),
+                    Ok(false) => None,
                     Err(error) => Some(Err(error.into())),
-                }),
-        )
+                },
+                Err(error) => Some(Err(error.into())),
+            }
+        }))
     }
 
     /// Graph existence for `GRAPH <g> { ... }` (charter G9).
