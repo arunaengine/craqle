@@ -9,6 +9,10 @@ pub(crate) struct CacheStatistics {
     pub(crate) hits: u64,
     pub(crate) misses: u64,
     pub(crate) evictions: u64,
+    /// Keys the removal predicate was asked about.
+    pub(crate) inspections: u64,
+    /// Times the recency order was rebuilt and sorted.
+    pub(crate) compactions: u64,
 }
 
 struct CacheEntry<V> {
@@ -27,6 +31,10 @@ pub(crate) struct BoundedCache<K, V> {
     hits: u64,
     misses: u64,
     evictions: u64,
+    #[cfg(test)]
+    inspections: u64,
+    #[cfg(test)]
+    compactions: u64,
 }
 
 impl<K, V> BoundedCache<K, V>
@@ -44,6 +52,10 @@ where
             hits: 0,
             misses: 0,
             evictions: 0,
+            #[cfg(test)]
+            inspections: 0,
+            #[cfg(test)]
+            compactions: 0,
         }
     }
 
@@ -96,12 +108,19 @@ where
     }
 
     pub(crate) fn remove_where(&mut self, mut predicate: impl FnMut(&K) -> bool) {
+        #[cfg(test)]
+        {
+            self.inspections = self.inspections.saturating_add(self.entries.len() as u64);
+        }
         let keys = self
             .entries
             .keys()
             .filter(|key| predicate(key))
             .cloned()
             .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return;
+        }
         for key in keys {
             self.remove(&key);
         }
@@ -123,6 +142,8 @@ where
             hits: self.hits,
             misses: self.misses,
             evictions: self.evictions,
+            inspections: self.inspections,
+            compactions: self.compactions,
         }
     }
 
@@ -148,6 +169,10 @@ where
     }
 
     fn compact_order(&mut self) {
+        #[cfg(test)]
+        {
+            self.compactions = self.compactions.saturating_add(1);
+        }
         let mut order = self
             .entries
             .iter()

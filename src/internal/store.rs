@@ -623,10 +623,6 @@ impl ObjectOrderCache {
         self.entries.get_cloned(&(*key, generation))
     }
 
-    fn invalidate(&mut self, key: &ObjectOrderKey) {
-        self.entries.remove_where(|(cached, _)| cached == key);
-    }
-
     #[cfg(test)]
     fn clear(&mut self) {
         self.entries.clear();
@@ -660,17 +656,17 @@ struct OrderEntry {
 }
 
 impl IndexState {
+    /// A graph's generation is part of every cache key, and every fill rechecks
+    /// it before installing, so one bump per changed graph already makes all of
+    /// that graph's older entries unreachable. Scanning the caches once per
+    /// changed quad repeated that work without changing any answer; the stale
+    /// entries are reclaimed by the ordinary entry and byte budget instead.
     fn publish(&mut self, publish: &PendingPublish) {
         let mut changed_graphs = HashSet::new();
         for mutation in &publish.quad_mutations {
             let quad = match mutation {
                 QuadMutation::Insert(quad) | QuadMutation::Remove(quad) => *quad,
             };
-            self.quad_subjects.remove_where(|(graph, subject, _)| {
-                *graph == quad.graph && *subject == quad.subject
-            });
-            self.object_order
-                .invalidate(&(quad.graph, quad.subject, quad.predicate));
             changed_graphs.insert(quad.graph);
         }
         for graph in changed_graphs {
