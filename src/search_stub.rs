@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::core::GraphId;
-pub(crate) use crate::search_queue::QueueBound;
+pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
 use crate::store::GraphStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -108,8 +108,16 @@ impl SearchIndex {
     /// wrote before the feature was turned off, and serves text the store no
     /// longer holds. The entries coalesce per `(graph, subject)`, so the
     /// retained debt is bounded by the corpus rather than by the write count.
-    pub fn process_queued_updates(&self, _store: &GraphStore, _bound: QueueBound) -> Result<usize> {
-        Ok(0)
+    pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
+        Ok(self.drain_queues(store, bound)?.covered)
+    }
+
+    pub fn drain_queues(
+        &self,
+        _store: &GraphStore,
+        _bound: QueueBound,
+    ) -> Result<crate::search_queue::DrainProgress> {
+        Ok(crate::search_queue::DrainProgress::default())
     }
 
     pub fn reindex_from_store(&self, _store: &GraphStore, _graph: &GraphId) -> Result<usize> {
