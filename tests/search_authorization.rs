@@ -10,10 +10,7 @@ use craqle::{
 const NEEDLE: &str = "authneedle";
 
 fn writer_auth() -> GrantAuthorizer {
-    GrantAuthorizer::new(vec![PermissionGrant::new(
-        "/t/**",
-        PermissionLevel::Write,
-    )])
+    GrantAuthorizer::new(vec![PermissionGrant::new("/t/**", PermissionLevel::Write)])
 }
 
 fn policy(public: bool) -> GraphPolicy {

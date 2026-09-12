@@ -15,8 +15,8 @@ use tantivy::tokenizer::{
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::core::{EncodedTerm, GraphId};
-pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
 use crate::search_queue::{DirtySubject, DrainProgress, drain_upto};
+pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
 use crate::store::{GraphStore, TermId};
 
 const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
@@ -735,7 +735,9 @@ impl SearchIndex {
         #[cfg(test)]
         {
             self.hooks.searches.fetch_add(1, Ordering::SeqCst);
-            self.hooks.decoded.fetch_add(top_docs.len(), Ordering::SeqCst);
+            self.hooks
+                .decoded
+                .fetch_add(top_docs.len(), Ordering::SeqCst);
         }
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -813,7 +815,10 @@ impl SearchIndex {
         let quota = bound.chunk.div_ceil(3).max(1);
         let mut pass = DrainPass {
             store,
-            bound: QueueBound { chunk: quota, ..bound },
+            bound: QueueBound {
+                chunk: quota,
+                ..bound
+            },
             progress: DrainProgress {
                 recovery,
                 ..DrainProgress::default()
@@ -848,7 +853,10 @@ impl SearchIndex {
                     self.clear_failure(&key);
                     covered.push(entry.clone());
                 }
-                Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+                Err(error) => pass
+                    .progress
+                    .failures
+                    .push(self.record_failure(key, &error)),
             }
         }
         if covered.is_empty() {
@@ -900,7 +908,10 @@ impl SearchIndex {
                     self.clear_failure(&key);
                     covered.push(entry.clone());
                 }
-                Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+                Err(error) => pass
+                    .progress
+                    .failures
+                    .push(self.record_failure(key, &error)),
             }
         }
         if covered.is_empty() {
@@ -940,7 +951,8 @@ impl SearchIndex {
         // Held across both phases: a rebuild of one of these graphs must not
         // clear and refill it from a scan that straddles the read below and
         // the apply that follows it.
-        let rebuild_guards = self.lock_graphs(slice.entries.iter().map(|entry| entry.graph.as_str()));
+        let rebuild_guards =
+            self.lock_graphs(slice.entries.iter().map(|entry| entry.graph.as_str()));
 
         // Phase 1: read every update from the store with NO writer lock held,
         // stopping once the prepared text reaches the pass budget.
@@ -965,17 +977,23 @@ impl SearchIndex {
                 pass.progress.failures.push(failure);
                 continue;
             }
-            match self.prepare_queued_entry(&mut caches, PrepareSubject {
-                store: pass.store,
-                graph: &entry.graph,
-                subject: entry.subject,
-            }) {
+            match self.prepare_queued_entry(
+                &mut caches,
+                PrepareSubject {
+                    store: pass.store,
+                    graph: &entry.graph,
+                    subject: entry.subject,
+                },
+            ) {
                 Ok(op) => {
                     prepared_bytes = prepared_bytes.saturating_add(op.text_bytes());
                     self.clear_failure(&key);
                     prepared.push((op, entry.clone()));
                 }
-                Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+                Err(error) => pass
+                    .progress
+                    .failures
+                    .push(self.record_failure(key, &error)),
             }
         }
 
@@ -988,7 +1006,10 @@ impl SearchIndex {
                 let key = FailureKey::subject(&entry.graph, entry.subject);
                 match self.apply_prepared_op(&mut writer, op) {
                     Ok(()) => covered.push(entry.clone()),
-                    Err(error) => pass.progress.failures.push(self.record_failure(key, &error)),
+                    Err(error) => pass
+                        .progress
+                        .failures
+                        .push(self.record_failure(key, &error)),
                 }
             }
         }
@@ -1884,7 +1905,11 @@ mod tests {
         )])
     }
 
-    fn crate_request(graph: &GraphId, description: &str, public: bool) -> crate::CreateCrateRequest {
+    fn crate_request(
+        graph: &GraphId,
+        description: &str,
+        public: bool,
+    ) -> crate::CreateCrateRequest {
         crate::CreateCrateRequest::new(
             graph.clone(),
             "Search Fixture",
