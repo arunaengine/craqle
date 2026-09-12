@@ -8463,6 +8463,68 @@ mod tests {
         assert_eq!(meminfo_available(&dir.path().join("absent")), None);
     }
 
+    /// Runs `mutate` on another thread while this thread owns query-view
+    /// maintenance, and reports whether that commit published durable projection
+    /// debt before its repair could run.
+    fn debt_seen_during(store: &GraphStore, mutate: impl FnOnce() + Send) -> bool {
+        let held = store.qv_gate.try_acquire().expect("gate starts free");
+        let mut observed = false;
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(mutate);
+            while store.qv_gate.waiting() == 0 && !worker.is_finished() {
+                std::thread::yield_now();
+            }
+            observed = store
+                .projection_debt_present(&store.read_snapshot().snapshot)
+                .unwrap();
+            held.finish();
+            worker.join().expect("mutation finished");
+        });
+        observed
+    }
+
+    /// Every authoritative mutation path reaches the same commit point, so each
+    /// one either publishes its query-view rows in the source batch or publishes
+    /// durable projection debt. Exercised here through a real remove and a real
+    /// graph deletion, not through a hand-built batch.
+    #[test]
+    fn every_mutation_path_records_debt() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-entry-points");
+        store.create_graph(&graph).unwrap();
+        let kept = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o"));
+        let doomed = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
+        commit_add(&store, &graph, kept);
+        let dot = commit_add(&store, &graph, doomed);
+        assert_query_index_ready(&store, 2);
+
+        let mut witnessed = VectorClock::new();
+        witnessed.advance(dot.actor, dot.counter);
+        assert!(
+            debt_seen_during(&store, || {
+                commit_remove(&store, &graph, doomed, &witnessed);
+            }),
+            "a removal that skipped maintenance must publish projection debt"
+        );
+        assert_query_index_ready(&store, 1);
+
+        let actor = ActorId::random();
+        let clock = store.get_vector_clock(&graph).unwrap();
+        let tombstone = GraphTombstone {
+            graph: graph.clone(),
+            delete_event: EventId::graph_delete(&graph, actor, &clock),
+            delete_actor: actor,
+            delete_clock: clock,
+        };
+        assert!(
+            debt_seen_during(&store, || {
+                store.delete_graph_tombstoned(&tombstone).unwrap();
+            }),
+            "a graph deletion that skipped maintenance must publish projection debt"
+        );
+        assert_query_index_ready(&store, 0);
+    }
+
     #[test]
     fn planner_distinct_counts() {
         let (_dir, store) = setup_store();
