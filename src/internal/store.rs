@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 #[cfg(feature = "shacl-core")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::cache::BoundedCache;
 #[cfg(test)]
 use crate::cache::CacheStatistics;
 use crate::core::*;
+use crate::qv_gate::QvCommitGate;
 use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
 use crate::{
     CraqleErrorKind, DISK_FORMAT_VERSION, DiskFormatVersion, QueryIndexState, QueryIndexStatus,
@@ -47,6 +49,8 @@ pub enum StoreError {
     },
     #[error("query index unavailable: {0}")]
     QueryIndexUnavailable(&'static str),
+    #[error("query-index maintenance is busy; the write was not applied")]
+    QueryIndexBusy,
     #[error("authoritative disk-format marker is missing from a non-empty store")]
     MissingAuthoritativeFormat,
     #[error("invalid authoritative disk-format marker")]
@@ -68,7 +72,9 @@ impl StoreError {
     pub(crate) fn kind(&self) -> CraqleErrorKind {
         match self {
             Self::Cancelled => CraqleErrorKind::Cancelled,
-            Self::TermCollision { .. } | Self::CursorCompareFailed => CraqleErrorKind::Conflict,
+            Self::TermCollision { .. } | Self::CursorCompareFailed | Self::QueryIndexBusy => {
+                CraqleErrorKind::Conflict
+            }
             Self::GraphNotFound(_) => CraqleErrorKind::InvalidInput,
             Self::QueryIndexVerificationFailed(_)
             | Self::InvalidQueryIndexEncoding { .. }
@@ -172,8 +178,10 @@ const SHACL_PENDING_QUEUE_SCHEMA_KEY: &[u8] = b"vshacl-pending-queue";
 const SHACL_PENDING_QUEUE_SCHEMA_VERSION: u8 = 1;
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
-const QV_COMMIT_ACTIVE: u64 = 1;
-const QV_COMMIT_DIRTY: u64 = 2;
+/// How long a graph commit waits for query-view maintenance ownership before it
+/// reports the store busy. A full rebuild owns the gate for its whole duration,
+/// so the wait is generous and the caller is refused rather than stalled forever.
+const QV_COMMIT_WAIT: Duration = Duration::from_secs(120);
 const TERM_DECODE_CACHE_CAP: usize = 1_000_000;
 const TERM_DECODE_CACHE_BYTES: usize = 128 * 1_048_576;
 const QUAD_SUBJECT_CACHE_CAP: usize = 65_536;
@@ -288,7 +296,10 @@ enum QuadMutation {
 type QuadKey = [u8; 64];
 type QueryQuadKey = [u8; 32];
 
-const QUERY_INDEX_SCHEMA_VERSION: u32 = 2;
+const QUERY_INDEX_SCHEMA_VERSION: u32 = 3;
+/// Version 2 headers predate atomic source-plus-query-view publication, so a
+/// `Ready` state from one is not evidence of coverage until it is verified.
+const QUERY_INDEX_LEGACY_SCHEMA_VERSION: u32 = 2;
 const QUERY_INDEX_HEADER_KEY: [u8; 1] = *b"H";
 const QUERY_INDEX_TOTAL_KEY: [u8; 1] = *b"T";
 const QUERY_INDEX_HEADER_MAGIC: [u8; 4] = *b"QVI2";
@@ -304,6 +315,7 @@ const QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG: u8 = b'A';
 const QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG: u8 = b'O';
 const QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG: u8 = b'X';
 const QUERY_INDEX_UNION_DUPLICATE_FREE_TAG: u8 = b'U';
+const QUERY_INDEX_PROJECTION_DEBT_TAG: u8 = b'W';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StoredQueryIndexState {
@@ -423,12 +435,14 @@ impl QueryIndexCounterKey {
 enum QueryIndexHeaderRead {
     Absent,
     Valid(QueryIndexHeader),
+    Legacy(QueryIndexHeader),
     Malformed,
 }
 
 enum QueryIndexCounterKeyRead {
     Header,
     Counter(QueryIndexCounterKey),
+    ProjectionDebt,
     UnknownTag,
     InvalidLength,
 }
@@ -734,12 +748,12 @@ pub struct GraphStore {
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
     /// [`GraphStore::graph_commit_guard`].
     commit_locks: Vec<Mutex<()>>,
-    /// One qv maintainer may stage global counters at a time. Other graph
-    /// commits never wait: they mark qv degraded and commit source state.
-    qv_commit_state: AtomicU64,
-    qv_degraded: AtomicBool,
-    qv_pending_commits: AtomicU64,
-    qv_catchup_failed: AtomicBool,
+    /// One qv maintainer stages global counters at a time. A graph commit that
+    /// cannot own the gate still commits its source rows, together with the
+    /// durable projection debt that keeps those rows out of qv admission.
+    qv_gate: QvCommitGate,
+    qv_commit_wait: Duration,
+    qv_debt_next: AtomicU64,
     #[cfg(feature = "shacl-core")]
     binding_lock: Mutex<()>,
     #[cfg(feature = "shacl-core")]
@@ -843,14 +857,6 @@ pub struct GraphStore {
 ///
 /// Poison is recovered: the protected state lives in fjall, not behind the mutex.
 pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
-
-struct QueryIndexCommitReset<'a>(&'a AtomicU64);
-
-impl Drop for QueryIndexCommitReset<'_> {
-    fn drop(&mut self) {
-        self.0.store(0, Ordering::Release);
-    }
-}
 
 #[cfg(feature = "shacl-core")]
 pub(crate) struct BindingGuard<'a> {
@@ -1262,6 +1268,13 @@ fn decode_query_index_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(raw))
 }
 
+fn projection_debt_key(debt: u64) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = QUERY_INDEX_PROJECTION_DEBT_TAG;
+    key[1..9].copy_from_slice(&debt.to_be_bytes());
+    key
+}
+
 fn query_index_failure_code_is_valid(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= QUERY_INDEX_FAILURE_MAX_BYTES
@@ -1312,9 +1325,12 @@ fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
             .try_into()
             .expect("fixed query-index header slice"),
     );
-    if schema_version != QUERY_INDEX_SCHEMA_VERSION {
+    if schema_version != QUERY_INDEX_SCHEMA_VERSION
+        && schema_version != QUERY_INDEX_LEGACY_SCHEMA_VERSION
+    {
         return QueryIndexHeaderRead::Malformed;
     }
+    let legacy = schema_version == QUERY_INDEX_LEGACY_SCHEMA_VERSION;
     let Some(source_epoch) = decode_query_index_u64(&bytes[12..20]) else {
         return QueryIndexHeaderRead::Malformed;
     };
@@ -1355,7 +1371,7 @@ fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
         }
         _ => return QueryIndexHeaderRead::Malformed,
     };
-    QueryIndexHeaderRead::Valid(QueryIndexHeader {
+    let header = QueryIndexHeader {
         state,
         source_epoch,
         index_epoch,
@@ -1364,7 +1380,12 @@ fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
         last_build_sequence,
         query_id_generation,
         next_query_id,
-    })
+    };
+    if legacy {
+        QueryIndexHeaderRead::Legacy(header)
+    } else {
+        QueryIndexHeaderRead::Valid(header)
+    }
 }
 
 fn query_index_term_at(bytes: &[u8], offset: usize) -> QueryTermId {
@@ -1421,6 +1442,10 @@ fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
             | QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG
             | QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG,
         ) => QueryIndexCounterKeyRead::InvalidLength,
+        Some(QUERY_INDEX_PROJECTION_DEBT_TAG) if bytes.len() == 9 => {
+            QueryIndexCounterKeyRead::ProjectionDebt
+        }
+        Some(QUERY_INDEX_PROJECTION_DEBT_TAG) => QueryIndexCounterKeyRead::InvalidLength,
         Some(_) => QueryIndexCounterKeyRead::UnknownTag,
         None => QueryIndexCounterKeyRead::InvalidLength,
     }
@@ -1635,6 +1660,7 @@ pub(crate) struct QueryIndexAdmission {
     pub(crate) fallback_reason: Option<&'static str>,
     pub(crate) header_reads: u64,
     pub(crate) counter_reads: u64,
+    pub(crate) debt_reads: u64,
 }
 
 /// One immutable, publication-coherent durable read view.
@@ -2307,21 +2333,25 @@ impl GraphStore {
         self.read_snapshot().snapshot
     }
 
-    /// O(1) qv2 eligibility gate for a single execution snapshot. Full source
-    /// and qv cross-checking belongs to open-time verification and explicit
-    /// maintenance checks; doing it here would erase the index's query value.
+    /// O(1) qv2 eligibility gate for a single execution snapshot.
+    ///
+    /// Every input comes from `snapshot` itself, so a view captured earlier keeps
+    /// its own correct answer after later writes, repairs, or reopen. Source rows
+    /// and their qv rows are published in one batch, so a coherent header in this
+    /// snapshot is evidence of coverage for this snapshot.
     fn snapshot_admission(&self, snapshot: &Snapshot) -> Result<QueryIndexAdmission> {
         #[cfg(test)]
         self.query_index_admission_probes
             .fetch_add(1, Ordering::Relaxed);
-        if self.qv_degraded.load(Ordering::Acquire) {
+        if self.projection_debt_present(snapshot)? {
             return Ok(QueryIndexAdmission {
                 trusted: false,
                 query_id_generation: None,
                 query_id_upper_bound: None,
-                fallback_reason: Some("concurrent-source-commit"),
+                fallback_reason: Some("source-commit-projection-pending"),
                 header_reads: 0,
                 counter_reads: 0,
+                debt_reads: 1,
             });
         }
         let header = match self.query_index_header_from_snapshot(snapshot)? {
@@ -2333,6 +2363,7 @@ impl GraphStore {
                     fallback_reason: Some("metadata-missing"),
                     header_reads: 1,
                     counter_reads: 0,
+                    debt_reads: 1,
                 });
             }
             QueryIndexHeaderRead::Malformed => {
@@ -2343,11 +2374,25 @@ impl GraphStore {
                     fallback_reason: Some("metadata-malformed"),
                     header_reads: 1,
                     counter_reads: 0,
+                    debt_reads: 1,
+                });
+            }
+            QueryIndexHeaderRead::Legacy(_) => {
+                return Ok(QueryIndexAdmission {
+                    trusted: false,
+                    query_id_generation: None,
+                    query_id_upper_bound: None,
+                    fallback_reason: Some("legacy-coverage-unverified"),
+                    header_reads: 1,
+                    counter_reads: 0,
+                    debt_reads: 1,
                 });
             }
             QueryIndexHeaderRead::Valid(header) => header,
         };
-        self.header_admission(snapshot, &header)
+        let mut admission = self.header_admission(snapshot, &header)?;
+        admission.debt_reads += 1;
+        Ok(admission)
     }
 
     fn header_admission(
@@ -2374,6 +2419,7 @@ impl GraphStore {
                 fallback_reason: Some(fallback_reason),
                 header_reads: 1,
                 counter_reads: 0,
+                debt_reads: 0,
             });
         }
         #[cfg(test)]
@@ -2394,6 +2440,7 @@ impl GraphStore {
             fallback_reason,
             header_reads: 1,
             counter_reads: 1,
+            debt_reads: 0,
         })
     }
 
@@ -2507,6 +2554,12 @@ impl GraphStore {
                 0,
                 0,
             ),
+            QueryIndexHeaderRead::Legacy(header) => (
+                QueryIndexState::Failed("legacy-coverage-unverified".to_owned()),
+                header.last_build_sequence,
+                header.query_id_generation,
+                header.next_query_id,
+            ),
             QueryIndexHeaderRead::Valid(header) => {
                 let total_matches_header = matches!(
                     self.query_index_counter_from_snapshot(&snapshot, QueryIndexCounterKey::Total)?,
@@ -2575,21 +2628,18 @@ impl GraphStore {
                 0,
                 0,
             ),
+            QueryIndexHeaderRead::Legacy(header) => (
+                QueryIndexState::Failed("legacy-coverage-unverified".to_owned()),
+                header.query_id_generation,
+                header.next_query_id,
+                header.source_live_quads,
+                header.indexed_quads,
+                header.last_build_sequence,
+            ),
             QueryIndexHeaderRead::Valid(header) => {
                 #[cfg(test)]
                 self.query_index_admission_probes
                     .fetch_add(1, Ordering::Relaxed);
-                if self.qv_degraded.load(Ordering::Acquire) {
-                    return Ok(QueryIndexStatus {
-                        schema_version: QUERY_INDEX_SCHEMA_VERSION,
-                        state: QueryIndexState::Failed("concurrent-source-commit".to_owned()),
-                        query_id_generation: header.query_id_generation,
-                        query_term_ids: header.next_query_id,
-                        source_live_quads: header.source_live_quads,
-                        indexed_quads: header.indexed_quads,
-                        last_build_sequence: header.last_build_sequence,
-                    });
-                }
                 let admission = self.header_admission(&snapshot, &header)?;
                 let state =
                     if matches!(header.state, StoredQueryIndexState::Ready) && !admission.trusted {
@@ -2638,6 +2688,9 @@ impl GraphStore {
 
     fn initialize_query_indexes_at_open(&self) -> Result<()> {
         let snapshot = self.db.snapshot();
+        if self.fail_unrepaired_debt(&snapshot)? {
+            return Ok(());
+        }
         match self.query_index_header_from_snapshot(&snapshot)? {
             QueryIndexHeaderRead::Absent => {
                 let source_live_quads = self.count_live_source_rows(&snapshot)?;
@@ -2668,6 +2721,7 @@ impl GraphStore {
                 self.stage_query_index_failed(&mut batch, None, "metadata-malformed");
                 self.commit_fjall_batch(batch)
             }
+            QueryIndexHeaderRead::Legacy(header) => self.certify_legacy_header(&snapshot, header),
             QueryIndexHeaderRead::Valid(header) => {
                 if !matches!(header.state, StoredQueryIndexState::Ready) {
                     return Ok(());
@@ -2681,6 +2735,30 @@ impl GraphStore {
                 self.commit_fjall_batch(batch)
             }
         }
+    }
+
+    /// Upgrades a header written before source and qv rows were published in one
+    /// batch. Its `Ready` state cannot prove coverage, so it is verified in full
+    /// once and then rewritten in the current format. Writing nothing on failure
+    /// keeps the migration safe to interrupt and safe to retry.
+    fn certify_legacy_header(&self, snapshot: &Snapshot, header: QueryIndexHeader) -> Result<()> {
+        if !matches!(header.state, StoredQueryIndexState::Ready) {
+            let mut batch = self.buffered_batch();
+            self.stage_query_index_header(&mut batch, &header);
+            return self.commit_fjall_batch(batch);
+        }
+        let report = self.verify_query_index_snapshot(
+            snapshot,
+            true,
+            QueryIndexVerificationExpectation::Ready,
+        )?;
+        let mut batch = self.buffered_batch();
+        if report.valid {
+            self.stage_query_index_header(&mut batch, &header);
+        } else {
+            self.stage_query_index_failed(&mut batch, Some(&header), "legacy-coverage-unverified");
+        }
+        self.commit_fjall_batch(batch)
     }
 
     fn query_index_row_is_sampled(full: bool, checked: u64) -> bool {
@@ -3053,7 +3131,7 @@ impl GraphStore {
                             ))?;
                     if !matches!(
                         decode_query_index_header(value.as_ref()),
-                        QueryIndexHeaderRead::Valid(_)
+                        QueryIndexHeaderRead::Valid(_) | QueryIndexHeaderRead::Legacy(_)
                     ) {
                         report.problem("meta-header-malformed");
                     }
@@ -3096,6 +3174,7 @@ impl GraphStore {
                         }
                     }
                 }
+                QueryIndexCounterKeyRead::ProjectionDebt => report.problem("qv-projection-debt"),
                 QueryIndexCounterKeyRead::UnknownTag => report.problem("meta-unknown-tag"),
                 QueryIndexCounterKeyRead::InvalidLength => {
                     report.problem("meta-counter-key-length")
@@ -3193,7 +3272,9 @@ impl GraphStore {
         let header_read = self.query_index_header_from_snapshot(snapshot)?;
         let snapshot_sequence = snapshot.seqno();
         let header = match &header_read {
-            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
+                Some(header)
+            }
             QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
         };
         let mut report = QueryIndexVerificationBuilder::new(full);
@@ -3224,7 +3305,9 @@ impl GraphStore {
             None => match header_read {
                 QueryIndexHeaderRead::Absent => report.problem("meta-header-missing"),
                 QueryIndexHeaderRead::Malformed => report.problem("meta-header-malformed"),
-                QueryIndexHeaderRead::Valid(_) => unreachable!("valid header was retained"),
+                QueryIndexHeaderRead::Valid(_) | QueryIndexHeaderRead::Legacy(_) => {
+                    unreachable!("decoded header was retained")
+                }
             },
             Some(header) => {
                 let expected_state_matches = match expected_state {
@@ -3623,7 +3706,9 @@ impl GraphStore {
     fn mark_query_index_rebuild_failed(&self, reason: &'static str) -> Result<()> {
         let snapshot = self.db.snapshot();
         let previous = match self.query_index_header_from_snapshot(&snapshot)? {
-            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
+                Some(header)
+            }
             QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
         };
         let mut batch = self.buffered_batch();
@@ -3632,19 +3717,16 @@ impl GraphStore {
     }
 
     pub(crate) fn rebuild_query_indexes(&self) -> Result<()> {
-        if self
-            .qv_commit_state
-            .compare_exchange(0, QV_COMMIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let Some(_owner) = self.qv_gate.try_acquire() else {
             return Err(StoreError::QueryIndexUnavailable(
                 "query-index rebuild overlaps a graph commit",
             ));
-        }
-        let _qv_reset = QueryIndexCommitReset(&self.qv_commit_state);
+        };
         let initial_snapshot = self.db.snapshot();
         let previous = match self.query_index_header_from_snapshot(&initial_snapshot)? {
-            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
+                Some(header)
+            }
             QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
         };
         let mut building = previous
@@ -3727,10 +3809,6 @@ impl GraphStore {
         })();
         if result.is_err() {
             let _ = self.mark_query_index_rebuild_failed("rebuild-failed");
-        }
-        let clean = self.finish_query_index_commit();
-        if result.is_ok() && clean {
-            self.qv_degraded.store(false, Ordering::Release);
         }
         result
     }
@@ -4283,7 +4361,7 @@ impl GraphStore {
     ) -> Result<()> {
         let snapshot = self.db.snapshot();
         match self.query_index_header_from_snapshot(&snapshot)? {
-            QueryIndexHeaderRead::Absent => Ok(()),
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Legacy(_) => Ok(()),
             QueryIndexHeaderRead::Malformed => {
                 self.stage_query_index_failed(batch, None, "metadata-malformed");
                 Ok(())
@@ -4320,92 +4398,89 @@ impl GraphStore {
         }
     }
 
-    fn begin_query_index_commit(&self) -> bool {
-        loop {
-            let state = self.qv_commit_state.load(Ordering::Acquire);
-            if state & QV_COMMIT_ACTIVE == 0 {
-                if self
-                    .qv_commit_state
-                    .compare_exchange(state, QV_COMMIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true;
-                }
-                continue;
-            }
-            if state & QV_COMMIT_DIRTY == 0
-                && self
-                    .qv_commit_state
-                    .compare_exchange(
-                        state,
-                        state | QV_COMMIT_DIRTY,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-            {
-                continue;
-            }
-            if self.qv_pending_commits.fetch_add(1, Ordering::AcqRel) == 0 {
-                self.qv_catchup_failed.store(false, Ordering::Release);
-            }
-            self.qv_degraded.store(true, Ordering::Release);
-            return false;
-        }
+    /// Stages the record that this commit's source rows are not covered by the
+    /// query view yet. It is removed in the same batch as the maintenance that
+    /// covers them, so no snapshot ever shows uncovered rows as admitted.
+    fn stage_projection_debt(&self, batch: &mut fjall::OwnedWriteBatch) -> u64 {
+        let debt = self.qv_debt_next.fetch_add(1, Ordering::AcqRel);
+        batch.insert(&self.qv2_meta, projection_debt_key(debt), [0u8; 0]);
+        debt
     }
 
-    fn finish_query_index_commit(&self) -> bool {
-        loop {
-            let state = self.qv_commit_state.load(Ordering::Acquire);
-            if self
-                .qv_commit_state
-                .compare_exchange(state, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return state == QV_COMMIT_ACTIVE;
-            }
-        }
-    }
-
-    fn catch_up_query_index(&self, publish: &PendingPublish) -> Result<()> {
-        loop {
-            if self
-                .qv_commit_state
-                .compare_exchange(0, QV_COMMIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        let _reset = QueryIndexCommitReset(&self.qv_commit_state);
+    /// Covers one source-only commit and clears its projection debt in a single
+    /// batch. Any failure commits nothing, so the debt keeps admission closed.
+    fn repair_projection_debt(&self, publish: &PendingPublish, debt: u64) -> Result<()> {
+        let owner = self
+            .qv_gate
+            .acquire_timeout(self.qv_commit_wait)
+            .ok_or(StoreError::QueryIndexBusy)?;
         let mut batch = self.buffered_batch();
         self.stage_query_index_maintenance(&mut batch, publish)?;
-        self.commit_fjall_batch(batch)
+        batch.remove(&self.qv2_meta, projection_debt_key(debt));
+        let result = self.commit_fjall_batch(batch);
+        owner.finish();
+        result
     }
 
-    fn finish_pending_query_index_commit(&self, caught_up: bool) {
-        if !caught_up {
-            self.qv_catchup_failed.store(true, Ordering::Release);
-        }
-        if self.qv_pending_commits.fetch_sub(1, Ordering::AcqRel) == 1
-            && !self.qv_catchup_failed.load(Ordering::Acquire)
+    /// True when this snapshot records source rows whose query-view maintenance
+    /// has not been committed. One seek; the prefix is empty in steady state.
+    fn projection_debt_present(&self, snapshot: &Snapshot) -> Result<bool> {
+        match snapshot
+            .prefix(&self.qv2_meta, [QUERY_INDEX_PROJECTION_DEBT_TAG])
+            .next()
         {
-            self.qv_degraded.store(false, Ordering::Release);
+            Some(guard) => {
+                let _ = guard.into_inner()?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
+    }
+
+    /// Projection debt left by a process that stopped between a source commit and
+    /// its maintenance cannot be applied: the pending delta is gone. Record the
+    /// obligation as a durable failure instead, so a rebuild restores coverage.
+    fn fail_unrepaired_debt(&self, snapshot: &Snapshot) -> Result<bool> {
+        let mut debts = Vec::new();
+        for guard in snapshot.prefix(&self.qv2_meta, [QUERY_INDEX_PROJECTION_DEBT_TAG]) {
+            let (key, _) = guard.into_inner()?;
+            debts.push(key);
+        }
+        if debts.is_empty() {
+            return Ok(false);
+        }
+        let previous = match self.query_index_header_from_snapshot(snapshot)? {
+            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
+                Some(header)
+            }
+            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        };
+        let mut batch = self.buffered_batch();
+        for debt in debts {
+            batch.remove(&self.qv2_meta, debt);
+        }
+        self.stage_query_index_failed(&mut batch, previous.as_ref(), "projection-debt-unrepaired");
+        self.commit_fjall_batch(batch)?;
+        Ok(true)
     }
 
     /// Commit without holding the global cache lock, then publish only the
     /// affected cache generations under a short write section.
-    #[allow(clippy::collapsible_if)]
+    ///
+    /// A commit that owns query-view maintenance publishes source rows and
+    /// query-view rows in one batch. A commit that does not publishes durable
+    /// projection debt in that same batch and repairs it afterwards. Either way
+    /// every snapshot holding these source rows also holds the evidence that
+    /// decides whether the query view may answer for them.
     fn commit_with_index(&self, mut commit: DurableCommit, publish: &PendingPublish) -> Result<()> {
-        let maintains_query_index = self.begin_query_index_commit();
-        if maintains_query_index {
-            if let Err(error) = self.stage_query_index_maintenance(&mut commit.batch, publish) {
-                let _ = self.finish_query_index_commit();
-                return Err(error);
+        let owner = self.qv_gate.try_acquire();
+        let debt = match &owner {
+            Some(_) => {
+                self.stage_query_index_maintenance(&mut commit.batch, publish)?;
+                None
             }
-        }
+            None => Some(self.stage_projection_debt(&mut commit.batch)),
+        };
         let committed = self.commit_durable(commit);
         let published = if committed.is_ok() {
             #[cfg(test)]
@@ -4415,28 +4490,18 @@ impl GraphStore {
         } else {
             false
         };
-        if maintains_query_index {
-            self.finish_query_index_commit();
-        } else {
-            let caught_up = if committed.is_ok() {
-                match self.catch_up_query_index(publish) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "query-index catch-up failed after a durable source commit"
-                        );
-                        self.mark_query_index_rebuild_failed("concurrent-catch-up-failed")
-                            .is_ok()
-                    }
-                }
-            } else {
-                true
-            };
-            self.finish_pending_query_index_commit(caught_up);
-        }
+        drop(owner);
         committed?;
         debug_assert!(published, "successful durable commit publishes cache state");
+        if let Some(debt) = debt
+            && let Err(error) = self.repair_projection_debt(publish, debt)
+        {
+            tracing::warn!(
+                error = %error,
+                "query-view catch-up failed after a durable source commit"
+            );
+            let _ = self.mark_query_index_rebuild_failed("concurrent-catch-up-failed");
+        }
         Ok(())
     }
 
@@ -4479,7 +4544,9 @@ impl GraphStore {
     pub(crate) fn fail_test_indexes(&self) {
         let snapshot = self.db.snapshot();
         let previous = match self.query_index_header_from_snapshot(&snapshot).unwrap() {
-            QueryIndexHeaderRead::Valid(header) => Some(header),
+            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
+                Some(header)
+            }
             QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
         };
         let mut batch = self.buffered_batch();
@@ -5200,10 +5267,9 @@ impl GraphStore {
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
-            qv_commit_state: AtomicU64::new(0),
-            qv_degraded: AtomicBool::new(false),
-            qv_pending_commits: AtomicU64::new(0),
-            qv_catchup_failed: AtomicBool::new(false),
+            qv_gate: QvCommitGate::new(),
+            qv_commit_wait: QV_COMMIT_WAIT,
+            qv_debt_next: AtomicU64::new(1),
             #[cfg(feature = "shacl-core")]
             binding_lock: Mutex::new(()),
             #[cfg(feature = "shacl-core")]
@@ -7914,7 +7980,9 @@ mod tests {
         let snapshot = store.db.snapshot();
         match store.query_index_header_from_snapshot(&snapshot).unwrap() {
             QueryIndexHeaderRead::Valid(header) => header,
-            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => {
+            QueryIndexHeaderRead::Absent
+            | QueryIndexHeaderRead::Legacy(_)
+            | QueryIndexHeaderRead::Malformed => {
                 panic!("query-index header must be present and valid")
             }
         }
@@ -10089,12 +10157,12 @@ mod tests {
                 batch: inner,
                 pending_fts,
             };
-            assert!(store.begin_query_index_commit());
+            let owner = store.qv_gate.try_acquire().unwrap();
             store
                 .stage_query_index_maintenance(&mut durable.batch, &publish)
                 .unwrap();
             store.commit_durable(durable).unwrap();
-            assert!(store.finish_query_index_commit());
+            owner.finish();
             store.persist().unwrap();
             // Deliberately omit `indexes.publish(&publish)`: this is the crash
             // window after durable commit and before cache publication.
