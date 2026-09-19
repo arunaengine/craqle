@@ -44,7 +44,7 @@ where
 #[cfg(test)]
 mod tests {
     #[test]
-    fn shared_pool_is_bounded_and_folds_in_input_order() {
+    fn pool_bounds_ordering() {
         assert!((1..=4).contains(&super::worker_count()));
         let output = super::map_ordered(vec![3_u8, 1, 2], |value| {
             Ok::<_, std::convert::Infallible>(value * 2)

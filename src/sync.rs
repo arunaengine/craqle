@@ -1406,7 +1406,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn topic_cursor_rejects_malformed_wrong_topic_checksum_and_future_version() {
+    fn rejects_invalid_cursors() {
         let topic = irokle::TopicId::from_bytes([1; 32]);
         let other = irokle::TopicId::from_bytes([2; 32]);
         let encoded = encode_topic_cursor(topic, &irokle::ActorClock::default()).unwrap();

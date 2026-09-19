@@ -1844,7 +1844,7 @@ mod tests {
     use spargebra::SparqlParser;
 
     #[test]
-    fn recognizes_guarded_algebra_shapes() {
+    fn recognizes_guarded_shapes() {
         for query in [
             "ASK { <urn:s> <urn:p> <urn:o> }",
             "SELECT ?s WHERE { ?s <urn:p> ?o } LIMIT 10",

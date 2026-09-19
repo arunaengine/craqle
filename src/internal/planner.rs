@@ -1266,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn bgp_reorder_puts_selective_pattern_first_regardless_of_written_order() {
+    fn selective_patterns_lead() {
         let (_dir, store) = seeded_store();
         for written in [
             "SELECT ?d WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> \"Dataset 7\" }",
@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_string_equality_folds_into_index_lookup() {
+    fn string_equality_folds() {
         let (_dir, store) = seeded_store();
         let mut query = parse(
             "SELECT ?d ?n WHERE { ?d <http://schema.org/name> ?n . FILTER(?n = \"Dataset 7\") }",
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_numeric_equality_is_not_folded() {
+    fn numeric_equality_remains() {
         let (_dir, store) = seeded_store();
         let mut query =
             parse("SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }");
@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_terms_estimate_to_zero_and_lead_the_chain() {
+    fn missing_terms_lead() {
         let (_dir, store) = seeded_store();
         let mut query = parse(
             "SELECT ?d WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> \"No Such Name\" }",
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_patterns_stay_joined_not_lateral() {
+    fn disconnected_patterns_join() {
         let (_dir, store) = seeded_store();
         let mut query = parse(
             "SELECT * WHERE { ?a <http://schema.org/name> ?n . ?b a <http://schema.org/Dataset> }",

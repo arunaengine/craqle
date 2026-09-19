@@ -1955,7 +1955,7 @@ mod tests {
             /// The optimized candidate path must agree with a full, deterministic
             /// post-state evaluation over duplicate, no-op, and reordered writes.
             #[test]
-            fn candidate_rules_match_full_post_state(
+            fn candidates_match_final(
                 operations in proptest::collection::vec((0usize..14, any::<bool>()), 0..24),
             ) {
                 let directory = tempfile::tempdir().unwrap();
@@ -2025,7 +2025,7 @@ mod tests {
         }
 
         #[test]
-        fn snapshot_fallback_applies_delta_but_normal_candidates_do_not_materialize() {
+        fn fallback_applies_delta() {
             let directory = tempfile::tempdir().unwrap();
             let store = GraphStore::open(directory.path()).unwrap();
             let graph = GraphId::new("urn:test:snapshot-fallback");

@@ -925,7 +925,7 @@ pub struct GraphStore {
     #[cfg(test)]
     commit_stall_active: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    commit_stall_max_active: std::sync::atomic::AtomicUsize,
+    peak_commit_stalls: std::sync::atomic::AtomicUsize,
     /// Makes the next durable batch fail immediately before fjall commits.
     #[cfg(test)]
     commit_failure: std::sync::atomic::AtomicBool,
@@ -3957,7 +3957,7 @@ impl GraphStore {
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(delay) = stall {
             let active = self.commit_stall_active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.commit_stall_max_active
+            self.peak_commit_stalls
                 .fetch_max(active, Ordering::SeqCst);
             self.commit_stalled.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
@@ -3976,7 +3976,7 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
         self.commit_stall_active.store(0, Ordering::SeqCst);
-        self.commit_stall_max_active.store(0, Ordering::SeqCst);
+        self.peak_commit_stalls.store(0, Ordering::SeqCst);
     }
 
     /// Whether a commit is inside its post-durable publication stall.
@@ -3986,8 +3986,8 @@ impl GraphStore {
     }
 
     #[cfg(test)]
-    fn commit_stall_max_active(&self) -> usize {
-        self.commit_stall_max_active.load(Ordering::SeqCst)
+    fn peak_commit_stalls(&self) -> usize {
+        self.peak_commit_stalls.load(Ordering::SeqCst)
     }
 
     /// Make exactly the next durable batch commit fail. Test-only.
@@ -4059,7 +4059,7 @@ impl GraphStore {
 
     /// Stall between an acknowledgement's token read and its commit. Test-only.
     #[cfg(test)]
-    fn stall_in_fts_ack(&self) {
+    fn stall_search_ack(&self) {
         let stall = *self
             .fts_ack_stall
             .lock()
@@ -5436,7 +5436,7 @@ impl GraphStore {
             #[cfg(test)]
             commit_stall_active: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
-            commit_stall_max_active: std::sync::atomic::AtomicUsize::new(0),
+            peak_commit_stalls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             commit_failure: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -7278,7 +7278,7 @@ impl GraphStore {
             )?;
         }
         #[cfg(test)]
-        self.stall_in_fts_ack();
+        self.stall_search_ack();
         if dirty {
             self.commit_fjall_batch(batch)?;
         }
@@ -7753,7 +7753,7 @@ impl GraphStore {
     /// Test-only hook that corrupts one bounded subject-cache entry without
     /// touching durable source state.
     #[cfg(test)]
-    fn corrupt_index_for_test(&self, quad: EncodedQuad) {
+    fn corrupt_test_index(&self, quad: EncodedQuad) {
         let mut entries = self
             .subject_entries((quad.graph, quad.subject), None)
             .unwrap();
@@ -7804,14 +7804,14 @@ mod tests {
     }
 
     #[test]
-    fn disk_format_marker_is_written_and_reopened() {
+    fn format_marker_reopens() {
         let dir = tempfile::tempdir().unwrap();
         GraphStore::open(dir.path()).unwrap().persist().unwrap();
         GraphStore::open(dir.path()).unwrap();
     }
 
     #[test]
-    fn future_disk_format_fails_closed() {
+    fn future_format_rejected() {
         let dir = tempfile::tempdir().unwrap();
         seed_raw_graph_record(
             dir.path(),
@@ -7826,7 +7826,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_disk_format_fails_closed() {
+    fn malformed_format_rejected() {
         let dir = tempfile::tempdir().unwrap();
         seed_raw_graph_record(dir.path(), DISK_FORMAT_KEY, &[1, 2, 3]);
 
@@ -7837,7 +7837,7 @@ mod tests {
     }
 
     #[test]
-    fn unmarked_nonempty_authoritative_store_fails_closed() {
+    fn unmarked_source_rejected() {
         let dir = tempfile::tempdir().unwrap();
         seed_raw_graph_record(dir.path(), b"Mlegacy", b"value");
 
@@ -7901,7 +7901,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn pending_queue_scan_is_independent_of_binding_count() {
+    fn pending_scan_bounded() {
         let (_dir, store) = setup_store();
         let mut previous = 0;
         for count in [0, 100, 1_000, 10_000] {
@@ -7936,7 +7936,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn explicit_queue_repair_restores_missing_and_malformed_entries() {
+    fn repair_restores_queue() {
         let (_dir, store) = setup_store();
         stage_binding_records(&store, 0, 100);
         let data = GraphId::new("urn:test:queue-scale:data");
@@ -7972,7 +7972,7 @@ mod tests {
     }
 
     #[test]
-    fn open_with_persist_mode_tracks_configured_mode() {
+    fn open_preserves_durability() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:persist-mode:sync-all");
 
@@ -7990,7 +7990,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_context_defaults_survive_reopen() {
+    fn default_context_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:context-defaults-reopen");
 
@@ -8114,7 +8114,7 @@ mod tests {
     /// that answer after the maintenance lands. Admission is a property of the
     /// captured snapshot, not of a current process flag.
     #[test]
-    fn uncovered_snapshot_is_never_admitted() {
+    fn uncovered_snapshot_rejected() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv-coverage-gap");
         store.create_graph(&graph).unwrap();
@@ -8159,7 +8159,7 @@ mod tests {
     /// not be admitted after reopen. The pending delta is gone, so the store
     /// records a durable failure that a rebuild clears.
     #[test]
-    fn unrepaired_debt_survives_reopen() {
+    fn unrepaired_debt_reopens() {
         let directory = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv-persisted-gap");
         {
@@ -8200,7 +8200,7 @@ mod tests {
 
     /// A finished rebuild leaves no owner behind, so later writes still proceed.
     #[test]
-    fn rebuild_leaves_no_owner() {
+    fn rebuild_releases_owner() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv-rebuild-owner");
         store.create_graph(&graph).unwrap();
@@ -8216,7 +8216,7 @@ mod tests {
     /// A failed commit releases maintenance ownership, so a healthy write that
     /// follows it can own the gate instead of waiting for an absent owner.
     #[test]
-    fn failed_commit_releases_ownership() {
+    fn failure_releases_ownership() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv-failed-commit");
         store.create_graph(&graph).unwrap();
@@ -8245,7 +8245,7 @@ mod tests {
     /// Publication bumps one generation per changed graph, so the caches are
     /// never scanned per changed quad and their recency order is never rebuilt.
     #[test]
-    fn writes_never_scan_warm_caches() {
+    fn writes_skip_scans() {
         let (_dir, store) = setup_store();
         let warm = GraphId::new("urn:test:cache-warm");
         let changed = GraphId::new("urn:test:cache-changed");
@@ -8316,7 +8316,7 @@ mod tests {
 
     /// A removal that matches nothing must not rebuild the recency order.
     #[test]
-    fn empty_removal_skips_compaction() {
+    fn empty_removal_uncompacted() {
         let mut cache: BoundedCache<u64, u64> = BoundedCache::new(64, 4_096);
         for key in 0..16u64 {
             cache.insert(key, key, 8);
@@ -8336,7 +8336,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_version_two_limits_bind() {
+    fn unified_limits_bind() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("cgroup");
         let mapping = dir.path().join("self-cgroup");
@@ -8355,7 +8355,7 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_limit_beats_child() {
+    fn ancestor_limits_bind() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("cgroup");
         let mapping = dir.path().join("self-cgroup");
@@ -8370,7 +8370,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_version_one_limits_bind() {
+    fn legacy_limits_bind() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("cgroup");
         let mapping = dir.path().join("self-cgroup");
@@ -8387,7 +8387,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_limits_bind_nothing() {
+    fn unreadable_limits_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("cgroup");
         let mapping = dir.path().join("self-cgroup");
@@ -8418,7 +8418,7 @@ mod tests {
     }
 
     #[test]
-    fn small_budget_has_no_gibibyte_floor() {
+    fn small_budget_unfloored() {
         let tight = CacheBudget::from_limit(Some(256 * 1_048_576));
         assert!(
             tight.database < DEFAULT_DB_CACHE_BYTES,
@@ -8438,7 +8438,7 @@ mod tests {
     }
 
     #[test]
-    fn large_budget_keeps_defaults() {
+    fn large_budget_defaults() {
         let roomy = CacheBudget::from_limit(Some(64 * 1_024 * 1_048_576));
         assert_eq!(roomy.database, MAX_DB_CACHE_BYTES);
         assert_eq!(roomy.terms, TERM_DECODE_CACHE_BYTES);
@@ -8453,7 +8453,7 @@ mod tests {
     }
 
     #[test]
-    fn meminfo_available_is_parsed() {
+    fn parses_available_memory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meminfo");
         std::fs::write(
@@ -8492,7 +8492,7 @@ mod tests {
     /// durable projection debt. Exercised here through a real remove and a real
     /// graph deletion, not through a hand-built batch.
     #[test]
-    fn every_mutation_path_records_debt() {
+    fn mutations_record_debt() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv-entry-points");
         store.create_graph(&graph).unwrap();
@@ -8677,7 +8677,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_term_ids_round_trip() {
+    fn term_identifiers_roundtrip() {
         let (_dir, store) = setup_store();
         let term = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:term"));
         let id = store.encode_term(&term).unwrap();
@@ -8686,7 +8686,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_fresh_empty_is_ready_and_old_source_without_header_is_missing() {
+    fn index_readiness_initializes() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:old-source");
         {
@@ -8718,7 +8718,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_v2_keys_and_disk_space_are_smaller_than_u128_layout() {
+    fn compact_indexes_smaller() {
         const ROWS: u64 = 10_000;
         let zero = QueryTermId(0);
         assert_eq!(query_index_key([zero; 4]).len(), 32);
@@ -8922,7 +8922,7 @@ mod tests {
     }
 
     #[test]
-    fn qv_reads_fall_back_for_every_spo_binding_shape_when_metadata_is_untrusted() {
+    fn untrusted_metadata_fallback() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:fallback-binding-shapes");
         store.create_graph(&graph).unwrap();
@@ -9092,7 +9092,7 @@ mod tests {
     }
 
     #[test]
-    fn qv_malformed_and_stale_headers_fall_back_before_cursor_output() {
+    fn invalid_headers_fallback() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:fallback-header");
         store.create_graph(&graph).unwrap();
@@ -9124,7 +9124,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_qv_row_corruption_is_terminal_without_a_fallback_restart() {
+    fn corrupt_rows_fail() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:terminal-corruption");
         store.create_graph(&graph).unwrap();
@@ -9172,7 +9172,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_insert_and_delete_survive_restart_ready() {
+    fn index_mutations_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:restart");
         let (quad, query_quad, dot) = {
@@ -9206,7 +9206,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_coalesces_live_dot_transitions_and_last_dot_removal() {
+    fn index_coalesces_dots() {
         let (_dir, store) = setup_store();
         let store = Arc::new(store);
         let graph = GraphId::new("urn:test:qv:dots");
@@ -9240,7 +9240,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_concurrent_cross_graph_writes_keep_exact_counters() {
+    fn concurrent_counters_exact() {
         let (_dir, store) = setup_store();
         let graph_one = GraphId::new("urn:test:qv:cross-graph:one");
         let graph_two = (0u64..)
@@ -9338,7 +9338,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_coalesces_repeated_crossings_in_one_batch() {
+    fn index_coalesces_crossings() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:net-transition");
         store.create_graph(&graph).unwrap();
@@ -9405,7 +9405,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_union_duplicate_proof_falls_back_and_rebuilds() {
+    fn duplicate_proof_rebuilds() {
         let (_dir, store) = setup_store();
         let first_graph = GraphId::new("urn:test:qv:union-proof:first");
         let second_graph = GraphId::new("urn:test:qv:union-proof:second");
@@ -9452,7 +9452,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_tracks_exact_dimensions_and_removes_zero_counters() {
+    fn dimension_counters_exact() {
         let (_dir, store) = setup_store();
         let graph_one = GraphId::new("urn:test:qv:counters:one");
         let graph_two = GraphId::new("urn:test:qv:counters:two");
@@ -9545,7 +9545,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_removing_last_row_keeps_ready_and_removes_zero_dimensions() {
+    fn final_removal_ready() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:last-row");
         store.create_graph(&graph).unwrap();
@@ -9592,7 +9592,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_keys_are_fixed_order_and_empty() {
+    fn index_keys_ordered() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:keys");
         store.create_graph(&graph).unwrap();
@@ -9622,7 +9622,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_status_rejects_mismatched_qv_rows_or_total() {
+    fn mismatched_index_rejected() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:status-qv-rows");
         store.create_graph(&graph).unwrap();
@@ -9727,7 +9727,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_rebuild_after_restart_recovers_missing_and_advances_sequence() {
+    fn reopened_rebuild_advances() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:rebuild-restart");
         {
@@ -9768,7 +9768,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_interrupted_building_reopens_without_promoting_derived_rows() {
+    fn interrupted_build_unpublished() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:interrupted-rebuild");
         let quad = {
@@ -9809,7 +9809,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_full_and_sample_verification_are_deterministic() {
+    fn index_verification_deterministic() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:verify-sample");
         store.create_graph(&graph).unwrap();
@@ -9854,7 +9854,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_verification_detects_qv_and_metadata_corruption() {
+    fn verification_detects_corruption() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:verification-corruption");
         store.create_graph(&graph).unwrap();
@@ -9919,7 +9919,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_maintenance_anomaly_commits_source_and_fails_derived_state() {
+    fn anomalies_preserve_source() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:maintenance-anomaly");
         store.create_graph(&graph).unwrap();
@@ -9952,7 +9952,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_maintenance_rejects_ahead_header_without_losing_source_write() {
+    fn ahead_header_rejected() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:maintenance-ahead-header");
         store.create_graph(&graph).unwrap();
@@ -9984,7 +9984,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_maintenance_rejects_orphan_counter_without_losing_source_write() {
+    fn orphan_counter_rejected() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:maintenance-orphan-counter");
         store.create_graph(&graph).unwrap();
@@ -10021,7 +10021,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_malformed_metadata_or_counter_is_never_trusted_ready() {
+    fn malformed_metadata_untrusted() {
         let metadata_dir = tempfile::tempdir().unwrap();
         let metadata_graph = GraphId::new("urn:test:qv:malformed-metadata");
         let metadata_quad = {
@@ -10089,7 +10089,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_epoch_mismatch_fails_open_and_explicit_rebuild_preserves_source() {
+    fn epoch_mismatch_rebuilds() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:epoch-mismatch");
         let quad = {
@@ -10123,7 +10123,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_rebuild_discards_ahead_header_hints() {
+    fn rebuild_discards_hints() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:ahead-hints");
         let first = {
@@ -10170,7 +10170,7 @@ mod tests {
     }
 
     #[test]
-    fn query_index_manual_compaction_preserves_all_keyspaces_across_reopen() {
+    fn compaction_preserves_keyspaces() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:qv:manual-compact");
         let quad = {
@@ -10225,7 +10225,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_queries_use_durable_source() {
+    fn queries_read_source() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:s"));
@@ -10261,7 +10261,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_pattern_reads_track_commits() {
+    fn patterns_track_commits() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         let subject = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:s"));
@@ -10338,7 +10338,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_dirty_set_deduplicates_subjects() {
+    fn dirty_subjects_deduplicate() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         store.create_graph(&graph).unwrap();
@@ -10407,7 +10407,7 @@ mod tests {
     /// commit must survive: the removal only ever covered the older token, so
     /// erasing the entry would leave that write unindexed for good.
     #[test]
-    fn ack_keeps_racing_enqueue() {
+    fn acknowledgement_preserves_enqueue() {
         let (_dir, store) = setup_store();
         let store = Arc::new(store);
         let graph = GraphId::new("urn:test:graph");
@@ -10443,7 +10443,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_graph_reindex_queue_round_trips() {
+    fn reindex_queue_roundtrips() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         store.create_graph(&graph).unwrap();
@@ -10637,7 +10637,7 @@ mod tests {
     }
 
     #[test]
-    fn global_commit_lock_concurrency() {
+    fn graph_commits_overlap() {
         let (_dir, store) = setup_store();
         let first = GraphId::new("urn:test:independent-commit:first");
         let second = GraphId::new("urn:test:independent-commit:second");
@@ -10657,14 +10657,14 @@ mod tests {
         });
 
         assert!(
-            store.commit_stall_max_active() >= 2,
+            store.peak_commit_stalls() >= 2,
             "independent durable commits were serialized by one cache lock"
         );
         assert_query_index_ready(&store, 2);
     }
 
     #[test]
-    fn commit_failure_publishes_no_cache_state() {
+    fn failure_preserves_caches() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:failed-commit-cache");
         store.create_graph(&graph).unwrap();
@@ -10700,7 +10700,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_after_durable_commit_rebuilds_cache_state() {
+    fn restart_rebuilds_caches() {
         let directory = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:durable-before-cache");
         let quad;
@@ -10758,7 +10758,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_store_cache_statistics() {
+    fn cache_statistics_bounded() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:bounded-cache-stats");
         store.create_graph(&graph).unwrap();
@@ -10855,7 +10855,7 @@ mod tests {
     /// A graph generation change makes every older subject cache entry stale,
     /// including unrelated entries that were locally corrupted.
     #[test]
-    fn commit_generation_invalidates_corrupt_cache() {
+    fn generation_invalidates_cache() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:index-anomaly");
         store.create_graph(&graph).unwrap();
@@ -10869,8 +10869,8 @@ mod tests {
 
         // Simulate drift in two subject-cache entries while durable source
         // still holds both quads.
-        store.corrupt_index_for_test(removed);
-        store.corrupt_index_for_test(collateral);
+        store.corrupt_test_index(removed);
+        store.corrupt_test_index(collateral);
         assert!(!store.index_contains(removed));
         assert!(!store.index_contains(collateral));
 
@@ -11742,7 +11742,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_fts_queue_for_graph_removes_subject_and_reindex_entries() {
+    fn clear_removes_queues() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
         store.create_graph(&graph).unwrap();

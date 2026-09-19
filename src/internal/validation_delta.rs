@@ -756,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_only_insert_is_visible_without_store_mutation() {
+    fn delta_inserts_visible() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:delta-only");
         let changes = vec![insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")];
@@ -785,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_and_reordered_changes_have_base_aware_final_state() {
+    fn delta_respects_base() {
         for base_present in [false, true] {
             let (_directory, store) = setup_store();
             let graph = GraphId::new(if base_present {
@@ -853,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_operations_never_duplicate_or_underflow() {
+    fn repeated_operations_stable() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:repeated");
         let inserts = vec![
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn base_present_final_insert_is_emitted_once() {
+    fn final_insert_unique() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:base-present");
         add_quad(&store, &graph, "urn:test:s", "urn:test:p", "urn:test:o");
@@ -894,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_graph_changes_do_not_affect_the_selected_view_or_impact() {
+    fn foreign_changes_isolated() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:selected");
         let foreign = GraphId::new("urn:test:foreign");
@@ -909,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn impact_is_id_based_and_limited_to_the_selected_graph() {
+    fn impact_scopes_identifiers() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:impact");
         let foreign = GraphId::new("urn:test:impact:foreign");
@@ -953,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_terms_decode_and_collisions_fail_explicitly() {
+    fn delta_terms_checked() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:delta-terms");
         let changes = vec![insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")];
@@ -979,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn exists_and_bounded_count_stop_after_their_cap() {
+    fn counts_stop_early() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:early-stop");
         for index in 0..3 {
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_ranges_stop_after_two_matching_count_forward_and_inverse_rows() {
+    fn overlay_ranges_bounded() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:overlay-ranges");
         let forward_subject = "urn:test:forward:subject";
@@ -1163,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_a_large_overlay_scan() {
+    fn overlay_scan_cancels() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:overlay-cancellation");
         let changes: Vec<_> = (0..1_025)
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn final_forward_and_inverse_walks_include_the_overlay() {
+    fn walks_include_overlay() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:walks");
         add_quad(
@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_visibility_includes_orphans_without_weakening_normal_reads() {
+    fn validation_includes_orphans() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:validation-orphan");
         let orphan = add_quad(

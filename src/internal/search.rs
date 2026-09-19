@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_and_search() -> Result<()> {
+    fn indexes_and_searches() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource(
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_in_graph() -> Result<()> {
+    fn searches_selected_graph() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource(
@@ -1449,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_query_operators_are_neutralized() -> Result<()> {
+    fn neutralizes_query_operators() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource(
@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ascii_folding_matches_diacritics() -> Result<()> {
+    fn folding_matches_diacritics() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource(
@@ -1503,7 +1503,7 @@ mod tests {
     /// clear that follows: the scan never saw it, so wiping its queue entry
     /// would leave it unindexed with nothing left to re-queue it.
     #[test]
-    fn reindex_keeps_late_write() {
+    fn reindex_preserves_writes() {
         let dir = tempdir().unwrap();
         let node = crate::CraqleNode::open(dir.path()).unwrap();
         let auth = crate::AllowAllAuthorizer;
@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_replaces_old_document() -> Result<()> {
+    fn upsert_replaces_document() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource(
@@ -1640,7 +1640,7 @@ mod tests {
     }
 
     #[test]
-    fn test_same_subject_in_multiple_graphs_do_not_collide() -> Result<()> {
+    fn subjects_remain_scoped() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource(
@@ -1667,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_indexes_subject_ids() -> Result<()> {
+    fn indexes_subject_identifiers() -> Result<()> {
         let idx = SearchIndex::open_in_memory()?;
 
         idx.index_resource("http://example.org/graph1", "urn:test:dataset123", None)?;
@@ -1681,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persistent_index_roundtrips_across_reopen() -> Result<()> {
+    fn persistent_index_reopens() -> Result<()> {
         let dir = tempdir().unwrap();
 
         let idx = SearchIndex::open(dir.path())?;

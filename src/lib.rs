@@ -3478,7 +3478,7 @@ impl CraqleNode {
         policy: GraphPolicy,
     ) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
-        self.set_local_graph_policy(graph, policy.normalized())?;
+        self.set_test_policy(graph, policy.normalized())?;
         self.persist_fjall()
     }
 
@@ -3743,7 +3743,7 @@ impl CraqleNode {
     }
 
     #[cfg(test)]
-    fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+    fn set_test_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.persist_graph_policy_with_durability(
             graph,
             policy,
@@ -4121,7 +4121,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_request_persists_with_configured_mode() {
+    fn durability_uses_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             directory.path(),
@@ -4146,7 +4146,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_already_durable_does_not_force_local_persist() {
+    fn durable_wal_reused() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(directory.path()).unwrap();
         let graph = GraphId::new("urn:test:durability:external-wal");
@@ -4257,7 +4257,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn separate_structural_and_shacl_write_checks() {
+    fn separates_write_checks() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             directory.path(),
@@ -4293,7 +4293,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn independent_shacl_writers_validate_concurrently() {
+    fn independent_writers_overlap() {
         for count in [1usize, 2, 4, 8, 16] {
             for (label, policy, rejected) in [
                 ("disabled", ShaclWritePolicy::Disabled, false),
@@ -4357,7 +4357,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn same_graph_shacl_writers_remain_serialized() {
+    fn graph_writers_serialize() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
             CraqleNode::open_with_options(
@@ -4407,7 +4407,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn shape_dependency_mutation_during_validation_rechecks_fences() {
+    fn validation_rechecks_dependencies() {
         for imported in [false, true] {
             let label = if imported { "import" } else { "root" };
             let directory = tempfile::tempdir().unwrap();
@@ -4548,7 +4548,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn sync_local_settlement_failure_returns_committed_batch() {
+    fn settlement_preserves_acceptance() {
         let directory = tempfile::tempdir().unwrap();
         let node = sync_node(&directory);
         let (data, focus) =
@@ -4604,7 +4604,7 @@ mod tests {
     }
 
     #[test]
-    fn query_authorization_uses_the_data_snapshot_policy() {
+    fn authorization_uses_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
             CraqleNode::open_with_options(
@@ -4691,7 +4691,7 @@ mod tests {
 
     #[cfg(feature = "search")]
     #[test]
-    fn query_fts_reauthorizes_hits_after_search() {
+    fn search_reauthorizes_hits() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
             CraqleNode::open_with_options(
@@ -5430,7 +5430,7 @@ mod tests {
     /// A record no retry could ever accept stays quarantined: the pass skips
     /// it and still applies the records behind it.
     #[test]
-    fn rejection_ledger_before_cursor_advance() {
+    fn rejection_precedes_cursor() {
         let ReplicaPair {
             _dir,
             irokle,
@@ -5844,7 +5844,7 @@ mod tests {
     }
 
     #[test]
-    fn local_write_after_delete_and_same_id_recreation_conflict() {
+    fn deletion_prevents_recreation() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),
@@ -5871,7 +5871,7 @@ mod tests {
     }
 
     #[test]
-    fn post_delete_remote_record_rejection() {
+    fn deletion_rejects_remote() {
         let pair = replica_pair();
         let graph = GraphId::new("urn:test:post-delete-remote-record");
         pair.origin
@@ -5918,7 +5918,7 @@ mod tests {
     }
 
     #[test]
-    fn three_replica_delete_write_arrival_order_permutations_converge() {
+    fn delete_permutations_converge() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = sync_node(&source_dir);
         let graph = GraphId::new("urn:test:delete-arrival-permutations");
@@ -6061,7 +6061,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn binding_status_reads_scale_with_records_not_shape_triples() {
+    fn status_bounds_reads() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             directory.path(),

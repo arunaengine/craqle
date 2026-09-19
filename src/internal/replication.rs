@@ -2705,7 +2705,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_queue_replay_survives_restart() {
+    fn replay_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, engine) = engine_at(dir.path());
@@ -2730,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_continues_after_one_graph_fails() {
+    fn replay_isolates_failures() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine) = engine_at(dir.path());
         queued_graphs(&store, 3);
@@ -2761,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_queue_replay_does_no_graph_work() {
+    fn empty_replay_idle() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine) = engine_at(dir.path());
         let outcome = engine
@@ -2827,7 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_local_settlement_failures_stay_pending_across_restart() {
+    fn settlement_debt_survives() {
         for policy in [ShaclWritePolicy::Enforce, ShaclWritePolicy::Advisory] {
             let dir = tempfile::tempdir().unwrap();
             let (data, snapshot) = {
@@ -2875,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn affected_graph_settlement_failure_does_not_reject_shape_write() {
+    fn settlement_preserves_shapes() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine, data, binding) = pending_engine(dir.path(), ShaclWritePolicy::Advisory);
         engine.replay_pending_bindings().unwrap();
@@ -2941,7 +2941,7 @@ mod tests {
     }
 
     #[test]
-    fn open_can_defer_and_resume_pending_queue() {
+    fn open_defers_replay() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
         let data = {
@@ -2980,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_open_has_zero_pending_startup_work() {
+    fn empty_startup_idle() {
         let dir = tempfile::tempdir().unwrap();
         let node = crate::CraqleNode::open(dir.path()).unwrap();
         let startup = node.startup_pending_replay();
@@ -2991,7 +2991,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_reopen_does_not_scan_binding_records() {
+    fn healthy_open_lazy() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
         {

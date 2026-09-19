@@ -913,7 +913,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_query_index_key_extracts_every_order() {
+    fn keys_cover_orders() {
         let graph = QueryTermId(1);
         let subject = QueryTermId(2);
         let predicate = QueryTermId(3);

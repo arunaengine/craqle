@@ -782,7 +782,7 @@ mod tests {
     use oxrdf::{Literal, Term};
 
     #[test]
-    fn encoded_term_round_trips_escaped_literals() {
+    fn escaped_literals_roundtrip() {
         let literal = Literal::new_typed_literal(
             "Quote: \" slash: \\\\ newline:\n snowman:\u{2603}",
             NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#string"),
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_term_round_trips_language_literals() {
+    fn language_literals_roundtrip() {
         let literal = Literal::new_language_tagged_literal_unchecked("bonjour", "fr-ca");
         let encoded = EncodedTerm::from_non_star_term(&Term::Literal(literal.clone()));
         let decoded = encoded.to_term().unwrap();

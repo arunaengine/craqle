@@ -191,7 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compaction_keeps_recency_order() {
+    fn compaction_preserves_recency() {
         let mut cache: BoundedCache<u64, u64> = BoundedCache::new(8, 4_096);
         for key in 0..8u64 {
             cache.insert(key, key, 8);

@@ -188,7 +188,7 @@ mod tests {
     const PATIENT: Duration = Duration::from_secs(60);
 
     #[test]
-    fn stale_guard_cannot_release_owner() {
+    fn stale_release_ignored() {
         let gate = QvCommitGate::new();
         let first = gate.try_acquire().expect("gate starts free");
         let stale = first.generation;
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_release_happens_once() {
+    fn releases_owner_once() {
         let gate = QvCommitGate::new();
         let owner = gate.try_acquire().expect("gate starts free");
         let generation = owner.generation;
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn waiters_are_admitted_in_order() {
+    fn admits_waiters_fifo() {
         let gate = Arc::new(QvCommitGate::new());
         let held = gate.try_acquire().expect("gate starts free");
         let (tx, rx) = mpsc::channel();
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn release_wakes_one_waiter() {
+    fn release_wakes_one() {
         let gate = Arc::new(QvCommitGate::new());
         let held = gate.try_acquire().expect("gate starts free");
         let running = Arc::new(AtomicUsize::new(0));
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_waiter_frees_its_place() {
+    fn cancellation_removes_waiter() {
         let gate = Arc::new(QvCommitGate::new());
         let held = gate.try_acquire().expect("gate starts free");
         let cancelling = Arc::clone(&gate);
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_before_park_survives() {
+    fn early_handoff_survives() {
         let gate = QvCommitGate::new();
         let owner = gate.try_acquire().expect("gate starts free");
         let waiter = Arc::new(Waiter {
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn unwinding_owner_releases_the_gate() {
+    fn unwind_releases_owner() {
         let gate = QvCommitGate::new();
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _owner = gate.try_acquire().expect("gate starts free");

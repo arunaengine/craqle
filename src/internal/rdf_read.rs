@@ -1007,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_cursor_matches_vector_wrapper_for_every_binding_shape() {
+    fn cursor_matches_collector() {
         let (_directory, store) = setup_store();
         let first_graph = GraphId::new("urn:test:raw:first");
         let second_graph = GraphId::new("urn:test:raw:second");
@@ -1058,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_stops_after_the_first_consumed_row() {
+    fn cursor_stops_early() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:early-stop");
         let first = add_quad(
@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn exists_uses_one_point_candidate_and_stops_on_a_hit() {
+    fn existence_stops_early() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:exists");
         let quad = add_quad(
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn count_up_to_zero_and_two_stop_at_the_requested_cap() {
+    fn count_respects_cap() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:count-up-to");
         let quad = add_quad(
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_before_a_scan_and_after_a_bound_union_candidate() {
+    fn cancellation_stops_scans() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:cancellation");
         let graph_id = add_many(&store, &graph, 1_025);
@@ -1277,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn default_union_cancellation_is_observed_at_1024_skipped_duplicate_copies() {
+    fn duplicates_observe_cancellation() {
         let (_directory, store) = setup_store();
         let mut first = None;
         for index in 0..1_025 {
@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_named_graph_stops_before_ranges_and_point_probes() {
+    fn hidden_graph_unread() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:hidden-named");
         let graph_id = add_many(&store, &graph, 1_025);
@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn visibility_cancellation_stops_before_named_and_union_reads() {
+    fn visibility_cancellation_stops() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:visibility-cancellation");
         let quad = add_quad(
@@ -1495,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn union_respects_set_and_predicate_visibility_once_per_graph() {
+    fn union_memoizes_visibility() {
         let (_directory, store) = setup_store();
         let first_graph = GraphId::new("urn:test:visible:first");
         let second_graph = GraphId::new("urn:test:visible:second");
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn union_qv_ranges_use_one_boundary() {
+    fn union_shares_boundary() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:union-candidate-index");
         let quad = add_quad(
@@ -1716,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn object_bound_patterns_use_object_leading_query_indexes() {
+    fn objects_lead_indexes() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:object-leading");
         let first = add_quad(
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn default_union_groups_qv_copies_but_named_union_preserves_them() {
+    fn unions_preserve_semantics() {
         let (_directory, store) = setup_store();
         let first_graph = GraphId::new("urn:test:default-union:first");
         let second_graph = GraphId::new("urn:test:default-union:second");
@@ -1870,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn default_union_skips_hidden_and_orphaned_copies_before_emitting_one() {
+    fn union_skips_hidden() {
         let (_directory, store) = setup_store();
         let orphan_graph = GraphId::new("urn:test:default-union:orphan");
         let hidden_graph = GraphId::new("urn:test:default-union:hidden");
@@ -1915,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn orphaned_subjects_and_objects_are_filtered_from_normal_diagnostics() {
+    fn diagnostics_hide_orphans() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:orphan-filter");
         add_quad(
@@ -1968,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_view_keeps_an_orphan_hidden_after_a_live_adoption() {
+    fn snapshot_hides_adoptions() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:snapshot-orphan-adoption");
         let entity = "urn:test:snapshot-orphan-adoption:entity";
@@ -2026,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_view_keeps_a_reachable_entity_visible_after_a_live_unlink() {
+    fn snapshot_preserves_reachability() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:snapshot-orphan-unlink");
         let entity = "urn:test:snapshot-orphan-unlink:entity";
@@ -2085,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_snapshot_orphan_recompute_stops_before_a_large_source_scan_when_cancelled() {
+    fn orphan_recomputation_cancels() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:snapshot-orphan-cancel");
         let graph_id = add_many(&store, &graph, 1_025);
@@ -2104,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_and_inverse_walks_delegate_to_pattern_scans() {
+    fn walks_use_patterns() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:walks");
         let first = add_quad(
@@ -2182,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn term_operations_use_graph_store_and_count_requested_decodes() {
+    fn term_decodes_counted() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:terms");
         let quad = add_quad(
@@ -2222,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_cursor_does_not_hold_the_publication_lock_or_see_later_writes() {
+    fn snapshot_isolates_publication() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:snapshot-barrier");
         let first = add_quad(
@@ -2261,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_object_cursor_is_lazy_and_copy_on_write_stable() {
+    fn predicate_cursor_stable() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:predicate-object-snapshot");
         let first = add_quad(
@@ -2318,7 +2318,7 @@ mod tests {
     }
 
     #[test]
-    fn object_cursor_is_lazy_and_copy_on_write_stable_across_add_and_remove() {
+    fn object_cursor_stable() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:object-snapshot");
         let first = add_quad(
@@ -2401,7 +2401,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_cursor_during_publication_reads_the_complete_durable_batch() {
+    fn publication_exposes_batch() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:raw-publication-barrier");
         store.create_graph(&graph).unwrap();

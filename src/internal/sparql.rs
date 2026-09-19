@@ -2802,7 +2802,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
     }
 
     #[cfg(test)]
-    fn with_default_union_marker(
+    fn mark_default_union(
         view: &'context StoreReadView<'store>,
         context: &'context ReadContext<'visibility>,
         marker: BlankNode,
@@ -3441,7 +3441,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_store_terms_hash_and_compare_in_query_id_space() {
+    fn query_terms_compare() {
         let first = StoredQueryTerm {
             source: TermId(1),
             query: Some(QueryTermId(7)),
@@ -3531,7 +3531,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_cursor_stops_after_the_first_accepted_row() {
+    fn dataset_stops_early() {
         let (_dir, store, _search, _engine) = setup_engine();
         let graph = GraphId::new("urn:test:dataset:early-stop");
         for index in 0..64 {
@@ -3574,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn same_binary_read_modes_preserve_complete_named_query_results() {
+    fn read_modes_equivalent() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:read-mode");
         insert_quad(
@@ -3621,7 +3621,7 @@ mod tests {
     }
 
     #[test]
-    fn degraded_count_distinct_object_matches_generic_across_query_index_states() {
+    fn degraded_counts_match() {
         fn fixture(
             state: Option<crate::QueryIndexState>,
         ) -> (
@@ -3836,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn named_dataset_cursor_is_lazy_and_matches_the_compatibility_collector() {
+    fn named_cursor_lazy() {
         let (_dir, store, _search, _engine) = setup_engine();
         let graph = GraphId::new("urn:test:dataset:named");
         for index in 0..24 {
@@ -3950,7 +3950,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_dataset_visibility_memoizes_and_hides_orphans() {
+    fn dataset_memoizes_visibility() {
         let (_dir, store, _search, _engine) = setup_engine();
         let visible_graph = GraphId::new("urn:test:dataset:visible");
         let hidden_graph = GraphId::new("urn:test:dataset:hidden");
@@ -4020,7 +4020,7 @@ mod tests {
     }
 
     #[test]
-    fn union_copy_multiplicity_and_direct_default_dedup_remain_distinct() {
+    fn union_multiplicity_preserved() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:dataset:copies:1");
         let graph2 = GraphId::new("urn:test:dataset:copies:2");
@@ -4089,7 +4089,7 @@ mod tests {
     }
 
     #[test]
-    fn default_union_marker_is_claimed_once_but_never_becomes_a_named_graph() {
+    fn union_marker_private() {
         let (_dir, store, _search, _engine) = setup_engine();
         let graph = GraphId::new("urn:test:dataset:marker");
         insert_quad(
@@ -4107,7 +4107,7 @@ mod tests {
             .unwrap();
         let view = StoreReadView::new(&store);
         let context = ReadContext::default();
-        let dataset = StoreDataset::with_default_union_marker(&view, &context, marker.clone());
+        let dataset = StoreDataset::mark_default_union(&view, &context, marker.clone());
 
         assert!(matches!(
             dataset
@@ -4140,7 +4140,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_hit_miss_and_limit_ten_remain_supported() {
+    fn bounded_queries_supported() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:dataset:limit");
         for index in 0..12 {
@@ -4193,7 +4193,7 @@ mod tests {
             .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
         assert!(matches!(
             prepared
-                .execute(StoreDataset::with_default_union_marker(
+                .execute(StoreDataset::mark_default_union(
                     &view,
                     &context,
                     default_union_marker,
@@ -4249,7 +4249,7 @@ mod tests {
     }
 
     #[test]
-    fn select_queries_use_union_default_graph() {
+    fn select_defaults_union() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:g1");
         let graph2 = GraphId::new("urn:test:g2");
@@ -4281,7 +4281,7 @@ mod tests {
     }
 
     #[test]
-    fn query_with_graphs_limits_default_and_named_graphs_to_visible_set() {
+    fn graph_scopes_authorize() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:g1");
         let graph2 = GraphId::new("urn:test:g2");
@@ -4339,7 +4339,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_graph_list_boundary_keeps_default_union_and_named_copy_semantics() {
+    fn explicit_scopes_preserved() {
         let (_dir, store, _search, engine) = setup_engine();
         let mut graphs = Vec::new();
         for index in 0..=EXPLICIT_DATASET_GRAPH_LIMIT {
@@ -4395,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn default_union_marker_reaches_paths_describe_construct_and_update_where() {
+    fn union_marker_propagates() {
         let (_dir, store, _search, engine) = setup_engine();
         let first_graph = GraphId::new("urn:test:marker-seam:first");
         let second_graph = GraphId::new("urn:test:marker-seam:second");
@@ -4459,7 +4459,7 @@ mod tests {
     }
 
     #[test]
-    fn large_visible_graph_sets_filter_through_union_view() {
+    fn large_scopes_filter() {
         let (_dir, store, _search, engine) = setup_engine();
         let total = EXPLICIT_DATASET_GRAPH_LIMIT + 8;
         let mut graphs = Vec::with_capacity(total);
@@ -4582,7 +4582,7 @@ mod tests {
     }
 
     #[test]
-    fn large_visible_graph_sets_hide_orphaned_entities() {
+    fn large_scopes_hide() {
         let (_dir, store, _search, engine) = setup_engine();
         let total = EXPLICIT_DATASET_GRAPH_LIMIT + 4;
         let mut graphs = Vec::with_capacity(total);
@@ -4628,7 +4628,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_visibility_filters_union_view() {
+    fn visibility_filters_union() {
         let (_dir, store, _search, engine) = setup_engine();
         let total = EXPLICIT_DATASET_GRAPH_LIMIT + 8;
         let shared_subject = "urn:test:pred:shared";
@@ -4751,7 +4751,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_visibility_hides_orphaned_entities() {
+    fn visibility_hides_orphans() {
         let (_dir, store, _search, engine) = setup_engine();
         let total = EXPLICIT_DATASET_GRAPH_LIMIT + 4;
         let mut graphs = Vec::with_capacity(total);
@@ -4800,7 +4800,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_visibility_is_memoized_per_graph() {
+    fn visibility_memoizes_graphs() {
         let (_dir, store, _search, engine) = setup_engine();
         let total = EXPLICIT_DATASET_GRAPH_LIMIT + 8;
         for idx in 0..total {
@@ -4838,7 +4838,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_visibility_blocks_cross_graph_influence() {
+    fn visibility_isolates_graphs() {
         let (_dir, store, _search, engine) = setup_engine();
         let visible_graph = GraphId::new("urn:test:join:visible");
         let hidden_graph = GraphId::new("urn:test:join:hidden");
@@ -4880,7 +4880,7 @@ mod tests {
     }
 
     #[test]
-    fn query_supports_union_optional_bind_and_filter() {
+    fn supports_algebra_combinations() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:g1");
         insert_quad(
@@ -4940,7 +4940,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_and_construct_queries_are_supported() {
+    fn supports_ask_construct() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:g1");
         insert_quad(
@@ -4975,7 +4975,7 @@ mod tests {
     }
 
     #[test]
-    fn select_queries_support_group_order_and_subqueries() {
+    fn supports_nested_select() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:g1");
         let graph2 = GraphId::new("urn:test:g2");
@@ -5041,7 +5041,7 @@ mod tests {
     }
 
     #[test]
-    fn orphaned_entities_are_hidden_from_select_queries() {
+    fn selects_hide_orphans() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:g1");
         insert_quad(
@@ -5134,7 +5134,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_insert_where_materializes_concrete_changes() {
+    fn updates_materialize_changes() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:g1");
         insert_quad(
@@ -5164,7 +5164,7 @@ mod tests {
     /// which would make the FTS SERVICE clause bind nothing at all.
     #[cfg(feature = "search")]
     #[test]
-    fn service_fts_binds_hits_and_scores() {
+    fn service_binds_hits() {
         let (_dir, store, search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:g1");
         insert_quad(
@@ -5230,7 +5230,7 @@ mod tests {
     /// which would make the FTS SERVICE clause bind nothing at all.
     #[cfg(feature = "search")]
     #[test]
-    fn service_fts_respects_visibility_predicate() {
+    fn service_respects_visibility() {
         let (_dir, store, search, engine) = setup_engine();
         let graph1 = GraphId::new("urn:test:fts:g1");
         let graph2 = GraphId::new("urn:test:fts:g2");

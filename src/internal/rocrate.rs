@@ -4590,7 +4590,7 @@ mod tests {
     /// mutation: failure leaves the old pair intact, never new data plus old
     /// hints.
     #[test]
-    fn atomic_rocrate_render_hints() {
+    fn atomic_render_hints() {
         let (_dir, store, flaky, manager) = flaky_manager();
         flaky.fail_context.store(true, Ordering::SeqCst);
 
@@ -4695,7 +4695,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_summary_includes_only_resource_descriptor_artifact_files() {
+    fn summary_filters_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::GraphStore::open(dir.path()).unwrap());
         let search = Arc::new(crate::search::SearchIndex::open_in_memory().unwrap());
