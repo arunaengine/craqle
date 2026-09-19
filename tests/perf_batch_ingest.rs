@@ -18,7 +18,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only batched ingest workflow profile"]
-    fn batched_ingest_workflow_profile() {
+    fn batched_ingest_profile() {
         let total_entities = env_usize(
             "CRAQLE_BATCH_PROFILE_TOTAL_ENTITIES",
             DEFAULT_TOTAL_ENTITIES,

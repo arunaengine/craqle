@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only multi-graph query-path profile"]
-    fn query_graphs_latency_across_many_graphs() {
+    fn multigraph_query_latency() {
         let graph_count = env_usize("CRAQLE_MULTI_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
         let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_FILES_PER_GRAPH);
         let samples = env_usize("CRAQLE_MULTI_QUERY_SAMPLES", DEFAULT_QUERY_SAMPLES);
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only concurrent multi-graph query-path profile"]
-    fn query_graphs_concurrent_latency_across_many_graphs() {
+    fn concurrent_query_latency() {
         let graph_count = env_usize("CRAQLE_MULTI_GRAPH_COUNT", 40_000);
         let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_FILES_PER_GRAPH);
         let samples = env_usize("CRAQLE_MULTI_QUERY_SAMPLES", DEFAULT_QUERY_SAMPLES);

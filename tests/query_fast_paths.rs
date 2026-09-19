@@ -66,7 +66,7 @@ fn canonical(results: &QueryResults) -> Vec<Vec<(String, EncodedTerm)>> {
 }
 
 #[test]
-fn fast_paths_match_generic() {
+fn fast_matches_generic() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let primary = GraphId::new("urn:test:fast:primary");
@@ -260,7 +260,7 @@ fn fast_paths_match_generic() {
 }
 
 #[test]
-fn fast_paths_fail_closed() {
+fn fast_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:private");
@@ -339,7 +339,7 @@ fn fast_paths_fail_closed() {
 }
 
 #[test]
-fn fixed_predicate_triangle_ask_uses_bounded_query_ids() {
+fn triangle_bounds_identifiers() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:triangle");
@@ -415,7 +415,7 @@ fn fixed_predicate_triangle_ask_uses_bounded_query_ids() {
 }
 
 #[test]
-fn count_fast_path_matches_every_triple_binding_shape() {
+fn count_bindings_equivalent() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:count-bindings");
@@ -472,7 +472,7 @@ fn count_fast_path_matches_every_triple_binding_shape() {
 }
 
 #[test]
-fn duplicate_free_union_count_uses_exact_graph_metadata() {
+fn union_count_exact() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let first = GraphId::new("urn:test:fast:union-meta:first");
@@ -513,7 +513,7 @@ fn duplicate_free_union_count_uses_exact_graph_metadata() {
 }
 
 #[test]
-fn subject_star_count_preserves_multiplicity() {
+fn star_preserves_multiplicity() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:subject-star");
@@ -563,7 +563,7 @@ fn subject_star_count_preserves_multiplicity() {
 }
 
 #[test]
-fn optional_subject_star_count_preserves_left_join_multiplicity() {
+fn optional_preserves_multiplicity() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:optional-star");
@@ -631,7 +631,7 @@ fn optional_subject_star_count_preserves_left_join_multiplicity() {
 }
 
 #[test]
-fn subject_set_counts_cover_exists_not_exists_and_minus() {
+fn subject_sets_equivalent() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:subject-set");
@@ -718,7 +718,7 @@ fn subject_set_counts_cover_exists_not_exists_and_minus() {
 }
 
 #[test]
-fn linear_chain_count_uses_explicit_cross_domains() {
+fn chain_domains_explicit() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let graph = GraphId::new("urn:test:fast:linear-chain");

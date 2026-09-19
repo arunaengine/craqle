@@ -16,7 +16,7 @@ use shacl::validator::store::Graph;
 use shacl::validator::{ShaclConfig, ShaclValidationMode};
 
 #[test]
-fn rocrate_rdf_star_term_is_rejected() {
+fn quoted_terms_rejected() {
     let quoted = Triple::new(
         NamedNode::new_unchecked("urn:craqle:test:quoted-subject"),
         NamedNode::new_unchecked("urn:craqle:test:quoted-predicate"),
@@ -38,7 +38,7 @@ fn rocrate_rdf_star_term_is_rejected() {
 }
 
 #[test]
-fn rudof_native_validation_runs_without_sparql() {
+fn native_validation_independent() {
     let shapes = r#"
         @prefix sh: <http://www.w3.org/ns/shacl#> .
         <urn:craqle:test:shape> a sh:NodeShape ;

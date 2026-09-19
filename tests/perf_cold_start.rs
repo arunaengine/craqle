@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only cold-start reopen and rebuild profile"]
-    fn cold_start_reopen_rebuild_to_query_ready() {
+    fn cold_readiness_profile() {
         let config = ColdStartConfig::from_env();
         assert!(config.graph_count > 0, "graph_count must be > 0");
         assert!(

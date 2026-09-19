@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only trusted (pre-validated) materialization latency profile"]
-    fn remote_materialization_trusted_profile() {
+    fn trusted_materialization_profile() {
         let preload = env_usize("CRAQLE_MAT_PRELOAD", DEFAULT_PRELOAD_DOCS);
         let docs = env_usize("CRAQLE_MAT_DOCS", DEFAULT_DOCS);
         let width = env_usize("CRAQLE_MAT_WIDTH", DEFAULT_WIDTH);

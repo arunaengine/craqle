@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only 2.5M single-graph capacity profile"]
-    fn single_graph_2_5_million_summary_and_disk_profile() {
+    fn large_graph_profile() {
         let config = CapacityConfig::from_env(
             "CRAQLE_CAPACITY_SINGLE",
             DEFAULT_SINGLE_GRAPH_COUNT,
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only single-graph capacity ramp profile"]
-    fn single_graph_capacity_ramp_profile() {
+    fn capacity_ramp_profile() {
         let base = CapacityConfig::from_env(
             "CRAQLE_CAPACITY_SINGLE",
             DEFAULT_SINGLE_GRAPH_COUNT,
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only single-graph step breakdown profile"]
-    fn single_graph_step_breakdown_profile() {
+    fn graph_step_profile() {
         let config = BreakdownConfig::from_env();
 
         let (_tmp, net) = setup_network(2);
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only many-graph capacity profile"]
-    fn many_small_graphs_summary_and_disk_profile() {
+    fn small_graphs_profile() {
         let config = CapacityConfig::from_env(
             "CRAQLE_CAPACITY_MANY",
             DEFAULT_MANY_GRAPH_COUNT,

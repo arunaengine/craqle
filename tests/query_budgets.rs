@@ -188,7 +188,7 @@ fn distinct_hides_rows() {
 
 /// BUDGET-03: `ORDER BY` with `LIMIT` sorts the whole product for one row.
 #[test]
-fn order_by_hides_rows() {
+fn ordering_charges_rows() {
     let fixture = Fixture::new();
     fixture.expect_limit(
         &format!("SELECT ?a WHERE {{ {} }} ORDER BY ?b LIMIT 1", product()),

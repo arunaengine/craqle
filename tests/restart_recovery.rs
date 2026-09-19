@@ -165,7 +165,7 @@ fn reopen_fingerprint_matches() {
 /// A deleted graph's tombstone survives reopen and permanently prevents reuse
 /// of the graph ID.
 #[test]
-fn deleted_graph_tombstone_survives_reopen() {
+fn tombstone_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let graph = GraphId::new("urn:test:restart:clock-resurrection");
 

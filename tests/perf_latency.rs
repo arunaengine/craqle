@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only large latency scenario"]
-    fn large_multi_crate_latency_profile() {
+    fn collection_latency_profile() {
         let config = PerfConfig::from_env();
         let (_tmp, net) = setup_network(2);
         let reader = GrantAuthorizer::default();

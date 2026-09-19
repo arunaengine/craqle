@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_preserves_result_sets_across_matrix_shapes() {
+    fn optimizer_preserves_results() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             tmp.path(),
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_respects_visibility_predicate() {
+    fn optimizer_respects_visibility() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             tmp.path(),
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_literal_folds_never_fire_on_non_canonical_spellings() {
+    fn noncanonical_literals_unfolded() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             tmp.path(),

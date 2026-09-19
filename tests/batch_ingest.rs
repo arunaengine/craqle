@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only batch ingest workflow profile"]
-    fn batch_ingest_workflow_profile() {
+    fn batch_ingest_profile() {
         run_batch_ingest_workflow().unwrap();
     }
 

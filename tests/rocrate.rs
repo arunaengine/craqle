@@ -11,7 +11,7 @@ mod tests {
     use crate::support::*;
 
     #[test]
-    fn test_export_import_roundtrip() {
+    fn export_import_roundtrip() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_jsonld_with_policy_rejects_invalid_new_graph() {
+    fn policy_rejects_import() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:invalid-bootstrap-import");
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_import_accepts_nonempty_graph() {
+    fn replacement_accepts_nonempty() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:trusted-bootstrap-non-empty");
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_property_rewrites_rocrate() {
+    fn property_update_rewrites() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_export_preserves_language_and_typed_value_objects() {
+    fn literal_objects_preserved() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:value-objects");
         let mgr = manager(net.peer(0));
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_benchmark_exports_can_omit_or_page_data_entities() {
+    fn exports_page_entities() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-export-page");
         let mgr = manager(net.peer(0));
@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_benchmark_exports_include_linked_contextual_entities() {
+    fn exports_include_contextual() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-export-contextual");
         let mgr = manager(net.peer(0));
@@ -730,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_benchmark_export_cursor_pages_can_resume() {
+    fn export_cursor_resumes() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-export-cursor");
         let mgr = manager(net.peer(0));
@@ -916,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_array_context_import_stores_profile_iris_and_exports_compact() {
+    fn custom_context_compacts() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-custom");
         let mgr = manager(net.peer(0));
@@ -967,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_context_term_last_definition_wins() {
+    fn context_definition_overrides() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-duplicate");
         let mgr = manager(net.peer(0));
@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn test_object_context_term_definition_with_id_expands() {
+    fn object_definition_expands() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-object-id");
         let mgr = manager(net.peer(0));
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_exports_retain_custom_context() {
+    fn partial_context_preserved() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-partial");
         let mgr = manager(net.peer(0));
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_context_exports_default_url_string() {
+    fn default_context_exports() {
         let (_tmp, net) = setup_network(1);
         let mgr = manager(net.peer(0));
 
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_context_entries_round_trip_verbatim() {
+    fn complex_context_roundtrips() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-complex");
         let mgr = manager(net.peer(0));
@@ -1280,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replacement_import_updates_stored_context() {
+    fn replacement_updates_context() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-replace");
         let mgr = manager(net.peer(0));
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_crate_over_custom_context_resets_to_default() {
+    fn creation_resets_context() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-create-reset");
         let mgr = manager(net.peer(0));
@@ -1364,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_crate_with_durability_over_custom_context_resets_to_default() {
+    fn durable_creation_resets() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-create-durability-reset");
         let mgr = manager(net.peer(0));
@@ -1413,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn null_context_is_rejected() {
+    fn null_context_rejected() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:ctx-null");
         let mgr = manager(net.peer(0));
@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_date_lexical_value() {
+    fn invalid_date_rejected() {
         fn document(date: serde_json::Value) -> String {
             serde_json::json!({
                 "@context": "https://w3id.org/ro/crate/1.2/context",

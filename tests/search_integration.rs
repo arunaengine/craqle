@@ -79,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_after_concurrent_edits_scenario() {
+    fn concurrent_edits_searchable() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-search-edit");
         let writer = writer_auth();
@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sparql_integrated_fts_uses_tantivy_hits() {
+    fn sparql_uses_search() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-fts");
         let writer = writer_auth();

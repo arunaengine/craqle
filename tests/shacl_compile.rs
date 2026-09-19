@@ -385,7 +385,7 @@ fn reject_multiple_paths() {
 }
 
 #[test]
-fn local_import_completes_shape() {
+fn local_import_completes() {
     let (_database, node) = node();
     let root = GraphId::new("urn:test:shacl:split-property-root");
     let imported = GraphId::new("urn:test:shacl:split-property-import");

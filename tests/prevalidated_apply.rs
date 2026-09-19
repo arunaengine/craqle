@@ -51,7 +51,7 @@ fn doc(graph: &GraphId, file_count: usize) -> String {
 }
 
 #[test]
-fn checked_apply_with_explicit_actor_is_deterministic() {
+fn explicit_actor_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
     let checked = CraqleNode::open(tmp.path().join("checked")).unwrap();
     let second = CraqleNode::open(tmp.path().join("second")).unwrap();
@@ -98,7 +98,7 @@ fn checked_apply_with_explicit_actor_is_deterministic() {
 }
 
 #[test]
-fn checked_apply_replaces_existing_graph() {
+fn checked_apply_replaces() {
     let tmp = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(tmp.path()).unwrap();
     let graph = GraphId::new("https://w3id.org/aruna/import-replace");
@@ -128,7 +128,7 @@ fn checked_apply_replaces_existing_graph() {
 }
 
 #[test]
-fn checked_apply_rejects_structurally_invalid_jsonld() {
+fn checked_apply_validates() {
     let tmp = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(tmp.path()).unwrap();
     let graph = GraphId::new("https://w3id.org/aruna/import-structural");
@@ -160,7 +160,7 @@ fn checked_apply_rejects_structurally_invalid_jsonld() {
 }
 
 #[test]
-fn checked_apply_still_validates_semantics() {
+fn checked_semantics_enforced() {
     let tmp = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(tmp.path()).unwrap();
     let graph = GraphId::new("https://w3id.org/aruna/import-checked-guard");
@@ -187,7 +187,7 @@ fn checked_apply_still_validates_semantics() {
 }
 
 #[test]
-fn create_with_explicit_actor_is_deterministic() {
+fn explicit_creation_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
     let checked = CraqleNode::open(tmp.path().join("checked")).unwrap();
     let second = CraqleNode::open(tmp.path().join("second")).unwrap();

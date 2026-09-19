@@ -170,7 +170,7 @@ fn diagnostic_access_matches() {
 }
 
 #[test]
-fn explicit_graph_query_authorization_fails_the_whole_request() {
+fn authorization_rejects_request() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let readable = GraphId::new("urn:test:explicit-auth:readable");

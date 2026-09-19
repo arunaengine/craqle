@@ -213,7 +213,7 @@ fn named_shared_query() -> String {
 }
 
 #[test]
-fn graph_variable_preserves_visible_copy_multiplicity() {
+fn graph_variables_preserve() {
     let fixture = fixture(2);
     let rows = canonical_rows(
         fixture
@@ -226,7 +226,7 @@ fn graph_variable_preserves_visible_copy_multiplicity() {
 }
 
 #[test]
-fn mixed_default_and_named_patterns_keep_dedup_and_multiplicity() {
+fn mixed_patterns_preserve() {
     let fixture = fixture(2);
     let query = format!(
         "SELECT ?g ?s WHERE {{ ?s <{TEST_PREDICATE}> \"{SHARED_VALUE}\" . \
@@ -243,7 +243,7 @@ fn mixed_default_and_named_patterns_keep_dedup_and_multiplicity() {
 }
 
 #[test]
-fn visibility_and_orphans_filter_default_and_named_scans() {
+fn scans_filter_visibility() {
     let fixture = fixture(2);
     let default_rows = canonical_rows(
         fixture
@@ -270,7 +270,7 @@ fn visibility_and_orphans_filter_default_and_named_scans() {
 }
 
 #[test]
-fn explicit_graph_scopes_preserve_semantics_at_the_32_graph_boundary() {
+fn scope_boundary_stable() {
     let fixture = fixture(33);
     let default_query = shared_query();
     let named_query = named_shared_query();
@@ -301,7 +301,7 @@ fn explicit_graph_scopes_preserve_semantics_at_the_32_graph_boundary() {
 }
 
 #[test]
-fn ask_and_limit_observe_duplicate_and_nonduplicate_data() {
+fn bounded_queries_deduplicate() {
     let fixture = fixture(2);
     let hit = format!("ASK {{ <{SHARED_SUBJECT}> <{TEST_PREDICATE}> \"{SHARED_VALUE}\" }}");
     let miss = format!(

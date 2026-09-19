@@ -463,7 +463,7 @@ fn modes_match_reports() {
 }
 
 #[test]
-fn auto_force_mode_correctness_matrix() {
+fn validation_modes_equivalent() {
     const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     let cases = [
         ModeCase {
@@ -724,7 +724,7 @@ fn auto_force_mode_correctness_matrix() {
 }
 
 #[test]
-fn auto_handles_skewed_high_frequency_predicates() {
+fn auto_handles_skew() {
     let (_directory, node) = node();
     let data = GraphId::new("urn:test:auto-skew:data");
     let shapes = GraphId::new("urn:test:auto-skew:shapes");
@@ -793,7 +793,7 @@ fn auto_handles_skewed_high_frequency_predicates() {
 }
 
 #[test]
-fn imported_shape_change_invalidates_then_reestimates() {
+fn imports_invalidate_estimates() {
     let (_directory, node) = node();
     let data = GraphId::new("urn:test:auto-import:data");
     let root = GraphId::new("urn:test:incremental-import-root");

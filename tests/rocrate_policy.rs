@@ -146,7 +146,7 @@ fn compile_policy(
 }
 
 #[test]
-fn valid_new_document_is_prepared_evaluated_and_committed_after_one_parse() {
+fn policy_parses_once() {
     let database = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(database.path()).unwrap();
     let data = GraphId::new("urn:test:rocrate-policy:new");
@@ -199,7 +199,7 @@ fn valid_new_document_is_prepared_evaluated_and_committed_after_one_parse() {
 }
 
 #[test]
-fn enforce_rejects_invalid_shacl_without_side_effects_and_advisory_commits() {
+fn policy_enforcement_atomic() {
     let database = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(database.path()).unwrap();
     let data = GraphId::new("urn:test:rocrate-policy:advisory");
@@ -240,7 +240,7 @@ fn enforce_rejects_invalid_shacl_without_side_effects_and_advisory_commits() {
 }
 
 #[test]
-fn existing_unchanged_replacement_and_stale_data_base_are_fenced() {
+fn replacements_fence_revisions() {
     let database = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(database.path()).unwrap();
     let data = GraphId::new("urn:test:rocrate-policy:existing");
@@ -336,7 +336,7 @@ fn existing_unchanged_replacement_and_stale_data_base_are_fenced() {
 }
 
 #[test]
-fn root_and_imported_shape_changes_invalidate_compiled_policy() {
+fn shapes_invalidate_policy() {
     let database = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(database.path()).unwrap();
     let data = GraphId::new("urn:test:rocrate-policy:shape-fence");
@@ -415,7 +415,7 @@ fn root_and_imported_shape_changes_invalidate_compiled_policy() {
 }
 
 #[test]
-fn versions_jsonld_terms_authorization_and_unsupported_shapes_fail_or_report_exactly() {
+fn policy_failures_explicit() {
     let database = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(database.path()).unwrap();
     let shapes = GraphId::new("urn:test:rocrate-policy:versions-shapes");

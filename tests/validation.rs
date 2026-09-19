@@ -11,7 +11,7 @@ mod tests {
     use crate::support::*;
 
     #[test]
-    fn test_rules_prevent_orphan_creation() {
+    fn rules_prevent_orphans() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
         let writer = writer_auth();
@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn test_orphaned_entity_after_concurrent_edit_scenario() {
+    fn concurrent_orphan_hidden() {
         let (_tmp, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-orphans");
         let writer = writer_auth();
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rules_prevent_root_destruction_scenario() {
+    fn rules_preserve_root() {
         let (_tmp, mut net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-root-guard");
         create_test_crate(&net, 0, &graph);

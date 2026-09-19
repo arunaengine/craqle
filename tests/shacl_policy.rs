@@ -554,7 +554,7 @@ fn shacl_policy_snapshot() {
 }
 
 #[test]
-fn status_reads_release_binding_lock_before_authorization() {
+fn status_authorizes_unlocked() {
     let (_directory, node) = node();
     let node = Arc::new(node);
     let data = GraphId::new("urn:test:shacl-policy:locked-data");

@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only derived-index open/readiness profile"]
-    fn derived_index_readiness_after_reopen() {
+    fn reopened_index_readiness() {
         let graph_count = env_usize("CRAQLE_MULTI_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
         let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_FILES_PER_GRAPH);
         let quads_per_graph = 5 + files_per_graph * 5;

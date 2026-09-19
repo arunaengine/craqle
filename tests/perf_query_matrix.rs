@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only optimizer before/after matrix"]
-    fn query_plan_matrix_before_after() {
+    fn query_plan_matrix() {
         let graph_count = env_usize("CRAQLE_MATRIX_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
         let samples = env_usize("CRAQLE_MATRIX_SAMPLES", DEFAULT_SAMPLES);
         let threads = env_usize("CRAQLE_MATRIX_CONCURRENCY", DEFAULT_THREADS);

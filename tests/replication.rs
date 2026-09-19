@@ -19,7 +19,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_delete_replicates_to_peers() {
+    fn deletion_replicates_peers() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-delete");
         create_test_crate(&net, 0, &graph);
@@ -73,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_remote_policy_event() {
+    fn unauthorized_policy_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let net =
             CraqleCluster::new_with_options(2, tmp.path(), |_| CraqleOptions::default()).unwrap();
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_delete_survives_reopen_without_resurrection() {
+    fn deletion_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let irokle = irokle::Irokle::builder().build().unwrap();
         let open = || {
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poison_event_does_not_brick_reconcile() {
+    fn poison_preserves_reconciliation() {
         let dir = tempfile::tempdir().unwrap();
         let irokle = irokle::Irokle::builder().build().unwrap();
         let node = CraqleNode::open_with_options(
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_graph_injection_is_rejected() {
+    fn graph_injection_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let irokle = irokle::Irokle::builder().build().unwrap();
         let node = CraqleNode::open_with_options(
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_durable_write_before_reconcile_does_not_fork_graph_topic() {
+    fn durable_write_unforked() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-topic-fork");
         create_test_crate(&net, 0, &graph);
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deterministic_actor_writes_are_identical_across_nodes() {
+    fn actor_writes_deterministic() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let node_a = CraqleNode::open(dir_a.path()).unwrap();
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_peer_create_crate() {
+    fn single_peer_creation() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
         create_test_crate(&net, 0, &graph);
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_add_convergence() {
+    fn additions_converge() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_three_peer_convergence() {
+    fn three_peers_converge() {
         let (_tmp, mut net) = setup_network(3);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_idempotent_batch_replay() {
+    fn batch_replay_idempotent() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_same_field_update_keeps_both_values() {
+    fn concurrent_values_survive() {
         let (_tmp, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate1");
 
@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_entity_addition_scenario() {
+    fn concurrent_entities_converge() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-entities");
         create_test_crate(&net, 0, &graph);
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_observed_remove_removes_quad_everywhere() {
+    fn observed_removal_converges() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-observed-remove");
         create_test_crate(&net, 0, &graph);
@@ -693,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_remove_is_add_wins() {
+    fn concurrent_addition_wins() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-add-wins");
         create_test_crate(&net, 0, &graph);
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_out_of_order_delivery_within_actor_scenario() {
+    fn reordered_events_converge() {
         let (_tmp, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-out-of-order");
         create_test_crate(&net, 0, &graph);
@@ -762,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_three_peer_partition_scenario() {
+    fn partitioned_peers_converge() {
         let (_tmp, mut net) = setup_network(3);
         let graph = GraphId::new("urn:test:crate-partition");
         manager(net.peer(0))
@@ -851,7 +851,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(24))]
 
         #[test]
-        fn prop_crdt_converges_under_random_ops(ops in prop::collection::vec(random_op_strategy(), 1..40)) {
+        fn generated_operations_converge(ops in prop::collection::vec(random_op_strategy(), 1..40)) {
             let (_tmp, net) = setup_network(3);
             let graph = GraphId::new("urn:test:crate-proptest");
             create_test_crate(&net, 0, &graph);
@@ -881,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_context_replicates_across_peers() {
+    fn custom_context_replicates() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:ctx-replicate");
         let organism_iri = "https://w3id.org/aruna/profiles/proteomics#organism";
@@ -974,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_context_imports_converge_to_lww_winner() {
+    fn concurrent_contexts_converge() {
         let (_tmp, net) = setup_network(2);
         let graph = GraphId::new("urn:test:ctx-concurrent");
         let default_context = serde_json::json!("https://w3id.org/ro/crate/1.2/context");

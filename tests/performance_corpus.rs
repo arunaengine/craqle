@@ -23,7 +23,7 @@ fn corpus(config: CorpusConfig) -> DeterministicCorpus {
 }
 
 #[test]
-fn equal_seed_and_config_produce_identical_records() {
+fn equal_seeds_repeat() {
     let config = config(10_000, 32, 25, DEFAULT_SEED);
     let left: Vec<_> = corpus(config).into_iter().collect();
     let right: Vec<_> = corpus(config).into_iter().collect();
@@ -32,7 +32,7 @@ fn equal_seed_and_config_produce_identical_records() {
 }
 
 #[test]
-fn changing_seed_changes_the_stream() {
+fn different_seeds_diverge() {
     let left = config(10_000, 32, 0, DEFAULT_SEED);
     let right = config(10_000, 32, 0, DEFAULT_SEED.wrapping_add(1));
 
@@ -43,7 +43,7 @@ fn changing_seed_changes_the_stream() {
 }
 
 #[test]
-fn iterator_has_exact_count_and_constant_sized_state() {
+fn iterator_state_bounded() {
     let large = corpus(config(10_000_000, 1_000, 90, DEFAULT_SEED));
     let mut stream = large.into_iter();
 
@@ -93,7 +93,7 @@ fn star_probe_complete() {
 }
 
 #[test]
-fn supported_dimensions_and_impossible_duplicates_are_rejected() {
+fn rejects_impossible_dimensions() {
     assert_eq!(
         CorpusConfig::new(9_999, 32, 0, DEFAULT_SEED),
         Err(CorpusConfigError::UnsupportedQuadCount(9_999))
@@ -116,7 +116,7 @@ fn supported_dimensions_and_impossible_duplicates_are_rejected() {
 }
 
 #[test]
-fn required_matrix_contains_only_valid_requested_dimensions() {
+fn matrix_dimensions_valid() {
     let matrix = CorpusConfig::required_matrix();
 
     assert_eq!(matrix.len(), 21);
@@ -149,7 +149,7 @@ fn required_matrix_contains_only_valid_requested_dimensions() {
 }
 
 #[test]
-fn graph_coverage_visibility_and_orphan_metadata_are_available() {
+fn corpus_metadata_available() {
     let records: Vec<_> = corpus(config(10_000, 32, 0, DEFAULT_SEED))
         .into_iter()
         .collect();
@@ -180,7 +180,7 @@ fn graph_coverage_visibility_and_orphan_metadata_are_available() {
 }
 
 #[test]
-fn duplicate_percent_is_exact_and_cross_graph() {
+fn duplicates_match_percentage() {
     for graphs in [32, 1_000] {
         for duplicate_percent in [0, 25, 90] {
             let records: Vec<_> = corpus(config(10_000, graphs, duplicate_percent, DEFAULT_SEED))
@@ -204,7 +204,7 @@ fn duplicate_percent_is_exact_and_cross_graph() {
 }
 
 #[test]
-fn canonical_stars_and_chain_segments_stay_local() {
+fn connected_patterns_local() {
     let records: Vec<_> = corpus(config(10_000, 1_000, 25, DEFAULT_SEED))
         .into_iter()
         .collect();
@@ -232,7 +232,7 @@ fn canonical_stars_and_chain_segments_stay_local() {
 }
 
 #[test]
-fn every_requested_10k_multigraph_configuration_covers_all_graphs() {
+fn configurations_cover_graphs() {
     for graphs in [32, 1_000] {
         let expected: BTreeSet<_> = (0..graphs as u32).collect();
         for duplicate_percent in REQUIRED_DUPLICATE_PERCENTS {
@@ -250,7 +250,7 @@ fn every_requested_10k_multigraph_configuration_covers_all_graphs() {
 }
 
 #[test]
-fn all_requested_workload_classes_occur() {
+fn workload_classes_present() {
     let records: Vec<_> = corpus(config(10_000, 32, 0, DEFAULT_SEED))
         .into_iter()
         .collect();
@@ -290,7 +290,7 @@ fn all_requested_workload_classes_occur() {
 }
 
 #[test]
-fn metadata_is_compact_and_reports_visibility_distribution() {
+fn metadata_reports_visibility() {
     let metadata = corpus(config(10_000, 32, 25, DEFAULT_SEED)).metadata();
 
     assert_eq!(metadata.version, corpus::CORPUS_VERSION);
@@ -303,7 +303,7 @@ fn metadata_is_compact_and_reports_visibility_distribution() {
 }
 
 #[test]
-fn tiny_golden_prefix_is_stable() {
+fn golden_prefix_stable() {
     let actual = corpus(config(10_000, 32, 25, DEFAULT_SEED))
         .into_iter()
         .take(8)

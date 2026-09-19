@@ -510,7 +510,7 @@ mod tests {
     /// when a later checked write restores reachability (G6, G7).
     #[test]
     #[cfg(feature = "search")]
-    fn replicated_orphan_relink_keeps_search() {
+    fn relink_preserves_search() {
         let (_dir, mut net) = setup_network(2);
         let node = net.peer(0);
         let graph = GraphId::new("urn:test:f3-requeue-baseline");

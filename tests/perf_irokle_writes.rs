@@ -16,7 +16,7 @@ mod tests {
 
     #[test]
     #[ignore = "diagnostic probe for Craqle + Irokle write latency"]
-    fn small_rocrate_write_latency_probe() {
+    fn crate_write_latency() {
         let samples = env_usize("CRAQLE_IROKLE_WRITE_PROBE_SAMPLES", 5);
         assert!(samples > 0, "samples must be > 0");
 

@@ -16,7 +16,7 @@ mod tests {
 
     #[test]
     #[ignore = "diagnostic probe for Craqle/Fjall durability policy latency"]
-    fn fjall_durability_policy_metadata_probe() {
+    fn durability_metadata_probe() {
         let samples = env_usize("CRAQLE_FJALL_DURABILITY_PROBE_SAMPLES", 5);
         let subwrites = env_usize("CRAQLE_FJALL_DURABILITY_PROBE_SUBWRITES", 4);
         assert!(samples > 0, "samples must be > 0");

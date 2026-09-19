@@ -265,7 +265,7 @@ fn license_shapes_roundtrip() {
 }
 
 #[test]
-fn unknown_future_version_has_exact_iri() {
+fn future_version_exact() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let document = crate_document(

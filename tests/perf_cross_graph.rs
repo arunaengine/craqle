@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only cross-graph graph-unbound sparql profile"]
-    fn graph_unbound_sparql_patterns_across_many_graphs() {
+    fn unbound_patterns_profile() {
         let config = CrossGraphConfig::from_env();
         assert!(config.graph_count > 0, "graph_count must be > 0");
         assert!(

@@ -223,7 +223,7 @@ fn expected_rows(mut rows: Vec<Vec<(String, EncodedTerm)>>) -> Vec<Vec<(String, 
 }
 
 #[test]
-fn baseline_queries_are_exact_and_planner_invariant() {
+fn baseline_plans_equivalent() {
     let fixture = fixture();
 
     let ask_hit = format!("ASK WHERE {{ <{NEEDLE_SUBJECT}> <{KNOWN}> <{KNOWN_OBJECT}> }}");
@@ -320,7 +320,7 @@ fn baseline_queries_are_exact_and_planner_invariant() {
 }
 
 #[test]
-fn duplicate_graph_results_are_planner_invariant_and_named_rows_keep_multiplicity() {
+fn plans_preserve_multiplicity() {
     let fixture = fixture();
     let default_query = format!("SELECT ?s WHERE {{ ?s <{SHARED}> \"same\" }}");
     let named_query = format!("SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s <{SHARED}> \"same\" }} }}");
@@ -354,7 +354,7 @@ fn duplicate_graph_results_are_planner_invariant_and_named_rows_keep_multiplicit
 }
 
 #[test]
-fn union_default_graph_deduplicates_identical_triples() {
+fn union_deduplicates_triples() {
     let fixture = fixture();
     let query = format!("SELECT ?s WHERE {{ ?s <{SHARED}> \"same\" }}");
     let expected = expected_rows(vec![vec![("s".to_string(), iri(DUPLICATE_SUBJECT))]]);
@@ -369,7 +369,7 @@ fn union_default_graph_deduplicates_identical_triples() {
 }
 
 #[test]
-fn hidden_graphs_and_recorded_orphans_are_not_query_visible() {
+fn queries_hide_orphans() {
     let fixture = fixture();
     let hidden_query = format!("SELECT ?s WHERE {{ ?s <{HIDDEN}> \"hidden\" }}");
     assert_eq!(

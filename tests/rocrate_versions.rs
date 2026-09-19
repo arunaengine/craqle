@@ -138,7 +138,7 @@ fn assert_unknown_on_every_import_route(jsonld: &str, expected: &str) {
 }
 
 #[test]
-fn supported_versions_round_trip_canonical_rdf_and_context() {
+fn supported_versions_roundtrip() {
     for (version, root, fixture) in [
         (
             RoCrateVersion::V1_1,
@@ -202,7 +202,7 @@ fn supported_versions_round_trip_canonical_rdf_and_context() {
 }
 
 #[test]
-fn creation_defaults_to_1_3_and_options_select_version_and_license() {
+fn creation_selects_version() {
     assert_eq!(RoCrateVersion::default(), RoCrateVersion::V1_3);
     assert_eq!(
         context_url(RoCrateVersion::V1_3),
@@ -294,7 +294,7 @@ fn creation_defaults_to_1_3_and_options_select_version_and_license() {
 }
 
 #[test]
-fn v1_3_contexts_and_bioschemas_terms_are_offline_and_faithful() {
+fn contexts_resolve_offline() {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
 
@@ -382,7 +382,7 @@ fn v1_3_contexts_and_bioschemas_terms_are_offline_and_faithful() {
 }
 
 #[test]
-fn context_only_and_specification_only_versions_survive_round_trips() {
+fn partial_versions_roundtrip() {
     let directory = tempfile::tempdir().unwrap();
     let source = CraqleNode::open(directory.path().join("source")).unwrap();
     let replica = CraqleNode::open(directory.path().join("replica")).unwrap();
@@ -516,7 +516,7 @@ fn context_only_and_specification_only_versions_survive_round_trips() {
 }
 
 #[test]
-fn entity_edits_keep_the_stored_version_marker() {
+fn edits_preserve_version() {
     for (version, fixture) in [
         (
             RoCrateVersion::V1_1,
@@ -555,7 +555,7 @@ fn entity_edits_keep_the_stored_version_marker() {
 }
 
 #[test]
-fn version_errors_are_shared_by_every_import_route() {
+fn imports_share_errors() {
     assert_unknown_on_every_import_route(
         include_str!("fixtures/rocrate/unknown-future-context.json"),
         "https://w3id.org/ro/crate/9.9/context",

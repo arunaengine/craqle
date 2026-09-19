@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only scan cost breakdown"]
-    fn aruna_shaped_corpus_scan_breakdown() {
+    fn corpus_scan_breakdown() {
         let graph_count = env_usize("CRAQLE_ARUNA_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
         let samples = env_usize("CRAQLE_ARUNA_QUERY_SAMPLES", DEFAULT_SAMPLES);
         let tmp = tempfile::tempdir().unwrap();
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only aruna-corpus query-path reproduction"]
-    fn aruna_shaped_corpus_select_latency() {
+    fn corpus_select_latency() {
         let graph_count = env_usize("CRAQLE_ARUNA_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
         let samples = env_usize("CRAQLE_ARUNA_QUERY_SAMPLES", DEFAULT_SAMPLES);
         let threads = env_usize("CRAQLE_ARUNA_CONCURRENCY", DEFAULT_THREADS);

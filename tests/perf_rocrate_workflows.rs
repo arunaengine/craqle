@@ -17,7 +17,7 @@ mod tests {
 
     #[test]
     #[ignore = "release-only large RO-Crate workflow comparison"]
-    fn compare_large_rocrate_import_and_batched_append() {
+    fn compare_import_append() {
         let entity_count = env_usize("CRAQLE_ROCRATE_WORKFLOW_ENTITY_COUNT", DEFAULT_ENTITY_COUNT);
         let batch_size = env_usize("CRAQLE_ROCRATE_WORKFLOW_BATCH_SIZE", DEFAULT_BATCH_SIZE);
         let include_validated_baseline =

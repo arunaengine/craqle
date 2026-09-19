@@ -14,7 +14,7 @@ mod tests {
 
     #[test]
     #[ignore = "performance smoke check"]
-    fn performance_store_and_sync_smoke() {
+    fn storage_sync_smoke() {
         let (_tmp, net) = setup_network(3);
         let graph = GraphId::new("urn:test:crate-perf");
         create_test_crate(&net, 0, &graph);
@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     #[ignore = "heavy real-world graph smoke test"]
-    fn heavy_real_world_graph_with_integrated_fts() {
+    fn large_search_graph() {
         let entity_count = std::env::var("CRAQLE_HEAVY_ENTITY_COUNT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
