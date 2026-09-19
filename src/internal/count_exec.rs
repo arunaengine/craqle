@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::count_plan::{CountValueDomain, SubjectSetMode};
-use crate::query_context::ReadContext;
-use crate::query_cursor::CountGrouping;
+use crate::query::context::ReadContext;
+use crate::query::cursor::CountGrouping;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{QueryBudget, Result, SparqlError};
 use crate::store::{QueryTermId, StoreError, TermId};
@@ -249,7 +249,7 @@ pub(crate) fn single_pattern_count(
         }
         GraphSelector::DefaultUnion => {
             if parallel_rows.is_some_and(|rows| rows >= PARALLEL_COUNT_MIN_ROWS) {
-                let workers = crate::query_worker::worker_count();
+                let workers = crate::query::worker::worker_count();
                 match cursor.into_scalar_partitions(workers) {
                     Ok(partitions) => {
                         return parallel_default_union_count(view, context, partitions, budget);
@@ -957,7 +957,7 @@ fn exact_named_count(
 fn default_union_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    cursor: &mut crate::query_cursor::RawQueryIndexKeyCursor,
+    cursor: &mut crate::query::cursor::RawQueryIndexKeyCursor,
     domain: CountValueDomain,
     budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
@@ -1102,12 +1102,12 @@ struct ParallelCountWork {
 fn parallel_default_union_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    partitions: Vec<crate::query_cursor::RawQueryIndexKeyCursor>,
+    partitions: Vec<crate::query::cursor::RawQueryIndexKeyCursor>,
     budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
     let graph_cache = parallel_graph_cache(view, context)?;
     let cancellation = context.cancellation();
-    let results = crate::query_worker::map_ordered(partitions, |cursor| {
+    let results = crate::query::worker::map_ordered(partitions, |cursor| {
         count_default_union_partition(cursor, &graph_cache, &cancellation, budget)
     })?;
 
@@ -1146,9 +1146,9 @@ fn parallel_graph_cache(
 }
 
 fn count_default_union_partition(
-    mut cursor: crate::query_cursor::RawQueryIndexKeyCursor,
+    mut cursor: crate::query::cursor::RawQueryIndexKeyCursor,
     graph_cache: &ParallelGraphOrphanCache,
-    cancellation: &crate::query_context::QueryCancellation,
+    cancellation: &crate::query::context::QueryCancellation,
     budget: &QueryBudget,
 ) -> Result<ParallelCountWork> {
     let mut result = ParallelCountWork::default();
@@ -1217,7 +1217,7 @@ fn count_default_union_partition(
 fn graph_orphans(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    cursor: &crate::query_cursor::RawQueryIndexKeyCursor,
+    cursor: &crate::query::cursor::RawQueryIndexKeyCursor,
     cache: &mut GraphOrphanCache,
     query_graph: QueryTermId,
 ) -> Result<Option<Rc<HashSet<TermId>>>> {

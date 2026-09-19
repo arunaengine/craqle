@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use crate::Result;
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView};
 use crate::store::TermId;
 

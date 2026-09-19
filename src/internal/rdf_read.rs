@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId};
-use crate::query_context::{GraphVisibility, QueryReadMode, ReadAccessPath, ReadContext};
-use crate::query_cursor::QueryCursor;
+use crate::query::context::{GraphVisibility, QueryReadMode, ReadAccessPath, ReadContext};
+use crate::query::cursor::QueryCursor;
 use crate::store::{
     EncodedQuad, GraphStore, QueryIndexAdmission, QueryIndexCursorOrder, Result, StoreError,
     StoreReadSnapshot, TermId,
@@ -245,7 +245,7 @@ impl<'store> StoreReadView<'store> {
         context: &ReadContext<'_>,
         selector: GraphSelector,
         pattern: QuadPattern,
-    ) -> Result<Option<crate::query_cursor::RawQueryIndexKeyCursor>> {
+    ) -> Result<Option<crate::query::cursor::RawQueryIndexKeyCursor>> {
         context.check_cancelled()?;
         let Some(pattern) = selector.apply(pattern) else {
             return Ok(None);
@@ -465,7 +465,7 @@ impl RdfReadView for StoreReadView<'_> {
                 self.store,
                 &self.snapshot,
                 context,
-                crate::query_cursor::RawQuadCursor::single(candidate),
+                crate::query::cursor::RawQuadCursor::single(candidate),
                 pattern,
             ));
         }
@@ -776,7 +776,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::{ActorId, Dot, GraphDiagnostics};
-    use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadContext};
+    use crate::query::context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadContext};
     use crate::store::{ClockUpdate, CounterKey, QuadAdd, QuadRemove, StoreError, hash_term};
 
     use super::*;

@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView};
 use crate::shacl::{ShaclValidationOptions, ShaclValidationReport, ShaclValidationStatistics};
 use crate::store::{TermId, hash_term};

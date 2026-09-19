@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
 use crate::planner::{JoinKind, JoinMode, PlannedJoin, PlannerTrace};
-use crate::query_context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
+use crate::query::context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
 use crate::sparql_fast_path::{FastPathPlan, QueryFastPathKind, QueryFastPathMode};
@@ -673,7 +673,7 @@ pub struct QueryPlan {
 pub struct QueryPlanNode {
     pub logical_operator: QueryLogicalOperator,
     pub physical_operator: QueryPhysicalOperator,
-    pub access_paths: Vec<crate::query_context::ReadAccessPath>,
+    pub access_paths: Vec<crate::query::context::ReadAccessPath>,
     pub estimated_rows: Option<u64>,
     pub actual_rows: Option<u64>,
     pub index_seeks: u64,
@@ -716,7 +716,7 @@ pub struct QueryExecutionStatistics {
     pub time_to_first_internal_result: Option<Duration>,
     pub fast_path: Option<QueryFastPathKind>,
     pub planned_joins: Vec<PlannedJoin>,
-    pub selected_access_paths: Vec<crate::query_context::ReadAccessPath>,
+    pub selected_access_paths: Vec<crate::query::context::ReadAccessPath>,
     pub plan_fingerprint: String,
     pub index_seeks: u64,
     pub qv_admission_checks: u64,
@@ -3421,7 +3421,7 @@ mod tests {
 
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
-    use crate::query_context::ReadAccessPath;
+    use crate::query::context::ReadAccessPath;
     #[cfg(feature = "search")]
     use crate::search::QueueBound;
     use crate::store::{EncodedQuad, FtsSubject, QuadAdd};

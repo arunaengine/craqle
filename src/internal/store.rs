@@ -1841,11 +1841,11 @@ impl StoreReadSnapshot {
         &self,
         store: &GraphStore,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> crate::query_cursor::RawQuadCursor {
+    ) -> crate::query::cursor::RawQuadCursor {
         store
             .current_derived_raw_cursor(self.sequence(), pattern)
             .unwrap_or_else(|| {
-                crate::query_cursor::RawQuadCursor::new(
+                crate::query::cursor::RawQuadCursor::new(
                     self.snapshot.clone(),
                     &store.quads,
                     pattern,
@@ -1857,16 +1857,16 @@ impl StoreReadSnapshot {
         &self,
         store: &GraphStore,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> crate::query_cursor::RawQuadCursor {
-        crate::query_cursor::RawQuadCursor::new(self.snapshot.clone(), &store.quads, pattern)
+    ) -> crate::query::cursor::RawQuadCursor {
+        crate::query::cursor::RawQuadCursor::new(self.snapshot.clone(), &store.quads, pattern)
     }
 
     pub(crate) fn raw_quad_point(
         &self,
         store: &GraphStore,
         quad: EncodedQuad,
-    ) -> Result<Option<crate::query_cursor::RawQuadCandidate>> {
-        crate::query_cursor::point_candidate(&self.snapshot, &store.quads, quad)
+    ) -> Result<Option<crate::query::cursor::RawQuadCandidate>> {
+        crate::query::cursor::point_candidate(&self.snapshot, &store.quads, quad)
     }
 
     pub(crate) fn query_index_cursor(
@@ -1874,12 +1874,12 @@ impl StoreReadSnapshot {
         store: &GraphStore,
         order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> Result<crate::query_cursor::RawQuadCursor> {
+    ) -> Result<crate::query::cursor::RawQuadCursor> {
         let Some((keyspace, prefix)) = store.query_index_range(&self.snapshot, order, pattern)?
         else {
-            return Ok(crate::query_cursor::RawQuadCursor::empty());
+            return Ok(crate::query::cursor::RawQuadCursor::empty());
         };
-        Ok(crate::query_cursor::RawQuadCursor::query_index(
+        Ok(crate::query::cursor::RawQuadCursor::query_index(
             self.snapshot.clone(),
             keyspace,
             &store.qv2_query_to_term,
@@ -1894,7 +1894,7 @@ impl StoreReadSnapshot {
         order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
         query_id_upper_bound: u64,
-    ) -> Result<Option<crate::query_cursor::RawQueryIndexKeyCursor>> {
+    ) -> Result<Option<crate::query::cursor::RawQueryIndexKeyCursor>> {
         let resolve = |term: Option<TermId>| -> Result<Option<Option<QueryTermId>>> {
             match term {
                 Some(term) => Ok(store
@@ -1920,9 +1920,9 @@ impl StoreReadSnapshot {
             return Ok(None);
         };
         let filter =
-            crate::query_cursor::RawQueryIndexPattern::new(graph, subject, predicate, object)
+            crate::query::cursor::RawQueryIndexPattern::new(graph, subject, predicate, object)
                 .without_prefix(order, prefix.len() / 8);
-        Ok(Some(crate::query_cursor::RawQueryIndexKeyCursor::new(
+        Ok(Some(crate::query::cursor::RawQueryIndexKeyCursor::new(
             self.snapshot.clone(),
             keyspace,
             &store.qv2_query_to_term,
@@ -2120,7 +2120,7 @@ impl StoreReadSnapshot {
     pub(crate) fn orphaned_entity_ids(
         &self,
         store: &GraphStore,
-        context: &crate::query_context::ReadContext<'_>,
+        context: &crate::query::context::ReadContext<'_>,
         graph: TermId,
     ) -> Result<HashSet<TermId>> {
         if !self.contains_graph_by_id(store, graph)? {
@@ -3957,8 +3957,7 @@ impl GraphStore {
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(delay) = stall {
             let active = self.commit_stall_active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak_commit_stalls
-                .fetch_max(active, Ordering::SeqCst);
+            self.peak_commit_stalls.fetch_max(active, Ordering::SeqCst);
             self.commit_stalled.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
             self.commit_stall_active.fetch_sub(1, Ordering::SeqCst);
@@ -4785,7 +4784,7 @@ impl GraphStore {
     fn snapshot_orphaned_entity_ids(
         &self,
         snapshot: &Snapshot,
-        context: &crate::query_context::ReadContext<'_>,
+        context: &crate::query::context::ReadContext<'_>,
         graph_id: TermId,
         vocab: &OrphanVocab,
     ) -> Result<HashSet<TermId>> {
@@ -6982,7 +6981,7 @@ impl GraphStore {
         &self,
         _snapshot_seqno: u64,
         _pattern: crate::rdf_read::QuadPattern,
-    ) -> Option<crate::query_cursor::RawQuadCursor> {
+    ) -> Option<crate::query::cursor::RawQuadCursor> {
         None
     }
 
@@ -7781,7 +7780,7 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_context::{QueryReadMode, ReadContext};
+    use crate::query::context::{QueryReadMode, ReadContext};
     use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
     use crate::search_queue::{QueueBound, drain_upto};
     use std::os::unix::fs::PermissionsExt;

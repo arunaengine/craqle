@@ -12,7 +12,7 @@ use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{QueryBudget, QueryResults, Result};
 use crate::store::{EncodedQuad, QueryTermId, TermId};
@@ -744,10 +744,10 @@ pub(crate) fn execute(
                         (domain, grouping),
                         (
                             crate::count_plan::CountValueDomain::Subject,
-                            crate::query_cursor::CountGrouping::Subject
+                            crate::query::cursor::CountGrouping::Subject
                         ) | (
                             crate::count_plan::CountValueDomain::Object,
-                            crate::query_cursor::CountGrouping::Object
+                            crate::query::cursor::CountGrouping::Object
                         )
                     );
                     let mut last_value = None;

@@ -17,7 +17,7 @@ use shacl::ir::{IRComponent, IRSchema, IRShape, ShapeLabelIdx};
 use shacl::rdf::ShaclParser;
 use shacl::types::{NodeKind, Severity, Target};
 
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::shacl::{
     CompiledShaclSchema, ShaclCompileOptions, ShaclCompileStatistics, ShaclError,

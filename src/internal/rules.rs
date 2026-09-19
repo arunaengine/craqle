@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use crate::RoCrateVersion;
 use crate::core::{CrateViolation, EncodedTerm, GraphId, MaterializedQuadChange, QuadOp, vocab};
-use crate::query_context::{QueryCancellation, ReadContext};
+use crate::query::context::{QueryCancellation, ReadContext};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::GraphStore;
 use crate::validation_delta::{DeltaImpact, DeltaIndex, DeltaReadView};

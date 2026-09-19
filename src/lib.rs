@@ -27,14 +27,8 @@ mod count_exec;
 mod count_plan;
 #[path = "internal/planner.rs"]
 mod planner;
-#[allow(dead_code)]
-#[path = "internal/query_context.rs"]
-mod query_context;
-#[allow(dead_code)]
-#[path = "internal/query_cursor.rs"]
-mod query_cursor;
-#[path = "internal/query_worker.rs"]
-mod query_worker;
+#[path = "internal/query/mod.rs"]
+mod query;
 #[path = "internal/qv_gate.rs"]
 mod qv_gate;
 #[allow(dead_code)]
@@ -87,7 +81,7 @@ use crate::core::{
     EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
 };
 #[cfg(feature = "shacl-core")]
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 #[cfg(feature = "shacl-core")]
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::replication::ReplicationEngine;
@@ -109,7 +103,7 @@ pub use crate::core::{
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
-pub use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
+pub use crate::query::context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
 pub use crate::replication::{
     CheckMode, DiagnosticsMode, MergeError, MergeResult, UpdateError, WriteChecks,
 };

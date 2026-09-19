@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use fjall::{Keyspace, Readable, Snapshot};
 
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::QuadPattern;
 use crate::store::{
     EncodedQuad, GraphStore, QueryIndexCursorOrder, QueryTermId, Result, StoreReadSnapshot, TermId,

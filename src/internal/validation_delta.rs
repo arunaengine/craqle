@@ -7,8 +7,8 @@ use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange, vocab};
-use crate::query_context::ReadContext;
-use crate::query_cursor::{CandidateStorage, QueryCursor, RawQuadCandidate, RawQuadCursor};
+use crate::query::context::ReadContext;
+use crate::query::cursor::{CandidateStorage, QueryCursor, RawQuadCandidate, RawQuadCursor};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::{EncodedQuad, GraphStore, Result, StoreError, TermId, hash_term};
 
@@ -634,7 +634,7 @@ impl RdfReadView for DeltaReadView<'_, '_> {
 #[cfg(test)]
 mod tests {
     use crate::core::{ActorId, Dot};
-    use crate::query_context::QueryCancellation;
+    use crate::query::context::QueryCancellation;
     use crate::store::{ClockUpdate, CounterKey, QuadAdd};
 
     use super::*;
