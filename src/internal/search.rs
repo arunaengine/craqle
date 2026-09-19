@@ -33,9 +33,6 @@ const REINDEX_FLUSH_CHUNK: usize = 2_048;
 /// the whole budget is still prepared: the cap is overshot by that one entry
 /// instead of the pass making no progress at all.
 const PREPARED_TEXT_BUDGET: usize = 64_000_000;
-/// Attempts one failing queue entry gets before this process stops retrying
-/// it. The durable entry stays, so the obligation outlives the quarantine.
-const MAX_ITEM_ATTEMPTS: u32 = 8;
 /// Rebuild-lock shards. Comfortably above the indexer's concurrency while
 /// staying a fixed, tiny allocation.
 const REBUILD_SHARDS: usize = 64;
@@ -152,11 +149,7 @@ pub struct SearchIndex {
     /// Set when a poisoned writer was rolled back and the index therefore owes
     /// the store a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
-    /// Attempts and last diagnostic per failing queue entry.
-    ///
-    /// In memory only. The durable queue entry is what keeps the coverage
-    /// obligation; this exists so one entry that always fails is not retried
-    /// in a tight loop, and so a flush can name what it could not cover.
+    /// Reports failed attempts while durable queue entries remain retryable.
     item_failures: Mutex<HashMap<FailureKey, DrainFailure>>,
     #[cfg(test)]
     hooks: TestHooks,
@@ -575,16 +568,6 @@ impl SearchIndex {
         entry.clone()
     }
 
-    /// A failing entry this process has stopped retrying, with its last state.
-    fn quarantined(&self, key: &FailureKey) -> Option<DrainFailure> {
-        self.item_failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .filter(|failure| failure.attempts >= MAX_ITEM_ATTEMPTS)
-            .cloned()
-    }
-
     fn clear_failure(&self, key: &FailureKey) {
         self.item_failures
             .lock()
@@ -848,10 +831,6 @@ impl SearchIndex {
         let mut covered = Vec::with_capacity(slice.entries.len());
         for entry in &slice.entries {
             let key = FailureKey::graph(&entry.graph);
-            if let Some(failure) = self.quarantined(&key) {
-                pass.progress.failures.push(failure);
-                continue;
-            }
             match self.settle_deleted_graph(pass.store, &entry.graph) {
                 Ok(()) => {
                     self.clear_failure(&key);
@@ -903,10 +882,6 @@ impl SearchIndex {
         let mut covered = Vec::with_capacity(slice.entries.len());
         for entry in &slice.entries {
             let key = FailureKey::graph(&entry.graph);
-            if let Some(failure) = self.quarantined(&key) {
-                pass.progress.failures.push(failure);
-                continue;
-            }
             match self.rebuild_queued_graph(pass.store, &entry.graph) {
                 Ok(()) => {
                     self.clear_failure(&key);
@@ -977,10 +952,6 @@ impl SearchIndex {
                 continue;
             }
             let key = FailureKey::subject(&entry.graph, entry.subject);
-            if let Some(failure) = self.quarantined(&key) {
-                pass.progress.failures.push(failure);
-                continue;
-            }
             match self.prepare_queued_entry(
                 &mut caches,
                 PrepareSubject {
@@ -2080,5 +2051,18 @@ mod tests {
             "the healthy graph stayed unindexed behind a permanently failing entry"
         );
         assert_eq!(healthy.as_str(), hits[0].graph_id);
+
+        for _ in 0..10 {
+            assert!(crate::flush_search_queue(&store, &search).is_err());
+        }
+        *search
+            .hooks
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        crate::flush_search_queue(&store, &search)
+            .expect("a recovered entry must remain retryable after repeated failures");
+        assert_eq!(2, search.search("isolationneedle", 50).unwrap().len());
+        assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
     }
 }

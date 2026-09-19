@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+};
 use std::time::Duration;
 #[cfg(feature = "shacl-core")]
 use std::time::Instant;
@@ -874,6 +876,8 @@ pub struct GraphStore {
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
     /// [`GraphStore::graph_commit_guard`].
     commit_locks: Vec<Mutex<()>>,
+    /// Commits share this guard; rebuilds exclude them before owning the qv gate.
+    projection_lock: RwLock<()>,
     /// One qv maintainer stages global counters at a time. A graph commit that
     /// cannot own the gate still commits its source rows, together with the
     /// durable projection debt that keeps those rows out of qv admission.
@@ -3842,7 +3846,26 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    pub(crate) fn repair_query_indexes(&self) -> Result<()> {
+        if self.snapshot_admission(&self.db.snapshot())?.trusted {
+            return Ok(());
+        }
+        match self.rebuild_query_indexes() {
+            Err(StoreError::QueryIndexUnavailable(_)) => Ok(()),
+            result => result,
+        }
+    }
+
     pub(crate) fn rebuild_query_indexes(&self) -> Result<()> {
+        let _projection = match self.projection_lock.try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(StoreError::QueryIndexUnavailable(
+                    "query-index rebuild overlaps a graph commit",
+                ));
+            }
+        };
         let Some(_owner) = self.qv_gate.try_acquire() else {
             return Err(StoreError::QueryIndexUnavailable(
                 "query-index rebuild overlaps a graph commit",
@@ -4598,6 +4621,10 @@ impl GraphStore {
     /// every snapshot holding these source rows also holds the evidence that
     /// decides whether the query view may answer for them.
     fn commit_with_index(&self, mut commit: DurableCommit, publish: &PendingPublish) -> Result<()> {
+        let _projection = self
+            .projection_lock
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let owner = self.qv_gate.try_acquire();
         let debt = match &owner {
             Some(_) => {
@@ -5394,6 +5421,7 @@ impl GraphStore {
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            projection_lock: RwLock::new(()),
             qv_gate: QvCommitGate::new(),
             qv_commit_wait: QV_COMMIT_WAIT,
             qv_debt_next: AtomicU64::new(1),
@@ -8154,9 +8182,7 @@ mod tests {
         assert_query_index_ready(&store, 2);
     }
 
-    /// A source-only commit that survives to disk without its maintenance must
-    /// not be admitted after reopen. The pending delta is gone, so the store
-    /// records a durable failure that a rebuild clears.
+    /// Reopened debt stays inadmissible until the maintenance worker rebuilds it.
     #[test]
     fn unrepaired_debt_reopens() {
         let directory = tempfile::tempdir().unwrap();
@@ -8182,7 +8208,7 @@ mod tests {
             // Stop here: the maintenance for this commit never runs.
         }
 
-        let reopened = GraphStore::open(directory.path()).unwrap();
+        let reopened = Arc::new(GraphStore::open(directory.path()).unwrap());
         let captured = reopened.read_snapshot();
         let admission = reopened.snapshot_admission(&captured.snapshot).unwrap();
         assert!(
@@ -8193,8 +8219,14 @@ mod tests {
             reopened.query_index_status().unwrap().state,
             QueryIndexState::Failed("projection-debt-unrepaired".to_owned())
         );
-        reopened.rebuild_query_indexes().unwrap();
+        maintenance_round(reopened.clone());
         assert_query_index_ready(&reopened, 2);
+        assert!(
+            !reopened
+                .snapshot_admission(&captured.snapshot)
+                .unwrap()
+                .trusted
+        );
     }
 
     /// A finished rebuild leaves no owner behind, so later writes still proceed.
@@ -8210,6 +8242,49 @@ mod tests {
         let second = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
         commit_add(&store, &graph, second);
         assert_query_index_ready(&store, 2);
+    }
+
+    #[test]
+    fn repair_failed_projection() {
+        let (_dir, mut store) = setup_store();
+        store.qv_commit_wait = Duration::ZERO;
+        let store = Arc::new(store);
+        let graph = GraphId::new("urn:test:projection-repair");
+        store.create_graph(&graph).unwrap();
+        let held = store.qv_gate.try_acquire().unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        let captured = store.read_snapshot();
+        assert!(
+            !store
+                .snapshot_admission(&captured.snapshot)
+                .unwrap()
+                .trusted
+        );
+        drop(held);
+
+        maintenance_round(store.clone());
+        assert_query_index_ready(&store, 1);
+        assert!(
+            !store
+                .snapshot_admission(&captured.snapshot)
+                .unwrap()
+                .trusted
+        );
+    }
+
+    fn maintenance_round(store: Arc<GraphStore>) {
+        let search = Arc::new(crate::SearchIndex::open_in_memory().unwrap());
+        let worker = crate::SearchUpdateWorker::start(store, search);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        worker
+            .sender
+            .send(crate::SearchWorkerMessage::Flush(sender))
+            .unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(180))
+            .unwrap()
+            .unwrap();
     }
 
     /// A failed commit releases maintenance ownership, so a healthy write that

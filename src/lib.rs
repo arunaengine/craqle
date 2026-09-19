@@ -632,10 +632,6 @@ const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
 /// Control messages one worker cycle collects before it goes back to work.
 /// Anything past this stays in the channel for the next cycle.
 const SEARCH_MAX_CONTROL_MESSAGES: usize = 1_024;
-/// How long [`SearchUpdateWorker::shutdown`] waits for the indexer thread.
-const SEARCH_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
-/// Poll interval while waiting for the indexer thread to finish.
-const SEARCH_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 /// Above this many selected graphs, `search_graphs` runs one filtered search
 /// instead of one full top-k collection per graph.
 const SEARCH_GRAPHS_PER_GRAPH_LIMIT: usize = 8;
@@ -674,7 +670,7 @@ impl SearchUpdateWorker {
             stopping: stopping.clone(),
         };
         let handle = std::thread::spawn(move || {
-            run_search_update_worker(receiver, ctx);
+            run_search_worker(receiver, ctx);
         });
 
         Self {
@@ -685,32 +681,15 @@ impl SearchUpdateWorker {
         }
     }
 
-    /// Ask the indexer to stop and wait up to `deadline` for its thread.
-    ///
-    /// Reports whether the thread finished. The stop flag is checked between
-    /// work slices, so a slice already inside a Tantivy or store call finishes
-    /// that call first: the bound is cooperative, not hard. Nothing here can
-    /// terminate a dependency call that does not return, and abandoning the
-    /// thread would leave a detached index writer able to race a reopened
-    /// store, so a timeout is reported rather than forced. A timed-out
-    /// shutdown loses no queue obligation: every entry it had not
-    /// acknowledged is still owed.
-    fn shutdown(&mut self, deadline: Duration) -> bool {
+    /// Stop between work slices and join before releasing the index owner.
+    /// An active dependency call must return before its writer can be released.
+    fn shutdown(&mut self) -> bool {
         self.stopping.store(true, Ordering::SeqCst);
         let _ = self.sender.send(SearchWorkerMessage::Stop);
         let Some(handle) = self.handle.take() else {
             return true;
         };
 
-        let give_up = std::time::Instant::now() + deadline;
-        while !handle.is_finished() {
-            if std::time::Instant::now() >= give_up {
-                // Kept, not detached: see the note above.
-                self.handle = Some(handle);
-                return false;
-            }
-            std::thread::sleep(SEARCH_SHUTDOWN_POLL);
-        }
         handle.join().is_ok()
     }
 
@@ -743,7 +722,7 @@ impl SearchUpdateWorker {
 
 impl Drop for SearchUpdateWorker {
     fn drop(&mut self) {
-        let _ = self.shutdown(SEARCH_SHUTDOWN_DEADLINE);
+        let _ = self.shutdown();
     }
 }
 
@@ -755,7 +734,7 @@ struct SearchWorkerCtx {
     stopping: Arc<AtomicBool>,
 }
 
-fn run_search_update_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
+fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
     loop {
         let mut flush_replies = Vec::new();
         let stop_message = collect_search_worker_messages(&receiver, &mut flush_replies);
@@ -772,7 +751,7 @@ fn run_search_update_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: 
         // always gets a fresh wake through.
         ctx.wake_pending.store(false, Ordering::SeqCst);
 
-        let result = drain_search_queue_guarded(&ctx);
+        let result = drain_search_queues(&ctx);
         let failed = result.is_err();
         for reply in flush_replies {
             let _ = reply.send(result.clone());
@@ -812,10 +791,14 @@ fn collect_search_worker_messages(
     false
 }
 
-/// Runs one drain cycle, turning a panic into an error rather than losing the
-/// indexer thread — it is the only thread that can repair the index.
-fn drain_search_queue_guarded(ctx: &SearchWorkerCtx) -> std::result::Result<(), String> {
-    let drain = panic::AssertUnwindSafe(|| flush_search_queue(&ctx.store, &ctx.search));
+/// Turns a maintenance-cycle panic into an error so the worker can retry.
+fn drain_search_queues(ctx: &SearchWorkerCtx) -> std::result::Result<(), String> {
+    let drain = panic::AssertUnwindSafe(|| {
+        if let Err(error) = ctx.store.repair_query_indexes() {
+            tracing::warn!(%error, "query index repair remains pending");
+        }
+        flush_search_queue(&ctx.store, &ctx.search)
+    });
     match panic::catch_unwind(drain) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),
@@ -6212,9 +6195,45 @@ mod tests {
             keep_alive.push(waiter);
         }
 
+        let (sender, receiver) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || sender.send(worker.shutdown()).unwrap());
         assert!(
-            worker.shutdown(PROGRESS_TIMEOUT),
+            receiver.recv_timeout(PROGRESS_TIMEOUT).unwrap(),
             "the indexer thread did not observe shutdown behind the backlog"
         );
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn drop_joins_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let (entered, observed) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let completed = finished.clone();
+        let handle = std::thread::spawn(move || {
+            assert!(matches!(
+                receiver.recv_timeout(PROGRESS_TIMEOUT).unwrap(),
+                SearchWorkerMessage::Stop
+            ));
+            entered.send(()).unwrap();
+            resume.recv_timeout(PROGRESS_TIMEOUT).unwrap();
+            completed.store(true, Ordering::SeqCst);
+        });
+        let worker = SearchUpdateWorker {
+            sender,
+            wake_pending: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            handle: Some(handle),
+        };
+        let (done, result) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            drop(worker);
+            done.send(finished.load(Ordering::SeqCst)).unwrap();
+        });
+        observed.recv_timeout(PROGRESS_TIMEOUT).unwrap();
+        release.send(()).unwrap();
+        assert!(result.recv_timeout(PROGRESS_TIMEOUT).unwrap());
+        owner.join().unwrap();
     }
 }
