@@ -1,3 +1,7 @@
+# Defines Craqle features, dependencies, and benchmark targets.
+# Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+# SPDX-License-Identifier: MIT
+
 [workspace]
 resolver = "3"
 
@@ -50,9 +54,9 @@ tempfile = "3.27.0"
 
 [package]
 name = "craqle"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.97.1"
 license = "MIT"
 description = "Versioned RDF graph storage, SPARQL, SHACL, and RO-Crate workflows"
 repository = "https://github.com/arunaengine/craqle"
@@ -76,7 +80,7 @@ shacl-core = [
 blake3 = { workspace = true }
 chrono = { workspace = true }
 fjall = { workspace = true }
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "dcce9593adf21b14c8c8214c7ad7c180777be303", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "fd29484e9281524efa692f59025ac6cca2443da8", features = [
     "fjall",
 ] }
 oxrdf = { workspace = true }

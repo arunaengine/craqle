@@ -12,8 +12,8 @@
 //! correctness or security defect makes that impossible. Authoritative CRDT
 //! data written by 0.2 remains readable by later 0.2 releases. Query and search
 //! indexes and compiled SHACL caches are derived data and may be rebuilt or
-//! discarded. Unsupported forms return an error. A future 0.3 release may make
-//! breaking changes with a migration note.
+//! discarded. Unsupported forms return an error. The 0.3 Irokle upgrade requires
+//! the migration steps documented in `CHANGELOG.md`.
 
 #![warn(unreachable_pub)]
 

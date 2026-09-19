@@ -1,6 +1,32 @@
+<!-- Records released behavior and upgrade requirements. -->
+<!-- Copyright (c) 2026 ArunaStorage Team @ JLU Giessen -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Changelog
 
 All notable changes to Craqle are documented here.
+
+## 0.3.0 - Unreleased
+
+### Changed
+
+- Integrates Irokle 0.3.0 at revision `fd29484e9281524efa692f59025ac6cca2443da8`.
+- Requires Rust 1.97.1 or newer. Craqle's authoritative RDF disk format remains `1.0`.
+- Background maintenance retries failed search entries and rebuilds uncovered query
+  indexes. Rebuilds exclude source commits while preserving concurrent normal writes.
+- Dropping a node joins its maintenance worker; an active storage or search call
+  must finish before shutdown completes.
+
+### Upgrading from 0.2
+
+- Applications that depend directly on Irokle must use the same revision as Craqle,
+  or use the `craqle::irokle` re-export so both libraries share identical types.
+- Upgrade replication peers together: Irokle 0.3 uses the `irokle/sync/2` protocol.
+- Back up Irokle's Fjall database before its first open with this version. Irokle
+  upgrades schema 1 to schema 2 in place and resumes an interrupted migration.
+  Older Irokle binaries reject schema 2; rollback requires the pre-upgrade backup.
+- Derived-index repair preserves surviving RDF source state. It cannot reconstruct
+  source events lost by older bugs without an authoritative history or healthy replica.
 
 ## 0.2.0 - 2026-08-22
 
