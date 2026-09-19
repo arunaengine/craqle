@@ -1,4 +1,6 @@
 //! Deterministic, bounded RDF-like corpus specifications for performance work.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The iterator yields compact numeric specifications rather than RDF strings
 //! and never retains the generated corpus. A benchmark can map the numeric

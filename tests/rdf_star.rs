@@ -1,3 +1,7 @@
+//! Checks explicit rejection of unsupported RDF-star terms.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use craqle::{
     AllowAllAuthorizer, CraqleErrorKind, CraqleNode, CreateCrateRequest, EncodedTerm, GraphId,
     GraphPolicy, MaterializedQuadChange, UpdateOptions,

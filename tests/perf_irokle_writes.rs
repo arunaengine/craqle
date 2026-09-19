@@ -1,3 +1,7 @@
+//! Profiles replicated RO-Crate writes through Irokle.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

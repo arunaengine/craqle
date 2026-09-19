@@ -1,3 +1,7 @@
+//! Measures derived-index readiness after reopening a store.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

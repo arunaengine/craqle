@@ -1,3 +1,7 @@
+//! Checks SHACL graph bindings and dependency revisions.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 mod support;

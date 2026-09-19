@@ -1,3 +1,7 @@
+//! Checks structural graph rules under local and concurrent edits.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

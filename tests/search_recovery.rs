@@ -1,4 +1,6 @@
 //! Search coverage across a change of build features.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The three phases run as separate processes over one shared directory, so
 //! they need separate `cargo test` invocations with different features. Each

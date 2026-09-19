@@ -1,3 +1,7 @@
+//! Checks query execution limits and typed limit failures.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 use std::time::Duration;

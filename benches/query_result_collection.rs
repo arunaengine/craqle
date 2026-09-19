@@ -1,3 +1,7 @@
+//! Compares query result collection allocations and runtime.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::hint::black_box;

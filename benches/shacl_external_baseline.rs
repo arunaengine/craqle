@@ -1,4 +1,6 @@
 //! External-copy SHACL baseline for the later Craqle-native validator.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! This deliberately exports the visible Craqle graph into Rudof's in-memory
 //! Oxigraph graph. It is comparison-only: production validation must not take

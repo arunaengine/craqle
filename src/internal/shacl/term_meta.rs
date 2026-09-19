@@ -1,3 +1,7 @@
+//! Interprets RDF literal datatypes and comparison semantics for SHACL.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::cmp::Ordering;
 use std::str::FromStr;
 

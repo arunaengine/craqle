@@ -1,3 +1,7 @@
+//! Compares query plans across a controlled workload matrix.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Query-shape matrix for the craqle plan optimizer over the aruna-shaped

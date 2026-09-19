@@ -1,3 +1,7 @@
+//! Checks JSON-LD import, export, context handling, and entity edits.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

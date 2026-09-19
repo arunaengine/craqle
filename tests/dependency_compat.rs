@@ -1,3 +1,7 @@
+//! Checks RDF-star rejection and the SHACL dependency feature contract.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 use oxrdf::{Literal, NamedNode, Term, Triple};

@@ -1,4 +1,6 @@
 //! Small, deterministic semantic baseline for the public SPARQL API.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! This deliberately checks results, not query timings.  Each baseline query
 //! runs with the craqle optimizer both enabled and disabled; solution rows are

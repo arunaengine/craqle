@@ -1,3 +1,7 @@
+//! Checks deterministic benchmark corpus generation and distribution.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #[path = "../benches/support/mod.rs"]
 mod corpus;
 

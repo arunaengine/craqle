@@ -1,4 +1,6 @@
 //! Bounded draining of the durable FTS queues.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! Shared by the real index and the `search`-disabled stub so both honour the
 //! same flush contract.

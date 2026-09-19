@@ -1,3 +1,7 @@
+//! Preserves search repair debt when the search feature is disabled.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::path::Path;
 
 use crate::core::GraphId;

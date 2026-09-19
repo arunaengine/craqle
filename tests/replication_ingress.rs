@@ -1,4 +1,6 @@
 //! Remote input must be rejected before it can change any durable state.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use chrono::Utc;
 use craqle::*;

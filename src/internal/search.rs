@@ -1,3 +1,7 @@
+//! Indexes visible RDF documents and drains durable search repair queues.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

@@ -1,3 +1,7 @@
+//! Profiles serial and concurrent queries across many graphs.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

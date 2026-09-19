@@ -1,4 +1,6 @@
 //! Exactly-once ownership of query-view maintenance with first-in admission.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! One owner at a time plans query-view counters against the committed state and
 //! publishes source rows and query-view rows in a single database batch. Waiting

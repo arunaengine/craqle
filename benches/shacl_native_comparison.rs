@@ -1,3 +1,7 @@
+//! Compares native SHACL validation with an external baseline.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::time::Instant;

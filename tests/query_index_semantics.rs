@@ -1,4 +1,6 @@
 //! Black-box query contracts for graph routing and duplicate handling.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! CONSTRUCT/DESCRIBE coverage remains in the internal SPARQL tests: the
 //! public graph result contains triples but no graph provenance, so it cannot

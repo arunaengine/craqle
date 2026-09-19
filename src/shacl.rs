@@ -1,4 +1,6 @@
 //! Craqle-owned SHACL compilation types.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use std::sync::Arc;
 use std::time::Duration;

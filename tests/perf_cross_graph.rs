@@ -1,3 +1,7 @@
+//! Profiles graph-unbound queries across many named graphs.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

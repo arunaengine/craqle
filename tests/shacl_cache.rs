@@ -1,3 +1,7 @@
+//! Checks compiled SHACL cache reuse and invalidation.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 mod support;

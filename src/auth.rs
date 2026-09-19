@@ -1,3 +1,7 @@
+//! Checks graph visibility and read or write grants.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::sync::OnceLock;
 
 use crate::core::{GraphId, GraphPolicy};

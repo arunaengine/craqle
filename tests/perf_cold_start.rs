@@ -1,3 +1,7 @@
+//! Profiles reopening and rebuilding indexes before query readiness.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

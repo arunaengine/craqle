@@ -1,3 +1,7 @@
+//! Collects timing and resource observations for ignored workload tests.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![allow(dead_code)]
 
 use std::fs;

@@ -1,3 +1,7 @@
+//! Checks public batch merge and snapshot installation semantics.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use chrono::Utc;
 use craqle::*;
 

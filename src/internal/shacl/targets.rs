@@ -1,3 +1,7 @@
+//! Selects SHACL focus nodes from compiled target declarations.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::BTreeSet;
 
 use crate::Result;

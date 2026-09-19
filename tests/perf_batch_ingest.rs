@@ -1,3 +1,7 @@
+//! Measures batched ingestion through the public workflow.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

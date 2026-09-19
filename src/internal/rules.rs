@@ -1,3 +1,7 @@
+//! Validates RO-Crate structure and graph mutation rules.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;

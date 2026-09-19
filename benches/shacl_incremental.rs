@@ -1,3 +1,7 @@
+//! Compares incremental and full SHACL validation work.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::env;
 use std::hint::black_box;
 use std::process::Command;

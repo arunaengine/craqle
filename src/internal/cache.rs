@@ -1,3 +1,7 @@
+//! Bounds cached entries and maintains their recency order.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 

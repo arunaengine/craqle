@@ -1,3 +1,7 @@
+//! Measures queries over an Aruna-shaped metadata corpus.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Faithful reproduction of the aruna production cluster query workload:

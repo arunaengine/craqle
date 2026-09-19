@@ -1,3 +1,7 @@
+//! Checks structural validation rules across RO-Crate versions.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use craqle::{
     AllowAllAuthorizer, CraqleError, CraqleNode, CrateViolation, CreateCrateOptions,
     CreateCrateRequest, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange, RoCrateError,

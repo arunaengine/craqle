@@ -1,3 +1,7 @@
+//! Publishes graph events and merges observed-remove replica state.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 #[cfg(feature = "shacl-core")]

@@ -1,4 +1,6 @@
 //! Craqle stores, validates, queries, searches, and replicates RO-Crates.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The integration surface is the root API: [`CraqleNode`], the typed request
 //! structs, and RO-Crate JSON-LD import/export. Everything under

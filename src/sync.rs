@@ -1,3 +1,7 @@
+//! Connects graph events, topic cursors, and Irokle replication.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 

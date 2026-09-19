@@ -1,3 +1,7 @@
+//! Checks supported RO-Crate versions and their JSON-LD contexts.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use craqle::{
     AllowAllAuthorizer, CraqleError, CraqleNode, CraqleRequestDurability, CreateCrateOptions,
     CreateCrateRequest, DenyAllAuthorizer, GraphId, GraphPolicy, RoCrateError, RoCrateVersion,

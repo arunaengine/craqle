@@ -1,3 +1,7 @@
+//! Checks replica convergence, deletion, and rejected remote events.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

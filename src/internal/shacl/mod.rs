@@ -1,3 +1,7 @@
+//! Organizes native SHACL compilation and validation.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 pub(crate) mod compile;
 pub(crate) mod constraints;
 pub(crate) mod dependencies;

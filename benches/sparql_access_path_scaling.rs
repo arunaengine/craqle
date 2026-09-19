@@ -1,3 +1,7 @@
+//! Measures SPARQL access paths as graph sizes grow.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::hint::black_box;
 
 #[path = "support/allocation.rs"]

@@ -1,3 +1,7 @@
+//! Measures bounded loading and entity access in large graphs.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::hint::black_box;
 use std::time::Duration;
 

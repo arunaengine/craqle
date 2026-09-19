@@ -1,3 +1,7 @@
+//! Defines RDF terms, observed-remove state, and replication snapshots.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};

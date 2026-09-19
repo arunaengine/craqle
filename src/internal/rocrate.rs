@@ -1,3 +1,7 @@
+//! Imports, exports, and edits RO-Crate JSON-LD documents.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;

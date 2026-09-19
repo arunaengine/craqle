@@ -1,3 +1,7 @@
+//! Simulates replica partitions, synchronization, and query fanout.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashSet};

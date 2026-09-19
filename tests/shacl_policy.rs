@@ -1,3 +1,7 @@
+//! Checks SHACL policy authorization and binding status.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 use std::sync::atomic::{AtomicBool, Ordering};

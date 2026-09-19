@@ -1,3 +1,7 @@
+//! Resolves SHACL shapes and their local import dependencies.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

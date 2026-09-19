@@ -1,3 +1,7 @@
+//! Measures import and query latency for large RO-Crates.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::hint::black_box;
 use std::time::Duration;
 

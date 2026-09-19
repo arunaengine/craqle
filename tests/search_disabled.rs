@@ -1,3 +1,7 @@
+//! Checks unsupported search behavior in builds without search.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #[cfg(not(feature = "search"))]
 #[test]
 fn search_disabled_error() {

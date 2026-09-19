@@ -1,3 +1,7 @@
+//! Checks shape compilation, imports, and unsupported SHACL forms.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 mod support;

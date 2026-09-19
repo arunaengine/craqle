@@ -1,3 +1,7 @@
+//! Checks SHACL enforcement and atomic graph write outcomes.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 mod support;

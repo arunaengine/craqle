@@ -1,3 +1,7 @@
+//! Compares specialized query paths with generic SPARQL evaluation.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 use crate::support::TestWriteExt as _;

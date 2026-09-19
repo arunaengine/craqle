@@ -1,3 +1,7 @@
+//! Checks public API authorization, durability, and replication contracts.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 use craqle::*;

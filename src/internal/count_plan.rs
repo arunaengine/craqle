@@ -1,5 +1,7 @@
 //! Type-safe count planning is kept separate from execution so eligibility
 //! decisions cannot be confused with exact stored counts.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
 

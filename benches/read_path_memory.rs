@@ -1,4 +1,6 @@
 //! Coarse process-memory baseline for completed public SPARQL query results.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! VmRSS/VmHWM describe the whole process, not a query-local allocator. The
 //! current public API fully collects `QueryResults`, so this observes retained

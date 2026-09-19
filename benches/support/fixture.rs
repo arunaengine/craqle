@@ -1,4 +1,6 @@
 //! Bounded, deterministic benchmark fixture construction for SPARQL reads.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The corpus iterator itself stays numeric and streaming. This module owns
 //! the temporary database and retains only graph metadata plus a handful of

@@ -1,3 +1,7 @@
+//! Executes planned counts over graph and union query views.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;

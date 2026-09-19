@@ -1,4 +1,6 @@
 //! Focused same-corpus Craqle versus Oxigraph SPARQL comparison.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The default mode runs Oxigraph 0.5.9 in memory. The explicit persistent mode
 //! below uses RocksDB and Craqle `SyncAll`. Both modes cover warm, fully

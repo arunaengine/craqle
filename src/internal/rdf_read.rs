@@ -1,3 +1,7 @@
+//! Reads visible RDF patterns through snapshot cursors.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::HashSet;

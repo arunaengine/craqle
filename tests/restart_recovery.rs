@@ -1,5 +1,7 @@
 //! WS0 restart-recovery guarantees, exercised end to end through the public
 //! `CraqleNode` API.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The store-level proofs (clock-tag mismatch detection, FTS queue token
 //! ordering, the legacy-clock migration fallback) live in

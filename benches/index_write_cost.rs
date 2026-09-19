@@ -1,4 +1,6 @@
 //! Persistent-index write-cost benchmark.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! Fixture construction is deliberately kept outside Criterion's measured
 //! closures. Every local case receives a new database per iteration, while

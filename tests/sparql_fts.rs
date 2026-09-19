@@ -1,3 +1,7 @@
+//! Checks full-text service rewriting and authorized SPARQL hits.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Completeness of the `SERVICE <urn:craqle:fts>` clause (charter G8, finding K2).

@@ -1,3 +1,7 @@
+//! Compares metadata persistence costs under Fjall durability policies.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

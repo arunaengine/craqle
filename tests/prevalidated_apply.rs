@@ -1,3 +1,7 @@
+//! Checks prepared RO-Crate application and explicit actor identity.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use craqle::*;
 
 fn policy() -> GraphPolicy {

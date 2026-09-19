@@ -1,3 +1,7 @@
+//! Exercises large graph storage, synchronization, and search workloads.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]

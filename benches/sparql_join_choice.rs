@@ -1,3 +1,7 @@
+//! Compares query join strategies over controlled graph distributions.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::env;
 use std::hint::black_box;
 

@@ -1,4 +1,6 @@
 //! Authorization-aware paging over the full-text index.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 #![cfg(feature = "search")]
 

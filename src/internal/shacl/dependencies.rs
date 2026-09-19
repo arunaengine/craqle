@@ -1,3 +1,7 @@
+//! Finds graph dependencies referenced by SHACL imports.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::BTreeSet;
 
 use crate::EncodedTerm;

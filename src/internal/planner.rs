@@ -1,4 +1,6 @@
 //! Craqle-owned query plan optimization.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! Rewrites the spargebra AST before it is handed to spareval, using the
 //! store's real cardinality statistics instead of sparopt's static guesses:

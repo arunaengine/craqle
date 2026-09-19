@@ -1,3 +1,7 @@
+//! Checks search updates and SPARQL full-text integration.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Every test here asserts on real tantivy results, so the `search`-off stub —

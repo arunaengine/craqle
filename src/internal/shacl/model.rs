@@ -1,3 +1,7 @@
+//! Defines compiled SHACL shapes, paths, targets, and constraints.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use crate::{EncodedTerm, RoCrateVersion};
 
 pub(crate) const COMPILED_SHACL_FORMAT_VERSION: u32 = crate::SHACL_COMPILER_MODEL_VERSION;

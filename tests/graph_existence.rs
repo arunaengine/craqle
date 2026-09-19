@@ -1,3 +1,7 @@
+//! Checks graph creation, existence, and mutation boundaries.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Graph-existence semantics (charter G9, finding K5).

@@ -1,3 +1,7 @@
+//! Checks query work limits, cancellation, and complete-result behavior.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![allow(clippy::result_large_err)]
 
 mod support;

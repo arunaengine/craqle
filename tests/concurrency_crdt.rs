@@ -1,3 +1,7 @@
+//! Exercises concurrent replica edits and observed-remove convergence.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Concurrency guarantees of the write path (finding K1).

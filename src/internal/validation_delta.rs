@@ -1,3 +1,7 @@
+//! Overlays pending mutations on snapshot RDF reads for validation.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::cmp::Ordering;
 use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap, HashSet};

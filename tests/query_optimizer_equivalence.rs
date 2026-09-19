@@ -1,3 +1,7 @@
+//! Checks optimized queries against unoptimized result sets.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 /// Result-equivalence harness for the craqle query-plan optimizer: every

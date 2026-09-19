@@ -1,5 +1,7 @@
 //! WS0 concurrency guarantees, exercised end to end through the public
 //! `CraqleNode` API.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 //!
 //! The guard-level proofs — parallel `insert_quad` + `commit` keeping the dot set
 //! intact, the self-guarding store functions not deadlocking, and the

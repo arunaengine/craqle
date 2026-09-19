@@ -1,3 +1,7 @@
+//! Scans snapshot query indexes with bounded key cursors.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;

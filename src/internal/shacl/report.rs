@@ -1,3 +1,7 @@
+//! Assembles deterministic SHACL validation reports and statistics.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::time::Instant;
 
 use crate::query_context::ReadContext;

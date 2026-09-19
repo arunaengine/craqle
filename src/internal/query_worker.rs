@@ -1,3 +1,7 @@
+//! Runs parallel query work through a shared bounded worker pool.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::sync::LazyLock;
 
 use rayon::prelude::*;

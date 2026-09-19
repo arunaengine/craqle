@@ -1,3 +1,7 @@
+//! Checks preservation of RO-Crate metadata and version identifiers.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 use craqle::{

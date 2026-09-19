@@ -1,3 +1,7 @@
+//! Builds isolated graph fixtures and assertions for integration tests.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 

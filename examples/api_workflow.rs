@@ -1,3 +1,7 @@
+//! Demonstrates public graph, query, and SHACL workflows.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #[cfg(not(feature = "shacl-core"))]
 fn main() {
     eprintln!("this example requires the `shacl-core` feature");
