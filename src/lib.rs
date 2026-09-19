@@ -31,7 +31,6 @@ mod planner;
 mod query;
 #[path = "internal/qv_gate.rs"]
 mod qv_gate;
-#[allow(dead_code)]
 #[path = "internal/rdf_read.rs"]
 mod rdf_read;
 #[path = "internal/replication.rs"]
@@ -3119,15 +3118,8 @@ impl CraqleNode {
             .plan)
     }
 
-    /// Execute a SPARQL query where graph visibility is decided by `visible`.
-    ///
-    /// The predicate is evaluated lazily over the union view: it runs at most
-    /// once per graph the evaluation actually touches (memoized for the
-    /// duration of the query), so the cost scales with the graphs a query
-    /// reaches instead of the total corpus. A quad participates in evaluation
-    /// iff its graph satisfies the predicate; the predicate must be cheap and
-    /// side-effect free.
-    #[cfg(test)]
+    /// Allows visibility-controlled query fixtures in search tests.
+    #[cfg(all(test, feature = "search"))]
     pub(crate) fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
     where
         F: Fn(&GraphId) -> bool,

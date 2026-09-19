@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 use std::cell::OnceCell;
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -60,6 +59,7 @@ impl GraphSelector {
 
 /// The shared behavior surface for durable RDF reads.
 pub(crate) trait RdfReadView {
+    #[cfg(feature = "shacl-core")]
     fn contains_graph(&self, graph: &GraphId) -> Result<bool>;
 
     fn scan<'store, 'context, 'visibility>(
@@ -107,15 +107,6 @@ pub(crate) trait RdfReadView {
     fn decode_term_arc(&self, context: &ReadContext<'_>, term: TermId) -> Result<Arc<EncodedTerm>> {
         Ok(Arc::new(self.decode_term(context, term)?))
     }
-
-    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool>;
-
-    fn compare_terms(
-        &self,
-        context: &ReadContext<'_>,
-        left: TermId,
-        right: TermId,
-    ) -> Result<Ordering>;
 
     fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool>;
 
@@ -418,6 +409,7 @@ impl<'store> StoreReadView<'store> {
 }
 
 impl RdfReadView for StoreReadView<'_> {
+    #[cfg(feature = "shacl-core")]
     fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
         StoreReadView::contains_graph(self, graph)
     }
@@ -662,23 +654,6 @@ impl RdfReadView for StoreReadView<'_> {
         Ok(decoded)
     }
 
-    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool> {
-        context.check_cancelled()?;
-        Ok(left == right)
-    }
-
-    fn compare_terms(
-        &self,
-        context: &ReadContext<'_>,
-        left: TermId,
-        right: TermId,
-    ) -> Result<Ordering> {
-        Ok(self
-            .decode_term(context, left)?
-            .0
-            .cmp(&self.decode_term(context, right)?.0))
-    }
-
     fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
         context.check_cancelled()?;
         let visible = graph_is_visible(self.store, &self.snapshot, context, graph)?;
@@ -770,7 +745,6 @@ pub(crate) fn quad_is_visible(
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::cmp::Ordering;
     use std::collections::HashMap;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2201,24 +2175,10 @@ mod tests {
             view.lookup_term(&context, &subject).unwrap()
         );
         assert_eq!(subject, view.decode_term(&context, quad.subject).unwrap());
-        assert!(
-            view.terms_equal(&context, quad.subject, quad.subject)
-                .unwrap()
-        );
-        assert!(
-            !view
-                .terms_equal(&context, quad.subject, quad.object)
-                .unwrap()
-        );
-        assert_ne!(
-            Ordering::Equal,
-            view.compare_terms(&context, quad.subject, quad.object)
-                .unwrap()
-        );
-        assert_eq!(3, context.snapshot().terms_decoded);
+        assert_eq!(1, context.snapshot().terms_decoded);
 
         assert!(view.decode_term(&context, TermId(u128::MAX)).is_err());
-        assert_eq!(3, context.snapshot().terms_decoded);
+        assert_eq!(1, context.snapshot().terms_decoded);
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub(crate) struct DrainSlice<T> {
     pub entries: Vec<T>,
     /// Storage rows the scan returned, summed over every widening step.
     /// Reported so a test can hold the scan to its budget.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub rows_read: usize,
     /// Eligible work is still queued under the same bound.
     ///
@@ -119,10 +119,9 @@ pub(crate) struct DrainSlice<T> {
     pub remaining: bool,
 }
 
-#[cfg(any(feature = "search", test))]
+#[cfg(test)]
 impl<T> DrainSlice<T> {
     /// Borrow the eligible entries. Used by queue tests in other modules.
-    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, T> {
         self.entries.iter()
     }
@@ -166,17 +165,22 @@ where
         let remaining = rows_read >= chunk;
         return Ok(DrainSlice {
             entries,
+            #[cfg(test)]
             rows_read,
             remaining,
         });
     };
 
     let mut request = chunk;
+    #[cfg(test)]
     let mut rows_read = 0usize;
     loop {
         let drained = drain(request)?;
         let whole_queue_seen = drained.len() < request;
-        rows_read = rows_read.saturating_add(drained.len());
+        #[cfg(test)]
+        {
+            rows_read = rows_read.saturating_add(drained.len());
+        }
 
         let mut eligible: Vec<T> = drained
             .into_iter()
@@ -187,6 +191,7 @@ where
             eligible.truncate(chunk);
             return Ok(DrainSlice {
                 entries: eligible,
+                #[cfg(test)]
                 rows_read,
                 remaining,
             });
@@ -194,6 +199,7 @@ where
         if whole_queue_seen {
             return Ok(DrainSlice {
                 entries: Vec::new(),
+                #[cfg(test)]
                 rows_read,
                 remaining: false,
             });
@@ -203,6 +209,7 @@ where
             // is owed work the caller must come back for, not an empty queue.
             return Ok(DrainSlice {
                 entries: Vec::new(),
+                #[cfg(test)]
                 rows_read,
                 remaining: true,
             });

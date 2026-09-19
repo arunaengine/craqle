@@ -2,9 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-use std::collections::BTreeSet;
-use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::sync::Arc;
+use std::ops::Bound::{Excluded, Included};
 
 use fjall::{Keyspace, Readable, Snapshot};
 
@@ -47,8 +45,8 @@ fn count_grouping_for_order(
 enum SourceIterator {
     Single(Option<RawQuadCandidate>),
     Durable {
-        snapshot: Snapshot,
-        keyspace: Keyspace,
+        _snapshot: Snapshot,
+        _keyspace: Keyspace,
         iterator: fjall::Iter,
     },
     QueryIndex {
@@ -56,19 +54,6 @@ enum SourceIterator {
         query_to_term: Keyspace,
         iterator: fjall::Iter,
         order: QueryIndexCursorOrder,
-    },
-    PredicateObject {
-        subjects: Arc<Vec<TermId>>,
-        next: usize,
-        graph: TermId,
-        predicate: TermId,
-        object: TermId,
-    },
-    Object {
-        entries: Arc<BTreeSet<(TermId, TermId)>>,
-        last: Option<(TermId, TermId)>,
-        graph: TermId,
-        object: TermId,
     },
     Empty,
 }
@@ -377,8 +362,7 @@ impl RawQueryIndexKeyCursor {
     }
 }
 
-/// Lazy source cursor. It owns either a Fjall snapshot or a copy-on-write
-/// in-memory range snapshot, but never an in-memory-index lock.
+/// Owns a durable snapshot or a single candidate without holding index locks.
 pub(crate) struct RawQuadCursor {
     source: SourceIterator,
 }
@@ -397,9 +381,6 @@ impl RawQuadCursor {
                 count_grouping_for_order(QueryIndexCursorOrder::Gspo, fixed)
             }
             SourceIterator::QueryIndex { order, .. } => count_grouping_for_order(*order, fixed),
-            SourceIterator::PredicateObject { .. } | SourceIterator::Object { .. } => {
-                CountGrouping::Subject
-            }
             SourceIterator::Single(_) | SourceIterator::Empty => CountGrouping::None,
         }
     }
@@ -430,8 +411,8 @@ impl RawQuadCursor {
         };
         Self {
             source: SourceIterator::Durable {
-                snapshot,
-                keyspace: quads.clone(),
+                _snapshot: snapshot,
+                _keyspace: quads.clone(),
                 iterator,
             },
         }
@@ -455,38 +436,6 @@ impl RawQuadCursor {
                 query_to_term: query_to_term.clone(),
                 iterator,
                 order,
-            },
-        }
-    }
-
-    pub(crate) fn predicate_object(
-        subjects: Arc<Vec<TermId>>,
-        graph: TermId,
-        predicate: TermId,
-        object: TermId,
-    ) -> Self {
-        Self {
-            source: SourceIterator::PredicateObject {
-                subjects,
-                next: 0,
-                graph,
-                predicate,
-                object,
-            },
-        }
-    }
-
-    pub(crate) fn object(
-        entries: Arc<BTreeSet<(TermId, TermId)>>,
-        graph: TermId,
-        object: TermId,
-    ) -> Self {
-        Self {
-            source: SourceIterator::Object {
-                entries,
-                last: None,
-                graph,
-                object,
             },
         }
     }
@@ -559,55 +508,6 @@ impl RawQuadCursor {
                     storage: CandidateStorage::QueryIndex,
                     bytes_read: (key.len() + value.len()) as u64,
                     key_fields_extracted: 4,
-                    encoded_quad_constructed: true,
-                }))
-            }
-            SourceIterator::PredicateObject {
-                subjects,
-                next,
-                graph,
-                predicate,
-                object,
-            } => {
-                let subject = *subjects.get(*next)?;
-                *next += 1;
-                Some(Ok(RawQuadCandidate {
-                    quad: EncodedQuad {
-                        graph: *graph,
-                        subject,
-                        predicate: *predicate,
-                        object: *object,
-                    },
-                    live: true,
-                    storage: CandidateStorage::Source,
-                    bytes_read: 64,
-                    key_fields_extracted: 1,
-                    encoded_quad_constructed: true,
-                }))
-            }
-            SourceIterator::Object {
-                entries,
-                last,
-                graph,
-                object,
-            } => {
-                let next = match *last {
-                    Some(last) => entries.range((Excluded(last), Unbounded)).next(),
-                    None => entries.iter().next(),
-                };
-                let &(subject, predicate) = next?;
-                *last = Some((subject, predicate));
-                Some(Ok(RawQuadCandidate {
-                    quad: EncodedQuad {
-                        graph: *graph,
-                        subject,
-                        predicate,
-                        object: *object,
-                    },
-                    live: true,
-                    storage: CandidateStorage::Source,
-                    bytes_read: 64,
-                    key_fields_extracted: 2,
                     encoded_quad_constructed: true,
                 }))
             }

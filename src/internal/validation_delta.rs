@@ -2,7 +2,6 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-use std::cmp::Ordering;
 use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -440,6 +439,7 @@ impl<'store, 'delta> DeltaReadView<'store, 'delta> {
 }
 
 impl RdfReadView for DeltaReadView<'_, '_> {
+    #[cfg(feature = "shacl-core")]
     fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
         Ok(self.base.contains_graph(graph)?
             || (hash_term(&EncodedTerm::from_named_node(&graph.0)) == self.graph()
@@ -603,23 +603,6 @@ impl RdfReadView for DeltaReadView<'_, '_> {
             return Ok(decoded.clone());
         }
         self.base.decode_term(context, term)
-    }
-
-    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool> {
-        context.check_cancelled()?;
-        Ok(left == right)
-    }
-
-    fn compare_terms(
-        &self,
-        context: &ReadContext<'_>,
-        left: TermId,
-        right: TermId,
-    ) -> Result<Ordering> {
-        Ok(self
-            .decode_term(context, left)?
-            .0
-            .cmp(&self.decode_term(context, right)?.0))
     }
 
     fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
