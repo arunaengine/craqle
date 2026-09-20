@@ -5710,14 +5710,17 @@ impl GraphStore {
         snapshot: &Snapshot,
         header: &IndexHeader,
         transitions: Vec<NetQuadTransition>,
-    ) -> Result<Option<QueryIndexMaintenancePlan>> {
-        let total =
-            match self.query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::Total)? {
-                QueryIndexCounterRead::Value(total) if total == header.indexed_quads => total,
-                QueryIndexCounterRead::Missing
-                | QueryIndexCounterRead::Malformed
-                | QueryIndexCounterRead::Value(_) => return Ok(None),
-            };
+    ) -> Result<Option<IndexUpdatePlan>> {
+        let Some(slot) = IndexSlot::decode(header.active_slot) else {
+            return Ok(None);
+        };
+        let spaces = self.query_spaces(slot);
+        let total = match Self::query_index_counter(snapshot, spaces, IndexCounterKey::Total)? {
+            IndexCounterRead::Value(total) if total == header.indexed_quads => total,
+            IndexCounterRead::Missing
+            | IndexCounterRead::Malformed
+            | IndexCounterRead::Value(_) => return Ok(None),
+        };
 
         let mut resolved = HashMap::new();
         let mut mappings = Vec::new();
@@ -5725,8 +5728,9 @@ impl GraphStore {
         let mut query_transitions = Vec::with_capacity(transitions.len());
         for transition in transitions {
             let allow_allocate = transition.is_live;
-            let Some(graph) = self.resolve_maintenance_query_term(
+            let Some(graph) = self.resolve_query_term(
                 snapshot,
+                spaces,
                 transition.quad.graph,
                 allow_allocate,
                 &mut resolved,
@@ -5736,8 +5740,9 @@ impl GraphStore {
             else {
                 return Ok(None);
             };
-            let Some(subject) = self.resolve_maintenance_query_term(
+            let Some(subject) = self.resolve_query_term(
                 snapshot,
+                spaces,
                 transition.quad.subject,
                 allow_allocate,
                 &mut resolved,
@@ -5747,8 +5752,9 @@ impl GraphStore {
             else {
                 return Ok(None);
             };
-            let Some(predicate) = self.resolve_maintenance_query_term(
+            let Some(predicate) = self.resolve_query_term(
                 snapshot,
+                spaces,
                 transition.quad.predicate,
                 allow_allocate,
                 &mut resolved,
@@ -5758,8 +5764,9 @@ impl GraphStore {
             else {
                 return Ok(None);
             };
-            let Some(object) = self.resolve_maintenance_query_term(
+            let Some(object) = self.resolve_query_term(
                 snapshot,
+                spaces,
                 transition.quad.object,
                 allow_allocate,
                 &mut resolved,
@@ -5776,14 +5783,14 @@ impl GraphStore {
                 object,
             };
             let mut already_desired = true;
-            let mut all_at_prior_state = true;
+            let mut prior_state_all = true;
             for (keyspace, key) in [
-                (&self.qv2_gspo, qv2_gspo_key(quad)),
-                (&self.qv2_gpos, qv2_gpos_key(quad)),
-                (&self.qv2_spog, qv2_spog_key(quad)),
-                (&self.qv2_posg, qv2_posg_key(quad)),
-                (&self.qv2_ospg, qv2_ospg_key(quad)),
-                (&self.qv2_gosp, qv2_gosp_key(quad)),
+                (spaces.gspo, gspo_key(quad)),
+                (spaces.gpos, gpos_key(quad)),
+                (spaces.spog, spog_key(quad)),
+                (spaces.posg, posg_key(quad)),
+                (spaces.ospg, ospg_key(quad)),
+                (spaces.gosp, gosp_key(quad)),
             ] {
                 let current = snapshot.get(keyspace, key)?;
                 let present = match current {
@@ -5792,47 +5799,49 @@ impl GraphStore {
                     Some(_) => return Ok(None),
                 };
                 already_desired &= present == transition.is_live;
-                all_at_prior_state &= present != transition.is_live;
+                prior_state_all &= present != transition.is_live;
             }
             if already_desired {
                 continue;
             }
-            if !all_at_prior_state {
+            if !prior_state_all {
                 return Ok(None);
             }
             query_transitions.push((quad, transition.is_live));
         }
 
         if query_transitions.is_empty() {
-            return Ok(Some(QueryIndexMaintenancePlan {
+            return Ok(Some(IndexUpdatePlan {
+                slot,
                 transitions: query_transitions,
                 mappings,
                 counters: Vec::new(),
+                revisions: Vec::new(),
                 header: None,
             }));
         }
 
-        let union_duplicate_free = match self
-            .query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::UnionDuplicateFree)?
-        {
-            QueryIndexCounterRead::Value(0) => false,
-            QueryIndexCounterRead::Value(1) => true,
-            QueryIndexCounterRead::Missing
-            | QueryIndexCounterRead::Malformed
-            | QueryIndexCounterRead::Value(_) => return Ok(None),
-        };
+        let union_duplicate_free =
+            match Self::query_index_counter(snapshot, spaces, IndexCounterKey::UnionDuplicateFree)?
+            {
+                IndexCounterRead::Value(0) => false,
+                IndexCounterRead::Value(1) => true,
+                IndexCounterRead::Missing
+                | IndexCounterRead::Malformed
+                | IndexCounterRead::Value(_) => return Ok(None),
+            };
         let union_uniqueness_preserved = !union_duplicate_free
             || if let [transition] = query_transitions.as_slice() {
-                self.single_transition_preserves_union_uniqueness(snapshot, *transition, &mappings)?
+                self.transition_keeps_union(snapshot, spaces, *transition, &mappings)?
             } else {
                 let new_terms = mappings.iter().map(|(_, query)| *query).collect();
-                self.insertions_preserve_union_uniqueness(snapshot, &query_transitions, &new_terms)?
+                self.insertions_keep_union(snapshot, spaces, &query_transitions, &new_terms)?
             };
 
-        let mut deltas = BTreeMap::<Vec<u8>, (QueryIndexCounterKey, i128)>::new();
+        let mut deltas = BTreeMap::<Vec<u8>, (IndexCounterKey, i128)>::new();
         for (quad, is_live) in &query_transitions {
             let delta = if *is_live { 1 } else { -1 };
-            for counter in query_index_live_counter_keys(*quad) {
+            for counter in live_counter_keys(*quad) {
                 let entry = deltas.entry(counter.bytes()).or_insert((counter, 0));
                 let Some(next) = entry.1.checked_add(delta) else {
                     return Ok(None);
@@ -5843,58 +5852,68 @@ impl GraphStore {
 
         let mut counters = Vec::with_capacity(deltas.len() + 1);
         for (counter, delta) in deltas.values() {
-            let has_rows = !matches!(counter, QueryIndexCounterKey::Total)
-                && self.query_index_counter_has_rows(snapshot, *counter)?;
-            let current = match self.query_index_counter_from_snapshot(snapshot, *counter)? {
-                QueryIndexCounterRead::Missing
-                    if !matches!(counter, QueryIndexCounterKey::Total) =>
-                {
+            let has_rows = !matches!(counter, IndexCounterKey::Total)
+                && self.counter_has_rows(snapshot, spaces, *counter)?;
+            let current = match Self::query_index_counter(snapshot, spaces, *counter)? {
+                IndexCounterRead::Missing if !matches!(counter, IndexCounterKey::Total) => {
                     if has_rows {
                         return Ok(None);
                     }
                     0
                 }
-                QueryIndexCounterRead::Value(value)
-                    if matches!(counter, QueryIndexCounterKey::Total)
-                        || (value != 0 && has_rows) =>
+                IndexCounterRead::Value(value)
+                    if matches!(counter, IndexCounterKey::Total) || (value != 0 && has_rows) =>
                 {
                     value
                 }
-                QueryIndexCounterRead::Missing
-                | QueryIndexCounterRead::Malformed
-                | QueryIndexCounterRead::Value(_) => return Ok(None),
+                IndexCounterRead::Missing
+                | IndexCounterRead::Malformed
+                | IndexCounterRead::Value(_) => return Ok(None),
             };
-            let Some(next) = Self::adjusted_query_index_counter(current, *delta) else {
+            let Some(next) = Self::adjusted_counter(current, *delta) else {
                 return Ok(None);
             };
-            counters.push(QueryIndexCounterUpdate {
+            counters.push(IndexCounterUpdate {
                 key: *counter,
-                value: if matches!(counter, QueryIndexCounterKey::Total) || next != 0 {
+                value: if matches!(counter, IndexCounterKey::Total) || next != 0 {
                     Some(next)
                 } else {
                     None
                 },
             });
         }
+        let predicates: HashSet<_> = query_transitions
+            .iter()
+            .map(|(quad, _)| quad.predicate)
+            .collect();
+        let mut revisions = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            let current = match Self::query_revision(snapshot, spaces, predicate)? {
+                IndexCounterRead::Missing => 0,
+                IndexCounterRead::Value(value) => value,
+                IndexCounterRead::Malformed => return Ok(None),
+            };
+            let Some(next) = current.checked_add(1) else {
+                return Ok(None);
+            };
+            revisions.push((predicate, next));
+        }
         if union_duplicate_free && !union_uniqueness_preserved {
-            counters.push(QueryIndexCounterUpdate {
-                key: QueryIndexCounterKey::UnionDuplicateFree,
+            counters.push(IndexCounterUpdate {
+                key: IndexCounterKey::UnionDuplicateFree,
                 value: Some(0),
             });
         }
 
         let total_delta = deltas
-            .get(QUERY_INDEX_TOTAL_KEY.as_slice())
+            .get(QV_TOTAL_KEY.as_slice())
             .map(|(_, delta)| *delta)
             .unwrap_or(0);
-        let Some(source_live_quads) =
-            Self::adjusted_query_index_counter(header.source_live_quads, total_delta)
+        let Some(source_live_quads) = Self::adjusted_counter(header.source_live_quads, total_delta)
         else {
             return Ok(None);
         };
-        let Some(indexed_quads) =
-            Self::adjusted_query_index_counter(header.indexed_quads, total_delta)
-        else {
+        let Some(indexed_quads) = Self::adjusted_counter(header.indexed_quads, total_delta) else {
             return Ok(None);
         };
         let Some(source_epoch) = header.source_epoch.checked_add(1) else {
@@ -5903,7 +5922,7 @@ impl GraphStore {
 
         let Some(updated_total) = counters
             .iter()
-            .find(|update| matches!(update.key, QueryIndexCounterKey::Total))
+            .find(|update| matches!(update.key, IndexCounterKey::Total))
             .and_then(|update| update.value)
         else {
             return Ok(None);
@@ -5914,12 +5933,15 @@ impl GraphStore {
         {
             return Ok(None);
         }
-        Ok(Some(QueryIndexMaintenancePlan {
+        Ok(Some(IndexUpdatePlan {
+            slot,
             transitions: query_transitions,
             mappings,
             counters,
-            header: Some(QueryIndexHeader {
-                state: StoredQueryIndexState::Ready,
+            revisions,
+            header: Some(IndexHeader {
+                active_slot: header.active_slot,
+                state: StoredIndexState::Ready,
                 source_epoch,
                 index_epoch: source_epoch,
                 source_live_quads,
@@ -5931,31 +5953,28 @@ impl GraphStore {
         }))
     }
 
-    fn stage_query_index_maintenance_plan(
-        &self,
-        batch: &mut fjall::OwnedWriteBatch,
-        plan: QueryIndexMaintenancePlan,
-    ) {
+    fn stage_index_plan(&self, batch: &mut fjall::OwnedWriteBatch, plan: IndexUpdatePlan) {
+        let spaces = self.query_spaces(plan.slot);
         for (term, query) in plan.mappings {
             batch.insert(
-                &self.qv2_term_to_query,
+                spaces.term_to_query,
                 term.to_be_bytes(),
                 query.to_be_bytes(),
             );
             batch.insert(
-                &self.qv2_query_to_term,
+                spaces.query_to_term,
                 query.to_be_bytes(),
                 term.to_be_bytes(),
             );
         }
         for (quad, is_live) in plan.transitions {
             let keys = [
-                (&self.qv2_gspo, qv2_gspo_key(quad)),
-                (&self.qv2_gpos, qv2_gpos_key(quad)),
-                (&self.qv2_spog, qv2_spog_key(quad)),
-                (&self.qv2_posg, qv2_posg_key(quad)),
-                (&self.qv2_ospg, qv2_ospg_key(quad)),
-                (&self.qv2_gosp, qv2_gosp_key(quad)),
+                (spaces.gspo, gspo_key(quad)),
+                (spaces.gpos, gpos_key(quad)),
+                (spaces.spog, spog_key(quad)),
+                (spaces.posg, posg_key(quad)),
+                (spaces.ospg, ospg_key(quad)),
+                (spaces.gosp, gosp_key(quad)),
             ];
             for (keyspace, key) in keys {
                 if is_live {
@@ -5967,64 +5986,134 @@ impl GraphStore {
         }
         for update in plan.counters {
             match update.value {
-                Some(value) => {
-                    batch.insert(&self.qv2_meta, update.key.bytes(), value.to_be_bytes())
-                }
-                None => batch.remove(&self.qv2_meta, update.key.bytes()),
+                Some(value) => batch.insert(spaces.meta, update.key.bytes(), value.to_be_bytes()),
+                None => batch.remove(spaces.meta, update.key.bytes()),
             }
         }
+        for (predicate, revision) in plan.revisions {
+            batch.insert(
+                spaces.meta,
+                predicate_revision_key(predicate),
+                revision.to_be_bytes(),
+            );
+        }
         if let Some(header) = plan.header {
-            self.stage_query_index_header(batch, &header);
+            self.stage_index_header(batch, &header);
         }
     }
 
-    fn stage_query_index_maintenance(
+    fn stage_index_update(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         publish: &PendingPublish,
     ) -> Result<()> {
         let snapshot = self.db.snapshot();
-        match self.query_index_header_from_snapshot(&snapshot)? {
-            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Legacy(_) => Ok(()),
-            QueryIndexHeaderRead::Malformed => {
-                self.stage_query_index_failed(batch, None, "metadata-malformed");
-                Ok(())
+        let transitions = coalesced_transitions(&publish.quad_mutations);
+        let build_active = self.query_build(&snapshot)?.is_some();
+        match self.snapshot_index_header(&snapshot)? {
+            IndexHeaderRead::Absent | IndexHeaderRead::Legacy(_) => {}
+            IndexHeaderRead::Malformed if !build_active => {
+                self.stage_index_failure(batch, None, "metadata-malformed");
             }
-            QueryIndexHeaderRead::Valid(header) => match header.state {
-                StoredQueryIndexState::Building | StoredQueryIndexState::Failed(_) => Ok(()),
-                StoredQueryIndexState::Ready => {
-                    if !header.ready_is_coherent()
-                        || !header.is_not_ahead_of_snapshot(snapshot.seqno())
-                    {
-                        self.stage_query_index_failed(
+            IndexHeaderRead::Malformed => {}
+            IndexHeaderRead::Valid(header) => match header.state {
+                StoredIndexState::Building | StoredIndexState::Failed(_) => {}
+                StoredIndexState::Ready => {
+                    if !header.ready_is_coherent() || !header.fits_snapshot(snapshot.seqno()) {
+                        self.stage_index_failure(
                             batch,
                             Some(&header),
                             "ready-metadata-inconsistent",
                         );
-                        return Ok(());
+                    } else {
+                        match self.plan_index_update(&snapshot, &header, transitions.clone())? {
+                            Some(plan) => self.stage_index_plan(batch, plan),
+                            None => self.stage_index_failure(
+                                batch,
+                                Some(&header),
+                                "maintenance-anomaly",
+                            ),
+                        }
                     }
-                    let transitions = coalesced_query_index_transitions(&publish.quad_mutations);
-                    match self.plan_ready_query_index_maintenance(
-                        &snapshot,
-                        &header,
-                        transitions,
-                    )? {
-                        Some(plan) => self.stage_query_index_maintenance_plan(batch, plan),
-                        None => self.stage_query_index_failed(
-                            batch,
-                            Some(&header),
-                            "maintenance-anomaly",
-                        ),
-                    }
-                    Ok(())
                 }
             },
         }
+        self.stage_query_delta(batch, &snapshot, transitions)
     }
 
-    /// Stages the record that this commit's source rows are not covered by the
-    /// query view yet. It is removed in the same batch as the maintenance that
-    /// covers them, so no snapshot ever shows uncovered rows as admitted.
+    fn query_build(&self, snapshot: &Snapshot) -> Result<Option<QueryBuildRecord>> {
+        let build: Option<QueryBuildRecord> = snapshot
+            .get(&self.qv2_meta, QV_BUILD_KEY)?
+            .map(|value| postcard::from_bytes(value.as_ref()).map_err(StoreError::from))
+            .transpose()?;
+        if let Some(build) = &build
+            && build.format > QV_SCHEMA_VERSION
+        {
+            return Err(StoreError::UnsupportedIndexFormat {
+                found: build.format,
+                supported: QV_SCHEMA_VERSION,
+            });
+        }
+        Ok(build.filter(|build| build.format == QV_SCHEMA_VERSION))
+    }
+
+    fn update_build_cursor(&self, cursor: Option<QuadKey>) -> Result<()> {
+        let owner = self
+            .qv_gate
+            .acquire_timeout(self.qv_commit_wait)
+            .ok_or(StoreError::QueryIndexBusy)?;
+        let snapshot = self.db.snapshot();
+        let mut build = self
+            .query_build(&snapshot)?
+            .ok_or(StoreError::QueryIndexUnavailable(
+                "query-index build record missing",
+            ))?;
+        build.scan_cursor = cursor;
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
+        let result = self.commit_fjall_batch(batch);
+        owner.finish();
+        result
+    }
+
+    fn stage_query_delta(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        snapshot: &Snapshot,
+        transitions: Vec<NetQuadTransition>,
+    ) -> Result<()> {
+        let Some(mut build) = self.query_build(snapshot)? else {
+            return Ok(());
+        };
+        if matches!(build.phase, QueryBuildPhase::Clear) {
+            return Ok(());
+        }
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let delta = QueryDeltaRecord { transitions };
+        let encoded = postcard::to_allocvec(&delta)?;
+        let rows = u64::try_from(delta.transitions.len()).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        let next_rows = build.delta_rows.saturating_add(rows);
+        let next_bytes = build.delta_bytes.saturating_add(bytes);
+        let (row_limit, byte_limit) = self.delta_limits();
+        if next_rows > row_limit || next_bytes > byte_limit {
+            return Err(StoreError::QueryIndexCapacity);
+        }
+        let delta_id = build.next_delta;
+        build.next_delta = build
+            .next_delta
+            .checked_add(1)
+            .ok_or(StoreError::QueryIndexCapacity)?;
+        build.delta_rows = next_rows;
+        build.delta_bytes = next_bytes;
+        batch.insert(&self.qv2_meta, query_delta_key(delta_id), encoded);
+        batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
+        Ok(())
+    }
+
+    /// Stages durable debt that keeps uncovered source rows out of QV admission.
     fn stage_projection_debt(&self, batch: &mut fjall::OwnedWriteBatch) -> u64 {
         let debt = self.qv_debt_next.fetch_add(1, Ordering::AcqRel);
         batch.insert(&self.qv2_meta, projection_debt_key(debt), [0u8; 0]);
@@ -6039,20 +6128,30 @@ impl GraphStore {
             .acquire_timeout(self.qv_commit_wait)
             .ok_or(StoreError::QueryIndexBusy)?;
         let mut batch = self.buffered_batch();
-        self.stage_query_index_maintenance(&mut batch, publish)?;
+        self.stage_index_update(&mut batch, publish)?;
         batch.remove(&self.qv2_meta, projection_debt_key(debt));
         let result = self.commit_fjall_batch(batch);
         owner.finish();
         result
     }
 
+    /// Retires a delta that can no longer be replayed and closes QV admission.
+    fn fail_projection_debt(&self, debt: u64, reason: &'static str) -> Result<()> {
+        let snapshot = self.db.snapshot();
+        let previous = match self.snapshot_index_header(&snapshot)? {
+            IndexHeaderRead::Valid(header) | IndexHeaderRead::Legacy(header) => Some(header),
+            IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
+        };
+        let mut batch = self.buffered_batch();
+        batch.remove(&self.qv2_meta, projection_debt_key(debt));
+        self.stage_index_failure(&mut batch, previous.as_ref(), reason);
+        self.commit_fjall_batch(batch)
+    }
+
     /// True when this snapshot records source rows whose query-view maintenance
     /// has not been committed. One seek; the prefix is empty in steady state.
     fn projection_debt_present(&self, snapshot: &Snapshot) -> Result<bool> {
-        match snapshot
-            .prefix(&self.qv2_meta, [QUERY_INDEX_PROJECTION_DEBT_TAG])
-            .next()
-        {
+        match snapshot.prefix(&self.qv2_meta, [QV_DEBT_TAG]).next() {
             Some(guard) => {
                 let _ = guard.into_inner()?;
                 Ok(true)
@@ -6061,41 +6160,30 @@ impl GraphStore {
         }
     }
 
-    /// Projection debt left by a process that stopped between a source commit and
-    /// its maintenance cannot be applied: the pending delta is gone. Record the
-    /// obligation as a durable failure instead, so a rebuild restores coverage.
+    /// Converts unrecoverable projection debt into a rebuild-required failure.
     fn fail_unrepaired_debt(&self, snapshot: &Snapshot) -> Result<bool> {
         let mut debts = Vec::new();
-        for guard in snapshot.prefix(&self.qv2_meta, [QUERY_INDEX_PROJECTION_DEBT_TAG]) {
+        for guard in snapshot.prefix(&self.qv2_meta, [QV_DEBT_TAG]) {
             let (key, _) = guard.into_inner()?;
             debts.push(key);
         }
         if debts.is_empty() {
             return Ok(false);
         }
-        let previous = match self.query_index_header_from_snapshot(snapshot)? {
-            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
-                Some(header)
-            }
-            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        let previous = match self.snapshot_index_header(snapshot)? {
+            IndexHeaderRead::Valid(header) | IndexHeaderRead::Legacy(header) => Some(header),
+            IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
         };
         let mut batch = self.buffered_batch();
         for debt in debts {
             batch.remove(&self.qv2_meta, debt);
         }
-        self.stage_query_index_failed(&mut batch, previous.as_ref(), "projection-debt-unrepaired");
+        self.stage_index_failure(&mut batch, previous.as_ref(), "projection-debt-unrepaired");
         self.commit_fjall_batch(batch)?;
         Ok(true)
     }
 
-    /// Commit without holding the global cache lock, then publish only the
-    /// affected cache generations under a short write section.
-    ///
-    /// A commit that owns query-view maintenance publishes source rows and
-    /// query-view rows in one batch. A commit that does not publishes durable
-    /// projection debt in that same batch and repairs it afterwards. Either way
-    /// every snapshot holding these source rows also holds the evidence that
-    /// decides whether the query view may answer for them.
+    /// Commits source with QV rows or durable debt, then publishes cache state.
     fn commit_with_index(&self, mut commit: DurableCommit, publish: &PendingPublish) -> Result<()> {
         let _projection = self
             .projection_lock
@@ -6104,10 +6192,15 @@ impl GraphStore {
         let owner = self.qv_gate.try_acquire();
         let debt = match &owner {
             Some(_) => {
-                self.stage_query_index_maintenance(&mut commit.batch, publish)?;
+                self.stage_index_update(&mut commit.batch, publish)?;
                 None
             }
-            None => Some(self.stage_projection_debt(&mut commit.batch)),
+            None => {
+                if self.query_build(&self.db.snapshot())?.is_some() {
+                    return Err(StoreError::QueryIndexBusy);
+                }
+                Some(self.stage_projection_debt(&mut commit.batch))
+            }
         };
         let committed = self.commit_durable(commit);
         let published = if committed.is_ok() {
@@ -6128,7 +6221,7 @@ impl GraphStore {
                 error = %error,
                 "query-view catch-up failed after a durable source commit"
             );
-            let _ = self.mark_query_index_rebuild_failed("concurrent-catch-up-failed");
+            let _ = self.fail_projection_debt(debt, "concurrent-catch-up-failed");
         }
         Ok(())
     }
@@ -6159,57 +6252,51 @@ impl GraphStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn query_index_admission_probe_count(&self) -> u64 {
-        self.query_index_admission_probes.load(Ordering::Relaxed)
+    pub(crate) fn admission_probe_count(&self) -> u64 {
+        self.index_admission_probes.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn index_verify_count(&self) -> u64 {
-        self.query_index_verification_runs.load(Ordering::Relaxed)
+        self.index_verification_runs.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn fail_test_indexes(&self) {
         let snapshot = self.db.snapshot();
-        let previous = match self.query_index_header_from_snapshot(&snapshot).unwrap() {
-            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
-                Some(header)
-            }
-            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
+        let previous = match self.snapshot_index_header(&snapshot).unwrap() {
+            IndexHeaderRead::Valid(header) | IndexHeaderRead::Legacy(header) => Some(header),
+            IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
         };
         let mut batch = self.buffered_batch();
-        self.stage_query_index_failed(&mut batch, previous.as_ref(), "test-failure");
+        self.stage_index_failure(&mut batch, previous.as_ref(), "test-failure");
         self.commit_fjall_batch(batch).unwrap();
     }
 
     #[cfg(test)]
-    pub(crate) fn set_test_query_index_state(&self, state: QueryIndexState) {
+    pub(crate) fn set_test_index(&self, state: QueryIndexState) {
         let snapshot = self.db.snapshot();
-        let QueryIndexHeaderRead::Valid(mut header) =
-            self.query_index_header_from_snapshot(&snapshot).unwrap()
+        let IndexHeaderRead::Valid(mut header) = self.snapshot_index_header(&snapshot).unwrap()
         else {
             panic!("query-index header must be present before degrading it");
         };
         let mut batch = self.buffered_batch();
         match state {
-            QueryIndexState::Missing => batch.remove(&self.qv2_meta, QUERY_INDEX_HEADER_KEY),
+            QueryIndexState::Missing => batch.remove(&self.qv2_meta, QV_HEADER_KEY),
             QueryIndexState::Building => {
-                header.state = StoredQueryIndexState::Building;
-                self.stage_query_index_header(&mut batch, &header);
+                header.state = StoredIndexState::Building;
+                self.stage_index_header(&mut batch, &header);
             }
             QueryIndexState::Failed(reason) => {
-                header.state = StoredQueryIndexState::Failed(reason);
-                self.stage_query_index_header(&mut batch, &header);
+                header.state = StoredIndexState::Failed(reason);
+                self.stage_index_header(&mut batch, &header);
             }
             QueryIndexState::Ready => panic!("test helper only degrades query indexes"),
         }
         self.commit_fjall_batch(batch).unwrap();
     }
 
-    /// The vocabulary term ids orphan detection matches on.
-    ///
-    /// `None` means the term was never interned, so no stored quad can mention
-    /// it and the branch that tests for it simply never fires.
+    /// Resolves the vocabulary ids used by orphan detection.
     fn orphan_vocab(&self) -> Result<OrphanVocab> {
         let id = |named_node: oxrdf::NamedNode| {
             self.lookup_term(&EncodedTerm::from_named_node(&named_node))
@@ -6224,17 +6311,7 @@ impl GraphStore {
         })
     }
 
-    /// Term ids of the graph's orphaned data entities.
-    ///
-    /// Evaluates [`crate::rules::orphaned_data_entities`] entirely on term ids
-    /// against the durable graph prefix: nothing is decoded, so the cost is a
-    /// handful of integer comparisons per stored triple. The rule is the specification and the two are
-    /// cross-checked on generated graph shapes by
-    /// `orphan_ids_match`; recomputation is on the hot path of
-    /// every write that defers its diagnostics refresh, where the decoding
-    /// version cost 74ms on a 10,000-entity crate.
-    ///
-    /// The crate root is the graph term itself, so its term id *is* `graph_id`.
+    /// Computes orphaned entity ids directly from durable term ids.
     fn orphaned_entity_ids(
         &self,
         graph_id: TermId,
@@ -6242,7 +6319,7 @@ impl GraphStore {
     ) -> Result<HashSet<TermId>> {
         let mut data_entities: HashSet<TermId> = HashSet::new();
         let mut adjacency: HashMap<TermId, Vec<TermId>> = HashMap::new();
-        self.for_each_stored_quad(graph_id, |quad, _| {
+        self.visit_stored_quads(graph_id, |quad, _| {
             if vocab.has_part == Some(quad.predicate) {
                 adjacency.entry(quad.subject).or_default().push(quad.object);
                 if quad.subject != graph_id {
@@ -6279,12 +6356,8 @@ impl GraphStore {
         Ok(data_entities)
     }
 
-    /// Snapshot-only twin of [`GraphStore::orphaned_entity_ids`]. Reads use it
-    /// when the persisted diagnostic record is absent or tagged for another
-    /// clock, so visibility cannot mix qv/source rows from one commit with
-    /// orphan state from another. It intentionally does not persist or update
-    /// the global diagnostic cache.
-    fn snapshot_orphaned_entity_ids(
+    /// Computes orphan ids from one snapshot without persisting read results.
+    fn snapshot_orphan_ids(
         &self,
         snapshot: &Snapshot,
         context: &crate::query::context::ReadContext<'_>,
@@ -6305,12 +6378,12 @@ impl GraphStore {
                 work_since_check = 0;
                 context.check_cancelled()?;
             }
-            if dot_payload_is_empty(value.as_ref()) {
+            if dots_empty(value.as_ref()) {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
-            context.record_key_fields_extracted(4);
-            context.increment_encoded_quad_constructions();
+            context.record_key_fields(4);
+            context.increment_quad_builds();
             if vocab.has_part == Some(quad.predicate) {
                 adjacency.entry(quad.subject).or_default().push(quad.object);
                 if quad.subject != graph_id {
@@ -6392,51 +6465,28 @@ impl GraphStore {
         Ok(GraphDiagnostics::from_orphaned_entities(entities))
     }
 
-    /// Open-time repair pass for the persisted diagnostics.
-    ///
-    /// A record whose clock tag still matches the graph's clock describes the
-    /// current state and is simply loaded into the memory cache; anything else
-    /// (missing record, or a tag left behind by a crash between the quad commit
-    /// and the diagnostics write) is recomputed and re-persisted right here,
-    /// not lazily.
-    ///
-    /// Doubles as the seeding pass for the clock mirror, which every later
-    /// freshness check reads. Nothing else holds the store yet, so seeding a
-    /// graph's clock before its diagnostics are looked at is enough ordering.
-    fn repair_graph_diagnostics_at_open(&self) -> Result<()> {
-        self.diagnostics_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-
+    /// Repairs missing or stale persisted diagnostics before the store opens.
+    fn repair_diagnostics(&self) -> Result<()> {
         for graph_id in self.graph_term_ids()? {
-            let clock = self.durable_vector_clock(graph_id)?;
-            self.indexes_write().clocks.insert(graph_id, clock.clone());
+            let clock = self.snapshot_vector_clock(&self.db.snapshot(), graph_id)?;
             let stored = self.read_stored_diagnostics(graph_id)?;
-            if let Some(record) = stored.as_ref().filter(|record| record.at_clock == clock) {
-                self.diagnostics_cache
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(graph_id, record.clone());
+            if stored
+                .as_ref()
+                .is_some_and(|record| record.at_clock == clock)
+            {
                 continue;
             }
 
             let previous = stored.map(|record| record.diagnostics).unwrap_or_default();
             let repaired = self.compute_tagged_diagnostics(graph_id)?;
-            // Re-queue first, record second, in that order and as separate
-            // commits: a crash or a failed enqueue in between must leave the
-            // older baseline so the next open re-queues again (G7).
+            // Re-queue before recording so a crash retains a repairable baseline.
             self.requeue_orphan_changes(graph_id, (&previous, &repaired.diagnostics))?;
             self.store_diagnostics_record(graph_id, repaired)?;
         }
         Ok(())
     }
 
-    /// Re-queue for search every entity whose orphan status changed during a
-    /// repair, since orphaned entities are invisible to search.
-    ///
-    /// Without it a crash between a quad commit and its diagnostics write
-    /// strands an entity as searchable, or wrongly hidden, until it is dirtied.
+    /// Re-queues entities whose repaired orphan visibility changed.
     fn requeue_orphan_changes(
         &self,
         graph_id: TermId,
@@ -6494,7 +6544,7 @@ impl GraphStore {
         let mut quads = Vec::new();
         for guard in self.quads.prefix(graph.to_be_bytes()) {
             let (key, value) = guard.into_inner()?;
-            if dot_payload_is_empty(value.as_ref()) {
+            if dots_empty(value.as_ref()) {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
