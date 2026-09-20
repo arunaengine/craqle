@@ -6558,185 +6558,361 @@ impl GraphStore {
         Ok(quads)
     }
 
-    fn planner_count(&self, count: Result<Option<u64>>, fallback: impl FnOnce() -> usize) -> usize {
-        count
-            .ok()
-            .flatten()
-            .and_then(|count| usize::try_from(count).ok())
-            .unwrap_or_else(fallback)
-    }
-
     fn source_pattern_count(
         &self,
-        subject: Option<TermId>,
-        predicate: Option<TermId>,
-        object: Option<TermId>,
-    ) -> usize {
-        self.quads_for_pattern(None, subject, predicate, object)
-            .map(|quads| quads.len())
-            .unwrap_or(usize::MAX)
-    }
-
-    fn query_index_pattern_count(
-        &self,
-        order: QueryIndexCursorOrder,
         pattern: crate::rdf_read::QuadPattern,
-    ) -> Option<usize> {
+        costs: &crate::query::context::QueryCost,
+    ) -> PlannerEstimate {
         let snapshot = self.read_snapshot();
-        if !snapshot.query_index_admission(self).ok()?.trusted {
-            return None;
-        }
-        let mut cursor = snapshot.query_index_cursor(self, order, pattern).ok()?;
+        let mut cursor = snapshot.raw_quad_cursor(self, pattern);
         let mut count = 0usize;
+        let mut visited = 0usize;
         while let Some(candidate) = cursor.next_candidate() {
-            let candidate = candidate.ok()?;
+            costs.planner_entries(1);
+            if visited == PLANNER_SAMPLE_ROWS {
+                return PlannerEstimate::Unknown;
+            }
+            visited += 1;
+            let Ok(candidate) = candidate else {
+                return PlannerEstimate::Unknown;
+            };
             if candidate.live && pattern.matches(candidate.quad) {
                 count = count.saturating_add(1);
             }
         }
-        Some(count)
+        PlannerEstimate::Exact(count)
     }
 
-    fn query_index_distinct_count(
+    fn index_pattern_count(
         &self,
-        predicate: Option<TermId>,
-        domain: DistinctDomain,
-    ) -> Option<usize> {
-        let snapshot = self.db.snapshot();
-        if !self.snapshot_admission(&snapshot).ok()?.trusted {
+        scan: &crate::query::cursor::IndexScan<'_>,
+    ) -> Option<PlannerEstimate> {
+        let snapshot = self.read_snapshot();
+        let admission = snapshot.query_index_admission(self).ok()?;
+        scan.costs.planner_points(
+            admission
+                .debt_reads
+                .saturating_add(admission.header_reads)
+                .saturating_add(admission.counter_reads.saturating_mul(2)),
+        );
+        if !admission.trusted {
             return None;
         }
-        let QueryIndexHeaderRead::Valid(header) =
-            self.query_index_header_from_snapshot(&snapshot).ok()?
-        else {
+        let mut cursor = snapshot
+            .query_index_cursor(self, scan)
+            .ok()?
+            .track_costs(scan.costs.clone());
+        let mut count = 0usize;
+        let mut visited = 0usize;
+        while let Some(candidate) = cursor.next_candidate() {
+            scan.costs.planner_entries(1);
+            if visited == PLANNER_SAMPLE_ROWS {
+                return Some(PlannerEstimate::Unknown);
+            }
+            visited += 1;
+            let candidate = candidate.ok()?;
+            if candidate.live && scan.pattern.matches(candidate.quad) {
+                count = count.saturating_add(1);
+            }
+        }
+        Some(PlannerEstimate::Exact(count))
+    }
+
+    fn index_distinct_count(
+        &self,
+        stat: DistinctStat,
+        costs: &crate::query::context::QueryCost,
+    ) -> Option<PlannerEstimate> {
+        let snapshot = self.db.snapshot();
+        let admission = self.snapshot_admission(&snapshot).ok()?;
+        costs.planner_points(
+            admission
+                .debt_reads
+                .saturating_add(admission.header_reads)
+                .saturating_add(admission.counter_reads.saturating_mul(2)),
+        );
+        if !admission.trusted {
+            return None;
+        }
+        costs.planner_points(1);
+        let IndexHeaderRead::Valid(header) = self.snapshot_index_header(&snapshot).ok()? else {
             return None;
         };
-        let predicate = match predicate {
-            Some(predicate) => match self
-                .query_term_id_from_snapshot(&snapshot, predicate)
-                .ok()?
-            {
-                Some(predicate) => Some(predicate),
-                None => return Some(0),
-            },
+        let slot = IndexSlot::decode(header.active_slot)?;
+        let spaces = self.query_spaces(slot);
+        let predicate = match stat.predicate {
+            Some(predicate) => {
+                costs.planner_points(1);
+                let value = snapshot
+                    .get(spaces.term_to_query, predicate.to_be_bytes())
+                    .ok()?;
+                costs.forward_mapping(16 + value.as_ref().map_or(0, |value| value.len() as u64));
+                match value {
+                    Some(value) => {
+                        Some(decode_query_id(value.as_ref(), "term-to-query mapping").ok()?)
+                    }
+                    None => return Some(PlannerEstimate::Exact(0)),
+                }
+            }
             None => None,
         };
-        let cache_key = (header.source_epoch, predicate, domain);
-        if let Some(count) = self.indexes_write().planner_distinct.get_cloned(&cache_key) {
-            return Some(count);
-        }
-
-        let count = match (predicate, domain) {
-            (predicate, DistinctDomain::Subject) => {
-                let mut subject = None;
-                let mut matched = false;
-                let mut count = 0usize;
-                for guard in snapshot.iter(&self.qv2_spog) {
-                    let (key, _) = guard.into_inner().ok()?;
-                    let quad = decode_qv2_spog_key(key.as_ref())?;
-                    if subject != Some(quad.subject) {
-                        count = count.saturating_add(usize::from(matched));
-                        subject = Some(quad.subject);
-                        matched = false;
-                    }
-                    matched |= predicate.is_none_or(|expected| quad.predicate == expected);
+        let revision = match predicate {
+            Some(predicate) => {
+                costs.planner_points(1);
+                match Self::query_revision(&snapshot, spaces, predicate).ok()? {
+                    IndexCounterRead::Value(version) => StatRevision::Predicate(version),
+                    IndexCounterRead::Missing => StatRevision::Epoch(header.source_epoch),
+                    IndexCounterRead::Malformed => return None,
                 }
-                count.saturating_add(usize::from(matched))
+            }
+            None => StatRevision::Epoch(header.source_epoch),
+        };
+        let cache_key = (header.query_id_generation, revision, predicate, stat.domain);
+        if let Some(estimate) = self.indexes_write().planner_distinct.get_cloned(&cache_key) {
+            costs.planner_cache(true);
+            return Some(estimate);
+        }
+        costs.planner_cache(false);
+
+        // Capped distinct samples are lower bounds, which biases join output upward.
+        let estimate = match (predicate, stat.domain) {
+            (Some(predicate), DistinctDomain::Subject) => {
+                let mut subjects = HashSet::new();
+                let mut visited = 0usize;
+                let mut truncated = false;
+                for guard in snapshot.prefix(spaces.posg, predicate.to_be_bytes()) {
+                    costs.planner_entries(1);
+                    if visited == PLANNER_SAMPLE_ROWS {
+                        truncated = true;
+                        break;
+                    }
+                    visited += 1;
+                    let (key, _) = guard.into_inner().ok()?;
+                    subjects.insert(decode_posg_key(key.as_ref())?.subject);
+                }
+                if truncated {
+                    PlannerEstimate::LowerBound(subjects.len())
+                } else {
+                    PlannerEstimate::Exact(subjects.len())
+                }
             }
             (Some(predicate), DistinctDomain::Object) => {
-                let mut object = None;
-                let mut count = 0usize;
-                for guard in snapshot.prefix(&self.qv2_posg, predicate.to_be_bytes()) {
-                    let (key, _) = guard.into_inner().ok()?;
-                    let quad = decode_qv2_posg_key(key.as_ref())?;
-                    if object != Some(quad.object) {
-                        object = Some(quad.object);
-                        count = count.saturating_add(1);
+                let mut objects = HashSet::new();
+                let mut visited = 0usize;
+                let mut truncated = false;
+                for guard in snapshot.prefix(spaces.posg, predicate.to_be_bytes()) {
+                    costs.planner_entries(1);
+                    if visited == PLANNER_SAMPLE_ROWS {
+                        truncated = true;
+                        break;
                     }
+                    visited += 1;
+                    let (key, _) = guard.into_inner().ok()?;
+                    objects.insert(decode_posg_key(key.as_ref())?.object);
                 }
-                count
+                if truncated {
+                    PlannerEstimate::LowerBound(objects.len())
+                } else {
+                    PlannerEstimate::Exact(objects.len())
+                }
+            }
+            (None, DistinctDomain::Subject) => {
+                let mut subjects = HashSet::new();
+                let mut visited = 0usize;
+                let mut truncated = false;
+                for guard in snapshot.iter(spaces.spog) {
+                    costs.planner_entries(1);
+                    if visited == PLANNER_SAMPLE_ROWS {
+                        truncated = true;
+                        break;
+                    }
+                    visited += 1;
+                    let (key, _) = guard.into_inner().ok()?;
+                    subjects.insert(decode_spog_key(key.as_ref())?.subject);
+                }
+                if truncated {
+                    PlannerEstimate::LowerBound(subjects.len())
+                } else {
+                    PlannerEstimate::Exact(subjects.len())
+                }
             }
             (None, DistinctDomain::Object) => {
-                let mut object = None;
-                let mut count = 0usize;
-                for guard in snapshot.iter(&self.qv2_ospg) {
-                    let (key, _) = guard.into_inner().ok()?;
-                    let quad = decode_qv2_ospg_key(key.as_ref())?;
-                    if object != Some(quad.object) {
-                        object = Some(quad.object);
-                        count = count.saturating_add(1);
+                let mut objects = HashSet::new();
+                let mut visited = 0usize;
+                let mut truncated = false;
+                for guard in snapshot.iter(spaces.ospg) {
+                    costs.planner_entries(1);
+                    if visited == PLANNER_SAMPLE_ROWS {
+                        truncated = true;
+                        break;
                     }
+                    visited += 1;
+                    let (key, _) = guard.into_inner().ok()?;
+                    objects.insert(decode_ospg_key(key.as_ref())?.object);
                 }
-                count
+                if truncated {
+                    PlannerEstimate::LowerBound(objects.len())
+                } else {
+                    PlannerEstimate::Exact(objects.len())
+                }
             }
         };
         self.indexes_write().planner_distinct.insert(
             cache_key,
-            count,
-            std::mem::size_of_val(&count),
+            estimate,
+            std::mem::size_of_val(&estimate),
         );
-        Some(count)
+        Some(estimate)
     }
 
-    /// Approximate corpus-wide counts used only for planning. qv counters are
-    /// preferred; source scans remain the correctness-preserving fallback.
-    pub(crate) fn stat_predicate_object_count(&self, predicate: TermId, object: TermId) -> usize {
-        let snapshot = self.read_snapshot();
-        self.planner_count(snapshot.qv_po_count(self, predicate, object), || {
-            self.source_pattern_count(None, Some(predicate), Some(object))
-        })
+    pub(crate) fn planner_estimate(
+        &self,
+        stat: PlannerStat,
+        costs: &crate::query::context::QueryCost,
+    ) -> PlannerEstimate {
+        let pattern = |subject, predicate, object| crate::rdf_read::QuadPattern {
+            subject,
+            predicate,
+            object,
+            ..crate::rdf_read::QuadPattern::default()
+        };
+        match stat {
+            PlannerStat::PredicateObject(predicate, object) => {
+                let snapshot = self.read_snapshot();
+                snapshot
+                    .qv_stat(
+                        self,
+                        &QvRead {
+                            stat: QvStat::PredicateObject(predicate, object),
+                            costs,
+                        },
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .map(PlannerEstimate::Exact)
+                    .unwrap_or_else(|| {
+                        self.source_pattern_count(
+                            pattern(None, Some(predicate), Some(object)),
+                            costs,
+                        )
+                    })
+            }
+            PlannerStat::Predicate(predicate) => {
+                let snapshot = self.read_snapshot();
+                snapshot
+                    .qv_stat(
+                        self,
+                        &QvRead {
+                            stat: QvStat::Predicate(predicate),
+                            costs,
+                        },
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .map(PlannerEstimate::Exact)
+                    .unwrap_or_else(|| {
+                        self.source_pattern_count(pattern(None, Some(predicate), None), costs)
+                    })
+            }
+            PlannerStat::PredicateSubjects(predicate) => self
+                .index_distinct_count(
+                    DistinctStat {
+                        predicate: Some(predicate),
+                        domain: DistinctDomain::Subject,
+                    },
+                    costs,
+                )
+                .unwrap_or(PlannerEstimate::Unknown),
+            PlannerStat::PredicateObjects(predicate) => self
+                .index_distinct_count(
+                    DistinctStat {
+                        predicate: Some(predicate),
+                        domain: DistinctDomain::Object,
+                    },
+                    costs,
+                )
+                .unwrap_or(PlannerEstimate::Unknown),
+            PlannerStat::Object(object) => self
+                .index_pattern_count(&crate::query::cursor::IndexScan {
+                    order: IndexCursorOrder::Ospg,
+                    pattern: pattern(None, None, Some(object)),
+                    query_id_limit: None,
+                    costs,
+                })
+                .unwrap_or_else(|| {
+                    self.source_pattern_count(pattern(None, None, Some(object)), costs)
+                }),
+            PlannerStat::Subject(subject) => self
+                .index_pattern_count(&crate::query::cursor::IndexScan {
+                    order: IndexCursorOrder::Spog,
+                    pattern: pattern(Some(subject), None, None),
+                    query_id_limit: None,
+                    costs,
+                })
+                .unwrap_or_else(|| {
+                    self.source_pattern_count(pattern(Some(subject), None, None), costs)
+                }),
+            PlannerStat::DistinctSubjects => self
+                .index_distinct_count(
+                    DistinctStat {
+                        predicate: None,
+                        domain: DistinctDomain::Subject,
+                    },
+                    costs,
+                )
+                .unwrap_or(PlannerEstimate::Unknown),
+            PlannerStat::DistinctObjects => self
+                .index_distinct_count(
+                    DistinctStat {
+                        predicate: None,
+                        domain: DistinctDomain::Object,
+                    },
+                    costs,
+                )
+                .unwrap_or(PlannerEstimate::Unknown),
+            PlannerStat::Total => {
+                let snapshot = self.read_snapshot();
+                snapshot
+                    .qv_stat(
+                        self,
+                        &QvRead {
+                            stat: QvStat::Total,
+                            costs,
+                        },
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .map(PlannerEstimate::Exact)
+                    .unwrap_or_else(|| self.source_pattern_count(pattern(None, None, None), costs))
+            }
+        }
     }
 
-    pub(crate) fn stat_predicate_count(&self, predicate: TermId) -> usize {
-        let snapshot = self.read_snapshot();
-        self.planner_count(snapshot.qv_p_count(self, predicate), || {
-            self.source_pattern_count(None, Some(predicate), None)
-        })
+    pub(crate) fn planner_stat(
+        &self,
+        stat: PlannerStat,
+        costs: &crate::query::context::QueryCost,
+    ) -> usize {
+        self.planner_estimate(stat, costs).row_upper()
     }
 
+    #[cfg(test)]
     pub(crate) fn predicate_subject_count(&self, predicate: TermId) -> usize {
-        self.query_index_distinct_count(Some(predicate), DistinctDomain::Subject)
-            .unwrap_or_else(|| self.stat_predicate_count(predicate))
+        self.planner_stat(
+            PlannerStat::PredicateSubjects(predicate),
+            &crate::query::context::QueryCost::default(),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn predicate_object_count(&self, predicate: TermId) -> usize {
-        self.query_index_distinct_count(Some(predicate), DistinctDomain::Object)
-            .unwrap_or_else(|| self.stat_predicate_count(predicate))
-    }
-
-    pub(crate) fn stat_object_count(&self, object: TermId) -> usize {
-        let pattern = crate::rdf_read::QuadPattern {
-            object: Some(object),
-            ..crate::rdf_read::QuadPattern::default()
-        };
-        self.query_index_pattern_count(QueryIndexCursorOrder::Ospg, pattern)
-            .unwrap_or_else(|| self.source_pattern_count(None, None, Some(object)))
-    }
-
-    pub(crate) fn stat_subject_count(&self, subject: TermId) -> usize {
-        let pattern = crate::rdf_read::QuadPattern {
-            subject: Some(subject),
-            ..crate::rdf_read::QuadPattern::default()
-        };
-        self.query_index_pattern_count(QueryIndexCursorOrder::Spog, pattern)
-            .unwrap_or_else(|| self.source_pattern_count(Some(subject), None, None))
-    }
-
-    pub(crate) fn distinct_subject_count(&self) -> usize {
-        self.query_index_distinct_count(None, DistinctDomain::Subject)
-            .unwrap_or_else(|| self.stat_total_quads())
-    }
-
-    pub(crate) fn distinct_object_count(&self) -> usize {
-        self.query_index_distinct_count(None, DistinctDomain::Object)
-            .unwrap_or_else(|| self.stat_total_quads())
-    }
-
-    pub(crate) fn stat_total_quads(&self) -> usize {
-        let snapshot = self.read_snapshot();
-        self.planner_count(snapshot.qv_total_count(self), || {
-            self.source_pattern_count(None, None, None)
-        })
+        self.planner_stat(
+            PlannerStat::PredicateObjects(predicate),
+            &crate::query::context::QueryCost::default(),
+        )
     }
 
     pub(crate) fn decode_quad_key(bytes: &[u8]) -> Result<EncodedQuad> {
@@ -6754,33 +6930,33 @@ impl GraphStore {
         })
     }
 
-    pub(crate) fn decode_query_index_key(
-        order: QueryIndexCursorOrder,
-        bytes: &[u8],
-    ) -> Result<QueryQuad> {
+    pub(crate) fn decode_query_key(order: IndexCursorOrder, bytes: &[u8]) -> Result<QueryQuad> {
         let quad = match order {
-            QueryIndexCursorOrder::Gspo => decode_qv2_gspo_key(bytes),
-            QueryIndexCursorOrder::Gpos => decode_qv2_gpos_key(bytes),
-            QueryIndexCursorOrder::Spog => decode_qv2_spog_key(bytes),
-            QueryIndexCursorOrder::Posg => decode_qv2_posg_key(bytes),
-            QueryIndexCursorOrder::Ospg => decode_qv2_ospg_key(bytes),
-            QueryIndexCursorOrder::Gosp => decode_qv2_gosp_key(bytes),
+            IndexCursorOrder::Gspo => decode_gspo_key(bytes),
+            IndexCursorOrder::Gpos => decode_gpos_key(bytes),
+            IndexCursorOrder::Spog => decode_spog_key(bytes),
+            IndexCursorOrder::Posg => decode_posg_key(bytes),
+            IndexCursorOrder::Ospg => decode_ospg_key(bytes),
+            IndexCursorOrder::Gosp => decode_gosp_key(bytes),
         };
-        quad.ok_or_else(|| StoreError::InvalidQueryIndexEncoding {
+        quad.ok_or_else(|| StoreError::InvalidIndexEncoding {
             context: "qv2 query index key",
             message: format!("expected 32 bytes, found {}", bytes.len()),
         })
     }
 
-    pub(crate) fn decode_query_source_term(
+    pub(crate) fn decode_query_term(
         snapshot: &Snapshot,
         query_to_term: &Keyspace,
         term: QueryTermId,
-    ) -> Result<TermId> {
+    ) -> Result<(TermId, u64)> {
         let value = snapshot.get(query_to_term, term.to_be_bytes())?.ok_or(
-            StoreError::QueryIndexVerificationFailed("query-to-term-mapping-missing"),
+            StoreError::IndexVerificationFailed("query-to-term-mapping-missing"),
         )?;
-        decode_query_source_term_value(value.as_ref(), "query-to-term mapping")
+        Ok((
+            decode_source_id(value.as_ref(), "query-to-term mapping")?,
+            u64::try_from(8usize.saturating_add(value.len())).unwrap_or(u64::MAX),
+        ))
     }
 
     pub(crate) fn quad_key(
@@ -6797,8 +6973,8 @@ impl GraphStore {
         key
     }
 
-    pub(crate) fn quad_value_is_live(bytes: &[u8]) -> bool {
-        !dot_payload_is_empty(bytes)
+    pub(crate) fn quad_is_live(bytes: &[u8]) -> bool {
+        !dots_empty(bytes)
     }
 
     fn count_objects_for_ids(
