@@ -51,9 +51,10 @@
         "hot_path.rs",
         "join_choice.rs",
         "plan_quality.rs",
-        "planning.rs"
+        "planning.rs",
+        "request_modes.rs"
       ],
-      "reason": "The six files form the SPARQL benchmark domain.",
+      "reason": "The seven files form the SPARQL benchmark domain.",
       "source": "Aruna STYLE.md shared-prefix rule"
     },
     {
