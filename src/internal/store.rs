@@ -2482,7 +2482,24 @@ impl SearchSnapshot {
         scan_graph_snapshot(&self.snapshot, &self.quads, scan)
     }
 
-    pub(crate) fn scan_subject(&self, scan: &SubjectScan) -> Result<SubjectPage> {
+    pub(crate) fn subject_present(&self, graph: TermId, subject: TermId) -> Result<bool> {
+        let mut prefix = [0u8; 32];
+        prefix[..16].copy_from_slice(&graph.to_be_bytes());
+        prefix[16..].copy_from_slice(&subject.to_be_bytes());
+        for guard in self.snapshot.prefix(&self.quads, prefix) {
+            let (_, value) = guard.into_inner()?;
+            if !dots_empty(value.as_ref()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn scan_subject(
+        &self,
+        scan: &SubjectScan,
+        predicates: &[TermId; 8],
+    ) -> Result<SubjectPage> {
         let mut prefix = [0u8; 32];
         prefix[..16].copy_from_slice(&scan.graph.to_be_bytes());
         prefix[16..].copy_from_slice(&scan.subject.to_be_bytes());
@@ -2492,7 +2509,13 @@ impl SearchSnapshot {
         let mut bytes = 0usize;
         let mut remaining = false;
         let mut oversized = None;
-        for guard in self.snapshot.prefix(&self.quads, prefix) {
+        let candidates = predicates.iter().flat_map(|predicate| {
+            let mut scoped = [0u8; 48];
+            scoped[..32].copy_from_slice(&prefix);
+            scoped[32..].copy_from_slice(&predicate.to_be_bytes());
+            self.snapshot.prefix(&self.quads, scoped)
+        });
+        for guard in candidates {
             let (key, value) = guard.into_inner()?;
             if dots_empty(value.as_ref()) {
                 continue;

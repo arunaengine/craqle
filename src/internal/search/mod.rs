@@ -68,6 +68,19 @@ static SEARCHABLE_PREDICATES: LazyLock<[EncodedTerm; 4]> = LazyLock::new(|| {
     ]
 });
 
+static SEARCHABLE_IDS: LazyLock<[TermId; 8]> = LazyLock::new(|| {
+    let mut predicates = std::array::from_fn(|index| {
+        let predicate = &SEARCHABLE_PREDICATES[index / 2];
+        if index % 2 == 0 {
+            crate::store::hash_term(predicate)
+        } else {
+            crate::store::hash_term(&EncodedTerm(predicate.0.replacen("http://", "https://", 1)))
+        }
+    });
+    predicates.sort_unstable();
+    predicates
+});
+
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     #[error("tantivy: {0}")]
@@ -2737,13 +2750,16 @@ impl SearchIndex {
         let mut found = false;
         loop {
             self.check_cancel(req.control)?;
-            let page = req.source.snapshot.scan_subject(&SubjectScan {
-                graph: req.graph_tid,
-                subject: req.subject,
-                after,
-                row_limit: SOURCE_PAGE_ROWS,
-                byte_limit: source_limit.saturating_sub(bytes),
-            })?;
+            let page = req.source.snapshot.scan_subject(
+                &SubjectScan {
+                    graph: req.graph_tid,
+                    subject: req.subject,
+                    after,
+                    row_limit: SOURCE_PAGE_ROWS,
+                    byte_limit: source_limit.saturating_sub(bytes),
+                },
+                &SEARCHABLE_IDS,
+            )?;
             if let Some(oversized) = page.oversized {
                 return Err(SearchError::ItemTooLarge {
                     bytes: oversized.bytes,
@@ -2753,10 +2769,8 @@ impl SearchIndex {
             found |= !page.entries.is_empty();
             rows = rows.saturating_add(page.rows);
             bytes = bytes.saturating_add(page.bytes);
-            for (predicate, object) in page.entries {
-                if is_searchable_predicate(&predicate) {
-                    append_searchable_text(&mut all_text, &object, text_limit)?;
-                }
+            for (_, object) in page.entries {
+                append_searchable_text(&mut all_text, &object, text_limit)?;
             }
             if !page.remaining {
                 break;
@@ -2782,7 +2796,12 @@ impl SearchIndex {
                 ));
             }
         }
-        let op = if found {
+        let op = if found
+            || req
+                .source
+                .snapshot
+                .subject_present(req.graph_tid, req.subject)?
+        {
             PreparedDocOp::Upsert {
                 doc,
                 all_text: (!all_text.is_empty()).then_some(all_text),
@@ -2925,13 +2944,16 @@ fn prepare_subject_op(
     let mut source_bytes = 0usize;
     let mut source_rows = 0usize;
     loop {
-        let page = caches.snapshot.scan_subject(&SubjectScan {
-            graph: graph_tid,
-            subject: req.subject,
-            after,
-            row_limit: SOURCE_PAGE_ROWS,
-            byte_limit: source_limit.saturating_sub(source_bytes),
-        })?;
+        let page = caches.snapshot.scan_subject(
+            &SubjectScan {
+                graph: graph_tid,
+                subject: req.subject,
+                after,
+                row_limit: SOURCE_PAGE_ROWS,
+                byte_limit: source_limit.saturating_sub(source_bytes),
+            },
+            &SEARCHABLE_IDS,
+        )?;
         if let Some(oversized) = page.oversized {
             return Err(SearchError::ItemTooLarge {
                 bytes: oversized.bytes,
@@ -2941,10 +2963,8 @@ fn prepare_subject_op(
         found |= !page.entries.is_empty();
         source_rows = source_rows.saturating_add(page.rows);
         source_bytes = source_bytes.saturating_add(page.bytes);
-        for (predicate, object) in page.entries {
-            if is_searchable_predicate(&predicate) {
-                append_searchable_text(&mut all_text, &object, text_limit)?;
-            }
+        for (_, object) in page.entries {
+            append_searchable_text(&mut all_text, &object, text_limit)?;
         }
         if !page.remaining {
             break;
@@ -2968,7 +2988,7 @@ fn prepare_subject_op(
             ));
         }
     }
-    if !found {
+    if !found && !caches.snapshot.subject_present(graph_tid, req.subject)? {
         return Ok(PreparedDocOp::Delete { doc });
     }
 
@@ -3100,17 +3120,6 @@ fn append_searchable_text(buffer: &mut String, term: &EncodedTerm, limit: usize)
     Ok(())
 }
 
-/// Normalize HTTPS schema predicates to the interned HTTP form.
-fn is_searchable_predicate(predicate: &EncodedTerm) -> bool {
-    let normalized = predicate
-        .0
-        .strip_prefix("<https://schema.org/")
-        .map(|suffix| format!("<http://schema.org/{suffix}"));
-    SEARCHABLE_PREDICATES
-        .iter()
-        .any(|candidate| candidate == predicate || normalized.as_ref() == Some(&candidate.0))
-}
-
 fn searchable_term_text(term: &EncodedTerm) -> Option<Cow<'_, str>> {
     if term.0.starts_with('<') && term.0.ends_with('>') {
         return Some(Cow::Borrowed(&term.0[1..term.0.len() - 1]));
@@ -3222,6 +3231,238 @@ mod tests {
 
         assert!(matches!(error, SearchError::ItemTooLarge { limit: 4, .. }));
         assert!(text.is_empty(), "rejection must not retain partial text");
+    }
+
+    #[test]
+    fn search_skips_fanout() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:search-fanout");
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        node.create_crate(
+            &writer_auth(),
+            crate_request(&graph, "originalneedle", true),
+        )
+        .unwrap();
+        let graph_tid = graph_term(&node.store, &graph);
+        let subject = EncodedTerm::from_named_node(&graph.0);
+        let scan = SubjectScan {
+            graph: graph_tid,
+            subject: graph_tid,
+            after: None,
+            row_limit: SOURCE_PAGE_ROWS,
+            byte_limit: usize::MAX,
+        };
+        let baseline = node
+            .store
+            .search_snapshot()
+            .scan_subject(&scan, &SEARCHABLE_IDS)
+            .unwrap();
+        let parts = (0..3_101)
+            .map(|index| {
+                (
+                    subject.clone(),
+                    EncodedTerm::from_named_node(&crate::vocab::schema_has_part()),
+                    EncodedTerm(format!("<urn:test:part-{index}>")),
+                )
+            })
+            .collect();
+        node.insert_quads(&writer_auth(), &graph, parts).unwrap();
+        let snapshot = node.store.search_snapshot();
+        let page = snapshot.scan_subject(&scan, &SEARCHABLE_IDS).unwrap();
+        assert_eq!(baseline.entries, page.entries);
+        assert_eq!(baseline.rows, page.rows);
+        assert_eq!(baseline.bytes, page.bytes);
+        assert!(!page.remaining);
+
+        let mut first_scan = scan.clone();
+        first_scan.row_limit = 1;
+        let first = snapshot.scan_subject(&first_scan, &SEARCHABLE_IDS).unwrap();
+        assert!(first.remaining);
+        node.insert_quads(
+            &writer_auth(),
+            &graph,
+            vec![(
+                subject.clone(),
+                EncodedTerm("<https://schema.org/description>".to_string()),
+                EncodedTerm("\"laterneedle\"".to_string()),
+            )],
+        )
+        .unwrap();
+        first_scan.after = first.next;
+        first_scan.row_limit = SOURCE_PAGE_ROWS;
+        let next = snapshot.scan_subject(&first_scan, &SEARCHABLE_IDS).unwrap();
+        let mut pinned = first.entries;
+        pinned.extend(next.entries);
+        assert_eq!(baseline.entries, pinned, "pages must retain one snapshot");
+
+        let source = StageSource {
+            snapshot,
+            orphaned: HashSet::new(),
+            bytes: 0,
+        };
+        let prepared = node
+            .search
+            .prepare_stage(StageSubject {
+                store: &node.store,
+                source: &source,
+                graph: &graph,
+                graph_tid,
+                subject: graph_tid,
+                generation: DIRECT_GENERATION,
+                control: &DrainControl::default(),
+                byte_limit: node.search.work_bytes(),
+            })
+            .unwrap();
+        assert_eq!(baseline.rows, prepared.rows);
+        assert!(
+            matches!(prepared.op, PreparedDocOp::Upsert { all_text: Some(text), .. }
+            if text.contains("originalneedle") && !text.contains("laterneedle"))
+        );
+        let mut caches = StoreSyncCaches::new(&node.store);
+        let current = prepare_subject_op(
+            PrepareSubject {
+                store: &node.store,
+                graph: &graph,
+                subject: graph_tid,
+                byte_limit: node.search.work_bytes(),
+                generation: DIRECT_GENERATION,
+            },
+            &mut caches,
+        )
+        .unwrap();
+        assert!(
+            matches!(current, PreparedDocOp::Upsert { all_text: Some(text), .. }
+            if text.contains("originalneedle") && text.contains("laterneedle"))
+        );
+        node.flush_search_updates().unwrap();
+        assert_eq!(1, node.search.search("laterneedle", 10).unwrap().len());
+    }
+
+    #[test]
+    fn search_limits_values() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:search-value-limit");
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        node.create_crate(&writer_auth(), crate_request(&graph, "boundedneedle", true))
+            .unwrap();
+        let graph_tid = graph_term(&node.store, &graph);
+        let subject = EncodedTerm::from_named_node(&graph.0);
+        let values = (0..SOURCE_PAGE_ROWS)
+            .map(|index| {
+                (
+                    subject.clone(),
+                    SEARCHABLE_PREDICATES[index % 4].clone(),
+                    EncodedTerm(format!("\"value-{index}\"")),
+                )
+            })
+            .collect();
+        node.insert_quads(&writer_auth(), &graph, values).unwrap();
+        let snapshot = node.store.search_snapshot();
+        let scan = SubjectScan {
+            graph: graph_tid,
+            subject: graph_tid,
+            after: None,
+            row_limit: SOURCE_PAGE_ROWS,
+            byte_limit: usize::MAX,
+        };
+        let page = snapshot.scan_subject(&scan, &SEARCHABLE_IDS).unwrap();
+        assert_eq!(SOURCE_PAGE_ROWS, page.rows);
+        assert!(
+            page.remaining,
+            "all predicate prefixes must share one row cap"
+        );
+        let mut caches = StoreSyncCaches::new(&node.store);
+        let error = prepare_subject_op(
+            PrepareSubject {
+                store: &node.store,
+                graph: &graph,
+                subject: graph_tid,
+                byte_limit: node.search.work_bytes(),
+                generation: DIRECT_GENERATION,
+            },
+            &mut caches,
+        );
+        assert!(matches!(
+            error,
+            Err(SearchError::SourceTooLarge {
+                limit: SOURCE_PAGE_ROWS,
+                ..
+            })
+        ));
+        let source = StageSource {
+            snapshot: snapshot.clone(),
+            orphaned: HashSet::new(),
+            bytes: 0,
+        };
+        let staged = node.search.prepare_stage(StageSubject {
+            store: &node.store,
+            source: &source,
+            graph: &graph,
+            graph_tid,
+            subject: graph_tid,
+            generation: DIRECT_GENERATION,
+            control: &DrainControl::default(),
+            byte_limit: node.search.work_bytes(),
+        });
+        assert!(matches!(
+            staged,
+            Err(SearchError::SourceTooLarge {
+                limit: SOURCE_PAGE_ROWS,
+                ..
+            })
+        ));
+        let mut scan = scan;
+        scan.byte_limit = page.bytes - 1;
+        let bounded = snapshot.scan_subject(&scan, &SEARCHABLE_IDS).unwrap();
+        assert!(bounded.remaining);
+        assert!(bounded.bytes <= scan.byte_limit);
+        assert!(bounded.rows < page.rows);
+    }
+
+    #[test]
+    fn search_keeps_identifiers() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:search-identity");
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        node.create_crate(
+            &writer_auth(),
+            crate_request(&graph, "identityneedle", true),
+        )
+        .unwrap();
+        let subject = EncodedTerm::from_subject_id("ro-crate-metadata.json");
+        let subject = node.store.lookup_term(&subject).unwrap().unwrap();
+        let mut caches = StoreSyncCaches::new(&node.store);
+        let prepared = prepare_subject_op(
+            PrepareSubject {
+                store: &node.store,
+                graph: &graph,
+                subject,
+                byte_limit: node.search.work_bytes(),
+                generation: DIRECT_GENERATION,
+            },
+            &mut caches,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepared,
+            PreparedDocOp::Upsert { all_text: None, .. }
+        ));
+        let absent = node
+            .store
+            .encode_term(&EncodedTerm::from_subject_id("urn:test:absent"))
+            .unwrap();
+        let prepared = prepare_subject_op(
+            PrepareSubject {
+                store: &node.store,
+                graph: &graph,
+                subject: absent,
+                byte_limit: node.search.work_bytes(),
+                generation: DIRECT_GENERATION,
+            },
+            &mut caches,
+        )
+        .unwrap();
+        assert!(matches!(prepared, PreparedDocOp::Delete { .. }));
     }
 
     #[test]
