@@ -1,0 +1,500 @@
+{
+  "maintained_extensions": [".gitignore", ".golden", ".json", ".jsonld", ".lock", ".md", ".py", ".rs", ".sh", ".toml", ".yaml", ".yml"],
+  "source_extensions": [".py", ".rs", ".sh"],
+  "header_extensions": [".gitignore", ".md", ".py", ".rs", ".sh", ".toml", ".yaml", ".yml"],
+  "max_comment_lines": 2,
+  "required_roots": [
+    ".",
+    ".github",
+    ".github/workflows",
+    "benches",
+    "examples",
+    "scripts",
+    "src",
+    "tests",
+    "tests/fixtures"
+  ],
+  "small_domains": [
+    {
+      "path": "benches/text",
+      "members": ["engine.rs", "joins.rs", "tantivy_ref.rs", "tests.rs"],
+      "reason": "The four files form the experimental text comparison domain.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    },
+    {
+      "path": "src/internal/search",
+      "members": ["queue.rs", "bench.rs", "recovery.rs"],
+      "reason": "The three search-prefixed protocol and test files share the search owner.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    },
+    {
+      "path": "tests/search",
+      "members": ["authorization.rs", "disabled.rs", "integration.rs", "recovery.rs"],
+      "reason": "The four files form the public search test domain.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    },
+    {
+      "path": "benches/catalog",
+      "members": [
+        "case.rs",
+        "main.rs",
+        "reads.rs"
+      ],
+      "reason": "The three files form the consistency benchmark catalog domain.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    },
+    {
+      "path": "benches/sparql",
+      "members": [
+        "access_path_scaling.rs",
+        "costs.rs",
+        "hot_path.rs",
+        "join_choice.rs",
+        "plan_quality.rs",
+        "planning.rs"
+      ],
+      "reason": "The six files form the SPARQL benchmark domain.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    },
+    {
+      "path": "benches/shacl",
+      "members": [
+        "external_baseline.rs",
+        "incremental.rs",
+        "native_comparison.rs"
+      ],
+      "reason": "The three files form the SHACL benchmark domain.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    },
+    {
+      "path": "scripts/style",
+      "members": ["checker.py", "content.py", "imports.py", "model.py", "public_exceptions.json", "rules.json", "tests.py", "tokens.py"],
+      "reason": "The eight files form the style enforcement domain.",
+      "source": "Aruna STYLE.md folder rules"
+    },
+    {
+      "path": "src/rocrate",
+      "members": [
+        "1_1.jsonld",
+        "1_2.jsonld",
+        "1_3.jsonld"
+      ],
+      "reason": "The three frozen assets form the versioned RO-Crate context family.",
+      "source": "Aruna STYLE.md shared-prefix and fixture preservation rules"
+    },
+    {
+      "path": "tests/rocrate",
+      "members": [
+        "fidelity.rs",
+        "main.rs",
+        "policy.rs",
+        "versions.rs"
+      ],
+      "reason": "The four files form the RO-Crate integration test domain.",
+      "source": "Aruna STYLE.md shared-prefix rule"
+    }
+  ],
+  "generic_prefixes": ["add", "apply", "check", "create", "delete", "get", "query", "read", "run", "set", "test", "update", "valid", "write"],
+  "skip_paths": [
+    {
+      "path": "LICENSE",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "The distributed MIT license text is fixed legal material.",
+      "source": "MIT distribution license"
+    }
+  ],
+  "exception_files": ["public_exceptions.json"],
+  "exceptions": [
+    {
+      "path": "scripts/style/checker.py",
+      "rule": "name_terms",
+      "name": "visit_AsyncFunctionDef",
+      "kind": "function",
+      "reason": "Python AST dispatch requires this exact visitor name.",
+      "source": "Python ast.NodeVisitor interface"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "CraqleFjallPersistMode",
+      "kind": "type",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "MultiGraphUpdateUnsupported",
+      "kind": "variant",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "PreparedRoCrateCommitOutcome",
+      "kind": "type",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "QueryIndexVerificationMode",
+      "kind": "type",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "UnsupportedRdfStarTerm",
+      "kind": "variant",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "accepted_by_write_policy",
+      "kind": "field",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "acknowledge_rejected_replication_record",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "add_contextual_entity_with",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "add_contextual_entity_with_triples",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "add_data_entity_with",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "add_data_entity_with_triples",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "analyze_prepared_in_graphs",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "append_new_data_entities_under",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "append_new_root_data_entities",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "apply_rocrate_document_checked_with_policy",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "apply_rocrate_document_checked_with_policy_and_durability",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "apply_rocrate_document_checked_with_policy_and_durability_as",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "apply_rocrate_document_with_policy",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "apply_rocrate_document_with_policy_and_durability",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "apply_sparql_update_with_options",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "bind_or_derive_irokle_topic",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "commit_prepared_rocrate_document",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "create_crate_with_durability",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "create_crate_with_durability_as",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "create_crate_with_options",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "delete_rejected_replication_record",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "execute_prepared_in_graphs",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "explain_prepared_in_graphs",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "export_rocrate_page_after",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "from_store_and_search",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "graph_store_persist_mode",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "inspect_rejected_replication_record",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "list_rejected_replication_records",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "pending_shacl_queue_status",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "plan_rocrate_document_checked",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "query_in_graphs_with_options",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "query_index_status_fast",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "repair_irokle_topic_cursor",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "repair_pending_shacl_queue",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "retry_rejected_replication_record",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "validate_rocrate_document_checked_with_policy",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "with_graph_store_persist_mode",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "with_pending_replay_policy",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {
+      "path": "src/lib.rs",
+      "rule": "name_terms",
+      "name": "with_remote_policy_authorizer",
+      "kind": "function",
+      "reason": "Preserve the shipped public Rust source contract.",
+      "source": "Craqle 0.2.x public API in src/lib.rs and CHANGELOG.md"
+    },
+    {"path":"src/internal/core.rs","rule":"name_terms","name":"UnsupportedRdfStarTerm","kind":"type","reason":"Preserve the shipped public RDF-star error type.","source":"Craqle 0.2.x public API"},
+    {"path":"src/internal/planner.rs","rule":"name_terms","name":"estimated_distinct_join_keys","kind":"field","reason":"Preserve the shipped public query plan field.","source":"Craqle 0.2.x public API"},
+    {"path":"src/internal/sparql.rs","rule":"name_terms","name":"max_property_path_edges","kind":"field","reason":"Preserve the shipped public query limit field.","source":"Craqle 0.2.x public API"},
+    {"path":"src/internal/sparql.rs","rule":"name_terms","name":"max_property_path_depth","kind":"field","reason":"Preserve the shipped public query limit field.","source":"Craqle 0.2.x public API"},
+    {"path":"src/internal/sparql.rs","rule":"name_terms","name":"time_to_first_internal_result","kind":"field","reason":"Preserve the shipped public query statistics field.","source":"Craqle 0.2.x public API"},
+    {"path":"src/internal/sparql_fast_path.rs","rule":"name_terms","name":"QueryFastPathMode","kind":"type","reason":"Preserve the shipped public query mode type.","source":"Craqle 0.2.x public API"},
+    {"path":"src/internal/sparql_fast_path.rs","rule":"name_terms","name":"QueryFastPathKind","kind":"type","reason":"Preserve the shipped public query kind type.","source":"Craqle 0.2.x public API"},
+    {"path":"src/lib.rs","rule":"name_terms","name":"QueryFastPathKind","kind":"binding","reason":"Preserve the shipped public query kind re-export.","source":"Craqle 0.2.x public API"},
+    {"path":"src/lib.rs","rule":"name_terms","name":"QueryFastPathMode","kind":"binding","reason":"Preserve the shipped public query mode re-export.","source":"Craqle 0.2.x public API"},
+    {"path":"src/lib.rs","rule":"name_terms","name":"CompiledRoCratePolicy","kind":"type","reason":"Preserve the shipped public RO-Crate policy type.","source":"Craqle 0.2.x public API"},
+    {"path":"src/lib.rs","rule":"name_terms","name":"RoCratePolicyOptions","kind":"type","reason":"Preserve the shipped public RO-Crate policy options.","source":"Craqle 0.2.x public API"},
+    {"path":"src/lib.rs","rule":"name_terms","name":"RoCratePolicyStatistics","kind":"type","reason":"Preserve the shipped public RO-Crate policy statistics.","source":"Craqle 0.2.x public API"},
+    {"path":"src/lib.rs","rule":"name_terms","name":"RoCratePolicyReport","kind":"type","reason":"Preserve the shipped public RO-Crate policy report.","source":"Craqle 0.2.x public API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"PendingShaclQueueStatus","kind":"type","reason":"Preserve the shipped public SHACL queue status.","source":"Craqle 0.2.x public API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"graph_commit_lock_wait_ns","kind":"field","reason":"Preserve the shipped public runtime statistics field.","source":"Craqle public SHACL API"},
+    {"path":"src/sync.rs","rule":"name_terms","name":"DenyRemotePolicyChanges","kind":"type","reason":"Preserve the shipped public remote policy authorizer.","source":"Craqle 0.2.x public API"},
+    {"path":"src/sync.rs","rule":"name_terms","name":"TopicCursorRepairAudit","kind":"type","reason":"Preserve the shipped public repair audit type.","source":"Craqle 0.2.x public API"},
+    {"path":"src/sync.rs","rule":"name_terms","name":"repaired_at_unix_nanos","kind":"field","reason":"Preserve the shipped public repair timestamp field.","source":"Craqle 0.2.x public API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"SHACL_COMPILER_MODEL_VERSION","kind":"constant","reason":"Preserve the shipped public compiler model constant.","source":"Craqle public SHACL API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"pending_queue_entries_scanned","kind":"field","reason":"Preserve the shipped public replay statistics field.","source":"Craqle public SHACL API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"binding_lock_wait_ns","kind":"field","reason":"Preserve the shipped public runtime statistics field.","source":"Craqle public SHACL API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"binding_lock_hold_ns","kind":"field","reason":"Preserve the shipped public runtime statistics field.","source":"Craqle public SHACL API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"status_full_shape_scans","kind":"field","reason":"Preserve the shipped public runtime statistics field.","source":"Craqle public SHACL API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"shape_compile_cache_hit","kind":"field","reason":"Preserve the shipped public validation statistics field.","source":"Craqle public SHACL API"},
+    {"path":"src/shacl.rs","rule":"name_terms","name":"accepted_by_write_policy","kind":"field","reason":"Preserve the shipped public validation outcome field.","source":"Craqle public SHACL API"}
+  ],
+  "macro_inputs": {"vocab_terms":{"mode":"static_list"}},
+  "test_paths": ["tests", "src/internal/tests.rs", "src/internal/search/bench.rs", "src/internal/store_bench.rs", "src/internal/store_recovery.rs", "src/internal/search/recovery.rs", "src/receipt_tests.rs"],
+  "mandatory_notices": ["// SPDX-License-Identifier: MIT", "# SPDX-License-Identifier: MIT", "<!-- SPDX-License-Identifier: MIT -->", "// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen", "# Copyright (c) 2026 ArunaStorage Team @ JLU Giessen", "<!-- Copyright (c) 2026 ArunaStorage Team @ JLU Giessen -->"]
+}
