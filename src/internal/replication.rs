@@ -726,14 +726,414 @@ impl ReplicationEngine {
         self.commit_changes(graph, changes)
     }
 
-    pub(crate) fn local_apply_changes_with_render_hints(
+    pub(crate) fn apply_mutation(
+        &self,
+        request: crate::sync::MutationRequest,
+    ) -> Result<crate::sync::MutationReceipt, UpdateError> {
+        self.ensure_change_targets(&request.graph, &request.changes)?;
+        if request.changes.is_empty() {
+            return Err(UpdateError::InvalidChangeSet(
+                "mutation request must contain at least one change".to_owned(),
+            ));
+        }
+        let digest = mutation_digest(&request.graph, &request.changes, None)?;
+        let retry_guard;
+        if let Some(receipt) = self.store.mutation_receipt(&request.id)? {
+            if receipt.graph != request.graph || receipt.request_digest != digest {
+                return Err(UpdateError::InvalidChangeSet(
+                    "mutation id is already bound to a different request".to_owned(),
+                ));
+            }
+            match request.admission_sequence {
+                None => return Ok(receipt),
+                Some(sequence) if sequence != receipt.admission_sequence => {
+                    return Err(UpdateError::ReceiptExpired);
+                }
+                Some(_) => {}
+            }
+            if receipt.source != crate::sync::SourceOutcome::Prepared {
+                return Ok(receipt);
+            }
+            retry_guard = Some(self.store.graph_write_guard(&request.graph));
+            if let Some(sync) = &self.sync {
+                if let Some(record) = sync
+                    .find_mutation(&receipt)
+                    .map_err(|error| self.accepted_sync(request.id, error))?
+                {
+                    self.apply_irokle_record(&record)
+                        .map_err(|error| self.accepted_merge(request.id, error))?;
+                    return self.store.mutation_receipt(&request.id)?.ok_or_else(|| {
+                        UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
+                    });
+                }
+            }
+        } else if request.admission_sequence.is_none() {
+            return self.prepare_mutation(&request);
+        } else {
+            return match self.store.receipt_status(&crate::sync::MutationLookup {
+                graph: request.graph,
+                id: request.id,
+                admission_sequence: request.admission_sequence,
+            })? {
+                crate::sync::MutationStatus::Expired => Err(UpdateError::ReceiptExpired),
+                crate::sync::MutationStatus::Known(receipt) => Ok(receipt),
+                crate::sync::MutationStatus::Unknown => Err(UpdateError::ReceiptUnknown),
+            };
+        }
+        self.commit_with_plan(LocalCommit {
+            id: Some(request.id),
+            write_locked: retry_guard.is_some(),
+            graph: &request.graph,
+            changes: request.changes,
+            checks: WriteChecks::normal(DiagnosticsMode::Immediate),
+            prepared_fence: None,
+            render_hints: None,
+        })?;
+        drop(retry_guard);
+        self.store
+            .mutation_receipt(&request.id)?
+            .ok_or_else(|| UpdateError::InvalidChangeSet("mutation receipt was not stored".into()))
+    }
+
+    fn prepare_mutation(
+        &self,
+        request: &crate::sync::MutationRequest,
+    ) -> Result<crate::sync::MutationReceipt, UpdateError> {
+        let _write_guard = self.store.graph_write_guard(&request.graph);
+        if let Some(tombstone) = self.store.graph_tombstone(&request.graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone });
+        }
+        let _commit_guard = self.store.graph_commit_guard(&request.graph);
+        self.validate(&request.graph, &request.changes)?;
+        #[cfg(feature = "shacl-core")]
+        let (_binding_guard, _) =
+            self.prepare_shacl_commit(&request.graph, &request.changes, true)?;
+        let (topic, frontier) = if let Some(sync) = &self.sync {
+            let topic = sync.ensure_topic_guarded(&self.store, &request.graph)?;
+            let frontier = sync.topic_frontier(topic)?;
+            (Some(topic), Some(frontier))
+        } else {
+            (None, None)
+        };
+        #[cfg(feature = "shacl-core")]
+        drop(_binding_guard);
+        let receipt = crate::sync::MutationReceipt {
+            id: request.id,
+            admission_sequence: 0,
+            graph: request.graph.clone(),
+            request_digest: mutation_digest(&request.graph, &request.changes, None)?,
+            event_id: None,
+            topic,
+            publish_after: frontier.as_ref().map(|frontier| frontier.clock.clone()),
+            topic_epoch: frontier.as_ref().map(|frontier| frontier.epoch),
+            topic_genesis: frontier.as_ref().map(|frontier| frontier.genesis),
+            search_token: None,
+            repair_graphs: vec![request.graph.clone()],
+            source: crate::sync::SourceOutcome::Prepared,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: crate::sync::RepairState {
+                diagnostics: crate::sync::RepairOutcome::Pending,
+                #[cfg(feature = "shacl-core")]
+                shacl: crate::sync::RepairOutcome::Pending,
+                #[cfg(not(feature = "shacl-core"))]
+                shacl: crate::sync::RepairOutcome::NotRequired,
+                search: crate::sync::RepairOutcome::Pending,
+                query_view: crate::sync::RepairOutcome::Pending,
+            },
+            source_version: self.store.graph_version_digest(&request.graph)?,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        let _receipt_guard = self.store.receipt_guard(&request.id);
+        let mut batch = self.store.new_batch();
+        if let Some(existing) = self.store.stage_receipt(&mut batch, &receipt)? {
+            return Ok(existing);
+        }
+        self.store.commit(batch)?;
+        self.store.persist_receipts()?;
+        self.store
+            .mutation_receipt(&request.id)?
+            .ok_or_else(|| UpdateError::InvalidChangeSet("mutation receipt was not stored".into()))
+    }
+
+    pub(crate) fn set_policy(
+        &self,
+        request: PolicyMutation<'_>,
+    ) -> Result<Option<crate::sync::MutationReceipt>, UpdateError> {
+        let _write = self.store.graph_write_guard(request.graph);
+        if let Some(tombstone) = self.store.graph_tombstone(request.graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone });
+        }
+        let current = self.store.graph_tagged_policy(request.graph)?;
+        if self.store.contains_graph(request.graph)? && current == request.tagged {
+            return Ok(None);
+        }
+        if request.publish
+            && let Some(sync) = &self.sync
+        {
+            let topic = sync.ensure_graph_topic(&self.store, request.graph)?;
+            let frontier = sync.topic_frontier(topic)?;
+            let record = sync.publish_policy(&self.store, request.graph, request.tagged)?;
+            #[cfg(test)]
+            if let Some(before_apply) = request.before_apply {
+                before_apply();
+            }
+            let CraqleGraphEvent::Policy { tagged, .. } = &record.event else {
+                return Err(UpdateError::InvalidChangeSet(
+                    "policy publish returned a different event".to_owned(),
+                ));
+            };
+            let id = crate::sync::MutationId::from_op(record.meta.op_id);
+            let digest = encoded_digest(tagged)?;
+            let applied = crate::sync::MutationReceipt {
+                id,
+                admission_sequence: 0,
+                graph: request.graph.clone(),
+                request_digest: digest,
+                event_id: Some(*record.meta.op_id.as_bytes()),
+                topic: Some(topic),
+                publish_after: Some(frontier.clock),
+                topic_epoch: Some(frontier.epoch),
+                topic_genesis: Some(frontier.genesis),
+                search_token: None,
+                repair_graphs: Vec::new(),
+                source: crate::sync::SourceOutcome::Applied,
+                persistence: crate::sync::PersistenceOutcome::Pending,
+                repairs: settled_repairs(),
+                source_version: digest,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            };
+            return self
+                .store
+                .set_policy_receipt(
+                    request.graph,
+                    PolicyReceipt {
+                        tagged,
+                        receipt: &applied,
+                    },
+                )
+                .map(Some)
+                .map_err(|error| Self::accepted_outcome(applied, UpdateError::Store(error)));
+        }
+
+        let id = new_mutation();
+        let digest = encoded_digest(&request.tagged)?;
+        let receipt = crate::sync::MutationReceipt {
+            id,
+            admission_sequence: 0,
+            graph: request.graph.clone(),
+            request_digest: digest,
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: settled_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .set_policy_receipt(
+                request.graph,
+                PolicyReceipt {
+                    tagged: &request.tagged,
+                    receipt: &receipt,
+                },
+            )
+            .map(Some)
+            .map_err(UpdateError::Store)
+    }
+
+    pub(crate) fn apply_policy_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<Option<crate::sync::MutationReceipt>, MergeError> {
+        let CraqleGraphEvent::Policy { graph, tagged } = &record.event else {
+            return Err(MergeError::InputRejected(
+                "expected a policy replication record".to_owned(),
+            ));
+        };
+        let current = self.store.graph_tagged_policy(graph)?;
+        if tagged.tag <= current.tag {
+            return Ok(None);
+        }
+        let digest = encoded_digest(tagged)?;
+        let receipt = crate::sync::MutationReceipt {
+            id: crate::sync::MutationId::from_op(record.meta.op_id),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: digest,
+            event_id: Some(*record.meta.op_id.as_bytes()),
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: settled_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .set_policy_receipt(
+                graph,
+                PolicyReceipt {
+                    tagged,
+                    receipt: &receipt,
+                },
+            )
+            .map(Some)
+            .map_err(MergeError::Store)
+    }
+
+    pub(crate) fn delete_graph(
+        &self,
+        graph: &GraphId,
+        publish: bool,
+    ) -> Result<Option<crate::sync::MutationReceipt>, UpdateError> {
+        let _write = self.store.graph_write_guard(graph);
+        if self.store.graph_tombstoned(graph)? && !self.store.contains_graph(graph)? {
+            return Ok(None);
+        }
+        let mut delete_clock = self.store.get_vector_clock(graph)?;
+        let delete_counter = delete_clock
+            .0
+            .get(&self.actor)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        delete_clock.advance(self.actor, delete_counter);
+        let tombstone = GraphTombstone {
+            graph: graph.clone(),
+            delete_event: EventId::graph_delete(graph, self.actor, &delete_clock),
+            delete_actor: self.actor,
+            delete_clock,
+        };
+        let digest = encoded_digest(&tombstone)?;
+        #[cfg(feature = "shacl-core")]
+        let repair_graphs = self.store.affected_shacl_graphs(graph)?;
+        #[cfg(not(feature = "shacl-core"))]
+        let repair_graphs = Vec::new();
+
+        if publish
+            && let Some(sync) = &self.sync
+            && let Some(topic) = sync.graph_topic_id(&self.store, graph)?
+        {
+            let frontier = sync.topic_frontier(topic)?;
+            let record = sync.publish_delete(&self.store, tombstone)?;
+            let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event else {
+                return Err(UpdateError::InvalidChangeSet(
+                    "delete publish returned a different event".to_owned(),
+                ));
+            };
+            let id = crate::sync::MutationId::from_op(record.meta.op_id);
+            let applied = crate::sync::MutationReceipt {
+                id,
+                admission_sequence: 0,
+                graph: graph.clone(),
+                request_digest: digest,
+                event_id: Some(*record.meta.op_id.as_bytes()),
+                topic: Some(topic),
+                publish_after: Some(frontier.clock),
+                topic_epoch: Some(frontier.epoch),
+                topic_genesis: Some(frontier.genesis),
+                search_token: None,
+                repair_graphs: repair_graphs.clone(),
+                source: crate::sync::SourceOutcome::Applied,
+                persistence: crate::sync::PersistenceOutcome::Pending,
+                repairs: delete_repairs(),
+                source_version: digest,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            };
+            return self
+                .store
+                .delete_with_receipt(tombstone, &applied)
+                .map(Some)
+                .map_err(|error| Self::accepted_outcome(applied, UpdateError::Store(error)));
+        }
+
+        let receipt = crate::sync::MutationReceipt {
+            id: new_mutation(),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: digest,
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs,
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: delete_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .delete_with_receipt(&tombstone, &receipt)
+            .map(Some)
+            .map_err(UpdateError::Store)
+    }
+
+    pub(crate) fn apply_delete_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<Option<crate::sync::MutationReceipt>, MergeError> {
+        let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event else {
+            return Err(MergeError::InputRejected(
+                "expected a graph deletion record".to_owned(),
+            ));
+        };
+        if self.store.graph_tombstoned(&tombstone.graph)?
+            && !self.store.contains_graph(&tombstone.graph)?
+        {
+            return Ok(None);
+        }
+        let digest = encoded_digest(tombstone)?;
+        #[cfg(feature = "shacl-core")]
+        let repair_graphs = self.store.affected_shacl_graphs(&tombstone.graph)?;
+        #[cfg(not(feature = "shacl-core"))]
+        let repair_graphs = Vec::new();
+        let receipt = crate::sync::MutationReceipt {
+            id: crate::sync::MutationId::from_op(record.meta.op_id),
+            admission_sequence: 0,
+            graph: tombstone.graph.clone(),
+            request_digest: digest,
+            event_id: Some(*record.meta.op_id.as_bytes()),
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs,
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: delete_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .delete_with_receipt(tombstone, &receipt)
+            .map(Some)
+            .map_err(MergeError::Store)
+    }
+
+    pub(crate) fn apply_changes_hints(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: RoCrateRenderHints,
+        render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
-        self.commit_changes_with_plan(LocalCommit {
+        self.ensure_change_targets(graph, &changes)?;
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
@@ -743,18 +1143,20 @@ impl ReplicationEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn local_apply_changes_bypassing_structural_rules(
+    pub(crate) fn apply_changes_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
             return self.empty_batch(graph);
         }
 
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Immediate),
@@ -766,18 +1168,20 @@ impl ReplicationEngine {
     /// Apply a trusted bulk change set locally and defer graph-diagnostics
     /// recomputation until the caller explicitly rebuilds diagnostics.
     #[cfg(test)]
-    pub(crate) fn local_apply_bulk_bypassing_structural_rules(
+    pub(crate) fn apply_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
             return self.empty_batch(graph);
         }
 
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
@@ -787,14 +1191,16 @@ impl ReplicationEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn local_apply_bulk_bypassing_structural_rules_with_render_hints(
+    pub(crate) fn apply_bulk_hints(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: RoCrateRenderHints,
+        render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
-        self.commit_changes_with_plan(LocalCommit {
+        self.ensure_change_targets(graph, &changes)?;
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
@@ -808,11 +1214,13 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        self.ensure_change_targets(graph, &changes)?;
         if changes.is_empty() {
             return self.empty_batch(graph);
         }
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Deferred),
@@ -821,25 +1229,25 @@ impl ReplicationEngine {
         })
     }
 
-    pub(crate) fn local_apply_bulk_prepared(
+    pub(crate) fn apply_bulk_prepared(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
         data_version: Option<[u8; 32]>,
         shape_versions: &[(GraphId, [u8; 32])],
-        render_hints: RoCrateRenderHints,
+        render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        self.ensure_change_targets(graph, &changes)?;
         let fence = PreparedCommitFence {
             data_version,
             shape_versions,
         };
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
-            // Structural rules were evaluated over the exact encoded
-            // candidate during preparation; do not rebuild a decoded current
-            // graph and re-evaluate a different orphan-inclusive view here.
+            // Preparation already evaluated structural rules over this exact encoded candidate.
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: Some(fence),
             render_hints: Some(render_hints),
@@ -865,16 +1273,13 @@ impl ReplicationEngine {
         })
     }
 
-    /// Run the checks a local apply of `changes` would run, without writing.
-    ///
-    /// The verdict describes the state visible now; a concurrent write to
-    /// `graph` can still invalidate the planned change set.
+    /// Validate without writing; later concurrent writes can invalidate this verdict.
     pub(crate) fn check_planned_changes(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
     ) -> Result<(), UpdateError> {
-        self.ensure_change_set_targets(graph, changes)?;
+        self.ensure_change_targets(graph, changes)?;
         self.validate(graph, changes)
     }
 
@@ -1006,7 +1411,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn prepared_shacl_write_is_current(
+    fn prepared_shacl_current(
         &self,
         graph: &GraphId,
         prepared: &PreparedShaclWrite<'_>,
@@ -1037,7 +1442,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn prepare_shacl_write_for_commit(
+    fn prepare_shacl_commit(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
@@ -1046,7 +1451,7 @@ impl ReplicationEngine {
         for _ in 0..SHACL_WRITE_RETRIES {
             let prepared = self.prepare_shacl_write(graph, changes, enforce_shacl)?;
             let binding_guard = self.store.binding_guard();
-            if self.prepared_shacl_write_is_current(graph, &prepared)? {
+            if self.prepared_shacl_current(graph, &prepared)? {
                 return Ok((binding_guard, prepared));
             }
         }
@@ -1487,7 +1892,7 @@ impl ReplicationEngine {
 
     #[cfg(all(test, feature = "shacl-core"))]
     pub(crate) fn replay_pending_bindings(&self) -> crate::store::Result<()> {
-        let outcome = self.replay_pending_bindings_bounded(usize::MAX, None)?;
+        let outcome = self.replay_bindings_bounded(usize::MAX, None)?;
         if let Some(failure) = outcome.failures.first() {
             return Err(crate::store::StoreError::InvalidEncoding {
                 context: "SHACL pending replay",
@@ -1498,16 +1903,14 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn replay_pending_bindings_bounded(
+    pub(crate) fn replay_bindings_bounded(
         &self,
         max_graphs: usize,
         max_elapsed: Option<Duration>,
     ) -> crate::store::Result<crate::PendingReplayOutcome> {
         let started = Instant::now();
         let deadline = max_elapsed.and_then(|elapsed| started.checked_add(elapsed));
-        let scan = self
-            .store
-            .pending_shacl_queue_bounded(max_graphs, deadline)?;
+        let scan = self.store.bounded_shacl_queue(max_graphs, deadline)?;
         let mut outcome = crate::PendingReplayOutcome {
             budget_exhausted: scan.budget_exhausted,
             ..crate::PendingReplayOutcome::default()
@@ -1521,7 +1924,7 @@ impl ReplicationEngine {
             match self.settle_current(&graph) {
                 Ok(reports) => {
                     outcome.statistics.reports_produced += reports as u64;
-                    if !self.store.shacl_graph_is_pending(&graph)? {
+                    if !self.store.shacl_graph_pending(&graph)? {
                         outcome.statistics.graphs_settled += 1;
                     }
                 }
@@ -1612,11 +2015,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn persist_shacl_evaluations_post_commit(
-        &self,
-        graph: &GraphId,
-        evaluations: Vec<ShaclEvaluation>,
-    ) -> bool {
+    fn persist_shacl_post(&self, graph: &GraphId, evaluations: Vec<ShaclEvaluation>) -> bool {
         if evaluations.is_empty() {
             return true;
         }
@@ -1628,7 +2027,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn settle_bindings_post_commit(
+    fn settle_bindings_post(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
@@ -1643,7 +2042,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn settle_current_post_commit(&self, graph: &GraphId) -> bool {
+    fn settle_current_post(&self, graph: &GraphId) -> bool {
         if let Err(error) = self.settle_current(graph) {
             self.report_settlement_failure(graph, &error);
             return false;
@@ -1651,7 +2050,7 @@ impl ReplicationEngine {
         true
     }
 
-    fn ensure_change_set_targets(
+    fn ensure_change_targets(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
@@ -1682,7 +2081,7 @@ impl ReplicationEngine {
                 .into_iter()
                 .find(|term| term.is_rdf_star())
             {
-                return Err(UnsupportedRdfStarTerm {
+                return Err(RdfStarError {
                     term: term.0.clone(),
                 }
                 .into());
@@ -1691,7 +2090,7 @@ impl ReplicationEngine {
         Ok(())
     }
 
-    fn ensure_prepared_data_current(
+    fn ensure_data_current(
         &self,
         graph: &GraphId,
         fence: &PreparedCommitFence<'_>,
@@ -1710,10 +2109,7 @@ impl ReplicationEngine {
         }
     }
 
-    fn ensure_prepared_shapes_current(
-        &self,
-        fence: &PreparedCommitFence<'_>,
-    ) -> Result<(), UpdateError> {
+    fn ensure_shapes_current(&self, fence: &PreparedCommitFence<'_>) -> Result<(), UpdateError> {
         for (graph, expected) in fence.shape_versions {
             if !self.store.contains_graph(graph)?
                 || self.store.graph_version_digest(graph)? != *expected
