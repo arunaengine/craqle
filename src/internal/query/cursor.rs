@@ -2,14 +2,17 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::ops::Bound::{Excluded, Included};
+use std::rc::Rc;
 
 use fjall::{Keyspace, Readable, Snapshot};
 
-use crate::query::context::ReadContext;
-use crate::rdf_read::QuadPattern;
+use crate::query::context::{QueryCost, ReadContext};
+use crate::rdf_read::{GraphVisibilityInput, QuadPattern, graph_orphans};
 use crate::store::{
-    EncodedQuad, GraphStore, QueryIndexCursorOrder, QueryTermId, Result, StoreReadSnapshot, TermId,
+    EncodedQuad, GraphStore, IndexCursorOrder, QueryTermId, Result, StoreReadSnapshot, TermId,
 };
 use crate::validation_delta::DeltaQuadCursor;
 
@@ -20,17 +23,17 @@ pub(crate) enum CountGrouping {
     None,
 }
 
-fn count_grouping_for_order(
-    order: QueryIndexCursorOrder,
+fn grouping_for_order(
+    order: IndexCursorOrder,
     mut fixed: impl FnMut(usize) -> bool,
 ) -> CountGrouping {
     let columns = match order {
-        QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
-        QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
-        QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
-        QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
-        QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
-        QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+        IndexCursorOrder::Gspo => [0, 1, 2, 3],
+        IndexCursorOrder::Gpos => [0, 2, 3, 1],
+        IndexCursorOrder::Spog => [1, 2, 3, 0],
+        IndexCursorOrder::Posg => [2, 3, 1, 0],
+        IndexCursorOrder::Ospg => [3, 1, 2, 0],
+        IndexCursorOrder::Gosp => [0, 3, 1, 2],
     };
     columns
         .into_iter()
@@ -53,7 +56,7 @@ enum SourceIterator {
         snapshot: Snapshot,
         query_to_term: Keyspace,
         iterator: fjall::Iter,
-        order: QueryIndexCursorOrder,
+        order: IndexCursorOrder,
     },
     Empty,
 }
@@ -76,21 +79,117 @@ pub(crate) enum CandidateStorage {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RawQueryIndexKey {
+pub(crate) struct RawIndexKey {
     bytes: [u8; 32],
-    order: QueryIndexCursorOrder,
+    order: IndexCursorOrder,
     pub(crate) bytes_read: u64,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RawQueryIndexPattern {
+pub(crate) struct RawIndexPattern {
     graph: Option<QueryTermId>,
     subject: Option<QueryTermId>,
     predicate: Option<QueryTermId>,
     object: Option<QueryTermId>,
 }
 
-impl RawQueryIndexPattern {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DenseSpace {
+    generation: u64,
+    snapshot: u64,
+    scope: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DenseTerm {
+    query: QueryTermId,
+    scope: u64,
+}
+
+impl PartialEq for DenseTerm {
+    fn eq(&self, other: &Self) -> bool {
+        self.query == other.query && self.scope == other.scope
+    }
+}
+
+impl Eq for DenseTerm {}
+
+impl Hash for DenseTerm {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.query.hash(state);
+        self.scope.hash(state);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DenseResolver {
+    inner: Rc<DenseResolverInner>,
+}
+
+struct DenseResolverInner {
+    snapshot: Snapshot,
+    query_to_term: Keyspace,
+    costs: QueryCost,
+    space: DenseSpace,
+    sources: RefCell<crate::cache::BoundedCache<QueryTermId, TermId>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DenseQuad {
+    pub(crate) graph: DenseTerm,
+    pub(crate) graph_source: TermId,
+    pub(crate) subject: DenseTerm,
+    subject_source: TermId,
+    pub(crate) predicate: DenseTerm,
+    pub(crate) object: DenseTerm,
+    object_source: TermId,
+    source_mask: u8,
+}
+
+impl DenseQuad {
+    pub(crate) fn subject_source(&self) -> Option<TermId> {
+        (self.source_mask & 1 != 0).then_some(self.subject_source)
+    }
+
+    pub(crate) fn object_source(&self) -> Option<TermId> {
+        (self.source_mask & 2 != 0).then_some(self.object_source)
+    }
+}
+
+pub(crate) struct IndexScan<'a> {
+    pub(crate) order: IndexCursorOrder,
+    pub(crate) pattern: QuadPattern,
+    pub(crate) query_id_limit: Option<u64>,
+    pub(crate) costs: &'a QueryCost,
+}
+
+pub(crate) struct RawIndexScan<'a> {
+    pub(crate) keyspace: &'a Keyspace,
+    pub(crate) query_to_term: &'a Keyspace,
+    pub(crate) order: IndexCursorOrder,
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) pattern: RawIndexPattern,
+    pub(crate) query_id_limit: u64,
+}
+
+pub(crate) struct QueryIndexScan<'a> {
+    pub(crate) keyspace: &'a Keyspace,
+    pub(crate) query_to_term: &'a Keyspace,
+    pub(crate) order: IndexCursorOrder,
+    pub(crate) prefix: Vec<u8>,
+}
+
+impl RawIndexPattern {
+    pub(crate) fn from_terms(terms: [Option<QueryTermId>; 4]) -> Self {
+        let [graph, subject, predicate, object] = terms;
+        Self {
+            graph,
+            subject,
+            predicate,
+            object,
+        }
+    }
+
     pub(crate) fn new(
         graph: Option<QueryTermId>,
         subject: Option<QueryTermId>,
@@ -105,18 +204,14 @@ impl RawQueryIndexPattern {
         }
     }
 
-    pub(crate) fn without_prefix(
-        mut self,
-        order: QueryIndexCursorOrder,
-        prefix_terms: usize,
-    ) -> Self {
+    pub(crate) fn without_prefix(mut self, order: IndexCursorOrder, prefix_terms: usize) -> Self {
         let columns = match order {
-            QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
-            QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
-            QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
-            QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
-            QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
-            QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+            IndexCursorOrder::Gspo => [0, 1, 2, 3],
+            IndexCursorOrder::Gpos => [0, 2, 3, 1],
+            IndexCursorOrder::Spog => [1, 2, 3, 0],
+            IndexCursorOrder::Posg => [2, 3, 1, 0],
+            IndexCursorOrder::Ospg => [3, 1, 2, 0],
+            IndexCursorOrder::Gosp => [0, 3, 1, 2],
         };
         for column in columns.into_iter().take(prefix_terms) {
             match column {
@@ -131,7 +226,7 @@ impl RawQueryIndexPattern {
     }
 }
 
-impl RawQueryIndexKey {
+impl RawIndexKey {
     fn term_at(self, index: usize) -> QueryTermId {
         QueryTermId(u64::from_be_bytes(
             self.bytes[index * 8..(index + 1) * 8]
@@ -142,102 +237,92 @@ impl RawQueryIndexKey {
 
     pub(crate) fn graph(self) -> QueryTermId {
         self.term_at(match self.order {
-            QueryIndexCursorOrder::Gspo
-            | QueryIndexCursorOrder::Gpos
-            | QueryIndexCursorOrder::Gosp => 0,
-            QueryIndexCursorOrder::Spog
-            | QueryIndexCursorOrder::Posg
-            | QueryIndexCursorOrder::Ospg => 3,
+            IndexCursorOrder::Gspo | IndexCursorOrder::Gpos | IndexCursorOrder::Gosp => 0,
+            IndexCursorOrder::Spog | IndexCursorOrder::Posg | IndexCursorOrder::Ospg => 3,
         })
     }
 
     pub(crate) fn subject(self) -> QueryTermId {
         self.term_at(match self.order {
-            QueryIndexCursorOrder::Gspo | QueryIndexCursorOrder::Ospg => 1,
-            QueryIndexCursorOrder::Gpos => 3,
-            QueryIndexCursorOrder::Spog => 0,
-            QueryIndexCursorOrder::Posg | QueryIndexCursorOrder::Gosp => 2,
+            IndexCursorOrder::Gspo | IndexCursorOrder::Ospg => 1,
+            IndexCursorOrder::Gpos => 3,
+            IndexCursorOrder::Spog => 0,
+            IndexCursorOrder::Posg | IndexCursorOrder::Gosp => 2,
         })
     }
 
     pub(crate) fn predicate(self) -> QueryTermId {
         self.term_at(match self.order {
-            QueryIndexCursorOrder::Gspo | QueryIndexCursorOrder::Ospg => 2,
-            QueryIndexCursorOrder::Gpos | QueryIndexCursorOrder::Spog => 1,
-            QueryIndexCursorOrder::Posg => 0,
-            QueryIndexCursorOrder::Gosp => 3,
+            IndexCursorOrder::Gspo | IndexCursorOrder::Ospg => 2,
+            IndexCursorOrder::Gpos | IndexCursorOrder::Spog => 1,
+            IndexCursorOrder::Posg => 0,
+            IndexCursorOrder::Gosp => 3,
         })
     }
 
     pub(crate) fn object(self) -> QueryTermId {
         self.term_at(match self.order {
-            QueryIndexCursorOrder::Gspo => 3,
-            QueryIndexCursorOrder::Gpos | QueryIndexCursorOrder::Spog => 2,
-            QueryIndexCursorOrder::Posg | QueryIndexCursorOrder::Gosp => 1,
-            QueryIndexCursorOrder::Ospg => 0,
+            IndexCursorOrder::Gspo => 3,
+            IndexCursorOrder::Gpos | IndexCursorOrder::Spog => 2,
+            IndexCursorOrder::Posg | IndexCursorOrder::Gosp => 1,
+            IndexCursorOrder::Ospg => 0,
         })
     }
 }
 
-pub(crate) struct RawQueryIndexKeyCursor {
+pub(crate) struct RawIndexCursor {
     snapshot: Snapshot,
     keyspace: Keyspace,
     query_to_term: Keyspace,
     iterator: fjall::Iter,
-    order: QueryIndexCursorOrder,
+    order: IndexCursorOrder,
     prefix: Vec<u8>,
-    pattern: RawQueryIndexPattern,
-    query_id_upper_bound: u64,
+    pattern: RawIndexPattern,
+    query_id_limit: u64,
     count_grouping: CountGrouping,
+    costs: QueryCost,
 }
 
-impl RawQueryIndexKeyCursor {
-    pub(crate) fn new(
-        snapshot: Snapshot,
-        keyspace: &Keyspace,
-        query_to_term: &Keyspace,
-        order: QueryIndexCursorOrder,
-        prefix: Vec<u8>,
-        pattern: RawQueryIndexPattern,
-        query_id_upper_bound: u64,
-    ) -> Self {
-        let iterator = if prefix.is_empty() {
-            snapshot.iter(keyspace)
+impl RawIndexCursor {
+    pub(crate) fn new(snapshot: Snapshot, scan: RawIndexScan<'_>) -> Self {
+        let iterator = if scan.prefix.is_empty() {
+            snapshot.iter(scan.keyspace)
         } else {
-            snapshot.prefix(keyspace, &prefix)
+            snapshot.prefix(scan.keyspace, &scan.prefix)
         };
-        let prefix_terms = prefix.len() / 8;
-        let count_grouping = count_grouping_for_order(order, |column| {
-            let column_position = match order {
-                QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
-                QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
-                QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
-                QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
-                QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
-                QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+        let prefix_terms = scan.prefix.len() / 8;
+        let count_grouping = grouping_for_order(scan.order, |column| {
+            let column_position = match scan.order {
+                IndexCursorOrder::Gspo => [0, 1, 2, 3],
+                IndexCursorOrder::Gpos => [0, 2, 3, 1],
+                IndexCursorOrder::Spog => [1, 2, 3, 0],
+                IndexCursorOrder::Posg => [2, 3, 1, 0],
+                IndexCursorOrder::Ospg => [3, 1, 2, 0],
+                IndexCursorOrder::Gosp => [0, 3, 1, 2],
             }
             .iter()
             .position(|candidate| *candidate == column)
             .expect("query-index columns contain every term");
             column_position < prefix_terms
                 || match column {
-                    0 => pattern.graph.is_some(),
-                    1 => pattern.subject.is_some(),
-                    2 => pattern.predicate.is_some(),
-                    3 => pattern.object.is_some(),
+                    0 => scan.pattern.graph.is_some(),
+                    1 => scan.pattern.subject.is_some(),
+                    2 => scan.pattern.predicate.is_some(),
+                    3 => scan.pattern.object.is_some(),
                     _ => unreachable!("query-index columns are four terms"),
                 }
         });
         Self {
             snapshot,
-            keyspace: keyspace.clone(),
-            query_to_term: query_to_term.clone(),
+            keyspace: scan.keyspace.clone(),
+            query_to_term: scan.query_to_term.clone(),
             iterator,
-            order,
-            prefix,
-            pattern,
-            query_id_upper_bound,
+            order: scan.order,
+            prefix: scan.prefix,
+            pattern: scan.pattern,
+            query_id_limit: scan.query_id_limit,
             count_grouping,
+            costs: QueryCost::default(),
         }
     }
 
@@ -251,17 +336,17 @@ impl RawQueryIndexKeyCursor {
     ) -> std::result::Result<Vec<Self>, Box<Self>> {
         let prefix_terms = self.prefix.len() / 8;
         let columns = match self.order {
-            QueryIndexCursorOrder::Gspo => [0, 1, 2, 3],
-            QueryIndexCursorOrder::Gpos => [0, 2, 3, 1],
-            QueryIndexCursorOrder::Spog => [1, 2, 3, 0],
-            QueryIndexCursorOrder::Posg => [2, 3, 1, 0],
-            QueryIndexCursorOrder::Ospg => [3, 1, 2, 0],
-            QueryIndexCursorOrder::Gosp => [0, 3, 1, 2],
+            IndexCursorOrder::Gspo => [0, 1, 2, 3],
+            IndexCursorOrder::Gpos => [0, 2, 3, 1],
+            IndexCursorOrder::Spog => [1, 2, 3, 0],
+            IndexCursorOrder::Posg => [2, 3, 1, 0],
+            IndexCursorOrder::Ospg => [3, 1, 2, 0],
+            IndexCursorOrder::Gosp => [0, 3, 1, 2],
         };
         if count < 2
             || prefix_terms >= columns.len()
             || columns[prefix_terms] == 0
-            || self.query_id_upper_bound < 2
+            || self.query_id_limit < 2
         {
             return Err(Box::new(self));
         }
@@ -274,20 +359,21 @@ impl RawQueryIndexKeyCursor {
             order,
             prefix,
             pattern,
-            query_id_upper_bound,
+            query_id_limit,
             count_grouping,
+            costs,
         } = self;
-        let count = count.min(usize::try_from(query_id_upper_bound).unwrap_or(count));
-        let width = query_id_upper_bound.div_ceil(count as u64);
+        let count = count.min(usize::try_from(query_id_limit).unwrap_or(count));
+        let width = query_id_limit.div_ceil(count as u64);
         Ok((0..count)
             .filter_map(|partition| {
                 let start = (partition as u64).saturating_mul(width);
-                if start >= query_id_upper_bound {
+                if start >= query_id_limit {
                     return None;
                 }
                 let end = ((partition + 1) as u64)
                     .saturating_mul(width)
-                    .min(query_id_upper_bound);
+                    .min(query_id_limit);
                 let mut lower = prefix.clone();
                 lower.extend_from_slice(&start.to_be_bytes());
                 let mut upper = prefix.clone();
@@ -301,21 +387,22 @@ impl RawQueryIndexKeyCursor {
                     order,
                     prefix: prefix.clone(),
                     pattern,
-                    query_id_upper_bound,
+                    query_id_limit,
                     count_grouping,
+                    costs: costs.clone(),
                 })
             })
             .collect())
     }
 
-    pub(crate) fn next_key(&mut self) -> Option<Result<RawQueryIndexKey>> {
+    pub(crate) fn next_key(&mut self) -> Option<Result<RawIndexKey>> {
         let guard = self.iterator.next()?;
         let (key, value) = match guard.into_inner() {
             Ok(entry) => entry,
             Err(error) => return Some(Err(error.into())),
         };
         if !value.as_ref().is_empty() {
-            return Some(Err(crate::store::StoreError::InvalidQueryIndexEncoding {
+            return Some(Err(crate::store::StoreError::InvalidIndexEncoding {
                 context: "qv2 query index value",
                 message: format!("expected empty value, found {} bytes", value.len()),
             }));
@@ -323,33 +410,113 @@ impl RawQueryIndexKeyCursor {
         let bytes = match <[u8; 32]>::try_from(key.as_ref()) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Some(Err(crate::store::StoreError::InvalidQueryIndexEncoding {
+                return Some(Err(crate::store::StoreError::InvalidIndexEncoding {
                     context: "qv2 query index key",
                     message: format!("expected 32 bytes, found {}", key.len()),
                 }));
             }
         };
-        Some(Ok(RawQueryIndexKey {
+        Some(Ok(RawIndexKey {
             bytes,
             order: self.order,
             bytes_read: (key.len() + value.len()) as u64,
         }))
     }
 
-    pub(crate) fn source_term(&self, term: QueryTermId) -> Result<TermId> {
-        GraphStore::decode_query_source_term(&self.snapshot, &self.query_to_term, term)
+    pub(crate) fn track_costs(mut self, costs: QueryCost) -> Self {
+        self.costs = costs;
+        self
     }
 
-    pub(crate) fn matches(&self, key: RawQueryIndexKey) -> (bool, u64) {
+    pub(crate) fn narrow(mut self, pattern: RawIndexPattern) -> Self {
+        let terms = match self.order {
+            IndexCursorOrder::Gspo => [
+                pattern.graph,
+                pattern.subject,
+                pattern.predicate,
+                pattern.object,
+            ],
+            IndexCursorOrder::Gpos => [
+                pattern.graph,
+                pattern.predicate,
+                pattern.object,
+                pattern.subject,
+            ],
+            IndexCursorOrder::Spog => [
+                pattern.subject,
+                pattern.predicate,
+                pattern.object,
+                pattern.graph,
+            ],
+            IndexCursorOrder::Posg => [
+                pattern.predicate,
+                pattern.object,
+                pattern.subject,
+                pattern.graph,
+            ],
+            IndexCursorOrder::Ospg => [
+                pattern.object,
+                pattern.subject,
+                pattern.predicate,
+                pattern.graph,
+            ],
+            IndexCursorOrder::Gosp => [
+                pattern.graph,
+                pattern.object,
+                pattern.subject,
+                pattern.predicate,
+            ],
+        };
+        let mut prefix = Vec::new();
+        for term in terms.into_iter().map_while(|term| term) {
+            prefix.extend_from_slice(&term.0.to_be_bytes());
+        }
+        self.iterator = if prefix.is_empty() {
+            self.snapshot.iter(&self.keyspace)
+        } else {
+            self.snapshot.prefix(&self.keyspace, &prefix)
+        };
+        self.prefix = prefix;
+        self.pattern = pattern.without_prefix(self.order, self.prefix.len() / 8);
+        self
+    }
+
+    pub(crate) fn resolver(&self, generation: u64, request: DenseRequest) -> DenseResolver {
+        DenseResolver {
+            inner: Rc::new(DenseResolverInner {
+                snapshot: self.snapshot.clone(),
+                query_to_term: self.query_to_term.clone(),
+                costs: self.costs.clone(),
+                space: DenseSpace {
+                    generation,
+                    snapshot: self.snapshot.seqno(),
+                    scope: request.scope,
+                },
+                sources: RefCell::new(crate::cache::BoundedCache::new(
+                    request.cache_entries,
+                    request.cache_bytes,
+                )),
+            }),
+        }
+    }
+
+    pub(crate) fn source_term(&self, term: QueryTermId) -> Result<TermId> {
+        let (term, bytes) =
+            GraphStore::decode_query_term(&self.snapshot, &self.query_to_term, term)?;
+        self.costs.reverse_mapping(bytes);
+        Ok(term)
+    }
+
+    pub(crate) fn matches(&self, key: RawIndexKey) -> (bool, u64) {
         let mut extracted = 0_u64;
         for (expected, actual) in [
             (
                 self.pattern.graph,
-                RawQueryIndexKey::graph as fn(RawQueryIndexKey) -> QueryTermId,
+                RawIndexKey::graph as fn(RawIndexKey) -> QueryTermId,
             ),
-            (self.pattern.subject, RawQueryIndexKey::subject),
-            (self.pattern.predicate, RawQueryIndexKey::predicate),
-            (self.pattern.object, RawQueryIndexKey::object),
+            (self.pattern.subject, RawIndexKey::subject),
+            (self.pattern.predicate, RawIndexKey::predicate),
+            (self.pattern.object, RawIndexKey::object),
         ] {
             if let Some(expected) = expected {
                 extracted += 1;
