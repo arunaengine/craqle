@@ -682,10 +682,9 @@ enum GraphScope<'a> {
     Predicate(&'a VisibleFn<'a>),
 }
 
-/// Visible-graph counts up to this limit populate spareval's available named
-/// graph list. Larger sets avoid O(graphs) metadata reads and use the same
-/// union view filtered by graph term id.
-const EXPLICIT_DATASET_GRAPH_LIMIT: usize = 32;
+/// Small graph sets populate spareval's named graph list. Larger sets use the
+/// union view filtered by graph term ID.
+const EXPLICIT_GRAPH_LIMIT: usize = 32;
 
 const COMMON_PREFIXES: &str = "\
 PREFIX schema: <http://schema.org/>\n\
@@ -709,14 +708,6 @@ const FTS_LIMIT_IRI: &str = "urn:craqle:fts:limit";
 const FTS_SCORE_IRI: &str = "urn:craqle:fts:score";
 const FTS_GRAPH_IRI: &str = "urn:craqle:fts:graph";
 
-/// Over-fetch factor for the FTS SERVICE. Graph visibility is decided per hit
-/// *after* tantivy has ranked them, so asking the index for exactly `fts:limit`
-/// hits silently returns fewer authorized rows than the caller requested.
-const FTS_OVERFETCH_FACTOR: usize = 4;
-/// Floor for the first over-fetch, so a small `fts:limit` still survives a run
-/// of unreadable top-ranked hits without another index round trip.
-const FTS_MIN_FETCH: usize = 64;
-
 impl SparqlEngine {
     pub(crate) fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
         Self { store, search }
@@ -728,10 +719,18 @@ impl SparqlEngine {
     }
 
     pub(crate) fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
-        Ok(parse_prepared_query(sparql, &QueryLimits::production())?.0)
+        self.prepare_with_limits(sparql, &QueryLimits::production())
     }
 
-    pub(crate) fn explain_prepared_in_graphs(
+    pub(crate) fn prepare_with_limits(
+        &self,
+        sparql: &str,
+        limits: &QueryLimits,
+    ) -> Result<PreparedQuery> {
+        Ok(parse_prepared_query(sparql, limits)?.0)
+    }
+
+    pub(crate) fn explain_prepared_graphs(
         &self,
         auth: &dyn crate::Authorizer,
         prepared: &PreparedQuery,
@@ -747,7 +746,7 @@ impl SparqlEngine {
         )
     }
 
-    pub(crate) fn explain_prepared_with_snapshot_visibility(
+    pub(crate) fn explain_prepared_snapshot(
         &self,
         prepared: &PreparedQuery,
         policy_visible: &SnapshotVisibleFn<'_>,
@@ -775,7 +774,7 @@ impl SparqlEngine {
         enforce_query_bytes(prepared.query_bytes, &options.limits)?;
         let clock = request_clock(options, Duration::ZERO);
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
-        authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
+        authorize_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
         rewrite_fts_query(
             &mut query,
@@ -784,20 +783,26 @@ impl SparqlEngine {
                 scope,
                 post_raw_visibility,
                 clock: &clock,
+                limits: &options.limits,
             },
         )?;
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
+        let features = query_features(&query);
+        QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
         clock.check_stage()?;
-        QueryBudget::new(query_features(&query), options.limits, clock)?;
-        Ok(explain_query_plan(
+        let features = query_features(&query);
+        QueryBudget::new(features.budget, options.limits, clock.clone())?;
+        let plan = explain_query_plan(
             &query,
             query_fingerprint(&query),
             &planner_trace,
             fast_path.as_ref(),
-        ))
+        );
+        clock.check_stage()?;
+        Ok(plan)
     }
 
     #[cfg(test)]
@@ -810,7 +815,7 @@ impl SparqlEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn query_with_graphs_read_mode(
+    pub(crate) fn query_graph_mode(
         &self,
         sparql: &str,
         graphs: &[GraphId],
@@ -824,7 +829,7 @@ impl SparqlEngine {
         )
     }
 
-    pub(crate) fn execute_prepared_in_graphs(
+    pub(crate) fn execute_prepared_graphs(
         &self,
         auth: &dyn crate::Authorizer,
         prepared: &PreparedQuery,
@@ -851,40 +856,50 @@ impl SparqlEngine {
         self.run_query(sparql, GraphScope::Predicate(visible), planner_enabled())
     }
 
-    pub(crate) fn query_with_snapshot_visibility(
+    pub(crate) fn query_snapshot(
         &self,
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryResults> {
         let options = QueryOptions::default();
         let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
-        self.execute_prepared_with_snapshot_visibility(
-            &prepared,
-            policy_visible,
-            &options,
-            parse_time,
-            false,
-        )
-        .map(|execution| execution.results)
+        self.execute_prepared_snapshot(&prepared, policy_visible, &options, parse_time, false)
+            .map(|execution| execution.results)
     }
 
-    pub(crate) fn query_with_snapshot_visibility_statistics(
+    pub(crate) fn query_with_options(
+        &self,
+        request: QueryRun<'_>,
+        policy_visible: &SnapshotVisibleFn<'_>,
+    ) -> Result<QueryExecution> {
+        let (prepared, parse_time) = parse_prepared_query(request.sparql, &request.options.limits)?;
+        self.execute_prepared_snapshot(&prepared, policy_visible, request.options, parse_time, true)
+    }
+
+    pub(crate) fn query_graphs_options(&self, request: GraphQuery<'_>) -> Result<QueryExecution> {
+        let (prepared, parse_time) = parse_prepared_query(request.sparql, &request.options.limits)?;
+        self.execute_prepared_scope(
+            &prepared,
+            GraphScope::List(request.graphs),
+            request.options,
+            parse_time,
+            true,
+            Some(request.auth),
+        )
+        .map(|(execution, _)| execution)
+    }
+
+    pub(crate) fn query_snapshot_stats(
         &self,
         sparql: &str,
         policy_visible: &SnapshotVisibleFn<'_>,
     ) -> Result<QueryExecution> {
         let options = QueryOptions::default();
         let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
-        self.execute_prepared_with_snapshot_visibility(
-            &prepared,
-            policy_visible,
-            &options,
-            parse_time,
-            true,
-        )
+        self.execute_prepared_snapshot(&prepared, policy_visible, &options, parse_time, true)
     }
 
-    pub(crate) fn execute_prepared_with_snapshot_visibility(
+    pub(crate) fn execute_prepared_snapshot(
         &self,
         prepared: &PreparedQuery,
         policy_visible: &SnapshotVisibleFn<'_>,
@@ -907,11 +922,14 @@ impl SparqlEngine {
                 scope,
                 post_raw_visibility: Some((self.store.as_ref(), policy_visible)),
                 clock: &clock,
+                limits: &options.limits,
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
+        let features = query_features(&query);
+        QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planning_started = Instant::now();
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
@@ -967,7 +985,9 @@ impl SparqlEngine {
             read_mode,
             optimize,
             join_mode: JoinMode::Auto,
-            fast_paths: QueryFastPathMode::Auto,
+            fast_paths: FastPathMode::Auto,
+            collect_costs: false,
+            collect_plan_statistics: true,
             limits: QueryLimits::default(),
         };
         let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
@@ -988,7 +1008,7 @@ impl SparqlEngine {
         enforce_query_bytes(prepared.query_bytes, &options.limits)?;
         let clock = request_clock(options, parse_time);
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
-        authorize_explicit_graph_scope(&view, scope, explicit_auth)?;
+        authorize_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
         let rewrite_started = Instant::now();
         rewrite_fts_query(
@@ -998,11 +1018,14 @@ impl SparqlEngine {
                 scope,
                 post_raw_visibility: None,
                 clock: &clock,
+                limits: &options.limits,
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
+        let features = query_features(&query);
+        QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planning_started = Instant::now();
         let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
@@ -1041,11 +1064,17 @@ impl SparqlEngine {
         mut stages: QueryStageStatistics,
         collect_plan_statistics: bool,
     ) -> Result<(QueryExecution, ReadStatistics)> {
-        let (context, named_graphs) =
+        let collect_plan_statistics =
+            collect_plan_statistics && options.collect_plan_statistics;
+        let (mut context, named_graphs) =
             scope_read_context(scope, view, options.cancellation.clone())?;
+        if options.collect_costs {
+            context.enable_costs();
+        }
         context.check_cancelled()?;
+        let features = query_features(&query);
         let budget = Arc::new(QueryBudget::new(
-            query_features(&query),
+            features.budget,
             options.limits,
             stages.clock.clone(),
         )?);
@@ -1058,13 +1087,14 @@ impl SparqlEngine {
                 outcome.execution_time,
                 CollectionMetrics {
                     collection_time: outcome.collection_time,
-                    time_to_first_internal_result: outcome.time_to_first_result,
+                    first_result_time: outcome.first_result_time,
                     result_rows: outcome.result_rows,
                     result_cells: outcome.result_cells,
                     ..CollectionMetrics::default()
                 },
                 ExplanationMetrics {
                     intermediate_rows: outcome.intermediate_rows,
+                    rows_available: true,
                     ..ExplanationMetrics::default()
                 },
             );
@@ -1079,8 +1109,7 @@ impl SparqlEngine {
             ));
         }
 
-        let mut evaluator =
-            QueryEvaluator::new().with_cancellation_token(options.cancellation.evaluator_token());
+        let mut evaluator = QueryEvaluator::new().with_cancellation_token(stages.clock.evaluator());
         if collect_plan_statistics {
             evaluator = evaluator.compute_statistics();
         }
@@ -1128,7 +1157,7 @@ impl SparqlEngine {
             Arc::clone(&budget),
         ));
         let initial_execution_time = execution_started.elapsed();
-        let results = results.map_err(map_eval_error)?;
+        let results = results.map_err(|error| map_eval_error(error, &stages.clock))?;
         let (results, collection) =
             collect_query_results(results, execution_started, &context, &budget)?;
         let read_statistics = context.snapshot();
@@ -1167,17 +1196,20 @@ impl SparqlEngine {
         }
         check_query_shape(sparql)?;
         let started = Instant::now();
+        let cancellation = QueryCancellation::new();
+        let clock = RequestClock::start(options.limits.deadline, cancellation.clone(), started);
         let full = format!("{COMMON_PREFIXES}{sparql}");
         let update = SparqlParser::new()
             .parse_update(&full)
             .map_err(|e| SparqlError::Parse(e.to_string()))?;
+        clock.check_stage()?;
 
         let view = StoreReadView::new(&self.store);
         let readable_graphs = readable_update_graphs(&view, auth)?;
         let mut changes = Vec::new();
         let mut changed_graphs = HashSet::new();
         for operation in &update.operations {
-            check_update_deadline(started, &options.limits)?;
+            clock.check_stage()?;
             match operation {
                 GraphUpdateOperation::InsertData { data } => {
                     for quad in data {
@@ -1194,7 +1226,7 @@ impl SparqlEngine {
                 }
                 GraphUpdateOperation::DeleteData { data } => {
                     for quad in data {
-                        let change = ground_quad_to_delete(quad)?;
+                        let change = ground_quad_delete(quad)?;
                         authorize_materialized_change(&view, auth, &change)?;
                         push_update_change(
                             &mut changes,
@@ -1214,14 +1246,11 @@ impl SparqlEngine {
                     authorize_update_dataset(&view, auth, using.as_ref())?;
                     authorize_update_pattern(&view, auth, pattern)?;
                     for quad in delete {
-                        authorize_update_template_graph(&view, auth, &quad.graph_name)?;
+                        authorize_template_graph(&view, auth, &quad.graph_name)?;
                     }
                     for quad in insert {
-                        authorize_update_template_graph(&view, auth, &quad.graph_name)?;
+                        authorize_template_graph(&view, auth, &quad.graph_name)?;
                     }
-                    let cancellation = QueryCancellation::new();
-                    let clock =
-                        RequestClock::start(options.limits.deadline, cancellation.clone(), started);
                     let template_width = delete.len().saturating_add(insert.len()).max(1);
                     let max_materialized_quads = options
                         .limits
@@ -1237,12 +1266,12 @@ impl SparqlEngine {
                         });
                     }
                     let budget = Arc::new(QueryBudget::new(
-                        features,
+                        features.budget,
                         update_read_limits(&options.limits),
-                        clock,
+                        clock.clone(),
                     )?);
-                    let evaluator = QueryEvaluator::new()
-                        .with_cancellation_token(cancellation.evaluator_token());
+                    let evaluator =
+                        QueryEvaluator::new().with_cancellation_token(clock.evaluator());
                     let mut prepared = evaluator.prepare_delete_insert(
                         delete.clone(),
                         insert.clone(),
@@ -1259,7 +1288,7 @@ impl SparqlEngine {
                             )]);
                     }
                     let context = ReadContext::with_visible_graphs(
-                        cancellation,
+                        cancellation.clone(),
                         readable_graphs.iter().cloned(),
                     );
                     let iter = prepared
@@ -1269,7 +1298,7 @@ impl SparqlEngine {
                             default_union_marker,
                             Arc::clone(&budget),
                         ))
-                        .map_err(map_eval_error)?;
+                        .map_err(|error| map_eval_error(error, &clock))?;
 
                     let mut materialized_quads = 0_usize;
                     for quad in iter {
@@ -1281,7 +1310,9 @@ impl SparqlEngine {
                                 limit: options.limits.max_materialized_bindings,
                             });
                         }
-                        let change = delete_insert_quad_to_change(quad.map_err(map_eval_error)?)?;
+                        let change = update_quad_change(
+                            quad.map_err(|error| map_eval_error(error, &clock))?,
+                        )?;
                         authorize_materialized_change(&view, auth, &change)?;
                         push_update_change(
                             &mut changes,
@@ -1295,11 +1326,11 @@ impl SparqlEngine {
                 GraphUpdateOperation::Clear { graph, .. }
                 | GraphUpdateOperation::Drop { graph, .. } => {
                     let target_graphs =
-                        update_graph_target_graphs(&self.store, graph, options.limits.max_graphs)?;
+                        update_target_graphs(&self.store, graph, options.limits.max_graphs)?;
                     for graph in &target_graphs {
                         authorize_update_graph(&view, auth, graph, crate::Action::Write, false)?;
                     }
-                    materialize_graph_target_removals(
+                    materialize_removals(
                         &self.store,
                         target_graphs,
                         &mut changes,
@@ -1332,6 +1363,9 @@ impl SparqlEngine {
 
 /// Query-shaped limits for an update's read side, under the update deadline.
 fn update_read_limits(limits: &UpdateLimits) -> QueryLimits {
+    if limits.is_unbounded() {
+        return QueryLimits::unbounded();
+    }
     QueryLimits {
         deadline: limits.deadline,
         ..QueryLimits::production()
