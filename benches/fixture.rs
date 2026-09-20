@@ -1,10 +1,7 @@
-//! Bounded, deterministic benchmark fixture construction for SPARQL reads.
+//! Builds bounded deterministic fixtures for SPARQL read benchmarks.
+//! Retains only graph metadata and stable query terms after streaming setup.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! The corpus iterator itself stays numeric and streaming. This module owns
-//! the temporary database and retains only graph metadata plus a handful of
-//! stable query terms after setup.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -14,9 +11,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use craqle::{
-    ActorId, AllowAllAuthorizer, CraqleFjallPersistMode, CraqleNode, CraqleOptions, EncodedTerm,
-    GraphId, MaterializedQuadChange, PreparedQuery, QueryExecution, QueryExecutionStatistics,
-    QueryOptions, QueryReadMode, QueryResults,
+    ActorId, AllowAllAuthorizer, CraqleFjallPersistMode as PersistMode, CraqleNode, CraqleOptions,
+    EncodedTerm, GraphId, MaterializedQuadChange, PreparedQuery, QueryExecution,
+    QueryExecutionStatistics, QueryOptions, QueryReadMode, QueryResults,
 };
 use oxrdf::Term;
 
@@ -30,7 +27,7 @@ use super::{
 pub const LOAD_BATCH_SIZE: usize = 16_384;
 
 const SELECT_LIMIT: usize = 10;
-const DIRECTORY_SIZE_ENTRY_LIMIT: usize = 100_000;
+const DIRECTORY_ENTRY_LIMIT: usize = 100_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BenchConfig {
@@ -39,7 +36,7 @@ pub struct BenchConfig {
     pub measurement: Duration,
     pub sample_size: usize,
     pub load_batch: usize,
-    pub persist_mode: CraqleFjallPersistMode,
+    pub persist_mode: PersistMode,
 }
 
 impl BenchConfig {
@@ -76,7 +73,7 @@ impl BenchConfig {
             measurement: env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 5),
             sample_size,
             load_batch,
-            persist_mode: CraqleFjallPersistMode::Buffer,
+            persist_mode: PersistMode::Buffer,
         }
     }
 }
@@ -153,7 +150,7 @@ struct Probe {
 struct FixtureMetrics {
     inserted_data_quads: usize,
     encoded_terms_constructed: usize,
-    encoded_term_payload_bytes: usize,
+    encoded_payload_bytes: usize,
     fixture_digest: String,
     database: DirectoryBytes,
 }
@@ -171,8 +168,8 @@ pub struct SemanticReport {
     pub select_rows: usize,
     pub count: usize,
     pub property_star_rows: usize,
-    pub rare_to_common_rows: usize,
-    pub common_to_rare_rows: usize,
+    pub rare_common_rows: usize,
+    pub common_rare_rows: usize,
     pub named_duplicate_rows: Option<usize>,
     pub union_duplicate_rows: Option<usize>,
     pub hidden_all_rows: Option<usize>,
@@ -211,7 +208,7 @@ impl Fixture {
         let mut visible_common_records = 0usize;
         let mut inserted_data_quads = 0usize;
         let mut encoded_terms_constructed = 0usize;
-        let mut encoded_term_payload_bytes = 0usize;
+        let mut encoded_payload_bytes = 0usize;
         let mut fixture_hasher = blake3::Hasher::new();
         hash_frame(&mut fixture_hasher, b"domain", b"craqle-fixture/v1");
         hash_frame(&mut fixture_hasher, b"version", CORPUS_VERSION.as_bytes());
@@ -239,7 +236,7 @@ impl Fixture {
         let mut late_rare_probe: Option<(u128, Probe)> = None;
         let mut duplicate_probe = None;
         let mut hidden_probe = None;
-        let mut visible_hot_pair_records = 0usize;
+        let mut visible_pair_records = 0usize;
 
         for record in DeterministicCorpus::new(config.corpus)
             .expect("validated benchmark corpus")
@@ -268,7 +265,7 @@ impl Fixture {
             hash_frame(&mut fixture_hasher, b"predicate", predicate.0.as_bytes());
             hash_frame(&mut fixture_hasher, b"object", object.0.as_bytes());
             encoded_terms_constructed += 3;
-            encoded_term_payload_bytes += subject.0.len() + predicate.0.len() + object.0.len();
+            encoded_payload_bytes += subject.0.len() + predicate.0.len() + object.0.len();
 
             graph_records[graph_index] += 1;
             inserted_data_quads += 1;
@@ -279,19 +276,19 @@ impl Fixture {
                 && matches!(record.predicate, PredicateKind::Common(0))
                 && matches!(record.object, ObjectSpec::Literal(0))
             {
-                visible_hot_pair_records += 1;
+                visible_pair_records += 1;
             }
 
             // A star selected after the duplicate prefix is wholly canonical:
             // its seven sibling records share the canonical graph locality.
             let star_start = record.ordinal - record.ordinal % 8;
-            let is_visible_canonical_star = !record.duplicate
+            let visible_canonical_star = !record.duplicate
                 && star_start >= config.corpus.duplicate_quads()
                 && visibility == GraphVisibility::Visible
                 && record.shape == CorpusShape::SameSubjectStar
                 && star_has_common(star_start, config.corpus.seed)
                 && record.predicate.is_rare();
-            if is_visible_canonical_star {
+            if visible_canonical_star {
                 if star_probe.is_none() {
                     star_probe = Some(Probe {
                         graph: all_graphs[graph_index].clone(),
@@ -358,7 +355,7 @@ impl Fixture {
             "the selected corpus configuration must cover every graph"
         );
         assert!(
-            visible_hot_pair_records >= SELECT_LIMIT,
+            visible_pair_records >= SELECT_LIMIT,
             "the fixed predicate-object SELECT needs at least ten visible matches"
         );
         assert_eq!(
@@ -448,7 +445,7 @@ impl Fixture {
             metrics: FixtureMetrics {
                 inserted_data_quads,
                 encoded_terms_constructed,
-                encoded_term_payload_bytes,
+                encoded_payload_bytes,
                 fixture_digest,
                 database: database_bytes,
             },
@@ -531,7 +528,7 @@ impl Fixture {
             .sparql
     }
 
-    pub fn hot_path_is_unordered_limit(&self, index: usize) -> bool {
+    pub fn hot_path_unordered(&self, index: usize) -> bool {
         matches!(
             self.cases
                 .get(index)
@@ -667,7 +664,7 @@ impl Fixture {
 
     /// Runs a full public query call over every generated graph, including the
     /// corpus's deliberately hidden graphs for duplicate-baseline inspection.
-    pub fn run_all_graph_query(&self, sparql: &str, label: &str) -> QueryResults {
+    pub fn run_global_query(&self, sparql: &str, label: &str) -> QueryResults {
         self.node
             .query_in_graphs(&AllowAllAuthorizer, &self.all_graphs, sparql)
             .unwrap_or_else(|_| panic!("{label} query failed"))
@@ -687,10 +684,10 @@ impl Fixture {
                     report.property_star_rows = value
                 }
                 (QueryKind::RareToCommon, CheckValue::Rows(value)) => {
-                    report.rare_to_common_rows = value
+                    report.rare_common_rows = value
                 }
                 (QueryKind::CommonToRare, CheckValue::Rows(value)) => {
-                    report.common_to_rare_rows = value
+                    report.common_rare_rows = value
                 }
                 _ => panic!("hot-path case result form did not match its assertion"),
             }
@@ -763,15 +760,13 @@ impl Fixture {
             println!(
                 "sparql_hot_path fixture: database_directory_partial_bytes={} entries_scanned={} \
                  walk_entry_cap={} walk_complete=false",
-                self.metrics.database.bytes,
-                self.metrics.database.entries,
-                DIRECTORY_SIZE_ENTRY_LIMIT,
+                self.metrics.database.bytes, self.metrics.database.entries, DIRECTORY_ENTRY_LIMIT,
             );
         }
         println!(
             "sparql_hot_path fixture: encoded_terms_constructed={} encoded_term_payload_bytes={} \
              (payload bytes are not allocator measurements)",
-            self.metrics.encoded_terms_constructed, self.metrics.encoded_term_payload_bytes
+            self.metrics.encoded_terms_constructed, self.metrics.encoded_payload_bytes
         );
         println!(
             "sparql_hot_path semantic rows: ask_hit={} ask_miss={} select_limit={} count={} \
@@ -781,8 +776,8 @@ impl Fixture {
             report.select_rows,
             report.count,
             report.property_star_rows,
-            report.rare_to_common_rows,
-            report.common_to_rare_rows,
+            report.rare_common_rows,
+            report.common_rare_rows,
         );
         match (report.named_duplicate_rows, report.union_duplicate_rows) {
             (Some(named), Some(union)) => println!(
@@ -929,7 +924,7 @@ impl<'a> GraphPartitionedLoader<'a> {
         }
         self.pending_changes -= changes.len();
         self.node
-            .apply_changes_bulk_unchecked(&self.graphs[graph_index], changes)
+            .apply_bulk_unchecked(&self.graphs[graph_index], changes)
             .expect("apply graph-scoped bounded benchmark batch");
     }
 }
@@ -1113,7 +1108,7 @@ fn directory_bytes_bounded(root: &Path) -> std::io::Result<DirectoryBytes> {
             continue;
         };
         for entry in read_dir {
-            if entries == DIRECTORY_SIZE_ENTRY_LIMIT {
+            if entries == DIRECTORY_ENTRY_LIMIT {
                 return Ok(DirectoryBytes {
                     bytes,
                     entries,

@@ -1,14 +1,11 @@
-//! Deterministic, bounded RDF-like corpus specifications for performance work.
+//! Defines deterministic bounded corpus specifications for performance work.
+//! Streams numeric records while consumers apply each record's metadata.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! The iterator yields compact numeric specifications rather than RDF strings
-//! and never retains the generated corpus. A benchmark can map the numeric
-//! identifiers to its own graph IDs and encoded RDF terms while applying graph
-//! visibility and orphan rules from the metadata on each [`QuadSpec`].
 
 #![allow(dead_code)]
 
+#[path = "fixture.rs"]
 pub mod fixture;
 
 use std::fmt;
@@ -23,7 +20,7 @@ pub trait BenchWriteExt {
         changes: Vec<MaterializedQuadChange>,
     ) -> craqle::Result<Batch>;
 
-    fn apply_changes_bulk_unchecked(
+    fn apply_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -43,7 +40,7 @@ impl BenchWriteExt for CraqleNode {
         self.apply_changes(&AllowAllAuthorizer, graph, changes)
     }
 
-    fn apply_changes_bulk_unchecked(
+    fn apply_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -91,19 +88,15 @@ pub const GRAPHS_1K: usize = 1_000;
 pub struct CorpusConfig {
     pub quads: usize,
     pub graphs: usize,
-    /// Percentage of output slots whose triple payload is reused from a
-    /// canonical slot in another graph. The exact number is
-    /// `floor(quads * duplicate_percent / 100)`.
+    /// Percentage of slots reusing a triple payload from another graph.
+    /// The count is `floor(quads * duplicate_percent / 100)`.
     pub duplicate_percent: u8,
     pub seed: u64,
 }
 
 impl CorpusConfig {
-    /// Validate and construct one of the supported performance dimensions.
-    ///
-    /// A one-graph corpus cannot contain an across-graph duplicate. Therefore
-    /// every non-zero duplicate rate is rejected for `graphs == 1` rather than
-    /// silently becoming an in-graph duplicate.
+    /// Constructs a supported dimension and rejects cross-graph duplication
+    /// for a one-graph corpus rather than changing its meaning.
     pub fn new(
         quads: usize,
         graphs: usize,
@@ -122,7 +115,7 @@ impl CorpusConfig {
             ));
         }
         if graphs == 1 && duplicate_percent != 0 {
-            return Err(CorpusConfigError::OneGraphCannotDuplicate {
+            return Err(CorpusConfigError::SingleGraphDuplicate {
                 graphs,
                 duplicate_percent,
             });
@@ -203,7 +196,7 @@ pub enum CorpusConfigError {
     UnsupportedQuadCount(usize),
     UnsupportedGraphCount(usize),
     UnsupportedDuplicatePercent(u8),
-    OneGraphCannotDuplicate {
+    SingleGraphDuplicate {
         graphs: usize,
         duplicate_percent: u8,
     },
@@ -230,7 +223,7 @@ impl fmt::Display for CorpusConfigError {
                     "unsupported duplicate percent {percent}; expected 0, 25, or 90"
                 )
             }
-            Self::OneGraphCannotDuplicate {
+            Self::SingleGraphDuplicate {
                 graphs,
                 duplicate_percent,
             } => write!(
@@ -308,9 +301,8 @@ pub enum ObjectSpec {
     Literal(u64),
 }
 
-/// One compact quad description. No RDF strings are allocated by the
-/// generator, and `source_ordinal` identifies the canonical output slot for
-/// a requested duplicate.
+/// One compact quad description without allocated RDF strings.
+/// `source_ordinal` identifies a duplicate's canonical output slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QuadSpec {
     pub ordinal: usize,
@@ -488,9 +480,8 @@ impl Iterator for CorpusIter {
 impl ExactSizeIterator for CorpusIter {}
 impl std::iter::FusedIterator for CorpusIter {}
 
-/// Return visibility metadata for one graph without constructing a graph ID.
-/// Graphs 3, 7, 11, ... are hidden for multi-graph corpora; one-graph corpora
-/// remain visible.
+/// Returns visibility without constructing a graph ID. Multi-graph corpora
+/// hide graphs 3, 7, 11, and so on; one-graph corpora remain visible.
 pub fn graph_visibility(graphs: usize, graph: u32) -> GraphVisibility {
     if graphs > 1 && graph % 4 == 3 {
         GraphVisibility::Hidden
@@ -519,9 +510,8 @@ fn duplicate_source(ordinal: usize, duplicate_quads: usize, quads: usize) -> Opt
     Some(duplicate_quads + ordinal % canonical_count)
 }
 
-/// Assign a canonical record to a graph while retaining the advertised
-/// locality. Every eight-edge star and every 48-edge chain segment is treated
-/// as one unit; the other workload records are independently distributed.
+/// Assigns canonical records while keeping each eight-edge star and 48-edge
+/// chain segment together; other records are distributed independently.
 fn canonical_graph(ordinal: usize, graphs: usize) -> u32 {
     const BLOCK: usize = 128;
     let local = ordinal % BLOCK;
@@ -536,9 +526,8 @@ fn canonical_graph(ordinal: usize, graphs: usize) -> u32 {
     (group % graphs) as u32
 }
 
-/// Rotate a duplicate into a deterministic destination distinct from its
-/// canonical source graph. The preferred graph cycles over every graph ID;
-/// only a collision with the source is advanced by one, preserving coverage.
+/// Rotates a duplicate through every graph, advancing source collisions once.
+/// This keeps destinations distinct while preserving graph coverage.
 fn duplicate_graph(source_graph: u32, ordinal: usize, graphs: usize) -> u32 {
     let preferred = (ordinal % graphs) as u32;
     if preferred == source_graph {

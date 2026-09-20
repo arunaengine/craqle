@@ -5,14 +5,17 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-#[path = "../tests/support/perf.rs"]
+#[path = "../tests/perf_support.rs"]
 mod perf;
-#[path = "../tests/support/sim.rs"]
+#[path = "../tests/sim_support.rs"]
 mod sim;
 
 use craqle::{CreateCrateRequest, GrantAuthorizer, GraphId};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use perf::{append_benchmark_media_objects, bench_auth, bench_policy, env_usize_list};
+use perf::{
+    AppendBatch, append_benchmark_entities as append_media, bench_auth, bench_policy,
+    env_usize_list,
+};
 use sim::CraqleCluster;
 
 const PAGE_SIZE: usize = 1_000;
@@ -51,13 +54,15 @@ fn build_fixture(entity_count: usize) -> Fixture {
 
     for start in (0..entity_count).step_by(DEFAULT_BATCH_SIZE) {
         let batch_count = usize::min(DEFAULT_BATCH_SIZE, entity_count - start);
-        append_benchmark_media_objects(
+        append_media(
             cluster.peer(0),
             &bench_auth(),
-            &graph,
-            start,
-            batch_count,
-            "proteomics",
+            AppendBatch {
+                graph: &graph,
+                start,
+                count: batch_count,
+                keyword: "proteomics",
+            },
         );
     }
 
