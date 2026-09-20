@@ -1148,9 +1148,9 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
                         index_id: ctx.search.index_id(),
                     });
                     #[cfg(not(feature = "search"))]
-                    let result = completed
-                        .clone()
-                        .and(Err(MaintenanceFailure::search(search::SearchError::Disabled)));
+                    let result = completed.clone().and(Err(MaintenanceFailure::search(
+                        search::SearchError::Disabled,
+                    )));
                     let _ = request.reply.send(result);
                 }
                 pending = kept;

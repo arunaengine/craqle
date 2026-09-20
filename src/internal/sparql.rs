@@ -1064,8 +1064,7 @@ impl SparqlEngine {
         mut stages: QueryStageStatistics,
         collect_plan_statistics: bool,
     ) -> Result<(QueryExecution, ReadStatistics)> {
-        let collect_plan_statistics =
-            collect_plan_statistics && options.collect_plan_statistics;
+        let collect_plan_statistics = collect_plan_statistics && options.collect_plan_statistics;
         let (mut context, named_graphs) =
             scope_read_context(scope, view, options.cancellation.clone())?;
         if options.collect_costs {
