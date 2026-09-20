@@ -205,9 +205,8 @@ fn objects(node: &CraqleNode, graph: &GraphId) -> Vec<String> {
     result
 }
 
-/// Everything an ignored or rejected merge must leave untouched: quad rows
-/// with their dots, the graph clock, and whether the graph exists at all. A
-/// missing graph fingerprints the empty hash, an existing empty one zeroes.
+/// Captures quads, dots, clock, and graph existence so rejected merges preserve
+/// the distinction between a missing graph and an existing empty graph.
 fn durable(node: &CraqleNode, graph: &GraphId) -> (GraphReplicaSnapshot, VectorClock, u64) {
     (
         node.graph_snapshot(graph).unwrap(),
@@ -434,6 +433,36 @@ fn join_matches_query() {
     visible.sort();
     assert_eq!(visible, objects(&node, &graph));
     assert_eq!(visible, vec!["\"y\"".to_owned()]);
+
+    #[cfg(feature = "search")]
+    {
+        node.flush_search_updates().unwrap();
+        let hits = node
+            .search(
+                &AllowAllAuthorizer,
+                SearchRequest {
+                    query: "y",
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].graph_id, graph.as_str());
+        assert_eq!(hits[0].subject_iri, "urn:test:merge:s");
+        let removed = node
+            .search(
+                &AllowAllAuthorizer,
+                SearchRequest {
+                    query: "x",
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert!(
+            removed.is_empty(),
+            "removed value remains absent from search"
+        );
+    }
 }
 
 #[test]

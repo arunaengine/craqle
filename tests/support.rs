@@ -7,7 +7,9 @@
 
 use std::collections::BTreeSet;
 
+#[path = "perf_support.rs"]
 pub mod perf;
+#[path = "sim_support.rs"]
 pub mod sim;
 
 use craqle::*;
@@ -24,7 +26,7 @@ pub trait TestWriteExt {
         changes: Vec<MaterializedQuadChange>,
     ) -> craqle::Result<Batch>;
 
-    fn apply_changes_bulk_unchecked(
+    fn apply_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -44,7 +46,7 @@ impl TestWriteExt for CraqleNode {
         self.apply_changes(&AllowAllAuthorizer, graph, changes)
     }
 
-    fn apply_changes_bulk_unchecked(
+    fn apply_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
@@ -65,7 +67,7 @@ impl TestWriteExt for CraqleNode {
 /// deadlock fails the run instead of hanging it.
 pub const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
-pub fn query_with_test_visibility<F>(
+pub fn query_with_visibility<F>(
     node: &CraqleNode,
     visible: F,
     sparql: &str,
@@ -86,15 +88,15 @@ where
     node.query(&auth, sparql)
 }
 
-pub fn query_with_test_planner<F>(
+pub fn query_with_planner<F>(
     node: &CraqleNode,
     visible: F,
-    sparql: &str,
-    optimize: bool,
+    query: (&str, bool),
 ) -> craqle::Result<QueryResults>
 where
     F: Fn(&GraphId) -> bool + Send + Sync,
 {
+    let (sparql, optimize) = query;
     let auth = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
         if visible(graph) {
             Ok(())
@@ -111,13 +113,8 @@ where
     Ok(node.execute_prepared(&auth, &query, &options)?.results)
 }
 
-/// Run `body` on a detached thread and fail if it does not finish in time.
-///
-/// The branch these tests guard replaces one engine-wide lock with a two-level
-/// hierarchy, and a lock-order regression there presents as a **hang**, not as a
-/// failed assertion. Joining would inherit the hang, so the worker is left
-/// detached: the test fails, the harness keeps going, and CI reports a defect
-/// instead of burning a runner until the job timeout.
+/// Runs `body` with a deadline so lock-order hangs fail the test promptly.
+/// A timed-out worker stays detached to avoid hanging the test harness.
 pub fn with_watchdog(label: &'static str, body: impl FnOnce() + Send + 'static) {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -153,19 +150,19 @@ pub fn create_test_crate(net: &sim::CraqleCluster, peer: usize, graph: &GraphId)
         .unwrap();
 }
 
-pub struct TestRoCrateApi<'a> {
+pub struct TestCrateApi<'a> {
     node: &'a CraqleNode,
     writer: GrantAuthorizer,
 }
 
-pub fn manager(node: &CraqleNode) -> TestRoCrateApi<'_> {
-    TestRoCrateApi {
+pub fn manager(node: &CraqleNode) -> TestCrateApi<'_> {
+    TestCrateApi {
         node,
         writer: writer_auth(),
     }
 }
 
-impl<'a> TestRoCrateApi<'a> {
+impl<'a> TestCrateApi<'a> {
     pub fn create_crate(
         &self,
         graph: GraphId,
@@ -205,26 +202,14 @@ impl<'a> TestRoCrateApi<'a> {
         )
     }
 
-    pub fn add_data_entity_under(
+    pub fn add_entity_under(
         &self,
         graph: &GraphId,
-        parent_id: &str,
-        entity_id: &str,
-        entity_type: &str,
-        name: &str,
-        additional_triples: Vec<(NamedNode, Term)>,
+        parent: (&str, NewDataEntity),
     ) -> craqle::Result<AppendDataEntitiesReport> {
-        self.node.append_new_data_entities_under(
-            &self.writer,
-            graph,
-            parent_id,
-            vec![NewDataEntity {
-                entity_id: entity_id.to_string(),
-                entity_type: entity_type.to_string(),
-                name: name.to_string(),
-                additional_triples,
-            }],
-        )
+        let (parent_id, entity) = parent;
+        self.node
+            .append_new_data_entities_under(&self.writer, graph, parent_id, vec![entity])
     }
 
     pub fn add_contextual_entity(
@@ -282,7 +267,7 @@ impl<'a> TestRoCrateApi<'a> {
             .export_rocrate_page(&GrantAuthorizer::default(), graph, offset, limit)
     }
 
-    pub fn export_jsonld_page_after(
+    pub fn export_page_after(
         &self,
         graph: &GraphId,
         after_entity_id: Option<&str>,

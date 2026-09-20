@@ -4,11 +4,7 @@
 
 mod support;
 
-/// Concurrency guarantees of the write path (finding K1).
-///
-/// Every test here drives *parallel* writers at one graph. Before the store's
-/// per-graph commit guard was adopted by `ReplicationEngine`, each of these
-/// races could mint a duplicate dot, drop an add, or lose a vector-clock entry.
+/// Exercises parallel writers that previously duplicated dots or lost state.
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashSet};
@@ -39,7 +35,7 @@ mod tests {
 
     /// Every writer thread inserts `ROUNDS` distinct keywords into the same
     /// graph in parallel. Returns every replication batch that was committed.
-    fn insert_keywords_in_parallel(node: &CraqleNode, graph: &GraphId, prefix: &str) -> Vec<Batch> {
+    fn insert_parallel_keywords(node: &CraqleNode, graph: &GraphId, prefix: &str) -> Vec<Batch> {
         std::thread::scope(|scope| {
             let writers: Vec<_> = (0..WRITERS)
                 .map(|writer| {
@@ -77,10 +73,7 @@ mod tests {
             .collect()
     }
 
-    /// K1a — two commits on one graph must never mint the same `(actor, counter)`.
-    ///
-    /// Each parallel insert is its own batch and therefore carries exactly one
-    /// dot; a duplicated counter would show up as two quads sharing a dot.
+    /// Each single-change batch must mint a unique `(actor, counter)` dot.
     #[test]
     fn dots_stay_unique() {
         with_watchdog("dots_stay_unique", || {
@@ -88,7 +81,7 @@ mod tests {
             let graph = GraphId::new("urn:test:crdt-dots");
             create_test_crate(&net, 0, &graph);
 
-            insert_keywords_in_parallel(net.peer(0), &graph, "dot");
+            insert_parallel_keywords(net.peer(0), &graph, "dot");
 
             let quads = keyword_quads(net.peer(0), &graph);
             assert_eq!(quads.len(), TOTAL_WRITES, "one keyword quad per write");
@@ -105,7 +98,7 @@ mod tests {
         });
     }
 
-    /// K1b — no add may be lost when writers race on the same graph.
+    /// No add may be lost when writers race on the same graph.
     #[test]
     fn adds_never_lost() {
         with_watchdog("adds_never_lost", || {
@@ -113,7 +106,7 @@ mod tests {
             let graph = GraphId::new("urn:test:crdt-adds");
             create_test_crate(&net, 0, &graph);
 
-            insert_keywords_in_parallel(net.peer(0), &graph, "add");
+            insert_parallel_keywords(net.peer(0), &graph, "add");
 
             let objects: HashSet<String> = keyword_quads(net.peer(0), &graph)
                 .into_iter()
@@ -128,10 +121,7 @@ mod tests {
         });
     }
 
-    /// K1c — every applied batch's dot ends up in the graph's vector clock (G2).
-    ///
-    /// A read-modify-write race on the clock silently drops the losing writer's
-    /// counter, leaving the clock behind the log head.
+    /// Every applied batch dot must enter the graph vector clock.
     #[test]
     fn clock_never_lost() {
         with_watchdog("clock_never_lost", || {
@@ -139,7 +129,7 @@ mod tests {
             let graph = GraphId::new("urn:test:crdt-clock");
             create_test_crate(&net, 0, &graph);
 
-            let batches = insert_keywords_in_parallel(net.peer(0), &graph, "clock");
+            let batches = insert_parallel_keywords(net.peer(0), &graph, "clock");
             let clock = net.peer(0).vector_clock(&graph).unwrap();
 
             let mut minted = HashSet::new();
@@ -168,11 +158,7 @@ mod tests {
         });
     }
 
-    /// G1 — a `Remove` deletes exactly the dots it witnessed and no others.
-    ///
-    /// Both peers add the same triple while partitioned, so it carries two dots.
-    /// Peer 0 then deletes it *before* healing, witnessing only its own dot, so
-    /// peer 1's concurrent add must survive the merge on both replicas.
+    /// A partitioned remove must preserve a concurrent dot it never witnessed.
     #[test]
     fn remove_kills_witnessed() {
         with_watchdog("remove_kills_witnessed", || {
@@ -204,12 +190,7 @@ mod tests {
         });
     }
 
-    /// Concurrent local writes in sync mode still converge across peers, and
-    /// both replicas agree on the derived diagnostics (G4, G6).
-    ///
-    /// Convergence alone is not the guarantee: two peers that both lost the same
-    /// add agree perfectly. The quad count is asserted against the state before
-    /// the writes plus one quad per write, so completeness is pinned as well.
+    /// Sync-mode writes must converge completely, including diagnostics.
     #[test]
     fn sync_writes_converge() {
         with_watchdog("sync_writes_converge", || {
@@ -219,7 +200,7 @@ mod tests {
             net.sync_until_converged(10).unwrap();
             let (seeded, _, _) = net.peer(0).graph_fingerprint(&graph).unwrap();
 
-            insert_keywords_in_parallel(net.peer(0), &graph, "converge");
+            insert_parallel_keywords(net.peer(0), &graph, "converge");
             net.sync_until_converged(20).unwrap();
 
             let fingerprint = net.peer(0).graph_fingerprint(&graph).unwrap();
@@ -242,9 +223,7 @@ mod tests {
         });
     }
 
-    /// K1d — the in-memory query indexes must equal the durable quad state after
-    /// a concurrent mix of inserts and deletes, **without** a restart to repair
-    /// them.
+    /// Query indexes must match durable state after concurrent churn without restart.
     #[test]
     fn index_matches_store() {
         with_watchdog("index_matches_store", || {
@@ -305,10 +284,7 @@ mod tests {
         });
     }
 
-    // ── F2: validation runs outside the commit guard ────────────────────────
-
-    /// Racing pairs. Each pair needs both writers to validate before either
-    /// commits, so a handful of pairs is not enough to be sure of hitting it.
+    // Repeated writer pairs exercise validation races outside the commit guard.
     const RACE_ROUNDS: usize = 24;
     /// Filler entities, purely to widen the validation window.
     const FILLER_ENTITIES: usize = 400;
@@ -418,7 +394,7 @@ mod tests {
         orphans
     }
 
-    /// F2 — checked writers serialize validation and commit per graph. Racing
+    /// Checked writers serialize validation and commit per graph. Racing
     /// parent-edge deletes cannot both commit against the same stale state.
     #[test]
     fn deletes_preserve_reachability() {
@@ -469,9 +445,7 @@ mod tests {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     start.wait();
-                    // A racer that loses the interleaving is rejected by the
-                    // reachability rule; what matters is the record the winners
-                    // leave behind.
+                    // A losing racer may be rejected; the committed graph must stay valid.
                     let _ = node.apply_changes(
                         &AllowAllAuthorizer,
                         &graph,
@@ -504,9 +478,7 @@ mod tests {
         );
     }
 
-    // ── F3: a read that writes destroys the search re-queue baseline ────────
-
-    /// F3 — a replicated orphan must be removed from search and re-enqueued
+    /// A replicated orphan must be removed from search and re-enqueued
     /// when a later checked write restores reachability (G6, G7).
     #[test]
     #[cfg(feature = "search")]

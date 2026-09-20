@@ -13,14 +13,14 @@ mod tests {
     use craqle::{CraqleNode, CreateCrateRequest, GrantAuthorizer, GraphId};
 
     use crate::support::{
-        CraqleCluster, benchmark_media_object_entities, dir_size_bytes, env_bool, env_usize,
+        CraqleCluster, EntityBatch, benchmark_entities, dir_size_bytes, env_bool, env_usize,
         format_bytes, format_stats, public_policy_for, sum_durations, writer_auth_for,
     };
 
     const DEFAULT_TOTAL_ENTITIES: usize = 250_000;
     const DEFAULT_BATCH_SIZE: usize = 10_000;
     const DEFAULT_PEER_COUNT: usize = 2;
-    const DEFAULT_SYNC_EVERY_BATCHES: usize = 0;
+    const DEFAULT_SYNC_BATCHES: usize = 0;
     const DEFAULT_QUERY_SAMPLES: usize = 3;
     const DEFAULT_PAGE_SIZE: usize = 1_000;
     const DEFAULT_MANUAL_COMPACT: bool = false;
@@ -46,10 +46,10 @@ mod tests {
     #[test]
     #[ignore = "release-only batch ingest workflow profile"]
     fn batch_ingest_profile() {
-        run_batch_ingest_workflow().unwrap();
+        run_batch_ingest().unwrap();
     }
 
-    fn run_batch_ingest_workflow() -> Result<()> {
+    fn run_batch_ingest() -> Result<()> {
         let config = Config::from_env();
         ensure!(
             config.peer_count == 1 || config.peer_count == 2,
@@ -105,14 +105,14 @@ mod tests {
             let batch_count = usize::min(config.batch_size, config.total_entities - start);
 
             let build_start = Instant::now();
-            let entities = benchmark_media_object_entities(
+            let entities = benchmark_entities(EntityBatch {
                 start,
-                batch_count,
-                "batch-ingest",
-                "Batch Entity",
-                "record",
-                "BATCH",
-            );
+                count: batch_count,
+                keyword: "batch-ingest",
+                name_prefix: "Batch Entity",
+                description_label: "record",
+                identifier_prefix: "BATCH",
+            });
             let build_elapsed = build_start.elapsed();
             build_latencies.push(build_elapsed);
 
@@ -369,7 +369,7 @@ mod tests {
                 peer_count: env_usize("CRAQLE_BATCH_INGEST_PEERS", DEFAULT_PEER_COUNT),
                 sync_every_batches: env_usize(
                     "CRAQLE_BATCH_INGEST_SYNC_EVERY_BATCHES",
-                    DEFAULT_SYNC_EVERY_BATCHES,
+                    DEFAULT_SYNC_BATCHES,
                 ),
                 query_samples: env_usize(
                     "CRAQLE_BATCH_INGEST_QUERY_SAMPLES",

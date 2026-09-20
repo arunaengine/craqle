@@ -82,9 +82,8 @@ fn poison(incoming: &mut Batch, place: Place, term: &str) {
     *slot = EncodedTerm(term.to_owned());
 }
 
-/// Everything a rejection must leave untouched: quad rows with their dots, the
-/// graph clock, and whether the graph exists at all. A graph this node does
-/// not hold fingerprints the empty hash, an existing empty one zeroes.
+/// Captures quads, dots, clock, and graph existence so rejection must preserve
+/// the full state, including the distinction between missing and empty graphs.
 fn durable(
     node: &CraqleNode,
     graph: &GraphId,
@@ -130,6 +129,36 @@ fn refuses(node: &CraqleNode, incoming: &GraphReplicaSnapshot) -> CraqleError {
     );
     assert_eq!(error.kind(), CraqleErrorKind::InvalidInput);
     error
+}
+
+fn advance_seed(seed: &mut u64) -> u64 {
+    *seed = (*seed)
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *seed
+}
+
+fn next_batch(graph: &GraphId) -> Batch {
+    let mut base = VectorClock::new();
+    base.advance(actor(1), 1);
+    Batch::from_changes(
+        graph.clone(),
+        actor(1),
+        2,
+        base,
+        [insert(graph, "\"next\"")],
+        Utc::now(),
+    )
+    .unwrap()
+}
+
+fn poison_snapshot(incoming: &mut GraphReplicaSnapshot, place: Place, term: &str) {
+    let slot = match place {
+        Place::Subject => &mut incoming.quads[0].subject,
+        Place::Predicate => &mut incoming.quads[0].predicate,
+        Place::Object => &mut incoming.quads[0].object,
+    };
+    *slot = EncodedTerm(term.to_owned());
 }
 
 #[test]
@@ -413,4 +442,85 @@ fn rejects_many_dots() {
         quads: vec![quad("\"x\"", dots)],
     };
     refuses(&node, &incoming);
+}
+
+#[test]
+fn malformed_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = open(temp.path(), "model", 48);
+    let graph = GraphId::new("urn:test:ingress:model");
+    assert!(node.merge_batch(&valid(&graph)).unwrap().applied);
+    let expected = durable(&node, &graph);
+    let malformed = ["", "<", "<urn:test:bad space>", "\"unterminated", "_:"];
+    let mut seed = 0x7b1d_5eed_cafe_f00d;
+
+    for index in 0..24 {
+        let random = advance_seed(&mut seed);
+        let place = match random % 3 {
+            0 => Place::Subject,
+            1 => Place::Predicate,
+            _ => Place::Object,
+        };
+        let term = malformed[(random as usize / 3) % malformed.len()];
+        let mut incoming = next_batch(&graph);
+        match index % 6 {
+            0 => poison(&mut incoming, place, term),
+            1 => {
+                let QuadOp::Add { dot, .. } = &mut incoming.ops[0] else {
+                    panic!("expected an add op");
+                };
+                dot.actor = actor(9);
+            }
+            2 => {
+                let QuadOp::Add { dot, .. } = &mut incoming.ops[0] else {
+                    panic!("expected an add op");
+                };
+                dot.counter = 3;
+            }
+            3 => incoming.base_clock.advance(actor(1), 2),
+            4 => {
+                let mut witnessed = incoming.base_clock.clone();
+                witnessed.advance(actor(7), 1);
+                incoming.ops[0] = QuadOp::Remove {
+                    subject: EncodedTerm(SUBJECT.to_owned()),
+                    predicate: EncodedTerm(PREDICATE.to_owned()),
+                    object: EncodedTerm("\"x\"".to_owned()),
+                    witnessed,
+                };
+            }
+            _ => {
+                poison(&mut incoming, place, term);
+                incoming.base_clock.advance(actor(1), 2);
+            }
+        }
+        rejects(&node, &incoming);
+        assert_eq!(expected, durable(&node, &graph), "batch case {index}");
+    }
+
+    for index in 0..18 {
+        let random = advance_seed(&mut seed);
+        let place = match random % 3 {
+            0 => Place::Subject,
+            1 => Place::Predicate,
+            _ => Place::Object,
+        };
+        let term = malformed[(random as usize / 3) % malformed.len()];
+        let mut incoming = expected.0.clone();
+        match index % 6 {
+            0 => incoming.clock = VectorClock::new(),
+            1 => {
+                let repeated = incoming.quads[0].dots[0];
+                incoming.quads[0].dots.push(repeated);
+            }
+            2 => incoming.quads.push(incoming.quads[0].clone()),
+            3 => incoming.quads[0].dots.clear(),
+            4 => poison_snapshot(&mut incoming, place, term),
+            _ => {
+                poison_snapshot(&mut incoming, place, term);
+                incoming.quads.push(incoming.quads[0].clone());
+            }
+        }
+        refuses(&node, &incoming);
+        assert_eq!(expected, durable(&node, &graph), "snapshot case {index}");
+    }
 }

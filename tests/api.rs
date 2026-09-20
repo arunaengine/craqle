@@ -167,7 +167,7 @@ fn graph_queries_filter() {
         .unwrap();
     }
 
-    let rows = match support::query_with_test_visibility(
+    let rows = match support::query_with_visibility(
         &node,
         |graph: &GraphId| graph.as_str() == "urn:test:lazy:one",
         "SELECT ?name WHERE { ?s schema:name ?name }",
@@ -184,26 +184,21 @@ fn graph_queries_filter() {
     );
 
     assert_eq!(
-        support::query_with_test_visibility(&node, |_: &GraphId| false, "ASK { ?s ?p ?o }",)
-            .unwrap(),
+        support::query_with_visibility(&node, |_: &GraphId| false, "ASK { ?s ?p ?o }").unwrap(),
         QueryResults::Boolean(false)
     );
 }
 
-/// `CraqleNode::query` now decides visibility with a lazy per-graph predicate
-/// instead of materializing the visible set and handing it to
-/// `query_graphs` (finding R1). Results must be unchanged, including above the
-/// 32-graph limit where `query_graphs` switches from an explicit dataset to the
-/// union view.
+/// Lazy and explicit visibility must agree above and below the graph threshold.
 #[test]
 fn query_matches_visible() {
     // Small visible set: explicit-dataset regime.
-    assert_query_regimes_agree(6, 2);
+    assert_regimes_agree(6, 2);
     // 40 visible graphs: crosses the explicit-dataset threshold.
-    assert_query_regimes_agree(40, 8);
+    assert_regimes_agree(40, 8);
 }
 
-fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
+fn assert_regimes_agree(readable: usize, unreadable: usize) {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let reader = reader_auth();
@@ -234,16 +229,37 @@ fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
     let visible = node.visible_graphs(&reader).unwrap();
     assert_eq!(visible.len(), readable, "visible set size");
 
-    for sparql in [
-        "SELECT ?s ?name WHERE { ?s schema:name ?name }",
-        "SELECT ?g ?name WHERE { GRAPH ?g { ?s schema:name ?name } }",
-        "SELECT ?name WHERE { ?s schema:name ?name } ORDER BY ?name LIMIT 5",
+    for (sparql, needs_unbounded) in [
+        ("SELECT ?s ?name WHERE { ?s schema:name ?name }", false),
+        (
+            "SELECT ?g ?name WHERE { GRAPH ?g { ?s schema:name ?name } }",
+            false,
+        ),
+        (
+            "SELECT ?name WHERE { ?s schema:name ?name } ORDER BY ?name LIMIT 5",
+            true,
+        ),
     ] {
+        let mut options = QueryOptions::default();
+        if needs_unbounded {
+            options.limits = QueryLimits::unbounded();
+        }
+        let prepared = node.prepare_query(sparql).unwrap();
         assert_eq!(
-            canonical_rows(node.query(&reader, sparql).unwrap()),
             canonical_rows(
-                node.query_in_graphs(&AllowAllAuthorizer, &visible, sparql)
-                    .unwrap(),
+                node.execute_prepared(&reader, &prepared, &options)
+                    .unwrap()
+                    .results,
+            ),
+            canonical_rows(
+                node.execute_prepared_in_graphs(
+                    &AllowAllAuthorizer,
+                    &visible,
+                    &prepared,
+                    &options,
+                )
+                .unwrap()
+                .results,
             ),
             "query and query_graphs(visible_graphs) disagree on `{sparql}` \
              with {readable} readable / {unreadable} unreadable graphs"
@@ -256,7 +272,7 @@ fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
             .unwrap()
     );
 
-    // G8 soundness: no hidden graph's data may appear either way.
+    // No hidden graph data may appear through either visibility path.
     let rows = canonical_rows(
         node.query(&reader, "SELECT ?name WHERE { ?s schema:name ?name }")
             .unwrap(),
@@ -388,9 +404,12 @@ fn updates_require_write() {
             .unwrap_err();
         assert!(matches!(err, CraqleError::Authorization(_)));
 
-        node.apply_sparql_update(
+        let mut options = UpdateOptions::default();
+        options.limits = UpdateLimits::unbounded();
+        node.apply_sparql_update_with_options(
             &writer,
             "INSERT { GRAPH <urn:test:update> { ?root schema:hasPart <urn:test:item> . <urn:test:item> rdf:type schema:MediaObject . <urn:test:item> schema:name \"allowed\" } } WHERE { GRAPH <urn:test:update> { ?root rdf:type schema:Dataset . ?root schema:datePublished ?date . } }",
+            &options,
         )
         .unwrap();
     });
@@ -929,10 +948,8 @@ fn search_scopes_retention() {
     assert_eq!(subjects, vec![selected_a.as_str(), selected_b.as_str()]);
 }
 
-/// The large-set path of `search_graphs` swaps one search-per-graph for a
-/// single search with an index-side graph filter (finding R8). Both paths must
-/// return the same graph-restricted, policy-respecting page.
-/// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+/// Large-set and per-graph search must return the same authorized page.
+/// This requires real Tantivy hits and does not run with the search stub.
 #[cfg(feature = "search")]
 #[test]
 fn search_crosses_threshold() {
