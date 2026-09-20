@@ -111,9 +111,9 @@ impl CraqleCluster {
         }
 
         let mut moved = 0;
-        for topic_id in self.all_craqle_topic_ids()? {
-            moved += self.sync_topic_one_way(left, right, topic_id)?;
-            moved += self.sync_topic_one_way(right, left, topic_id)?;
+        for topic_id in self.all_topic_ids()? {
+            moved += self.sync_topic((left, right), topic_id)?;
+            moved += self.sync_topic((right, left), topic_id)?;
         }
 
         Ok(moved)
@@ -122,7 +122,7 @@ impl CraqleCluster {
     /// One full all-pairs sync round; returns the number of ops moved.
     pub fn sync_round(&self) -> Result<usize> {
         let peer_count = self.peers.len();
-        let topics = self.all_craqle_topic_ids()?;
+        let topics = self.all_topic_ids()?;
         let mut moved = 0;
         for sender in 0..peer_count {
             for receiver in 0..peer_count {
@@ -130,7 +130,7 @@ impl CraqleCluster {
                     continue;
                 }
                 for topic_id in &topics {
-                    moved += self.sync_topic_one_way(sender, receiver, *topic_id)?;
+                    moved += self.sync_topic((sender, receiver), *topic_id)?;
                 }
             }
         }
@@ -241,12 +241,8 @@ impl CraqleCluster {
         Ok(())
     }
 
-    fn sync_topic_one_way(
-        &self,
-        sender: usize,
-        receiver: usize,
-        topic_id: irokle::TopicId,
-    ) -> Result<usize> {
+    fn sync_topic(&self, peers: (usize, usize), topic_id: irokle::TopicId) -> Result<usize> {
+        let (sender, receiver) = peers;
         let remote_summary = self.irokles[receiver].sync_summary(topic_id)?;
         let data = self.irokles[sender]
             .plan_sync_data(self.irokles[receiver].peer_id(), &remote_summary)?;
@@ -261,7 +257,7 @@ impl CraqleCluster {
         Ok(moved)
     }
 
-    fn all_craqle_topic_ids(&self) -> Result<Vec<irokle::TopicId>> {
+    fn all_topic_ids(&self) -> Result<Vec<irokle::TopicId>> {
         let mut topics = BTreeSet::new();
         for node in &self.irokles {
             for topic in node.list_topics()? {

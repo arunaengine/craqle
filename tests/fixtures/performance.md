@@ -1,3 +1,7 @@
+<!-- Documents the deterministic performance fixture contract. -->
+<!-- Copyright (c) 2026 ArunaStorage Team @ JLU Giessen -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Deterministic performance corpus
 
 The performance corpus is generated at iteration time; large RDF data is not
