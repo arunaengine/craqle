@@ -700,10 +700,14 @@ impl SearchIndex {
 
     /// Create or open a persistent index at the given directory path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_budget(path, MemoryBudget::default())
+    }
+
+    pub fn open_with_budget(path: impl AsRef<Path>, budget: MemoryBudget) -> Result<Self> {
         let schema = build_schema();
 
         let dir = path.as_ref();
-        let (index, needs_rebuild) = if dir.join("meta.json").exists() {
+        let (index, mut needs_rebuild) = if dir.join("meta.json").exists() {
             let index = Index::open_in_dir(dir)?;
             if schema_fields(&index.schema()).is_ok() {
                 (index, false)
@@ -713,65 +717,475 @@ impl SearchIndex {
         } else {
             (create_index_dir(dir, &schema)?, true)
         };
+        let index_id = match load_index_id(dir)? {
+            Some(index_id) => index_id,
+            None => {
+                let index_id = *uuid::Uuid::new_v4().as_bytes();
+                store_index_id(dir, index_id)?;
+                needs_rebuild = true;
+                index_id
+            }
+        };
 
         register_text_analyzer(&index);
-        let (f_doc_key, f_graph_id, f_subject_iri, f_all_text) = schema_fields(&index.schema())?;
+        let (
+            f_doc_key,
+            f_graph_id,
+            f_subject_iri,
+            f_all_text,
+            f_generation_key,
+            f_doc_generation,
+            f_generation_scope,
+            f_stable_key,
+        ) = schema_fields(&index.schema())?;
         let reader = index.reader()?;
-        let writer = index.writer(DISK_INDEX_WRITER_HEAP_BYTES)?;
+        let generations = Arc::new(GenerationView::default());
+        let view = Arc::new(SearchView {
+            searcher: reader.searcher(),
+            generations,
+            bound: false,
+        });
+        let writer_bytes = usize::try_from(budget.search_writer_bytes()).map_err(|_| {
+            SearchError::ItemTooLarge {
+                bytes: usize::MAX,
+                limit: usize::MAX,
+            }
+        })?;
+        let prepared_bytes = usize::try_from(budget.prepared_work_bytes()).unwrap_or(usize::MAX);
+        let writer = index.writer(writer_bytes)?;
 
         Ok(Self {
             index,
             reader,
+            view: RwLock::new(view),
             writer: Mutex::new(writer),
             write_epoch: AtomicU64::new(0),
             committed_epoch: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
             rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
             rebuild_owed: AtomicBool::new(false),
-            item_failures: Mutex::new(HashMap::new()),
+            scan_cursors: Mutex::new(QueueCursors::default()),
+            retry_now: AtomicU64::new(0),
+            fair_cursor: AtomicU64::new(0),
+            prepared_bytes,
+            work_lock: Mutex::new(()),
+            stage_sources: Mutex::new(HashMap::new()),
+            session: *uuid::Uuid::new_v4().as_bytes(),
             #[cfg(test)]
             hooks: TestHooks::default(),
-            needs_rebuild,
+            needs_rebuild: AtomicBool::new(needs_rebuild),
+            index_id,
             f_doc_key,
             f_graph_id,
             f_subject_iri,
             f_all_text,
+            f_generation_key,
+            f_doc_generation,
+            f_generation_scope,
+            f_stable_key,
         })
     }
 
     /// Create an in-memory index (useful for tests).
     pub fn open_in_memory() -> Result<Self> {
+        Self::memory_with_budget(MemoryBudget::default())
+    }
+
+    pub fn memory_with_budget(budget: MemoryBudget) -> Result<Self> {
         let schema = build_schema();
 
-        let (f_doc_key, f_graph_id, f_subject_iri, f_all_text) = schema_fields(&schema)?;
+        let (
+            f_doc_key,
+            f_graph_id,
+            f_subject_iri,
+            f_all_text,
+            f_generation_key,
+            f_doc_generation,
+            f_generation_scope,
+            f_stable_key,
+        ) = schema_fields(&schema)?;
         let index = Index::create_in_ram(schema);
         register_text_analyzer(&index);
         let reader = index.reader()?;
-        let writer = index.writer(MEMORY_INDEX_WRITER_HEAP_BYTES)?;
+        let generations = Arc::new(GenerationView::default());
+        let view = Arc::new(SearchView {
+            searcher: reader.searcher(),
+            generations,
+            bound: true,
+        });
+        let writer_bytes = usize::try_from(budget.search_writer_bytes()).map_err(|_| {
+            SearchError::ItemTooLarge {
+                bytes: usize::MAX,
+                limit: usize::MAX,
+            }
+        })?;
+        let prepared_bytes = usize::try_from(budget.prepared_work_bytes()).unwrap_or(usize::MAX);
+        let writer = index.writer(writer_bytes)?;
 
         Ok(Self {
             index,
             reader,
+            view: RwLock::new(view),
             writer: Mutex::new(writer),
             write_epoch: AtomicU64::new(0),
             committed_epoch: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
             rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
             rebuild_owed: AtomicBool::new(false),
-            item_failures: Mutex::new(HashMap::new()),
+            scan_cursors: Mutex::new(QueueCursors::default()),
+            retry_now: AtomicU64::new(0),
+            fair_cursor: AtomicU64::new(0),
+            prepared_bytes,
+            work_lock: Mutex::new(()),
+            stage_sources: Mutex::new(HashMap::new()),
+            session: *uuid::Uuid::new_v4().as_bytes(),
             #[cfg(test)]
             hooks: TestHooks::default(),
-            needs_rebuild: false,
+            needs_rebuild: AtomicBool::new(false),
+            index_id: *uuid::Uuid::new_v4().as_bytes(),
             f_doc_key,
             f_graph_id,
             f_subject_iri,
             f_all_text,
+            f_generation_key,
+            f_doc_generation,
+            f_generation_scope,
+            f_stable_key,
         })
     }
 
     /// Returns `true` when the on-disk index had to be created or migrated.
     pub fn needs_rebuild(&self) -> bool {
-        self.needs_rebuild
+        self.needs_rebuild.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn index_id(&self) -> [u8; 16] {
+        self.index_id
+    }
+
+    pub(crate) fn query_bytes(&self) -> usize {
+        self.prepared_bytes / 4
+    }
+
+    pub(crate) fn check_query_bytes(&self, bytes: usize) -> crate::Result<()> {
+        let limit = self.query_bytes();
+        if bytes > limit {
+            return Err(SearchError::ItemTooLarge { bytes, limit }.into());
+        }
+        Ok(())
+    }
+
+    fn pin_view(&self) -> Arc<SearchView> {
+        self.view
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish_searcher(&self) {
+        let mut published = self.view.write().unwrap_or_else(PoisonError::into_inner);
+        let generations = published.generations.clone();
+        let bound = published.bound;
+        *published = Arc::new(SearchView {
+            searcher: self.reader.searcher(),
+            generations,
+            bound,
+        });
+    }
+
+    #[cfg(test)]
+    fn publish_rows(&self, rows: Vec<GraphGeneration>) {
+        self.publish_generations(GenerationView::from_rows(self.index_id, rows));
+    }
+
+    fn publish_generations(&self, generations: GenerationView) {
+        let mut published = self.view.write().unwrap_or_else(PoisonError::into_inner);
+        *published = Arc::new(SearchView {
+            searcher: self.reader.searcher(),
+            generations: Arc::new(generations),
+            bound: true,
+        });
+    }
+
+    fn set_generation(&self, graph: &str, generation: Option<GenerationId>) {
+        let mut published = self.view.write().unwrap_or_else(PoisonError::into_inner);
+        let mut generations = (*published.generations).clone();
+        match generation {
+            Some(generation) => {
+                generations.by_graph.insert(graph.to_string(), generation);
+            }
+            None => {
+                generations.by_graph.remove(graph);
+            }
+        }
+        generations.active = generations
+            .by_graph
+            .iter()
+            .map(|(graph, generation)| generation_scope(self.index_id, graph, *generation))
+            .collect();
+        *published = Arc::new(SearchView {
+            searcher: self.reader.searcher(),
+            generations: Arc::new(generations),
+            bound: true,
+        });
+    }
+
+    fn active_generation(&self, graph: &str) -> Option<GenerationId> {
+        self.pin_view().generations.by_graph.get(graph).copied()
+    }
+
+    fn stage_bytes(&self) -> usize {
+        self.stage_sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .fold(0usize, |bytes, source| bytes.saturating_add(source.bytes))
+    }
+
+    fn work_bytes(&self) -> usize {
+        self.prepared_bytes.saturating_sub(self.stage_bytes()) / 4
+    }
+
+    fn apply_switch(&self, switched: &GenerationSwitch) {
+        self.set_generation(switched.graph.as_str(), switched.active);
+    }
+
+    pub(crate) fn bind_store(&self, store: &GraphStore) -> Result<Option<u64>> {
+        let coverage = store.search_coverage()?;
+        let foreign = coverage.is_none_or(|coverage| coverage.index_id != self.index_id);
+        if foreign {
+            self.purge_index()?;
+        }
+        let revision = self.index.load_metas()?.opstamp;
+        let manifest = match coverage {
+            Some(coverage) if !foreign && revision >= coverage.index_revision => {
+                // A rebuild keeps the last active generations readable; queued
+                // debt still prevents final coverage certification.
+                let target = if coverage.rebuild.is_some() {
+                    0
+                } else {
+                    coverage.covered
+                };
+                Some(self.load_manifest(store, target)?)
+            }
+            _ => None,
+        };
+        let manifest_valid = coverage
+            .zip(manifest.as_ref())
+            .is_some_and(|(coverage, manifest)| {
+                manifest.valid
+                    && (coverage.rebuild.is_some()
+                        || (manifest.digest_match
+                            && coverage.manifest_count == manifest.count
+                            && coverage.manifest_hash == manifest.hash))
+            });
+        if manifest_valid {
+            self.publish_generations(manifest.expect("manifest checked").generations);
+        } else {
+            self.publish_generations(GenerationView::default());
+        }
+        let needs_rebuild = self.needs_rebuild.load(Ordering::SeqCst)
+            || coverage.is_none_or(|coverage| {
+                coverage.index_id != self.index_id
+                    || coverage.rebuild.is_some()
+                    || revision < coverage.index_revision
+                    || !manifest_valid
+            });
+        if !needs_rebuild {
+            return Ok(None);
+        }
+        Ok(Some(store.bind_search_rebuild(&RebuildRequest {
+            index_id: self.index_id,
+            index_revision: revision,
+        })?))
+    }
+
+    fn load_manifest(&self, store: &GraphStore, target: u64) -> Result<ManifestState> {
+        let snapshot = store.search_manifest_snapshot()?;
+        let map_limit = self.prepared_bytes / 2;
+        let mut generations = GenerationView::default();
+        let mut hash = [0u8; 32];
+        let mut count = 0u64;
+        let mut valid = snapshot.oldest_owed()?.is_none_or(|owed| owed > target);
+        let mut after = None;
+        let mut retained = 0usize;
+        loop {
+            let page = store.scan_search_manifest(
+                &snapshot,
+                &ManifestScan {
+                    index_id: self.index_id,
+                    after,
+                    row_limit: SOURCE_PAGE_ROWS,
+                    byte_limit: map_limit.saturating_sub(retained),
+                },
+            )?;
+            if let Some(oversized) = page.oversized {
+                return Err(SearchError::ItemTooLarge {
+                    bytes: oversized.bytes,
+                    limit: oversized.limit,
+                });
+            }
+            retained = retained.saturating_add(page.bytes);
+            for row in page.entries {
+                let old_debt = row.source_owed.is_some_and(|owed| owed <= target)
+                    || row.delete_owed.is_some_and(|owed| owed <= target)
+                    || row.stage_target.is_some_and(|owed| owed <= target);
+                let missing_live = row.live
+                    && row.active.is_none()
+                    && row.source_owed.is_none_or(|owed| owed <= target);
+                let stale_dead = !row.live
+                    && row.active.is_some()
+                    && row.delete_owed.is_none_or(|owed| owed <= target);
+                if row.wrong_index || old_debt || missing_live || stale_dead {
+                    valid = false;
+                }
+                if let Some(generation) = row.active {
+                    let graph = row.graph.as_str();
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&(graph.len() as u64).to_be_bytes());
+                    hasher.update(graph.as_bytes());
+                    hasher.update(&generation.0.to_be_bytes());
+                    for (current, byte) in hash.iter_mut().zip(hasher.finalize().as_bytes()) {
+                        *current ^= byte;
+                    }
+                    count = count.saturating_add(1);
+                    if row.live {
+                        generations.by_graph.insert(graph.to_string(), generation);
+                    }
+                }
+            }
+            if !page.remaining {
+                break;
+            }
+            after = page.next;
+            if after.is_none() {
+                return Err(SearchError::Store(
+                    crate::store::StoreError::InvalidSearchState(
+                        "manifest-scan-continuation-missing",
+                    ),
+                ));
+            }
+        }
+        generations.active = generations
+            .by_graph
+            .iter()
+            .map(|(graph, generation)| generation_scope(self.index_id, graph, *generation))
+            .collect();
+        let digest = snapshot.digest(self.index_id)?;
+        Ok(ManifestState {
+            generations,
+            count,
+            hash,
+            epoch: digest.epoch,
+            valid,
+            digest_match: digest.count == count && digest.hash == hash,
+        })
+    }
+
+    fn purge_index(&self) -> Result<()> {
+        if self.reader.searcher().num_docs() == 0 {
+            return Ok(());
+        }
+        let _serialized = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let covered = {
+            let mut writer = self.writer()?;
+            writer.delete_all_documents()?;
+            self.write_epoch.fetch_add(1, Ordering::SeqCst);
+            let covered = self.write_epoch.load(Ordering::SeqCst);
+            writer.commit()?;
+            covered
+        };
+        self.reader.reload()?;
+        self.publish_generations(GenerationView::default());
+        self.committed_epoch.store(covered, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coverage_target(&self, store: &GraphStore) -> Result<Option<u64>> {
+        self.bind_store(store)
+    }
+
+    pub(crate) fn complete_coverage(&self, store: &GraphStore, target: u64) -> Result<()> {
+        let current = store.search_coverage()?;
+        let full_scan = self.needs_rebuild.load(Ordering::SeqCst)
+            || current.is_none_or(|coverage| coverage.rebuild.is_some());
+        let (count, hash, epoch, generations) = if full_scan {
+            let manifest = self.load_manifest(store, target)?;
+            if !manifest.valid {
+                return Err(SearchError::Store(
+                    crate::store::StoreError::InvalidSearchState(
+                        "search-generation-manifest-invalid",
+                    ),
+                ));
+            }
+            (
+                manifest.count,
+                manifest.hash,
+                manifest.epoch,
+                Some(manifest.generations),
+            )
+        } else {
+            let digest = store.search_manifest_digest(self.index_id)?;
+            (digest.count, digest.hash, digest.epoch, None)
+        };
+        let revision = self.index.load_metas()?.opstamp;
+        if let Some(current) = current
+            && current.index_id == self.index_id
+            && current.covered >= target
+            && current.rebuild.is_none()
+            && revision >= current.index_revision
+            && current.manifest_count == count
+            && current.manifest_hash == hash
+        {
+            self.needs_rebuild.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        if let Some(rebuild) = current.and_then(|coverage| coverage.rebuild) {
+            if target < rebuild {
+                return Err(SearchError::Store(
+                    crate::store::StoreError::InvalidSearchState(
+                        "search-rebuild-coverage-incomplete",
+                    ),
+                ));
+            }
+            store.finish_search_rebuild(&crate::search::queue::SearchCoverage {
+                format: crate::search::queue::SEARCH_META_FORMAT,
+                index_id: self.index_id,
+                index_revision: revision,
+                covered: target,
+                rebuild: Some(rebuild),
+                manifest_count: count,
+                manifest_hash: hash,
+                manifest_epoch: epoch,
+            })?;
+        } else {
+            store.advance_search_coverage(&crate::search::queue::SearchCoverage {
+                format: crate::search::queue::SEARCH_META_FORMAT,
+                index_id: self.index_id,
+                index_revision: revision,
+                covered: target,
+                rebuild: None,
+                manifest_count: count,
+                manifest_hash: hash,
+                manifest_epoch: epoch,
+            })?;
+        }
+        if let Some(generations) = generations {
+            self.publish_generations(generations);
+        }
+        self.needs_rebuild.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn check_cancel(&self, control: &DrainControl) -> Result<()> {
+        if control.is_cancelled() {
+            return Err(SearchError::Cancelled);
+        }
+        Ok(())
     }
 
     /// Makes the next indexer drain cycle panic. Test-only.
