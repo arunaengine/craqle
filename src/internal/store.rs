@@ -6977,12 +6977,7 @@ impl GraphStore {
         !dots_empty(bytes)
     }
 
-    fn count_objects_for_ids(
-        &self,
-        graph: TermId,
-        subject: TermId,
-        predicate: TermId,
-    ) -> Result<usize> {
+    fn count_object_ids(&self, graph: TermId, subject: TermId, predicate: TermId) -> Result<usize> {
         Ok(self
             .subject_entries((graph, subject), None)?
             .into_iter()
@@ -6990,14 +6985,8 @@ impl GraphStore {
             .count())
     }
 
-    /// Objects of `(graph, subject, predicate)` in decoded-term order.
-    ///
-    /// Decoding happens with no lock held, so a commit can invalidate the entry
-    /// while it runs. The generation snapshot taken before the index is read is
-    /// what stops the result being cached in that case: an ordering installed
-    /// over a newer one would be served indefinitely on a quiescent graph and
-    /// silently omit a new `hasPart` child from every export page (G6).
-    fn ordered_objects_for_subject_predicate(
+    /// Returns decoded-term order, installing only under the captured graph epoch.
+    fn ordered_objects(
         &self,
         graph: TermId,
         subject: TermId,
@@ -7006,7 +6995,7 @@ impl GraphStore {
         let key = (graph, subject, predicate);
         let generation = {
             let mut indexes = self.indexes_write();
-            let generation = indexes.generations.get(&graph).copied().unwrap_or(0);
+            let generation = indexes.graph_epoch(graph);
             if let Some(cached) = indexes.object_order.get(&key, generation) {
                 return Ok(cached);
             }
@@ -7032,7 +7021,7 @@ impl GraphStore {
                 .collect::<Vec<_>>(),
         );
         let mut indexes = self.indexes_write();
-        if indexes.generations.get(&graph).copied().unwrap_or(0) == generation {
+        if indexes.graph_epoch(graph) == generation {
             indexes.object_order.install(
                 OrderEntry {
                     key,
@@ -7045,30 +7034,25 @@ impl GraphStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_persist_mode(path, PersistMode::Buffer)
+        Self::open_with_budget(path, PersistMode::Buffer, MemoryBudget::default())
     }
 
-    pub fn open_with_persist_mode(
+    pub fn open_with_mode(path: impl AsRef<Path>, persist_mode: PersistMode) -> Result<Self> {
+        Self::open_with_budget(path, persist_mode, MemoryBudget::default())
+    }
+
+    pub(crate) fn open_with_budget(
         path: impl AsRef<Path>,
         persist_mode: PersistMode,
+        memory: MemoryBudget,
     ) -> Result<Self> {
+        let memory_lease = memory.reserve()?;
         let worker_threads = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
             .min(32);
-        // `max_write_buffer_size` is `#[deprecated = "todo"]` and `#[doc(hidden)]`
-        // upstream (fjall 3.1.6) — a knob whose behaviour is not settled. We
-        // stop setting it rather than pin
-        // durability behaviour to an unstable option; per-keyspace
-        // `max_memtable_size` below still bounds memtable growth, so the
-        // durability contract (G10) is unchanged.
-        //
-        // `max_journaling_size` and `max_memtable_size` only bound replay
-        // *together*: measured over a 40,000-graph corpus, capping the journal
-        // alone left 218 MiB of journal and an 8.7 s reopen, because the
-        // eviction that enforces the cap only runs after a flush and the 1 GiB
-        // memtables never produced one. See [`MAX_JOURNALING_BYTES`].
-        let budget = CacheBudget::current();
+        // Per-keyspace memtables and the journal ceiling jointly bound replay.
+        let budget = CacheBudget::from_budget(memory);
         let db = Database::builder(path.as_ref())
             .manual_journal_persist(true)
             .cache_size(budget.database)
@@ -7076,7 +7060,14 @@ impl GraphStore {
             .max_journaling_size(MAX_JOURNALING_BYTES)
             .worker_threads(worker_threads)
             .open()?;
-        Self::with_persist_mode(db, persist_mode)
+        Self::with_memory(
+            db,
+            persist_mode,
+            OpenMemory {
+                budget: memory,
+                lease: memory_lease,
+            },
+        )
     }
 
     pub fn from_database(db: Database) -> Result<Self> {
@@ -7084,13 +7075,19 @@ impl GraphStore {
     }
 
     /// Build a store on an already-open database with an explicit durability
-    /// mode; [`GraphStore::open_with_persist_mode`] opens the database first.
+    /// mode; [`GraphStore::open_with_mode`] opens the database first.
     pub fn with_persist_mode(db: Database, persist_mode: PersistMode) -> Result<Self> {
-        let budget = CacheBudget::current();
+        let budget = MemoryBudget::default();
+        let lease = budget.reserve()?;
+        Self::with_memory(db, persist_mode, OpenMemory { budget, lease })
+    }
+
+    fn with_memory(db: Database, persist_mode: PersistMode, memory: OpenMemory) -> Result<Self> {
+        let budget = CacheBudget::from_budget(memory.budget);
         let point_read_heavy = || {
             KeyspaceCreateOptions::default()
                 .expect_point_read_hits(true)
-                .max_memtable_size(POINT_READ_MEMTABLE_BYTES)
+                .max_memtable_size(READ_MEMTABLE_BYTES)
         };
         let write_heavy = || {
             KeyspaceCreateOptions::default()
@@ -7098,14 +7095,17 @@ impl GraphStore {
                 .index_block_compression_policy(CompressionPolicy::disabled())
                 .compaction_strategy(Arc::new(
                     Leveled::default()
-                        .with_l0_threshold(WRITE_HEAVY_L0_THRESHOLD)
-                        .with_table_target_size(WRITE_HEAVY_TABLE_TARGET_BYTES)
-                        .with_level_ratio_policy(vec![WRITE_HEAVY_LEVEL_RATIO]),
+                        .with_l0_threshold(WRITE_LEVEL_LIMIT)
+                        .with_table_target_size(WRITE_TABLE_BYTES)
+                        .with_level_ratio_policy(vec![WRITE_LEVEL_RATIO]),
                 ))
-                .max_memtable_size(WRITE_HEAVY_MEMTABLE_BYTES)
+                .max_memtable_size(WRITE_MEMTABLE_BYTES)
         };
 
         let store = Self {
+            _memory_lease: memory.lease,
+            #[cfg(feature = "shacl-core")]
+            shacl_cache_bytes: budget.shacl,
             terms: db.keyspace("terms", point_read_heavy)?,
             quads: db.keyspace("quads", write_heavy)?,
             graphs: db.keyspace("graphs", point_read_heavy)?,
@@ -7116,25 +7116,50 @@ impl GraphStore {
             qv2_posg: db.keyspace("qv2_posg", write_heavy)?,
             qv2_ospg: db.keyspace("qv2_ospg", write_heavy)?,
             qv2_gosp: db.keyspace("qv2_gosp", write_heavy)?,
-            qv2_term_to_query: db.keyspace("qv2_term_to_query", point_read_heavy)?,
-            qv2_query_to_term: db.keyspace("qv2_query_to_term", point_read_heavy)?,
+            primary_term_map: db.keyspace(PRIMARY_TERM_MAP, point_read_heavy)?,
+            primary_query_map: db.keyspace(PRIMARY_QUERY_MAP, point_read_heavy)?,
             qv2_meta: db.keyspace("qv2_meta", point_read_heavy)?,
+            qv3_gspo: db.keyspace("qv3_gspo", write_heavy)?,
+            qv3_gpos: db.keyspace("qv3_gpos", write_heavy)?,
+            qv3_spog: db.keyspace("qv3_spog", write_heavy)?,
+            qv3_posg: db.keyspace("qv3_posg", write_heavy)?,
+            qv3_ospg: db.keyspace("qv3_ospg", write_heavy)?,
+            qv3_gosp: db.keyspace("qv3_gosp", write_heavy)?,
+            secondary_term_map: db.keyspace(SECONDARY_TERM_MAP, point_read_heavy)?,
+            secondary_query_map: db.keyspace(SECONDARY_QUERY_MAP, point_read_heavy)?,
+            qv3_meta: db.keyspace("qv3_meta", point_read_heavy)?,
+            search_queue: db.keyspace("search_queue_v1", write_heavy)?,
+            search_meta: db.keyspace("search_meta_v1", point_read_heavy)?,
+            receipts: db.keyspace("mutation_receipts_v1", point_read_heavy)?,
+            receipt_order: db.keyspace("mutation_receipt_order_v1", point_read_heavy)?,
+            repair_audits: db.keyspace("repair_audits_v1", point_read_heavy)?,
+            repair_backups: db.keyspace("repair_backups_v1", write_heavy)?,
             db,
             persist_mode,
             term_locks: (0..TERM_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             commit_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            write_locks: (0..GRAPH_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            receipt_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
+            receipt_next: AtomicU64::new(1),
+            #[cfg(test)]
+            receipt_lookups: AtomicU64::new(0),
+            #[cfg(test)]
+            receipt_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            receipt_persists: AtomicU64::new(0),
             projection_lock: RwLock::new(()),
+            qv_maintenance: Mutex::new(()),
             qv_gate: QvCommitGate::new(),
             qv_commit_wait: QV_COMMIT_WAIT,
             qv_debt_next: AtomicU64::new(1),
             #[cfg(feature = "shacl-core")]
             binding_lock: Mutex::new(()),
             #[cfg(feature = "shacl-core")]
-            binding_lock_wait_ns: AtomicU64::new(0),
+            binding_wait_ns: AtomicU64::new(0),
             #[cfg(feature = "shacl-core")]
-            binding_lock_hold_ns: AtomicU64::new(0),
+            binding_hold_ns: AtomicU64::new(0),
             #[cfg(feature = "shacl-core")]
-            graph_commit_lock_wait_ns: AtomicU64::new(0),
+            graph_lock_wait: AtomicU64::new(0),
             #[cfg(feature = "shacl-core")]
             validation_ns: AtomicU64::new(0),
             #[cfg(feature = "shacl-core")]
@@ -7148,7 +7173,7 @@ impl GraphStore {
             #[cfg(feature = "shacl-core")]
             status_shape_compilations: AtomicU64::new(0),
             #[cfg(feature = "shacl-core")]
-            status_full_shape_scans: AtomicU64::new(0),
+            status_shape_scans: AtomicU64::new(0),
             #[cfg(all(test, feature = "shacl-core"))]
             validation_stall: Mutex::new(Duration::ZERO),
             #[cfg(all(test, feature = "shacl-core"))]
@@ -7156,8 +7181,7 @@ impl GraphStore {
             #[cfg(all(test, feature = "shacl-core"))]
             validation_max_active: std::sync::atomic::AtomicUsize::new(0),
             indexes: RwLock::new(IndexState::with_budget(&budget)),
-            diagnostics_cache: RwLock::new(HashMap::new()),
-            term_decode_cache: RwLock::new(BoundedCache::new(TERM_DECODE_CACHE_CAP, budget.terms)),
+            term_decode_cache: RwLock::new(BoundedCache::new(TERM_CACHE_CAP, budget.terms)),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
             #[cfg(test)]
@@ -7175,24 +7199,35 @@ impl GraphStore {
             #[cfg(test)]
             rebuild_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            rebuild_hook: RwLock::new(None),
+            #[cfg(test)]
+            delta_row_limit: AtomicU64::new(QV_DELTA_ROWS),
+            #[cfg(test)]
+            delta_byte_limit: AtomicU64::new(QV_DELTA_BYTES),
+            #[cfg(test)]
             delete_stall: Mutex::new(None),
             #[cfg(test)]
             delete_stalled: std::sync::atomic::AtomicBool::new(false),
             fts_queue_lock: Mutex::new(()),
             dirty_counter: AtomicU64::new(1),
+            dirty_committed: AtomicU64::new(0),
             diagnostics_computed: AtomicU64::new(0),
             #[cfg(test)]
-            query_index_admission_probes: AtomicU64::new(0),
+            index_admission_probes: AtomicU64::new(0),
             #[cfg(test)]
-            query_index_verification_runs: AtomicU64::new(0),
+            index_verification_runs: AtomicU64::new(0),
             #[cfg(test)]
             persists: AtomicU64::new(0),
         };
 
         store.ensure_disk_format()?;
-        store.initialize_query_indexes_at_open()?;
+        store.recover_query_build(None)?;
+        store.initialize_indexes()?;
+        store.migrate_search_meta()?;
+        store.restore_receipt_next()?;
         store.restore_dirty_counter()?;
-        store.repair_graph_diagnostics_at_open()?;
+        store.rebuild_search_order()?;
+        store.repair_diagnostics()?;
         Ok(store)
     }
 
@@ -7212,7 +7247,7 @@ impl GraphStore {
                 }
                 Ok(())
             }
-            None if self.authoritative_keyspaces_are_empty()? => {
+            None if self.authority_spaces_empty()? => {
                 let mut batch = self.buffered_batch();
                 batch.insert(
                     &self.graphs,
@@ -7227,7 +7262,7 @@ impl GraphStore {
         }
     }
 
-    fn authoritative_keyspaces_are_empty(&self) -> Result<bool> {
+    fn authority_spaces_empty(&self) -> Result<bool> {
         for keyspace in [&self.terms, &self.quads, &self.log] {
             if keyspace.iter().next().is_some() {
                 return Ok(false);
@@ -7242,21 +7277,24 @@ impl GraphStore {
         Ok(true)
     }
 
-    /// Restore the FTS queue token counter across restarts.
-    ///
-    /// Acknowledgement is token-comparison based: a reindex/delete entry clears
-    /// every subject entry whose token is `<=` its own. If the counter restarted
-    /// at 1, a subject enqueued *after* a restart would get a token below a
-    /// reindex token issued *before* it and be silently dropped without tantivy
-    /// ever having processed it — a silent search-index data loss (G7). Seeding
-    /// the counter past every live token makes tokens strictly increasing across
-    /// restarts, which is exactly what the acknowledgement rule assumes.
+    /// Restores the monotonic committed FTS token head across restarts.
     fn restore_dirty_counter(&self) -> Result<()> {
-        let mut highest = 0u64;
+        let stored_head = self
+            .search_meta
+            .get(SEARCH_HEAD_KEY)?
+            .map(|value| decode_u64(value.as_ref(), "search token head"))
+            .transpose()?;
+        if let Some(highest) = stored_head {
+            self.dirty_counter
+                .store(highest.checked_add(1).unwrap_or(u64::MAX), Ordering::SeqCst);
+            self.dirty_committed.store(highest, Ordering::SeqCst);
+            return Ok(());
+        }
+        let mut highest = stored_head.unwrap_or(0);
         for prefix in [
             graph_dirty_prefix(),
             graph_reindex_prefix(),
-            graph_search_delete_prefix(),
+            graph_delete_prefix(),
         ] {
             for guard in self.graphs.prefix(prefix) {
                 let (_, value) = guard.into_inner()?;
@@ -7264,8 +7302,195 @@ impl GraphStore {
                 highest = highest.max(tokens.latest);
             }
         }
-        self.dirty_counter.store(highest + 1, Ordering::SeqCst);
+        if let Some(coverage) = self.search_coverage()? {
+            highest = highest.max(coverage.covered);
+            if let Some(rebuild) = coverage.rebuild {
+                highest = highest.max(rebuild);
+            }
+        }
+        for guard in self.receipts.iter() {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 32 {
+                continue;
+            }
+            let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
+            if let Some(token) = receipt.search_token {
+                highest = highest.max(token);
+            }
+        }
+        if stored_head != Some(highest) {
+            let mut batch = self.buffered_batch();
+            batch.insert(&self.search_meta, SEARCH_HEAD_KEY, highest.to_be_bytes());
+            self.commit_fjall_batch(batch)?;
+        }
+        self.dirty_counter
+            .store(highest.checked_add(1).unwrap_or(u64::MAX), Ordering::SeqCst);
+        self.dirty_committed.store(highest, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn migrate_search_meta(&self) -> Result<()> {
+        if let Some(value) = self.search_meta.get(SEARCH_SCHEMA_KEY)? {
+            let found = u16::from_be_bytes(
+                value
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| StoreError::InvalidSearchState("search-schema-marker-invalid"))?,
+            );
+            if found > SEARCH_META_FORMAT {
+                return Err(StoreError::UnsupportedSearchFormat {
+                    found,
+                    supported: SEARCH_META_FORMAT,
+                });
+            }
+            if found == SEARCH_META_FORMAT {
+                return Ok(());
+            }
+        }
+        loop {
+            let mut batch = self.buffered_batch();
+            let mut removed = 0usize;
+            for guard in self.search_meta.prefix([SEARCH_FAILURE_PREFIX]) {
+                let (key, _) = guard.into_inner()?;
+                batch.remove(&self.search_meta, key);
+                removed += 1;
+                if removed == QV_BUILD_ROWS {
+                    break;
+                }
+            }
+            if removed == 0 {
+                batch.insert(
+                    &self.search_meta,
+                    SEARCH_SCHEMA_KEY,
+                    SEARCH_META_FORMAT.to_be_bytes(),
+                );
+                self.commit_fjall_batch(batch)?;
+                return Ok(());
+            }
+            self.commit_fjall_batch(batch)?;
+        }
+    }
+
+    fn restore_receipt_next(&self) -> Result<()> {
+        let mut highest = self
+            .receipt_order
+            .get(RECEIPT_EXPIRED_KEY)?
+            .and_then(|value| decode_index_count(value.as_ref()))
+            .unwrap_or(0);
+        for guard in self.receipts.iter() {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 32 {
+                continue;
+            }
+            let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
+            highest = highest.max(receipt.admission_sequence);
+        }
+        self.receipt_next
+            .store(highest.saturating_add(1).max(1), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Rebuild the disposable token ordering from durable queue identities.
+    fn rebuild_search_order(&self) -> Result<()> {
+        let mut migration = match self.search_meta.get(SEARCH_ORDER_KEY)? {
+            Some(value) => postcard::from_bytes::<SearchOrderMigration>(value.as_ref())?,
+            None => SearchOrderMigration {
+                format: SEARCH_ORDER_FORMAT,
+                stage: SearchOrderStage::Clear,
+                after: Vec::new(),
+            },
+        };
+        if migration.format > SEARCH_ORDER_FORMAT {
+            return Err(StoreError::UnsupportedSearchFormat {
+                found: migration.format,
+                supported: SEARCH_ORDER_FORMAT,
+            });
+        }
+        while !matches!(migration.stage, SearchOrderStage::Done) {
+            let mut batch = self.buffered_batch();
+            let mut visited = 0usize;
+            let mut last = None;
+            match migration.stage {
+                SearchOrderStage::Clear => {
+                    for guard in self.search_queue.iter() {
+                        let (key, _) = guard.into_inner()?;
+                        if key.as_ref() <= migration.after.as_slice() {
+                            continue;
+                        }
+                        last = Some(key.to_vec());
+                        batch.remove(&self.search_queue, key);
+                        visited += 1;
+                        if visited == QV_BUILD_ROWS {
+                            break;
+                        }
+                    }
+                }
+                SearchOrderStage::Delete
+                | SearchOrderStage::Reindex
+                | SearchOrderStage::Subject => {
+                    let (kind, prefix) = match migration.stage {
+                        SearchOrderStage::Delete => (QueueKind::Delete, graph_delete_prefix()),
+                        SearchOrderStage::Reindex => (QueueKind::Reindex, graph_reindex_prefix()),
+                        SearchOrderStage::Subject => (QueueKind::Subject, graph_dirty_prefix()),
+                        SearchOrderStage::Clear | SearchOrderStage::Done => unreachable!(),
+                    };
+                    for guard in self.graphs.prefix(prefix) {
+                        let (key, value) = guard.into_inner()?;
+                        if key.as_ref() <= migration.after.as_slice() {
+                            continue;
+                        }
+                        let cursor = self.queue_cursor(kind, key.as_ref(), value.as_ref())?;
+                        batch.insert(&self.search_queue, search_order_key(cursor), key.as_ref());
+                        last = Some(key.to_vec());
+                        visited += 1;
+                        if visited == QV_BUILD_ROWS {
+                            break;
+                        }
+                    }
+                }
+                SearchOrderStage::Done => unreachable!(),
+            }
+            if let Some(last) = last {
+                migration.after = last;
+            }
+            if visited < QV_BUILD_ROWS {
+                migration.stage = match migration.stage {
+                    SearchOrderStage::Clear => SearchOrderStage::Delete,
+                    SearchOrderStage::Delete => SearchOrderStage::Reindex,
+                    SearchOrderStage::Reindex => SearchOrderStage::Subject,
+                    SearchOrderStage::Subject => SearchOrderStage::Done,
+                    SearchOrderStage::Done => unreachable!(),
+                };
+                migration.after.clear();
+            }
+            batch.insert(
+                &self.search_meta,
+                SEARCH_ORDER_KEY,
+                postcard::to_allocvec(&migration)?,
+            );
+            self.commit_fjall_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn queue_cursor(&self, kind: QueueKind, key: &[u8], value: &[u8]) -> Result<QueueCursor> {
+        let tokens = decode_dirty_tokens(value, "fts queue tokens")?;
+        let expected = if matches!(kind, QueueKind::Subject) {
+            33
+        } else {
+            17
+        };
+        if key.len() != expected {
+            return Err(StoreError::InvalidSearchState("queue-identity-key-invalid"));
+        }
+        Ok(QueueCursor {
+            token: tokens.oldest,
+            kind,
+            graph: decode_term_id(&key[1..17], "fts queue graph")?,
+            subject: matches!(kind, QueueKind::Subject)
+                .then(|| decode_term_id(&key[17..33], "fts queue subject"))
+                .transpose()?,
+        })
     }
 
     pub fn database(&self) -> &Database {
@@ -7276,14 +7501,36 @@ impl GraphStore {
         self.persist_mode
     }
 
-    /// Flush every keyspace, then compact it.
-    ///
-    /// The rotation is load-bearing: compaction has no input until a memtable
-    /// is flushed, and a memtable only flushes on its own once it exceeds a
-    /// ceiling that fjall persists per keyspace at creation. A store created
-    /// before that ceiling was lowered keeps the old one, so this call was
-    /// otherwise a no-op on exactly the stores needing it (C1/C2). Depends on
-    /// fjall's `#[doc(hidden)]` `rotate_memtable_and_wait`.
+    pub(crate) fn persistence_outcome(&self) -> crate::sync::PersistenceOutcome {
+        match self.persist_mode {
+            PersistMode::Buffer => crate::sync::PersistenceOutcome::Buffered,
+            PersistMode::SyncData => crate::sync::PersistenceOutcome::DataSynced,
+            PersistMode::SyncAll => crate::sync::PersistenceOutcome::FullySynced,
+        }
+    }
+
+    #[cfg(feature = "shacl-core")]
+    pub(crate) fn shacl_cache_bytes(&self) -> usize {
+        self.shacl_cache_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receipt_work(&self) -> ReceiptWork {
+        ReceiptWork {
+            lookups: self.receipt_lookups.load(Ordering::Relaxed),
+            writes: self.receipt_writes.load(Ordering::Relaxed),
+            persists: self.receipt_persists.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn persist_receipts(&self) -> Result<()> {
+        self.db.persist(self.persist_mode)?;
+        #[cfg(test)]
+        self.receipt_persists.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Flushes every keyspace before compaction, including stores with old ceilings.
     pub fn manual_compact(&self) -> Result<()> {
         self.db.persist(self.persist_mode)?;
         for keyspace in [
@@ -7297,9 +7544,24 @@ impl GraphStore {
             &self.qv2_posg,
             &self.qv2_ospg,
             &self.qv2_gosp,
-            &self.qv2_term_to_query,
-            &self.qv2_query_to_term,
+            &self.primary_term_map,
+            &self.primary_query_map,
             &self.qv2_meta,
+            &self.qv3_gspo,
+            &self.qv3_gpos,
+            &self.qv3_spog,
+            &self.qv3_posg,
+            &self.qv3_ospg,
+            &self.qv3_gosp,
+            &self.secondary_term_map,
+            &self.secondary_query_map,
+            &self.qv3_meta,
+            &self.search_queue,
+            &self.search_meta,
+            &self.receipts,
+            &self.receipt_order,
+            &self.repair_audits,
+            &self.repair_backups,
         ] {
             keyspace.rotate_memtable_and_wait()?;
             keyspace.major_compact()?;
@@ -7340,16 +7602,12 @@ impl GraphStore {
 
     fn read_term(&self, id: TermId) -> Result<EncodedTerm> {
         match self.terms.get(id.to_be_bytes())? {
-            Some(bytes) => Ok(EncodedTerm(decode_term_utf8(bytes.as_ref())?)),
+            Some(bytes) => Ok(EncodedTerm(decode_term_text(bytes.as_ref())?)),
             None => Err(StoreError::TermNotFound(id.0)),
         }
     }
 
-    /// Decode a term id through the global term cache.
-    ///
-    /// Term ids are content hashes of immutable term bytes, so a cached entry
-    /// can never become stale and needs no invalidation path. Returns an `Arc`
-    /// so hot paths share one allocation instead of cloning the string.
+    /// Decodes an immutable term through the bounded global cache.
     pub(crate) fn decode_term_arc(&self, id: TermId) -> Result<Arc<EncodedTerm>> {
         if let Some(term) = self
             .term_decode_cache
@@ -7389,7 +7647,7 @@ impl GraphStore {
         }
         Err(StoreError::TermCollision {
             attempted: term.0.clone(),
-            existing: decode_term_utf8(existing.as_ref())?,
+            existing: decode_term_text(existing.as_ref())?,
         })
     }
 
@@ -7404,7 +7662,7 @@ impl GraphStore {
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
-        if self.read_graph_meta_by_id(graph_id)?.is_none() {
+        if self.read_graph_meta(graph_id)?.is_none() {
             batch.insert(
                 &self.graphs,
                 graph_meta_key(graph_id),
@@ -7419,7 +7677,7 @@ impl GraphStore {
     pub(crate) fn stage_graph(&self, batch: &mut WriteBatch, graph: &GraphId) -> Result<TermId> {
         let graph_id =
             self.encode_term_internal(Some(batch), &EncodedTerm::from_named_node(&graph.0))?;
-        if self.read_graph_meta_by_id(graph_id)?.is_none() {
+        if self.read_graph_meta(graph_id)?.is_none() {
             batch.insert(
                 &self.graphs,
                 graph_meta_key(graph_id),
@@ -7433,11 +7691,11 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(false);
         };
-        self.contains_graph_by_id(graph_id)
+        self.contains_graph_id(graph_id)
     }
 
     /// O(1) existence probe that never decodes the metadata record.
-    pub(crate) fn contains_graph_by_id(&self, graph_id: TermId) -> Result<bool> {
+    pub(crate) fn contains_graph_id(&self, graph_id: TermId) -> Result<bool> {
         Ok(self.graphs.contains_key(graph_meta_key(graph_id))?)
     }
 
@@ -7475,21 +7733,21 @@ impl GraphStore {
     }
 
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn pending_shacl_queue_repair_required(&self) -> Result<bool> {
+    pub(crate) fn shacl_repair_needed(&self) -> Result<bool> {
         Ok(self
             .graphs
-            .get(SHACL_PENDING_QUEUE_SCHEMA_KEY)?
-            .is_none_or(|value| value.as_ref() != [SHACL_PENDING_QUEUE_SCHEMA_VERSION]))
+            .get(SHACL_QUEUE_KEY)?
+            .is_none_or(|value| value.as_ref() != [SHACL_QUEUE_VERSION]))
     }
 
     /// Rebuild the durable pending queue from all binding records.
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn repair_pending_shacl_queue(&self) -> Result<PendingQueueRepairStatistics> {
+    pub(crate) fn repair_shacl_queue(&self) -> Result<QueueRepairStats> {
         let mut batch = self.new_batch();
-        let mut pending_queue_entries_scanned = 0u64;
+        let mut pending_entries_scanned = 0u64;
         for guard in self.graphs.prefix(shacl_pending_prefix()) {
             let (key, _) = guard.into_inner()?;
-            pending_queue_entries_scanned += 1;
+            pending_entries_scanned += 1;
             batch.remove(&self.graphs, key);
         }
 
@@ -7516,21 +7774,17 @@ impl GraphStore {
             };
             batch.insert(&self.graphs, shacl_pending_key(data_graph), []);
         }
-        batch.insert(
-            &self.graphs,
-            SHACL_PENDING_QUEUE_SCHEMA_KEY,
-            [SHACL_PENDING_QUEUE_SCHEMA_VERSION],
-        );
+        batch.insert(&self.graphs, SHACL_QUEUE_KEY, [SHACL_QUEUE_VERSION]);
         self.commit(batch)?;
-        Ok(PendingQueueRepairStatistics {
+        Ok(QueueRepairStats {
             binding_records_scanned,
-            pending_queue_entries_scanned,
+            pending_entries_scanned,
         })
     }
 
     /// Scan only the durable pending queue, optionally stopping at a replay budget.
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn pending_shacl_queue_bounded(
+    pub(crate) fn bounded_shacl_queue(
         &self,
         max_graphs: usize,
         deadline: Option<Instant>,
@@ -7579,7 +7833,7 @@ impl GraphStore {
 
     #[cfg(feature = "shacl-core")]
     pub(crate) fn pending_shacl_queue(&self) -> Result<Vec<GraphId>> {
-        Ok(self.pending_shacl_queue_bounded(usize::MAX, None)?.graphs)
+        Ok(self.bounded_shacl_queue(usize::MAX, None)?.graphs)
     }
 
     #[cfg(all(test, feature = "shacl-core"))]
@@ -7598,7 +7852,7 @@ impl GraphStore {
     }
 
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn shacl_graph_is_pending(&self, graph: &GraphId) -> Result<bool> {
+    pub(crate) fn shacl_graph_pending(&self, graph: &GraphId) -> Result<bool> {
         let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
         Ok(self.graphs.contains_key(shacl_pending_key(graph))?)
     }
@@ -7798,15 +8052,26 @@ impl GraphStore {
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
     pub fn delete_graph(&self, graph: &GraphId) -> Result<()> {
-        self.delete_graph_inner(graph, None)
+        self.delete_graph_inner(DeleteGraph {
+            graph,
+            tombstone: None,
+            receipt: None,
+        })?;
+        Ok(())
     }
 
     /// Delete a graph and persist its tombstone in the same durable batch.
+    #[cfg(test)]
     pub(crate) fn delete_graph_tombstoned(&self, tombstone: &GraphTombstone) -> Result<()> {
-        self.delete_graph_inner(&tombstone.graph, Some(tombstone))
+        self.delete_graph_inner(DeleteGraph {
+            graph: &tombstone.graph,
+            tombstone: Some(tombstone),
+            receipt: None,
+        })?;
+        Ok(())
     }
 
-    fn delete_graph_inner(
+    pub(crate) fn delete_with_receipt(
         &self,
         graph: &GraphId,
         tombstone: Option<&GraphTombstone>,
