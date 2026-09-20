@@ -12441,7 +12441,7 @@ mod tests {
         #[cfg(not(feature = "search"))]
         assert!(matches!(
             result,
-            Err(error) if error.kind() == crate::CraqleErrorKind::Unsupported
+            Err(error) if error.kind == crate::CraqleErrorKind::Unsupported
         ));
     }
 
