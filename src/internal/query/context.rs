@@ -5,16 +5,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::core::{EncodedTerm, GraphId};
 use crate::store::{Result, StoreError, TermId, hash_term};
 
-/// Cancellation shared by one or more Craqle read operations.
-///
-/// This deliberately belongs to Craqle rather than exposing an evaluator or
-/// storage cancellation primitive through the public API.
+/// Cancellation shared by Craqle reads without exposing evaluator or storage
+/// cancellation primitives through the public API.
 #[derive(Clone)]
 pub struct QueryCancellation {
     inner: Arc<QueryCancellationInner>,
@@ -22,15 +20,44 @@ pub struct QueryCancellation {
 
 struct QueryCancellationInner {
     cancelled: AtomicBool,
+    registry: Mutex<CancellationRegistry>,
+}
+
+#[derive(Default)]
+struct CancellationRegistry {
+    next_id: u128,
+    evaluators: HashMap<u128, Arc<RequestState>>,
+}
+
+pub(crate) struct RequestState {
+    cause: Mutex<RequestOutcome>,
     evaluator: spareval::CancellationToken,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestOutcome {
+    Active,
+    Explicit,
+    Deadline,
+    QueryCapacity,
+    DeadlineCapacity,
+    DeadlineUnavailable,
+}
+
+pub(crate) struct CancelRegistration {
+    inner: Arc<QueryCancellationInner>,
+    id: Option<u128>,
+    state: Arc<RequestState>,
+}
+
+pub(crate) const MAX_QUERY_REGISTRATIONS: usize = 65_536;
 
 impl Default for QueryCancellation {
     fn default() -> Self {
         Self {
             inner: Arc::new(QueryCancellationInner {
                 cancelled: AtomicBool::new(false),
-                evaluator: spareval::CancellationToken::new(),
+                registry: Mutex::new(CancellationRegistry::default()),
             }),
         }
     }
@@ -44,7 +71,18 @@ impl QueryCancellation {
 
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::Release);
-        self.inner.evaluator.cancel();
+        let states = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evaluators
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for state in states {
+            state.mark_explicit();
+        }
     }
 
     #[must_use]
@@ -52,8 +90,131 @@ impl QueryCancellation {
         self.inner.cancelled.load(Ordering::Acquire)
     }
 
-    pub(crate) fn evaluator_token(&self) -> spareval::CancellationToken {
-        self.inner.evaluator.clone()
+    pub(crate) fn register(&self) -> CancelRegistration {
+        self.register_with_limit(MAX_QUERY_REGISTRATIONS)
+    }
+
+    fn register_with_limit(&self, limit: usize) -> CancelRegistration {
+        let state = Arc::new(RequestState::new());
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = if self.is_cancelled() {
+            None
+        } else if registry.evaluators.len() >= limit {
+            None
+        } else if let Some(next_id) = registry.next_id.checked_add(1) {
+            let id = registry.next_id;
+            registry.next_id = next_id;
+            registry.evaluators.insert(id, Arc::clone(&state));
+            Some(id)
+        } else {
+            None
+        };
+        let outcome = if self.is_cancelled() {
+            RequestOutcome::Explicit
+        } else if id.is_none() {
+            RequestOutcome::QueryCapacity
+        } else {
+            RequestOutcome::Active
+        };
+        drop(registry);
+        state.mark(outcome);
+        CancelRegistration {
+            inner: Arc::clone(&self.inner),
+            id,
+            state,
+        }
+    }
+}
+
+impl CancelRegistration {
+    pub(crate) fn evaluator(&self) -> spareval::CancellationToken {
+        self.state.evaluator.clone()
+    }
+
+    pub(crate) fn state(&self) -> Arc<RequestState> {
+        Arc::clone(&self.state)
+    }
+
+    pub(crate) fn outcome(&self) -> RequestOutcome {
+        self.state.outcome()
+    }
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        let Some(id) = self.id else {
+            return;
+        };
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry
+            .evaluators
+            .get(&id)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            registry.evaluators.remove(&id);
+        }
+    }
+}
+
+impl RequestState {
+    pub(crate) fn new() -> Self {
+        Self {
+            cause: Mutex::new(RequestOutcome::Active),
+            evaluator: spareval::CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn mark_deadline(&self) {
+        let mut cause = self
+            .cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cause == RequestOutcome::Active {
+            *cause = RequestOutcome::Deadline;
+        }
+        drop(cause);
+        self.evaluator.cancel();
+    }
+
+    pub(crate) fn mark_capacity(&self) {
+        self.mark(RequestOutcome::DeadlineCapacity);
+    }
+
+    pub(crate) fn mark_unavailable(&self) {
+        self.mark(RequestOutcome::DeadlineUnavailable);
+    }
+
+    fn mark_explicit(&self) {
+        self.mark(RequestOutcome::Explicit);
+    }
+
+    fn mark(&self, outcome: RequestOutcome) {
+        let mut cause = self
+            .cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outcome == RequestOutcome::Explicit || *cause == RequestOutcome::Active {
+            *cause = outcome;
+        }
+        drop(cause);
+        if outcome != RequestOutcome::Active {
+            self.evaluator.cancel();
+        }
+    }
+
+    pub(crate) fn outcome(&self) -> RequestOutcome {
+        *self
+            .cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -81,6 +242,14 @@ pub struct ReadStatistics {
     pub source_bytes_read: u64,
     pub qv_keys_read: u64,
     pub qv_bytes_read: u64,
+    #[serde(default)]
+    pub reverse_mapping_reads: u64,
+    #[serde(default)]
+    pub reverse_mapping_bytes: u64,
+    #[serde(default)]
+    pub forward_mapping_reads: u64,
+    #[serde(default)]
+    pub forward_mapping_bytes: u64,
     pub candidate_quads: u64,
     pub matching_quads: u64,
     pub graphs_considered: u64,
@@ -92,6 +261,150 @@ pub struct ReadStatistics {
     pub result_terms_decoded: u64,
     pub encoded_quad_constructions: u64,
     pub terms_decoded: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CostStatistics {
+    pub(crate) reverse_mapping_reads: u64,
+    pub(crate) reverse_mapping_bytes: u64,
+    pub(crate) forward_mapping_reads: u64,
+    pub(crate) forward_mapping_bytes: u64,
+    pub(crate) planner_index_entries: u64,
+    pub(crate) planner_point_reads: u64,
+    pub(crate) planner_cache_hits: u64,
+    pub(crate) planner_cache_misses: u64,
+    pub(crate) planner_memo_hits: u64,
+    pub(crate) planner_memo_misses: u64,
+}
+
+#[derive(Debug, Default)]
+struct CostCounters {
+    reverse_mapping_reads: AtomicU64,
+    reverse_mapping_bytes: AtomicU64,
+    forward_mapping_reads: AtomicU64,
+    forward_mapping_bytes: AtomicU64,
+    planner_index_entries: AtomicU64,
+    planner_point_reads: AtomicU64,
+    planner_cache_hits: AtomicU64,
+    planner_cache_misses: AtomicU64,
+    planner_memo_hits: AtomicU64,
+    planner_memo_misses: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QueryCost {
+    counters: Option<Arc<CostCounters>>,
+    planner: bool,
+}
+
+impl QueryCost {
+    pub(crate) fn enabled(enabled: bool) -> Self {
+        Self {
+            counters: enabled.then(|| Arc::new(CostCounters::default())),
+            planner: false,
+        }
+    }
+
+    pub(crate) fn planner(enabled: bool) -> Self {
+        Self {
+            counters: enabled.then(|| Arc::new(CostCounters::default())),
+            planner: true,
+        }
+    }
+
+    pub(crate) fn as_planner(&self) -> Self {
+        Self {
+            counters: self.counters.clone(),
+            planner: true,
+        }
+    }
+
+    pub(crate) fn reverse_mapping(&self, bytes: u64) {
+        if let Some(counters) = &self.counters {
+            Self::increment(&counters.reverse_mapping_reads);
+            Self::add(&counters.reverse_mapping_bytes, bytes);
+            if self.planner {
+                Self::increment(&counters.planner_point_reads);
+            }
+        }
+    }
+
+    pub(crate) fn forward_mapping(&self, bytes: u64) {
+        if let Some(counters) = &self.counters {
+            Self::increment(&counters.forward_mapping_reads);
+            Self::add(&counters.forward_mapping_bytes, bytes);
+            if self.planner {
+                Self::increment(&counters.planner_point_reads);
+            }
+        }
+    }
+
+    pub(crate) fn planner_entries(&self, count: u64) {
+        if self.planner
+            && let Some(counters) = &self.counters
+        {
+            Self::add(&counters.planner_index_entries, count);
+        }
+    }
+
+    pub(crate) fn planner_points(&self, count: u64) {
+        if self.planner
+            && let Some(counters) = &self.counters
+        {
+            Self::add(&counters.planner_point_reads, count);
+        }
+    }
+
+    pub(crate) fn planner_cache(&self, hit: bool) {
+        if self.planner
+            && let Some(counters) = &self.counters
+        {
+            Self::increment(if hit {
+                &counters.planner_cache_hits
+            } else {
+                &counters.planner_cache_misses
+            });
+        }
+    }
+
+    pub(crate) fn planner_memo(&self, hit: bool) {
+        if self.planner
+            && let Some(counters) = &self.counters
+        {
+            Self::increment(if hit {
+                &counters.planner_memo_hits
+            } else {
+                &counters.planner_memo_misses
+            });
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> CostStatistics {
+        self.counters
+            .as_ref()
+            .map_or_else(CostStatistics::default, |counters| CostStatistics {
+                reverse_mapping_reads: counters.reverse_mapping_reads.load(Ordering::Relaxed),
+                reverse_mapping_bytes: counters.reverse_mapping_bytes.load(Ordering::Relaxed),
+                forward_mapping_reads: counters.forward_mapping_reads.load(Ordering::Relaxed),
+                forward_mapping_bytes: counters.forward_mapping_bytes.load(Ordering::Relaxed),
+                planner_index_entries: counters.planner_index_entries.load(Ordering::Relaxed),
+                planner_point_reads: counters.planner_point_reads.load(Ordering::Relaxed),
+                planner_cache_hits: counters.planner_cache_hits.load(Ordering::Relaxed),
+                planner_cache_misses: counters.planner_cache_misses.load(Ordering::Relaxed),
+                planner_memo_hits: counters.planner_memo_hits.load(Ordering::Relaxed),
+                planner_memo_misses: counters.planner_memo_misses.load(Ordering::Relaxed),
+            })
+    }
+
+    fn increment(counter: &AtomicU64) {
+        Self::add(counter, 1);
+    }
+
+    fn add(counter: &AtomicU64, amount: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(amount))
+        });
+    }
 }
 
 /// Storage access selected for an RDF pattern scan.
@@ -131,6 +444,7 @@ struct ReadCounters {
     source_bytes_read: Cell<u64>,
     qv_keys_read: Cell<u64>,
     qv_bytes_read: Cell<u64>,
+    costs: QueryCost,
     candidate_quads: Cell<u64>,
     matching_quads: Cell<u64>,
     graphs_considered: Cell<u64>,
@@ -167,6 +481,10 @@ impl ReadCounters {
             source_bytes_read: self.source_bytes_read.get(),
             qv_keys_read: self.qv_keys_read.get(),
             qv_bytes_read: self.qv_bytes_read.get(),
+            reverse_mapping_reads: self.costs.snapshot().reverse_mapping_reads,
+            reverse_mapping_bytes: self.costs.snapshot().reverse_mapping_bytes,
+            forward_mapping_reads: self.costs.snapshot().forward_mapping_reads,
+            forward_mapping_bytes: self.costs.snapshot().forward_mapping_bytes,
             candidate_quads: self.candidate_quads.get(),
             matching_quads: self.matching_quads.get(),
             graphs_considered: self.graphs_considered.get(),
@@ -192,9 +510,8 @@ pub(crate) enum GraphVisibility<'a> {
 pub(crate) struct ReadContext<'a> {
     cancellation: QueryCancellation,
     pub(crate) visibility: GraphVisibility<'a>,
-    /// Validation is intentionally distinct from ordinary query visibility:
-    /// it names the one proposed graph and keeps its rows observable even
-    /// before the graph exists durably or diagnostics have been recomputed.
+    /// Validation keeps the proposed graph visible before durable creation or
+    /// diagnostic recomputation.
     validation_graph: Option<TermId>,
     counters: ReadCounters,
     graph_visibility: RefCell<HashMap<TermId, bool>>,
@@ -254,9 +571,8 @@ impl<'a> ReadContext<'a> {
         }
     }
 
-    /// Read the final state of exactly one graph while validating a candidate
-    /// write. This is crate-private so normal query reads retain their usual
-    /// graph and orphan filtering semantics.
+    /// Reads one candidate graph's final state while retaining normal filtering
+    /// for ordinary queries.
     #[must_use]
     pub(crate) fn for_validation(cancellation: QueryCancellation, graph: &GraphId) -> Self {
         let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
@@ -274,6 +590,14 @@ impl<'a> ReadContext<'a> {
     #[must_use]
     pub(crate) fn snapshot(&self) -> ReadStatistics {
         self.counters.snapshot()
+    }
+
+    pub(crate) fn enable_costs(&mut self) {
+        self.counters.costs = QueryCost::enabled(true);
+    }
+
+    pub(crate) fn costs(&self) -> QueryCost {
+        self.counters.costs.clone()
     }
 
     pub(crate) fn check_cancelled(&self) -> Result<()> {
@@ -388,11 +712,11 @@ impl<'a> ReadContext<'a> {
         ReadCounters::add(&self.counters.duplicate_copies_skipped, count);
     }
 
-    pub(crate) fn record_key_fields_extracted(&self, count: u64) {
+    pub(crate) fn record_key_fields(&self, count: u64) {
         ReadCounters::add(&self.counters.key_fields_extracted, count);
     }
 
-    pub(crate) fn increment_encoded_quad_constructions(&self) {
+    pub(crate) fn increment_quad_builds(&self) {
         ReadCounters::increment(&self.counters.encoded_quad_constructions);
     }
 
@@ -401,7 +725,7 @@ impl<'a> ReadContext<'a> {
         ReadCounters::increment(&self.counters.terms_decoded);
     }
 
-    pub(crate) fn increment_result_terms_decoded(&self) {
+    pub(crate) fn increment_result_decodes(&self) {
         ReadCounters::increment(&self.counters.result_terms_decoded);
     }
 
@@ -423,5 +747,67 @@ impl<'a> ReadContext<'a> {
 
     pub(crate) fn validation_graph(&self) -> Option<TermId> {
         self.validation_graph
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_releases_capacity() {
+        let cancellation = QueryCancellation::new();
+        let first = cancellation.register_with_limit(1);
+        assert_eq!(first.outcome(), RequestOutcome::Active);
+        let rejected = cancellation.register_with_limit(1);
+        assert_eq!(rejected.outcome(), RequestOutcome::QueryCapacity);
+        assert!(rejected.evaluator().is_cancelled());
+        drop(first);
+        let admitted = cancellation.register_with_limit(1);
+        assert_eq!(admitted.outcome(), RequestOutcome::Active);
+
+        let exhausted = QueryCancellation::new();
+        exhausted.inner.registry.lock().unwrap().next_id = u128::MAX;
+        let rejected = exhausted.register_with_limit(1);
+        assert_eq!(rejected.outcome(), RequestOutcome::QueryCapacity);
+    }
+
+    #[test]
+    fn stale_drop_preserves() {
+        let cancellation = QueryCancellation::new();
+        let registration = cancellation.register_with_limit(1);
+        let id = registration.id.expect("registration must have an id");
+        let replacement = Arc::new(RequestState::new());
+        cancellation
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .evaluators
+            .insert(id, Arc::clone(&replacement));
+        drop(registration);
+        let registry = cancellation.inner.registry.lock().unwrap();
+        assert!(
+            registry
+                .evaluators
+                .get(&id)
+                .is_some_and(|state| Arc::ptr_eq(state, &replacement))
+        );
+    }
+
+    #[test]
+    fn explicit_wins_race() {
+        let cancellation = QueryCancellation::new();
+        let registration = cancellation.register();
+        registration.state.mark_deadline();
+        cancellation.cancel();
+        assert_eq!(registration.outcome(), RequestOutcome::Explicit);
+        assert!(registration.evaluator().is_cancelled());
+
+        let cancellation = QueryCancellation::new();
+        let registration = cancellation.register();
+        cancellation.cancel();
+        registration.state.mark_deadline();
+        assert_eq!(registration.outcome(), RequestOutcome::Explicit);
     }
 }
