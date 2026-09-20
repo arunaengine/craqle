@@ -387,6 +387,105 @@ mod tests {
     }
 
     #[test]
+    fn slice_demand_plans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(tmp.path()).unwrap();
+        let graph = GraphId::new("urn:test:slice-demand");
+        let mut changes = Vec::new();
+        let mut left = vec![Vec::new(); 129];
+        let mut right = vec![Vec::new(); 129];
+        for index in 0..256 {
+            let key = if index < 128 {
+                0
+            } else {
+                1 + (index - 128) % 128
+            };
+            let subject = format!("urn:test:slice-demand:left:{index:03}");
+            left[key].push(subject.clone());
+            changes.push(MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: term_iri(&subject),
+                predicate: term_iri("urn:test:slice-demand:left"),
+                object: term_iri(&format!("urn:test:slice-demand:key:{key:03}")),
+            });
+        }
+        for index in 0..512 {
+            let key = if index < 256 {
+                0
+            } else {
+                1 + (index - 256) % 128
+            };
+            let subject = format!("urn:test:slice-demand:right:{index:03}");
+            right[key].push(subject.clone());
+            changes.push(MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: term_iri(&subject),
+                predicate: term_iri("urn:test:slice-demand:right"),
+                object: term_iri(&format!("urn:test:slice-demand:key:{key:03}")),
+            });
+        }
+        node.apply_changes_unchecked(&graph, changes).unwrap();
+        let mut expected = BTreeSet::new();
+        for (key, (left, right)) in left.iter().zip(&right).enumerate() {
+            for left in left {
+                for right in right {
+                    expected.insert(format!(
+                        "key=<urn:test:slice-demand:key:{key:03}>|left=<{left}>|right=<{right}>"
+                    ));
+                }
+            }
+        }
+        let run = |suffix: &str, mode| {
+            let query = node
+                .prepare_query(&format!(
+                    "SELECT ?left ?right ?key WHERE {{ \
+                     ?left <urn:test:slice-demand:left> ?key . \
+                     ?right <urn:test:slice-demand:right> ?key }} {suffix}"
+                ))
+                .unwrap();
+            let mut options = QueryOptions::default();
+            options.fast_paths = QueryFastPathMode::Disabled;
+            options.join_mode = mode;
+            options.collect_plan_statistics = false;
+            node.execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                std::slice::from_ref(&graph),
+                &query,
+                &options,
+            )
+            .unwrap()
+        };
+        let full = run("", JoinMode::Auto);
+        assert_eq!(full.statistics.result_rows as usize, expected.len());
+        assert_eq!(canonical_rows(full.results.clone()), expected);
+        assert_eq!(
+            full.statistics.planned_joins[0].physical_operator,
+            JoinKind::Hash
+        );
+        let assert_limited = |results: &QueryResults| {
+            let QueryResults::Solutions(rows) = results else {
+                panic!("expected solutions");
+            };
+            let actual = canonical_rows(results.clone());
+            assert_eq!(rows.len(), 20);
+            assert_eq!(actual.len(), 20);
+            assert!(actual.is_subset(&expected));
+        };
+        let limited = run("LIMIT 20", JoinMode::Auto);
+        assert_limited(&limited.results);
+        assert_eq!(
+            limited.statistics.planned_joins[0].physical_operator,
+            JoinKind::IndexedLateral
+        );
+        let forced = run("LIMIT 20", JoinMode::ForceHash);
+        assert_limited(&forced.results);
+        assert_eq!(
+            forced.statistics.planned_joins[0].physical_operator,
+            JoinKind::Hash
+        );
+    }
+
+    #[test]
     fn optimizer_respects_visibility() {
         let tmp = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
