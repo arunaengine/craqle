@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use crate::core::{EncodedTerm, GraphId};
 use crate::query::context::{GraphVisibility, QueryReadMode, ReadAccessPath, ReadContext};
-use crate::query::cursor::QueryCursor;
+use crate::query::cursor::{
+    DenseCursor, DenseInput, DenseResolver, IndexScan, QueryCursor, RawIndexPattern,
+};
 use crate::store::{
-    EncodedQuad, GraphStore, QueryIndexAdmission, QueryIndexCursorOrder, Result, StoreError,
-    StoreReadSnapshot, TermId,
+    EncodedQuad, GraphStore, IndexCursorOrder, QueryIndexAdmission, QvRead, QvStat, Result,
+    StoreError, StoreReadSnapshot, TermId,
 };
 
 /// A quad pattern represented entirely by internally interned term ids.
@@ -22,6 +24,37 @@ pub(crate) struct QuadPattern {
     pub(crate) subject: Option<TermId>,
     pub(crate) predicate: Option<TermId>,
     pub(crate) object: Option<TermId>,
+}
+
+pub(crate) struct DenseScan {
+    pub(crate) selector: GraphSelector,
+    pub(crate) shape: QuadPattern,
+    pub(crate) pattern: RawIndexPattern,
+    pub(crate) source_hints: [Option<(crate::store::QueryTermId, TermId)>; 4],
+    pub(crate) scope: u64,
+    pub(crate) resolver: Option<DenseResolver>,
+    pub(crate) cache_entries: usize,
+    pub(crate) cache_bytes: usize,
+}
+
+pub(crate) struct VisibilityTerms {
+    pub(crate) graph: TermId,
+    pub(crate) subject: TermId,
+    pub(crate) object: TermId,
+}
+
+pub(crate) struct VisibilityInput<'store, 'context, 'visibility> {
+    pub(crate) store: &'store GraphStore,
+    pub(crate) snapshot: &'store StoreReadSnapshot,
+    pub(crate) context: &'context ReadContext<'visibility>,
+    pub(crate) terms: VisibilityTerms,
+}
+
+pub(crate) struct GraphVisibilityInput<'store, 'context, 'visibility> {
+    pub(crate) store: &'store GraphStore,
+    pub(crate) snapshot: &'store StoreReadSnapshot,
+    pub(crate) context: &'context ReadContext<'visibility>,
+    pub(crate) graph: TermId,
 }
 
 impl QuadPattern {
@@ -218,7 +251,11 @@ impl<'store> StoreReadView<'store> {
         term: TermId,
     ) -> Result<Option<crate::store::QueryTermId>> {
         context.check_cancelled()?;
-        self.snapshot.query_term_id(self.store, term)
+        let (term, bytes) = self.snapshot.query_term_id(self.store, term)?;
+        if let Some(bytes) = bytes {
+            context.costs().forward_mapping(bytes);
+        }
+        Ok(term)
     }
 
     pub(crate) fn decode_result_term(
@@ -227,16 +264,16 @@ impl<'store> StoreReadView<'store> {
         term: TermId,
     ) -> Result<EncodedTerm> {
         let decoded = decode_term(self.store, context, term)?;
-        context.increment_result_terms_decoded();
+        context.increment_result_decodes();
         Ok(decoded)
     }
 
-    pub(crate) fn raw_query_index_keys(
+    pub(crate) fn raw_index_keys(
         &self,
         context: &ReadContext<'_>,
         selector: GraphSelector,
         pattern: QuadPattern,
-    ) -> Result<Option<crate::query::cursor::RawQueryIndexKeyCursor>> {
+    ) -> Result<Option<crate::query::cursor::RawIndexCursor>> {
         context.check_cancelled()?;
         let Some(pattern) = selector.apply(pattern) else {
             return Ok(None);
@@ -269,14 +306,90 @@ impl<'store> StoreReadView<'store> {
         }
         context.record_access_path(path);
         context.increment_index_seeks();
-        self.snapshot.query_index_key_cursor(
+        let costs = context.costs();
+        self.snapshot.index_key_cursor(
             self.store,
-            Self::qv_order(path),
-            pattern,
-            admission
-                .query_id_upper_bound
-                .expect("trusted query index has a dense-ID upper bound"),
+            &IndexScan {
+                order: Self::qv_order(path),
+                pattern,
+                query_id_limit: admission.query_id_limit,
+                costs: &costs,
+            },
         )
+    }
+
+    pub(crate) fn dense_keys<'context, 'visibility>(
+        &'context self,
+        context: &'context ReadContext<'visibility>,
+        scan: DenseScan,
+    ) -> Result<Option<DenseCursor<'context, 'context, 'visibility>>> {
+        context.check_cancelled()?;
+        if context.validation_graph().is_some() {
+            return Ok(None);
+        }
+        let Some(shape) = scan.selector.apply(scan.shape) else {
+            return Ok(None);
+        };
+        if let GraphSelector::Named(graph) = scan.selector
+            && !self.graph_is_visible(context, graph)?
+        {
+            return Ok(None);
+        }
+        if matches!(self.read_mode, QueryReadMode::ForceSource) {
+            return Ok(None);
+        }
+        let path = match self.read_mode {
+            QueryReadMode::Auto => Self::auto_access_path(scan.selector, shape),
+            QueryReadMode::ForceQv => Self::force_qv_path(scan.selector, shape),
+            QueryReadMode::ForceSource => unreachable!("handled above"),
+        };
+        let admission = self.qv_admission(context)?;
+        if !admission.trusted {
+            if matches!(self.read_mode, QueryReadMode::ForceQv)
+                || matches!(scan.selector, GraphSelector::DefaultUnion)
+            {
+                return Err(StoreError::QueryIndexUnavailable(
+                    admission
+                        .fallback_reason
+                        .unwrap_or("query-index-v2-not-trusted"),
+                ));
+            }
+            return Ok(None);
+        }
+        let generation =
+            admission
+                .query_id_generation
+                .ok_or(StoreError::IndexVerificationFailed(
+                    "query-generation-missing",
+                ))?;
+        context.record_access_path(path);
+        context.increment_index_seeks();
+        let costs = context.costs();
+        let Some(raw) = self.snapshot.index_key_cursor(
+            self.store,
+            &IndexScan {
+                order: Self::qv_order(path),
+                pattern: QuadPattern::default(),
+                query_id_limit: admission.query_id_limit,
+                costs: &costs,
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(DenseCursor::new(DenseInput {
+            store: self.store,
+            snapshot: &self.snapshot,
+            context,
+            raw: raw.narrow(scan.pattern).track_costs(costs),
+            generation,
+            scope: scan.scope,
+            default_union: matches!(scan.selector, GraphSelector::DefaultUnion),
+            source_hints: scan.source_hints,
+            resolver: scan.resolver,
+            cache_entries: scan.cache_entries,
+            cache_bytes: scan.cache_bytes,
+        })))
     }
 
     pub(crate) fn orphaned_ids(
@@ -287,22 +400,22 @@ impl<'store> StoreReadView<'store> {
         orphaned_for_graph(self.store, &self.snapshot, context, graph)
     }
 
-    fn qv_order(path: ReadAccessPath) -> QueryIndexCursorOrder {
+    fn qv_order(path: ReadAccessPath) -> IndexCursorOrder {
         match path {
-            ReadAccessPath::QvGspo => QueryIndexCursorOrder::Gspo,
-            ReadAccessPath::QvGpos => QueryIndexCursorOrder::Gpos,
-            ReadAccessPath::QvSpog => QueryIndexCursorOrder::Spog,
-            ReadAccessPath::QvPosg => QueryIndexCursorOrder::Posg,
-            ReadAccessPath::QvOspg => QueryIndexCursorOrder::Ospg,
-            ReadAccessPath::QvGosp => QueryIndexCursorOrder::Gosp,
+            ReadAccessPath::QvGspo => IndexCursorOrder::Gspo,
+            ReadAccessPath::QvGpos => IndexCursorOrder::Gpos,
+            ReadAccessPath::QvSpog => IndexCursorOrder::Spog,
+            ReadAccessPath::QvPosg => IndexCursorOrder::Posg,
+            ReadAccessPath::QvOspg => IndexCursorOrder::Ospg,
+            ReadAccessPath::QvGosp => IndexCursorOrder::Gosp,
             ReadAccessPath::SourceGspo | ReadAccessPath::Empty => {
                 unreachable!("only qv access paths have qv orders")
             }
         }
     }
 
-    pub(crate) fn contains_graph_by_id(&self, graph: TermId) -> Result<bool> {
-        self.snapshot.contains_graph_by_id(self.store, graph)
+    pub(crate) fn contains_graph_id(&self, graph: TermId) -> Result<bool> {
+        self.snapshot.contains_graph_id(self.store, graph)
     }
 
     pub(crate) fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
@@ -312,11 +425,19 @@ impl<'store> StoreReadView<'store> {
         else {
             return Ok(false);
         };
-        self.contains_graph_by_id(graph)
+        self.contains_graph_id(graph)
     }
 
-    pub(crate) fn graph_term_id_iter(&self) -> impl Iterator<Item = Result<TermId>> + '_ {
-        self.snapshot.graph_term_id_iter(self.store)
+    pub(crate) fn graph_term_iter(&self) -> impl Iterator<Item = Result<TermId>> + '_ {
+        self.snapshot.graph_term_iter(self.store)
+    }
+
+    pub(crate) fn planner_stat(
+        &self,
+        context: &ReadContext<'_>,
+        stat: crate::store::PlannerStat,
+    ) -> usize {
+        self.store.planner_stat(stat, &context.costs().as_planner())
     }
 
     pub(crate) fn qv_g_count(
@@ -328,7 +449,14 @@ impl<'store> StoreReadView<'store> {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot.qv_g_count(self.store, graph)
+        let costs = context.costs();
+        self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::Graph(graph),
+                costs: &costs,
+            },
+        )
     }
 
     pub(crate) fn qv_total_count(&self, context: &ReadContext<'_>) -> Result<Option<u64>> {
@@ -336,18 +464,34 @@ impl<'store> StoreReadView<'store> {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot.qv_total_count(self.store)
+        let costs = context.costs();
+        self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::Total,
+                costs: &costs,
+            },
+        )
     }
 
-    pub(crate) fn qv_union_duplicate_free(
-        &self,
-        context: &ReadContext<'_>,
-    ) -> Result<Option<bool>> {
+    pub(crate) fn qv_union_unique(&self, context: &ReadContext<'_>) -> Result<Option<bool>> {
         if !self.qv_ready(context)? {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot.qv_union_duplicate_free(self.store)
+        let costs = context.costs();
+        let value = self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::UnionUnique,
+                costs: &costs,
+            },
+        )?;
+        Ok(value.and_then(|value| match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }))
     }
 
     pub(crate) fn qv_p_count(
@@ -359,7 +503,14 @@ impl<'store> StoreReadView<'store> {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot.qv_p_count(self.store, predicate)
+        let costs = context.costs();
+        self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::Predicate(predicate),
+                costs: &costs,
+            },
+        )
     }
 
     pub(crate) fn qv_po_count(
@@ -372,7 +523,14 @@ impl<'store> StoreReadView<'store> {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot.qv_po_count(self.store, predicate, object)
+        let costs = context.costs();
+        self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::PredicateObject(predicate, object),
+                costs: &costs,
+            },
+        )
     }
 
     pub(crate) fn qv_gp_count(
@@ -385,7 +543,14 @@ impl<'store> StoreReadView<'store> {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot.qv_gp_count(self.store, graph, predicate)
+        let costs = context.costs();
+        self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::GraphPredicate(graph, predicate),
+                costs: &costs,
+            },
+        )
     }
 
     pub(crate) fn qv_gpo_count(
@@ -399,8 +564,14 @@ impl<'store> StoreReadView<'store> {
             return Ok(None);
         }
         context.record_qv_meta();
-        self.snapshot
-            .qv_gpo_count(self.store, graph, predicate, object)
+        let costs = context.costs();
+        self.snapshot.qv_stat(
+            self.store,
+            &QvRead {
+                stat: QvStat::GraphPredicateObject(graph, predicate, object),
+                costs: &costs,
+            },
+        )
     }
 
     fn qv_ready(&self, context: &ReadContext<'_>) -> Result<bool> {
@@ -508,9 +679,19 @@ impl RdfReadView for StoreReadView<'_> {
 
         context.record_access_path(requested);
         context.increment_index_seeks();
-        let raw =
-            self.snapshot
-                .query_index_cursor(self.store, Self::qv_order(requested), pattern)?;
+        let costs = context.costs();
+        let raw = self
+            .snapshot
+            .query_index_cursor(
+                self.store,
+                &IndexScan {
+                    order: Self::qv_order(requested),
+                    pattern,
+                    query_id_limit: None,
+                    costs: &costs,
+                },
+            )?
+            .track_costs(costs);
         if matches!(selector, GraphSelector::DefaultUnion) {
             Ok(QueryCursor::default_union(
                 self.store,
@@ -690,7 +871,7 @@ pub(crate) fn graph_is_visible(
     context.increment_graphs_considered();
     let visible = if let Some(validation_graph) = context.validation_graph() {
         graph == validation_graph
-    } else if !snapshot.contains_graph_by_id(store, graph)? {
+    } else if !snapshot.contains_graph_id(store, graph)? {
         false
     } else {
         match &context.visibility {
@@ -729,17 +910,54 @@ pub(crate) fn quad_is_visible(
     context: &ReadContext<'_>,
     quad: EncodedQuad,
 ) -> Result<bool> {
-    let visible = graph_is_visible(store, snapshot, context, quad.graph)?;
-    context.check_cancelled()?;
+    terms_are_visible(VisibilityInput {
+        store,
+        snapshot,
+        context,
+        terms: VisibilityTerms {
+            graph: quad.graph,
+            subject: quad.subject,
+            object: quad.object,
+        },
+    })
+}
+
+pub(crate) fn terms_are_visible(input: VisibilityInput<'_, '_, '_>) -> Result<bool> {
+    let visible = graph_is_visible(
+        input.store,
+        input.snapshot,
+        input.context,
+        input.terms.graph,
+    )?;
+    input.context.check_cancelled()?;
     if !visible {
         return Ok(false);
     }
-    if context.validation_graph().is_some() {
+    if input.context.validation_graph().is_some() {
         return Ok(true);
     }
-    let orphaned = orphaned_for_graph(store, snapshot, context, quad.graph)?;
-    context.increment_orphan_checks();
-    Ok(!orphaned.contains(&quad.subject) && !orphaned.contains(&quad.object))
+    let orphaned = orphaned_for_graph(
+        input.store,
+        input.snapshot,
+        input.context,
+        input.terms.graph,
+    )?;
+    input.context.increment_orphan_checks();
+    Ok(!orphaned.contains(&input.terms.subject) && !orphaned.contains(&input.terms.object))
+}
+
+pub(crate) fn graph_orphans(
+    input: GraphVisibilityInput<'_, '_, '_>,
+) -> Result<Option<Rc<HashSet<TermId>>>> {
+    if input.context.validation_graph().is_some() {
+        return Ok(None);
+    }
+    let visible = graph_is_visible(input.store, input.snapshot, input.context, input.graph)?;
+    input.context.check_cancelled()?;
+    if !visible {
+        return Ok(None);
+    }
+    orphaned_for_graph(input.store, input.snapshot, input.context, input.graph).map(Some)
 }
 
 #[cfg(test)]
@@ -801,7 +1019,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        let mut clock = store.vector_clock_id(graph_id).unwrap();
         clock.advance(actor, counter);
         store
             .set_vector_clock(
@@ -825,7 +1043,7 @@ mod tests {
         let _guard = store.graph_commit_guard(graph);
         let actor = ActorId::random();
         let mut batch = store.new_batch();
-        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        let mut clock = store.vector_clock_id(graph_id).unwrap();
         for index in 0..count {
             let subject = store
                 .resolve_term(&named(&format!("urn:test:read:s{index}")))
@@ -927,7 +1145,7 @@ mod tests {
     }
 
     fn remove_quad(store: &GraphStore, graph: &GraphId, quad: EncodedQuad) {
-        let witnessed = store.get_vector_clock_by_id(quad.graph).unwrap();
+        let witnessed = store.vector_clock_id(quad.graph).unwrap();
         let _guard = store.graph_commit_guard(graph);
         let mut batch = store.new_batch();
         assert!(
@@ -1585,7 +1803,7 @@ mod tests {
             .lookup_term(&named("urn:test:read:p"))
             .unwrap()
             .unwrap();
-        let before = store.query_index_admission_probe_count();
+        let before = store.admission_probe_count();
         let view = StoreReadView::new(&store);
         let second_view = view.clone();
         let context = ReadContext::default();
@@ -1617,7 +1835,7 @@ mod tests {
 
         assert_eq!(
             2,
-            store.query_index_admission_probe_count() - before,
+            store.admission_probe_count() - before,
             "the hot path reads only the Ready header and exact total counter"
         );
         let statistics = context.snapshot();
@@ -2319,7 +2537,7 @@ mod tests {
                         "urn:test:object:p3",
                         "urn:test:object:o",
                     );
-                    let witnessed = store.get_vector_clock_by_id(removed.graph).unwrap();
+                    let witnessed = store.vector_clock_id(removed.graph).unwrap();
                     let _guard = store.graph_commit_guard(&graph);
                     let mut batch = store.new_batch();
                     assert!(
