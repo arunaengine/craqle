@@ -2200,6 +2200,7 @@ struct FtsRewriteCtx<'a> {
     scope: GraphScope<'a>,
     post_raw_visibility: Option<(&'a GraphStore, &'a SnapshotVisibleFn<'a>)>,
     clock: &'a RequestClock,
+    limits: &'a QueryLimits,
 }
 
 fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
@@ -2311,28 +2312,33 @@ fn rewrite_graph_pattern(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result
     })
 }
 
-/// Graph-visibility verdicts for FTS hits, memoized by graph IRI.
-///
-/// Over-fetching surfaces many hits from the same graph and the `Predicate`
-/// scope's callback costs a policy read per call, so each graph is decided at
-/// most once per SERVICE clause.
+/// Bounds graph-policy memoization for one pinned SERVICE request.
 struct FtsGraphVisibility<'a> {
     scope: GraphScope<'a>,
     listed: Option<HashSet<&'a str>>,
-    memo: RefCell<HashMap<String, bool>>,
+    memo: RefCell<crate::cache::BoundedCache<String, bool>>,
 }
 
 impl<'a> FtsGraphVisibility<'a> {
-    fn new(scope: GraphScope<'a>) -> Self {
+    fn new(scope: GraphScope<'a>, bytes: usize) -> Result<Self> {
         let listed = match scope {
-            GraphScope::List(graphs) => Some(graphs.iter().map(GraphId::as_str).collect()),
+            GraphScope::List(graphs) => {
+                let needed = graphs.len().saturating_mul(std::mem::size_of::<&str>() * 4);
+                if needed > bytes {
+                    return Err(SparqlError::QueryLimit {
+                        resource: "fts graph scope bytes",
+                        limit: bytes,
+                    });
+                }
+                Some(graphs.iter().map(GraphId::as_str).collect())
+            }
             _ => None,
         };
-        Self {
+        Ok(Self {
             scope,
             listed,
-            memo: RefCell::new(HashMap::new()),
-        }
+            memo: RefCell::new(crate::cache::BoundedCache::new(1_024, bytes)),
+        })
     }
 
     fn allows(&self, graph_iri: &str) -> bool {
@@ -2344,46 +2350,25 @@ impl<'a> FtsGraphVisibility<'a> {
                 .as_ref()
                 .is_some_and(|listed| listed.contains(graph_iri)),
             GraphScope::Predicate(visible) => {
-                if let Some(&allowed) = self.memo.borrow().get(graph_iri) {
+                if let Some(allowed) = self.memo.borrow_mut().get_cloned(graph_iri) {
                     return allowed;
                 }
                 let allowed = visible(&GraphId::new(graph_iri));
-                self.memo.borrow_mut().insert(graph_iri.to_owned(), allowed);
+                self.memo.borrow_mut().insert(
+                    graph_iri.to_owned(),
+                    allowed,
+                    graph_iri.len().saturating_mul(2),
+                );
                 allowed
             }
         }
     }
 }
 
-/// Post-search filter applied to every hit tantivy returns.
 struct FtsHitFilter<'a> {
     visibility: &'a FtsGraphVisibility<'a>,
     post_raw_visibility: Option<(&'a GraphStore, &'a SnapshotVisibleFn<'a>)>,
-    /// Set when the SERVICE pinned its subject to a concrete IRI.
     subject: Option<&'a str>,
-}
-
-impl FtsHitFilter<'_> {
-    fn keeps(
-        &self,
-        hit: &crate::search::SearchHit,
-        current: Option<&StoreReadSnapshot>,
-        current_memo: &mut HashMap<String, bool>,
-    ) -> bool {
-        if !self.visibility.allows(&hit.graph_id) {
-            return false;
-        }
-        if let (Some((_, visible)), Some(current)) = (self.post_raw_visibility, current) {
-            let allowed = *current_memo
-                .entry(hit.graph_id.clone())
-                .or_insert_with(|| visible(current, &GraphId::new(&hit.graph_id)));
-            if !allowed {
-                return false;
-            }
-        }
-        self.subject
-            .is_none_or(|subject| hit.subject_iri == subject)
-    }
 }
 
 /// One FTS SERVICE lookup: what to search for, how many rows the caller asked
@@ -2399,77 +2384,66 @@ struct FtsSearchRequest<'a> {
     filter: FtsHitFilter<'a>,
 }
 
-/// Collects up to the requested number of authorized, deduplicated hits,
-/// widening its over-fetch until the page fills or the index runs out.
+/// Authorizes before ranking and checks current raw policies before returning rows.
 fn search_visible_hits(
     search: &SearchIndex,
     request: &FtsSearchRequest<'_>,
 ) -> Result<Vec<crate::search::SearchHit>> {
-    let mut fetch = request
-        .limit
-        .saturating_mul(FTS_OVERFETCH_FACTOR)
-        .max(FTS_MIN_FETCH);
-    loop {
+    request.clock.check_stage()?;
+    let allows = |graph: &str| {
         request.clock.check_stage()?;
-        let raw = match request.graph {
-            Some(graph) => search.search_in_graph(graph, request.query, fetch)?,
-            None => search.search(request.query, fetch)?,
-        };
-        let raw_len = raw.len();
-        let current = request
-            .filter
-            .post_raw_visibility
-            .map(|(store, _)| store.read_snapshot());
-        let mut current_memo = HashMap::new();
-
-        let mut seen = crate::SeenHits::default();
-        let mut kept = Vec::with_capacity(request.limit.min(raw_len));
-        for hit in raw {
-            if !seen.admits(&hit)
-                || !request
-                    .filter
-                    .keeps(&hit, current.as_ref(), &mut current_memo)
-            {
+        Ok(request.graph.is_none_or(|selected| graph == selected)
+            && request.filter.visibility.allows(graph))
+    };
+    let check = || request.clock.check_stage();
+    let raw = search.collect_filtered(crate::search::FilterQuery::<SparqlError> {
+        query: request.query,
+        limit: request.limit,
+        subject: request.filter.subject,
+        allows: &allows,
+        check: &check,
+    })?;
+    request.clock.check_stage()?;
+    if request.clamped && raw.len() == request.limit {
+        return Err(SparqlError::QueryLimit {
+            resource: "fts hits",
+            limit: request.limit,
+        });
+    }
+    let current = request
+        .filter
+        .post_raw_visibility
+        .map(|(store, _)| store.read_snapshot());
+    let mut memo = crate::cache::BoundedCache::new(1_024, search.query_bytes() / 4);
+    let mut kept = Vec::with_capacity(raw.len());
+    for hit in raw {
+        if let (Some((_, visible)), Some(current)) =
+            (request.filter.post_raw_visibility, current.as_ref())
+        {
+            let allowed = if let Some(allowed) = memo.get_cloned(hit.graph_id.as_str()) {
+                allowed
+            } else {
+                let allowed = visible(current, &GraphId::new(&hit.graph_id));
+                memo.insert(
+                    hit.graph_id.clone(),
+                    allowed,
+                    hit.graph_id.len().saturating_mul(2),
+                );
+                allowed
+            };
+            if !allowed {
                 continue;
             }
-            kept.push(hit);
-            if kept.len() == request.limit {
-                if request.clamped {
-                    return Err(SparqlError::QueryLimit {
-                        resource: "fts hits",
-                        limit: request.limit,
-                    });
-                }
-                return Ok(kept);
-            }
         }
-
-        // Short of `limit`. If the index returned fewer hits than we asked
-        // for it has no more matches, so this is the complete answer.
-        if raw_len < fetch {
-            return Ok(kept);
-        }
-        match fetch.checked_mul(FTS_OVERFETCH_FACTOR) {
-            Some(next) => fetch = next,
-            // Widening any further would overflow, so completeness is unknown.
-            None => {
-                return Err(SparqlError::QueryLimit {
-                    resource: "fts over-fetch",
-                    limit: fetch,
-                });
-            }
-        }
+        kept.push(hit);
     }
+    Ok(kept)
 }
 
-/// Rewrites an FTS SERVICE clause into an inline `VALUES` block.
-///
-/// The index is read at its **last committed state**: FTS updates still
-/// sitting in the durable queue (drained by the search worker, G7) are not
-/// visible to this clause. Callers that need read-your-writes must flush the
-/// search worker first.
+/// Rewrites FTS against the last committed index state into `VALUES`.
+/// Callers needing read-your-writes must flush search first.
 fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
-    let spec = parse_fts_service_spec(pattern)?;
+    let spec = parse_fts_spec(pattern)?;
     if spec.limit == 0 {
         return Ok(GraphPattern::Values {
             variables: requested_fts_variables(&spec),
@@ -2483,8 +2457,14 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
             "FTS SERVICE must bind at least one variable".into(),
         ));
     }
-
-    let visibility = FtsGraphVisibility::new(cx.scope);
+    if spec.limit > cx.limits.max_intermediate_rows {
+        return Err(SparqlError::QueryLimit {
+            resource: "intermediate rows",
+            limit: cx.limits.max_intermediate_rows,
+        });
+    }
+    cx.search.ensure_available()?;
+    let visibility = FtsGraphVisibility::new(cx.scope, cx.search.query_bytes() / 4)?;
     let graph = match &spec.graph {
         Some(FtsGraphBinding::Fixed(graph)) => {
             if !visibility.allows(graph.as_str()) {
@@ -2528,10 +2508,9 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
     })
 }
 
-/// Read one FTS SERVICE block's arguments. `fts:limit` is clamped to
-/// [`crate::MAX_SEARCH_LIMIT`] (10_000); a clamp that truncates the answer is
-/// reported by [`search_visible_hits`].
-fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
+/// Reads FTS arguments and clamps `fts:limit` to [`crate::MAX_SEARCH_LIMIT`].
+/// A truncating clamp is reported by [`search_visible_hits`].
+fn parse_fts_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     let GraphPattern::Bgp { patterns } = pattern else {
         return Err(SparqlError::Unsupported(
             "FTS SERVICE currently supports only basic graph patterns".into(),
@@ -2553,7 +2532,7 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
             }
         };
 
-        set_or_check_subject(&mut spec, pattern.subject)?;
+        set_fts_subject(&mut spec, pattern.subject)?;
 
         match predicate.as_str() {
             FTS_QUERY_IRI => {
@@ -2570,9 +2549,8 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
                         "fts:limit must be bound to an integer literal".into(),
                     ));
                 };
-                // Clamped rather than rejected outright: a large limit is a
-                // legitimate "give me everything". A clamp that truncates the
-                // answer is reported when the page actually fills.
+                // Large limits are clamped. A full page reports possible
+                // truncation.
                 let requested = literal.value().parse::<usize>().map_err(|_| {
                     SparqlError::Unsupported("fts:limit must be a positive integer".into())
                 })?;
@@ -2620,7 +2598,7 @@ fn parse_fts_service_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     Ok(spec)
 }
 
-fn set_or_check_subject(spec: &mut FtsServiceSpec, subject: TermPattern) -> Result<()> {
+fn set_fts_subject(spec: &mut FtsServiceSpec, subject: TermPattern) -> Result<()> {
     let subject = match subject {
         TermPattern::Variable(variable) => FtsSubjectPattern::Variable(variable),
         TermPattern::NamedNode(node) => FtsSubjectPattern::NamedNode(node),
