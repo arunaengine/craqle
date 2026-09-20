@@ -3688,12 +3688,8 @@ fn splice_context_json(
     }
 }
 
-/// Simple `term -> IRI` mappings and their reverse, derived from a stored
-/// RO-Crate `@context`. String mappings from inline embedded context objects
-/// are captured, and object definitions carrying a string `@id` are expanded to
-/// that IRI; other complex shapes are skipped. Duplicate terms resolve
-/// last-write-wins (a later entry overrides an earlier one), with a warning on
-/// the import path (see [`collect_context_terms`]).
+/// Forward and reverse term mappings from supported stored context definitions.
+/// Later duplicate terms win, with warnings during import.
 #[derive(Debug, Default)]
 struct ContextTermMap {
     forward: HashMap<String, String>,
@@ -3741,12 +3737,7 @@ impl ContextTermMap {
         }
     }
 
-    /// Compact a predicate IRI back to a context term.
-    ///
-    /// A custom mapping wins over the built-in schema.org/rdf/rdfs compaction.
-    /// The built-in compaction is suppressed when the stored context redefines
-    /// the resulting term to a different IRI, so an emitted compact key always
-    /// resolves back to exactly the stored predicate IRI.
+    /// Compact a predicate with custom mappings first, suppressing conflicting built-in terms.
     fn compact_predicate(&self, iri: &str) -> String {
         if let Some(term) = self.reverse.get(iri) {
             return term.clone();
@@ -3787,27 +3778,21 @@ fn collect_identifier_terms(context: &serde_json::Value, terms: &mut HashSet<Str
 
 /// Whether a submitted `@context` is a bare supported RO-Crate context (a
 /// plain reference string, or a single-element array of it).
-fn is_bare_rocrate_context(context: &serde_json::Value) -> bool {
+fn bare_rocrate_context(context: &serde_json::Value) -> bool {
     match context {
-        serde_json::Value::String(url) => is_supported_context_url(url),
+        serde_json::Value::String(url) => supported_context(url),
         serde_json::Value::Array(items) => {
             items.len() == 1
                 && items
                     .first()
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(is_supported_context_url)
+                    .is_some_and(supported_context)
         }
         _ => false,
     }
 }
 
-/// Serialize the submitted `@context` verbatim for storage, or `None` when it is
-/// absent or degenerate.
-///
-/// Only strings, arrays, and objects can carry a usable JSON-LD context.
-/// Degenerate values (`null`, numbers, booleans) carry no mappings and are
-/// treated as "no custom context" so export falls back to the bare default URL
-/// rather than round-tripping a nonsensical `@context`.
+/// Store usable string, array, or object contexts; treat degenerate values as absent.
 fn extract_raw_context(value: &serde_json::Value) -> Option<String> {
     let context = value.as_object()?.get("@context")?;
     if !matches!(
@@ -3832,7 +3817,7 @@ fn normalized_import_context(
 ) -> Option<String> {
     let raw = extract_raw_context(value)?;
     let context = serde_json::from_str(&raw).ok()?;
-    if !is_bare_rocrate_context(&context) {
+    if !bare_rocrate_context(&context) {
         return Some(raw);
     }
 
@@ -3845,7 +3830,7 @@ fn normalized_import_context(
             && object.to_named_node().is_some_and(|specification| {
                 matches!(
                     specification.as_str(),
-                    ROCRATE_1_1_SPEC_URL | ROCRATE_1_2_SPEC_URL | ROCRATE_1_3_SPEC_URL
+                    ROCRATE_SPEC_11 | ROCRATE_SPEC_12 | ROCRATE_SPEC_13
                 )
             })
     });
@@ -3905,16 +3890,8 @@ fn insert_context_term(map: &mut HashMap<String, String>, term: &str, iri: Strin
     map.insert(term.to_string(), iri);
 }
 
-/// Collect `term -> IRI` mappings from a `@context`.
-///
-/// Array entries are processed in order so later definitions override earlier
-/// ones (last-write-wins). String term definitions map directly, and object
-/// term definitions carrying a string `@id` are expanded to that IRI. Reference
-/// URLs other than the RO-Crate base, `@`-keywords, and object definitions
-/// without a string `@id` cannot be expanded here and are skipped. When `warn`
-/// is set (import path) each skip — and each duplicate term that remaps to a
-/// different IRI — is logged at `warn` level; the export path passes `false` so
-/// it does not re-log on every export.
+/// Collect context term mappings in order, with later definitions taking precedence.
+/// Optionally warn about unsupported references, definitions, and remapped duplicates.
 fn collect_context_terms(
     context: &serde_json::Value,
     map: &mut HashMap<String, String>,
@@ -3922,7 +3899,7 @@ fn collect_context_terms(
 ) {
     match context {
         serde_json::Value::String(url) => {
-            if !is_supported_context_url(url) && warn {
+            if !supported_context(url) && warn {
                 tracing::warn!(
                     context = %url,
                     "ignoring non-RO-Crate reference @context for term expansion"
@@ -3975,7 +3952,7 @@ fn collect_context_terms(
 }
 
 fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateError> {
-    let rdf_graph = rocrate_to_rdf_with_options(
+    let rdf_graph = rocrate_to_rdf(
         rocrate,
         ContextResolverBuilder::default(),
         ConversionOptions::AllowRelative,
@@ -3983,12 +3960,12 @@ fn rocrate_triples(rocrate: &RoCrate) -> Result<BTreeSet<TripleKey>, RoCrateErro
 
     let mut triples = BTreeSet::new();
     for triple in rdf_graph {
-        triples.insert(triple_key_from_rdf(&triple)?);
+        triples.insert(triple_key(&triple)?);
     }
     Ok(triples)
 }
 
-fn triple_key_from_rdf(triple: &Triple) -> Result<TripleKey, RoCrateError> {
+fn triple_key(triple: &Triple) -> Result<TripleKey, RoCrateError> {
     Ok((
         EncodedTerm::from(&triple.subject),
         EncodedTerm::from_named_node(&triple.predicate),
@@ -4011,14 +3988,14 @@ fn normalize_metadata_descriptor(metadata: &mut MetadataDescriptor) {
             .or_else(|| dynamic.remove("schema:conformsTo"))
             .or_else(|| dynamic.remove("http://schema.org/conformsTo"))
             .or_else(|| dynamic.remove("https://schema.org/conformsTo"))
-            .or_else(|| dynamic.remove(DCTERMS_CONFORMS_TO_IRI))
+            .or_else(|| dynamic.remove(DCTERMS_CONFORMS_IRI))
         && let Some(id) = first_identifier(&value)
     {
         metadata.conforms_to = Id::Id(id);
     }
 
     if let Id::Id(id) = &metadata.conforms_to
-        && let Ok(Some(version)) = version_from_context_url(id)
+        && let Ok(Some(version)) = context_version(id)
     {
         metadata.conforms_to = Id::Id(version.specification_url().to_string());
     }
@@ -4035,7 +4012,7 @@ fn first_identifier(value: &EntityValue) -> Option<String> {
 
 fn preferred_identifier(ids: &[String]) -> Option<String> {
     ids.iter()
-        .find(|id| !is_supported_context_url(id))
+        .find(|id| !supported_context(id))
         .cloned()
         .or_else(|| ids.first().cloned())
 }
@@ -4119,6 +4096,21 @@ mod tests {
     }
 
     impl CraqleGraphSync for FlakySync {
+        fn publish_mutation(
+            &self,
+            store: &crate::store::GraphStore,
+            mutation: crate::sync::OutgoingMutation,
+        ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+            if self.fail_changes.load(Ordering::SeqCst)
+                || (mutation.render_hints.is_some() && self.fail_context.load(Ordering::SeqCst))
+            {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "injected atomic RO-Crate publish failure".to_owned(),
+                ));
+            }
+            self.inner.publish_mutation(store, mutation)
+        }
+
         fn publish_changes(
             &self,
             store: &crate::store::GraphStore,
@@ -4138,7 +4130,7 @@ mod tests {
             store: &crate::store::GraphStore,
             graph: &GraphId,
             changes: Vec<MaterializedQuadChange>,
-            render_hints: crate::core::TaggedRoCrateRenderHints,
+            render_hints: crate::core::TaggedRenderHints,
         ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
             if self.fail_changes.load(Ordering::SeqCst) || self.fail_context.load(Ordering::SeqCst)
             {
@@ -4200,12 +4192,12 @@ mod tests {
             self.inner.bind_graph_topic(store, graph, topic_id)
         }
 
-        fn bind_graph_topic_if_present(
+        fn bind_existing_topic(
             &self,
             store: &crate::store::GraphStore,
             graph: &GraphId,
         ) -> SyncResult<Option<irokle::TopicId>> {
-            self.inner.bind_graph_topic_if_present(store, graph)
+            self.inner.bind_existing_topic(store, graph)
         }
 
         fn mint_graph_topic(
@@ -4227,6 +4219,13 @@ mod tests {
             cursor: Option<&[u8]>,
         ) -> SyncResult<TopicCatchup> {
             self.inner.topic_records_since(topic_id, cursor)
+        }
+
+        fn topic_frontier(
+            &self,
+            topic_id: irokle::TopicId,
+        ) -> SyncResult<crate::sync::TopicFrontier> {
+            self.inner.topic_frontier(topic_id)
         }
 
         fn is_local_record(
@@ -4316,7 +4315,7 @@ mod tests {
         }
     }
 
-    /// G4 publish-first: a failed graph-event publication moves no local state.
+    /// Publish-first: a failed graph-event publication moves no local state.
     /// Every field a write can touch is compared, not just the quad count.
     #[test]
     fn publish_persists_nothing() {
@@ -4494,9 +4493,7 @@ mod tests {
         }
     }
 
-    /// Render hints and their RDF candidate are one published and committed
-    /// mutation: failure leaves the old pair intact, never new data plus old
-    /// hints.
+    /// Render hints and RDF data commit as one mutation, preserving the old pair on failure.
     #[test]
     fn atomic_render_hints() {
         let (_dir, store, flaky, manager) = flaky_manager();
@@ -4620,7 +4617,7 @@ mod tests {
                 ROCRATE_CONTEXT_URL,
                 {
                     "hasResource": "http://www.w3.org/ns/dx/prof#hasResource",
-                    "hasArtifact": PROF_HAS_ARTIFACT_IRI,
+                    "hasArtifact": PROF_ARTIFACT_IRI,
                     "text": "http://schema.org/text"
                 }
             ],
@@ -4658,13 +4655,13 @@ mod tests {
                 },
                 {
                     "@id": "#mode-descriptor",
-                    "@type": PROF_RESOURCE_DESCRIPTOR_IRI,
+                    "@type": PROF_DESCRIPTOR_IRI,
                     "name": "Mode Rules",
                     "hasArtifact": {"@id": "./mode.json"}
                 },
                 {
                     "@id": "#schema-descriptor",
-                    "@type": PROF_RESOURCE_DESCRIPTOR_IRI,
+                    "@type": PROF_DESCRIPTOR_IRI,
                     "name": "Schema Rules",
                     "hasArtifact": {"@id": "./schema.json"}
                 },
