@@ -4,7 +4,7 @@
 
 use std::sync::LazyLock;
 
-use rayon::prelude::*;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 const MAX_QUERY_WORKERS: usize = 4;
 
