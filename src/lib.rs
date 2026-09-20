@@ -2288,6 +2288,137 @@ impl CraqleNode {
         Ok(sync.sync_status(&self.store, graph)?)
     }
 
+    pub fn apply_mutation(
+        &self,
+        auth: &dyn Authorizer,
+        request: MutationRequest,
+    ) -> Result<MutationReceipt> {
+        self.ensure_graph_action(&request.graph, auth, Action::Write)?;
+        let receipt = self.replication.apply_mutation(request)?;
+        if receipt.source == SourceOutcome::Prepared {
+            return Ok(receipt.outbound());
+        }
+        if let Err(error) = self.schedule_graph_search(&receipt.graph) {
+            return Err(accepted_error(receipt, error));
+        }
+        self.persist_receipt(receipt).map(MutationReceipt::outbound)
+    }
+
+    pub fn mutation_status(
+        &self,
+        auth: &dyn Authorizer,
+        lookup: MutationLookup,
+    ) -> Result<MutationStatus> {
+        if self.store.graph_tombstoned(&lookup.graph)? {
+            let policy = self
+                .store
+                .deleted_graph_policy(&lookup.graph)?
+                .ok_or_else(|| AuthorizationError::PermissionDenied {
+                    action: Action::Write,
+                    graph: lookup.graph.to_string(),
+                })?;
+            auth.authorize(&lookup.graph, &policy, Action::Write)?;
+        } else {
+            self.ensure_graph_action(&lookup.graph, auth, Action::Read)?;
+        }
+        Ok(match self.replication.mutation_status(&lookup)? {
+            MutationStatus::Known(receipt) => MutationStatus::Known(receipt.outbound()),
+            status => status,
+        })
+    }
+
+    pub fn reconcile_graph(
+        &self,
+        auth: &dyn Authorizer,
+        request: ReconcileRequest,
+    ) -> Result<RepairReport> {
+        let action = match request.mode {
+            RepairMode::DryRun => Action::Read,
+            RepairMode::Apply => Action::Write,
+        };
+        self.ensure_graph_action(&request.graph, auth, action)?;
+        let report = match request.source {
+            ReconcileSource::HealthySnapshot {
+                source,
+                snapshot,
+                digest,
+            } => {
+                if snapshot.graph != request.graph {
+                    return Err(CraqleError::SyncInputRejected(
+                        "healthy snapshot graph does not match the authorized graph".to_owned(),
+                    ));
+                }
+                self.replication.reconcile_snapshot(&RepairRequest {
+                    id: request.id,
+                    authority: RepairAuthority::HealthySnapshot { source, digest },
+                    authoritative: snapshot,
+                    mode: request.mode,
+                    backup: None,
+                })?
+            }
+            ReconcileSource::History { topic } => {
+                let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+                if self.store.topic_graph_binding(topic.as_bytes())?.as_deref()
+                    != Some(request.graph.as_str())
+                {
+                    return Err(CraqleError::SyncInputRejected(
+                        "history topic is not bound to the authorized graph".to_owned(),
+                    ));
+                }
+                let frontier = sync.topic_frontier(topic)?;
+                let authority = RepairAuthority::History {
+                    topic,
+                    target: frontier.clock.clone(),
+                };
+                let history = sync.history_snapshot(&HistoryRequest {
+                    topic,
+                    graph: request.graph.clone(),
+                    target: frontier.clock,
+                });
+                match history {
+                    Ok(HistorySnapshot::Live(snapshot)) => {
+                        self.replication.reconcile_snapshot(&RepairRequest {
+                            id: request.id,
+                            authority,
+                            authoritative: snapshot,
+                            mode: request.mode,
+                            backup: None,
+                        })?
+                    }
+                    Ok(HistorySnapshot::Tombstoned) => self.replication.record_history(
+                        sync::HistoryFailure {
+                            id: request.id,
+                            graph: request.graph.clone(),
+                            authority,
+                            mode: request.mode,
+                        },
+                        RepairResult::Tombstoned,
+                    )?,
+                    Err(_) => self.replication.record_history(
+                        sync::HistoryFailure {
+                            id: request.id,
+                            graph: request.graph.clone(),
+                            authority,
+                            mode: request.mode,
+                        },
+                        RepairResult::HistoryMissing,
+                    )?,
+                }
+            }
+        };
+        if report.audit.result == RepairResult::Applied {
+            self.schedule_search_update();
+        }
+        if let Err(error) = self.persist_fjall() {
+            return Err(CraqleError::RepairAccepted {
+                error_kind: error.kind(),
+                reason: error.to_string(),
+                report: Box::new(report),
+            });
+        }
+        Ok(report)
+    }
+
     /// Apply every craqle topic's outstanding records, returning the graphs
     /// whose content changed. Callers that only want a count read `.len()`.
     pub fn reconcile_irokle(&self) -> Result<HashSet<GraphId>> {
@@ -2304,7 +2435,7 @@ impl CraqleNode {
         // Topics carry independent cursors, so one stall holds back only its
         // own topic; the first failure is reported once the rest have run.
         for topic_id in sync.craqle_topic_ids()? {
-            match self.reconcile_irokle_topic(sync, topic_id) {
+            match self.reconcile_topic(sync, topic_id) {
                 Ok(pass) => {
                     applied.extend(pass.applied);
                     stalled = stalled.or(pass.stalled);
@@ -2325,74 +2456,51 @@ impl CraqleNode {
 
     /// Apply a topic's outstanding records in order, stopping at the first
     /// failure a retry could clear rather than losing that record for good.
-    fn reconcile_irokle_topic(
+    fn reconcile_topic(
         &self,
         sync: &Arc<dyn sync::CraqleGraphSync>,
         topic_id: irokle::TopicId,
     ) -> Result<TopicPass> {
-        let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
-        // A history read that fails is retryable, so it stalls its topic. A
-        // silent skip would leave the topic unread for the rest of the process.
-        let catchup = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
-
-        let sync::TopicCatchup {
-            records,
-            mut cursor,
-        } = catchup;
-
+        let mut stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
         let mut applied = HashSet::new();
         let mut stalled = None;
-        for topic_record in &records {
-            if let sync::TopicRecord::Rejected(record) = topic_record {
-                cursor.consume(topic_record);
-                let cursor_bytes = cursor
-                    .encode()?
-                    .expect("a consumed replication record has a cursor");
-                let graph = self
-                    .store
-                    .topic_graph_binding(topic_id.as_bytes())?
-                    .map(|graph| GraphId::new(&graph));
-                let rejection = RejectedReplicationRecord {
-                    topic: topic_id,
-                    record_id: record.meta.op_id,
-                    actor: record.meta.actor_id,
-                    sequence: record.meta.actor_seq,
-                    graph,
-                    payload_digest: record.payload_digest,
-                    error_kind: record.error_kind,
-                    reason: record.reason.clone(),
-                    seen_count: 0,
-                    acknowledged: false,
-                };
-                let rejection = self
-                    .store
-                    .record_replication_rejection(rejection, Some(&cursor_bytes))?;
-                self.store.persist()?;
-                self.replication_rejections.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    topic = %topic_id,
-                    record = %rejection.record_id,
-                    error_kind = ?rejection.error_kind,
-                    seen_count = rejection.seen_count,
-                    "persisted rejected craqle replication payload before cursor advance",
-                );
-                continue;
+        loop {
+            let sync::TopicCatchup {
+                records,
+                mut cursor,
+                more,
+            } = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
+            if records.is_empty() && more {
+                return Err(CraqleError::SyncInputRejected(
+                    "replication page made no progress".to_owned(),
+                ));
             }
-            let sync::TopicRecord::Event(record) = topic_record else {
-                unreachable!()
-            };
-            match self.apply_reconciled_record(sync, topic_id, record) {
-                Ok(Some(graph)) => {
-                    applied.insert(graph);
+            for topic_record in &records {
+                if matches!(topic_record, sync::TopicRecord::Control(_)) {
                     cursor.consume(topic_record);
+                    continue;
                 }
-                Ok(None) => cursor.consume(topic_record),
-                Err(error) if error.rejects_record() => {
+                if let sync::TopicRecord::Rejected(record) = topic_record {
                     cursor.consume(topic_record);
-                    let cursor_bytes = cursor
-                        .encode()?
-                        .expect("a consumed replication record has a cursor");
-                    let rejection = self.rejected_replication_record(topic_id, record, &error)?;
+                    let cursor_bytes = cursor.encode()?.ok_or_else(|| {
+                        CraqleError::SyncInputRejected("consumed record has no cursor".to_owned())
+                    })?;
+                    let graph = self
+                        .store
+                        .topic_graph_binding(topic_id.as_bytes())?
+                        .map(|graph| GraphId::new(&graph));
+                    let rejection = RejectedReplicationRecord {
+                        topic: topic_id,
+                        record_id: record.meta.op_id,
+                        actor: record.meta.actor_id,
+                        sequence: record.meta.actor_seq,
+                        graph,
+                        payload_digest: record.payload_digest,
+                        error_kind: record.error_kind,
+                        reason: record.reason.clone(),
+                        seen_count: 0,
+                        acknowledged: false,
+                    };
                     let rejection = self
                         .store
                         .record_replication_rejection(rejection, Some(&cursor_bytes))?;
@@ -2403,26 +2511,67 @@ impl CraqleNode {
                         record = %rejection.record_id,
                         error_kind = ?rejection.error_kind,
                         seen_count = rejection.seen_count,
-                        "persisted rejected craqle replication record before cursor advance",
+                        "persisted rejected craqle replication payload before cursor advance",
                     );
+                    continue;
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        topic = %topic_id,
-                        %error,
-                        "stalled craqle reconcile at a retryable failure",
-                    );
-                    stalled = Some(error);
-                    break;
+                let sync::TopicRecord::Event(record) = topic_record else {
+                    unreachable!()
+                };
+                match self.apply_reconciled_record(sync, topic_id, record) {
+                    Ok(Some(graph)) => {
+                        applied.insert(graph);
+                        cursor.consume(topic_record);
+                    }
+                    Ok(None) => cursor.consume(topic_record),
+                    Err(error) if error.rejects_record() => {
+                        cursor.consume(topic_record);
+                        let cursor_bytes = cursor.encode()?.ok_or_else(|| {
+                            CraqleError::SyncInputRejected(
+                                "consumed record has no cursor".to_owned(),
+                            )
+                        })?;
+                        let rejection =
+                            self.rejected_replication_record(topic_id, record, &error)?;
+                        let rejection = self
+                            .store
+                            .record_replication_rejection(rejection, Some(&cursor_bytes))?;
+                        self.store.persist()?;
+                        self.replication_rejections.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            topic = %topic_id,
+                            record = %rejection.record_id,
+                            error_kind = ?rejection.error_kind,
+                            seen_count = rejection.seen_count,
+                            "persisted rejected craqle replication record before cursor advance",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            topic = %topic_id,
+                            %error,
+                            "stalled craqle reconcile at a retryable failure",
+                        );
+                        stalled = Some(error);
+                        break;
+                    }
                 }
             }
-        }
 
-        // Persisted even when the pass stalled: it covers exactly the prefix
-        // that was consumed, so the retry resumes at the failed record.
-        if let Some(cursor) = cursor.encode()? {
-            self.store
-                .set_applied_topic_clock(topic_id.as_bytes(), &cursor)?;
+            let previous = stored_cursor.clone();
+            if let Some(encoded) = cursor.encode()? {
+                self.store.set_topic_clock(topic_id.as_bytes(), &encoded)?;
+                self.store.persist()?;
+                stored_cursor = Some(encoded);
+            }
+            if stalled.is_some() || !more {
+                break;
+            }
+            if stored_cursor == previous {
+                return Err(CraqleError::SyncInputRejected(
+                    "replication cursor did not advance".to_owned(),
+                ));
+            }
         }
         Ok(TopicPass { applied, stalled })
     }
@@ -2452,9 +2601,9 @@ impl CraqleNode {
             None => sync.bind_graph_topic(&self.store, graph, topic_id)?,
         }
         let local_record = sync.is_local_record(topic_id, record);
-        let _write_guard = replication::graph_write_guard(graph);
+        let _write_guard = self.store.graph_write_guard(graph);
         Ok(self
-            .apply_irokle_record_locked(record, local_record)?
+            .apply_record_locked(record, local_record)?
             .then(|| graph.clone()))
     }
 
@@ -2533,17 +2682,17 @@ impl CraqleNode {
         };
         self.authorize_rejection_record(auth, &rejected, Action::Write)?;
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        let topic_record = sync
-            .topic_records_since(topic, None)?
-            .records
-            .into_iter()
-            .find(|record| record.meta().op_id == record_id)
-            .ok_or_else(|| {
-                CraqleError::SyncInputRejected(format!(
-                    "rejected record {record_id} is no longer available in topic {topic}"
-                ))
-            })?;
+        let topic_record = sync.topic_record(topic, record_id)?.ok_or_else(|| {
+            CraqleError::SyncInputRejected(format!(
+                "rejected record {record_id} is no longer available in topic {topic}"
+            ))
+        })?;
         let record = match topic_record {
+            sync::TopicRecord::Control(_) => {
+                return Err(CraqleError::SyncInputRejected(
+                    "rejected record is not an event".to_owned(),
+                ));
+            }
             sync::TopicRecord::Event(record) => record,
             sync::TopicRecord::Rejected(record) => {
                 let rejection = RejectedReplicationRecord {
@@ -2635,7 +2784,7 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         topic: irokle::TopicId,
-        expected_old_cursor_digest: [u8; 32],
+        expected_digest: [u8; 32],
         replacement_position: irokle::ActorClock,
     ) -> Result<TopicCursorRepairAudit> {
         let _reconcile_guard = self
@@ -2652,10 +2801,11 @@ impl CraqleNode {
                 ))
             })?;
         self.ensure_graph_action(&graph, auth, Action::Write)?;
-        let replacement = sync::encode_topic_cursor(topic, &replacement_position)?;
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let replacement = sync.topic_cursor_at(topic, &replacement_position)?;
         let audit = self.store.repair_topic_cursor(
             topic,
-            expected_old_cursor_digest,
+            expected_digest,
             &replacement,
             Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
         )?;
@@ -2692,10 +2842,7 @@ impl CraqleNode {
     }
 
     pub fn graph_violations(&self, graph: &GraphId) -> Result<Vec<CrateViolation>> {
-        Ok(crate::rules::post_merge_violations_from_store(
-            &self.store,
-            graph,
-        )?)
+        Ok(crate::rules::post_merge_violations(&self.store, graph)?)
     }
 
     /// Return the RO-Crate version from its live marker or retained context evidence.
@@ -2723,13 +2870,13 @@ impl CraqleNode {
         if let Some(license) = options.license {
             request.license = Some(license);
         }
-        self.create_crate_with_durability_as_version(
+        self.create_versioned(CrateBuild {
             auth,
             request,
-            CraqleRequestDurability::Durable,
-            None,
-            options.version,
-        )
+            durability: CraqleRequestDurability::Durable,
+            actor: None,
+            version: options.version,
+        })
     }
 
     /// Create a new RO-Crate graph with an explicit request durability policy.
@@ -2742,9 +2889,7 @@ impl CraqleNode {
         self.create_crate_with_durability_as(auth, request, durability, None)
     }
 
-    /// Like [`CraqleNode::create_crate_with_durability`], but non-publishing
-    /// writes are authored under `actor`, so replicas materializing the same
-    /// logical event emit identical CRDT ops.
+    /// Author non-publishing writes under `actor` for deterministic CRDT ops.
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
     pub fn create_crate_with_durability_as(
         &self,
@@ -2753,24 +2898,17 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
         actor: Option<ActorId>,
     ) -> Result<Batch> {
-        self.create_crate_with_durability_as_version(
+        self.create_versioned(CrateBuild {
             auth,
             request,
             durability,
             actor,
-            RoCrateVersion::default(),
-        )
+            version: RoCrateVersion::default(),
+        })
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
-    fn create_crate_with_durability_as_version(
-        &self,
-        auth: &dyn Authorizer,
-        request: CreateCrateRequest,
-        durability: CraqleRequestDurability,
-        actor: Option<ActorId>,
-        version: RoCrateVersion,
-    ) -> Result<Batch> {
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %build.request.graph.as_str()))]
+    fn create_versioned(&self, build: CrateBuild<'_>) -> Result<Batch> {
         let CreateCrateRequest {
             graph,
             name,
@@ -2778,11 +2916,11 @@ impl CraqleNode {
             date_published,
             license,
             policy,
-        } = request;
+        } = build.request;
         let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let manager = self.manager_with(durability, actor);
-        let batch = if version == RoCrateVersion::default() {
+        self.ensure_policy_action(&graph, &policy, build.auth, Action::Write)?;
+        let manager = self.manager_with(build.durability, build.actor);
+        let batch = if build.version == RoCrateVersion::default() {
             manager.create_crate(
                 graph.clone(),
                 &name,
@@ -2791,28 +2929,33 @@ impl CraqleNode {
                 license.as_deref(),
             )?
         } else {
-            manager.create_crate_with_version(
+            manager.create_crate_version(
                 graph.clone(),
                 &name,
                 &description,
                 &date_published,
                 license.as_deref(),
-                version,
+                build.version,
             )?
         };
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.persist_policy(PolicyWrite {
+            graph: &graph,
+            policy,
+            durability: build.durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability: build.durability,
+        })
     }
 
-    /// Validate and materialize a create-crate request without applying it.
-    ///
-    /// Returns the changes that would be applied, but does not mutate the graph
-    /// store, persist policy, enqueue search, or publish Irokle records.
+    /// Validate and materialize crate changes without applying side effects.
     pub fn validate_create_crate(
         &self,
         auth: &dyn Authorizer,
         request: CreateCrateRequest,
-    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+    ) -> Result<Vec<CoreChange>> {
         let CreateCrateRequest {
             graph,
             name,
@@ -2870,7 +3013,11 @@ impl CraqleNode {
             entity.additional_triples,
             &replaced_predicates,
         )?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
     /// Create or replace a root-linked data entity.
@@ -2914,9 +3061,7 @@ impl CraqleNode {
         entities: Vec<NewDataEntity>,
     ) -> Result<AppendDataEntitiesReport> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        let report = self
-            .manager()
-            .append_new_root_data_entities(graph, entities)?;
+        let report = self.manager().append_root_entities(graph, entities)?;
         self.finish_report(graph, report)
     }
 
@@ -2931,7 +3076,7 @@ impl CraqleNode {
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let report = self
             .manager()
-            .append_new_data_entities_under(graph, parent_id, entities)?;
+            .append_entities_under(graph, parent_id, entities)?;
         self.finish_report(graph, report)
     }
 
@@ -2975,7 +3120,11 @@ impl CraqleNode {
                 entity.additional_triples,
                 &replaced_predicates,
             )?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
     /// Create or replace a contextual entity.
@@ -3065,9 +3214,7 @@ impl CraqleNode {
         limit: usize,
     ) -> Result<RoCratePage> {
         self.ensure_graph_action(graph, auth, Action::Read)?;
-        Ok(self
-            .manager()
-            .export_jsonld_page_after(graph, cursor, limit)?)
+        Ok(self.manager().export_page_after(graph, cursor, limit)?)
     }
 
     /// Replace the current visible RO-Crate state from a JSON-LD document.
@@ -3114,8 +3261,16 @@ impl CraqleNode {
         let batch = self
             .manager_for_durability(durability)
             .import_jsonld(graph.clone(), jsonld)?;
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.persist_policy(PolicyWrite {
+            graph: &graph,
+            policy,
+            durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
     /// Strict variant of `apply_rocrate_document_with_policy` that validates
@@ -3166,37 +3321,33 @@ impl CraqleNode {
         let batch = self
             .manager_with(durability, actor)
             .import_jsonld_checked(graph.clone(), jsonld)?;
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.persist_policy(PolicyWrite {
+            graph: &graph,
+            policy,
+            durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
-    /// Strictly validate and materialize a RO-Crate document without applying it.
-    ///
-    /// Returns the changes that would be applied, but does not mutate the graph
-    /// store, persist policy, enqueue search, or publish Irokle records.
+    /// Strictly validate and materialize RO-Crate changes without side effects.
     pub fn validate_rocrate_document_checked_with_policy(
         &self,
         auth: &dyn Authorizer,
         graph: GraphId,
         jsonld: &str,
         policy: GraphPolicy,
-    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+    ) -> Result<Vec<CoreChange>> {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        Ok(self.manager().plan_import_jsonld_checked(&graph, jsonld)?)
+        Ok(self.manager().plan_checked_import(&graph, jsonld)?)
     }
 
-    /// Change set the strict RO-Crate replacement would commit for `jsonld`,
-    /// without applying it.
-    ///
-    /// Runs the same complete-RO-Crate validation as
-    /// [`CraqleNode::apply_rocrate_document_checked_with_policy`] and requires
-    /// the same write authorization as
-    /// [`CraqleNode::apply_rocrate_document`]. Mutates nothing: no quads, no
-    /// policy, no search queue, no replication record.
-    ///
-    /// The change set describes the state visible now, so a concurrent write
-    /// to `graph` can still invalidate it.
+    /// Plan a strict authorized RO-Crate replacement without side effects.
+    /// Concurrent graph writes may invalidate the returned change set.
     pub fn plan_rocrate_document_checked(
         &self,
         auth: &dyn Authorizer,
@@ -3204,15 +3355,11 @@ impl CraqleNode {
         jsonld: &str,
     ) -> Result<Vec<MaterializedQuadChange>> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        Ok(self.manager().plan_import_jsonld_checked(graph, jsonld)?)
+        Ok(self.manager().plan_checked_import(graph, jsonld)?)
     }
 
-    /// Change set [`CraqleNode::patch_data_with`] would commit for `request`,
-    /// without applying it.
-    ///
-    /// Structurally validated exactly as the applying variant is, against the
-    /// state visible now, which a concurrent write to the graph can still
-    /// invalidate. Mutates nothing.
+    /// Plan a validated data patch without applying side effects.
+    /// Concurrent graph writes may invalidate the returned change set.
     pub fn plan_patch_data(
         &self,
         auth: &dyn Authorizer,
@@ -3259,7 +3406,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         graph: &GraphId,
         jsonld: &str,
-    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+    ) -> Result<Vec<CoreChange>> {
         if self.store.contains_graph(graph)? {
             self.ensure_graph_action(graph, auth, Action::Write)?;
         }
@@ -3290,14 +3437,13 @@ impl CraqleNode {
         let mut authorized = HashSet::new();
         for change in &changes {
             let graph = match change {
-                CoreMaterializedQuadChange::Insert { graph, .. }
-                | CoreMaterializedQuadChange::Delete { graph, .. } => graph,
+                CoreChange::Insert { graph, .. } | CoreChange::Delete { graph, .. } => graph,
             };
             if authorized.insert(graph.clone()) {
                 self.ensure_graph_action(graph, auth, Action::Write)?;
             }
         }
-        let graph = single_graph_for_changes(&changes)?;
+        let graph = single_change_graph(&changes)?;
         let batch = self.replication.local_apply_changes(&graph, changes)?;
         Ok(Some(self.finish_batch(&graph, batch)?))
     }
@@ -3319,7 +3465,7 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         graph: &GraphId,
-        changes: Vec<CoreMaterializedQuadChange>,
+        changes: Vec<CoreChange>,
     ) -> Result<Batch> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.replication.local_apply_changes(graph, changes)?;
@@ -3327,14 +3473,12 @@ impl CraqleNode {
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_changes_bypassing_structural_rules(
+    pub(crate) fn apply_unchecked(
         &self,
         graph: &GraphId,
-        changes: Vec<CoreMaterializedQuadChange>,
+        changes: Vec<CoreChange>,
     ) -> Result<Batch> {
-        let batch = self
-            .replication
-            .local_apply_changes_bypassing_structural_rules(graph, changes)?;
+        let batch = self.replication.apply_changes_unchecked(graph, changes)?;
         self.finish_batch(graph, batch)
     }
 
