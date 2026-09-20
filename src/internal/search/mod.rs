@@ -1499,29 +1499,38 @@ impl SearchIndex {
         all_text: Option<&str>,
     ) -> Result<()> {
         let _rebuild = self.lock_graph(graph_id);
+        let generation = self.active_generation(graph_id).unwrap_or_else(|| {
+            self.set_generation(graph_id, Some(DIRECT_GENERATION));
+            DIRECT_GENERATION
+        });
         let mut writer = self.writer()?;
         self.add_document(
             &mut writer,
             ResourceDoc {
                 graph_id,
                 subject_iri,
+                generation,
                 all_text,
                 delete_existing: true,
             },
         )
     }
 
-    /// Adds a second document under an existing key, bypassing the delete
-    /// that normally keeps one document per key. Test seeding only.
+    /// Seed a duplicate document without the normal identity replacement.
     #[cfg(test)]
     pub(crate) fn seed_duplicate(&self, graph_id: &str, subject_iri: &str) -> Result<()> {
         let _rebuild = self.lock_graph(graph_id);
+        let generation = self.active_generation(graph_id).unwrap_or_else(|| {
+            self.set_generation(graph_id, Some(DIRECT_GENERATION));
+            DIRECT_GENERATION
+        });
         let mut writer = self.writer()?;
         self.add_document(
             &mut writer,
             ResourceDoc {
                 graph_id,
                 subject_iri,
+                generation,
                 all_text: None,
                 delete_existing: false,
             },
@@ -1531,7 +1540,7 @@ impl SearchIndex {
     /// Add `doc` to the index, optionally replacing the document with the same
     /// `(graph, subject)` key first.
     fn add_document(&self, writer: &mut IndexWriter, doc: ResourceDoc<'_>) -> Result<()> {
-        let key = doc_key(doc.graph_id, doc.subject_iri);
+        let key = doc_key(doc.graph_id, doc.generation, doc.subject_iri);
         if doc.delete_existing {
             writer.delete_term(Term::from_field_text(self.f_doc_key, &key));
         }
@@ -1546,6 +1555,15 @@ impl SearchIndex {
         document.add_text(self.f_doc_key, key);
         document.add_text(self.f_graph_id, doc.graph_id);
         document.add_text(self.f_subject_iri, doc.subject_iri);
+        document.add_text(
+            self.f_generation_key,
+            generation_key(self.index_id, doc.graph_id, doc.generation),
+        );
+        document.add_u64(self.f_doc_generation, doc.generation.0);
+        let scope = generation_scope(self.index_id, doc.graph_id, doc.generation);
+        document.add_bytes(self.f_generation_scope, &scope);
+        let stable = stable_hit_key(doc.graph_id, doc.subject_iri);
+        document.add_bytes(self.f_stable_key, &stable);
         document.add_text(self.f_all_text, &all_text);
 
         writer.add_document(document)?;
@@ -1554,11 +1572,198 @@ impl SearchIndex {
     }
 
     /// Full-text search across all graphs.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = query_parser.parse_query(&sanitize_query(query))?;
+    pub(crate) fn search_authorized(
+        &self,
+        req: AuthorizedQuery<'_>,
+    ) -> crate::Result<Vec<SearchHit>> {
+        let check = || Ok::<(), crate::CraqleError>(());
+        self.collect_filtered(FilterQuery {
+            query: req.query,
+            limit: req.limit,
+            subject: req.subject,
+            allows: req.allows,
+            check: &check,
+        })
+    }
 
-        self.collect_top_docs(&parsed, limit)
+    pub(crate) fn collect_filtered<E>(
+        &self,
+        req: FilterQuery<'_, E>,
+    ) -> std::result::Result<Vec<SearchHit>, E>
+    where
+        E: From<SearchError>,
+    {
+        if req.limit == 0 {
+            return Ok(Vec::new());
+        }
+        if req.query.len() > self.query_bytes() {
+            return Err(E::from(SearchError::ItemTooLarge {
+                bytes: req.query.len(),
+                limit: self.query_bytes(),
+            }));
+        }
+        let view = self.pin_view();
+        self.check_bound(&view).map_err(E::from)?;
+        let parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
+        let parsed = parser
+            .parse_query(&sanitize_query(req.query))
+            .map_err(SearchError::from)
+            .map_err(E::from)?;
+        let query: Box<dyn Query> = if let Some(subject) = req.subject {
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, parsed),
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.f_subject_iri, subject),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ]))
+        } else {
+            parsed
+        };
+        let native_limit = self.query_bytes() / 2;
+        let per_rank = std::mem::size_of::<RankedDoc>().saturating_add(64);
+        let rank_bytes = req.limit.saturating_mul(per_rank);
+        if rank_bytes > native_limit {
+            return Err(E::from(SearchError::ItemTooLarge {
+                bytes: rank_bytes,
+                limit: native_limit,
+            }));
+        }
+        let weight = query
+            .weight(EnableScoring::enabled_from_searcher(&view.searcher))
+            .map_err(SearchError::from)
+            .map_err(E::from)?;
+        let mut ranked: BinaryHeap<RankedDoc> = BinaryHeap::with_capacity(req.limit);
+        let mut retained_keys = HashSet::with_capacity(req.limit);
+        for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
+            let scopes = reader
+                .fast_fields()
+                .bytes(GENERATION_SCOPE_FIELD)
+                .map_err(SearchError::from)
+                .map_err(E::from)?;
+            let stable = reader
+                .fast_fields()
+                .bytes(STABLE_KEY_FIELD)
+                .map_err(SearchError::from)
+                .map_err(E::from)?;
+            let mut scorer = weight
+                .scorer(reader, 1.0)
+                .map_err(SearchError::from)
+                .map_err(E::from)?;
+            while scorer.doc() != TERMINATED {
+                (req.check)()?;
+                let doc = scorer.doc();
+                if reader
+                    .alive_bitset()
+                    .is_none_or(|alive| alive.is_alive(doc))
+                    && let Some(scope) = first_bytes(scopes.as_ref(), doc)
+                    && view.generations.active.contains(scope.as_slice())
+                    && let Some(graph) = scope_graph(&scope)
+                    && (req.allows)(graph)?
+                    && let Some(stable) = first_bytes(stable.as_ref(), doc)
+                    && let Ok(stable) = <[u8; 32]>::try_from(stable.as_slice())
+                {
+                    let score = scorer.score();
+                    if !score.is_finite() {
+                        return Err(E::from(SearchError::Tantivy(
+                            tantivy::TantivyError::SystemError(
+                                "search produced a non-finite score".to_string(),
+                            ),
+                        )));
+                    }
+                    let candidate = RankedDoc {
+                        score,
+                        stable,
+                        address: DocAddress::new(segment as u32, doc),
+                    };
+                    if retained_keys.contains(&candidate.stable) {
+                        if ranked
+                            .iter()
+                            .find(|current| current.stable == candidate.stable)
+                            .is_some_and(|current| candidate < *current)
+                        {
+                            let mut values = std::mem::take(&mut ranked).into_vec();
+                            if let Some(current) = values
+                                .iter_mut()
+                                .find(|current| current.stable == candidate.stable)
+                            {
+                                *current = candidate;
+                            }
+                            ranked = BinaryHeap::from(values);
+                        }
+                        let _ = scorer.advance();
+                        continue;
+                    }
+                    if ranked.len() < req.limit {
+                        retained_keys.insert(candidate.stable);
+                        ranked.push(candidate);
+                    } else if ranked.peek().is_some_and(|worst| candidate < *worst) {
+                        if let Some(removed) = ranked.pop() {
+                            retained_keys.remove(&removed.stable);
+                        }
+                        retained_keys.insert(candidate.stable);
+                        ranked.push(candidate);
+                    }
+                }
+                let _ = scorer.advance();
+            }
+        }
+        let mut ranked = ranked.into_vec();
+        ranked.sort();
+        #[cfg(test)]
+        {
+            self.hooks.searches.fetch_add(1, Ordering::SeqCst);
+            self.hooks.decoded.fetch_add(ranked.len(), Ordering::SeqCst);
+        }
+        let mut retained = rank_bytes;
+        let mut hits = Vec::with_capacity(ranked.len());
+        for ranked in ranked {
+            (req.check)()?;
+            let doc: TantivyDocument = view
+                .searcher
+                .doc(ranked.address)
+                .map_err(SearchError::from)
+                .map_err(E::from)?;
+            let hit = self.doc_to_hit(doc, ranked.score);
+            retained = retained
+                .saturating_add(hit.graph_id.len())
+                .saturating_add(hit.subject_iri.len());
+            if retained > native_limit {
+                return Err(E::from(SearchError::ItemTooLarge {
+                    bytes: retained,
+                    limit: native_limit,
+                }));
+            }
+            hits.push(hit);
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| {
+                    stable_hit_key(&left.graph_id, &left.subject_iri)
+                        .cmp(&stable_hit_key(&right.graph_id, &right.subject_iri))
+                })
+                .then_with(|| left.graph_id.cmp(&right.graph_id))
+                .then_with(|| left.subject_iri.cmp(&right.subject_iri))
+        });
+        Ok(hits)
+    }
+
+    /// Full-text search across all graphs.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let allows = |_: &str| Ok::<bool, SearchError>(true);
+        let check = || Ok::<(), SearchError>(());
+        self.collect_filtered(FilterQuery {
+            query,
+            limit,
+            subject: None,
+            allows: &allows,
+            check: &check,
+        })
     }
 
     /// Full-text search restricted to a single graph.
@@ -1568,61 +1773,44 @@ impl SearchIndex {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = query_parser.parse_query(&sanitize_query(query))?;
-        let graph_filter = TermQuery::new(
-            Term::from_field_text(self.f_graph_id, graph_id),
-            IndexRecordOption::Basic,
-        );
-        let combined = BooleanQuery::new(vec![
-            (Occur::Must, parsed),
-            (Occur::Must, Box::new(graph_filter)),
-        ]);
-
-        self.collect_top_docs(&combined, limit)
+        let allows = |candidate: &str| Ok::<bool, SearchError>(candidate == graph_id);
+        let check = || Ok::<(), SearchError>(());
+        self.collect_filtered(FilterQuery {
+            query,
+            limit,
+            subject: None,
+            allows: &allows,
+            check: &check,
+        })
     }
 
-    /// Full-text search restricted to an explicit set of graphs.
-    ///
-    /// One top-k collection over a graph-set filter, instead of one full
-    /// search per graph. Callers must have authorized every graph in the set
-    /// against the *stored* policy first: this filter only narrows the
-    /// candidate set, it is not an authorization check (G8).
+    /// Search one top-k collection restricted to an already authorized graph set.
     pub fn search_in_graphs(&self, req: GraphSetQuery<'_>) -> Result<Vec<SearchHit>> {
         if req.graphs.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Sanitized exactly as in `search` and `search_in_graph`: this is the
-        // arm `search_graphs` picks above a graph-count threshold, and a raw
-        // parse there made the same user query mean something else — or fail
-        // outright — purely because one more graph was readable (G8).
-        let query_parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = query_parser.parse_query(&sanitize_query(req.query))?;
-
-        let graph_clauses: Vec<(Occur, Box<dyn Query>)> = req
-            .graphs
-            .iter()
-            .map(|graph| {
-                let term = TermQuery::new(
-                    Term::from_field_text(self.f_graph_id, graph.as_str()),
-                    IndexRecordOption::Basic,
-                );
-                (Occur::Should, Box::new(term) as Box<dyn Query>)
-            })
-            .collect();
-
-        let combined = BooleanQuery::new(vec![
-            (Occur::Must, parsed),
-            (Occur::Must, Box::new(BooleanQuery::new(graph_clauses))),
-        ]);
-
-        self.collect_top_docs(&combined, req.limit)
+        let allows = |candidate: &str| {
+            Ok::<bool, SearchError>(req.graphs.iter().any(|graph| graph.as_str() == candidate))
+        };
+        let check = || Ok::<(), SearchError>(());
+        self.collect_filtered(FilterQuery {
+            query: req.query,
+            limit: req.limit,
+            subject: None,
+            allows: &allows,
+            check: &check,
+        })
     }
 
-    fn collect_top_docs(&self, query: &dyn Query, limit: usize) -> Result<Vec<SearchHit>> {
-        let searcher = self.reader.searcher();
-        let top_docs = searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
+    #[cfg(test)]
+    fn collect_top_docs(&self, req: TopRequest<'_>) -> Result<Vec<SearchHit>> {
+        let generations = req.view.generations.clone();
+        let collector = BytesFilterCollector::new(
+            GENERATION_SCOPE_FIELD.to_string(),
+            move |scope: &[u8]| generations.active.contains(scope),
+            TopDocs::with_limit(req.limit).order_by_score(),
+        );
+        let top_docs = req.view.searcher.search(req.query, &collector)?;
         #[cfg(test)]
         {
             self.hooks.searches.fetch_add(1, Ordering::SeqCst);
@@ -1632,21 +1820,20 @@ impl SearchIndex {
         }
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            let doc: TantivyDocument = req.view.searcher.doc(doc_address)?;
             hits.push(self.doc_to_hit(doc, score));
         }
         Ok(hits)
     }
 
-    /// Commit pending writes and reload the reader so subsequent searches
-    /// reflect the latest changes.
-    ///
-    /// A completion barrier, not a request: returning `Ok` means a commit
-    /// covering every write made before the call has finished and the reader
-    /// has been reloaded. A plain dirty flag cleared up front let a second
-    /// caller see "clean" while the first commit was still in flight and
-    /// acknowledge queue entries Tantivy had not yet made durable — if that
-    /// commit then failed, the acknowledged work was never indexed (G7).
+    fn check_bound(&self, view: &SearchView) -> Result<()> {
+        if !view.bound {
+            return Err(SearchError::Unbound);
+        }
+        Ok(())
+    }
+
+    /// Commit every preceding write and reload the reader before returning.
     pub fn commit(&self) -> Result<()> {
         let target = self.write_epoch.load(Ordering::SeqCst);
         if self.committed_epoch.load(Ordering::SeqCst) >= target {
