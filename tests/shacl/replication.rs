@@ -4,6 +4,7 @@
 
 #![cfg(feature = "shacl-core")]
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;

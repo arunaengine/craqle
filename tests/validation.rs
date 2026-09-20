@@ -123,8 +123,10 @@ mod tests {
             graph.as_str(),
             graph.as_str()
         );
+        let mut options = UpdateOptions::default();
+        options.limits = UpdateLimits::unbounded();
         net.peer_mut(1)
-            .apply_sparql_update(&writer_auth(), &remove_link)
+            .apply_sparql_update_with_options(&writer_auth(), &remove_link, &options)
             .unwrap();
         net.sync_until_converged(10).unwrap();
 
@@ -177,10 +179,13 @@ mod tests {
             graph.as_str()
         );
 
-        match net
-            .peer_mut(0)
-            .apply_sparql_update(&writer_auth(), &delete_root)
-        {
+        let mut options = UpdateOptions::default();
+        options.limits = UpdateLimits::unbounded();
+        match net.peer_mut(0).apply_sparql_update_with_options(
+            &writer_auth(),
+            &delete_root,
+            &options,
+        ) {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
                     violations
@@ -329,8 +334,7 @@ mod tests {
             .unwrap();
     }
 
-    /// W4 — the delta index resolves a triple last-writer-wins, so deleting and
-    /// re-inserting the root type in one change set leaves the root intact.
+    /// Re-inserting the root type in one change set leaves the root intact.
     #[test]
     fn reinsert_passes_validation() {
         let (_tmp, net) = setup_network(1);
@@ -408,9 +412,7 @@ mod tests {
         }
     }
 
-    /// A `hasPart` cycle that is not attached to the root is unreachable: the
-    /// walk must not call the members reachable just because they reach each
-    /// other. Pinned on both the validated path and the recomputed diagnostics.
+    /// A cycle with no root path remains orphaned during writes and diagnostic rebuilds.
     #[test]
     fn detached_cycle_rejected() {
         let (_tmp, net) = setup_network(1);

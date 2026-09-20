@@ -491,7 +491,7 @@ impl<V: RdfReadView> Validator<'_, '_, '_, V> {
                 }
             }
             ResolvedConstraint::LessThan(predicate)
-            | ResolvedConstraint::LessThanOrEquals(predicate) => {
+            | ResolvedConstraint::LessOrEqual(predicate) => {
                 let other = self.predicate_values(focus, *predicate)?;
                 for value in values.iter().copied() {
                     let left = self.term_meta.get(self.view, self.context, value)?.cloned();
@@ -506,7 +506,7 @@ impl<V: RdfReadView> Validator<'_, '_, '_, V> {
                                 ResolvedConstraint::LessThan(_) => {
                                     comparison == Some(Ordering::Less)
                                 }
-                                ResolvedConstraint::LessThanOrEquals(_) => {
+                                ResolvedConstraint::LessOrEqual(_) => {
                                     matches!(comparison, Some(Ordering::Less | Ordering::Equal))
                                 }
                                 _ => unreachable!(),
@@ -764,10 +764,10 @@ fn node_kind_matches(expected: NodeKindPlan, actual: Option<TermKind>) -> bool {
         NodeKindPlan::Iri => actual == Some(TermKind::Iri),
         NodeKindPlan::Literal => actual == Some(TermKind::Literal),
         NodeKindPlan::BlankNode => actual == Some(TermKind::BlankNode),
-        NodeKindPlan::BlankNodeOrIri => {
+        NodeKindPlan::BlankOrIri => {
             matches!(actual, Some(TermKind::BlankNode | TermKind::Iri))
         }
-        NodeKindPlan::BlankNodeOrLiteral => {
+        NodeKindPlan::BlankOrLiteral => {
             matches!(actual, Some(TermKind::BlankNode | TermKind::Literal))
         }
         NodeKindPlan::IriOrLiteral => matches!(actual, Some(TermKind::Iri | TermKind::Literal)),

@@ -204,7 +204,7 @@ pub(crate) fn component_iri(constraint: &ResolvedConstraint) -> &'static str {
         ResolvedConstraint::LessThan(_) => {
             concat!("http://www.w3.org/ns/shacl#", "LessThanConstraintComponent")
         }
-        ResolvedConstraint::LessThanOrEquals(_) => concat!(
+        ResolvedConstraint::LessOrEqual(_) => concat!(
             "http://www.w3.org/ns/shacl#",
             "LessThanOrEqualsConstraintComponent"
         ),

@@ -52,7 +52,7 @@ pub(crate) fn analyze(
             ConstraintPlan::Equals(predicate)
             | ConstraintPlan::Disjoint(predicate)
             | ConstraintPlan::LessThan(predicate)
-            | ConstraintPlan::LessThanOrEquals(predicate) => {
+            | ConstraintPlan::LessOrEqual(predicate) => {
                 forward.insert(predicate.clone());
             }
             ConstraintPlan::Or(shapes)
@@ -79,7 +79,7 @@ pub(crate) fn analyze(
         target_classes: classes.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         nested_shapes: nested.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         reads_rdf_type,
-        reads_all_outgoing_predicates: reads_all_outgoing,
+        reads_all_predicates: reads_all_outgoing,
         has_transitive_path,
         requires_global_work,
     }

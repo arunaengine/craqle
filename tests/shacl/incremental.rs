@@ -4,6 +4,7 @@
 
 #![cfg(feature = "shacl-core")]
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
@@ -103,7 +104,7 @@ _:tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999
 <urn:test:matrix-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
 
-const ZERO_OR_ONE_PATH_SHAPES: &str = r#"
+const OPTIONAL_PATH_SHAPES: &str = r#"
 <urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
 <urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
 <urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
@@ -112,7 +113,7 @@ _:path <http://www.w3.org/ns/shacl#zeroOrOnePath> <urn:test:rel> .
 <urn:test:matrix-property> <http://www.w3.org/ns/shacl#maxCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
 
-const ZERO_OR_MORE_PATH_SHAPES: &str = r#"
+const STAR_PATH_SHAPES: &str = r#"
 <urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
 <urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
 <urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
@@ -121,7 +122,7 @@ _:path <http://www.w3.org/ns/shacl#zeroOrMorePath> <urn:test:rel> .
 <urn:test:matrix-property> <http://www.w3.org/ns/shacl#maxCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
 
-const ONE_OR_MORE_PATH_SHAPES: &str = r#"
+const PLUS_PATH_SHAPES: &str = r#"
 <urn:test:matrix-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
 <urn:test:matrix-shape> <http://www.w3.org/ns/shacl#targetNode> <urn:test:matrix-focus> .
 <urn:test:matrix-shape> <http://www.w3.org/ns/shacl#property> <urn:test:matrix-property> .
@@ -572,7 +573,7 @@ fn validation_modes_equivalent() {
         },
         ModeCase {
             name: "zero-or-one-path",
-            shapes: ZERO_OR_ONE_PATH_SHAPES,
+            shapes: OPTIONAL_PATH_SHAPES,
             seed: &[(
                 "urn:test:matrix-focus",
                 "urn:test:seed",
@@ -587,7 +588,7 @@ fn validation_modes_equivalent() {
         },
         ModeCase {
             name: "zero-or-more-path",
-            shapes: ZERO_OR_MORE_PATH_SHAPES,
+            shapes: STAR_PATH_SHAPES,
             seed: &[(
                 "urn:test:matrix-focus",
                 "urn:test:seed",
@@ -602,7 +603,7 @@ fn validation_modes_equivalent() {
         },
         ModeCase {
             name: "one-or-more-path",
-            shapes: ONE_OR_MORE_PATH_SHAPES,
+            shapes: PLUS_PATH_SHAPES,
             seed: &[(
                 "urn:test:matrix-focus",
                 "urn:test:seed",

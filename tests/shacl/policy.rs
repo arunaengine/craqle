@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;

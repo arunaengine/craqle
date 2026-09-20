@@ -4,6 +4,7 @@
 
 #![cfg(feature = "shacl-core")]
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
@@ -205,7 +206,7 @@ fn checked_advisory_diagnostics() {
     );
 
     let child = "<urn:test:unchecked-child>";
-    node.apply_changes_bulk_unchecked(
+    node.apply_bulk_unchecked(
         &data,
         vec![add(&data, &format!("<{}>", data.as_str()), HAS_PART, child)],
     )
