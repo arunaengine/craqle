@@ -3210,6 +3210,317 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn text_limit_rejects() {
+        let mut text = String::new();
+        let term = EncodedTerm("\"oversized\"".to_string());
+
+        let error = append_searchable_text(&mut text, &term, 4).unwrap_err();
+
+        assert!(matches!(error, SearchError::ItemTooLarge { limit: 4, .. }));
+        assert!(text.is_empty(), "rejection must not retain partial text");
+    }
+
+    #[test]
+    fn failure_tracks_oldest() {
+        let graph = GraphId::new("urn:test:failure-oldest");
+        let state = RetryState {
+            id: graph_queue_id(QueueKind::Reindex, &graph),
+            owed_from: 5,
+            target: 100,
+            attempts: 1,
+            retry_at_ms: u64::MAX,
+            code: "item-too-large".to_string(),
+            error_kind: crate::CraqleErrorKind::QueryLimit,
+        };
+
+        let failure = drain_failure(&state, "oversized");
+        assert_eq!(5, failure.owed_from);
+        assert_eq!(100, failure.target);
+        assert!(failure.owed_from <= 50);
+        assert!(failure.owed_from > 4);
+    }
+
+    #[test]
+    fn generation_isolates_graphs() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        let first = GraphId::new("urn:test:generation-first");
+        let second = GraphId::new("urn:test:generation-second");
+        index.publish_rows(vec![
+            GraphGeneration {
+                graph: first.clone(),
+                active: Some(GenerationId(2)),
+                covered: 1,
+            },
+            GraphGeneration {
+                graph: second.clone(),
+                active: Some(GenerationId(3)),
+                covered: 1,
+            },
+        ]);
+        {
+            let mut writer = index.writer().unwrap();
+            index
+                .add_document(
+                    &mut writer,
+                    ResourceDoc {
+                        graph_id: first.as_str(),
+                        subject_iri: "urn:test:stale",
+                        generation: GenerationId(3),
+                        all_text: Some("collisionneedle"),
+                        delete_existing: true,
+                    },
+                )
+                .unwrap();
+            index
+                .add_document(
+                    &mut writer,
+                    ResourceDoc {
+                        graph_id: second.as_str(),
+                        subject_iri: "urn:test:active",
+                        generation: GenerationId(3),
+                        all_text: Some("collisionneedle"),
+                        delete_existing: true,
+                    },
+                )
+                .unwrap();
+        }
+        index.commit().unwrap();
+
+        assert!(
+            index
+                .search_in_graph(first.as_str(), "collisionneedle", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let hits = index.search("collisionneedle", 10).unwrap();
+        assert_eq!(1, hits.len());
+        assert_eq!(second.as_str(), hits[0].graph_id);
+    }
+
+    #[test]
+    fn authorization_precedes_topk() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        for value in 0..20 {
+            let graph = format!("urn:test:hidden:{value:02}");
+            index
+                .index_resource(
+                    &graph,
+                    &format!("urn:test:item:{value:02}"),
+                    Some("rankneedle"),
+                )
+                .unwrap();
+        }
+        let visible = "urn:test:visible";
+        index
+            .index_resource(visible, "urn:test:wanted", Some("rankneedle"))
+            .unwrap();
+        index.commit().unwrap();
+        let allows = |graph: &str| Ok(graph == visible);
+
+        let hits = index
+            .search_authorized(AuthorizedQuery {
+                query: "rankneedle",
+                limit: 1,
+                subject: None,
+                allows: &allows,
+            })
+            .unwrap();
+        assert_eq!(1, hits.len());
+        assert_eq!(visible, hits[0].graph_id);
+    }
+
+    #[test]
+    fn authorized_ties_stable() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        for value in (0..20).rev() {
+            index
+                .index_resource(
+                    "urn:test:stable",
+                    &format!("urn:test:item:{value:02}"),
+                    Some("stableneedle"),
+                )
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let allows = |_: &str| Ok(true);
+        let first = index
+            .search_authorized(AuthorizedQuery {
+                query: "stableneedle",
+                limit: 1,
+                subject: None,
+                allows: &allows,
+            })
+            .unwrap();
+        let page = index
+            .search_authorized(AuthorizedQuery {
+                query: "stableneedle",
+                limit: 5,
+                subject: None,
+                allows: &allows,
+            })
+            .unwrap();
+
+        assert_eq!(first[0].subject_iri, page[0].subject_iri);
+        assert!(page.windows(2).all(|pair| {
+            stable_hit_key(&pair[0].graph_id, &pair[0].subject_iri)
+                < stable_hit_key(&pair[1].graph_id, &pair[1].subject_iri)
+        }));
+    }
+
+    #[test]
+    fn duplicate_keeps_score() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        let graph = "urn:test:duplicate-score";
+        index.set_generation(graph, Some(DIRECT_GENERATION));
+        {
+            let mut writer = index.writer().unwrap();
+            for text in ["boostneedle", "boostneedle boostneedle boostneedle"] {
+                index
+                    .add_document(
+                        &mut writer,
+                        ResourceDoc {
+                            graph_id: graph,
+                            subject_iri: "urn:test:subject",
+                            generation: DIRECT_GENERATION,
+                            all_text: Some(text),
+                            delete_existing: false,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        index.commit().unwrap();
+        let view = index.pin_view();
+        let parser = QueryParser::for_index(&index.index, vec![index.f_all_text]);
+        let query = parser.parse_query("boostneedle").unwrap();
+        let raw = index
+            .collect_top_docs(TopRequest {
+                view: &view,
+                query: &query,
+                limit: 8,
+            })
+            .unwrap();
+        let expected = raw
+            .iter()
+            .map(|hit| hit.score)
+            .max_by(f32::total_cmp)
+            .unwrap();
+        let allows = |_: &str| Ok(true);
+        let hits = index
+            .search_authorized(AuthorizedQuery {
+                query: "boostneedle",
+                limit: 1,
+                subject: None,
+                allows: &allows,
+            })
+            .unwrap();
+
+        assert_eq!(1, hits.len());
+        assert_eq!(
+            std::cmp::Ordering::Equal,
+            hits[0].score.total_cmp(&expected)
+        );
+    }
+
+    #[test]
+    fn tail_scan_wraps() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        let cursor = QueueCursor {
+            token: 7,
+            kind: QueueKind::Reindex,
+            graph: TermId(9),
+            subject: None,
+        };
+        index
+            .scan_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reindexes = Some(cursor);
+        let page = QueuePage::<()> {
+            entries: Vec::new(),
+            next: Some(cursor),
+            remaining: false,
+            rows: 0,
+            bytes: 0,
+            oversized: None,
+        };
+
+        assert!(index.save_scan(ScanSave {
+            kind: QueueKind::Reindex,
+            page: &page,
+            started: true,
+        }));
+        assert!(
+            index
+                .scan_cursors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reindexes
+                .is_none()
+        );
+        assert!(!index.save_scan(ScanSave {
+            kind: QueueKind::Reindex,
+            page: &page,
+            started: false,
+        }));
+    }
+
+    #[test]
+    fn pinned_view_survives() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        let graph = GraphId::new("urn:test:pinned-generation");
+        index
+            .index_resource(graph.as_str(), "urn:test:old", Some("oldneedle"))
+            .unwrap();
+        index.commit().unwrap();
+        let pinned = index.pin_view();
+
+        {
+            let mut writer = index.writer().unwrap();
+            index
+                .add_document(
+                    &mut writer,
+                    ResourceDoc {
+                        graph_id: graph.as_str(),
+                        subject_iri: "urn:test:new",
+                        generation: GenerationId(2),
+                        all_text: Some("newneedle"),
+                        delete_existing: true,
+                    },
+                )
+                .unwrap();
+        }
+        index.commit().unwrap();
+        assert_eq!(1, index.search("oldneedle", 10).unwrap().len());
+        assert!(index.search("newneedle", 10).unwrap().is_empty());
+
+        index.set_generation(graph.as_str(), Some(GenerationId(2)));
+        assert!(index.search("oldneedle", 10).unwrap().is_empty());
+        assert_eq!(1, index.search("newneedle", 10).unwrap().len());
+        {
+            let writer = index.writer().unwrap();
+            writer.delete_term(Term::from_field_text(
+                index.f_generation_key,
+                &generation_key(index.index_id, graph.as_str(), DIRECT_GENERATION),
+            ));
+            index.write_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        index.commit().unwrap();
+
+        let parser = QueryParser::for_index(&index.index, vec![index.f_all_text]);
+        let parsed = parser.parse_query("oldneedle").unwrap();
+        let hits = index
+            .collect_top_docs(TopRequest {
+                view: &pinned,
+                query: &parsed,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(1, hits.len());
+        assert_eq!("urn:test:old", hits[0].subject_iri);
+    }
+
     fn build_legacy_schema() -> Schema {
         let mut builder = SchemaBuilder::default();
         builder.add_text_field("doc_key", STRING | STORED);
