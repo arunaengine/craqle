@@ -820,6 +820,37 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         cursor: Option<&[u8]>,
     ) -> SyncResult<TopicCatchup>;
 
+    fn topic_cursor_at(
+        &self,
+        _topic_id: irokle::TopicId,
+        _clock: &irokle::ActorClock,
+    ) -> SyncResult<Vec<u8>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn topic_frontier(&self, _topic_id: irokle::TopicId) -> SyncResult<TopicFrontier> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn topic_record(
+        &self,
+        _topic_id: irokle::TopicId,
+        _id: irokle::OpId,
+    ) -> SyncResult<Option<TopicRecord>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn history_snapshot(&self, _request: &HistoryRequest) -> SyncResult<HistorySnapshot> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn find_mutation(
+        &self,
+        _receipt: &MutationReceipt,
+    ) -> SyncResult<Option<EventRecord<CraqleGraphEvent>>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
     fn is_local_record(
         &self,
         topic_id: irokle::TopicId,
@@ -847,13 +878,8 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
 pub struct IrokleGraphSync<S: irokle::Storage> {
     node: irokle::Irokle<S>,
     options: CraqleIrokleOptions,
-    /// Memo of confirmed graph → irokle topic bindings (derived-state register
-    /// row 12). Bindings are write-once for a live graph, so a hit can never be
-    /// wrong while the graph exists; only *confirmed* bindings are inserted and
-    /// a miss is never cached, because a concurrent sync admission can create
-    /// the topic between two calls.
-    ///
-    /// Shared across clones so every handle to one node sees one memo.
+    /// Shared confirmed graph-to-topic bindings. Misses remain uncached because
+    /// concurrent admission may create the topic between calls.
     topic_memo: Arc<RwLock<HashMap<GraphId, irokle::TopicId>>>,
     /// Set by a test to fail the next history read, standing in for an
     /// unreadable topic. Shared across clones, like the memo.
@@ -939,7 +965,7 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
         if guarded {
             store.set_topic_guarded(graph, *topic_id.as_bytes())?;
         } else {
-            store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+            store.set_topic_id(graph, *topic_id.as_bytes())?;
         }
         self.remember_topic(graph, topic_id);
         Ok(topic_id)
@@ -999,6 +1025,23 @@ struct GraphTopic<'a> {
 }
 
 impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
+    fn publish_mutation(
+        &self,
+        store: &GraphStore,
+        mutation: OutgoingMutation,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        let topic = self.open_graph_topic(store, &mutation.graph)?;
+        Ok(topic.publish_with(
+            CraqleGraphEvent::Mutation {
+                id: mutation.id,
+                graph: mutation.graph,
+                changes: mutation.changes,
+                render_hints: mutation.render_hints.map(Into::into),
+            },
+            self.publish_options(),
+        )?)
+    }
+
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
     fn publish_changes(
         &self,
@@ -1022,7 +1065,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: TaggedRoCrateRenderHints,
+        render_hints: TaggedRenderHints,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, graph)?;
         Ok(topic.publish_with(
@@ -1121,7 +1164,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         Ok(())
     }
 
-    fn bind_graph_topic_if_present(
+    fn bind_existing_topic(
         &self,
         store: &GraphStore,
         graph: &GraphId,
@@ -1139,7 +1182,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 actual: state.event_type_id,
             }));
         }
-        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        store.set_topic_id(graph, *topic_id.as_bytes())?;
         Ok(Some(topic_id))
     }
 
@@ -1153,7 +1196,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         let topic_id = graph_topic_id(graph);
         let mut genesis_error = None;
         for _ in 0..2 {
-            if let Some(topic_id) = self.bind_graph_topic_if_present(store, graph)? {
+            if let Some(topic_id) = self.bind_existing_topic(store, graph)? {
                 return Ok(topic_id);
             }
             let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
@@ -1165,7 +1208,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             let oplog = Oplog::with_storage(self.node.storage().clone());
             match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
                 Ok(_) => {
-                    store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+                    store.set_topic_id(graph, *topic_id.as_bytes())?;
                     return Ok(topic_id);
                 }
                 Err(error) => genesis_error = Some(error),
