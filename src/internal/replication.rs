@@ -2855,31 +2855,202 @@ impl ReplicationEngine {
         }
 
         #[cfg(feature = "shacl-core")]
-        let pending_graphs;
+        let repair_graphs = self.store.affected_shacl_graphs(graph)?;
+        #[cfg(not(feature = "shacl-core"))]
+        let repair_graphs = Vec::new();
+        let id = new_mutation();
+        let request_digest = snapshot_digest(snapshot)?;
+        let source_receipt = crate::sync::MutationReceipt {
+            id,
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest,
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: repair_graphs.clone(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: crate::sync::RepairState {
+                diagnostics: crate::sync::RepairOutcome::Pending,
+                #[cfg(feature = "shacl-core")]
+                shacl: crate::sync::RepairOutcome::Pending,
+                #[cfg(not(feature = "shacl-core"))]
+                shacl: crate::sync::RepairOutcome::NotRequired,
+                search: crate::sync::RepairOutcome::Pending,
+                query_view: crate::sync::RepairOutcome::Pending,
+            },
+            source_version: clock_digest(&snapshot.clock)?,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
         let applied = {
             let _commit_guard = self.store.graph_commit_guard(graph);
-            #[cfg(feature = "shacl-core")]
-            {
-                pending_graphs = self.store.affected_shacl_graphs(graph)?;
-            }
-            self.join_snapshot(snapshot)?
+            self.join_snapshot(snapshot, Some(&source_receipt))?
         };
 
         #[cfg(feature = "shacl-core")]
         if applied {
-            let settled = self.settle_current_post_commit(graph);
-            self.settle_shacl_graphs(&pending_graphs, (!settled).then_some(graph));
+            let settled = self.settle_current_post(graph);
+            self.settle_shacl_graphs(&repair_graphs, (!settled).then_some(graph));
+            if let Err(error) = self.complete_shacl(id, settled) {
+                let Some(receipt) = self.store.mutation_receipt(&id)? else {
+                    return Err(MergeError::Store(error));
+                };
+                return Err(MergeError::Accepted {
+                    receipt,
+                    error_kind: error.kind(),
+                    reason: error.to_string(),
+                });
+            }
         }
-        Ok(MergeResult { applied })
+        let receipt = if applied {
+            self.store.mutation_receipt(&id)?
+        } else {
+            None
+        };
+        Ok(MergeReceipt {
+            result: MergeResult { applied },
+            receipt,
+        })
+    }
+
+    pub(crate) fn preview_repair(
+        &self,
+        request: &crate::sync::RepairRequest,
+    ) -> Result<crate::sync::RepairReport, MergeError> {
+        crate::sync::check_snapshot(&request.authoritative)
+            .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        let graph = &request.authoritative.graph;
+        let local = self.store.graph_snapshot_bounded(
+            graph,
+            SnapshotLimits {
+                max_rows: 1_048_576,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )?;
+        let before_digest = snapshot_digest(&local)?;
+        let authority_digest = snapshot_digest(&request.authoritative)?;
+        if let crate::sync::RepairAuthority::HealthySnapshot { digest, .. } = &request.authority
+            && *digest != authority_digest
+        {
+            return Err(MergeError::InputRejected(
+                "healthy snapshot digest does not match its authoritative state".to_owned(),
+            ));
+        }
+        let tombstoned = self.store.graph_tombstoned(graph)?;
+        let result = if tombstoned {
+            crate::sync::RepairResult::Tombstoned
+        } else if local == request.authoritative {
+            crate::sync::RepairResult::Exact
+        } else if request.mode == crate::sync::RepairMode::Apply
+            && request
+                .backup
+                .as_ref()
+                .is_none_or(|backup| backup.source_revision != before_digest)
+        {
+            crate::sync::RepairResult::BackupRequired
+        } else {
+            crate::sync::RepairResult::Differs
+        };
+        let diff = (local != request.authoritative).then(|| crate::sync::RepairDiff {
+            unresolved: crate::sync::missing_dots(&request.authoritative.clock, &local.clock),
+            local,
+            authoritative: request.authoritative.clone(),
+        });
+        Ok(crate::sync::RepairReport {
+            audit: crate::sync::RepairAudit {
+                id: request.id,
+                graph: graph.clone(),
+                mode: request.mode,
+                authority: request.authority.clone(),
+                before_digest,
+                after_digest: None,
+                backup: request.backup.clone(),
+                result,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            },
+            diff,
+        })
+    }
+
+    pub(crate) fn reconcile_snapshot(
+        &self,
+        request: &crate::sync::RepairRequest,
+    ) -> Result<crate::sync::RepairReport, MergeError> {
+        let mut report = self.preview_repair(request)?;
+        if request.mode == crate::sync::RepairMode::Apply
+            && matches!(
+                report.audit.result,
+                crate::sync::RepairResult::Differs | crate::sync::RepairResult::BackupRequired
+            )
+        {
+            report.audit.backup = Some(self.store.backup_snapshot(&report.audit.graph)?);
+            report.audit.result = crate::sync::RepairResult::Applied;
+            report.audit.after_digest = Some(snapshot_digest(&request.authoritative)?);
+            self.store
+                .replace_snapshot(&request.authoritative, &report.audit)?;
+            return Ok(report);
+        }
+        self.record_repair(&report.audit)?;
+        Ok(report)
+    }
+
+    pub(crate) fn record_repair(
+        &self,
+        audit: &crate::sync::RepairAudit,
+    ) -> crate::store::Result<()> {
+        let mut batch = self.store.new_batch();
+        self.store.stage_repair_audit(&mut batch, audit)?;
+        self.store.commit(batch)
+    }
+
+    pub(crate) fn record_history(
+        &self,
+        failure: crate::sync::HistoryFailure,
+        result: crate::sync::RepairResult,
+    ) -> Result<crate::sync::RepairReport, MergeError> {
+        if !matches!(
+            result,
+            crate::sync::RepairResult::HistoryMissing | crate::sync::RepairResult::Tombstoned
+        ) {
+            return Err(MergeError::InputRejected(
+                "history audit result must be missing or tombstoned".to_owned(),
+            ));
+        }
+        let local = self.store.graph_snapshot_bounded(
+            &failure.graph,
+            SnapshotLimits {
+                max_rows: 1_048_576,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )?;
+        let audit = crate::sync::RepairAudit {
+            id: failure.id,
+            graph: failure.graph,
+            mode: failure.mode,
+            authority: failure.authority,
+            before_digest: snapshot_digest(&local)?,
+            after_digest: None,
+            backup: None,
+            result,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.record_repair(&audit)?;
+        Ok(crate::sync::RepairReport { audit, diff: None })
     }
 
     /// Write the OR-Set join of local state and `snapshot`, reporting whether
     /// anything changed. **Call with the graph commit guard held.**
-    fn join_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<bool, MergeError> {
+    fn join_snapshot(
+        &self,
+        snapshot: &GraphReplicaSnapshot,
+        receipt: Option<&crate::sync::MutationReceipt>,
+    ) -> Result<bool, MergeError> {
         let graph = &snapshot.graph;
-        // Both pre-merge contexts are read before either is joined: a dot the
-        // other side's context covers but its live set omits is a removal that
-        // side has already seen, not an addition this side is missing.
+        // An absent dot covered by the other pre-merge clock is an observed removal.
         let local = self.store.graph_snapshot(graph)?;
         let mut clock = local.clock.clone();
         clock.merge(&snapshot.clock);
@@ -2980,19 +3151,50 @@ impl ReplicationEngine {
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(&clock)?)?;
+        let mut staged_receipt = receipt.cloned();
+        if affected_subjects.is_empty()
+            && let Some(receipt) = &mut staged_receipt
+        {
+            receipt.repairs.search = crate::sync::RepairOutcome::NotRequired;
+        }
+        let _receipt_guard = staged_receipt
+            .as_ref()
+            .map(|receipt| self.store.receipt_guard(&receipt.id));
+        if let Some(receipt) = &staged_receipt {
+            if self.store.stage_receipt(&mut batch, receipt)?.is_some() {
+                return Err(MergeError::Store(crate::store::StoreError::ReceiptConflict));
+            }
+        }
         self.store.commit(batch)?;
-        self.recompute_graph_diagnostics(graph)?;
+        drop(_receipt_guard);
+        if let Err(error) = self.recompute_graph_diagnostics(graph) {
+            if let Some(receipt) = staged_receipt
+                .as_ref()
+                .and_then(|receipt| self.store.mutation_receipt(&receipt.id).ok().flatten())
+            {
+                return Err(MergeError::Accepted {
+                    receipt,
+                    error_kind: error.kind(),
+                    reason: error.to_string(),
+                });
+            }
+            return Err(MergeError::Store(error));
+        }
+        if let Some(receipt) = &staged_receipt {
+            self.complete_diagnostics(receipt.id)?;
+        }
         Ok(true)
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
-    fn apply_single_batch(
-        &self,
-        incoming: &Batch,
-        render_hints: Option<&TaggedRoCrateRenderHints>,
-        vector_clock: &mut VectorClock,
-    ) -> Result<(), MergeError> {
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %apply.incoming.graph.as_str(), op_count = apply.incoming.ops.len()))]
+    fn apply_single_batch(&self, apply: ApplyBatch<'_>) -> Result<(), MergeError> {
+        let ApplyBatch {
+            incoming,
+            clock: vector_clock,
+            plan,
+        } = apply;
         let graph = &incoming.graph;
+        let _receipt_guard = self.store.receipt_guard(&plan.id);
         let mut batch = self.store.new_batch();
         let mut affected_subjects = HashSet::new();
         let mut term_cache = HashMap::new();
@@ -3081,38 +3283,44 @@ impl ReplicationEngine {
                 subjects: &affected_subjects,
             },
         )?;
-        if let Some(render_hints) = render_hints {
+        if let Some(render_hints) = plan.hints {
             self.store
                 .stage_graph_context(&mut batch, graph_id, render_hints)?;
         }
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(vector_clock)?)?;
+        let receipt = source_receipt(graph, plan, vector_clock)?;
+        if self.store.mutation_receipt(&plan.id)?.is_some() {
+            self.store.stage_receipt_update(&mut batch, &receipt)?;
+        } else if self.store.stage_receipt(&mut batch, &receipt)?.is_some() {
+            return Err(MergeError::Store(
+                crate::store::StoreError::InvalidEncoding {
+                    context: "mutation receipt",
+                    message: "receipt exists without applied source clock".to_owned(),
+                },
+            ));
+        }
+        self.store.stage_batch_receipt(
+            &mut batch,
+            &BatchReceiptLink {
+                graph: graph_id,
+                actor: incoming.actor,
+                counter: incoming.counter,
+                id: plan.id,
+            },
+        )?;
         self.store.commit(batch)?;
         Ok(())
     }
 
-    /// Bring the persisted diagnostics record back in step with the state the
-    /// commit just produced. **Call with the graph commit guard held.**
-    ///
-    /// Re-stamps the previous verdict when the write cannot have moved the orphan
-    /// set; otherwise recomputes.
-    ///
-    /// Validation success is not an orphan verdict; only the dependency summary
-    /// proves when the previous set remains exact.
+    /// Settle diagnostics under the graph commit guard, restamping only when reachability is unchanged.
     fn settle_diagnostics(
         &self,
         graph: &GraphId,
         pending: &PendingDiagnostics,
     ) -> crate::store::Result<()> {
-        // Case 1. `orphaned_data_entities` reads exactly two triple shapes:
-        // `?s rdf:type schema:Dataset|schema:MediaObject` (which entities count
-        // as data entities) and `?s schema:hasPart ?o` (which adds to that set
-        // and forms every edge of the reachability graph). Nothing else in the
-        // graph can affect it. `touches_reachability` is set by exactly those
-        // two shapes, so a write that leaves it clear provably leaves the orphan
-        // set identical — the previous verdict is still exact and only needs
-        // re-stamping so its clock tag matches the new state (G6).
+        // Only data-entity type and `hasPart` shapes can change the orphan set.
         if !pending.summary.touches_reachability() {
             return self.publish_graph_diagnostics(graph, &pending.previous);
         }
@@ -3121,7 +3329,7 @@ impl ReplicationEngine {
         self.recompute_graph_diagnostics(graph)
     }
 
-    /// Recompute the orphan set from post-write state and publish it (G6, G7).
+    /// Recompute and publish the post-write orphan set.
     fn recompute_graph_diagnostics(&self, graph: &GraphId) -> crate::store::Result<()> {
         // The commit already made the stored record's clock tag stale, so this
         // read recomputes. It does not persist: this is the record's writer.
@@ -3129,16 +3337,8 @@ impl ReplicationEngine {
         self.publish_graph_diagnostics(graph, &current)
     }
 
-    /// Persist `current` as the graph's orphan record and re-queue for search
-    /// every entity whose orphan status differs from the last persisted set.
-    ///
-    /// The baseline is the *persisted* record, never a caller's pre-write read:
-    /// a deferred bulk write that has committed but not yet rebuilt leaves that
-    /// read already reflecting flips the index has never seen, and persisting it
-    /// would strand them (G7).
-    ///
-    /// Re-queue first, record second: they are separate commits, and a crash
-    /// between them must leave the older baseline so the next rebuild re-queues.
+    /// Re-queue orphan changes against the persisted baseline before publishing current diagnostics.
+    /// A crash between those commits retains the older baseline for safe replay.
     fn publish_graph_diagnostics(
         &self,
         graph: &GraphId,
@@ -3318,7 +3518,6 @@ fn map_store_error(error: crate::CraqleError) -> crate::store::StoreError {
     }
 }
 
-#[cfg(feature = "shacl-core")]
 fn clock_digest(clock: &VectorClock) -> crate::store::Result<[u8; 32]> {
     Ok(*blake3::hash(&postcard::to_allocvec(clock)?).as_bytes())
 }
@@ -3349,9 +3548,7 @@ fn map_update_error(error: crate::CraqleError) -> UpdateError {
 
 type TermTriple<'a> = (&'a EncodedTerm, &'a EncodedTerm, &'a EncodedTerm);
 
-/// Local and remote dot sets for every quad identity either side holds. A quad
-/// only one side holds is still considered, because the other side's context
-/// may prove it was removed.
+/// Include unilateral quads so the opposite clock can prove an observed removal.
 fn join_union<'a>(
     local: &'a GraphReplicaSnapshot,
     remote: &'a GraphReplicaSnapshot,
@@ -3389,11 +3586,27 @@ fn join_dots(local: &[Dot], remote: &[Dot], contexts: (&VectorClock, &VectorCloc
     joined
 }
 
-fn update_error_from_merge(error: MergeError) -> UpdateError {
+fn snapshot_digest(snapshot: &GraphReplicaSnapshot) -> Result<[u8; 32], MergeError> {
+    let bytes = postcard::to_allocvec(snapshot)
+        .map_err(crate::store::StoreError::from)
+        .map_err(MergeError::Store)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+fn merge_update_error(error: MergeError) -> UpdateError {
     match error {
         MergeError::Store(error) => UpdateError::Store(error),
         MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
         MergeError::MissingDependencies(_) => UpdateError::InvalidChangeSet(error.to_string()),
+        MergeError::Accepted {
+            receipt,
+            error_kind,
+            reason,
+        } => UpdateError::Accepted {
+            receipt,
+            error_kind,
+            reason,
+        },
     }
 }
 
@@ -3414,6 +3627,105 @@ mod tests {
         (store, engine)
     }
 
+    fn settled_receipt(
+        store: &GraphStore,
+        graph: &GraphId,
+        persistence: crate::sync::PersistenceOutcome,
+    ) -> crate::sync::MutationReceipt {
+        crate::sync::MutationReceipt {
+            id: crate::sync::MutationId::new(),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: [7; 32],
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence,
+            repairs: settled_repairs(),
+            source_version: store.graph_version_digest(graph).unwrap(),
+            updated_unix_nanos: 1,
+        }
+    }
+
+    fn store_receipt(store: &GraphStore, receipt: &crate::sync::MutationReceipt) {
+        let _guard = store.receipt_guard(&receipt.id);
+        let mut batch = store.new_batch();
+        assert!(store.stage_receipt(&mut batch, receipt).unwrap().is_none());
+        store.commit(batch).unwrap();
+        store.persist_receipts().unwrap();
+    }
+
+    #[test]
+    fn status_skips_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let graph = GraphId::new("urn:test:receipt-status-work");
+        store.create_graph(&graph).unwrap();
+        let receipt = settled_receipt(&store, &graph, store.persistence_outcome());
+        store_receipt(&store, &receipt);
+        let stored = store.mutation_receipt(&receipt.id).unwrap().unwrap();
+        let lookup = crate::sync::MutationLookup {
+            graph,
+            id: stored.id,
+            admission_sequence: Some(stored.admission_sequence),
+        };
+        let before = store.receipt_work();
+
+        assert!(matches!(
+            engine.mutation_status(&lookup).unwrap(),
+            crate::sync::MutationStatus::Known(_)
+        ));
+        assert!(matches!(
+            engine.mutation_status(&lookup).unwrap(),
+            crate::sync::MutationStatus::Known(_)
+        ));
+
+        let after = store.receipt_work();
+        assert_eq!(after.writes, before.writes);
+        assert_eq!(after.persists, before.persists);
+    }
+
+    #[test]
+    fn persist_writes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let graph = GraphId::new("urn:test:receipt-persist-work");
+        store.create_graph(&graph).unwrap();
+        let receipt = settled_receipt(&store, &graph, crate::sync::PersistenceOutcome::Pending);
+        store_receipt(&store, &receipt);
+        let before = store.receipt_work();
+
+        engine.mark_persisted(&receipt.id).unwrap().unwrap();
+
+        let after = store.receipt_work();
+        assert_eq!(after.writes - before.writes, 1);
+        assert_eq!(after.persists - before.persists, 1);
+    }
+
+    #[test]
+    fn store_locks_isolate() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_a = Arc::new(GraphStore::open(dir_a.path()).unwrap());
+        let store_b = Arc::new(GraphStore::open(dir_b.path()).unwrap());
+        let graph = GraphId::new("urn:test:store-lock-isolation");
+        let held = store_a.graph_write_guard(&graph);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other_graph = graph.clone();
+        std::thread::spawn(move || {
+            let _guard = store_b.graph_write_guard(&other_graph);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(180))
+            .expect("an unrelated store was blocked by the same graph IRI");
+        drop(held);
+    }
+
     fn pending_engine(
         dir: &std::path::Path,
         policy: ShaclWritePolicy,
@@ -3423,7 +3735,7 @@ mod tests {
         let shapes = GraphId::new("urn:test:pending-shapes");
         let focus = EncodedTerm("<urn:test:pending-focus>".to_owned());
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -3434,7 +3746,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -3548,7 +3860,7 @@ mod tests {
         {
             let (store, engine) = engine_at(dir.path());
             queued_graphs(&store, 5);
-            let outcome = engine.replay_pending_bindings_bounded(2, None).unwrap();
+            let outcome = engine.replay_bindings_bounded(2, None).unwrap();
             assert_eq!(outcome.statistics.pending_queue_entries_scanned, 2);
             assert_eq!(outcome.statistics.graphs_settled, 2);
             assert_eq!(outcome.statistics.reports_produced, 2);
@@ -3558,9 +3870,7 @@ mod tests {
         }
 
         let (store, engine) = engine_at(dir.path());
-        let outcome = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let outcome = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(outcome.statistics.graphs_settled, 3);
         assert_eq!(outcome.statistics.reports_produced, 3);
         assert!(!outcome.budget_exhausted);
@@ -3572,11 +3882,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine) = engine_at(dir.path());
         queued_graphs(&store, 3);
-        engine.arm_settle_failure_after(1);
+        engine.arm_settle_after(1);
 
-        let outcome = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let outcome = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.statistics.graphs_settled, 2);
         assert_eq!(outcome.statistics.reports_produced, 2);
@@ -3590,9 +3898,7 @@ mod tests {
             crate::ShaclValidationState::Pending
         );
 
-        let retry = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let retry = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(retry.statistics.graphs_settled, 1);
         assert_eq!(retry.statistics.reports_produced, 1);
         assert_eq!(store.pending_shacl_count().unwrap(), 0);
@@ -3602,9 +3908,7 @@ mod tests {
     fn empty_replay_idle() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine) = engine_at(dir.path());
-        let outcome = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let outcome = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(outcome.statistics.pending_queue_entries_scanned, 0);
         assert_eq!(outcome.statistics.graphs_settled, 0);
         assert_eq!(outcome.statistics.reports_produced, 0);
@@ -3699,9 +4003,7 @@ mod tests {
             };
 
             let (store, engine) = engine_at(dir.path());
-            let replay = engine
-                .replay_pending_bindings_bounded(usize::MAX, None)
-                .unwrap();
+            let replay = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
             assert_eq!(replay.statistics.graphs_settled, 1);
             assert_eq!(store.graph_snapshot(&data).unwrap(), snapshot);
             assert_eq!(
@@ -3720,7 +4022,7 @@ mod tests {
         engine.arm_settle_failure();
         let shapes = binding.shapes_graph;
         let batch = engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![MaterializedQuadChange::Insert {
                     graph: shapes.clone(),
@@ -3876,7 +4178,7 @@ mod tests {
         receiver.replay_pending_bindings().unwrap();
         let shapes = GraphId::new("urn:test:pending-shapes");
         let batch = sender
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![MaterializedQuadChange::Insert {
                     graph: shapes.clone(),
@@ -3924,7 +4226,7 @@ mod tests {
             receiver.replay_pending_bindings().unwrap();
             let shapes = GraphId::new("urn:test:pending-shapes");
             let batch = sender
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     &shapes,
                     vec![
                         MaterializedQuadChange::Insert {
@@ -4009,7 +4311,7 @@ mod tests {
         let before = store.graph_version_digest(&data).unwrap();
 
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -4038,7 +4340,7 @@ mod tests {
         let before = (
             store.graph_snapshot(&data).unwrap(),
             store.get_vector_clock(&data).unwrap(),
-            store.query_index_status_fast().unwrap(),
+            store.index_status_fast().unwrap(),
             store.shacl_binding_statuses(&data).unwrap(),
         );
 
@@ -4068,7 +4370,7 @@ mod tests {
 
         assert_eq!(store.graph_snapshot(&data).unwrap(), before.0);
         assert_eq!(store.get_vector_clock(&data).unwrap(), before.1);
-        assert_eq!(store.query_index_status_fast().unwrap(), before.2);
+        assert_eq!(store.index_status_fast().unwrap(), before.2);
         assert_eq!(store.shacl_binding_statuses(&data).unwrap(), before.3);
     }
 
@@ -4080,7 +4382,7 @@ mod tests {
         let shape = EncodedTerm("<urn:test:pending-shape>".to_owned());
         let property = EncodedTerm("<urn:test:pending-property>".to_owned());
         setup
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -4117,7 +4419,7 @@ mod tests {
             )
             .unwrap();
         setup
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -4150,7 +4452,7 @@ mod tests {
         let before = (
             store.graph_snapshot(&data).unwrap(),
             store.get_vector_clock(&data).unwrap(),
-            store.query_index_status_fast().unwrap(),
+            store.index_status_fast().unwrap(),
             store.shacl_binding_statuses(&data).unwrap(),
         );
 
@@ -4169,7 +4471,7 @@ mod tests {
 
         assert_eq!(store.graph_snapshot(&data).unwrap(), before.0);
         assert_eq!(store.get_vector_clock(&data).unwrap(), before.1);
-        assert_eq!(store.query_index_status_fast().unwrap(), before.2);
+        assert_eq!(store.index_status_fast().unwrap(), before.2);
         assert_eq!(store.shacl_binding_statuses(&data).unwrap(), before.3);
         assert!(store.drain_fts_queue(usize::MAX).unwrap().is_empty());
         assert!(sync.graph_topic_id(&store, &data).unwrap().is_none());
@@ -4190,7 +4492,7 @@ mod tests {
         let imported = GraphId::new("urn:test:arrive-import");
         let focus = EncodedTerm("<urn:test:arrive-focus>".to_owned());
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -4201,7 +4503,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &root,
                 vec![MaterializedQuadChange::Insert {
                     graph: root.clone(),
@@ -4257,7 +4559,7 @@ mod tests {
         assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
 
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &imported,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -4299,7 +4601,7 @@ mod tests {
         let focus = EncodedTerm("<urn:test:stale-deps-focus>".to_owned());
         let imports = EncodedTerm("<http://www.w3.org/2002/07/owl#imports>".to_owned());
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -4311,7 +4613,7 @@ mod tests {
             .unwrap();
         for (graph, import) in [(&root, &first), (&first, &nested)] {
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     graph,
                     vec![MaterializedQuadChange::Insert {
                         graph: graph.clone(),
@@ -4324,7 +4626,7 @@ mod tests {
         }
         let old_nested = store.graph_version_digest(&nested).unwrap();
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &nested,
                 vec![MaterializedQuadChange::Insert {
                     graph: nested.clone(),
@@ -4409,7 +4711,7 @@ mod tests {
         );
 
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &second,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -4447,7 +4749,7 @@ mod tests {
             let shapes = if imported { &import } else { &root };
             let focus = EncodedTerm("<urn:test:error-focus>".to_owned());
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     &data,
                     vec![MaterializedQuadChange::Insert {
                         graph: data.clone(),
@@ -4459,7 +4761,7 @@ mod tests {
                 .unwrap();
             if imported {
                 engine
-                    .local_apply_changes_bypassing_structural_rules(
+                    .apply_changes_unchecked(
                         &root,
                         vec![MaterializedQuadChange::Insert {
                             graph: root.clone(),
@@ -4473,7 +4775,7 @@ mod tests {
                     .unwrap();
             }
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     shapes,
                     vec![
                         MaterializedQuadChange::Insert {
@@ -4541,7 +4843,7 @@ mod tests {
             engine.replay_pending_bindings().unwrap();
 
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     shapes,
                     vec![MaterializedQuadChange::Insert {
                         graph: shapes.clone(),
