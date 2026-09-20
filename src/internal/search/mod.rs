@@ -343,6 +343,14 @@ struct TestHooks {
     drain_panic: AtomicBool,
     /// Pauses a rebuild between its clear and its refill.
     rebuild: StallHook,
+    /// Holds a completed staged rebuild before publication.
+    stage: GateHook,
+    /// Holds a committed stage page before its durable cursor advances.
+    page: GateHook,
+    /// Holds a durable generation switch before queue acknowledgement.
+    switch: GateHook,
+    /// Holds committed cleanup deletes before durable acknowledgement.
+    cleanup: GateHook,
     /// Pauses a commit just before the Tantivy commit it is about to run.
     commit: StallHook,
     /// Index searches run, so a test can prove one request runs one search.
@@ -354,6 +362,71 @@ struct TestHooks {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct GateState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct GateHook {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl GateHook {
+    fn arm(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = GateState {
+            armed: true,
+            entered: false,
+            released: false,
+        };
+    }
+
+    fn run(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, std::time::Duration::from_secs(10))
+                .unwrap_or_else(PoisonError::into_inner);
+            state = next;
+            assert!(!timeout.timed_out(), "staged rebuild was not released");
+        }
+        state.armed = false;
+    }
+
+    fn wait(&self) {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(10), |state| {
+                !state.entered
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            state.entered && !timeout.timed_out(),
+            "staged rebuild did not start"
+        );
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
 impl TestHooks {
     fn fail_item(&self, graph: &GraphId) -> Result<()> {
         let armed = self
@@ -361,9 +434,9 @@ impl TestHooks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if armed.as_deref() == Some(graph.as_str()) {
-            return Err(SearchError::Tantivy(tantivy::TantivyError::SystemError(
-                "injected item failure".to_string(),
-            )));
+            return Err(SearchError::Store(
+                crate::store::StoreError::InvalidSearchState("search-diagnostics-stale"),
+            ));
         }
         Ok(())
     }
@@ -614,7 +687,7 @@ impl SearchIndex {
 
     /// Consumes a pending injected panic, reporting whether one was armed.
     #[cfg(test)]
-    pub(crate) fn take_armed_drain_panic(&self) -> bool {
+    pub(crate) fn take_drain_panic(&self) -> bool {
         self.hooks.drain_panic.swap(false, Ordering::SeqCst)
     }
 
@@ -628,6 +701,56 @@ impl SearchIndex {
     #[cfg(test)]
     pub(crate) fn await_rebuild_stall(&self) {
         self.hooks.rebuild.wait_entered();
+    }
+
+    #[cfg(test)]
+    fn arm_stage_gate(&self) {
+        self.hooks.stage.arm();
+    }
+
+    #[cfg(test)]
+    fn await_stage_gate(&self) {
+        self.hooks.stage.wait();
+    }
+
+    #[cfg(test)]
+    fn release_stage_gate(&self) {
+        self.hooks.stage.release();
+    }
+
+    #[cfg(test)]
+    fn arm_page_gate(&self) {
+        self.hooks.page.arm();
+    }
+
+    #[cfg(test)]
+    fn await_page_gate(&self) {
+        self.hooks.page.wait();
+    }
+
+    #[cfg(test)]
+    fn release_page_gate(&self) {
+        self.hooks.page.release();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_switch_gate(&self) {
+        self.hooks.switch.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn await_switch_gate(&self) {
+        self.hooks.switch.wait();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_cleanup_gate(&self) {
+        self.hooks.cleanup.arm();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn await_cleanup_gate(&self) {
+        self.hooks.cleanup.wait();
     }
 
     /// Lock one graph's rebuild shard. See `rebuild_shards` for the order this
