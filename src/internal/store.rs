@@ -699,19 +699,150 @@ struct NetQuadTransition {
     is_live: bool,
 }
 
-struct QueryIndexCounterUpdate {
-    key: QueryIndexCounterKey,
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum QueryBuildPhase {
+    Clear,
+    Scan,
+    Replay,
+    Verify,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebuildPhase {
+    BuildCreate,
+    ScanPage,
+    ReplayPage,
+    BeforeSwitch,
+    AfterSwitch,
+    CleanupPage,
+    Retire,
+}
+
+#[cfg(test)]
+pub(crate) struct RebuildHook<'a> {
+    store: &'a GraphStore,
+}
+
+#[cfg(test)]
+impl Drop for RebuildHook<'_> {
+    fn drop(&mut self) {
+        *self
+            .store
+            .rebuild_hook
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct DeltaLimitGuard<'a> {
+    store: &'a GraphStore,
+    rows: u64,
+    bytes: u64,
+}
+
+#[cfg(test)]
+impl Drop for DeltaLimitGuard<'_> {
+    fn drop(&mut self) {
+        self.store
+            .delta_row_limit
+            .store(self.rows, Ordering::SeqCst);
+        self.store
+            .delta_byte_limit
+            .store(self.bytes, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct QueryBuildRecord {
+    format: u32,
+    slot: u8,
+    source_sequence: u64,
+    source_epoch: u64,
+    control_digest: [u8; 32],
+    trusted_active: bool,
+    #[serde(with = "crate::core::quad_cursor")]
+    scan_cursor: Option<QuadKey>,
+    replay_cursor: u64,
+    next_delta: u64,
+    delta_rows: u64,
+    delta_bytes: u64,
+    phase: QueryBuildPhase,
+    target: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QueryDeltaRecord {
+    transitions: Vec<NetQuadTransition>,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct QueryCleanupRecord {
+    format: u32,
+    slot: u8,
+}
+
+struct QueryClear<'a> {
+    keyspace: &'a Keyspace,
+    stop: Option<&'a AtomicBool>,
+}
+
+struct QueryBuildCtx<'a> {
+    snapshot: &'a Snapshot,
+    spaces: IndexSpaces<'a>,
+    build: &'a mut QueryBuildRecord,
+    stop: &'a AtomicBool,
+}
+
+#[derive(Clone)]
+pub(crate) struct BatchReceiptLink {
+    pub(crate) graph: TermId,
+    pub(crate) actor: ActorId,
+    pub(crate) counter: u64,
+    pub(crate) id: MutationId,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
+pub(crate) struct ReceiptWork {
+    pub(crate) lookups: u64,
+    pub(crate) writes: u64,
+    pub(crate) persists: u64,
+}
+
+struct DeleteGraph<'a> {
+    graph: &'a GraphId,
+    tombstone: Option<&'a GraphTombstone>,
+    receipt: Option<&'a MutationReceipt>,
+}
+
+pub(crate) struct PolicyReceipt<'a> {
+    pub(crate) tagged: &'a TaggedGraphPolicy,
+    pub(crate) receipt: &'a MutationReceipt,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredBatchReceipt {
+    id: MutationId,
+    sequence: u64,
+}
+
+struct IndexCounterUpdate {
+    key: IndexCounterKey,
     value: Option<u64>,
 }
 
-struct QueryIndexMaintenancePlan {
+struct IndexUpdatePlan {
+    slot: IndexSlot,
     transitions: Vec<(QueryQuad, bool)>,
     mappings: Vec<(TermId, QueryTermId)>,
-    counters: Vec<QueryIndexCounterUpdate>,
-    header: Option<QueryIndexHeader>,
+    counters: Vec<IndexCounterUpdate>,
+    revisions: Vec<(QueryTermId, u64)>,
+    header: Option<IndexHeader>,
 }
 
-enum QueryIndexCounterRead {
+enum IndexCounterRead {
     Missing,
     Value(u64),
     Malformed,
@@ -730,15 +861,35 @@ impl FtsQueueKey {
         match self {
             Self::Subject { graph, subject } => graph_dirty_key(graph, subject).to_vec(),
             Self::Reindex(graph) => graph_reindex_key(graph).to_vec(),
-            Self::Delete(graph) => graph_search_delete_key(graph).to_vec(),
+            Self::Delete(graph) => graph_delete_key(graph).to_vec(),
+        }
+    }
+
+    fn cursor(self, token: u64) -> QueueCursor {
+        match self {
+            Self::Subject { graph, subject } => QueueCursor {
+                token,
+                kind: QueueKind::Subject,
+                graph,
+                subject: Some(subject),
+            },
+            Self::Reindex(graph) => QueueCursor {
+                token,
+                kind: QueueKind::Reindex,
+                graph,
+                subject: None,
+            },
+            Self::Delete(graph) => QueueCursor {
+                token,
+                kind: QueueKind::Delete,
+                graph,
+                subject: None,
+            },
         }
     }
 }
 
-/// FTS queue keys a batch owes, deduplicated but kept in enqueue order.
-///
-/// Order is load-bearing: acknowledgement compares tokens, so a whole-graph
-/// reindex enqueued after some subjects must outrank them and clear them.
+/// Deduplicated FTS debt keys retained in enqueue order for token acknowledgements.
 #[derive(Default)]
 struct PendingFts {
     order: Vec<FtsQueueKey>,
@@ -759,26 +910,95 @@ struct AckedEntry {
     covered: u64,
 }
 
+struct OrderedQueuePage {
+    rows: Vec<(QueueCursor, DirtyTokens)>,
+    next: Option<QueueCursor>,
+    remaining: bool,
+    visited: usize,
+    bytes: usize,
+    oversized: Option<(QueueCursor, u64, usize)>,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum SearchOrderStage {
+    Clear,
+    Delete,
+    Reindex,
+    Subject,
+    Done,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchOrderMigration {
+    format: u16,
+    stage: SearchOrderStage,
+    after: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredGeneration {
+    format: u16,
+    index_id: [u8; 16],
+    generation: GraphGeneration,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredStage {
+    format: u16,
+    index_id: [u8; 16],
+    job: StageJob,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacySearchCoverage {
+    format: u16,
+    index_id: [u8; 16],
+    covered: u64,
+    rebuild: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredManifest {
+    format: u16,
+    index_id: [u8; 16],
+    count: u64,
+    hash: [u8; 32],
+    epoch: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchRebuildScan {
+    format: u16,
+    index_id: [u8; 16],
+    target: u64,
+    after: Option<TermId>,
+    done: bool,
+}
+
+struct ManifestChange<'a> {
+    index_id: [u8; 16],
+    graph: &'a GraphId,
+    previous: Option<GenerationId>,
+    active: Option<GenerationId>,
+}
+
 /// A batch's durable half: the staged fjall writes plus the FTS queue keys
 /// whose tokens are minted when it publishes.
 struct DurableCommit {
     batch: fjall::OwnedWriteBatch,
     pending_fts: PendingFts,
+    pending_receipts: Vec<MutationReceipt>,
 }
 
 pub struct WriteBatch {
     inner: fjall::OwnedWriteBatch,
-    /// Uncommitted dot sets, so later operations in the same batch read the
-    /// batch-local state instead of the (still stale) durable one. `None` means
-    /// "written empty", i.e. the quad is dead. Keyed by the fixed-size quad key
-    /// so no per-quad `Vec` is allocated.
+    /// Batch-local dot states; `None` means the quad was written dead.
     pending_quad_states: HashMap<QuadKey, Option<Vec<Dot>>>,
     pending_terms: HashMap<TermId, String>,
     publish: PendingPublish,
-    /// Queue keys this batch dirtied. Their tokens are minted and their entries
-    /// staged when the batch commits, under the queue lock, so no
-    /// acknowledgement can be reading them at the time.
+    /// Queue keys staged and tokenized under the queue lock at commit.
     pending_fts: PendingFts,
+    pending_receipts: Vec<MutationReceipt>,
 }
 
 impl WriteBatch {
@@ -789,6 +1009,7 @@ impl WriteBatch {
             pending_terms: HashMap::new(),
             publish: PendingPublish::default(),
             pending_fts: PendingFts::default(),
+            pending_receipts: Vec::new(),
         }
     }
 
@@ -813,22 +1034,17 @@ struct IndexState {
     #[allow(clippy::type_complexity)]
     quad_subjects: BoundedCache<(TermId, TermId, u64), Arc<Vec<(TermId, TermId)>>>,
     object_order: ObjectOrderCache,
-    planner_distinct: BoundedCache<(u64, Option<QueryTermId>, DistinctDomain), usize>,
-    generations: HashMap<TermId, u64>,
-    /// Per-graph clocks as published by each graph's last commit. A missing
-    /// entry is the empty clock, which is what the durable read yields for a
-    /// graph that has never committed.
-    clocks: HashMap<TermId, VectorClock>,
+    planner_distinct: BoundedCache<PlannerCacheKey, PlannerEstimate>,
+    epochs: [u64; INDEX_EPOCH_SHARDS],
 }
 
 impl IndexState {
     fn with_budget(budget: &CacheBudget) -> Self {
         Self {
-            quad_subjects: BoundedCache::new(QUAD_SUBJECT_CACHE_CAP, budget.subjects),
+            quad_subjects: BoundedCache::new(SUBJECT_CACHE_CAP, budget.subjects),
             object_order: ObjectOrderCache::with_budget(budget),
-            planner_distinct: BoundedCache::new(PLANNER_DISTINCT_CACHE_CAP, budget.planner),
-            generations: HashMap::new(),
-            clocks: HashMap::new(),
+            planner_distinct: BoundedCache::new(PLANNER_CACHE_CAP, budget.planner),
+            epochs: [0; INDEX_EPOCH_SHARDS],
         }
     }
 }
@@ -839,15 +1055,60 @@ enum DistinctDomain {
     Object,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum StatRevision {
+    Epoch(u64),
+    Predicate(u64),
+}
+
+type PlannerCacheKey = (u64, StatRevision, Option<QueryTermId>, DistinctDomain);
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) enum PlannerStat {
+    PredicateObject(TermId, TermId),
+    Predicate(TermId),
+    PredicateSubjects(TermId),
+    PredicateObjects(TermId),
+    Object(TermId),
+    Subject(TermId),
+    DistinctSubjects,
+    DistinctObjects,
+    Total,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlannerEstimate {
+    Exact(usize),
+    LowerBound(usize),
+    Unknown,
+}
+
+impl PlannerEstimate {
+    pub(crate) fn row_upper(self) -> usize {
+        match self {
+            Self::Exact(value) => value,
+            Self::LowerBound(_) | Self::Unknown => usize::MAX,
+        }
+    }
+
+    pub(crate) fn distinct_lower(self) -> usize {
+        match self {
+            Self::Exact(value) | Self::LowerBound(value) => value,
+            Self::Unknown => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DistinctStat {
+    predicate: Option<TermId>,
+    domain: DistinctDomain,
+}
+
 type ObjectOrderKey = (TermId, TermId, TermId);
 type ObjectOrderValues = Arc<Vec<TermId>>;
 
-/// `(graph, subject, predicate)` → objects in decoded-term order.
-///
-/// Repopulation decodes outside the lock, so an entry computed from an index a
-/// commit has since invalidated must not be installed. `generation` moves on
-/// every invalidation and a repopulating reader only installs what it computed
-/// while the count has not moved.
+/// Objects in decoded-term order, fenced by the graph shard epoch.
 struct ObjectOrderCache {
     entries: BoundedCache<(ObjectOrderKey, u64), ObjectOrderValues>,
 }
@@ -855,7 +1116,7 @@ struct ObjectOrderCache {
 impl ObjectOrderCache {
     fn with_budget(budget: &CacheBudget) -> Self {
         Self {
-            entries: BoundedCache::new(OBJECT_ORDER_CACHE_CAP, budget.objects),
+            entries: BoundedCache::new(ORDER_CACHE_CAP, budget.objects),
         }
     }
 }
@@ -898,11 +1159,11 @@ struct OrderEntry {
 }
 
 impl IndexState {
-    /// A graph's generation is part of every cache key, and every fill rechecks
-    /// it before installing, so one bump per changed graph already makes all of
-    /// that graph's older entries unreachable. Scanning the caches once per
-    /// changed quad repeated that work without changing any answer; the stale
-    /// entries are reclaimed by the ordinary entry and byte budget instead.
+    fn graph_epoch(&self, graph: TermId) -> u64 {
+        self.epochs[(graph.0 as usize) % INDEX_EPOCH_SHARDS]
+    }
+
+    /// Bumps changed graph shards so older cache entries become unreachable.
     fn publish(&mut self, publish: &PendingPublish) {
         let mut changed_graphs = HashSet::new();
         for mutation in &publish.quad_mutations {
@@ -912,15 +1173,8 @@ impl IndexState {
             changed_graphs.insert(quad.graph);
         }
         for graph in changed_graphs {
-            let generation = self.generations.entry(graph).or_default();
-            *generation = generation.wrapping_add(1);
-        }
-
-        for (&graph_id, clock) in &publish.clocks {
-            match clock {
-                Some(clock) => self.clocks.insert(graph_id, clock.clone()),
-                None => self.clocks.remove(&graph_id),
-            };
+            let epoch = &mut self.epochs[(graph.0 as usize) % INDEX_EPOCH_SHARDS];
+            *epoch = epoch.wrapping_add(1);
         }
     }
 }
@@ -930,8 +1184,7 @@ impl IndexState {
 #[derive(Default)]
 struct PendingPublish {
     quad_mutations: Vec<QuadMutation>,
-    /// `None` clears the mirror entry, which is what removing a graph's clock
-    /// key means.
+    /// Clock writes keep clock-only batches on the post-commit publication path.
     clocks: HashMap<TermId, Option<VectorClock>>,
 }
 
@@ -941,31 +1194,26 @@ impl PendingPublish {
     }
 }
 
-/// Diagnostics as persisted under `'O' || graph_id`, tagged with the graph's
-/// vector clock at the moment they were computed.
-///
-/// The tag is what makes the cache self-checking: every quad-mutating commit
-/// advances the graph clock (`set_vector_clock` is part of the same batch), so
-/// `at_clock != current clock` proves the record describes an older state and
-/// must be recomputed.
+/// Persisted graph diagnostics tagged with their source vector clock.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct StoredDiagnostics {
     diagnostics: GraphDiagnostics,
     at_clock: VectorClock,
 }
 
-/// The interned ids of the four vocabulary terms orphan detection matches on.
-///
-/// `None` means the term was never interned, so no stored quad can mention it.
+/// Interned vocabulary ids used by orphan detection; `None` means absent.
 struct OrphanVocab {
     rdf_type: Option<TermId>,
-    /// `schema:Dataset` and `schema:MediaObject` — the two types that make a
+    /// `schema:Dataset` and `schema:MediaObject` are the two types that make a
     /// non-root subject a data entity.
     data_types: [Option<TermId>; 2],
     has_part: Option<TermId>,
 }
 
 pub struct GraphStore {
+    _memory_lease: MemoryLease,
+    #[cfg(feature = "shacl-core")]
+    shacl_cache_bytes: usize,
     db: Database,
     persist_mode: PersistMode,
     terms: Keyspace,
@@ -978,30 +1226,54 @@ pub struct GraphStore {
     qv2_posg: Keyspace,
     qv2_ospg: Keyspace,
     qv2_gosp: Keyspace,
-    qv2_term_to_query: Keyspace,
-    qv2_query_to_term: Keyspace,
+    primary_term_map: Keyspace,
+    primary_query_map: Keyspace,
     qv2_meta: Keyspace,
+    qv3_gspo: Keyspace,
+    qv3_gpos: Keyspace,
+    qv3_spog: Keyspace,
+    qv3_posg: Keyspace,
+    qv3_ospg: Keyspace,
+    qv3_gosp: Keyspace,
+    secondary_term_map: Keyspace,
+    secondary_query_map: Keyspace,
+    qv3_meta: Keyspace,
+    search_queue: Keyspace,
+    search_meta: Keyspace,
+    receipts: Keyspace,
+    receipt_order: Keyspace,
+    repair_audits: Keyspace,
+    repair_backups: Keyspace,
     /// Guards first-write-wins term interning, sharded by term id.
     term_locks: Vec<Mutex<()>>,
     /// Guards whole read→write→commit cycles of one graph's CRDT state; see
     /// [`GraphStore::graph_commit_guard`].
     commit_locks: Vec<Mutex<()>>,
+    /// Orders publication and local apply for one graph within this store.
+    write_locks: Vec<Mutex<()>>,
+    receipt_locks: Vec<Mutex<()>>,
+    receipt_next: AtomicU64,
+    #[cfg(test)]
+    receipt_lookups: AtomicU64,
+    #[cfg(test)]
+    receipt_writes: AtomicU64,
+    #[cfg(test)]
+    receipt_persists: AtomicU64,
     /// Commits share this guard; rebuilds exclude them before owning the qv gate.
     projection_lock: RwLock<()>,
-    /// One qv maintainer stages global counters at a time. A graph commit that
-    /// cannot own the gate still commits its source rows, together with the
-    /// durable projection debt that keeps those rows out of qv admission.
+    qv_maintenance: Mutex<()>,
+    /// Serializes QV counters; contenders persist debt that closes admission.
     qv_gate: QvCommitGate,
     qv_commit_wait: Duration,
     qv_debt_next: AtomicU64,
     #[cfg(feature = "shacl-core")]
     binding_lock: Mutex<()>,
     #[cfg(feature = "shacl-core")]
-    binding_lock_wait_ns: AtomicU64,
+    binding_wait_ns: AtomicU64,
     #[cfg(feature = "shacl-core")]
-    binding_lock_hold_ns: AtomicU64,
+    binding_hold_ns: AtomicU64,
     #[cfg(feature = "shacl-core")]
-    graph_commit_lock_wait_ns: AtomicU64,
+    graph_lock_wait: AtomicU64,
     #[cfg(feature = "shacl-core")]
     validation_ns: AtomicU64,
     #[cfg(feature = "shacl-core")]
@@ -1015,7 +1287,7 @@ pub struct GraphStore {
     #[cfg(feature = "shacl-core")]
     status_shape_compilations: AtomicU64,
     #[cfg(feature = "shacl-core")]
-    status_full_shape_scans: AtomicU64,
+    status_shape_scans: AtomicU64,
     #[cfg(all(test, feature = "shacl-core"))]
     validation_stall: Mutex<Duration>,
     #[cfg(all(test, feature = "shacl-core"))]
@@ -1023,9 +1295,6 @@ pub struct GraphStore {
     #[cfg(all(test, feature = "shacl-core"))]
     validation_max_active: std::sync::atomic::AtomicUsize,
     indexes: RwLock<IndexState>,
-    /// Memory mirror of the persisted `'O'` records; always carries the clock
-    /// tag so a reader can tell a fresh entry from a stale one.
-    diagnostics_cache: RwLock<HashMap<TermId, StoredDiagnostics>>,
     /// Global term-id → term cache. Term ids are content hashes, so entries do
     /// not need invalidation; capacity and bytes are bounded independently.
     term_decode_cache: RwLock<BoundedCache<TermId, Arc<EncodedTerm>>>,
@@ -1053,50 +1322,43 @@ pub struct GraphStore {
     rebuild_stall: Mutex<Option<std::time::Duration>>,
     #[cfg(test)]
     rebuild_stalled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    rebuild_hook: RwLock<Option<Arc<dyn Fn(RebuildPhase) + Send + Sync>>>,
+    #[cfg(test)]
+    delta_row_limit: AtomicU64,
+    #[cfg(test)]
+    delta_byte_limit: AtomicU64,
     /// Set by a test to stall a graph delete between its queue scan and the
     /// commit; `delete_stalled` publishes that the window has been entered.
     #[cfg(test)]
     delete_stall: Mutex<Option<std::time::Duration>>,
     #[cfg(test)]
     delete_stalled: std::sync::atomic::AtomicBool,
-    /// Serializes every durable mutation of the FTS queues: minting a dirty
-    /// token and staging its entry, the acknowledgement check-and-remove, and
-    /// the queue clears. Without it an enqueue can land between an
-    /// acknowledgement's token read and its committed removal and be erased
-    /// without ever being indexed (G7).
-    ///
-    /// **Lock order: innermost.** Take it after the graph commit guard, hold it
-    /// only across the queue read plus the commit that acts on it, and take no
-    /// other `GraphStore` lock while it is held.
+    /// Serializes FTS queue mutations and is innermost in the store lock order.
     fts_queue_lock: Mutex<()>,
     dirty_counter: AtomicU64,
-    /// How many times this store instance has recomputed graph diagnostics.
-    /// Tests use it to prove a reopen served the persisted record instead of
-    /// recomputing, and that a stale record was repaired at open.
+    dirty_committed: AtomicU64,
+    /// Number of graph diagnostics recomputations by this store instance.
     diagnostics_computed: AtomicU64,
     /// Metadata point reads performed by the O(1) qv2 admission gate.
     #[cfg(test)]
-    query_index_admission_probes: AtomicU64,
+    index_admission_probes: AtomicU64,
     #[cfg(test)]
-    query_index_verification_runs: AtomicU64,
+    index_verification_runs: AtomicU64,
     /// Explicit persists so far. Tests use it to pin a durability call that
     /// leaves no other trace inside one process.
     #[cfg(test)]
     persists: AtomicU64,
 }
 
-// ── Frozen WS0 parameter structs ────────────────────────────────────────────
+// Mutation parameter structs.
 
-/// RAII guard serializing one graph's read→write cycles (dot sets, log heads,
-/// vector clock, meta, diagnostics tag). Sharded by graph term hash.
-///
-/// **Lock order: graph commit guard ▸ term shard locks.** Never take a second
-/// commit guard while holding one — `std::sync::Mutex` is not reentrant. Any
-/// method that calls `graph_commit_guard` itself is therefore off limits while
-/// one is held; batch-taking methods do not lock and require the caller to hold it.
-///
-/// Poison is recovered: the protected state lives in fjall, not behind the mutex.
+/// Serializes one graph's read-write cycle before term shard locks.
 pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+pub(crate) struct GraphWriteGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+pub(crate) struct ReceiptGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
 
 #[cfg(feature = "shacl-core")]
 pub(crate) struct BindingGuard<'a> {
@@ -1115,9 +1377,9 @@ impl Drop for BindingGuard<'_> {
 }
 
 #[cfg(feature = "shacl-core")]
-pub(crate) struct PendingQueueRepairStatistics {
+pub(crate) struct QueueRepairStats {
     pub(crate) binding_records_scanned: u64,
-    pub(crate) pending_queue_entries_scanned: u64,
+    pub(crate) pending_entries_scanned: u64,
 }
 
 #[cfg(feature = "shacl-core")]
@@ -1144,14 +1406,14 @@ impl Drop for ValidationProbe<'_> {
     }
 }
 
-/// An OR-Set add: contributes exactly one unique dot to the quad's dot set (G1).
+/// An OR-Set add contributes exactly one unique dot to the quad's dot set.
 pub struct QuadAdd {
     pub quad: EncodedQuad,
     pub dot: Dot,
 }
 
 /// An OR-Set remove: deletes exactly the dots contained in the witnessed clock
-/// and can never kill a dot it did not witness (G1).
+/// and can never kill a dot it did not witness.
 pub struct QuadRemove<'a> {
     pub quad: EncodedQuad,
     pub witnessed: &'a VectorClock,
@@ -1198,6 +1460,12 @@ pub enum PageCursor<'a> {
 pub struct PageRequest<'a> {
     pub cursor: PageCursor<'a>,
     pub limit: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotLimits {
+    pub(crate) max_rows: u64,
+    pub(crate) max_bytes: u64,
 }
 
 fn encode_dirty_tokens(tokens: DirtyTokens) -> [u8; 16] {
