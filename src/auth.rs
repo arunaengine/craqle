@@ -55,12 +55,8 @@ pub enum AuthorizationError {
     InvalidPattern { pattern: String, message: String },
 }
 
-/// Authorization hook used by the root Craqle API.
-///
-/// External services can implement this trait directly or pass a closure.
-/// Craqle provides [`GrantAuthorizer`] as a simple built-in adapter for
-/// grant/path-based authorization, but authorization policy itself is not tied
-/// to that implementation.
+/// Authorization hook implemented directly, by a closure, or through [`GrantAuthorizer`].
+/// Application authorization policy remains independent of the built-in adapter.
 pub trait Authorizer: Send + Sync {
     fn authorize(
         &self,
@@ -84,7 +80,6 @@ where
     }
 }
 
-/// Built-in authorizer adapter using path grants against graph policy paths.
 /// Built-in authorizer adapter using path grants against graph policy paths.
 pub struct GrantAuthorizer {
     pub grants: Vec<PermissionGrant>,
@@ -175,9 +170,8 @@ impl Authorizer for GrantAuthorizer {
             return Ok(());
         }
 
-        // Test for the existence of a usable grant without materializing them:
-        // `visible_graphs` and the search filters call this once per candidate
-        // graph, and the collected `Vec` was allocated only to be measured.
+        // Search and visibility call this per graph, so avoid collecting grants
+        // merely to test whether one exists.
         let has_usable_grant = self.grants.iter().any(|grant| grant.level.allows(action));
 
         if !has_usable_grant || policy.permission_paths.is_empty() {
