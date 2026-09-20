@@ -1,0 +1,22 @@
+{
+  "B01": {"writers": [1, 2, 4, 8, 16], "graphs": [1, 32, 256], "replicated": [false, true], "search": [false, true], "persist": ["buffer", "sync-data", "sync-all"]},
+  "B02": {"rows": [10000, 100000, 1000000], "state": ["covered", "debt", "old", "empty"]},
+  "B03": {"rate": [0, 50, 90, 110], "rows": [10000, 100000, 1000000]},
+  "B04": {"cache": [0, 4000, 65536], "changed": [1, 100, 1000, 10000], "related": [false, true]},
+  "B05": {"rows": [10000, 100000, 1000000], "overlap": [0, 50, 100], "actors": [1, 10, 100], "deleted": [false, true]},
+  "B06": {"history": [1000, 100000, 1000000], "suffix": [0, 1, 100, 10000], "actors": [1, 10, 100]},
+  "B07": {"state": ["enabled", "disabled", "repaired", "interrupted"]},
+  "B08": {"jobs": [0, 1, 1000, 100000], "later": [false, true], "recovery": [false, true]},
+  "B09": {"failure": ["permanent", "transient", "flush-flood", "shutdown"]},
+  "B10": {"future": [0, 1000, 100000, 1000000], "eligible": [1, 10, 100], "subject_bytes": [16, 1024, 65536]},
+  "B11": {"page": [1, 10, 100], "readable_per_mille": [0, 1, 10, 500, 1000], "hits": [10000, 100000, 1000000], "graphs": [1, 32, 256]},
+  "B12": {"query": ["values", "join", "sort", "distinct", "group", "string", "path", "fts"]},
+  "B13": {"selectivity": ["low", "high"], "cache": ["cold", "warm"], "rows": [10000, 100000, 1000000]},
+  "B14": {"stores": [1, 2, 4], "shacl": ["none", "advisory", "enforcing"], "collision": [false, true]},
+  "B15": {"readers": [1, 4, 8, 16], "hit_percent": [0, 50, 90, 100], "cache": [4000, 65536]},
+  "B16": {"memory_mib": [256, 512, 1024, 4096], "stores": [1, 2, 4], "search": [false, true]},
+  "B17": {"receipt": ["pending", "retry", "lost-reply", "diagnostics-failure", "expired"]},
+  "B18": {"input": ["valid", "invalid", "shared", "envelope", "nested"], "bytes": [1024, 1048576, 16777216]},
+  "B19": {"stage": ["legacy", "repair", "gc", "backup"], "rows": [10000, 100000, 1000000]},
+  "B20": {"rate": [50, 90, 110], "restart": [false, true], "rows": [10000, 100000, 1000000]}
+}

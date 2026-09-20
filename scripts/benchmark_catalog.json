@@ -1,0 +1,154 @@
+{
+  "B01": {
+    "coverage": "partial",
+    "notes": "Native commit, persistence, merge, and concurrent writer closures; full writer and graph axes still require target extension.",
+    "commands": [
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "index_write_cost", "--", "concurrent"]}
+    ]
+  },
+  "B02": {
+    "coverage": "bounded",
+    "notes": "Native query-index admission and access-path scaling with deterministic corpus metadata.",
+    "commands": [
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "sparql_access_path_scaling"]}
+    ]
+  },
+  "B03": {
+    "coverage": "partial",
+    "notes": "Reopen and readiness work is measured; offered-rate rebuild axes remain open.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_derived_index_open", "reopened_index_readiness", "--", "--ignored", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B04": {
+    "coverage": "partial",
+    "notes": "Native write and warm read allocation workloads; complete cache-size by mutation-size axes remain open.",
+    "commands": [
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "index_write_cost", "--", "local"]},
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "read_path_memory"]}
+    ]
+  },
+  "B05": {
+    "coverage": "partial",
+    "notes": "Native merge timing and deterministic reordered-event correctness; million-row overlap matrix remains open.",
+    "commands": [
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "index_write_cost", "--", "merge"]},
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "replication", "reordered_events_converge", "--", "--exact", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B06": {
+    "coverage": "partial",
+    "notes": "Native local and network-backed Irokle write probes; full replay suffix and actor axes remain open.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_irokle_writes", "crate_write_latency", "--", "--ignored", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B07": {
+    "coverage": "bounded",
+    "notes": "Three binaries exercise search enabled, disabled, and enabled over one persistent store.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--features", "search", "--test", "search_recovery", "phase_writes_index", "--", "--exact", "--nocapture", "--test-threads=1"], "env": {"CRAQLE_SEARCH_PHASE": "write", "CRAQLE_SEARCH_DIR": "{workdir}/search"}},
+      {"argv": ["cargo", "test", "--locked", "--no-default-features", "--test", "search_recovery", "phase_mutates_source", "--", "--exact", "--nocapture", "--test-threads=1"], "env": {"CRAQLE_SEARCH_PHASE": "mutate", "CRAQLE_SEARCH_DIR": "{workdir}/search"}},
+      {"argv": ["cargo", "test", "--locked", "--features", "search", "--test", "search_recovery", "phase_repairs_index", "--", "--exact", "--nocapture", "--test-threads=1"], "env": {"CRAQLE_SEARCH_PHASE": "verify", "CRAQLE_SEARCH_DIR": "{workdir}/search"}}
+    ]
+  },
+  "B08": {
+    "coverage": "partial",
+    "notes": "Native fixed-target and restart search regressions; complete job-count latency axes remain open.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "search_recovery", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B09": {
+    "coverage": "bounded",
+    "notes": "Private native harness covers permanent item failure, transient global commit failure, flush flood, cancellation, retries, healthy progress, and remaining debt.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "search", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B10": {
+    "coverage": "bounded",
+    "notes": "Private native harness enforces row and byte caps across future, eligible, and subject-size axes with explicit capacity admission.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "queue", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B11": {
+    "coverage": "partial",
+    "notes": "Native authorized FTS and graph visibility workloads; full readability percentage matrix remains open.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "sparql_fts", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B12": {
+    "coverage": "bounded",
+    "notes": "Native adversarial query budget suite plus allocation-aware result collection benchmark.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "query_budgets", "--", "--nocapture", "--test-threads=1"]},
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "query_result_collection"]}
+    ]
+  },
+  "B13": {
+    "coverage": "bounded",
+    "notes": "Native hot-path, access-path, join-choice, and differential workloads.",
+    "commands": [
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "sparql_hot_path"]},
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "sparql_join_choice"]},
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "query_differential", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B14": {
+    "coverage": "bounded",
+    "notes": "Private native harness measures same-IRI independent stores, colliding and distinct shards, and SHACL lock modes.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "store_concurrency", "--", "--nocapture", "--test-threads=1"]},
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "shacl_incremental", "--", "policy"]}
+    ]
+  },
+  "B15": {
+    "coverage": "bounded",
+    "notes": "Native concurrent reads plus production and exact-recency cache controls cover locality, churn, hit rate, eviction, retained bytes, and result equality.",
+    "commands": [
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "cache_churn"]},
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "read_path_memory"]},
+      {"argv": ["cargo", "bench", "--locked", "--all-features", "--bench", "sparql_hot_path"]}
+    ]
+  },
+  "B16": {
+    "coverage": "partial",
+    "notes": "Native capacity and process memory workloads; each budget must be enforced by the external cgroup runner.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_capacity", "large_graph_profile", "--", "--ignored", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B17": {
+    "coverage": "bounded",
+    "notes": "Private native harness measures pending, retry, lost-reply, failed repair, expiry, persistence, and restart receipt outcomes.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "restart_recovery", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B18": {
+    "coverage": "partial",
+    "notes": "Native valid and invalid ingress suite; parse and allocation counters depend on final instrumentation.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "validation", "--", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B19": {
+    "coverage": "partial",
+    "notes": "Native reopen and derived-index readiness profile; historical fixture migration axes remain open.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_cold_start", "cold_readiness_profile", "--", "--ignored", "--nocapture", "--test-threads=1"]},
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_derived_index_open", "reopened_index_readiness", "--", "--ignored", "--nocapture", "--test-threads=1"]}
+    ]
+  },
+  "B20": {
+    "coverage": "partial",
+    "notes": "Native concurrent query and materialization workloads; open-loop offered-rate overload and drain axes remain open.",
+    "commands": [
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_multigraph_query", "concurrent_query_latency", "--", "--ignored", "--nocapture", "--test-threads=1"]},
+      {"argv": ["cargo", "test", "--locked", "--all-features", "--test", "perf_materialization", "remote_materialization_profile", "--", "--ignored", "--nocapture", "--test-threads=1"]}
+    ]
+  }
+}
