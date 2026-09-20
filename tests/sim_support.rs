@@ -145,12 +145,14 @@ impl CraqleCluster {
             self.sync_round()?;
             self.reconcile_all()?;
             if self.check_convergence()? {
+                #[cfg(feature = "search")]
                 self.flush_search_updates()?;
                 return Ok(());
             }
         }
 
         if self.check_convergence()? {
+            #[cfg(feature = "search")]
             self.flush_search_updates()?;
             Ok(())
         } else {
