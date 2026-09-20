@@ -3,11 +3,14 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use oxrdf::graph::CanonicalizationAlgorithm;
-use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, TermRef, Triple};
+use oxrdf::{
+    BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode as SubjectNode, Term, TermRef, Triple,
+};
 use rudof_iri::IriS;
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_core::SHACLPath;
@@ -33,16 +36,17 @@ use crate::{
 use super::dependencies;
 use super::eval;
 use super::model::{
-    COMPILED_SHACL_FORMAT_VERSION, CompiledSchemaInner, CompiledShape, ConstraintPlan, MessagePlan,
-    NodeKindPlan, PathPlan, SeverityPlan, ShapeId, ShapeKind, TargetPlan,
+    CompiledSchemaInner, CompiledShape, ConstraintPlan, MessagePlan, NodeKindPlan, PathPlan,
+    SHACL_FORMAT_VERSION, SeverityPlan, ShapeId, ShapeKind, TargetPlan,
 };
 use super::resolve::{ResolvedSchema, ResolvedTarget, resolve};
 use crate::cache::BoundedCache;
 
 const CACHE_CAPACITY: usize = 32;
-const CACHE_BYTES: usize = 64 * 1_048_576;
+const CACHE_COUNT: usize = 3;
+const ALLOCATION_RESERVE: usize = 2 * size_of::<usize>();
 const EXTENSION_PROFILE: u32 = 0;
-const RUDOF_VERSION: &str = "0.3.10";
+const RUDOF_VERSION: &str = "0.3.19";
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 const OWL_IMPORTS: &str = "<http://www.w3.org/2002/07/owl#imports>";
 const SH_CONSTRAINT_COMPONENT: &str = "<http://www.w3.org/ns/shacl#ConstraintComponent>";
@@ -51,8 +55,22 @@ const SH_PROPERTY: &str = "<http://www.w3.org/ns/shacl#property>";
 const SH_TARGET_TYPE: &str = "<http://www.w3.org/ns/shacl#TargetType>";
 const SH_PATH: &str = "<http://www.w3.org/ns/shacl#path>";
 const SH_NODE: &str = "http://www.w3.org/ns/shacl#node";
+
+fn cache_limits(total: usize) -> [usize; CACHE_COUNT] {
+    let base = total / CACHE_COUNT;
+    let remainder = total % CACHE_COUNT;
+    [
+        base.saturating_add(usize::from(remainder > 0)),
+        base.saturating_add(usize::from(remainder > 1)),
+        base,
+    ]
+}
+
+fn sum_bytes(values: impl Iterator<Item = usize>) -> usize {
+    values.fold(0, usize::saturating_add)
+}
 const SH_NOT: &str = "http://www.w3.org/ns/shacl#not";
-const SH_QUALIFIED_VALUE_SHAPE: &str = "http://www.w3.org/ns/shacl#qualifiedValueShape";
+const SH_QUALIFIED_SHAPE: &str = "http://www.w3.org/ns/shacl#qualifiedValueShape";
 const SH_PROPERTY_IRI: &str = "http://www.w3.org/ns/shacl#property";
 const SH_AND: &str = "http://www.w3.org/ns/shacl#and";
 const SH_OR: &str = "http://www.w3.org/ns/shacl#or";
@@ -104,11 +122,12 @@ impl Drop for ValidationTimer<'_> {
 
 impl ShaclCompiler {
     pub(crate) fn new(store: Arc<GraphStore>) -> Self {
+        let limits = cache_limits(store.shacl_cache_bytes());
         Self {
             store,
-            cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, CACHE_BYTES)),
-            resolved_cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, CACHE_BYTES)),
-            validation_cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, CACHE_BYTES)),
+            cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, limits[0])),
+            resolved_cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, limits[1])),
+            validation_cache: Mutex::new(BoundedCache::new(CACHE_CAPACITY, limits[2])),
         }
     }
 
@@ -120,7 +139,7 @@ impl ShaclCompiler {
         let materialized = materialize_shapes(&self.store, shapes_graph, options)?;
         let key = CacheKey {
             digest: materialized.digest,
-            model_version: COMPILED_SHACL_FORMAT_VERSION,
+            model_version: SHACL_FORMAT_VERSION,
             rudof_version: RUDOF_VERSION,
             rocrate_version: options.rocrate_version,
             extension_profile: EXTENSION_PROFILE,
@@ -172,8 +191,8 @@ impl ShaclCompiler {
         )?);
         let compile_time = compile_start.elapsed();
 
-        self.cache()
-            .insert(key, inner.clone(), materialized.ntriples.len());
+        let bytes = inner.estimated_bytes();
+        self.cache().insert(key, inner.clone(), bytes);
         Ok(CompiledShaclSchema {
             inner,
             shape_versions: materialized.graph_versions.into(),
@@ -208,7 +227,7 @@ impl ShaclCompiler {
         let start = Instant::now();
         let resolved = Arc::new(resolve(&self.store, schema.inner.clone())?);
         let resolve_time = start.elapsed();
-        let bytes = resolved.shapes.len().saturating_mul(4_096).max(1);
+        let bytes = resolved.estimated_bytes();
         cache.insert(fingerprint, resolved.clone(), bytes);
         Ok((resolved, false, resolve_time))
     }
@@ -217,7 +236,7 @@ impl ShaclCompiler {
         let snapshot = self.store.read_snapshot();
         for (graph, version) in versions {
             let graph = hash_term(&EncodedTerm::from_named_node(&graph.0));
-            if !snapshot.contains_graph_by_id(&self.store, graph)?
+            if !snapshot.contains_graph_id(&self.store, graph)?
                 || snapshot.graph_version(&self.store, graph)? != *version
             {
                 return Ok(false);
@@ -617,7 +636,7 @@ impl ShaclCompiler {
             for change in changes {
                 let mut selected = forward.contains(&change.predicate);
                 selected |= inverse.contains(&change.predicate);
-                selected |= dependencies.reads_all_outgoing_predicates;
+                selected |= dependencies.reads_all_predicates;
                 if dependencies.reads_rdf_type && change.predicate == rdf_type {
                     selected = true;
                     global[index] |= shape.path.is_some();
@@ -830,9 +849,10 @@ impl ShaclCompiler {
     }
 
     fn cache_validation(&self, key: ValidationCacheKey, report: ShaclValidationReport) {
-        let bytes = postcard::to_allocvec(&report)
-            .map(|encoded| encoded.len())
-            .unwrap_or(CACHE_BYTES);
+        let bytes = key
+            .data_graph
+            .capacity()
+            .saturating_add(validation_bytes(&report));
         let mut cache = self.validation_cache();
         cache.insert(key, report, bytes);
     }
@@ -870,6 +890,54 @@ impl ShaclCompiler {
         self.cache_validation(key, report);
         Ok(())
     }
+}
+
+/// Conservative retained estimate for cache admission, not an RSS measurement.
+fn validation_bytes(report: &ShaclValidationReport) -> usize {
+    let string = |value: &String| value.capacity().saturating_add(ALLOCATION_RESERVE);
+    let read = &report.statistics.read;
+    ALLOCATION_RESERVE
+        .saturating_add(read.fallback_reason.as_ref().map(string).unwrap_or(0))
+        .saturating_add(
+            read.selected_access_paths
+                .capacity()
+                .saturating_mul(size_of::<crate::ReadAccessPath>())
+                .saturating_add(ALLOCATION_RESERVE),
+        )
+        .saturating_add(
+            report
+                .results
+                .capacity()
+                .saturating_mul(size_of::<crate::ShaclValidationResult>()),
+        )
+        .saturating_add(sum_bytes(report.results.iter().map(|result| {
+            string(&result.focus_node.0)
+                .saturating_add(
+                    result
+                        .value
+                        .as_ref()
+                        .map(|term| string(&term.0))
+                        .unwrap_or(0),
+                )
+                .saturating_add(result.result_path.as_ref().map(string).unwrap_or(0))
+                .saturating_add(string(&result.source_shape.0))
+                .saturating_add(string(&result.source_constraint_component))
+                .saturating_add(string(&result.severity.0))
+                .saturating_add(
+                    result
+                        .messages
+                        .capacity()
+                        .saturating_mul(size_of::<crate::ShaclMessage>()),
+                )
+                .saturating_add(sum_bytes(result.messages.iter().map(|message| {
+                    message
+                        .language
+                        .as_ref()
+                        .map(string)
+                        .unwrap_or(0)
+                        .saturating_add(string(&message.text))
+                })))
+        })))
 }
 
 struct IncrementalSelection {
@@ -1061,7 +1129,7 @@ fn select_incremental_targets<V: RdfReadView>(
                 candidates[index].insert(change.object);
                 affected = true;
             }
-            if dependencies.reads_all_outgoing_predicates {
+            if dependencies.reads_all_predicates {
                 candidates[index].insert(change.subject);
                 affected = true;
             }
@@ -1300,7 +1368,7 @@ fn materialize_shapes(
             let subject = encoded_subject
                 .to_term()
                 .ok_or_else(|| ill_formed_term(snapshot, &quad.subject))?;
-            let subject = NamedOrBlankNode::try_from(subject)
+            let subject = SubjectNode::try_from(subject)
                 .map_err(|_| ill_formed_term(snapshot, &quad.subject))?;
             let predicate = quad
                 .predicate
@@ -1367,7 +1435,7 @@ fn reject_recursive_shapes(graph: &Graph) -> Result<()> {
             }
         };
         match triple.predicate.as_str() {
-            SH_NODE | SH_NOT | SH_QUALIFIED_VALUE_SHAPE | SH_PROPERTY_IRI => {
+            SH_NODE | SH_NOT | SH_QUALIFIED_SHAPE | SH_PROPERTY_IRI => {
                 edges.entry(subject).or_default().insert(object);
             }
             SH_AND | SH_OR | SH_XONE => list_references.push((subject, object)),
@@ -1638,7 +1706,7 @@ fn compile_model(
         });
     }
     Ok(CompiledSchemaInner {
-        format_version: COMPILED_SHACL_FORMAT_VERSION,
+        format_version: SHACL_FORMAT_VERSION,
         schema_hash,
         rocrate_version,
         shapes: shapes.into_boxed_slice(),
@@ -1701,8 +1769,8 @@ fn compile_component(
             NodeKind::Iri => NodeKindPlan::Iri,
             NodeKind::Lit => NodeKindPlan::Literal,
             NodeKind::BNode => NodeKindPlan::BlankNode,
-            NodeKind::BNodeOrIri => NodeKindPlan::BlankNodeOrIri,
-            NodeKind::BNodeOrLit => NodeKindPlan::BlankNodeOrLiteral,
+            NodeKind::BNodeOrIri => NodeKindPlan::BlankOrIri,
+            NodeKind::BNodeOrLit => NodeKindPlan::BlankOrLiteral,
             NodeKind::IriOrLit => NodeKindPlan::IriOrLiteral,
         }),
         IRComponent::MinCount(value) => ConstraintPlan::MinCount(value.min_count()),
@@ -1742,7 +1810,7 @@ fn compile_component(
         IRComponent::Disjoint(value) => ConstraintPlan::Disjoint(encoded_iri(value.iri())),
         IRComponent::LessThan(value) => ConstraintPlan::LessThan(encoded_iri(value.iri())),
         IRComponent::LessThanOrEquals(value) => {
-            ConstraintPlan::LessThanOrEquals(encoded_iri(value.iri()))
+            ConstraintPlan::LessOrEqual(encoded_iri(value.iri()))
         }
         IRComponent::Or(value) => {
             ConstraintPlan::Or(shape_ids(schema, labels, value.shapes())?.into_boxed_slice())
@@ -1878,7 +1946,7 @@ fn encoded_object(object: &Object) -> Result<EncodedTerm> {
     match object {
         Object::Iri(iri) => Ok(encoded_iri(iri)),
         Object::BlankNode(label) => BlankNode::new(label.clone())
-            .map(|node| EncodedTerm::from_non_star_term(&Term::BlankNode(node)))
+            .map(|node| EncodedTerm::from_plain_term(&Term::BlankNode(node)))
             .map_err(|error| {
                 ShaclError::IllFormedShapes {
                     graph: "Rudof term conversion".to_owned(),
@@ -1917,12 +1985,18 @@ fn encoded_literal(
             NamedNode::new_unchecked(datatype.as_str()),
         )
     };
-    Ok(EncodedTerm::from_non_star_term(&Term::Literal(value)))
+    Ok(EncodedTerm::from_plain_term(&Term::Literal(value)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionEstimate, auto_delta};
+    use std::mem::size_of;
+
+    use super::{ExecutionEstimate, auto_delta, cache_limits, validation_bytes};
+    use crate::{
+        EncodedTerm, ReadAccessPath, ShaclMessage, ShaclValidationReport, ShaclValidationResult,
+        ShaclValidationStatistics,
+    };
 
     #[test]
     fn auto_tie_guard() {
@@ -1941,5 +2015,46 @@ mod tests {
             ..saturated
         };
         assert!(auto_delta(true, finite));
+    }
+
+    #[test]
+    fn report_cache_estimate() {
+        let mut access_paths = Vec::with_capacity(64);
+        access_paths.push(ReadAccessPath::SourceGspo);
+        let mut statistics = ShaclValidationStatistics::default();
+        statistics.read.fallback_reason = Some("query-view fallback".to_owned());
+        statistics.read.selected_access_paths = access_paths;
+        let report = ShaclValidationReport {
+            conforms: false,
+            accepted_by_write_policy: false,
+            results: vec![ShaclValidationResult {
+                focus_node: EncodedTerm("<urn:test:focus>".to_owned()),
+                value: Some(EncodedTerm("\"value\"".to_owned())),
+                result_path: Some("urn:test:path".to_owned()),
+                source_shape: EncodedTerm("<urn:test:shape>".to_owned()),
+                source_constraint_component: "urn:test:component".to_owned(),
+                severity: EncodedTerm("<urn:test:severity>".to_owned()),
+                messages: vec![ShaclMessage {
+                    language: Some("en".to_owned()),
+                    text: "retained validation message".to_owned(),
+                }],
+            }],
+            statistics,
+        };
+        let encoded = postcard::to_allocvec(&report).unwrap();
+        assert!(
+            validation_bytes(&report)
+                > encoded.len()
+                    + report.statistics.read.selected_access_paths.capacity()
+                        * size_of::<ReadAccessPath>()
+        );
+    }
+
+    #[test]
+    fn cache_share_bounded() {
+        for total in [0, 1, 2, 3, 4, 1_048_576] {
+            let limits = cache_limits(total);
+            assert_eq!(limits.into_iter().sum::<usize>(), total);
+        }
     }
 }

@@ -3,8 +3,30 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{EncodedTerm, RoCrateVersion};
+use std::mem::size_of;
 
-pub(crate) const COMPILED_SHACL_FORMAT_VERSION: u32 = crate::SHACL_COMPILER_MODEL_VERSION;
+const ALLOCATION_RESERVE: usize = 2 * size_of::<usize>();
+
+fn slice_bytes<T>(slice: &[T]) -> usize {
+    slice
+        .len()
+        .saturating_mul(size_of::<T>())
+        .saturating_add(ALLOCATION_RESERVE)
+}
+
+fn term_bytes(term: &EncodedTerm) -> usize {
+    term.0.capacity().saturating_add(ALLOCATION_RESERVE)
+}
+
+fn string_bytes(value: &String) -> usize {
+    value.capacity().saturating_add(ALLOCATION_RESERVE)
+}
+
+fn sum_bytes(values: impl Iterator<Item = usize>) -> usize {
+    values.fold(0, usize::saturating_add)
+}
+
+pub(crate) const SHACL_FORMAT_VERSION: u32 = crate::SHACL_COMPILER_MODEL_VERSION;
 
 #[derive(Debug)]
 pub(crate) struct CompiledSchemaInner {
@@ -63,8 +85,8 @@ pub(crate) enum NodeKindPlan {
     Iri,
     Literal,
     BlankNode,
-    BlankNodeOrIri,
-    BlankNodeOrLiteral,
+    BlankOrIri,
+    BlankOrLiteral,
     IriOrLiteral,
 }
 
@@ -90,7 +112,7 @@ pub(crate) enum ConstraintPlan {
     Equals(EncodedTerm),
     Disjoint(EncodedTerm),
     LessThan(EncodedTerm),
-    LessThanOrEquals(EncodedTerm),
+    LessOrEqual(EncodedTerm),
     Or(Box<[ShapeId]>),
     And(Box<[ShapeId]>),
     Not(ShapeId),
@@ -133,12 +155,22 @@ pub(crate) struct ShapeDependencies {
     pub(crate) target_classes: Box<[EncodedTerm]>,
     pub(crate) nested_shapes: Box<[ShapeId]>,
     pub(crate) reads_rdf_type: bool,
-    pub(crate) reads_all_outgoing_predicates: bool,
+    pub(crate) reads_all_predicates: bool,
     pub(crate) has_transitive_path: bool,
     pub(crate) requires_global_work: bool,
 }
 
 impl CompiledSchemaInner {
+    /// Conservative retained allocation estimate used only for cache admission.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(ALLOCATION_RESERVE)
+            .saturating_add(slice_bytes(&self.shapes))
+            .saturating_add(sum_bytes(
+                self.shapes.iter().map(CompiledShape::estimated_bytes),
+            ))
+    }
+
     pub(crate) fn plan_fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"craqle-shacl-plan/v1\0");
@@ -161,6 +193,31 @@ impl CompiledSchemaInner {
 }
 
 impl CompiledShape {
+    fn estimated_bytes(&self) -> usize {
+        term_bytes(&self.label)
+            .saturating_add(slice_bytes(&self.targets))
+            .saturating_add(sum_bytes(
+                self.targets.iter().map(TargetPlan::estimated_bytes),
+            ))
+            .saturating_add(
+                self.path
+                    .as_ref()
+                    .map(PathPlan::estimated_bytes)
+                    .unwrap_or(0),
+            )
+            .saturating_add(slice_bytes(&self.constraints))
+            .saturating_add(sum_bytes(
+                self.constraints.iter().map(ConstraintPlan::estimated_bytes),
+            ))
+            .saturating_add(slice_bytes(&self.property_shapes))
+            .saturating_add(self.severity.estimated_bytes())
+            .saturating_add(slice_bytes(&self.messages))
+            .saturating_add(sum_bytes(
+                self.messages.iter().map(MessagePlan::estimated_bytes),
+            ))
+            .saturating_add(self.dependencies.estimated_bytes())
+    }
+
     fn hash_plan(&self, hasher: &mut blake3::Hasher) {
         hash_u64(hasher, u64::from(self.id.0));
         hash_term(hasher, &self.label);
@@ -260,8 +317,8 @@ impl ConstraintPlan {
                         NodeKindPlan::Iri => 0,
                         NodeKindPlan::Literal => 1,
                         NodeKindPlan::BlankNode => 2,
-                        NodeKindPlan::BlankNodeOrIri => 3,
-                        NodeKindPlan::BlankNodeOrLiteral => 4,
+                        NodeKindPlan::BlankOrIri => 3,
+                        NodeKindPlan::BlankOrLiteral => 4,
                         NodeKindPlan::IriOrLiteral => 5,
                     },
                 );
@@ -299,7 +356,7 @@ impl ConstraintPlan {
             Self::Equals(term) => hash_tagged_term(hasher, 14, term),
             Self::Disjoint(term) => hash_tagged_term(hasher, 15, term),
             Self::LessThan(term) => hash_tagged_term(hasher, 16, term),
-            Self::LessThanOrEquals(term) => hash_tagged_term(hasher, 17, term),
+            Self::LessOrEqual(term) => hash_tagged_term(hasher, 17, term),
             Self::Or(shapes) => hash_tagged_shapes(hasher, 18, shapes),
             Self::And(shapes) => hash_tagged_shapes(hasher, 19, shapes),
             Self::Not(shape) => hash_tagged_shape(hasher, 20, *shape),
@@ -352,7 +409,7 @@ impl ShapeDependencies {
         hash_terms(hasher, &self.target_classes);
         hash_shape_ids(hasher, &self.nested_shapes);
         hash_bool(hasher, self.reads_rdf_type);
-        hash_bool(hasher, self.reads_all_outgoing_predicates);
+        hash_bool(hasher, self.reads_all_predicates);
         hash_bool(hasher, self.has_transitive_path);
         hash_bool(hasher, self.requires_global_work);
     }
@@ -438,4 +495,107 @@ fn hash_bool(hasher: &mut blake3::Hasher, value: bool) {
 
 fn hash_u64(hasher: &mut blake3::Hasher, value: u64) {
     hasher.update(&value.to_be_bytes());
+}
+
+impl TargetPlan {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Node(term)
+            | Self::Class(term)
+            | Self::SubjectsOf(term)
+            | Self::ObjectsOf(term)
+            | Self::ImplicitClass(term) => term_bytes(term),
+        }
+    }
+}
+
+impl PathPlan {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Predicate(term) => term_bytes(term),
+            Self::Alternative(paths) | Self::Sequence(paths) => slice_bytes(paths)
+                .saturating_add(sum_bytes(paths.iter().map(Self::estimated_bytes))),
+            Self::Inverse(path)
+            | Self::ZeroOrMore(path)
+            | Self::OneOrMore(path)
+            | Self::ZeroOrOne(path) => size_of::<Self>()
+                .saturating_add(ALLOCATION_RESERVE)
+                .saturating_add(path.estimated_bytes()),
+        }
+    }
+}
+
+impl ConstraintPlan {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Class(term)
+            | Self::Datatype(term)
+            | Self::MinExclusive(term)
+            | Self::MaxExclusive(term)
+            | Self::MinInclusive(term)
+            | Self::MaxInclusive(term)
+            | Self::Equals(term)
+            | Self::Disjoint(term)
+            | Self::LessThan(term)
+            | Self::LessOrEqual(term)
+            | Self::HasValue(term) => term_bytes(term),
+            Self::Pattern { pattern, flags } => {
+                string_bytes(pattern).saturating_add(flags.as_ref().map(string_bytes).unwrap_or(0))
+            }
+            Self::LanguageIn(values) => {
+                slice_bytes(values).saturating_add(sum_bytes(values.iter().map(string_bytes)))
+            }
+            Self::Or(shapes) | Self::And(shapes) | Self::Xone(shapes) => slice_bytes(shapes),
+            Self::In(terms) => {
+                slice_bytes(terms).saturating_add(sum_bytes(terms.iter().map(term_bytes)))
+            }
+            Self::QualifiedValueShape { siblings, .. } => slice_bytes(siblings),
+            Self::Closed { ignored_properties } => slice_bytes(ignored_properties)
+                .saturating_add(sum_bytes(ignored_properties.iter().map(term_bytes))),
+            Self::NodeKind(_)
+            | Self::MinCount(_)
+            | Self::MaxCount(_)
+            | Self::MinLength(_)
+            | Self::MaxLength(_)
+            | Self::UniqueLang(_)
+            | Self::Not(_)
+            | Self::Node(_) => 0,
+        }
+    }
+}
+
+impl SeverityPlan {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Custom(term) => term_bytes(term),
+            Self::Trace | Self::Debug | Self::Info | Self::Warning | Self::Violation => 0,
+        }
+    }
+}
+
+impl MessagePlan {
+    fn estimated_bytes(&self) -> usize {
+        self.language
+            .as_ref()
+            .map(string_bytes)
+            .unwrap_or(0)
+            .saturating_add(string_bytes(&self.text))
+    }
+}
+
+impl ShapeDependencies {
+    fn estimated_bytes(&self) -> usize {
+        sum_bytes(
+            [
+                &self.forward_predicates,
+                &self.inverse_predicates,
+                &self.target_classes,
+            ]
+            .into_iter()
+            .map(|terms| {
+                slice_bytes(terms).saturating_add(sum_bytes(terms.iter().map(term_bytes)))
+            }),
+        )
+        .saturating_add(slice_bytes(&self.nested_shapes))
+    }
 }

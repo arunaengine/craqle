@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::cmp::Ordering;
+use std::mem::size_of;
 use std::str::FromStr;
 
 use oxrdf::Term;
@@ -41,6 +42,21 @@ enum ComparableValue {
 }
 
 impl TermMeta {
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let string = |value: &String| value.capacity().saturating_add(2 * size_of::<usize>());
+        self.language
+            .as_ref()
+            .map(string)
+            .unwrap_or(0)
+            .saturating_add(self.lexical.as_ref().map(string).unwrap_or(0))
+            .saturating_add(
+                self.comparable
+                    .as_ref()
+                    .map(ComparableValue::estimated_bytes)
+                    .unwrap_or(0),
+            )
+    }
+
     pub(crate) fn from_encoded(term: &EncodedTerm) -> Option<Self> {
         match term.to_term()? {
             Term::NamedNode(node) => {
@@ -82,6 +98,29 @@ impl TermMeta {
 
     pub(crate) fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         comparable_cmp(self.comparable.as_ref()?, other.comparable.as_ref()?)
+    }
+}
+
+impl ComparableValue {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::String(value, language) => value
+                .capacity()
+                .saturating_add(2 * size_of::<usize>())
+                .saturating_add(
+                    language
+                        .as_ref()
+                        .map(|value| value.capacity().saturating_add(2 * size_of::<usize>()))
+                        .unwrap_or(0),
+                ),
+            Self::Integer(_)
+            | Self::Decimal(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::DateTime(_)
+            | Self::Date(_)
+            | Self::Time(_) => 0,
+        }
     }
 }
 
