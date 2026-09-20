@@ -4159,6 +4159,408 @@ mod tests {
             .expect("the fixture graph must be interned")
     }
 
+    #[test]
+    fn page_replay_idempotent() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:page-replay");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(&writer_auth(), crate_request(&graph, "currentneedle", true))
+                .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        search
+            .index_resource(graph.as_str(), graph.as_str(), Some("legacyneedle"))
+            .unwrap();
+        search.commit().unwrap();
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts_reindex(&mut batch, graph_term(&store, &graph))
+            .unwrap();
+        store.commit(batch).unwrap();
+        let target = store.current_dirty_token();
+        search.arm_page_gate();
+        let control = DrainControl::default();
+
+        let worker = {
+            let store = store.clone();
+            let search = search.clone();
+            let graph = graph.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let _guard = search.lock_graph(graph.as_str());
+                search.stage_graph(
+                    GraphWork {
+                        store: &store,
+                        graph: &graph,
+                        control: &control,
+                        byte_limit: search.work_bytes(),
+                    },
+                    target,
+                )
+            })
+        };
+        search.await_page_gate();
+        control.cancel();
+        assert_eq!(1, search.search("legacyneedle", 10).unwrap().len());
+        search.release_page_gate();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SearchError::Cancelled)
+        ));
+        let request = GenerationRequest {
+            index_id: search.index_id,
+            graph: graph.clone(),
+        };
+        assert_eq!(
+            None,
+            store.search_stage(&request).unwrap().unwrap().cursor,
+            "cursor must not move past an unrecorded committed page"
+        );
+
+        let resumed = DrainControl::default();
+        loop {
+            let outcome = {
+                let _guard = search.lock_graph(graph.as_str());
+                search
+                    .stage_graph(
+                        GraphWork {
+                            store: &store,
+                            graph: &graph,
+                            control: &resumed,
+                            byte_limit: search.work_bytes(),
+                        },
+                        target,
+                    )
+                    .unwrap()
+            };
+            if matches!(outcome, StageOutcome::Covered(_)) {
+                break;
+            }
+        }
+        assert!(search.search("legacyneedle", 10).unwrap().is_empty());
+        assert_eq!(1, search.search("currentneedle", 10).unwrap().len());
+    }
+
+    #[test]
+    fn cancel_keeps_waiter() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:shared-waiter");
+        let node = Arc::new(crate::CraqleNode::open(dir.path()).unwrap());
+        node.create_crate(&writer_auth(), crate_request(&graph, "sharedneedle", true))
+            .unwrap();
+        node.flush_search_updates().unwrap();
+        let mut batch = node.store.new_batch();
+        node.store
+            .enqueue_fts_reindex(&mut batch, graph_term(&node.store, &graph))
+            .unwrap();
+        node.store.commit(batch).unwrap();
+        node.search.arm_page_gate();
+
+        let cancellation = crate::QueryCancellation::new();
+        let first = {
+            let node = node.clone();
+            let cancellation = cancellation.clone();
+            std::thread::spawn(move || {
+                node.flush_search(&crate::SearchFlushOptions {
+                    timeout: None,
+                    cancellation,
+                })
+            })
+        };
+        node.search.await_page_gate();
+        let (ready, submitted) = std::sync::mpsc::channel();
+        let second = {
+            let node = node.clone();
+            std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                node.flush_search(&crate::SearchFlushOptions::default())
+            })
+        };
+        submitted.recv().unwrap();
+        cancellation.cancel();
+        assert!(first.join().unwrap().is_err());
+        node.search.release_page_gate();
+
+        second.join().unwrap().unwrap();
+        assert!(node.store.drain_reindex_queue(8).unwrap().is_empty());
+        assert_eq!(1, node.search.search("sharedneedle", 10).unwrap().len());
+    }
+
+    #[test]
+    fn complete_stage_reopens() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:complete-stage");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(&writer_auth(), crate_request(&graph, "currentneedle", true))
+                .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+
+        let store = reopen_store(dir.path());
+        let search_path = dir.path().join("staged-search");
+        let search = Arc::new(SearchIndex::open(&search_path).unwrap());
+        assert!(search.bind_store(&store).unwrap().is_some());
+        let switched = store
+            .ensure_search_generation(&GenerationRequest {
+                index_id: search.index_id,
+                graph: graph.clone(),
+            })
+            .unwrap();
+        search.apply_switch(&switched);
+        {
+            let mut writer = search.writer().unwrap();
+            search
+                .add_document(
+                    &mut writer,
+                    ResourceDoc {
+                        graph_id: graph.as_str(),
+                        subject_iri: graph.as_str(),
+                        generation: switched.active.unwrap(),
+                        all_text: Some("legacyneedle"),
+                        delete_existing: true,
+                    },
+                )
+                .unwrap();
+        }
+        search.commit().unwrap();
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts_reindex(&mut batch, graph_term(&store, &graph))
+            .unwrap();
+        store.commit(batch).unwrap();
+        let target = store.current_dirty_token();
+        search.arm_stage_gate();
+        let control = DrainControl::default();
+
+        let worker = {
+            let store = store.clone();
+            let search = search.clone();
+            let graph = graph.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let outcome = {
+                        let _guard = search.lock_graph(graph.as_str());
+                        search.stage_graph(
+                            GraphWork {
+                                store: &store,
+                                graph: &graph,
+                                control: &control,
+                                byte_limit: search.work_bytes(),
+                            },
+                            target,
+                        )?
+                    };
+                    if matches!(outcome, StageOutcome::Covered(_)) {
+                        return Ok(());
+                    }
+                }
+            })
+        };
+        search.await_stage_gate();
+        control.cancel();
+        search.release_stage_gate();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SearchError::Cancelled)
+        ));
+        assert_eq!(1, search.search("legacyneedle", 10).unwrap().len());
+        drop(search);
+
+        let reopened = SearchIndex::open(&search_path).unwrap();
+        reopened.bind_store(&store).unwrap();
+        assert_eq!(1, reopened.search("legacyneedle", 10).unwrap().len());
+        let resumed = DrainControl::default();
+        let outcome = {
+            let _guard = reopened.lock_graph(graph.as_str());
+            reopened
+                .stage_graph(
+                    GraphWork {
+                        store: &store,
+                        graph: &graph,
+                        control: &resumed,
+                        byte_limit: reopened.work_bytes(),
+                    },
+                    target,
+                )
+                .unwrap()
+        };
+        assert!(matches!(outcome, StageOutcome::Covered(_)));
+        assert!(reopened.search("legacyneedle", 10).unwrap().is_empty());
+        assert_eq!(1, reopened.search("currentneedle", 10).unwrap().len());
+        let active = store
+            .search_generation(&GenerationRequest {
+                index_id: reopened.index_id,
+                graph: graph.clone(),
+            })
+            .unwrap()
+            .active;
+        drop(reopened);
+
+        let replay = SearchIndex::open(&search_path).unwrap();
+        replay.bind_store(&store).unwrap();
+        assert_eq!(
+            active,
+            store
+                .search_generation(&GenerationRequest {
+                    index_id: replay.index_id,
+                    graph: graph.clone(),
+                })
+                .unwrap()
+                .active
+        );
+        crate::flush_search_queue(&store, &replay).unwrap();
+        assert!(
+            store
+                .search_generation(&GenerationRequest {
+                    index_id: replay.index_id,
+                    graph: graph.clone(),
+                })
+                .unwrap()
+                .active
+                .is_some()
+        );
+        assert!(replay.search("legacyneedle", 10).unwrap().is_empty());
+        assert_eq!(1, replay.search("currentneedle", 10).unwrap().len());
+        assert!(store.drain_reindex_queue(8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_cancels_stage() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:delete-stage");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(&writer_auth(), crate_request(&graph, "currentneedle", true))
+                .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        search
+            .index_resource(graph.as_str(), graph.as_str(), Some("legacyneedle"))
+            .unwrap();
+        search.commit().unwrap();
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts_reindex(&mut batch, graph_term(&store, &graph))
+            .unwrap();
+        store.commit(batch).unwrap();
+        let target = store.current_dirty_token();
+        search.arm_page_gate();
+        let control = DrainControl::default();
+
+        let worker = {
+            let store = store.clone();
+            let search = search.clone();
+            let graph = graph.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let _guard = search.lock_graph(graph.as_str());
+                search.stage_graph(
+                    GraphWork {
+                        store: &store,
+                        graph: &graph,
+                        control: &control,
+                        byte_limit: search.work_bytes(),
+                    },
+                    target,
+                )
+            })
+        };
+        search.await_page_gate();
+        store.delete_graph(&graph).unwrap();
+        control.cancel();
+        search.release_page_gate();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SearchError::Cancelled)
+        ));
+
+        let delete_target = store.current_dirty_token();
+        search
+            .process_queued_updates(
+                &store,
+                QueueBound {
+                    chunk: 8,
+                    max_token: Some(delete_target),
+                },
+            )
+            .unwrap();
+        let request = GenerationRequest {
+            index_id: search.index_id,
+            graph: graph.clone(),
+        };
+        assert!(store.search_stage(&request).unwrap().is_none());
+        assert!(store.search_generation(&request).unwrap().active.is_none());
+        assert!(search.search("legacyneedle", 10).unwrap().is_empty());
+        assert!(search.search("currentneedle", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_keeps_reader() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:cancelled-rebuild");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(&writer_auth(), crate_request(&graph, "oldneedle", true))
+                .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+
+        let store = reopen_store(dir.path());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        search
+            .index_resource(graph.as_str(), graph.as_str(), Some("oldneedle"))
+            .unwrap();
+        search.commit().unwrap();
+        search.arm_stage_gate();
+        let control = DrainControl::default();
+
+        let worker = {
+            let store = store.clone();
+            let search = search.clone();
+            let graph = graph.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let target = store.current_dirty_token();
+                loop {
+                    let outcome = {
+                        let _guard = search.lock_graph(graph.as_str());
+                        search.stage_graph(
+                            GraphWork {
+                                store: &store,
+                                graph: &graph,
+                                control: &control,
+                                byte_limit: search.work_bytes(),
+                            },
+                            target,
+                        )?
+                    };
+                    if matches!(outcome, StageOutcome::Covered(_)) {
+                        return Ok(());
+                    }
+                }
+            })
+        };
+        search.await_stage_gate();
+        control.cancel();
+        assert_eq!(1, search.search("oldneedle", 10).unwrap().len());
+        search.release_stage_gate();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SearchError::Cancelled)
+        ));
+        assert_eq!(1, search.search("oldneedle", 10).unwrap().len());
+    }
+
     /// A flush that triggers its own recovery owes the whole rebuild, not the
     /// one queue entry that happened to land on its original cutoff.
     #[test]
