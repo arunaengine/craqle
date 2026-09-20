@@ -3635,9 +3635,7 @@ mod tests {
         Ok(())
     }
 
-    /// A write landing after a reindex scan pinned its token must survive the
-    /// clear that follows: the scan never saw it, so wiping its queue entry
-    /// would leave it unindexed with nothing left to re-queue it.
+    /// Queue entries newer than a reindex cutoff must survive its clear.
     #[test]
     fn reindex_preserves_writes() {
         let dir = tempdir().unwrap();
@@ -3821,6 +3819,7 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let idx = SearchIndex::open(dir.path())?;
+        let index_id = idx.index_id();
         assert!(idx.needs_rebuild());
         idx.index_resource(
             "http://example.org/graph1",
@@ -3831,12 +3830,50 @@ mod tests {
         drop(idx);
 
         let reopened = SearchIndex::open(dir.path())?;
+        assert_eq!(index_id, reopened.index_id());
         assert!(!reopened.needs_rebuild());
+        reopened.set_generation("http://example.org/graph1", Some(DIRECT_GENERATION));
         let hits = reopened.search_in_graph("http://example.org/graph1", "proteomics", 10)?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].subject_iri, "http://example.org/entity1");
 
         Ok(())
+    }
+
+    #[test]
+    fn foreign_index_rebuilds() {
+        let dir = tempdir().unwrap();
+        let store = GraphStore::open(dir.path().join("store")).unwrap();
+        let first = SearchIndex::open(dir.path().join("first")).unwrap();
+        store
+            .advance_search_coverage(&crate::search::queue::SearchCoverage {
+                format: crate::search::queue::SEARCH_META_FORMAT,
+                index_id: first.index_id(),
+                index_revision: first.index.load_metas().unwrap().opstamp,
+                covered: store.current_dirty_token(),
+                rebuild: None,
+                manifest_count: 0,
+                manifest_hash: [0; 32],
+                manifest_epoch: 0,
+            })
+            .unwrap();
+
+        let foreign_path = dir.path().join("foreign");
+        let seeded = SearchIndex::open(&foreign_path).unwrap();
+        seeded
+            .index_resource(
+                "urn:test:foreign",
+                "urn:test:foreign",
+                Some("foreignneedle"),
+            )
+            .unwrap();
+        seeded.commit().unwrap();
+        let foreign_id = seeded.index_id();
+        drop(seeded);
+        let foreign = SearchIndex::open(&foreign_path).unwrap();
+        assert_eq!(foreign_id, foreign.index_id());
+        assert!(foreign.coverage_target(&store).unwrap().is_some());
+        assert_eq!(0, foreign.reader.searcher().num_docs());
     }
 
     #[test]
@@ -3867,11 +3904,12 @@ mod tests {
         std::fs::create_dir_all(&search_dir).unwrap();
         let legacy_schema = build_legacy_schema();
         let legacy_index = Index::create_in_dir(&search_dir, legacy_schema.clone()).unwrap();
-        let mut writer = legacy_index.writer(MEMORY_INDEX_WRITER_HEAP_BYTES).unwrap();
+        let writer_bytes = usize::try_from(MemoryBudget::default().search_writer_bytes()).unwrap();
+        let mut writer = legacy_index.writer(writer_bytes).unwrap();
         let mut doc = TantivyDocument::default();
         doc.add_text(
             legacy_schema.get_field("doc_key").unwrap(),
-            doc_key(graph.as_str(), graph.as_str()),
+            format!("{}\u{1f}{}", graph.as_str(), graph.as_str()),
         );
         doc.add_text(legacy_schema.get_field("graph_id").unwrap(), graph.as_str());
         doc.add_text(
@@ -3904,7 +3942,7 @@ mod tests {
         );
     }
 
-    // ── G7: a poisoned Tantivy writer is derived state, so it self-heals ──
+    // Poisoned derived state must repair itself.
 
     /// Panic while holding the writer lock, from a thread that is then joined.
     fn poison_writer(index: Arc<SearchIndex>) {
@@ -3944,9 +3982,7 @@ mod tests {
         Ok(())
     }
 
-    /// A second committer must not report success while the first commit is
-    /// still running: the pipeline acknowledges queue entries once `commit`
-    /// returns, and those writes are neither durable nor visible yet (G7).
+    /// A second committer cannot finish before the in-flight commit it needs.
     #[test]
     fn commit_awaits_inflight() -> Result<()> {
         let index = Arc::new(SearchIndex::open_in_memory()?);
@@ -3970,9 +4006,7 @@ mod tests {
         Ok(())
     }
 
-    /// The repair is not just "stop panicking": the rollback drops the writer
-    /// back to its last commit, so the index has to re-derive from the store,
-    /// which is the source of truth. One indexer pass must be enough.
+    /// Poison recovery must re-derive rolled-back index state in one pass.
     #[test]
     fn poisoned_writer_reconverges() {
         let dir = tempdir().unwrap();
@@ -4020,9 +4054,7 @@ mod tests {
         };
         assert_eq!(1, found(&node));
 
-        // Drop the graph's documents behind the store's back, so the index is
-        // stale in exactly the way an interrupted writer leaves it. Nothing is
-        // queued for it: only a re-derivation from the store can bring it back.
+        // Simulate unqueued stale index state that only re-derivation can repair.
         node.search.delete_graph_documents(graph.as_str()).unwrap();
         node.search.commit().unwrap();
         assert_eq!(0, found(&node));
@@ -4063,9 +4095,7 @@ mod tests {
         )
     }
 
-    /// One request must run one search over one pinned reader. Escalating the
-    /// Tantivy fetch until enough hits survive authorization asks the index for
-    /// a multiple of the page the caller wanted, once per pass.
+    /// One authorized request uses one search over one pinned reader.
     #[test]
     fn search_runs_once() {
         let dir = tempdir().unwrap();
