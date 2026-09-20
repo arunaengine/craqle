@@ -17,7 +17,9 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
 use tantivy::TERMINATED;
 #[cfg(test)]
 use tantivy::collector::{BytesFilterCollector, TopDocs};
-use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, QueryParser, TermQuery};
+use tantivy::query::{
+    Bm25StatisticsProvider as _, BooleanQuery, EnableScoring, Occur, Query, QueryParser, TermQuery,
+};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
     Value,
@@ -285,6 +287,62 @@ impl Ord for RankedDoc {
     }
 }
 
+/// The best `limit` eligible documents, keeping one copy per logical resource.
+struct TopRanked {
+    ranked: BinaryHeap<RankedDoc>,
+    keys: HashSet<[u8; 32]>,
+    limit: usize,
+}
+
+impl TopRanked {
+    fn new(limit: usize) -> Self {
+        Self {
+            ranked: BinaryHeap::with_capacity(limit),
+            keys: HashSet::with_capacity(limit),
+            limit,
+        }
+    }
+
+    fn retain(&mut self, candidate: RankedDoc) {
+        if self.keys.contains(&candidate.stable) {
+            if self
+                .ranked
+                .iter()
+                .find(|current| current.stable == candidate.stable)
+                .is_some_and(|current| candidate < *current)
+            {
+                let mut values = std::mem::take(&mut self.ranked).into_vec();
+                if let Some(current) = values
+                    .iter_mut()
+                    .find(|current| current.stable == candidate.stable)
+                {
+                    *current = candidate;
+                }
+                self.ranked = BinaryHeap::from(values);
+            }
+            return;
+        }
+        if self.ranked.len() < self.limit {
+            self.keys.insert(candidate.stable);
+            self.ranked.push(candidate);
+        } else if self.ranked.peek().is_some_and(|worst| candidate < *worst) {
+            if let Some(removed) = self.ranked.pop() {
+                self.keys.remove(&removed.stable);
+            }
+            self.keys.insert(candidate.stable);
+            self.ranked.push(candidate);
+        }
+    }
+
+    /// Scores at or below this value cannot enter; ties with the worst kept score still can.
+    fn threshold(&self) -> Score {
+        match self.ranked.peek() {
+            Some(worst) if self.ranked.len() >= self.limit => worst.score.next_down(),
+            _ => Score::NEG_INFINITY,
+        }
+    }
+}
+
 struct StageSource {
     snapshot: SearchSnapshot,
     orphaned: HashSet<TermId>,
@@ -390,6 +448,10 @@ struct TestHooks {
     fail_graph: Mutex<Option<String>>,
     /// Fails the next required metadata read, modelling an index I/O error.
     metadata_io: AtomicBool,
+    /// Forces the exhaustive collector, the oracle for pruned collection.
+    exhaustive: AtomicBool,
+    /// Segments collected with score pruning.
+    pruned: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1671,8 +1733,8 @@ impl SearchIndex {
             .weight(EnableScoring::enabled_from_searcher(&view.searcher))
             .map_err(SearchError::from)
             .map_err(E::from)?;
-        let mut ranked: BinaryHeap<RankedDoc> = BinaryHeap::with_capacity(req.limit);
-        let mut retained_keys = HashSet::with_capacity(req.limit);
+        let mut top = TopRanked::new(req.limit);
+        let pruning = self.pruning_safe(&view.searcher, query.as_ref());
         for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
             let scopes = reader
                 .fast_fields()
@@ -1684,13 +1746,10 @@ impl SearchIndex {
                 .bytes(STABLE_KEY_FIELD)
                 .map_err(SearchError::from)
                 .map_err(E::from)?;
-            let mut scorer = weight
-                .scorer(reader, 1.0)
-                .map_err(SearchError::from)
-                .map_err(E::from)?;
-            while scorer.doc() != TERMINATED {
+            let initial = top.threshold();
+            // Ineligible documents return the current threshold, so they never raise it.
+            let mut offer = |doc: DocId, score: &mut dyn FnMut() -> Score| {
                 (req.check)()?;
-                let doc = scorer.doc();
                 if reader
                     .alive_bitset()
                     .is_none_or(|alive| alive.is_alive(doc))
@@ -1702,7 +1761,7 @@ impl SearchIndex {
                         allows: req.allows,
                     })?
                 {
-                    let score = scorer.score();
+                    let score = score();
                     if !score.is_finite() {
                         return Err(E::from(SearchError::Tantivy(
                             tantivy::TantivyError::SystemError(
@@ -1710,44 +1769,45 @@ impl SearchIndex {
                             ),
                         )));
                     }
-                    let candidate = RankedDoc {
+                    top.retain(RankedDoc {
                         score,
                         stable,
                         address: DocAddress::new(segment as u32, doc),
-                    };
-                    if retained_keys.contains(&candidate.stable) {
-                        if ranked
-                            .iter()
-                            .find(|current| current.stable == candidate.stable)
-                            .is_some_and(|current| candidate < *current)
-                        {
-                            let mut values = std::mem::take(&mut ranked).into_vec();
-                            if let Some(current) = values
-                                .iter_mut()
-                                .find(|current| current.stable == candidate.stable)
-                            {
-                                *current = candidate;
-                            }
-                            ranked = BinaryHeap::from(values);
-                        }
-                        let _ = scorer.advance();
-                        continue;
-                    }
-                    if ranked.len() < req.limit {
-                        retained_keys.insert(candidate.stable);
-                        ranked.push(candidate);
-                    } else if ranked.peek().is_some_and(|worst| candidate < *worst) {
-                        if let Some(removed) = ranked.pop() {
-                            retained_keys.remove(&removed.stable);
-                        }
-                        retained_keys.insert(candidate.stable);
-                        ranked.push(candidate);
-                    }
+                    });
                 }
+                Ok(top.threshold())
+            };
+            if pruning {
+                #[cfg(test)]
+                self.hooks.pruned.fetch_add(1, Ordering::SeqCst);
+                let mut failed = None;
+                weight
+                    .for_each_pruning(initial, reader, &mut |doc, score| {
+                        if failed.is_some() {
+                            return Score::INFINITY;
+                        }
+                        offer(doc, &mut || score).unwrap_or_else(|error| {
+                            failed = Some(error);
+                            Score::INFINITY
+                        })
+                    })
+                    .map_err(SearchError::from)
+                    .map_err(E::from)?;
+                if let Some(error) = failed {
+                    return Err(error);
+                }
+                continue;
+            }
+            let mut scorer = weight
+                .scorer(reader, 1.0)
+                .map_err(SearchError::from)
+                .map_err(E::from)?;
+            while scorer.doc() != TERMINATED {
+                offer(scorer.doc(), &mut || scorer.score())?;
                 let _ = scorer.advance();
             }
         }
-        let mut ranked = ranked.into_vec();
+        let mut ranked = top.ranked.into_vec();
         ranked.sort();
         #[cfg(test)]
         {
@@ -2909,6 +2969,42 @@ impl SearchIndex {
         })
     }
 
+    /// Whether block-max pruning bounds hold: one segment, one field, and a term union
+    /// scored with that segment's own statistics.
+    fn pruning_safe(&self, searcher: &Searcher, query: &dyn Query) -> bool {
+        #[cfg(test)]
+        if self.hooks.exhaustive.load(Ordering::SeqCst) {
+            return false;
+        }
+        let [reader] = searcher.segment_readers() else {
+            return false;
+        };
+        let Some(terms) = pruning_terms(query) else {
+            return false;
+        };
+        let Some(field) = terms.first().map(|term| term.field()) else {
+            return false;
+        };
+        let statistics = || -> tantivy::Result<bool> {
+            if terms.iter().any(|term| term.field() != field)
+                || searcher.total_num_docs()? != u64::from(reader.max_doc())
+                || searcher.total_num_tokens(field)?
+                    != reader.inverted_index(field)?.total_num_tokens()
+            {
+                return Ok(false);
+            }
+            for term in &terms {
+                if searcher.doc_freq(term)?
+                    != u64::from(reader.inverted_index(field)?.doc_freq(term)?)
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        statistics().unwrap_or(false)
+    }
+
     /// Returns the stable key of an active, allowed document, or `None` for skipped ones.
     fn active_key<E>(&self, req: ActiveDoc<'_, E>) -> std::result::Result<Option<[u8; 32]>, E>
     where
@@ -3120,6 +3216,23 @@ fn scope_graph(scope: &[u8]) -> Option<&str> {
         return None;
     }
     std::str::from_utf8(&scope[16..scope.len() - 8]).ok()
+}
+
+/// Terms of a single term query or of a union whose clauses are all optional terms.
+fn pruning_terms(query: &dyn Query) -> Option<Vec<&Term>> {
+    if let Some(term) = query.downcast_ref::<TermQuery>() {
+        return Some(vec![term.term()]);
+    }
+    let boolean = query.downcast_ref::<BooleanQuery>()?;
+    boolean
+        .clauses()
+        .iter()
+        .map(|(occur, query)| {
+            (*occur == Occur::Should)
+                .then(|| query.downcast_ref::<TermQuery>().map(TermQuery::term))
+                .flatten()
+        })
+        .collect()
 }
 
 /// Reads the graph named by one document's generation scope.
@@ -4017,6 +4130,166 @@ mod tests {
         };
         assert_eq!(identities(&expected), identities(&repaired));
         assert!(pinned.generations.active.contains(scope.as_slice()));
+    }
+
+    const PRUNE_GRAPHS: usize = 12;
+
+    fn prune_graph(index: usize) -> String {
+        format!("urn:test:prune:graph:{}", index % PRUNE_GRAPHS)
+    }
+
+    /// Deterministic text with common, rare, and tied terms of varied frequency.
+    fn prune_text(index: usize, round: usize) -> String {
+        let mut state = (index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ round as u64;
+        let mut words = Vec::new();
+        for _ in 0..(index % 5) + 1 {
+            words.push("common");
+        }
+        state ^= state >> 29;
+        if state % 17 == 0 {
+            words.push("rare");
+        }
+        words.push(if state % 2 == 0 { "alpha" } else { "beta" });
+        if index % 7 == 0 {
+            return "tie filler".to_owned();
+        }
+        words.join(" ")
+    }
+
+    fn write_prune(index: &SearchIndex, (from, to): (usize, usize), round: usize) {
+        for position in from..to {
+            let graph = prune_graph(position);
+            let subject = format!("urn:test:prune:subject:{position}");
+            index
+                .index_resource(&graph, &subject, Some(&prune_text(position, round)))
+                .unwrap();
+        }
+        index.commit().unwrap();
+    }
+
+    fn merge_all(index: &SearchIndex) {
+        let segments = index.index.searchable_segment_ids().unwrap();
+        if segments.len() > 1 {
+            index.writer().unwrap().merge(&segments).wait().unwrap();
+        }
+        index.reader.reload().unwrap();
+        index.publish_searcher();
+    }
+
+    fn prune_hits(
+        index: &SearchIndex,
+        query: &str,
+        (limit, sparse): (usize, bool),
+    ) -> Vec<SearchHit> {
+        let allows = |graph: &str| {
+            Ok::<bool, SearchError>(!sparse || !graph.ends_with(":0") && !graph.ends_with(":3"))
+        };
+        let check = || Ok::<(), SearchError>(());
+        index
+            .collect_filtered(FilterQuery {
+                query,
+                limit,
+                subject: None,
+                allows: &allows,
+                check: &check,
+            })
+            .unwrap()
+    }
+
+    /// Pruned hits must equal exhaustive hits, allowing score ties at the k-th boundary.
+    fn assert_same_top(index: &SearchIndex, label: &str) -> usize {
+        let before = index.hooks.pruned.load(Ordering::SeqCst);
+        for query in ["common", "rare", "tie", "alpha beta", "common rare"] {
+            for request in [
+                (1, false),
+                (10, false),
+                (10, true),
+                (100, false),
+                (100, true),
+            ] {
+                index.hooks.exhaustive.store(true, Ordering::SeqCst);
+                let oracle = prune_hits(index, query, request);
+                index.hooks.exhaustive.store(false, Ordering::SeqCst);
+                let pruned = prune_hits(index, query, request);
+                let case = format!("{label} {query:?} {request:?}");
+                assert_eq!(oracle.len(), pruned.len(), "{case}");
+                let identity = |hit: &SearchHit| (hit.graph_id.clone(), hit.subject_iri.clone());
+                if oracle
+                    .iter()
+                    .zip(&pruned)
+                    .all(|(left, right)| left.score.to_bits() == right.score.to_bits())
+                {
+                    let order = |hits: &[SearchHit]| hits.iter().map(identity).collect::<Vec<_>>();
+                    assert_eq!(order(&oracle), order(&pruned), "{case}");
+                    continue;
+                }
+                let tolerance = |score: f32| score.abs() * 1e-5 + 1e-6;
+                for (left, right) in oracle.iter().zip(&pruned) {
+                    assert!(
+                        (left.score - right.score).abs() <= tolerance(left.score),
+                        "{case}"
+                    );
+                }
+                let boundary = oracle.last().map_or(0.0, |hit| hit.score);
+                let firm = |hits: &[SearchHit]| {
+                    hits.iter()
+                        .filter(|hit| hit.score - boundary > tolerance(boundary))
+                        .map(identity)
+                        .collect::<BTreeSet<_>>()
+                };
+                assert_eq!(firm(&oracle), firm(&pruned), "{case}");
+            }
+        }
+        index.hooks.pruned.load(Ordering::SeqCst) - before
+    }
+
+    #[test]
+    fn pruned_matches_exhaustive() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        write_prune(&index, (0, 200), 0);
+        write_prune(&index, (200, 400), 0);
+        assert!(index.pin_view().searcher.segment_readers().len() > 1);
+        assert_eq!(
+            0,
+            assert_same_top(&index, "segments"),
+            "several segments must not prune"
+        );
+
+        merge_all(&index);
+        assert!(
+            assert_same_top(&index, "merged") > 0,
+            "one segment must prune"
+        );
+
+        // Replacements and deletions leave dead documents inside the merged segment.
+        write_prune(&index, (0, 120), 1);
+        {
+            let mut writer = index.writer().unwrap();
+            for position in (120..400).step_by(9) {
+                index.delete_doc(
+                    &mut writer,
+                    &DocIdentity {
+                        graph_iri: prune_graph(position),
+                        subject_iri: format!("urn:test:prune:subject:{position}"),
+                        generation: DIRECT_GENERATION,
+                    },
+                );
+            }
+        }
+        index.commit().unwrap();
+        merge_all(&index);
+        assert!(assert_same_top(&index, "updated") > 0);
+
+        // Old-generation documents stay in the segment but must never enter or raise the threshold.
+        index.set_generation(&prune_graph(1), Some(GenerationId(2)));
+        index
+            .seed_duplicate(&prune_graph(2), "urn:test:prune:subject:2")
+            .unwrap();
+        index.commit().unwrap();
+        merge_all(&index);
+        assert!(assert_same_top(&index, "switched") > 0);
+        let hits = prune_hits(&index, "common", (400, false));
+        assert!(hits.iter().all(|hit| hit.graph_id != prune_graph(1)));
     }
 
     #[test]
