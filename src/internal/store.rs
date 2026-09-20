@@ -6179,18 +6179,19 @@ impl GraphStore {
             .projection_lock
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let owner = self.qv_gate.try_acquire();
+        let mut owner = self.qv_gate.try_acquire();
+        if owner.is_none() && self.query_build(&self.db.snapshot())?.is_some() {
+            owner = self.qv_gate.acquire_timeout(self.qv_commit_wait);
+            if owner.is_none() {
+                return Err(StoreError::QueryIndexBusy);
+            }
+        }
         let debt = match &owner {
             Some(_) => {
                 self.stage_index_update(&mut commit.batch, publish)?;
                 None
             }
-            None => {
-                if self.query_build(&self.db.snapshot())?.is_some() {
-                    return Err(StoreError::QueryIndexBusy);
-                }
-                Some(self.stage_projection_debt(&mut commit.batch))
-            }
+            None => Some(self.stage_projection_debt(&mut commit.batch)),
         };
         let committed = self.commit_durable(commit);
         let published = if committed.is_ok() {
@@ -8349,19 +8350,39 @@ impl GraphStore {
 
     /// Reads clock-tagged diagnostics by term id without persisting recomputations.
     pub fn graph_diagnostics_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
-        let clock = self.vector_clock_id(graph_id)?;
+        let snapshot = self.read_snapshot();
+        let clock = self.snapshot_vector_clock(&snapshot.snapshot, graph_id)?;
 
-        if let Some(record) = self.read_stored_diagnostics(graph_id)?
+        if let Some(record) = self.snapshot_stored_diagnostics(&snapshot.snapshot, graph_id)?
             && record.at_clock == clock
         {
             return Ok(record.diagnostics);
         }
 
-        if !self.contains_graph_id(graph_id)? {
+        if !snapshot.contains_graph_id(self, graph_id)? {
             return Ok(GraphDiagnostics::default());
         }
 
-        Ok(self.compute_tagged_diagnostics(graph_id)?.diagnostics)
+        self.snapshot_diagnostics(&snapshot, graph_id)
+    }
+
+    fn snapshot_diagnostics(
+        &self,
+        snapshot: &StoreReadSnapshot,
+        graph_id: TermId,
+    ) -> Result<GraphDiagnostics> {
+        let context = crate::query::context::ReadContext::default();
+        let orphans = snapshot.orphaned_entity_ids(self, &context, graph_id)?;
+        let mut entities = Vec::with_capacity(orphans.len());
+        for orphan in orphans {
+            let term = self.decode_term_arc(orphan)?;
+            entities.push(
+                term.to_named_node()
+                    .map(|named_node| named_node.as_str().to_string())
+                    .unwrap_or_else(|| term.0.clone()),
+            );
+        }
+        Ok(GraphDiagnostics::from_orphaned_entities(entities))
     }
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
