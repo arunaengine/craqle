@@ -493,6 +493,13 @@
     {"path":"src/shacl.rs","rule":"name_terms","name":"status_full_shape_scans","kind":"field","reason":"Preserve the shipped public runtime statistics field.","source":"Craqle public SHACL API"},
     {"path":"src/shacl.rs","rule":"name_terms","name":"shape_compile_cache_hit","kind":"field","reason":"Preserve the shipped public validation statistics field.","source":"Craqle public SHACL API"},
     {"path":"src/shacl.rs","rule":"name_terms","name":"accepted_by_write_policy","kind":"field","reason":"Preserve the shipped public validation outcome field.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"CoreSubsetV1","kind":"variant","reason":"Preserve the shipped public SHACL profile variant.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"ReplayAllBeforeOpen","kind":"variant","reason":"Preserve the shipped public replay policy variant.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"ShapesGraphNotFound","kind":"variant","reason":"Preserve the shipped public SHACL error variant.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"UnsupportedRdfStarTerm","kind":"variant","reason":"Preserve the shipped public SHACL error variant.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"DataGraphNotFound","kind":"variant","reason":"Preserve the shipped public SHACL error variant.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"SchemaChangedDuringValidation","kind":"variant","reason":"Preserve the shipped public SHACL error variant.","source":"Craqle public SHACL API"}
+    ,{"path":"src/shacl.rs","rule":"name_terms","name":"ShapesGraphMutationUnsupported","kind":"variant","reason":"Preserve the shipped public SHACL error variant.","source":"Craqle public SHACL API"}
   ],
   "macro_inputs": {"vocab_terms":{"mode":"static_list"}},
   "test_paths": ["tests", "src/internal/tests.rs", "src/internal/search/bench.rs", "src/internal/store_bench.rs", "src/internal/store_recovery.rs", "src/internal/search/recovery.rs", "src/receipt_tests.rs"],
