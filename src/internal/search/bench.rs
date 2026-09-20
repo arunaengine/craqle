@@ -1,0 +1,269 @@
+//! Measures private search failure and bounded queue contracts for B09 and B10.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use serde_json::{Value, json};
+
+use super::*;
+
+fn bench_case() -> Value {
+    serde_json::from_str(&std::env::var("CRAQLE_BENCH_CASE").unwrap()).unwrap()
+}
+
+fn byte_cap() -> usize {
+    std::env::var("CRAQLE_BENCH_BYTE_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128 * 1024 * 1024)
+}
+
+fn writer_auth() -> crate::GrantAuthorizer {
+    crate::GrantAuthorizer::new(vec![crate::PermissionGrant::new(
+        "/bench/**",
+        crate::PermissionLevel::Write,
+    )])
+}
+
+fn crate_request(graph: &GraphId, label: &str) -> crate::CreateCrateRequest {
+    crate::CreateCrateRequest::new(
+        graph.clone(),
+        "Search Bench",
+        label,
+        "2026-09-20",
+        None,
+        crate::core::GraphPolicy {
+            public: true,
+            permission_paths: vec!["/bench/search".to_string()],
+        },
+    )
+}
+
+fn reopen_store(path: &Path) -> Arc<GraphStore> {
+    Arc::new(GraphStore::open(path.join("store")).unwrap())
+}
+
+fn graph_term(store: &GraphStore, graph: &GraphId) -> TermId {
+    store
+        .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+        .unwrap()
+        .unwrap()
+}
+
+fn seed_graphs(path: &Path) -> (Arc<GraphStore>, Arc<SearchIndex>, GraphId, GraphId) {
+    let healthy = GraphId::new("urn:bench:failure:healthy");
+    let broken = GraphId::new("urn:bench:failure:broken");
+    {
+        let node = crate::CraqleNode::open(path).unwrap();
+        for graph in [&healthy, &broken] {
+            node.create_crate(&writer_auth(), crate_request(graph, "failure needle"))
+                .unwrap();
+        }
+        node.flush_search_updates().unwrap();
+    }
+    let store = reopen_store(path);
+    let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+    search.bind_store(&store).unwrap();
+    let mut batch = store.new_batch();
+    for graph in [&healthy, &broken] {
+        store
+            .enqueue_fts_reindex(&mut batch, graph_term(&store, graph))
+            .unwrap();
+    }
+    store.commit(batch).unwrap();
+    (store, search, healthy, broken)
+}
+
+#[test]
+#[ignore = "release-only B09 private failure workload"]
+fn catalog_b09() {
+    let case = bench_case();
+    let mode = case["failure"].as_str().unwrap_or("permanent");
+    let root = tempfile::tempdir().unwrap();
+    let (store, search, healthy, broken) = seed_graphs(root.path());
+    let started = Instant::now();
+    let mut failures = 0usize;
+    let mut retries = 0u32;
+    if mode == "shutdown" {
+        let control = DrainControl::default();
+        control.cancel();
+        let result = search.drain_queues(
+            &store,
+            DrainRequest {
+                bound: QueueBound {
+                    chunk: 64,
+                    max_token: None,
+                },
+                control,
+            },
+        );
+        assert!(matches!(result, Err(SearchError::Cancelled)));
+    } else if mode == "transient" {
+        store.arm_commit_failure();
+        let result = search.drain_queues(
+            &store,
+            DrainRequest {
+                bound: QueueBound {
+                    chunk: 64,
+                    max_token: Some(store.current_dirty_token()),
+                },
+                control: DrainControl::default(),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "the injected global commit failure was not observed"
+        );
+        failures = 1;
+        crate::flush_search_queue(&store, &search).unwrap();
+    } else {
+        *search
+            .hooks
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(broken.as_str().to_string());
+        search.set_retry_now(1);
+        let attempts = match mode {
+            "permanent" => MAX_RETRY_ATTEMPTS,
+            "flush-flood" => 64,
+            value => panic!("unknown failure mode {value}"),
+        };
+        for attempt in 0..attempts {
+            search.set_retry_now(u64::from(attempt).saturating_mul(RETRY_MAX_MS + 1) + 1);
+            let result = search
+                .drain_queues(
+                    &store,
+                    DrainRequest {
+                        bound: QueueBound {
+                            chunk: if mode == "flush-flood" { 1 } else { 64 },
+                            max_token: Some(store.current_dirty_token()),
+                        },
+                        control: DrainControl::default(),
+                    },
+                )
+                .unwrap();
+            failures += result.failures.len();
+        }
+        let id = graph_queue_id(QueueKind::Reindex, &broken);
+        retries = store
+            .fts_failure(&id)
+            .unwrap()
+            .map_or(0, |state| state.attempts);
+        *search
+            .hooks
+            .fail_graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+    let healthy_hits = search.search("failure", 10).unwrap();
+    assert!(
+        mode == "shutdown"
+            || healthy_hits
+                .iter()
+                .any(|hit| hit.graph_id == healthy.as_str())
+    );
+    let output_digest = blake3::hash(format!("{healthy_hits:?}").as_bytes())
+        .to_hex()
+        .to_string();
+    println!(
+        "{}",
+        json!({
+            "benchmark_id": "B09",
+            "status": "measured",
+            "case": case,
+            "result": {
+                "completed": healthy_hits.len(),
+                "output_digest": output_digest,
+                "failures": failures,
+                "retries": retries,
+                "remaining_debt": store.drain_reindex_queue(usize::MAX).unwrap().len(),
+                "work_ns": started.elapsed().as_nanos(),
+            }
+        })
+    );
+}
+
+fn queue_graph(index: usize, bytes: usize) -> GraphId {
+    GraphId::new(&format!("urn:bench:queue:{index}:{}", "x".repeat(bytes)))
+}
+
+fn enqueue_graph(store: &GraphStore, graph: &GraphId) {
+    store.create_graph(graph).unwrap();
+    let mut batch = store.new_batch();
+    store
+        .enqueue_fts_reindex(&mut batch, graph_term(store, graph))
+        .unwrap();
+    store.commit(batch).unwrap();
+}
+
+#[test]
+#[ignore = "release-only B10 private queue workload"]
+fn catalog_b10() {
+    let case = bench_case();
+    let future = case["future"].as_u64().unwrap_or(0) as usize;
+    let eligible = case["eligible"].as_u64().unwrap_or(1) as usize;
+    let subject_bytes = case["subject_bytes"].as_u64().unwrap_or(16) as usize;
+    let estimated = future
+        .saturating_add(eligible)
+        .saturating_mul(subject_bytes.saturating_add(256));
+    if estimated > byte_cap() {
+        println!(
+            "{}",
+            json!({
+                "benchmark_id": "B10",
+                "status": "capacity_blocked",
+                "case": case,
+                "estimated_bytes": estimated,
+                "byte_cap": byte_cap(),
+            })
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let store = GraphStore::open(root.path()).unwrap();
+    for index in 0..eligible {
+        enqueue_graph(&store, &queue_graph(index, subject_bytes));
+    }
+    let target = store.current_dirty_token();
+    for index in 0..future {
+        enqueue_graph(&store, &queue_graph(eligible + index, subject_bytes));
+    }
+
+    let row_limit = eligible.saturating_add(1).max(1);
+    let byte_limit = row_limit.saturating_mul(subject_bytes.saturating_add(128));
+    let started = Instant::now();
+    let page = store
+        .scan_fts_reindexes(&QueueScan {
+            max_token: Some(target),
+            after: None,
+            row_limit,
+            byte_limit,
+        })
+        .unwrap();
+    assert!(page.entries.len() <= eligible);
+    assert!(page.rows <= row_limit);
+    assert!(page.bytes <= byte_limit);
+    let output_digest = blake3::hash(format!("{:?}", page.entries).as_bytes())
+        .to_hex()
+        .to_string();
+    println!(
+        "{}",
+        json!({
+            "benchmark_id": "B10",
+            "status": "measured",
+            "case": case,
+            "result": {
+                "completed": page.entries.len(),
+                "output_digest": output_digest,
+                "records_visited": page.rows,
+                "prepared_bytes": page.bytes,
+                "max_queue_bytes": byte_limit,
+                "remaining_debt": usize::from(page.remaining),
+                "future_rows": future,
+                "work_ns": started.elapsed().as_nanos(),
+            }
+        })
+    );
+}
