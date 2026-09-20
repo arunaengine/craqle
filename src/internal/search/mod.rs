@@ -2,48 +2,62 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+pub(crate) mod queue;
 
-use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use std::borrow::Cow;
+use std::collections::BinaryHeap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::Path;
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
+
+use tantivy::TERMINATED;
+#[cfg(test)]
+use tantivy::collector::{BytesFilterCollector, TopDocs};
+use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing, Value,
+    FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
+    Value,
 };
 use tantivy::tokenizer::{
     AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
 };
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tantivy::{DocAddress, DocId, DocSet, Index, IndexReader, IndexWriter, Score, Searcher};
+use tantivy::{TantivyDocument, Term};
 
 use crate::core::{EncodedTerm, GraphId};
-use crate::search_queue::{DirtySubject, DrainProgress, drain_upto};
-pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
-use crate::store::{GraphStore, TermId};
+use crate::memory::MemoryBudget;
+#[cfg(test)]
+use crate::search::queue::GraphGeneration;
+use crate::search::queue::{
+    CleanupFailure, CleanupScan, DirtySubject, DrainControl, DrainProgress, DrainRequest,
+    GenerationId, GenerationRequest, GenerationSwitch, GraphScan, ManifestScan, OversizedEntry,
+    QueueCursor, QueueId, QueueKind, QueuePage, QueueScan, RebuildRequest, RebuildScan, RetryState,
+    StageFailure, StageJob, StageRequest, SubjectScan,
+};
+pub(crate) use crate::search::queue::{DrainFailure, QueueBound};
+use crate::store::{GraphStore, SearchSnapshot, TermId};
 
-const DISK_INDEX_WRITER_HEAP_BYTES: usize = 256_000_000;
-const MEMORY_INDEX_WRITER_HEAP_BYTES: usize = 64_000_000;
-const REINDEX_FLUSH_CHUNK: usize = 2_048;
-/// Prepared subject text one drain pass may hold before it stops and leaves
-/// the rest queued for a continuation.
-///
-/// Checked before each subject rather than after, so one subject larger than
-/// the whole budget is still prepared: the cap is overshot by that one entry
-/// instead of the pass making no progress at all.
-const PREPARED_TEXT_BUDGET: usize = 64_000_000;
+const MAX_RETRY_ATTEMPTS: u32 = 8;
+const RETRY_BASE_MS: u64 = 250;
+const RETRY_MAX_MS: u64 = 60_000;
+const SOURCE_PAGE_ROWS: usize = 2_048;
+const STAGE_SOURCE_BYTES: usize = 256;
 /// Rebuild-lock shards. Comfortably above the indexer's concurrency while
 /// staying a fixed, tiny allocation.
 const REBUILD_SHARDS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
-const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v2";
+const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v5";
+const INDEX_ID_FILE: &str = ".craqle-index-id";
+const DIRECT_GENERATION: GenerationId = GenerationId(1);
+const GENERATION_FIELD: &str = "doc_generation";
+const GENERATION_SCOPE_FIELD: &str = "generation_scope";
+const STABLE_KEY_FIELD: &str = "stable_key";
 
-/// Predicates whose objects contribute to a document's searchable text.
-///
-/// Built once instead of per synced subject: the previous per-call constructor
-/// allocated four `NamedNode`s plus four `EncodedTerm`s for every subject the
-/// worker touched.
+/// Cached predicates whose objects contribute searchable document text.
 static SEARCHABLE_PREDICATES: LazyLock<[EncodedTerm; 4]> = LazyLock::new(|| {
     [
         EncodedTerm::from_named_node(&crate::vocab::schema_name()),
@@ -61,13 +75,27 @@ pub enum SearchError {
     QueryParse(#[from] tantivy::query::QueryParserError),
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("search maintenance cancelled")]
+    Cancelled,
+    #[error("search index is not bound to its durable generation state")]
+    Unbound,
+    #[error("search item uses {bytes} bytes, limit is {limit}")]
+    ItemTooLarge { bytes: usize, limit: usize },
+    #[error("search item uses {rows} source rows, limit is {limit}")]
+    SourceTooLarge { rows: usize, limit: usize },
 }
 
 impl SearchError {
     pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
         match self {
             Self::QueryParse(_) => crate::CraqleErrorKind::InvalidInput,
-            Self::Tantivy(_) => crate::CraqleErrorKind::Storage,
+            Self::Cancelled => crate::CraqleErrorKind::Cancelled,
+            Self::ItemTooLarge { .. } | Self::SourceTooLarge { .. } => {
+                crate::CraqleErrorKind::QueryLimit
+            }
+            Self::Tantivy(_) | Self::Io(_) | Self::Unbound => crate::CraqleErrorKind::Storage,
             Self::Store(error) => error.kind(),
         }
     }
@@ -75,34 +103,186 @@ impl SearchError {
 
 pub(crate) type Result<T> = std::result::Result<T, SearchError>;
 
-/// Identity of one failing queue entry.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FailureKey {
-    graph: String,
-    subject: Option<TermId>,
+#[derive(Default)]
+struct QueueCursors {
+    deletes: Option<QueueCursor>,
+    reindexes: Option<QueueCursor>,
+    subjects: Option<QueueCursor>,
+    cleanup: Option<GenerationId>,
 }
 
-impl FailureKey {
-    fn graph(graph: &GraphId) -> Self {
-        Self {
-            graph: graph.as_str().to_string(),
-            subject: None,
-        }
-    }
-
-    fn subject(graph: &GraphId, subject: TermId) -> Self {
-        Self {
-            graph: graph.as_str().to_string(),
-            subject: Some(subject),
-        }
-    }
+struct ScanSave<'a, T> {
+    kind: QueueKind,
+    page: &'a QueuePage<T>,
+    started: bool,
 }
 
 /// One drain pass: what it may read, and what it has covered so far.
 struct DrainPass<'a> {
     store: &'a GraphStore,
     bound: QueueBound,
+    control: DrainControl,
     progress: DrainProgress,
+    byte_limit: usize,
+    advanced: bool,
+}
+
+struct GraphWork<'a> {
+    store: &'a GraphStore,
+    graph: &'a GraphId,
+    control: &'a DrainControl,
+    byte_limit: usize,
+}
+
+struct QueueInput<'a> {
+    kind: QueueKind,
+    bound: &'a QueueBound,
+    byte_limit: usize,
+}
+
+struct FailureInput<'a> {
+    id: &'a QueueId,
+    owed_from: u64,
+    target: u64,
+}
+
+struct FailedItem<'a> {
+    input: FailureInput<'a>,
+    error: SearchError,
+}
+
+#[derive(Clone, Copy)]
+enum FailureClass {
+    ItemPermanent,
+    ItemRetryable,
+    Global,
+    Rebuild,
+}
+
+#[derive(Clone, Default)]
+struct GenerationView {
+    by_graph: HashMap<String, GenerationId>,
+    active: HashSet<Vec<u8>>,
+}
+
+impl GenerationView {
+    #[cfg(test)]
+    fn from_rows(index_id: [u8; 16], rows: Vec<GraphGeneration>) -> Self {
+        let mut view = Self::default();
+        view.extend(index_id, rows);
+        view
+    }
+
+    #[cfg(test)]
+    fn extend(&mut self, index_id: [u8; 16], rows: Vec<GraphGeneration>) {
+        self.by_graph.extend(rows.into_iter().filter_map(|row| {
+            row.active
+                .map(|generation| (row.graph.as_str().to_string(), generation))
+        }));
+        self.active = self
+            .by_graph
+            .iter()
+            .map(|(graph, generation)| generation_scope(index_id, graph, *generation))
+            .collect();
+    }
+}
+
+struct SearchView {
+    searcher: Searcher,
+    generations: Arc<GenerationView>,
+    bound: bool,
+}
+
+struct ManifestState {
+    generations: GenerationView,
+    count: u64,
+    hash: [u8; 32],
+    epoch: u64,
+    valid: bool,
+    digest_match: bool,
+}
+
+#[cfg(test)]
+struct TopRequest<'a> {
+    view: &'a SearchView,
+    query: &'a dyn Query,
+    limit: usize,
+}
+
+pub(crate) struct AuthorizedQuery<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub subject: Option<&'a str>,
+    pub allows: &'a dyn Fn(&str) -> crate::Result<bool>,
+}
+
+pub(crate) struct FilterQuery<'a, E> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub subject: Option<&'a str>,
+    pub allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
+    pub check: &'a dyn Fn() -> std::result::Result<(), E>,
+}
+
+#[derive(Clone, Debug)]
+struct RankedDoc {
+    score: Score,
+    stable: [u8; 32],
+    address: DocAddress,
+}
+
+impl PartialEq for RankedDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score).is_eq()
+            && self.stable == other.stable
+            && self.address == other.address
+    }
+}
+
+impl Eq for RankedDoc {}
+
+impl PartialOrd for RankedDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedDoc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.stable.cmp(&other.stable))
+            .then_with(|| self.address.cmp(&other.address))
+    }
+}
+
+struct StageSource {
+    snapshot: SearchSnapshot,
+    orphaned: HashSet<TermId>,
+    bytes: usize,
+}
+
+enum StageOutcome {
+    Pending(usize),
+    Covered(u64),
+}
+
+struct StageSubject<'a> {
+    store: &'a GraphStore,
+    source: &'a StageSource,
+    graph: &'a GraphId,
+    graph_tid: TermId,
+    subject: TermId,
+    generation: GenerationId,
+    control: &'a DrainControl,
+    byte_limit: usize,
+}
+
+struct PreparedStage {
+    op: PreparedDocOp,
+    rows: usize,
+    bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -119,45 +299,39 @@ pub struct SearchHit {
 pub struct SearchIndex {
     index: Index,
     reader: IndexReader,
-    /// Guards the single Tantivy writer. Held only around `add`/`delete`
-    /// calls — never across store reads. One writer, rather
-    /// than concurrent writers behind an `RwLock`, keeps delete/add
-    /// interleaving deterministic instead of timing-dependent (G7).
-    ///
-    /// Never locked directly: go through [`SearchIndex::writer`], which turns
-    /// a poisoned lock into a recovery instead of a panic.
+    view: RwLock<Arc<SearchView>>,
+    /// Single Tantivy writer, held only for index mutation and poison recovery.
     writer: Mutex<IndexWriter>,
-    /// Bumped under the writer lock by every index mutation. A committer
-    /// records the value its writes carried and only reports success once
-    /// `committed_epoch` has reached it.
+    /// Epoch assigned under the writer lock to every index mutation.
     write_epoch: AtomicU64,
-    /// Highest `write_epoch` a finished Tantivy commit has made durable and
-    /// visible to the reader. Advanced only after both succeed, so a failed
-    /// commit leaves the debt outstanding for the next caller (G7).
+    /// Highest write epoch committed durably and visible to readers.
     committed_epoch: AtomicU64,
-    /// Serializes commits so a caller cannot mistake another thread's
-    /// in-flight commit for a finished one.
-    ///
-    /// LOCK ORDER: rebuild shard, then this, then [`SearchIndex::writer`].
+    /// Serializes commits after rebuild shards and before the writer lock.
     commit_lock: Mutex<()>,
-    /// Serializes a graph's clear-and-refill against every other mutation of
-    /// the same graph. Sharded by graph IRI.
-    ///
-    /// LOCK ORDER: these, then `commit_lock`, then [`SearchIndex::writer`];
-    /// multiple shards always in ascending index order.
+    /// Graph mutation shards precede commit and writer locks in ascending order.
     rebuild_shards: [Mutex<()>; REBUILD_SHARDS],
     /// Set when a poisoned writer was rolled back and the index therefore owes
     /// the store a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
-    /// Reports failed attempts while durable queue entries remain retryable.
-    item_failures: Mutex<HashMap<FailureKey, DrainFailure>>,
+    scan_cursors: Mutex<QueueCursors>,
+    retry_now: AtomicU64,
+    fair_cursor: AtomicU64,
+    prepared_bytes: usize,
+    work_lock: Mutex<()>,
+    stage_sources: Mutex<HashMap<GenerationId, Arc<StageSource>>>,
+    session: [u8; 16],
     #[cfg(test)]
     hooks: TestHooks,
-    needs_rebuild: bool,
+    needs_rebuild: AtomicBool,
+    index_id: [u8; 16],
     f_doc_key: Field,
     f_graph_id: Field,
     f_subject_iri: Field,
     f_all_text: Field,
+    f_generation_key: Field,
+    f_doc_generation: Field,
+    f_generation_scope: Field,
+    f_stable_key: Field,
 }
 
 /// Interleaving hooks a test arms to pin down a race. Per-index rather than
