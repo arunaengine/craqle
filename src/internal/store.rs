@@ -3392,62 +3392,56 @@ impl GraphStore {
         self.read_snapshot().snapshot
     }
 
-    /// O(1) qv2 eligibility gate for a single execution snapshot.
-    ///
-    /// Every input comes from `snapshot` itself, so a view captured earlier keeps
-    /// its own correct answer after later writes, repairs, or reopen. Source rows
-    /// and their qv rows are published in one batch, so a coherent header in this
-    /// snapshot is evidence of coverage for this snapshot.
+    /// Tests QV eligibility solely from one execution snapshot.
     fn snapshot_admission(&self, snapshot: &Snapshot) -> Result<QueryIndexAdmission> {
         #[cfg(test)]
-        self.query_index_admission_probes
-            .fetch_add(1, Ordering::Relaxed);
+        self.index_admission_probes.fetch_add(1, Ordering::Relaxed);
         if self.projection_debt_present(snapshot)? {
             return Ok(QueryIndexAdmission {
                 trusted: false,
                 query_id_generation: None,
-                query_id_upper_bound: None,
+                query_id_limit: None,
                 fallback_reason: Some("source-commit-projection-pending"),
                 header_reads: 0,
                 counter_reads: 0,
                 debt_reads: 1,
             });
         }
-        let header = match self.query_index_header_from_snapshot(snapshot)? {
-            QueryIndexHeaderRead::Absent => {
+        let header = match self.snapshot_index_header(snapshot)? {
+            IndexHeaderRead::Absent => {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
                     query_id_generation: None,
-                    query_id_upper_bound: None,
+                    query_id_limit: None,
                     fallback_reason: Some("metadata-missing"),
                     header_reads: 1,
                     counter_reads: 0,
                     debt_reads: 1,
                 });
             }
-            QueryIndexHeaderRead::Malformed => {
+            IndexHeaderRead::Malformed => {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
                     query_id_generation: None,
-                    query_id_upper_bound: None,
+                    query_id_limit: None,
                     fallback_reason: Some("metadata-malformed"),
                     header_reads: 1,
                     counter_reads: 0,
                     debt_reads: 1,
                 });
             }
-            QueryIndexHeaderRead::Legacy(_) => {
+            IndexHeaderRead::Legacy(_) => {
                 return Ok(QueryIndexAdmission {
                     trusted: false,
                     query_id_generation: None,
-                    query_id_upper_bound: None,
+                    query_id_limit: None,
                     fallback_reason: Some("legacy-coverage-unverified"),
                     header_reads: 1,
                     counter_reads: 0,
                     debt_reads: 1,
                 });
             }
-            QueryIndexHeaderRead::Valid(header) => header,
+            IndexHeaderRead::Valid(header) => header,
         };
         let mut admission = self.header_admission(snapshot, &header)?;
         admission.debt_reads += 1;
@@ -3457,24 +3451,22 @@ impl GraphStore {
     fn header_admission(
         &self,
         snapshot: &Snapshot,
-        header: &QueryIndexHeader,
+        header: &IndexHeader,
     ) -> Result<QueryIndexAdmission> {
         let fallback_reason = match &header.state {
-            StoredQueryIndexState::Building => Some("index-building"),
-            StoredQueryIndexState::Failed(_) => Some("index-failed"),
-            StoredQueryIndexState::Ready if !header.ready_is_coherent() => {
-                Some("metadata-incoherent")
-            }
-            StoredQueryIndexState::Ready if !header.is_not_ahead_of_snapshot(snapshot.seqno()) => {
+            StoredIndexState::Building => Some("index-building"),
+            StoredIndexState::Failed(_) => Some("index-failed"),
+            StoredIndexState::Ready if !header.ready_is_coherent() => Some("metadata-incoherent"),
+            StoredIndexState::Ready if !header.fits_snapshot(snapshot.seqno()) => {
                 Some("metadata-ahead-of-snapshot")
             }
-            StoredQueryIndexState::Ready => None,
+            StoredIndexState::Ready => None,
         };
         if let Some(fallback_reason) = fallback_reason {
             return Ok(QueryIndexAdmission {
                 trusted: false,
                 query_id_generation: None,
-                query_id_upper_bound: None,
+                query_id_limit: None,
                 fallback_reason: Some(fallback_reason),
                 header_reads: 1,
                 counter_reads: 0,
@@ -3482,20 +3474,18 @@ impl GraphStore {
             });
         }
         #[cfg(test)]
-        self.query_index_admission_probes
-            .fetch_add(1, Ordering::Relaxed);
-        let (trusted, fallback_reason) = match self
-            .query_index_counter_from_snapshot(snapshot, QueryIndexCounterKey::Total)?
-        {
-            QueryIndexCounterRead::Value(total) if total == header.indexed_quads => (true, None),
-            QueryIndexCounterRead::Value(_) => (false, Some("total-counter-mismatch")),
-            QueryIndexCounterRead::Missing => (false, Some("total-counter-missing")),
-            QueryIndexCounterRead::Malformed => (false, Some("total-counter-malformed")),
-        };
+        self.index_admission_probes.fetch_add(1, Ordering::Relaxed);
+        let (trusted, fallback_reason) =
+            match self.snapshot_counter(snapshot, IndexCounterKey::Total)? {
+                IndexCounterRead::Value(total) if total == header.indexed_quads => (true, None),
+                IndexCounterRead::Value(_) => (false, Some("total-counter-mismatch")),
+                IndexCounterRead::Missing => (false, Some("total-counter-missing")),
+                IndexCounterRead::Malformed => (false, Some("total-counter-malformed")),
+            };
         Ok(QueryIndexAdmission {
             trusted,
             query_id_generation: trusted.then_some(header.query_id_generation),
-            query_id_upper_bound: trusted.then_some(header.next_query_id),
+            query_id_limit: trusted.then_some(header.next_query_id),
             fallback_reason,
             header_reads: 1,
             counter_reads: 1,
@@ -3506,15 +3496,18 @@ impl GraphStore {
     fn query_index_range(
         &self,
         snapshot: &Snapshot,
-        order: QueryIndexCursorOrder,
-        pattern: crate::rdf_read::QuadPattern,
-    ) -> Result<Option<(&Keyspace, Vec<u8>)>> {
-        let terms = match order {
-            QueryIndexCursorOrder::Gspo => match (
-                pattern.graph,
-                pattern.subject,
-                pattern.predicate,
-                pattern.object,
+        scan: &crate::query::cursor::IndexScan<'_>,
+    ) -> Result<Option<(&Keyspace, &Keyspace, Vec<u8>)>> {
+        scan.costs.planner_points(1);
+        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+            return Ok(None);
+        };
+        let terms = match scan.order {
+            IndexCursorOrder::Gspo => match (
+                scan.pattern.graph,
+                scan.pattern.subject,
+                scan.pattern.predicate,
+                scan.pattern.object,
             ) {
                 (Some(graph), Some(subject), Some(predicate), Some(object)) => {
                     vec![graph, subject, predicate, object]
@@ -3526,43 +3519,50 @@ impl GraphStore {
                 (Some(graph), None, _, _) => vec![graph],
                 (None, _, _, _) => Vec::new(),
             },
-            QueryIndexCursorOrder::Gpos => match (pattern.graph, pattern.predicate, pattern.object)
-            {
+            IndexCursorOrder::Gpos => match (
+                scan.pattern.graph,
+                scan.pattern.predicate,
+                scan.pattern.object,
+            ) {
                 (Some(graph), Some(predicate), Some(object)) => vec![graph, predicate, object],
                 (Some(graph), Some(predicate), None) => vec![graph, predicate],
                 (Some(graph), None, _) => vec![graph],
                 (None, _, _) => Vec::new(),
             },
-            QueryIndexCursorOrder::Spog => {
-                match (pattern.subject, pattern.predicate, pattern.object) {
-                    (Some(subject), Some(predicate), Some(object)) => {
-                        vec![subject, predicate, object]
-                    }
-                    (Some(subject), Some(predicate), None) => vec![subject, predicate],
-                    (Some(subject), None, _) => vec![subject],
-                    (None, _, _) => Vec::new(),
+            IndexCursorOrder::Spog => match (
+                scan.pattern.subject,
+                scan.pattern.predicate,
+                scan.pattern.object,
+            ) {
+                (Some(subject), Some(predicate), Some(object)) => {
+                    vec![subject, predicate, object]
                 }
-            }
-            QueryIndexCursorOrder::Posg => match (pattern.predicate, pattern.object) {
+                (Some(subject), Some(predicate), None) => vec![subject, predicate],
+                (Some(subject), None, _) => vec![subject],
+                (None, _, _) => Vec::new(),
+            },
+            IndexCursorOrder::Posg => match (scan.pattern.predicate, scan.pattern.object) {
                 (Some(predicate), Some(object)) => vec![predicate, object],
                 (Some(predicate), None) => vec![predicate],
                 (None, _) => Vec::new(),
             },
-            QueryIndexCursorOrder::Ospg => {
-                match (pattern.object, pattern.subject, pattern.predicate) {
-                    (Some(object), Some(subject), Some(predicate)) => {
-                        vec![object, subject, predicate]
-                    }
-                    (Some(object), Some(subject), None) => vec![object, subject],
-                    (Some(object), None, _) => vec![object],
-                    (None, _, _) => Vec::new(),
+            IndexCursorOrder::Ospg => match (
+                scan.pattern.object,
+                scan.pattern.subject,
+                scan.pattern.predicate,
+            ) {
+                (Some(object), Some(subject), Some(predicate)) => {
+                    vec![object, subject, predicate]
                 }
-            }
-            QueryIndexCursorOrder::Gosp => match (
-                pattern.graph,
-                pattern.object,
-                pattern.subject,
-                pattern.predicate,
+                (Some(object), Some(subject), None) => vec![object, subject],
+                (Some(object), None, _) => vec![object],
+                (None, _, _) => Vec::new(),
+            },
+            IndexCursorOrder::Gosp => match (
+                scan.pattern.graph,
+                scan.pattern.object,
+                scan.pattern.subject,
+                scan.pattern.predicate,
             ) {
                 (Some(graph), Some(object), Some(subject), Some(predicate)) => {
                     vec![graph, object, subject, predicate]
@@ -3575,57 +3575,75 @@ impl GraphStore {
                 (None, _, _, _) => Vec::new(),
             },
         };
-        let keyspace = match order {
-            QueryIndexCursorOrder::Gspo => &self.qv2_gspo,
-            QueryIndexCursorOrder::Gpos => &self.qv2_gpos,
-            QueryIndexCursorOrder::Spog => &self.qv2_spog,
-            QueryIndexCursorOrder::Posg => &self.qv2_posg,
-            QueryIndexCursorOrder::Ospg => &self.qv2_ospg,
-            QueryIndexCursorOrder::Gosp => &self.qv2_gosp,
+        let keyspace = match scan.order {
+            IndexCursorOrder::Gspo => spaces.gspo,
+            IndexCursorOrder::Gpos => spaces.gpos,
+            IndexCursorOrder::Spog => spaces.spog,
+            IndexCursorOrder::Posg => spaces.posg,
+            IndexCursorOrder::Ospg => spaces.ospg,
+            IndexCursorOrder::Gosp => spaces.gosp,
         };
         let mut query_terms = Vec::with_capacity(terms.len());
         for term in terms {
-            let Some(term) = self.query_term_id_from_snapshot(snapshot, term)? else {
+            scan.costs.planner_points(1);
+            let Some(spaces) = self.active_query_spaces(snapshot)? else {
                 return Ok(None);
             };
-            query_terms.push(term);
+            let value = snapshot.get(spaces.term_to_query, term.to_be_bytes())?;
+            scan.costs
+                .forward_mapping(16 + value.as_ref().map_or(0, |value| value.len() as u64));
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            query_terms.push(decode_query_id(value.as_ref(), "term-to-query mapping")?);
         }
-        Ok(Some((keyspace, query_index_prefix(&query_terms))))
+        Ok(Some((
+            keyspace,
+            spaces.query_to_term,
+            query_index_prefix(&query_terms),
+        )))
     }
 
     pub(crate) fn query_index_status(&self) -> Result<QueryIndexStatus> {
         let snapshot = self.query_index_snapshot();
         let snapshot_sequence = snapshot.seqno();
-        let header = self.query_index_header_from_snapshot(&snapshot)?;
-        let source_live_quads = self.count_live_source_rows(&snapshot)?;
-        let (indexed_quads, gpos_well_formed) =
-            self.summarize_qv_rows(&snapshot, &self.qv2_gpos)?;
-        let (gspo_quads, gspo_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_gspo)?;
-        let (spog_quads, spog_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_spog)?;
-        let (posg_quads, posg_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_posg)?;
-        let (ospg_quads, ospg_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_ospg)?;
-        let (gosp_quads, gosp_well_formed) = self.summarize_qv_rows(&snapshot, &self.qv2_gosp)?;
+        let header = self.snapshot_index_header(&snapshot)?;
+        let slot = match &header {
+            IndexHeaderRead::Valid(header) => IndexSlot::decode(header.active_slot)
+                .ok_or(StoreError::IndexVerificationFailed("active-slot-invalid"))?,
+            IndexHeaderRead::Legacy(_) | IndexHeaderRead::Absent | IndexHeaderRead::Malformed => {
+                IndexSlot::Primary
+            }
+        };
+        let spaces = self.query_spaces(slot);
+        let source_live_quads = self.count_live_rows(&snapshot)?;
+        let (indexed_quads, gpos_well_formed) = self.summarize_qv_rows(&snapshot, spaces.gpos)?;
+        let (gspo_quads, gspo_well_formed) = self.summarize_qv_rows(&snapshot, spaces.gspo)?;
+        let (spog_quads, spog_well_formed) = self.summarize_qv_rows(&snapshot, spaces.spog)?;
+        let (posg_quads, posg_well_formed) = self.summarize_qv_rows(&snapshot, spaces.posg)?;
+        let (ospg_quads, ospg_well_formed) = self.summarize_qv_rows(&snapshot, spaces.ospg)?;
+        let (gosp_quads, gosp_well_formed) = self.summarize_qv_rows(&snapshot, spaces.gosp)?;
         let (state, last_build_sequence, query_id_generation, query_term_ids) = match header {
-            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0),
-            QueryIndexHeaderRead::Malformed => (
+            IndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0),
+            IndexHeaderRead::Malformed => (
                 QueryIndexState::Failed("metadata-malformed".to_owned()),
                 0,
                 0,
                 0,
             ),
-            QueryIndexHeaderRead::Legacy(header) => (
+            IndexHeaderRead::Legacy(header) => (
                 QueryIndexState::Failed("legacy-coverage-unverified".to_owned()),
                 header.last_build_sequence,
                 header.query_id_generation,
                 header.next_query_id,
             ),
-            QueryIndexHeaderRead::Valid(header) => {
+            IndexHeaderRead::Valid(header) => {
                 let total_matches_header = matches!(
-                    self.query_index_counter_from_snapshot(&snapshot, QueryIndexCounterKey::Total)?,
-                    QueryIndexCounterRead::Value(total) if total == header.indexed_quads
+                    self.snapshot_counter(&snapshot, IndexCounterKey::Total)?,
+                    IndexCounterRead::Value(total) if total == header.indexed_quads
                 );
                 let ready_matches_snapshot = header.ready_is_coherent()
-                    && header.is_not_ahead_of_snapshot(snapshot_sequence)
+                    && header.fits_snapshot(snapshot_sequence)
                     && header.source_live_quads == source_live_quads
                     && header.indexed_quads == indexed_quads
                     && indexed_quads == gspo_quads
@@ -3640,7 +3658,7 @@ impl GraphStore {
                     && ospg_well_formed
                     && gosp_well_formed
                     && total_matches_header;
-                if matches!(header.state, StoredQueryIndexState::Ready) && !ready_matches_snapshot {
+                if matches!(header.state, StoredIndexState::Ready) && !ready_matches_snapshot {
                     (
                         QueryIndexState::Failed("ready-status-mismatch".to_owned()),
                         header.last_build_sequence,
@@ -3658,7 +3676,7 @@ impl GraphStore {
             }
         };
         Ok(QueryIndexStatus {
-            schema_version: QUERY_INDEX_SCHEMA_VERSION,
+            schema_version: QV_SCHEMA_VERSION,
             state,
             query_id_generation,
             query_term_ids,
@@ -3668,7 +3686,7 @@ impl GraphStore {
         })
     }
 
-    pub(crate) fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
+    pub(crate) fn index_status_fast(&self) -> Result<QueryIndexStatus> {
         let snapshot = self.query_index_snapshot();
         let (
             state,
@@ -3677,9 +3695,9 @@ impl GraphStore {
             source_live_quads,
             indexed_quads,
             last_build_sequence,
-        ) = match self.query_index_header_from_snapshot(&snapshot)? {
-            QueryIndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0, 0, 0),
-            QueryIndexHeaderRead::Malformed => (
+        ) = match self.snapshot_index_header(&snapshot)? {
+            IndexHeaderRead::Absent => (QueryIndexState::Missing, 0, 0, 0, 0, 0),
+            IndexHeaderRead::Malformed => (
                 QueryIndexState::Failed("metadata-malformed".to_owned()),
                 0,
                 0,
@@ -3687,7 +3705,7 @@ impl GraphStore {
                 0,
                 0,
             ),
-            QueryIndexHeaderRead::Legacy(header) => (
+            IndexHeaderRead::Legacy(header) => (
                 QueryIndexState::Failed("legacy-coverage-unverified".to_owned()),
                 header.query_id_generation,
                 header.next_query_id,
@@ -3695,22 +3713,21 @@ impl GraphStore {
                 header.indexed_quads,
                 header.last_build_sequence,
             ),
-            QueryIndexHeaderRead::Valid(header) => {
+            IndexHeaderRead::Valid(header) => {
                 #[cfg(test)]
-                self.query_index_admission_probes
-                    .fetch_add(1, Ordering::Relaxed);
+                self.index_admission_probes.fetch_add(1, Ordering::Relaxed);
                 let admission = self.header_admission(&snapshot, &header)?;
-                let state =
-                    if matches!(header.state, StoredQueryIndexState::Ready) && !admission.trusted {
-                        QueryIndexState::Failed(
-                            admission
-                                .fallback_reason
-                                .unwrap_or("ready-metadata-mismatch")
-                                .to_owned(),
-                        )
-                    } else {
-                        header.state()
-                    };
+                let state = if matches!(header.state, StoredIndexState::Ready) && !admission.trusted
+                {
+                    QueryIndexState::Failed(
+                        admission
+                            .fallback_reason
+                            .unwrap_or("ready-metadata-mismatch")
+                            .to_owned(),
+                    )
+                } else {
+                    header.state()
+                };
                 (
                     state,
                     header.query_id_generation,
@@ -3722,7 +3739,7 @@ impl GraphStore {
             }
         };
         Ok(QueryIndexStatus {
-            schema_version: QUERY_INDEX_SCHEMA_VERSION,
+            schema_version: QV_SCHEMA_VERSION,
             state,
             query_id_generation,
             query_term_ids,
@@ -3734,31 +3751,33 @@ impl GraphStore {
 
     pub(crate) fn verify_query_indexes(
         &self,
-        mode: impl Into<QueryIndexVerificationMode>,
+        mode: impl Into<IndexVerifyMode>,
     ) -> Result<QueryIndexVerification> {
         let snapshot = self.query_index_snapshot();
         let mode = mode.into();
-        self.verify_query_index_snapshot(
+        self.verify_index_snapshot(
             &snapshot,
-            matches!(mode, QueryIndexVerificationMode::Full),
-            QueryIndexVerificationExpectation::Ready,
+            matches!(mode, IndexVerifyMode::Full),
+            IndexVerifyState::Ready,
+            None,
+            None,
         )
     }
 
-    fn initialize_query_indexes_at_open(&self) -> Result<()> {
+    fn initialize_indexes(&self) -> Result<()> {
         let snapshot = self.db.snapshot();
         if self.fail_unrepaired_debt(&snapshot)? {
             return Ok(());
         }
-        match self.query_index_header_from_snapshot(&snapshot)? {
-            QueryIndexHeaderRead::Absent => {
-                let source_live_quads = self.count_live_source_rows(&snapshot)?;
+        match self.snapshot_index_header(&snapshot)? {
+            IndexHeaderRead::Absent => {
+                let source_live_quads = self.count_live_rows(&snapshot)?;
                 if source_live_quads != 0 {
                     return Ok(());
                 }
-                if !self.query_index_keyspaces_are_empty(&snapshot)? {
+                if !self.index_spaces_empty(&snapshot)? {
                     let mut batch = self.buffered_batch();
-                    self.stage_query_index_failed(
+                    self.stage_index_failure(
                         &mut batch,
                         None,
                         "metadata-missing-with-derived-residue",
@@ -3766,23 +3785,23 @@ impl GraphStore {
                     return self.commit_fjall_batch(batch);
                 }
                 let mut batch = self.buffered_batch();
-                self.stage_query_index_header(&mut batch, &QueryIndexHeader::empty_ready());
-                batch.insert(&self.qv2_meta, QUERY_INDEX_TOTAL_KEY, 0u64.to_be_bytes());
+                self.stage_index_header(&mut batch, &IndexHeader::empty_ready());
+                batch.insert(&self.qv2_meta, QV_TOTAL_KEY, 0u64.to_be_bytes());
                 batch.insert(
                     &self.qv2_meta,
-                    QueryIndexCounterKey::UnionDuplicateFree.bytes(),
+                    IndexCounterKey::UnionDuplicateFree.bytes(),
                     1u64.to_be_bytes(),
                 );
                 self.commit_fjall_batch(batch)
             }
-            QueryIndexHeaderRead::Malformed => {
+            IndexHeaderRead::Malformed => {
                 let mut batch = self.buffered_batch();
-                self.stage_query_index_failed(&mut batch, None, "metadata-malformed");
+                self.stage_index_failure(&mut batch, None, "metadata-malformed");
                 self.commit_fjall_batch(batch)
             }
-            QueryIndexHeaderRead::Legacy(header) => self.certify_legacy_header(&snapshot, header),
-            QueryIndexHeaderRead::Valid(header) => {
-                if !matches!(header.state, StoredQueryIndexState::Ready) {
+            IndexHeaderRead::Legacy(header) => self.certify_legacy_header(&snapshot, header),
+            IndexHeaderRead::Valid(header) => {
+                if !matches!(header.state, StoredIndexState::Ready) {
                     return Ok(());
                 }
                 let admission = self.snapshot_admission(&snapshot)?;
@@ -3790,41 +3809,35 @@ impl GraphStore {
                     return Ok(());
                 }
                 let mut batch = self.buffered_batch();
-                self.stage_query_index_failed(&mut batch, Some(&header), "open-admission-failed");
+                self.stage_index_failure(&mut batch, Some(&header), "open-admission-failed");
                 self.commit_fjall_batch(batch)
             }
         }
     }
 
-    /// Upgrades a header written before source and qv rows were published in one
-    /// batch. Its `Ready` state cannot prove coverage, so it is verified in full
-    /// once and then rewritten in the current format. Writing nothing on failure
-    /// keeps the migration safe to interrupt and safe to retry.
-    fn certify_legacy_header(&self, snapshot: &Snapshot, header: QueryIndexHeader) -> Result<()> {
-        if !matches!(header.state, StoredQueryIndexState::Ready) {
+    /// Fully verifies a legacy header before rewriting it in the current format.
+    fn certify_legacy_header(&self, snapshot: &Snapshot, header: IndexHeader) -> Result<()> {
+        if !matches!(header.state, StoredIndexState::Ready) {
             let mut batch = self.buffered_batch();
-            self.stage_query_index_header(&mut batch, &header);
+            self.stage_index_header(&mut batch, &header);
             return self.commit_fjall_batch(batch);
         }
-        let report = self.verify_query_index_snapshot(
-            snapshot,
-            true,
-            QueryIndexVerificationExpectation::Ready,
-        )?;
+        let report =
+            self.verify_index_snapshot(snapshot, true, IndexVerifyState::Ready, None, None)?;
         let mut batch = self.buffered_batch();
         if report.valid {
-            self.stage_query_index_header(&mut batch, &header);
+            self.stage_index_header(&mut batch, &header);
         } else {
-            self.stage_query_index_failed(&mut batch, Some(&header), "legacy-coverage-unverified");
+            self.stage_index_failure(&mut batch, Some(&header), "legacy-coverage-unverified");
         }
         self.commit_fjall_batch(batch)
     }
 
-    fn query_index_row_is_sampled(full: bool, checked: u64) -> bool {
-        full || checked < QUERY_INDEX_SAMPLE_ROWS
+    fn index_row_sampled(full: bool, checked: u64) -> bool {
+        full || checked < QV_SAMPLE_ROWS
     }
 
-    fn qv_row_is_present_and_empty(
+    fn qv_row_empty(
         &self,
         snapshot: &Snapshot,
         keyspace: &Keyspace,
@@ -3835,52 +3848,53 @@ impl GraphStore {
             .is_some_and(|value| value.as_ref().is_empty()))
     }
 
-    fn verify_source_to_qv_rows(
+    fn verify_source_rows(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         full: bool,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
         for guard in snapshot.iter(&self.quads) {
             let (key, value) = guard.into_inner()?;
-            if dot_payload_is_empty(value.as_ref()) {
+            if dots_empty(value.as_ref()) {
                 continue;
             }
             report.report.source_live_quads =
                 report.report.source_live_quads.checked_add(1).ok_or(
-                    StoreError::QueryIndexVerificationFailed("source-row-count-overflow"),
+                    StoreError::IndexVerificationFailed("source-row-count-overflow"),
                 )?;
-            let Some(quad) = decode_source_quad_key(key.as_ref()) else {
+            let Some(quad) = decode_source_quad(key.as_ref()) else {
                 report.problem("source-key-length");
                 continue;
             };
-            if !Self::query_index_row_is_sampled(full, report.report.checked_source_rows) {
+            if !Self::index_row_sampled(full, report.report.checked_source_rows) {
                 continue;
             }
             report.report.checked_source_rows =
                 report.report.checked_source_rows.checked_add(1).ok_or(
-                    StoreError::QueryIndexVerificationFailed("source-check-count-overflow"),
+                    StoreError::IndexVerificationFailed("source-check-count-overflow"),
                 )?;
-            let Some(quad) = self.query_quad_from_snapshot(snapshot, quad)? else {
+            let Some(quad) = self.spaces_query_quad(snapshot, spaces, quad)? else {
                 report.problem("source-query-id-mapping-missing");
                 continue;
             };
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_gspo, qv2_gspo_key(quad))? {
+            if !self.qv_row_empty(snapshot, spaces.gspo, gspo_key(quad))? {
                 report.problem("source-gspo-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_gpos, qv2_gpos_key(quad))? {
+            if !self.qv_row_empty(snapshot, spaces.gpos, gpos_key(quad))? {
                 report.problem("source-gpos-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_spog, qv2_spog_key(quad))? {
+            if !self.qv_row_empty(snapshot, spaces.spog, spog_key(quad))? {
                 report.problem("source-spog-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_posg, qv2_posg_key(quad))? {
+            if !self.qv_row_empty(snapshot, spaces.posg, posg_key(quad))? {
                 report.problem("source-posg-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_ospg, qv2_ospg_key(quad))? {
+            if !self.qv_row_empty(snapshot, spaces.ospg, ospg_key(quad))? {
                 report.problem("source-ospg-missing-or-nonempty");
             }
-            if !self.qv_row_is_present_and_empty(snapshot, &self.qv2_gosp, qv2_gosp_key(quad))? {
+            if !self.qv_row_empty(snapshot, spaces.gosp, gosp_key(quad))? {
                 report.problem("source-gosp-missing-or-nonempty");
             }
         }
@@ -3890,90 +3904,94 @@ impl GraphStore {
     fn verify_qv_rows(
         &self,
         snapshot: &Snapshot,
-        order: QueryIndexKeyOrder,
+        spaces: IndexSpaces<'_>,
+        order: IndexKeyOrder,
         full: bool,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<u64> {
         let (keyspace, key_problem, value_problem, source_problem) = match order {
-            QueryIndexKeyOrder::Gspo => (
-                &self.qv2_gspo,
+            IndexKeyOrder::Gspo => (
+                spaces.gspo,
                 "qv-gspo-key-length",
                 "qv-gspo-value-nonempty",
                 "qv-gspo-source-missing",
             ),
-            QueryIndexKeyOrder::Gpos => (
-                &self.qv2_gpos,
+            IndexKeyOrder::Gpos => (
+                spaces.gpos,
                 "qv-gpos-key-length",
                 "qv-gpos-value-nonempty",
                 "qv-gpos-source-missing",
             ),
-            QueryIndexKeyOrder::Spog => (
-                &self.qv2_spog,
+            IndexKeyOrder::Spog => (
+                spaces.spog,
                 "qv-spog-key-length",
                 "qv-spog-value-nonempty",
                 "qv-spog-source-missing",
             ),
-            QueryIndexKeyOrder::Posg => (
-                &self.qv2_posg,
+            IndexKeyOrder::Posg => (
+                spaces.posg,
                 "qv-posg-key-length",
                 "qv-posg-value-nonempty",
                 "qv-posg-source-missing",
             ),
-            QueryIndexKeyOrder::Ospg => (
-                &self.qv2_ospg,
+            IndexKeyOrder::Ospg => (
+                spaces.ospg,
                 "qv-ospg-key-length",
                 "qv-ospg-value-nonempty",
                 "qv-ospg-source-missing",
             ),
-            QueryIndexKeyOrder::Gosp => (
-                &self.qv2_gosp,
+            IndexKeyOrder::Gosp => (
+                spaces.gosp,
                 "qv-gosp-key-length",
                 "qv-gosp-value-nonempty",
                 "qv-gosp-source-missing",
             ),
         };
         let mut rows = 0u64;
-        let mut checked_in_this_keyspace = 0u64;
+        let mut checked_space = 0u64;
         for guard in snapshot.iter(keyspace) {
             let (key, value) = guard.into_inner()?;
             rows = rows
                 .checked_add(1)
-                .ok_or(StoreError::QueryIndexVerificationFailed(
+                .ok_or(StoreError::IndexVerificationFailed(
                     "index-row-count-overflow",
                 ))?;
-            if !Self::query_index_row_is_sampled(full, checked_in_this_keyspace) {
+            if !Self::index_row_sampled(full, checked_space) {
                 continue;
             }
-            checked_in_this_keyspace = checked_in_this_keyspace.checked_add(1).ok_or(
-                StoreError::QueryIndexVerificationFailed("index-check-count-overflow"),
-            )?;
+            checked_space =
+                checked_space
+                    .checked_add(1)
+                    .ok_or(StoreError::IndexVerificationFailed(
+                        "index-check-count-overflow",
+                    ))?;
             report.report.checked_index_rows =
                 report.report.checked_index_rows.checked_add(1).ok_or(
-                    StoreError::QueryIndexVerificationFailed("index-check-count-overflow"),
+                    StoreError::IndexVerificationFailed("index-check-count-overflow"),
                 )?;
             if !value.as_ref().is_empty() {
                 report.problem(value_problem);
             }
             let quad = match order {
-                QueryIndexKeyOrder::Gspo => decode_qv2_gspo_key(key.as_ref()),
-                QueryIndexKeyOrder::Gpos => decode_qv2_gpos_key(key.as_ref()),
-                QueryIndexKeyOrder::Spog => decode_qv2_spog_key(key.as_ref()),
-                QueryIndexKeyOrder::Posg => decode_qv2_posg_key(key.as_ref()),
-                QueryIndexKeyOrder::Ospg => decode_qv2_ospg_key(key.as_ref()),
-                QueryIndexKeyOrder::Gosp => decode_qv2_gosp_key(key.as_ref()),
+                IndexKeyOrder::Gspo => decode_gspo_key(key.as_ref()),
+                IndexKeyOrder::Gpos => decode_gpos_key(key.as_ref()),
+                IndexKeyOrder::Spog => decode_spog_key(key.as_ref()),
+                IndexKeyOrder::Posg => decode_posg_key(key.as_ref()),
+                IndexKeyOrder::Ospg => decode_ospg_key(key.as_ref()),
+                IndexKeyOrder::Gosp => decode_gosp_key(key.as_ref()),
             };
             let Some(quad) = quad else {
                 report.problem(key_problem);
                 continue;
             };
-            let Some(quad) = self.source_quad_from_snapshot(snapshot, quad)? else {
+            let Some(quad) = self.spaces_source_quad(snapshot, spaces, quad)? else {
                 report.problem("qv-query-id-mapping-missing");
                 continue;
             };
             let source_key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
             let source_is_live = snapshot
                 .get(&self.quads, source_key)?
-                .is_some_and(|source| !dot_payload_is_empty(source.as_ref()));
+                .is_some_and(|source| !dots_empty(source.as_ref()));
             if !source_is_live {
                 report.problem(source_problem);
             }
@@ -3981,18 +3999,19 @@ impl GraphStore {
         Ok(rows)
     }
 
-    fn verify_expected_query_index_counter(
+    fn verify_index_counter(
         &self,
         snapshot: &Snapshot,
-        key: QueryIndexCounterKey,
+        spaces: IndexSpaces<'_>,
+        key: IndexCounterKey,
         expected: u64,
         missing_problem: &'static str,
         mismatch_problem: &'static str,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
-        match snapshot.get(&self.qv2_meta, key.bytes())? {
+        match snapshot.get(spaces.meta, key.bytes())? {
             None => report.problem(missing_problem),
-            Some(value) => match decode_query_index_u64(value.as_ref()) {
+            Some(value) => match decode_index_count(value.as_ref()) {
                 Some(actual) if actual == expected => {}
                 _ => report.problem(mismatch_problem),
             },
@@ -4000,34 +4019,36 @@ impl GraphStore {
         Ok(())
     }
 
-    fn verify_gpos_counter_group(
+    fn verify_gpos_group(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         dimension: usize,
         terms: [QueryTermId; 3],
         expected: u64,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
         let (key, missing_problem, mismatch_problem) = match dimension {
             1 => (
-                QueryIndexCounterKey::Graph(terms[0]),
+                IndexCounterKey::Graph(terms[0]),
                 "counter-g-missing",
                 "counter-g-mismatch",
             ),
             2 => (
-                QueryIndexCounterKey::GraphPredicate(terms[0], terms[1]),
+                IndexCounterKey::GraphPredicate(terms[0], terms[1]),
                 "counter-gp-missing",
                 "counter-gp-mismatch",
             ),
             3 => (
-                QueryIndexCounterKey::GraphPredicateObject(terms[0], terms[1], terms[2]),
+                IndexCounterKey::GraphPredicateObject(terms[0], terms[1], terms[2]),
                 "counter-gpo-missing",
                 "counter-gpo-mismatch",
             ),
             _ => unreachable!("only GPOS counter dimensions are used"),
         };
-        self.verify_expected_query_index_counter(
+        self.verify_index_counter(
             snapshot,
+            spaces,
             key,
             expected,
             missing_problem,
@@ -4036,62 +4057,65 @@ impl GraphStore {
         )
     }
 
-    fn verify_gpos_counter_dimension(
+    fn verify_gpos_dimension(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         dimension: usize,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
         let mut current = None::<[QueryTermId; 3]>;
         let mut count = 0u64;
-        for guard in snapshot.iter(&self.qv2_gpos) {
+        for guard in snapshot.iter(spaces.gpos) {
             let (key, _) = guard.into_inner()?;
-            let Some(quad) = decode_qv2_gpos_key(key.as_ref()) else {
+            let Some(quad) = decode_gpos_key(key.as_ref()) else {
                 continue;
             };
             let terms = [quad.graph, quad.predicate, quad.object];
             if let Some(previous) = current
                 && previous[..dimension] != terms[..dimension]
             {
-                self.verify_gpos_counter_group(snapshot, dimension, previous, count, report)?;
+                self.verify_gpos_group(snapshot, spaces, dimension, previous, count, report)?;
                 count = 0;
             }
             current = Some(terms);
             count = count
                 .checked_add(1)
-                .ok_or(StoreError::QueryIndexVerificationFailed(
+                .ok_or(StoreError::IndexVerificationFailed(
                     "counter-count-overflow",
                 ))?;
         }
         if let Some(previous) = current {
-            self.verify_gpos_counter_group(snapshot, dimension, previous, count, report)?;
+            self.verify_gpos_group(snapshot, spaces, dimension, previous, count, report)?;
         }
         Ok(())
     }
 
-    fn verify_posg_counter_group(
+    fn verify_posg_group(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         dimension: usize,
         terms: [QueryTermId; 2],
         expected: u64,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
         let (key, missing_problem, mismatch_problem) = match dimension {
             1 => (
-                QueryIndexCounterKey::Predicate(terms[0]),
+                IndexCounterKey::Predicate(terms[0]),
                 "counter-p-missing",
                 "counter-p-mismatch",
             ),
             2 => (
-                QueryIndexCounterKey::PredicateObject(terms[0], terms[1]),
+                IndexCounterKey::PredicateObject(terms[0], terms[1]),
                 "counter-po-missing",
                 "counter-po-mismatch",
             ),
             _ => unreachable!("only POSG counter dimensions are used"),
         };
-        self.verify_expected_query_index_counter(
+        self.verify_index_counter(
             snapshot,
+            spaces,
             key,
             expected,
             missing_problem,
@@ -4100,11 +4124,12 @@ impl GraphStore {
         )
     }
 
-    fn verify_posg_counter_dimension(
+    fn verify_posg_dimension(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         dimension: usize,
-        report: &mut QueryIndexVerificationBuilder,
+        report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
         let mut current = None::<[QueryTermId; 2]>;
         let mut count = 0u64;
