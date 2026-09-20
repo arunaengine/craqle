@@ -5093,107 +5093,264 @@ impl GraphStore {
     }
 
     pub(crate) fn rebuild_query_indexes(&self) -> Result<()> {
-        let _projection = match self.projection_lock.try_write() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(StoreError::QueryIndexUnavailable(
+        self.rebuild_query_with(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn rebuild_query_with(&self, stop: &AtomicBool) -> Result<()> {
+        let _maintenance = self
+            .qv_maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.rebuild_query_inner(stop)
+    }
+
+    fn rebuild_query_inner(&self, stop: &AtomicBool) -> Result<()> {
+        if stop.load(Ordering::Relaxed) {
+            return Err(StoreError::Cancelled);
+        }
+        let (active, inactive) = {
+            let _projection = match self.projection_lock.try_write() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    return Err(StoreError::QueryIndexUnavailable(
+                        "query-index rebuild overlaps a graph commit",
+                    ));
+                }
+            };
+            let owner = self
+                .qv_gate
+                .try_acquire()
+                .ok_or(StoreError::QueryIndexUnavailable(
                     "query-index rebuild overlaps a graph commit",
+                ))?;
+            let snapshot = self.db.snapshot();
+            if self.projection_debt_present(&snapshot)? || self.query_build(&snapshot)?.is_some() {
+                return Err(StoreError::QueryIndexUnavailable(
+                    "query-index capture is not ready",
                 ));
             }
-        };
-        let Some(_owner) = self.qv_gate.try_acquire() else {
-            return Err(StoreError::QueryIndexUnavailable(
-                "query-index rebuild overlaps a graph commit",
-            ));
-        };
-        let initial_snapshot = self.db.snapshot();
-        let previous = match self.query_index_header_from_snapshot(&initial_snapshot)? {
-            QueryIndexHeaderRead::Valid(header) | QueryIndexHeaderRead::Legacy(header) => {
-                Some(header)
-            }
-            QueryIndexHeaderRead::Absent | QueryIndexHeaderRead::Malformed => None,
-        };
-        let mut building = previous
-            .clone()
-            .unwrap_or_else(QueryIndexHeader::empty_ready);
-        building.state = StoredQueryIndexState::Building;
-        {
-            let mut batch = self.buffered_batch();
-            self.stage_query_index_header(&mut batch, &building);
-            self.commit_fjall_batch(batch)?;
-        }
-
-        let result = (|| -> Result<()> {
-            self.clear_query_index_derived_data()?;
-            let source_snapshot = self.db.snapshot();
-            let source_sequence = source_snapshot.seqno();
-            let last_build_sequence = previous
-                .as_ref()
-                .filter(|header| header.last_build_sequence <= source_sequence)
-                .and_then(|header| header.last_build_sequence.checked_add(1))
-                .map(|next| next.max(source_sequence))
-                .unwrap_or(source_sequence);
-            let source_epoch = previous
-                .as_ref()
-                .filter(|header| {
-                    header.source_epoch <= source_sequence && header.index_epoch <= source_sequence
-                })
-                .map(|header| header.source_epoch.max(header.index_epoch))
-                .and_then(|prior| prior.max(source_sequence).checked_add(1))
-                .unwrap_or(source_sequence);
-            let query_id_generation = previous
-                .as_ref()
-                .and_then(|header| header.query_id_generation.checked_add(1))
-                .unwrap_or(1);
-            let (source_live_quads, next_query_id) =
-                self.build_query_index_rows(&source_snapshot)?;
-            let union_duplicate_free =
-                self.query_index_union_duplicate_free(&self.db.snapshot())?;
-            let candidate = QueryIndexHeader {
-                state: StoredQueryIndexState::Building,
-                source_epoch,
-                index_epoch: source_epoch,
-                source_live_quads,
-                indexed_quads: source_live_quads,
-                last_build_sequence,
-                query_id_generation,
-                next_query_id,
+            let active = match self.snapshot_index_header(&snapshot)? {
+                IndexHeaderRead::Valid(header) | IndexHeaderRead::Legacy(header) => {
+                    IndexSlot::decode(header.active_slot)
+                        .ok_or(StoreError::IndexVerificationFailed("active-slot-invalid"))?
+                }
+                IndexHeaderRead::Absent | IndexHeaderRead::Malformed => IndexSlot::Primary,
             };
+            let inactive = active.other();
+            let build = QueryBuildRecord {
+                format: QV_SCHEMA_VERSION,
+                slot: inactive.encode(),
+                source_sequence: 0,
+                source_epoch: 0,
+                control_digest: self.query_header_digest(&snapshot)?,
+                trusted_active: false,
+                scan_cursor: None,
+                replay_cursor: 0,
+                next_delta: 1,
+                delta_rows: 0,
+                delta_bytes: 0,
+                phase: QueryBuildPhase::Clear,
+                target: None,
+            };
+            let mut batch = self.buffered_batch();
+            batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
+            self.commit_fjall_batch(batch)?;
+            #[cfg(test)]
+            self.run_rebuild_hook(RebuildPhase::BuildCreate);
+            owner.finish();
+            (active, inactive)
+        };
+
+        self.clear_query_slot(inactive, Some(stop))?;
+
+        let (previous, source_snapshot, mut build) = {
+            let _projection = match self.projection_lock.try_write() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    return Err(StoreError::QueryIndexUnavailable(
+                        "query-index rebuild overlaps a graph commit",
+                    ));
+                }
+            };
+            let owner = self
+                .qv_gate
+                .try_acquire()
+                .ok_or(StoreError::QueryIndexUnavailable(
+                    "query-index rebuild overlaps a graph commit",
+                ))?;
+            let capture = self.db.snapshot();
+            let current = self
+                .query_build(&capture)?
+                .ok_or(StoreError::QueryIndexUnavailable(
+                    "query-index build record missing",
+                ))?;
+            if current.slot != inactive.encode()
+                || !matches!(current.phase, QueryBuildPhase::Clear)
+                || self.projection_debt_present(&capture)?
             {
+                return Err(StoreError::QueryIndexUnavailable(
+                    "query-index capture changed",
+                ));
+            }
+            let header_read = self.snapshot_index_header(&capture)?;
+            let previous = match &header_read {
+                IndexHeaderRead::Valid(header) | IndexHeaderRead::Legacy(header) => header.clone(),
+                IndexHeaderRead::Absent | IndexHeaderRead::Malformed => IndexHeader::empty_ready(),
+            };
+            if IndexSlot::decode(previous.active_slot) != Some(active) {
+                return Err(StoreError::QueryIndexUnavailable(
+                    "query-index active slot changed",
+                ));
+            }
+            let mut build = current;
+            build.control_digest = self.query_header_digest(&capture)?;
+            build.trusted_active = matches!(header_read, IndexHeaderRead::Valid(_))
+                && self.snapshot_admission(&capture)?.trusted;
+            build.phase = QueryBuildPhase::Scan;
+            let mut batch = self.buffered_batch();
+            batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
+            self.commit_fjall_batch(batch)?;
+            let source_snapshot = self.db.snapshot();
+            build.source_sequence = source_snapshot.seqno();
+            build.source_epoch = if build.trusted_active {
+                previous.source_epoch
+            } else {
+                source_snapshot.seqno()
+            };
+            let mut batch = self.buffered_batch();
+            batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
+            self.commit_fjall_batch(batch)?;
+            owner.finish();
+            (previous, source_snapshot, build)
+        };
+
+        let result =
+            (|| -> Result<()> {
+                let spaces = self.query_spaces(inactive);
+                let (source_live_quads, next_query_id) = self.build_query_rows(QueryBuildCtx {
+                    snapshot: &source_snapshot,
+                    spaces,
+                    build: &mut build,
+                    stop,
+                })?;
+                let union_duplicate_free = self.index_union_unique(&self.db.snapshot(), spaces)?;
+                let query_id_generation = previous.query_id_generation.checked_add(1).unwrap_or(1);
+                let mut candidate = IndexHeader {
+                    active_slot: inactive.encode(),
+                    state: StoredIndexState::Building,
+                    source_epoch: build.source_epoch,
+                    index_epoch: build.source_epoch,
+                    source_live_quads,
+                    indexed_quads: source_live_quads,
+                    last_build_sequence: build.source_sequence,
+                    query_id_generation,
+                    next_query_id,
+                };
                 let mut batch = self.buffered_batch();
+                batch.insert(spaces.meta, QV_TOTAL_KEY, source_live_quads.to_be_bytes());
                 batch.insert(
-                    &self.qv2_meta,
-                    QUERY_INDEX_TOTAL_KEY,
-                    source_live_quads.to_be_bytes(),
-                );
-                batch.insert(
-                    &self.qv2_meta,
-                    QueryIndexCounterKey::UnionDuplicateFree.bytes(),
+                    spaces.meta,
+                    IndexCounterKey::UnionDuplicateFree.bytes(),
                     u64::from(union_duplicate_free).to_be_bytes(),
                 );
-                self.stage_query_index_header(&mut batch, &candidate);
                 self.commit_fjall_batch(batch)?;
-            }
-            let verification_snapshot = self.db.snapshot();
-            let report = self.verify_query_index_snapshot(
-                &verification_snapshot,
-                true,
-                QueryIndexVerificationExpectation::BuildingCandidate,
-            )?;
-            if !report.valid {
-                return Err(StoreError::QueryIndexVerificationFailed(
-                    "rebuild-verification-failed",
-                ));
-            }
-            let mut ready = candidate;
-            ready.state = StoredQueryIndexState::Ready;
-            let mut batch = self.buffered_batch();
-            self.stage_query_index_header(&mut batch, &ready);
-            self.commit_fjall_batch(batch)
-        })();
+
+                let latest = self.query_build(&self.db.snapshot())?.ok_or(
+                    StoreError::QueryIndexUnavailable("query-index build record missing"),
+                )?;
+                build = latest;
+                let target = build.next_delta.saturating_sub(1);
+                self.replay_query_deltas(&mut build, &mut candidate, target, stop)?;
+
+                let owner = self
+                    .qv_gate
+                    .acquire_timeout(self.qv_commit_wait)
+                    .ok_or(StoreError::QueryIndexBusy)?;
+                build = self.query_build(&self.db.snapshot())?.ok_or(
+                    StoreError::QueryIndexUnavailable("query-index build record missing"),
+                )?;
+                let verify_target = build.next_delta.saturating_sub(1);
+                self.replay_owned_deltas(&mut build, &mut candidate, verify_target, stop)?;
+                build.phase = QueryBuildPhase::Verify;
+                build.target = Some(verify_target);
+                let mut state = self.buffered_batch();
+                state.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
+                self.commit_fjall_batch(state)?;
+                let verification_snapshot = self.db.snapshot();
+                owner.finish();
+                let report = self.verify_index_snapshot(
+                    &verification_snapshot,
+                    true,
+                    IndexVerifyState::BuildingCandidate,
+                    Some(inactive),
+                    Some(&candidate),
+                )?;
+                if !report.valid {
+                    return Err(StoreError::IndexVerificationFailed(
+                        "rebuild-verification-failed",
+                    ));
+                }
+                #[cfg(test)]
+                self.run_rebuild_hook(RebuildPhase::BeforeSwitch);
+                let owner = self
+                    .qv_gate
+                    .acquire_timeout(self.qv_commit_wait)
+                    .ok_or(StoreError::QueryIndexBusy)?;
+                build = self.query_build(&self.db.snapshot())?.ok_or(
+                    StoreError::QueryIndexUnavailable("query-index build record missing"),
+                )?;
+                let final_target = build.next_delta.saturating_sub(1);
+                self.replay_owned_deltas(&mut build, &mut candidate, final_target, stop)?;
+                let final_snapshot = self.db.snapshot();
+                let active_matches = if build.trusted_active {
+                    match self.snapshot_index_header(&final_snapshot)? {
+                        IndexHeaderRead::Valid(current) => {
+                            IndexSlot::decode(current.active_slot) == Some(active)
+                                && candidate.source_epoch == current.source_epoch
+                                && candidate.source_live_quads == current.source_live_quads
+                        }
+                        IndexHeaderRead::Absent
+                        | IndexHeaderRead::Legacy(_)
+                        | IndexHeaderRead::Malformed => false,
+                    }
+                } else {
+                    self.query_header_digest(&final_snapshot)? == build.control_digest
+                };
+                if !active_matches
+                    || build.slot != inactive.encode()
+                    || build.replay_cursor != final_target
+                    || candidate.indexed_quads != candidate.source_live_quads
+                {
+                    return Err(StoreError::IndexVerificationFailed(
+                        "final-coverage-mismatch",
+                    ));
+                }
+                let mut ready = candidate;
+                ready.state = StoredIndexState::Ready;
+                let mut batch = self.buffered_batch();
+                self.stage_index_header(&mut batch, &ready);
+                batch.remove(&self.qv2_meta, QV_BUILD_KEY);
+                batch.insert(
+                    &self.qv2_meta,
+                    QV_CLEANUP_KEY,
+                    postcard::to_allocvec(&QueryCleanupRecord {
+                        format: QV_SCHEMA_VERSION,
+                        slot: active.encode(),
+                    })?,
+                );
+                let published = self.commit_fjall_batch(batch);
+                #[cfg(test)]
+                if published.is_ok() {
+                    self.run_rebuild_hook(RebuildPhase::AfterSwitch);
+                }
+                owner.finish();
+                published?;
+                self.recover_query_build(Some(stop))
+            })();
         if result.is_err() {
-            let _ = self.mark_query_index_rebuild_failed("rebuild-failed");
+            tracing::warn!("query-index rebuild left its active generation unchanged");
         }
         result
     }
@@ -5287,6 +5444,54 @@ impl GraphStore {
         self.rebuild_stalled.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_rebuild_hook(
+        &self,
+        hook: Arc<dyn Fn(RebuildPhase) + Send + Sync>,
+    ) -> RebuildHook<'_> {
+        *self
+            .rebuild_hook
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+        RebuildHook { store: self }
+    }
+
+    #[cfg(test)]
+    fn run_rebuild_hook(&self, phase: RebuildPhase) {
+        let hook = self
+            .rebuild_hook
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(phase);
+        }
+    }
+
+    fn delta_limits(&self) -> (u64, u64) {
+        #[cfg(test)]
+        {
+            return (
+                self.delta_row_limit.load(Ordering::SeqCst),
+                self.delta_byte_limit.load(Ordering::SeqCst),
+            );
+        }
+        #[cfg(not(test))]
+        {
+            (QV_DELTA_ROWS, QV_DELTA_BYTES)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_delta_limits(&self, rows: u64, bytes: u64) -> DeltaLimitGuard<'_> {
+        let previous = DeltaLimitGuard {
+            store: self,
+            rows: self.delta_row_limit.swap(rows, Ordering::SeqCst),
+            bytes: self.delta_byte_limit.swap(bytes, Ordering::SeqCst),
+        };
+        previous
+    }
+
     /// Stall a graph delete between its queue scan and its commit. Test-only.
     #[cfg(test)]
     fn stall_in_delete(&self) {
@@ -5329,28 +5534,55 @@ impl GraphStore {
 
     /// Widen the acknowledgement's check-and-remove window. Test-only.
     #[cfg(test)]
-    pub(crate) fn set_fts_ack_stall(&self, delay: std::time::Duration) {
+    pub(crate) fn set_ack_stall(&self, delay: std::time::Duration) {
         *self
             .fts_ack_stall
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
     }
 
-    fn query_index_counter_from_snapshot(
+    fn snapshot_counter(
         &self,
         snapshot: &Snapshot,
-        key: QueryIndexCounterKey,
-    ) -> Result<QueryIndexCounterRead> {
-        Ok(match snapshot.get(&self.qv2_meta, key.bytes())? {
-            None => QueryIndexCounterRead::Missing,
-            Some(value) => match decode_query_index_u64(value.as_ref()) {
-                Some(value) => QueryIndexCounterRead::Value(value),
-                None => QueryIndexCounterRead::Malformed,
+        key: IndexCounterKey,
+    ) -> Result<IndexCounterRead> {
+        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+            return Ok(IndexCounterRead::Missing);
+        };
+        Self::query_index_counter(snapshot, spaces, key)
+    }
+
+    fn query_index_counter(
+        snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
+        key: IndexCounterKey,
+    ) -> Result<IndexCounterRead> {
+        Ok(match snapshot.get(spaces.meta, key.bytes())? {
+            None => IndexCounterRead::Missing,
+            Some(value) => match decode_index_count(value.as_ref()) {
+                Some(value) => IndexCounterRead::Value(value),
+                None => IndexCounterRead::Malformed,
             },
         })
     }
 
-    fn adjusted_query_index_counter(current: u64, delta: i128) -> Option<u64> {
+    fn query_revision(
+        snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
+        predicate: QueryTermId,
+    ) -> Result<IndexCounterRead> {
+        Ok(
+            match snapshot.get(spaces.meta, predicate_revision_key(predicate))? {
+                None => IndexCounterRead::Missing,
+                Some(value) => match decode_index_count(value.as_ref()) {
+                    Some(value) => IndexCounterRead::Value(value),
+                    None => IndexCounterRead::Malformed,
+                },
+            },
+        )
+    }
+
+    fn adjusted_counter(current: u64, delta: i128) -> Option<u64> {
         if delta >= 0 {
             current.checked_add(u64::try_from(delta).ok()?)
         } else {
@@ -5358,9 +5590,10 @@ impl GraphStore {
         }
     }
 
-    fn resolve_maintenance_query_term(
+    fn resolve_query_term(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         term: TermId,
         allow_allocate: bool,
         resolved: &mut HashMap<TermId, QueryTermId>,
@@ -5370,7 +5603,7 @@ impl GraphStore {
         if let Some(query) = resolved.get(&term) {
             return Ok(Some(*query));
         }
-        if let Some(value) = snapshot.get(&self.qv2_term_to_query, term.to_be_bytes())? {
+        if let Some(value) = snapshot.get(spaces.term_to_query, term.to_be_bytes())? {
             let Ok(raw) = <[u8; 8]>::try_from(value.as_ref()) else {
                 return Ok(None);
             };
@@ -5378,7 +5611,7 @@ impl GraphStore {
             if query.0 >= *next_query_id {
                 return Ok(None);
             }
-            let Some(reverse) = snapshot.get(&self.qv2_query_to_term, query.to_be_bytes())? else {
+            let Some(reverse) = snapshot.get(spaces.query_to_term, query.to_be_bytes())? else {
                 return Ok(None);
             };
             if reverse.as_ref() != term.to_be_bytes() {
@@ -5395,7 +5628,7 @@ impl GraphStore {
             return Ok(None);
         };
         if snapshot
-            .get(&self.qv2_query_to_term, query.to_be_bytes())?
+            .get(spaces.query_to_term, query.to_be_bytes())?
             .is_some()
         {
             return Ok(None);
@@ -5406,11 +5639,16 @@ impl GraphStore {
         Ok(Some(query))
     }
 
-    fn query_index_spo_exists(&self, snapshot: &Snapshot, quad: QueryQuad) -> Result<bool> {
-        let key = qv2_spog_key(quad);
+    fn index_spo_exists(
+        &self,
+        snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
+        quad: QueryQuad,
+    ) -> Result<bool> {
+        let key = spog_key(quad);
         let mut prefix = [0u8; 24];
         prefix.copy_from_slice(&key[..24]);
-        match snapshot.prefix(&self.qv2_spog, prefix).next() {
+        match snapshot.prefix(spaces.spog, prefix).next() {
             Some(guard) => {
                 let _ = guard.into_inner()?;
                 Ok(true)
@@ -5419,9 +5657,10 @@ impl GraphStore {
         }
     }
 
-    fn insertions_preserve_union_uniqueness(
+    fn insertions_keep_union(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         transitions: &[(QueryQuad, bool)],
         new_terms: &HashSet<QueryTermId>,
     ) -> Result<bool> {
@@ -5440,16 +5679,17 @@ impl GraphStore {
             {
                 continue;
             }
-            if self.query_index_spo_exists(snapshot, *quad)? {
+            if self.index_spo_exists(snapshot, spaces, *quad)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn single_transition_preserves_union_uniqueness(
+    fn transition_keeps_union(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         transition: (QueryQuad, bool),
         mappings: &[(TermId, QueryTermId)],
     ) -> Result<bool> {
@@ -5462,13 +5702,13 @@ impl GraphStore {
         }) {
             return Ok(true);
         }
-        Ok(!self.query_index_spo_exists(snapshot, quad)?)
+        Ok(!self.index_spo_exists(snapshot, spaces, quad)?)
     }
 
-    fn plan_ready_query_index_maintenance(
+    fn plan_index_update(
         &self,
         snapshot: &Snapshot,
-        header: &QueryIndexHeader,
+        header: &IndexHeader,
         transitions: Vec<NetQuadTransition>,
     ) -> Result<Option<QueryIndexMaintenancePlan>> {
         let total =
