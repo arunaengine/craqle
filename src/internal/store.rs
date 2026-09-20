@@ -13967,26 +13967,26 @@ mod tests {
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, quad);
 
-        remove_query_index_key_for_test(
+        remove_test_key(
             &store,
             &store.qv2_spog,
-            qv2_spog_key(query_quad_for_test(&store, quad)),
+            spog_key(test_query_quad(&store, quad)),
         );
         assert_eq!(
             store.query_index_status().unwrap().state,
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
         );
 
-        stage_query_index_value_for_test(
+        stage_test_value(
             &store,
             &store.qv2_spog,
-            qv2_spog_key(query_quad_for_test(&store, quad)),
+            spog_key(test_query_quad(&store, quad)),
             Vec::<u8>::new(),
         );
-        stage_query_index_value_for_test(
+        stage_test_value(
             &store,
             &store.qv2_posg,
-            qv2_posg_key(query_quad_for_test(&store, quad)),
+            posg_key(test_query_quad(&store, quad)),
             vec![1],
         );
         assert_eq!(
@@ -13994,36 +13994,31 @@ mod tests {
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
         );
 
-        stage_query_index_value_for_test(
+        stage_test_value(
             &store,
             &store.qv2_posg,
-            qv2_posg_key(query_quad_for_test(&store, quad)),
+            posg_key(test_query_quad(&store, quad)),
             Vec::<u8>::new(),
         );
-        remove_query_index_key_for_test(
+        remove_test_key(
             &store,
             &store.qv2_spog,
-            qv2_spog_key(query_quad_for_test(&store, quad)),
+            spog_key(test_query_quad(&store, quad)),
         );
-        stage_query_index_value_for_test(&store, &store.qv2_spog, vec![0; 31], Vec::<u8>::new());
+        stage_test_value(&store, &store.qv2_spog, vec![0; 31], Vec::<u8>::new());
         assert_eq!(
             store.query_index_status().unwrap().state,
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
         );
 
-        remove_query_index_key_for_test(&store, &store.qv2_spog, vec![0; 31]);
-        stage_query_index_value_for_test(
+        remove_test_key(&store, &store.qv2_spog, vec![0; 31]);
+        stage_test_value(
             &store,
             &store.qv2_spog,
-            qv2_spog_key(query_quad_for_test(&store, quad)),
+            spog_key(test_query_quad(&store, quad)),
             Vec::<u8>::new(),
         );
-        stage_query_index_value_for_test(
-            &store,
-            &store.qv2_meta,
-            QUERY_INDEX_TOTAL_KEY,
-            2u64.to_be_bytes(),
-        );
+        stage_test_value(&store, &store.qv2_meta, QV_TOTAL_KEY, 2u64.to_be_bytes());
         assert_eq!(
             store.query_index_status().unwrap().state,
             QueryIndexState::Failed("ready-status-mismatch".to_owned())
@@ -14044,20 +14039,20 @@ mod tests {
 
         let reopened = GraphStore::open(dir.path()).unwrap();
         assert_eq!(0, reopened.index_verify_count());
-        let probes_before = reopened.query_index_admission_probe_count();
-        let status = reopened.query_index_status_fast().unwrap();
+        let probes_before = reopened.admission_probe_count();
+        let status = reopened.index_status_fast().unwrap();
         assert_eq!(QueryIndexState::Ready, status.state);
         assert_eq!(1, status.source_live_quads);
         assert_eq!(1, status.indexed_quads);
         assert_eq!(
             2,
-            reopened.query_index_admission_probe_count() - probes_before,
+            reopened.admission_probe_count() - probes_before,
             "fast status reads only the header and total counter"
         );
         assert_eq!(0, reopened.index_verify_count());
 
         let sampled = reopened
-            .verify_query_indexes(QueryIndexVerificationMode::Sample)
+            .verify_query_indexes(IndexVerifyMode::Sample)
             .unwrap();
         assert!(sampled.valid);
         assert!(!sampled.full);
@@ -14073,7 +14068,7 @@ mod tests {
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             commit_add(&store, &graph, quad);
-            remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
+            remove_test_key(&store, &store.qv2_meta, QV_HEADER_KEY);
             store.persist().unwrap();
         }
 
@@ -14085,24 +14080,24 @@ mod tests {
             );
             let before_rebuild_sequence = store.db.snapshot().seqno();
             store.rebuild_query_indexes().unwrap();
-            let first = query_index_header_for_test(&store);
-            assert!(matches!(first.state, StoredQueryIndexState::Ready));
+            let first = test_index_header(&store);
+            assert!(matches!(first.state, StoredIndexState::Ready));
             assert!(first.last_build_sequence >= before_rebuild_sequence);
             assert!(first.source_epoch >= before_rebuild_sequence);
             assert_eq!(first.source_live_quads, 1);
             assert_eq!(first.indexed_quads, 1);
-            assert_query_index_ready(&store, 1);
+            assert_index_ready(&store, 1);
 
             store.rebuild_query_indexes().unwrap();
-            let second = query_index_header_for_test(&store);
+            let second = test_index_header(&store);
             assert!(second.last_build_sequence > first.last_build_sequence);
-            assert!(second.source_epoch > first.source_epoch);
+            assert_eq!(second.source_epoch, first.source_epoch);
             assert!(second.query_id_generation > first.query_id_generation);
             store.persist().unwrap();
         }
 
         let reopened = GraphStore::open(dir.path()).unwrap();
-        assert_query_index_ready(&reopened, 1);
+        assert_index_ready(&reopened, 1);
     }
 
     #[test]
@@ -14114,13 +14109,13 @@ mod tests {
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             commit_add(&store, &graph, quad);
-            let mut header = query_index_header_for_test(&store);
-            header.state = StoredQueryIndexState::Building;
-            stage_query_index_header_for_test(&store, &header);
-            remove_query_index_key_for_test(
+            let mut header = test_index_header(&store);
+            header.state = StoredIndexState::Building;
+            stage_test_header(&store, &header);
+            remove_test_key(
                 &store,
                 &store.qv2_posg,
-                qv2_posg_key(query_quad_for_test(&store, quad)),
+                posg_key(test_query_quad(&store, quad)),
             );
             store.persist().unwrap();
             quad
@@ -14138,12 +14133,12 @@ mod tests {
                 "Building must retain canonical fallback reads"
             );
             store.rebuild_query_indexes().unwrap();
-            assert_query_index_ready(&store, 1);
+            assert_index_ready(&store, 1);
             store.persist().unwrap();
         }
 
         let reopened = GraphStore::open(dir.path()).unwrap();
-        assert_query_index_ready(&reopened, 1);
+        assert_index_ready(&reopened, 1);
     }
 
     #[test]
@@ -14151,7 +14146,7 @@ mod tests {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv:verify-sample");
         store.create_graph(&graph).unwrap();
-        let rows = QUERY_INDEX_SAMPLE_ROWS + 1;
+        let rows = QV_SAMPLE_ROWS + 1;
         {
             let _guard = store.graph_commit_guard(&graph);
             let mut batch = store.new_batch();
@@ -14179,8 +14174,8 @@ mod tests {
         assert!(!sample.full);
         assert_eq!(sample.source_live_quads, rows);
         assert_eq!(sample.indexed_quads, rows);
-        assert_eq!(sample.checked_source_rows, QUERY_INDEX_SAMPLE_ROWS);
-        assert_eq!(sample.checked_index_rows, QUERY_INDEX_SAMPLE_ROWS * 6);
+        assert_eq!(sample.checked_source_rows, QV_SAMPLE_ROWS);
+        assert_eq!(sample.checked_index_rows, QV_SAMPLE_ROWS * 6);
 
         let full = store.verify_query_indexes(true).unwrap();
         assert!(full.valid);
@@ -14198,44 +14193,24 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, quad);
-        let query_quad = query_quad_for_test(&store, quad);
+        let query_quad = test_query_quad(&store, quad);
         let extra = QueryQuad {
-            subject: QueryTermId(query_index_header_for_test(&store).next_query_id),
+            subject: QueryTermId(test_index_header(&store).next_query_id),
             ..query_quad
         };
 
-        stage_query_index_value_for_test(
-            &store,
-            &store.qv2_gpos,
-            qv2_gpos_key(extra),
-            Vec::<u8>::new(),
-        );
-        stage_query_index_value_for_test(
-            &store,
-            &store.qv2_gpos,
-            qv2_gpos_key(query_quad),
-            vec![1],
-        );
-        remove_query_index_key_for_test(&store, &store.qv2_spog, qv2_spog_key(query_quad));
-        stage_query_index_value_for_test(&store, &store.qv2_posg, vec![0; 31], Vec::<u8>::new());
-        stage_query_index_value_for_test(
+        stage_test_value(&store, &store.qv2_gpos, gpos_key(extra), Vec::<u8>::new());
+        stage_test_value(&store, &store.qv2_gpos, gpos_key(query_quad), vec![1]);
+        remove_test_key(&store, &store.qv2_spog, spog_key(query_quad));
+        stage_test_value(&store, &store.qv2_posg, vec![0; 31], Vec::<u8>::new());
+        stage_test_value(&store, &store.qv2_meta, QV_TOTAL_KEY, vec![0; 7]);
+        stage_test_value(&store, &store.qv2_meta, vec![b'Z'], 0u64.to_be_bytes());
+        stage_test_value(&store, &store.qv2_meta, vec![b'G', 0], 0u64.to_be_bytes());
+        let orphan_graph = QueryTermId(test_index_header(&store).next_query_id);
+        stage_test_value(
             &store,
             &store.qv2_meta,
-            QUERY_INDEX_TOTAL_KEY,
-            vec![0; 7],
-        );
-        stage_query_index_value_for_test(&store, &store.qv2_meta, vec![b'Z'], 0u64.to_be_bytes());
-        stage_query_index_value_for_test(
-            &store,
-            &store.qv2_meta,
-            vec![b'G', 0],
-            0u64.to_be_bytes(),
-        );
-        let orphan_graph = QueryTermId(query_index_header_for_test(&store).next_query_id);
-        stage_query_index_value_for_test(
-            &store,
-            &store.qv2_meta,
-            QueryIndexCounterKey::Graph(orphan_graph).bytes(),
+            IndexCounterKey::Graph(orphan_graph).bytes(),
             1u64.to_be_bytes(),
         );
 
@@ -14252,7 +14227,7 @@ mod tests {
             "meta-counter-key-length",
             "meta-counter-orphan",
         ] {
-            assert_query_index_problem(&report, problem);
+            assert_index_problem(&report, problem);
         }
     }
 
@@ -14263,11 +14238,10 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, first);
-        remove_query_index_key_for_test(
+        remove_test_key(
             &store,
             &store.qv2_meta,
-            QueryIndexCounterKey::Predicate(query_term_id_for_test(&store, first.predicate))
-                .bytes(),
+            IndexCounterKey::Predicate(test_query_id(&store, first.predicate)).bytes(),
         );
 
         let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
@@ -14296,11 +14270,11 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, first);
-        let mut header = query_index_header_for_test(&store);
+        let mut header = test_index_header(&store);
         let ahead = store.db.snapshot().seqno().checked_add(100).unwrap();
         header.source_epoch = ahead;
         header.index_epoch = ahead;
-        stage_query_index_header_for_test(&store, &header);
+        stage_test_header(&store, &header);
 
         let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, second);
@@ -14329,14 +14303,14 @@ mod tests {
         let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p1", "urn:test:o"));
         commit_add(&store, &graph, first);
         let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p2", "urn:test:o"));
-        let orphan_predicate = query_index_header_for_test(&store)
+        let orphan_predicate = test_index_header(&store)
             .next_query_id
             .checked_add(1)
             .unwrap();
-        stage_query_index_value_for_test(
+        stage_test_value(
             &store,
             &store.qv2_meta,
-            QueryIndexCounterKey::Predicate(QueryTermId(orphan_predicate)).bytes(),
+            IndexCounterKey::Predicate(QueryTermId(orphan_predicate)).bytes(),
             1u64.to_be_bytes(),
         );
 
@@ -14371,12 +14345,7 @@ mod tests {
                 ("urn:test:s", "urn:test:p", "urn:test:o"),
             );
             commit_add(&store, &metadata_graph, quad);
-            stage_query_index_value_for_test(
-                &store,
-                &store.qv2_meta,
-                QUERY_INDEX_HEADER_KEY,
-                vec![0],
-            );
+            stage_test_value(&store, &store.qv2_meta, QV_HEADER_KEY, vec![0]);
             store.persist().unwrap();
             quad
         };
@@ -14404,12 +14373,7 @@ mod tests {
                 ("urn:test:s", "urn:test:p", "urn:test:o"),
             );
             commit_add(&store, &counter_graph, quad);
-            stage_query_index_value_for_test(
-                &store,
-                &store.qv2_meta,
-                QUERY_INDEX_TOTAL_KEY,
-                vec![0; 7],
-            );
+            stage_test_value(&store, &store.qv2_meta, QV_TOTAL_KEY, vec![0; 7]);
             store.persist().unwrap();
             quad
         };
@@ -14435,9 +14399,9 @@ mod tests {
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             commit_add(&store, &graph, quad);
-            let mut header = query_index_header_for_test(&store);
+            let mut header = test_index_header(&store);
             header.index_epoch = header.index_epoch.checked_add(1).unwrap();
-            stage_query_index_header_for_test(&store, &header);
+            stage_test_header(&store, &header);
             store.persist().unwrap();
             quad
         };
@@ -14452,7 +14416,7 @@ mod tests {
         assert!(!store.verify_query_indexes(true).unwrap().valid);
 
         store.rebuild_query_indexes().unwrap();
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
         assert_eq!(
             store.quads_for_pattern(None, None, None, None).unwrap(),
             source_before_rebuild,
@@ -14469,11 +14433,11 @@ mod tests {
             store.create_graph(&graph).unwrap();
             let first = encode_quad(&store, &graph, ("urn:test:s1", "urn:test:p", "urn:test:o"));
             commit_add(&store, &graph, first);
-            let mut header = query_index_header_for_test(&store);
+            let mut header = test_index_header(&store);
             header.source_epoch = u64::MAX;
             header.index_epoch = u64::MAX;
             header.last_build_sequence = u64::MAX;
-            stage_query_index_header_for_test(&store, &header);
+            stage_test_header(&store, &header);
             store.persist().unwrap();
             first
         };
@@ -14485,18 +14449,18 @@ mod tests {
         );
         let failed_report = store.verify_query_indexes(true).unwrap();
         assert!(!failed_report.valid);
-        assert_query_index_problem(&failed_report, "meta-epoch-ahead-of-snapshot");
-        assert_query_index_problem(&failed_report, "meta-build-sequence-ahead-of-snapshot");
+        assert_index_problem(&failed_report, "meta-epoch-ahead-of-snapshot");
+        assert_index_problem(&failed_report, "meta-build-sequence-ahead-of-snapshot");
         assert_eq!(
             store.quads_for_pattern(None, None, None, None).unwrap(),
             vec![first]
         );
 
         store.rebuild_query_indexes().unwrap();
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
         let second = encode_quad(&store, &graph, ("urn:test:s2", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, second);
-        assert_query_index_ready(&store, 2);
+        assert_index_ready(&store, 2);
         assert_eq!(
             store
                 .quads_for_pattern(None, None, None, None)
@@ -14518,14 +14482,14 @@ mod tests {
             commit_add(&store, &graph, quad);
             store.manual_compact().unwrap();
             let snapshot = store.db.snapshot();
-            let query_quad = query_quad_for_test(&store, quad);
+            let query_quad = test_query_quad(&store, quad);
             for (keyspace, key) in [
-                (&store.qv2_gspo, qv2_gspo_key(query_quad)),
-                (&store.qv2_gpos, qv2_gpos_key(query_quad)),
-                (&store.qv2_spog, qv2_spog_key(query_quad)),
-                (&store.qv2_posg, qv2_posg_key(query_quad)),
-                (&store.qv2_ospg, qv2_ospg_key(query_quad)),
-                (&store.qv2_gosp, qv2_gosp_key(query_quad)),
+                (&store.qv2_gspo, gspo_key(query_quad)),
+                (&store.qv2_gpos, gpos_key(query_quad)),
+                (&store.qv2_spog, spog_key(query_quad)),
+                (&store.qv2_posg, posg_key(query_quad)),
+                (&store.qv2_ospg, ospg_key(query_quad)),
+                (&store.qv2_gosp, gosp_key(query_quad)),
             ] {
                 assert!(
                     snapshot
@@ -14538,13 +14502,13 @@ mod tests {
             }
             assert!(
                 snapshot
-                    .get(&store.qv2_meta, QUERY_INDEX_HEADER_KEY)
+                    .get(&store.qv2_meta, QV_HEADER_KEY)
                     .unwrap()
                     .is_some()
             );
             assert_eq!(
                 snapshot
-                    .get(&store.qv2_meta, QUERY_INDEX_TOTAL_KEY)
+                    .get(&store.qv2_meta, QV_TOTAL_KEY)
                     .unwrap()
                     .unwrap()
                     .as_ref(),
@@ -14555,7 +14519,7 @@ mod tests {
         };
 
         let reopened = GraphStore::open(dir.path()).unwrap();
-        assert_query_index_ready(&reopened, 1);
+        assert_index_ready(&reopened, 1);
         assert_eq!(
             reopened.quads_for_pattern(None, None, None, None).unwrap(),
             vec![quad]
@@ -14704,9 +14668,7 @@ mod tests {
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
     }
 
-    /// Re-dirtying a subject must not lift its entry above a bound pinned
-    /// before it: the flush holding that bound promised to index the first
-    /// write, and a drain filters on the token the entry carries.
+    /// Redirtying preserves the oldest token promised to an earlier flush.
     #[test]
     fn enqueue_keeps_oldest() {
         let (_dir, store) = setup_store();
@@ -14728,22 +14690,47 @@ mod tests {
 
         enqueue(subject);
         // What a flush starting right here would pin.
-        let bound = QueueBound {
-            chunk: 10,
+        let bound = QueueScan {
             max_token: Some(store.current_dirty_token()),
+            after: None,
+            row_limit: 10,
+            byte_limit: 1_048_576,
         };
         // Carry the counter past the bound, then dirty the subject again.
         enqueue(other);
         enqueue(subject);
 
-        let drained = drain_upto(&bound, |chunk| store.drain_fts_queue(chunk)).unwrap();
+        let drained = store.scan_fts_subjects(&bound).unwrap();
 
-        assert!(drained.iter().any(|entry| entry.subject == subject));
+        assert!(drained.entries.iter().any(|entry| entry.subject == subject));
     }
 
-    /// An enqueue landing between an acknowledgement's token read and its
-    /// commit must survive: the removal only ever covered the older token, so
-    /// erasing the entry would leave that write unindexed for good.
+    #[test]
+    fn token_head_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:token-head");
+        let committed;
+        {
+            let store = GraphStore::open(directory.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let graph_id = store
+                .resolve_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap();
+            let subject = store.resolve_term(&named("urn:test:subject")).unwrap();
+            let mut batch = store.new_batch();
+            store
+                .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
+                .unwrap();
+            store.commit(batch).unwrap();
+            committed = store.current_dirty_token();
+            store.clear_graph_queue(&graph, committed).unwrap();
+            store.persist().unwrap();
+        }
+        let reopened = GraphStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.current_dirty_token(), committed);
+    }
+
+    /// An enqueue concurrent with acknowledgement must retain its newer debt.
     #[test]
     fn acknowledgement_preserves_enqueue() {
         let (_dir, store) = setup_store();
@@ -14763,7 +14750,7 @@ mod tests {
         let queued = store.drain_fts_queue(10).unwrap();
         assert_eq!(1, queued.len());
 
-        store.set_fts_ack_stall(std::time::Duration::from_millis(300));
+        store.set_ack_stall(std::time::Duration::from_millis(300));
         let acking = {
             let store = store.clone();
             std::thread::spawn(move || store.acknowledge_fts_queue(&queued).unwrap())
@@ -14793,19 +14780,16 @@ mod tests {
         store.enqueue_fts_reindex(&mut batch, graph_id).unwrap();
         store.commit(batch).unwrap();
 
-        let queued = store.drain_fts_reindex_queue(10).unwrap();
+        let queued = store.drain_reindex_queue(10).unwrap();
         assert_eq!(1, queued.len());
         assert_eq!(queued[0].graph, graph);
-        store.acknowledge_fts_reindex_queue(&queued).unwrap();
-        assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+        store.acknowledge_reindex(&queued).unwrap();
+        assert!(store.drain_reindex_queue(10).unwrap().is_empty());
     }
 
-    // ── W14: the reindex collapse is relative to graph size ─────────────
+    // Reindex collapse relative to graph size.
 
-    /// Give `graph` exactly `count` distinct subjects, in one batch.
-    ///
-    /// Returns the graph's term id together with its subject ids, in ascending
-    /// seed order, so a caller can enqueue a prefix of them.
+    /// Seeds distinct subjects and returns the graph and subject ids.
     fn seed_subjects(store: &GraphStore, graph: &GraphId, count: usize) -> (TermId, Vec<TermId>) {
         let mut batch = store.new_batch();
         let mut cache = HashMap::new();
@@ -14869,51 +14853,42 @@ mod tests {
         store.commit(batch).unwrap();
 
         let per_subject = store.drain_fts_queue(usize::MAX).unwrap().len();
-        let reindexes = store.drain_fts_reindex_queue(usize::MAX).unwrap().len();
+        let reindexes = store.drain_reindex_queue(usize::MAX).unwrap().len();
         (per_subject, reindexes)
     }
 
-    /// The collapse still fires when the rescan really is the cheaper option:
-    /// the batch is large *and* covers half the graph, so re-reading the graph
-    /// costs no more than the per-subject entries it replaces.
+    /// A large batch covering half the graph collapses to one rescan.
     #[test]
     fn enqueue_collapses_batch() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:w14:half");
         store.create_graph(&graph).unwrap();
 
-        let (graph_id, subjects) =
-            seed_subjects(&store, &graph, FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD * 2);
-        let batch = &subjects[..FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD];
+        let (graph_id, subjects) = seed_subjects(&store, &graph, FTS_REINDEX_THRESHOLD * 2);
+        let batch = &subjects[..FTS_REINDEX_THRESHOLD];
 
         assert_eq!((0, 1), enqueue_and_count(&store, graph_id, batch));
     }
 
-    /// One subject past the halfway mark the rescan is the more expensive
-    /// option, and the enqueue must stay per-subject.
-    ///
-    /// The absolute rule alone turned this write into a rescan of a graph twice
-    /// its size — and, in a batched ingest, once per batch.
+    /// A batch below half the graph remains per-subject.
     #[test]
     fn enqueue_below_ratio() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:w14:dwarfed");
         store.create_graph(&graph).unwrap();
 
-        let (graph_id, subjects) =
-            seed_subjects(&store, &graph, FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD * 2 + 1);
-        let batch = &subjects[..FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD];
+        let (graph_id, subjects) = seed_subjects(&store, &graph, FTS_REINDEX_THRESHOLD * 2 + 1);
+        let batch = &subjects[..FTS_REINDEX_THRESHOLD];
 
         // Every affected subject is queued: the relative rule may only move
-        // work off the rescan branch, never drop it (G7).
+        // work off the rescan branch, never drop it.
         assert_eq!(
-            (FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD, 0),
+            (FTS_REINDEX_THRESHOLD, 0),
             enqueue_and_count(&store, graph_id, batch)
         );
     }
 
-    /// A batch that is the whole graph still stays per-subject while it is
-    /// small: the absolute bound survives the relative one.
+    /// Small whole-graph batches remain per-subject.
     #[test]
     fn enqueue_below_threshold() {
         let (_dir, store) = setup_store();
@@ -14925,13 +14900,9 @@ mod tests {
         assert_eq!((100, 0), enqueue_and_count(&store, graph_id, &subjects));
     }
 
-    // ── Commit guards and cache publication ─────────────────────────────
+    // Commit guards and cache publication.
 
-    /// Concurrent adds to one quad must each contribute a distinct dot (G1).
-    ///
-    /// Without the commit guard the `next_counter` read-then-write and the
-    /// `insert_quad` read-modify-write of the dot set interleave, so two writers
-    /// mint the same counter and one add is lost.
+    /// Concurrent adds to one quad retain distinct dots.
     #[test]
     fn commits_keep_dots() {
         const WRITERS: usize = 8;
@@ -14968,7 +14939,7 @@ mod tests {
             dots.iter().map(|dot| (dot.actor, dot.counter)).collect();
         assert_eq!(dots.len(), unique.len(), "two adds shared a dot");
 
-        // Every minted counter is reflected in the graph clock (G2).
+        // Every minted counter is reflected in the graph clock.
         let clock = store.get_vector_clock(&graph).unwrap();
         let clocked: u64 = clock.0.values().sum();
         assert_eq!(dots.len() as u64, clocked);
@@ -14998,7 +14969,7 @@ mod tests {
             store.peak_commit_stalls() >= 2,
             "independent durable commits were serialized by one cache lock"
         );
-        assert_query_index_ready(&store, 2);
+        assert_index_ready(&store, 2);
     }
 
     #[test]
@@ -15010,7 +14981,7 @@ mod tests {
         let rejected = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:rejected"));
         commit_add(&store, &graph, seeded);
         assert!(store.index_contains(seeded));
-        let generation = store.indexes_read().generations.get(&seeded.graph).copied();
+        let generation = store.indexes_read().graph_epoch(seeded.graph);
 
         let _commit_guard = store.graph_commit_guard(&graph);
         let mut batch = store.new_batch();
@@ -15029,10 +15000,7 @@ mod tests {
         store.arm_commit_failure();
         assert!(store.commit(batch).is_err());
 
-        assert_eq!(
-            generation,
-            store.indexes_read().generations.get(&seeded.graph).copied()
-        );
+        assert_eq!(generation, store.indexes_read().graph_epoch(seeded.graph));
         assert!(store.index_contains(seeded));
         assert!(!store.contains_quad(rejected).unwrap());
     }
@@ -15069,14 +15037,16 @@ mod tests {
                 pending_terms: _,
                 publish,
                 pending_fts,
+                pending_receipts: _,
             } = batch;
             let mut durable = DurableCommit {
                 batch: inner,
                 pending_fts,
+                pending_receipts: Vec::new(),
             };
             let owner = store.qv_gate.try_acquire().unwrap();
             store
-                .stage_query_index_maintenance(&mut durable.batch, &publish)
+                .stage_index_update(&mut durable.batch, &publish)
                 .unwrap();
             store.commit_durable(durable).unwrap();
             owner.finish();
@@ -15090,7 +15060,7 @@ mod tests {
         assert_eq!(
             1,
             reopened
-                .subject_triple_count_by_ids(quad.graph, quad.subject)
+                .subject_triple_count(quad.graph, quad.subject)
                 .unwrap()
         );
     }
@@ -15134,9 +15104,7 @@ mod tests {
         }
     }
 
-    /// The self-guarding store functions take their own guard, so calling them
-    /// concurrently — including on graphs that share a lock shard — must make
-    /// progress rather than deadlock.
+    /// Concurrent self-guarding calls make progress even on one lock shard.
     #[test]
     fn guards_never_deadlock() {
         const THREADS: usize = 8;
@@ -15158,7 +15126,7 @@ mod tests {
                             .set_graph_policy(&graph, &GraphPolicy::default())
                             .unwrap();
                         store
-                            .set_irokle_topic_id(&graph, [(index * 32 + round as usize) as u8; 32])
+                            .set_topic_id(&graph, [(index * 32 + round as usize) as u8; 32])
                             .unwrap();
                         store
                             .set_graph_context(
@@ -15242,12 +15210,9 @@ mod tests {
         assert!(store.contains_quad(collateral).unwrap());
     }
 
-    // ── FTS queue tokens across restarts ────────────────────────────────
+    // FTS queue tokens across restarts.
 
-    /// A reindex token issued before a restart must never acknowledge a
-    /// subject entry queued after it. With the counter restarting at 1 the
-    /// post-restart entry gets a lower token and is silently dropped without
-    /// tantivy ever having indexed the subject.
+    /// A pre-restart reindex cannot acknowledge post-restart subject debt.
     #[test]
     fn tokens_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -15271,21 +15236,16 @@ mod tests {
             store.commit(batch).unwrap();
             store.persist().unwrap();
 
-            let queued = store.drain_fts_reindex_queue(10).unwrap();
+            let queued = store.drain_reindex_queue(10).unwrap();
             assert_eq!(1, queued.len());
             // The pre-restart subject entries are legitimately covered.
-            store
-                .acknowledge_fts_subjects_for_reindexed_graphs(&queued)
-                .unwrap();
+            store.acknowledge_reindexed(&queued).unwrap();
             assert!(store.drain_fts_queue(10).unwrap().is_empty());
             queued[0].tokens.latest
         };
 
         let store = GraphStore::open(dir.path()).unwrap();
-        assert!(
-            store.current_dirty_token() > reindex_token,
-            "the token counter must resume past every live queue token"
-        );
+        assert_eq!(store.current_dirty_token(), reindex_token);
 
         let graph_id = store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))
@@ -15296,14 +15256,13 @@ mod tests {
             .enqueue_fts(&mut batch, FtsSubject { graph_id, subject })
             .unwrap();
         store.commit(batch).unwrap();
+        assert!(store.current_dirty_token() > reindex_token);
 
-        let reindex_queued = store.drain_fts_reindex_queue(10).unwrap();
+        let reindex_queued = store.drain_reindex_queue(10).unwrap();
         assert_eq!(1, reindex_queued.len());
         assert_eq!(graph, reindex_queued[0].graph);
         assert_eq!(reindex_token, reindex_queued[0].tokens.latest);
-        store
-            .acknowledge_fts_subjects_for_reindexed_graphs(&reindex_queued)
-            .unwrap();
+        store.acknowledge_reindexed(&reindex_queued).unwrap();
 
         let remaining = store.drain_fts_queue(10).unwrap();
         assert_eq!(
@@ -15314,11 +15273,9 @@ mod tests {
         assert_eq!(subject, remaining[0].subject);
     }
 
-    // ── Vector-clock key split ──────────────────────────────────────────
+    // Vector-clock key split.
 
-    /// Open is the only moment a store written before the split can still be
-    /// carrying its clock inside the metadata record, so that is where the
-    /// fallback runs and seeds the mirror every later read uses.
+    /// Open migrates clocks still embedded in legacy graph metadata.
     #[test]
     fn clock_split_migration() {
         let (dir, store) = setup_store();
@@ -15333,7 +15290,7 @@ mod tests {
         let legacy_actor = ActorId::random();
         let mut legacy_clock = VectorClock::new();
         legacy_clock.advance(legacy_actor, 7);
-        let mut meta = store.read_graph_meta_by_id(graph_id).unwrap().unwrap();
+        let mut meta = store.read_graph_meta(graph_id).unwrap().unwrap();
         meta.clock = legacy_clock.clone();
         let mut batch = store.new_batch();
         batch.insert(
@@ -15371,7 +15328,7 @@ mod tests {
 
         assert_eq!(fresh, store.get_vector_clock(&graph).unwrap());
         // The clock write must not have touched the metadata record.
-        let meta_after = store.read_graph_meta_by_id(graph_id).unwrap().unwrap();
+        let meta_after = store.read_graph_meta(graph_id).unwrap().unwrap();
         assert_eq!(legacy_clock, meta_after.clock);
     }
 
@@ -15402,25 +15359,16 @@ mod tests {
         );
     }
 
-    // ── Persisted, clock-tagged diagnostics ─────────────────────────────
+    // Persisted, clock-tagged diagnostics.
 
-    /// Attach `entity` to the graph as a data entity that is *not* reachable
-    /// from the root, i.e. an orphan.
-    /// Persist a graph's diagnostics the way a committing writer does.
-    ///
-    /// Reads deliberately do not persist what they recompute (see
-    /// [`GraphStore::graph_diagnostics_by_id`]), so a fixture that needs a
-    /// stored record has to settle it here, holding the guard the writer holds.
+    /// Persists diagnostics under the same guard used by writers.
     fn settle_diagnostics(store: &GraphStore, graph: &GraphId) {
         let _commit_guard = store.graph_commit_guard(graph);
         let diagnostics = store.compute_graph_diagnostics(graph).unwrap();
         store.set_graph_diagnostics(graph, &diagnostics).unwrap();
     }
 
-    /// A reader that sees the post-commit clock must not then read an index
-    /// that predates it: it would compute a pre-write orphan set, tag it with
-    /// the post-write clock, and every later reader would accept that as fresh
-    /// until the next write (G6).
+    /// Readers cannot combine a post-commit clock with pre-commit graph state.
     #[test]
     fn commit_publishes_atomically() {
         let (_dir, store) = setup_store();
@@ -15473,14 +15421,14 @@ mod tests {
     ) -> (Vec<EncodedQuad>, Vec<EncodedQuad>) {
         let mut indexed = Vec::new();
         store
-            .for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+            .visit_graph_quads::<StoreError, _>(graph_id, |quad| {
                 indexed.push(quad);
                 Ok(())
             })
             .unwrap();
         let mut stored = Vec::new();
         store
-            .for_each_stored_quad(graph_id, |quad, _| {
+            .visit_stored_quads(graph_id, |quad, _| {
                 stored.push(quad);
                 Ok(())
             })
@@ -15491,9 +15439,7 @@ mod tests {
         (indexed, stored)
     }
 
-    /// A rebuild scans the durable quads and then installs what it read. While
-    /// the scan ran unlocked, a commit landing inside that window was erased
-    /// from the index by the install, yet kept the clock it had published.
+    /// Cache rebuilds preserve commits landing during their scan.
     #[test]
     fn rebuild_keeps_commits() {
         let (_dir, store) = setup_store();
@@ -15518,12 +15464,7 @@ mod tests {
         assert_eq!(stored, indexed, "the index must describe the stored quads");
     }
 
-    /// Repopulating the object-order cache reads the index, then decodes and
-    /// sorts with no lock held. An invalidation landing entirely inside that
-    /// window used to be undone by the ordering the reader had already
-    /// computed — stored untagged, so nothing ever rechecked it, and a graph
-    /// that then went quiet kept paging exports missing the newest `hasPart`
-    /// child (G6).
+    /// Object-order fills cannot overwrite a concurrent invalidation.
     #[test]
     fn paging_sees_appends() {
         const SEEDED: usize = 400;
@@ -15546,7 +15487,7 @@ mod tests {
 
         let total_objects = || {
             store
-                .count_objects_for_subject_predicate(&graph, &root, &predicate)
+                .count_matching_objects(&graph, &root, &predicate)
                 .unwrap()
         };
         let first_page = || {
@@ -15604,13 +15545,7 @@ mod tests {
         commit_add(store, graph, quad);
     }
 
-    /// The id-based orphan pass in [`GraphStore::compute_graph_diagnostics`] is
-    /// an optimisation of `rules::orphaned_data_entities`, so it has to agree
-    /// with it on every shape that distinguishes them: reachable and unreachable
-    /// entities, chains, `hasPart` cycles, entities that are only ever a
-    /// `hasPart` object, typed non-data entities, and the root itself (which is
-    /// never an orphan). Consistency outranks speed — if these ever diverge, the
-    /// rule is right and this test is the thing that says so.
+    /// Id-based orphan detection matches the rules implementation across graph shapes.
     #[test]
     fn orphan_ids_match() {
         let (_dir, store) = setup_store();
@@ -15741,9 +15676,7 @@ mod tests {
         );
     }
 
-    /// Quads committed without a diagnostics refresh — what a crash between the
-    /// quad commit and the diagnostics write leaves behind — must be repaired
-    /// promptly: at open, and by any read that sees the stale tag.
+    /// Open and reads repair diagnostics left stale by an interrupted writer.
     #[test]
     fn crash_repairs_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
@@ -15789,7 +15722,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
+            let mut clock = store.vector_clock_id(quad.graph).unwrap();
             clock.advance(actor, counter);
             store
                 .set_vector_clock(
@@ -15827,9 +15760,7 @@ mod tests {
                 "the read is served from the record open repaired"
             );
 
-            // Repair on read: dirty the graph again without refreshing
-            // diagnostics, then read. The clock tag no longer matches, so the
-            // reader must recompute rather than serve the stale set.
+            // A mismatched clock forces read-time recomputation.
             commit_orphan(&store, &graph, "urn:orphan:later");
             assert_eq!(
                 vec![
@@ -15841,9 +15772,7 @@ mod tests {
             );
             assert_eq!(2, store.diagnostics_compute_count());
 
-            // The read repaired what it served, not what is stored: the record
-            // is the search re-queue's baseline, so only a committing writer
-            // moves it.
+            // Only a committing writer advances the stored search baseline.
             settle_diagnostics(&store, &graph);
             store.persist().unwrap();
         }
@@ -15857,14 +15786,7 @@ mod tests {
         );
     }
 
-    /// A read may not touch the persisted diagnostics record.
-    ///
-    /// The record names the orphan set the search index was last brought in
-    /// step with, and `rebuild_graph_diagnostics` re-queues exactly the
-    /// difference against it. A reader that persisted its own recomputation —
-    /// the search worker is such a reader — would erase that difference without
-    /// indexing anything, and the entity whose visibility changed would never
-    /// be re-queued (G7).
+    /// Reads preserve the persisted diagnostics baseline used for search diffs.
     #[test]
     fn read_preserves_baseline() {
         let (_dir, store) = setup_store();
@@ -15894,9 +15816,7 @@ mod tests {
         );
     }
 
-    /// A repair that changes the orphan set must re-queue the affected
-    /// subjects, because orphans are invisible to search: otherwise the index
-    /// keeps showing an entity the store now hides (G6/G7).
+    /// Orphan visibility repairs re-queue affected search subjects.
     #[test]
     fn open_requeues_orphans() {
         let dir = tempfile::tempdir().unwrap();
@@ -15942,9 +15862,7 @@ mod tests {
         );
     }
 
-    /// The other direction: an entity the root adopted since the record was
-    /// written has to come *back* to search at open, or the restart leaves it
-    /// hidden (G7).
+    /// Open re-queues an entity adopted after the stored baseline.
     #[test]
     fn open_requeues_adopted() {
         let dir = tempfile::tempdir().unwrap();
@@ -15994,7 +15912,7 @@ mod tests {
         );
     }
 
-    // ── Durability under the fjall configuration (G10) ──────────────────
+    // Durability under the Fjall configuration.
 
     #[test]
     fn reopen_fingerprint_matches() {
@@ -16013,7 +15931,7 @@ mod tests {
 
             let _commit_guard = store.graph_commit_guard(&graph);
             let mut batch = store.new_batch();
-            let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+            let mut clock = store.vector_clock_id(graph_id).unwrap();
             for index in 0..ENTITIES {
                 let counter = store
                     .next_counter(&mut batch, CounterKey { graph_id, actor })
@@ -16101,15 +16019,13 @@ mod tests {
         store.commit(batch).unwrap();
 
         store
-            .clear_fts_queue_for_graph(&graph, store.current_dirty_token())
+            .clear_graph_queue(&graph, store.current_dirty_token())
             .unwrap();
         assert!(store.drain_fts_queue(10).unwrap().is_empty());
-        assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+        assert!(store.drain_reindex_queue(10).unwrap().is_empty());
     }
 
-    /// The delete scans the graph's queue keys without the queue lock, so an
-    /// enqueue landing before its commit used to outlive the deleted graph and
-    /// re-index a subject of a graph that no longer exists.
+    /// Graph deletion removes queue entries that raced before its commit.
     #[test]
     fn delete_sweeps_queue() {
         let (_dir, store) = setup_store();
@@ -16142,7 +16058,7 @@ mod tests {
         );
         assert_eq!(
             1,
-            store.drain_fts_delete_queue(10).unwrap().len(),
+            store.drain_delete_queue(10).unwrap().len(),
             "the delete's own queue entry must survive the sweep"
         );
     }
@@ -16165,9 +16081,7 @@ mod tests {
         total
     }
 
-    /// `manual_compact` must flush, not just request a compaction: without the
-    /// rotation there is nothing on disk to compact and the journal is never
-    /// reclaimed (C1/C2).
+    /// Manual compaction flushes memtables before reclaiming journals.
     #[test]
     fn compact_flushes_writes() {
         let dir = tempfile::tempdir().unwrap();
