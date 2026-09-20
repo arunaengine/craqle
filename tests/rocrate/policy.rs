@@ -4,13 +4,15 @@
 
 #![cfg(feature = "shacl-core")]
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleError, CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm,
-    GraphId, GraphPolicy, MaterializedQuadChange, PrepareRoCrateOptions, PreparedCommitMode,
-    PreparedGraphBase, RoCratePolicyOptions, RoCrateVersion, ShaclCompileOptions, ShaclError,
+    GraphId, GraphPolicy, MaterializedQuadChange, PrepareRoCrateOptions as PrepareOptions,
+    PreparedCommitMode, PreparedGraphBase, RoCratePolicyOptions as PolicyOptions, RoCrateVersion,
+    ShaclCompileOptions, ShaclError,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -159,12 +161,12 @@ fn policy_parses_once() {
             &AllowAllAuthorizer,
             &data,
             &jsonld,
-            &PrepareRoCrateOptions {
+            &PrepareOptions {
                 new_graph_policy: GraphPolicy {
                     public: true,
                     permission_paths: vec![],
                 },
-                ..PrepareRoCrateOptions::default()
+                ..PrepareOptions::default()
             },
         )
         .unwrap();
@@ -177,7 +179,7 @@ fn policy_parses_once() {
             &AllowAllAuthorizer,
             &prepared,
             &policy,
-            &RoCratePolicyOptions::default(),
+            &PolicyOptions::default(),
         )
         .unwrap();
     assert!(report.conforms);
@@ -211,7 +213,7 @@ fn policy_enforcement_atomic() {
             &AllowAllAuthorizer,
             &data,
             &document(&data, RoCrateVersion::V1_2, false, "Dataset", vec![]),
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .unwrap();
     assert!(prepared.structural_findings().is_empty());
@@ -250,7 +252,7 @@ fn replacements_fence_revisions() {
             &AllowAllAuthorizer,
             &data,
             &original,
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .unwrap();
     node.commit_prepared_rocrate_document(
@@ -266,7 +268,7 @@ fn replacements_fence_revisions() {
             &AllowAllAuthorizer,
             &data,
             &original,
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .unwrap();
     assert!(matches!(unchanged.base, PreparedGraphBase::Existing { .. }));
@@ -284,7 +286,7 @@ fn replacements_fence_revisions() {
             &AllowAllAuthorizer,
             &data,
             &document(&data, RoCrateVersion::V1_2, true, "Replacement", vec![]),
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .unwrap();
     node.commit_prepared_rocrate_document(
@@ -305,7 +307,7 @@ fn replacements_fence_revisions() {
             &AllowAllAuthorizer,
             &data,
             &document(&data, RoCrateVersion::V1_2, true, "Stale", vec![]),
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .unwrap();
     insert(
@@ -358,7 +360,7 @@ fn shapes_invalidate_policy() {
             &AllowAllAuthorizer,
             &data,
             &document(&data, RoCrateVersion::V1_2, true, "Dataset", vec![]),
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .unwrap();
     let imported_policy = compile_policy(&node, &root, RoCrateVersion::V1_2, true);
@@ -366,7 +368,7 @@ fn shapes_invalidate_policy() {
         &AllowAllAuthorizer,
         &prepared,
         &imported_policy,
-        &RoCratePolicyOptions::default(),
+        &PolicyOptions::default(),
     )
     .unwrap();
     insert(
@@ -407,7 +409,7 @@ fn shapes_invalidate_policy() {
             &AllowAllAuthorizer,
             &prepared,
             &root_policy,
-            &RoCratePolicyOptions::default(),
+            &PolicyOptions::default(),
         )
         .unwrap_err();
     assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
@@ -449,7 +451,7 @@ fn policy_failures_explicit() {
                 &AllowAllAuthorizer,
                 &data,
                 &document(&data, version, true, "Dataset", extras),
-                &PrepareRoCrateOptions::default(),
+                &PrepareOptions::default(),
             )
             .unwrap();
         assert_eq!(prepared.detected_version, version);
@@ -459,7 +461,7 @@ fn policy_failures_explicit() {
                 &AllowAllAuthorizer,
                 &prepared,
                 &policy,
-                &RoCratePolicyOptions::default(),
+                &PolicyOptions::default(),
             )
             .unwrap()
             .conforms
@@ -472,7 +474,7 @@ fn policy_failures_explicit() {
             &DenyAllAuthorizer,
             &denied,
             &document(&denied, RoCrateVersion::V1_2, true, "Dataset", vec![]),
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .is_err()
     );
@@ -485,7 +487,7 @@ fn policy_failures_explicit() {
             &AllowAllAuthorizer,
             &denied,
             "not json",
-            &PrepareRoCrateOptions::default(),
+            &PrepareOptions::default(),
         )
         .is_err()
     );

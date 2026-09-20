@@ -98,7 +98,7 @@ fn assert_unknown_version(error: CraqleError, expected: &str) {
     }
 }
 
-fn assert_unknown_on_every_import_route(jsonld: &str, expected: &str) {
+fn assert_unknown_imports(jsonld: &str, expected: &str) {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
 
@@ -143,17 +143,17 @@ fn supported_versions_roundtrip() {
         (
             RoCrateVersion::V1_1,
             "urn:fixture:rocrate:valid-1.1:root",
-            include_str!("fixtures/rocrate/valid-1.1.json"),
+            include_str!("../fixtures/rocrate/valid-1.1.json"),
         ),
         (
             RoCrateVersion::V1_2,
             "urn:fixture:rocrate:valid-1.2:root",
-            include_str!("fixtures/rocrate/valid-1.2.json"),
+            include_str!("../fixtures/rocrate/valid-1.2.json"),
         ),
         (
             RoCrateVersion::V1_3,
             "urn:fixture:rocrate:valid-1.3:root",
-            include_str!("fixtures/rocrate/valid-1.3.json"),
+            include_str!("../fixtures/rocrate/valid-1.3.json"),
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -302,7 +302,7 @@ fn contexts_resolve_offline() {
     node.apply_rocrate_document_checked_with_policy(
         &AllowAllAuthorizer,
         bioschemas.clone(),
-        include_str!("fixtures/rocrate/bioschemas-1.3.json"),
+        include_str!("../fixtures/rocrate/bioschemas-1.3.json"),
         policy(),
     )
     .unwrap();
@@ -325,11 +325,11 @@ fn contexts_resolve_offline() {
     for (graph, fixture) in [
         (
             GraphId::new("urn:test:version-custom-object"),
-            include_str!("fixtures/rocrate/custom-context-1.3.json"),
+            include_str!("../fixtures/rocrate/custom-1.3.json"),
         ),
         (
             GraphId::new("urn:test:version-custom-array"),
-            include_str!("fixtures/rocrate/context-array-1.3.json"),
+            include_str!("../fixtures/rocrate/array-1.3.json"),
         ),
     ] {
         let submitted: Value = serde_json::from_str(fixture).unwrap();
@@ -520,11 +520,11 @@ fn edits_preserve_version() {
     for (version, fixture) in [
         (
             RoCrateVersion::V1_1,
-            include_str!("fixtures/rocrate/valid-1.1.json"),
+            include_str!("../fixtures/rocrate/valid-1.1.json"),
         ),
         (
             RoCrateVersion::V1_2,
-            include_str!("fixtures/rocrate/valid-1.2.json"),
+            include_str!("../fixtures/rocrate/valid-1.2.json"),
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -556,12 +556,12 @@ fn edits_preserve_version() {
 
 #[test]
 fn imports_share_errors() {
-    assert_unknown_on_every_import_route(
-        include_str!("fixtures/rocrate/unknown-future-context.json"),
+    assert_unknown_imports(
+        include_str!("../fixtures/rocrate/unknown-future-context.json"),
         "https://w3id.org/ro/crate/9.9/context",
     );
-    assert_unknown_on_every_import_route(
-        include_str!("fixtures/rocrate/unknown-future-specification.json"),
+    assert_unknown_imports(
+        include_str!("../fixtures/rocrate/unknown-future-specification.json"),
         "https://w3id.org/ro/crate/9.9",
     );
 
@@ -572,7 +572,7 @@ fn imports_share_errors() {
         node.apply_rocrate_document_checked_with_policy(
             &AllowAllAuthorizer,
             graph,
-            include_str!("fixtures/rocrate/context-spec-mismatch.json"),
+            include_str!("../fixtures/rocrate/context-spec-mismatch.json"),
             policy(),
         ),
         Err(CraqleError::RoCrate(RoCrateError::VersionMismatch { .. }))

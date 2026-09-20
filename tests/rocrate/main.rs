@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -243,14 +244,14 @@ mod tests {
         node.append_new_root_data_entities(
             &writer,
             &graph,
-            benchmark_media_object_entities(
-                0,
-                250,
-                "append-bulk-keyword",
-                "Append Entity",
-                "append record",
-                "APPEND",
-            ),
+            benchmark_entities(EntityBatch {
+                start: 0,
+                count: 250,
+                keyword: "append-bulk-keyword",
+                name_prefix: "Append Entity",
+                description_label: "append record",
+                identifier_prefix: "APPEND",
+            }),
         )
         .unwrap();
         node.flush_search_updates().unwrap();
@@ -307,14 +308,14 @@ mod tests {
         node.append_new_root_data_entities(
             &writer,
             &graph,
-            benchmark_media_object_entities(
-                0,
-                25,
-                "graph-reindex-keyword",
-                "Graph Reindex Entity",
-                "graph reindex record",
-                "REINDEX",
-            ),
+            benchmark_entities(EntityBatch {
+                start: 0,
+                count: 25,
+                keyword: "graph-reindex-keyword",
+                name_prefix: "Graph Reindex Entity",
+                description_label: "graph reindex record",
+                identifier_prefix: "REINDEX",
+            }),
         )
         .unwrap();
 
@@ -585,22 +586,30 @@ mod tests {
         )
         .unwrap();
 
-        mgr0.add_data_entity_under(
+        mgr0.add_entity_under(
             &graph,
-            graph.as_str(),
-            "results/figures/",
-            "http://schema.org/Dataset",
-            "Figures Directory",
-            vec![],
+            (
+                graph.as_str(),
+                NewDataEntity {
+                    entity_id: "results/figures/".to_string(),
+                    entity_type: "http://schema.org/Dataset".to_string(),
+                    name: "Figures Directory".to_string(),
+                    additional_triples: vec![],
+                },
+            ),
         )
         .unwrap();
-        mgr0.add_data_entity_under(
+        mgr0.add_entity_under(
             &graph,
-            "results/figures/",
-            "results/figures/fig1.png",
-            "http://schema.org/MediaObject",
-            "Figure 1",
-            vec![],
+            (
+                "results/figures/",
+                NewDataEntity {
+                    entity_id: "results/figures/fig1.png".to_string(),
+                    entity_type: "http://schema.org/MediaObject".to_string(),
+                    name: "Figure 1".to_string(),
+                    additional_triples: vec![],
+                },
+            ),
         )
         .unwrap();
 
@@ -724,7 +733,7 @@ mod tests {
         assert!(summary.contains("Alice Example"));
         assert!(!summary.contains("sample.dat"));
 
-        let page = mgr.export_jsonld_page_after(&graph, None, 1).unwrap();
+        let page = mgr.export_page_after(&graph, None, 1).unwrap();
         assert!(page.jsonld.contains("sample.dat"));
         assert!(page.jsonld.contains("Alice Example"));
     }
@@ -754,7 +763,7 @@ mod tests {
             .unwrap();
         }
 
-        let first_page = mgr.export_jsonld_page_after(&graph, None, 2).unwrap();
+        let first_page = mgr.export_page_after(&graph, None, 2).unwrap();
         assert_eq!(first_page.total_data_entities, 5);
         assert_eq!(first_page.returned_data_entities, 2);
         assert_eq!(first_page.next_offset, None);
@@ -763,7 +772,7 @@ mod tests {
         assert!(first_page.jsonld.contains("cursor-1.dat"));
 
         let second_page = mgr
-            .export_jsonld_page_after(&graph, first_page.next_cursor.as_deref(), 2)
+            .export_page_after(&graph, first_page.next_cursor.as_deref(), 2)
             .unwrap();
         assert_eq!(second_page.total_data_entities, 5);
         assert_eq!(second_page.returned_data_entities, 2);
@@ -800,13 +809,13 @@ mod tests {
             .unwrap();
         }
         let cursor = mgr
-            .export_jsonld_page_after(&graph, None, 1)
+            .export_page_after(&graph, None, 1)
             .unwrap()
             .next_cursor
             .unwrap();
 
         let unknown = mgr
-            .export_jsonld_page_after(&graph, Some("./data/0.dat"), 1)
+            .export_page_after(&graph, Some("./data/0.dat"), 1)
             .unwrap_err();
         assert_eq!(unknown.kind(), CraqleErrorKind::InvalidInput);
 
@@ -819,13 +828,13 @@ mod tests {
         *corrupt.last_mut().unwrap() = replacement;
         let corrupt = String::from_utf8(corrupt).unwrap();
         assert_eq!(
-            mgr.export_jsonld_page_after(&graph, Some(&corrupt), 1)
+            mgr.export_page_after(&graph, Some(&corrupt), 1)
                 .unwrap_err()
                 .kind(),
             CraqleErrorKind::InvalidInput
         );
         assert_eq!(
-            mgr.export_jsonld_page_after(&other, Some(&cursor), 1)
+            mgr.export_page_after(&other, Some(&cursor), 1)
                 .unwrap_err()
                 .kind(),
             CraqleErrorKind::InvalidInput
@@ -840,7 +849,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mgr.export_jsonld_page_after(&graph, Some(&cursor), 1)
+            mgr.export_page_after(&graph, Some(&cursor), 1)
                 .unwrap_err()
                 .kind(),
             CraqleErrorKind::InvalidInput
@@ -1154,7 +1163,7 @@ mod tests {
         let page_value: serde_json::Value = serde_json::from_str(&page.jsonld).unwrap();
         assert!(context_mappings(&page_value["@context"]).contains_key("assayType"));
 
-        let page_after = mgr.export_jsonld_page_after(&graph, None, 10).unwrap();
+        let page_after = mgr.export_page_after(&graph, None, 10).unwrap();
         let after_value: serde_json::Value = serde_json::from_str(&page_after.jsonld).unwrap();
         assert!(context_mappings(&after_value["@context"]).contains_key("organism"));
     }
@@ -1514,14 +1523,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Orphan-bearing export fixtures (WS2-T1/T2/T3, charter G6).
-    //
-    // Every existing export test and every bench runs against a crate with an
-    // empty orphan set, so all of them take the orphan-free fast path. The
-    // fixtures below are the only coverage of the slow path where orphan
-    // hiding actually has to do something.
-    // ---------------------------------------------------------------------
+    // These fixtures exercise export behavior with a nonempty orphan set.
 
     const VISIBLE_ENTITIES: usize = 3000;
     const ORPHANED_ENTITIES: usize = 100;
@@ -1548,8 +1550,7 @@ mod tests {
             .collect()
     }
 
-    /// A typed data entity plus its name — the minimum that makes something a
-    /// data entity as far as `orphaned_data_entities` is concerned.
+    /// Returns the minimum triples that classify a named data entity.
     fn data_entity_triples(
         entity_id: &str,
         name: &str,
@@ -1568,9 +1569,7 @@ mod tests {
         ]
     }
 
-    /// Produce orphans through two individually valid writes: each replica
-    /// removes one of two reachability paths while partitioned, and the merge
-    /// removes both paths.
+    /// Produces orphans by merging two valid partitioned path removals.
     fn make_replicated_orphans(
         net: &mut CraqleCluster,
         graph: &GraphId,
@@ -1682,11 +1681,8 @@ mod tests {
         orphans: Vec<String>,
     }
 
-    /// A crate with [`VISIBLE_ENTITIES`] root-linked data entities and
-    /// [`ORPHANED_ENTITIES`] data entities that no `hasPart` chain reaches, so
-    /// the graph's diagnostics carry a non-empty orphan set. The first visible
-    /// entity also points at the first orphan through a non-`hasPart`
-    /// predicate, which pins the object side of orphan hiding.
+    /// Builds visible and orphaned entities plus a non-reachability reference
+    /// that exercises orphan hiding on both subject and object positions.
     fn orphan_fixture(net: &mut CraqleCluster, graph: &GraphId) -> OrphanFixture {
         manager(net.peer(0))
             .create_crate(
@@ -1756,7 +1752,7 @@ mod tests {
 
     /// One entity's `hasPart` ids, in emitted order. A single-element fan-out
     /// serializes as one object rather than an array.
-    fn entry_has_part_ids(entry: &serde_json::Value) -> Vec<String> {
+    fn entry_part_ids(entry: &serde_json::Value) -> Vec<String> {
         match &entry["hasPart"] {
             serde_json::Value::Null => Vec::new(),
             serde_json::Value::Object(single) => {
@@ -1770,8 +1766,8 @@ mod tests {
         }
     }
 
-    fn root_has_part_ids(document: &serde_json::Value, graph: &GraphId) -> Vec<String> {
-        entry_has_part_ids(graph_entry(document, graph.as_str()))
+    fn root_part_ids(document: &serde_json::Value, graph: &GraphId) -> Vec<String> {
+        entry_part_ids(graph_entry(document, graph.as_str()))
     }
 
     /// One entity's `@type` terms, whichever JSON shape they took.
@@ -1786,11 +1782,8 @@ mod tests {
         }
     }
 
-    /// RO-Crate 1.2, *Data Entities*: every data entity a crate contains MUST be
-    /// linked from the Root Data Entity by `hasPart`, directly or indirectly.
-    /// A view that emits one without such a path is not a crate at all — and
-    /// re-importing it correctly orphans the entity, losing it.
-    fn assert_data_entities_are_root_linked(document: &serde_json::Value, graph: &GraphId) {
+    /// Every exported data entity must be reachable from the root by `hasPart`.
+    fn assert_entities_linked(document: &serde_json::Value, graph: &GraphId) {
         let entries = document["@graph"].as_array().expect("@graph array");
         let mut reachable = std::collections::HashSet::from([graph.as_str().to_string()]);
         let mut queue = vec![graph.as_str().to_string()];
@@ -1801,7 +1794,7 @@ mod tests {
             else {
                 continue;
             };
-            for child in entry_has_part_ids(entry) {
+            for child in entry_part_ids(entry) {
                 if reachable.insert(child.clone()) {
                     queue.push(child);
                 }
@@ -1848,7 +1841,7 @@ mod tests {
         let full = parsed(&mgr.export_jsonld(&graph).unwrap());
         assert_hides_orphans(&full, &fixture);
         assert_eq!(
-            root_has_part_ids(&full, &graph),
+            root_part_ids(&full, &graph),
             fixture.visible,
             "the full export must list every visible entity and nothing else"
         );
@@ -1862,7 +1855,7 @@ mod tests {
         let summary = parsed(&mgr.export_jsonld_summary(&graph).unwrap());
         assert_hides_orphans(&summary, &fixture);
         assert!(
-            root_has_part_ids(&summary, &graph).is_empty(),
+            root_part_ids(&summary, &graph).is_empty(),
             "the summary view carries no data entities at all"
         );
 
@@ -1874,7 +1867,7 @@ mod tests {
             assert_eq!(page.total_data_entities, VISIBLE_ENTITIES);
             let document = parsed(&page.jsonld);
             assert_hides_orphans(&document, &fixture);
-            let ids = root_has_part_ids(&document, &graph);
+            let ids = root_part_ids(&document, &graph);
             assert_eq!(ids.len(), page.returned_data_entities);
             collected.extend(ids);
             match page.next_offset {
@@ -1892,12 +1885,12 @@ mod tests {
         let mut cursor: Option<String> = None;
         loop {
             let page = mgr
-                .export_jsonld_page_after(&graph, cursor.as_deref(), 250)
+                .export_page_after(&graph, cursor.as_deref(), 250)
                 .unwrap();
             assert_eq!(page.total_data_entities, VISIBLE_ENTITIES);
             let document = parsed(&page.jsonld);
             assert_hides_orphans(&document, &fixture);
-            let ids = root_has_part_ids(&document, &graph);
+            let ids = root_part_ids(&document, &graph);
             assert_eq!(ids.len(), page.returned_data_entities);
             collected.extend(ids);
             match page.next_cursor {
@@ -1927,11 +1920,7 @@ mod tests {
                 .jsonld,
         );
 
-        // Semantic JSON equality, not byte equality: these entities carry
-        // `dynamic_entity` properties, and upstream ro-crate-rs serializes those
-        // by iterating a `std::collections::HashMap`, so their key order is
-        // nondeterministic run to run. The `@context` has no dynamic properties,
-        // so it is compared byte for byte.
+        // Dynamic entity key order varies, while the context stays deterministic.
         assert_eq!(full["@graph"], paged["@graph"]);
         assert_eq!(
             serde_json::to_string(&full["@context"]).unwrap(),
@@ -1939,9 +1928,7 @@ mod tests {
         );
     }
 
-    /// An orphaned parent is invisible, so appending under it is "entity not
-    /// found" — the O(1) probes that replaced the fan-out decode must keep
-    /// answering that way (WS2-T2 hazard, G6).
+    /// Appending under an invisible orphan must still report "entity not found".
     #[test]
     fn append_rejects_orphan() {
         let (_dir, mut net) = setup_network(2);
@@ -1971,13 +1958,17 @@ mod tests {
         );
 
         let error = mgr
-            .add_data_entity_under(
+            .add_entity_under(
                 &graph,
-                orphan_parent,
-                "./data/child.dat",
-                "http://schema.org/MediaObject",
-                "Child",
-                vec![],
+                (
+                    orphan_parent,
+                    NewDataEntity {
+                        entity_id: "./data/child.dat".to_string(),
+                        entity_type: "http://schema.org/MediaObject".to_string(),
+                        name: "Child".to_string(),
+                        additional_triples: vec![],
+                    },
+                ),
             )
             .unwrap_err();
         assert!(
@@ -1987,23 +1978,22 @@ mod tests {
 
         // The same call under the visible root still succeeds, so the probe is
         // rejecting invisibility rather than everything.
-        mgr.add_data_entity_under(
+        mgr.add_entity_under(
             &graph,
-            graph.as_str(),
-            "./data/child.dat",
-            "http://schema.org/MediaObject",
-            "Child",
-            vec![],
+            (
+                graph.as_str(),
+                NewDataEntity {
+                    entity_id: "./data/child.dat".to_string(),
+                    entity_type: "http://schema.org/MediaObject".to_string(),
+                    name: "Child".to_string(),
+                    additional_triples: vec![],
+                },
+            ),
         )
         .unwrap();
     }
 
-    // ---------------------------------------------------------------------
-    // Writing to an orphaned entity (G6).
-    //
-    // Orphan hiding empties a subject's visible view, so a diff against that
-    // view emits no deletes and re-attachment resurfaces what it replaced.
-    // ---------------------------------------------------------------------
+    // Writes to hidden orphans must replace stored state before reattachment.
 
     const REWRITTEN_ID: &str = "./data/rewritten.dat";
     const STALE_NAME: &str = "Stale Name";
@@ -2040,7 +2030,7 @@ mod tests {
     }
 
     /// Every stored object of `REWRITTEN_ID` under one predicate, hidden
-    /// triples included — the state a write has to have replaced.
+    /// triples included, the state a write has to have replaced.
     fn stored_objects(
         node: &CraqleNode,
         graph: &GraphId,
@@ -2166,28 +2156,14 @@ mod tests {
         assert_fresh_entity(node, &graph);
     }
 
-    // ---------------------------------------------------------------------
-    // Orphan hiding across term kinds (G6).
-    //
-    // `oxjsonld` mints a blank node for every inline nested entity, so an
-    // orphan's id reaches `GraphDiagnostics::orphaned_entities` in N-Triples
-    // form: `<http://…>` becomes the bare IRI, but a blank node stays `_:b…`.
-    // A reader that re-encodes such an id as the IRI `<_:b…>` matches no
-    // interned term, so the orphan stays fully visible. The two fixtures below
-    // pin the blank-node and named-node paths side by side over the same four
-    // surfaces: export, SPARQL, search and describe.
-    // ---------------------------------------------------------------------
+    // Blank-node and named-node orphan ids require different term encoding.
+    // Both paths are checked through export, query, search, and describe.
 
     const DETACHED_NAME: &str = "Detached Nested Person";
     const LINKED_NAME: &str = "Linked Nested Person";
     const REFERRER_ID: &str = "./referrer.txt";
 
-    /// One nested entity in the two spellings the reads use: `id` is the bare
-    /// form that diagnostics, exported `@id`s and search hits carry, `term` the
-    /// N-Triples form that SPARQL bindings and describe pairs carry. For a
-    /// blank node the two coincide (`_:b…`); for a named node they differ
-    /// (`#linked` versus `<#linked>`), which is precisely why an orphan id has
-    /// to be re-encoded per term kind instead of wrapped in angle brackets.
+    /// Keeps the bare read id beside its N-Triples term representation.
     struct NestedEntity {
         id: String,
         term: EncodedTerm,
@@ -2210,14 +2186,8 @@ mod tests {
         linked: NestedEntity,
     }
 
-    /// A crate whose root references two nested entities — one over `creator`,
-    /// one over `mentions` — plus one named file under `hasPart`. The
-    /// `mentions` target is then turned into an unreachable data entity by
-    /// giving it a `hasPart` edge of its own: `hasPart` membership is what
-    /// makes something a data entity, and nothing links the root to it, so it
-    /// becomes an orphan while a live triple still points at it. `inline`
-    /// selects whether the nested entities are written inline (which the
-    /// importer mints as blank nodes) or with explicit `@id`s.
+    /// Builds linked and orphaned nested entities as blank or named nodes.
+    /// A live `mentions` edge keeps the object-side hiding case observable.
     fn nested_entity_fixture(
         net: &mut CraqleCluster,
         graph: &GraphId,
@@ -2344,9 +2314,7 @@ mod tests {
         .collect()
     }
 
-    /// Every subject `search` returns for `query`, plus every object
-    /// `search_resources` hydrates those hits with, once the index has caught
-    /// up with the store.
+    /// Collects search subjects and hydrated objects after indexing catches up.
     #[cfg(feature = "search")]
     fn searched_terms(node: &CraqleNode, query: &str) -> Vec<String> {
         node.flush_search_updates().unwrap();
@@ -2370,10 +2338,8 @@ mod tests {
             .collect()
     }
 
-    /// Export, SPARQL, search and describe must all hide the orphan, drop the
-    /// live `mentions` triple that still points at it, and keep the reachable
-    /// sibling — whether the nested entities are blank nodes or named nodes.
-    fn assert_orphan_hidden_everywhere(net: &mut CraqleCluster, graph: &GraphId, inline: bool) {
+    /// Every read surface must hide the orphan and keep its reachable sibling.
+    fn assert_orphan_hidden(net: &mut CraqleCluster, graph: &GraphId, inline: bool) {
         let entities = nested_entity_fixture(net, graph, inline);
         let node = net.peer(0);
 
@@ -2432,12 +2398,12 @@ mod tests {
         );
     }
 
-    /// An orphan imported as a blank node — the path that was uncovered.
+    /// An orphan imported as a blank node exercises the uncovered path.
     #[test]
     fn orphan_blank_hidden() {
         let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-blank-node");
-        assert_orphan_hidden_everywhere(&mut net, &graph, true);
+        assert_orphan_hidden(&mut net, &graph, true);
     }
 
     /// The named-node twin, so the two encodings stay pinned side by side.
@@ -2445,12 +2411,10 @@ mod tests {
     fn orphan_named_hidden() {
         let (_dir, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:orphan-named-node");
-        assert_orphan_hidden_everywhere(&mut net, &graph, false);
+        assert_orphan_hidden(&mut net, &graph, false);
     }
 
-    /// The inverse of orphan hiding: a blank node that no diagnostics entry
-    /// names stays fully visible. Encoding orphan ids correctly must not turn
-    /// into hiding every blank node.
+    /// A blank node absent from diagnostics must remain visible everywhere.
     #[test]
     fn linked_blank_visible() {
         let (_dir, mut net) = setup_network(2);
@@ -2482,16 +2446,8 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // Blank nodes are addressable entities (write path).
-    //
-    // Every read hands blank-node ids back in bare `_:b0` form — search hits,
-    // `describe_subject`, exported `@id`s, page cursors — so a caller can and
-    // will feed one straight back into a write. The write path therefore has to
-    // encode an entity id exactly the way the read path does. Wrapping `_:b0` as
-    // the IRI `<_:b0>` yields a *different* term: the write reports success and
-    // then no reader ever resolves it.
-    // ---------------------------------------------------------------------
+    // Read surfaces return bare blank-node ids that callers can pass to writes.
+    // Encoding them as IRIs writes an unreachable, distinct term.
 
     const RENAMED: &str = "Renamed Nested Person";
 
@@ -2506,10 +2462,7 @@ mod tests {
             .collect()
     }
 
-    /// A property update addressed by a blank-node id must land on the term the
-    /// reads resolve. `update_property` with `old_value: None` is replace-all, so
-    /// a write that misses also fails to delete: the stale value survives beside
-    /// a new one nothing can see.
+    /// A replace-all update by blank-node id must modify the term reads resolve.
     #[test]
     fn blank_update_visible() {
         let (_dir, mut net) = setup_network(2);
@@ -2596,7 +2549,7 @@ mod tests {
 
     /// The root's `hasPart` objects read straight off the store, as bare ids.
     /// Ground truth for the walk below, independent of the export renderer.
-    fn root_part_ids(node: &CraqleNode, graph: &GraphId) -> std::collections::BTreeSet<String> {
+    fn stored_part_ids(node: &CraqleNode, graph: &GraphId) -> std::collections::BTreeSet<String> {
         let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
         snapshot_terms(node, graph)
             .into_iter()
@@ -2621,24 +2574,21 @@ mod tests {
         mixed_part_fixture(&node, &graph);
         let mgr = manager(&node);
 
-        let expected = root_part_ids(&node, &graph);
+        let expected = stored_part_ids(&node, &graph);
         assert_eq!(
             expected.iter().filter(|id| id.starts_with("_:")).count(),
             2,
             "fixture must link two blank-node parts from the root: {expected:?}"
         );
 
-        // One entity per page, so every cursor is emitted from — and fed back
-        // as — a single entity id, two of the three of them blank nodes.
+        // One entity per page makes every cursor a single entity id.
         let mut collected: Vec<String> = Vec::new();
         let mut cursors: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..expected.len() {
-            let page = mgr
-                .export_jsonld_page_after(&graph, cursor.as_deref(), 1)
-                .unwrap();
+            let page = mgr.export_page_after(&graph, cursor.as_deref(), 1).unwrap();
             assert_eq!(page.total_data_entities, expected.len());
-            let ids = root_has_part_ids(&parsed(&page.jsonld), &graph);
+            let ids = root_part_ids(&parsed(&page.jsonld), &graph);
             assert_eq!(
                 ids.len(),
                 page.returned_data_entities,
@@ -2668,9 +2618,7 @@ mod tests {
         );
     }
 
-    /// The import context register is a two-phase, publish-first LWW register
-    /// (G4/G5): re-running an unchanged import leaves it exactly as it was, and
-    /// an import carrying a different context replaces it.
+    /// Reimport preserves an unchanged context and replaces a changed one.
     #[test]
     fn context_retry_idempotent() {
         let (_tmp, net) = setup_network(1);
@@ -2686,9 +2634,7 @@ mod tests {
             "the custom context should be stored after the first import"
         );
 
-        // Re-importing the same document: phase 1 is an empty quad diff and
-        // phase 2's `current == context` guard trips, so nothing is republished
-        // and the register is byte-identical.
+        // An unchanged context must not be republished.
         mgr.import_jsonld(graph.clone(), &document).unwrap();
         let replayed = parsed(&mgr.export_jsonld(&graph).unwrap())["@context"].clone();
         assert_eq!(
@@ -2713,14 +2659,7 @@ mod tests {
         );
     }
 
-    /// Import must *compute* the orphan set, never assert it.
-    ///
-    /// The import paths apply their changes with `DiagnosticsPlan::DEFERRED`, so
-    /// nothing settles diagnostics for them; they must therefore call
-    /// `rebuild_graph_diagnostics`. Stamping `GraphDiagnostics::default()`
-    /// instead writes a wrong set under a *matching* clock tag, which both the
-    /// read-time tag check and the open-time repair then accept as fresh —
-    /// permanently losing every orphan the graph really has.
+    /// Import must rebuild the orphan set instead of stamping empty diagnostics.
     #[test]
     fn reimport_preserves_orphans() {
         let (_tmp, mut net) = setup_network(2);
@@ -2819,14 +2758,7 @@ mod tests {
         .to_string()
     }
 
-    /// Every export view is itself a valid crate.
-    ///
-    /// The summary view is the one that used to break this: it emitted profile
-    /// artifacts as data entities while re-deriving the root's `hasPart` from
-    /// the (empty) page, so nothing linked them. Checked across the full,
-    /// summary and both paged views so a regression on any export path shows up
-    /// here, and closed by re-importing the summary: a view whose data entities
-    /// are all root-linked orphans nothing.
+    /// Every full, summary, and paged export must remain a root-linked crate.
     #[test]
     fn views_link_entities() {
         let (_tmp, net) = setup_network(1);
@@ -2837,11 +2769,11 @@ mod tests {
             .unwrap();
 
         let full = parsed(&mgr.export_jsonld(&graph).unwrap());
-        assert_data_entities_are_root_linked(&full, &graph);
+        assert_entities_linked(&full, &graph);
 
         let summary_json = mgr.export_jsonld_summary(&graph).unwrap();
         let summary = parsed(&summary_json);
-        assert_data_entities_are_root_linked(&summary, &graph);
+        assert_entities_linked(&summary, &graph);
         assert!(
             graph_ids(&summary).contains(&"./profile/mode.json".to_string()),
             "the fixture must put a data entity in the summary, or this proves nothing"
@@ -2855,12 +2787,9 @@ mod tests {
             let mut offset = 0usize;
             loop {
                 let page = mgr.export_jsonld_page(&graph, offset, limit).unwrap();
-                assert_data_entities_are_root_linked(&parsed(&page.jsonld), &graph);
-                let after = mgr
-                    .export_jsonld_page_after(&graph, None, limit)
-                    .unwrap()
-                    .jsonld;
-                assert_data_entities_are_root_linked(&parsed(&after), &graph);
+                assert_entities_linked(&parsed(&page.jsonld), &graph);
+                let after = mgr.export_page_after(&graph, None, limit).unwrap().jsonld;
+                assert_entities_linked(&parsed(&after), &graph);
                 match page.next_offset {
                     Some(next) => offset = next,
                     None => break,

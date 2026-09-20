@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 use craqle::{
