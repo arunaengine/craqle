@@ -2802,107 +2802,93 @@ impl StoreReadSnapshot {
         self.qv_count(store, IndexCounterKey::Total, false)
     }
 
-    pub(crate) fn qv_total_count(&self, store: &GraphStore) -> Result<Option<u64>> {
-        self.qv_count(store, QueryIndexCounterKey::Total, false)
-    }
-
-    pub(crate) fn qv_union_duplicate_free(&self, store: &GraphStore) -> Result<Option<bool>> {
-        Ok(
-            match store.query_index_counter_from_snapshot(
-                &self.snapshot,
-                QueryIndexCounterKey::UnionDuplicateFree,
-            )? {
-                QueryIndexCounterRead::Value(0) => Some(false),
-                QueryIndexCounterRead::Value(1) => Some(true),
-                QueryIndexCounterRead::Missing
-                | QueryIndexCounterRead::Malformed
-                | QueryIndexCounterRead::Value(_) => None,
-            },
-        )
-    }
-
-    pub(crate) fn qv_p_count(&self, store: &GraphStore, predicate: TermId) -> Result<Option<u64>> {
-        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
-            return Ok(Some(0));
+    pub(crate) fn qv_stat(&self, store: &GraphStore, read: &QvRead<'_>) -> Result<Option<u64>> {
+        let map = |term: TermId| -> Result<Option<QueryTermId>> {
+            read.costs.planner_points(1);
+            let Some(spaces) = store.active_query_spaces(&self.snapshot)? else {
+                return Ok(None);
+            };
+            let value = self
+                .snapshot
+                .get(spaces.term_to_query, term.to_be_bytes())?;
+            read.costs
+                .forward_mapping(16 + value.as_ref().map_or(0, |value| value.len() as u64));
+            value
+                .map(|value| decode_query_id(value.as_ref(), "term-to-query mapping"))
+                .transpose()
         };
-        self.qv_count(store, QueryIndexCounterKey::Predicate(predicate), true)
-    }
-
-    pub(crate) fn qv_po_count(
-        &self,
-        store: &GraphStore,
-        predicate: TermId,
-        object: TermId,
-    ) -> Result<Option<u64>> {
-        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
-            return Ok(Some(0));
+        let (key, zero_missing) = match read.stat {
+            QvStat::Graph(graph) => {
+                let Some(graph) = map(graph)? else {
+                    return Ok(Some(0));
+                };
+                (IndexCounterKey::Graph(graph), false)
+            }
+            QvStat::Total => (IndexCounterKey::Total, false),
+            QvStat::UnionUnique => (IndexCounterKey::UnionDuplicateFree, false),
+            QvStat::Predicate(predicate) => {
+                let Some(predicate) = map(predicate)? else {
+                    return Ok(Some(0));
+                };
+                (IndexCounterKey::Predicate(predicate), true)
+            }
+            QvStat::PredicateObject(predicate, object) => {
+                let Some(predicate) = map(predicate)? else {
+                    return Ok(Some(0));
+                };
+                let Some(object) = map(object)? else {
+                    return Ok(Some(0));
+                };
+                (IndexCounterKey::PredicateObject(predicate, object), true)
+            }
+            QvStat::GraphPredicate(graph, predicate) => {
+                let Some(graph) = map(graph)? else {
+                    return Ok(Some(0));
+                };
+                let Some(predicate) = map(predicate)? else {
+                    return Ok(Some(0));
+                };
+                (IndexCounterKey::GraphPredicate(graph, predicate), true)
+            }
+            QvStat::GraphPredicateObject(graph, predicate, object) => {
+                let Some(graph) = map(graph)? else {
+                    return Ok(Some(0));
+                };
+                let Some(predicate) = map(predicate)? else {
+                    return Ok(Some(0));
+                };
+                let Some(object) = map(object)? else {
+                    return Ok(Some(0));
+                };
+                (
+                    IndexCounterKey::GraphPredicateObject(graph, predicate, object),
+                    true,
+                )
+            }
         };
-        let Some(object) = store.query_term_id_from_snapshot(&self.snapshot, object)? else {
-            return Ok(Some(0));
-        };
-        self.qv_count(
-            store,
-            QueryIndexCounterKey::PredicateObject(predicate, object),
-            true,
-        )
-    }
-
-    pub(crate) fn qv_gp_count(
-        &self,
-        store: &GraphStore,
-        graph: TermId,
-        predicate: TermId,
-    ) -> Result<Option<u64>> {
-        let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
-            return Ok(Some(0));
-        };
-        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
-            return Ok(Some(0));
-        };
-        self.qv_count(
-            store,
-            QueryIndexCounterKey::GraphPredicate(graph, predicate),
-            true,
-        )
-    }
-
-    pub(crate) fn qv_gpo_count(
-        &self,
-        store: &GraphStore,
-        graph: TermId,
-        predicate: TermId,
-        object: TermId,
-    ) -> Result<Option<u64>> {
-        let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
-            return Ok(Some(0));
-        };
-        let Some(predicate) = store.query_term_id_from_snapshot(&self.snapshot, predicate)? else {
-            return Ok(Some(0));
-        };
-        let Some(object) = store.query_term_id_from_snapshot(&self.snapshot, object)? else {
-            return Ok(Some(0));
-        };
-        self.qv_count(
-            store,
-            QueryIndexCounterKey::GraphPredicateObject(graph, predicate, object),
-            true,
-        )
-    }
-
-    fn qv_count(
-        &self,
-        store: &GraphStore,
-        key: QueryIndexCounterKey,
-        zero_missing: bool,
-    ) -> Result<Option<u64>> {
-        match store.query_index_counter_from_snapshot(&self.snapshot, key)? {
-            QueryIndexCounterRead::Value(count) => Ok(Some(count)),
-            QueryIndexCounterRead::Missing if zero_missing => Ok(Some(0)),
-            QueryIndexCounterRead::Missing | QueryIndexCounterRead::Malformed => Ok(None),
+        read.costs.planner_points(2);
+        match store.snapshot_counter(&self.snapshot, key)? {
+            IndexCounterRead::Value(count) => Ok(Some(count)),
+            IndexCounterRead::Missing if zero_missing => Ok(Some(0)),
+            IndexCounterRead::Missing | IndexCounterRead::Malformed => Ok(None),
         }
     }
 
-    pub(crate) fn contains_graph_by_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
+    #[cfg(test)]
+    fn qv_count(
+        &self,
+        store: &GraphStore,
+        key: IndexCounterKey,
+        zero_missing: bool,
+    ) -> Result<Option<u64>> {
+        match store.snapshot_counter(&self.snapshot, key)? {
+            IndexCounterRead::Value(count) => Ok(Some(count)),
+            IndexCounterRead::Missing if zero_missing => Ok(Some(0)),
+            IndexCounterRead::Missing | IndexCounterRead::Malformed => Ok(None),
+        }
+    }
+
+    pub(crate) fn contains_graph_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
         Ok(self
             .snapshot
             .get(&store.graphs, graph_meta_key(graph))?
@@ -2914,7 +2900,7 @@ impl StoreReadSnapshot {
         Ok(*blake3::hash(&postcard::to_allocvec(&clock)?).as_bytes())
     }
 
-    pub(crate) fn graph_term_id_iter<'a>(
+    pub(crate) fn graph_term_iter<'a>(
         &'a self,
         store: &'a GraphStore,
     ) -> impl Iterator<Item = Result<TermId>> + 'a {
@@ -2943,7 +2929,7 @@ impl StoreReadSnapshot {
         }
         Err(StoreError::TermCollision {
             attempted: term.0.clone(),
-            existing: decode_term_utf8(existing.as_ref())?,
+            existing: decode_term_text(existing.as_ref())?,
         })
     }
 
@@ -2963,17 +2949,14 @@ impl StoreReadSnapshot {
         ))
     }
 
-    /// Returns the orphan ids implied by this exact snapshot. A matching
-    /// persisted diagnostic record is cheap; stale or absent records are
-    /// recomputed from snapshot quads and are never persisted or globally
-    /// cached by reads.
+    /// Returns orphan ids derived from this exact snapshot without persisting reads.
     pub(crate) fn orphaned_entity_ids(
         &self,
         store: &GraphStore,
         context: &crate::query::context::ReadContext<'_>,
         graph: TermId,
     ) -> Result<HashSet<TermId>> {
-        if !self.contains_graph_by_id(store, graph)? {
+        if !self.contains_graph_id(store, graph)? {
             return Ok(HashSet::new());
         }
         let clock = store.snapshot_vector_clock(&self.snapshot, graph)?;
@@ -3007,28 +2990,61 @@ impl StoreReadSnapshot {
             ],
             has_part: id(crate::core::vocab::schema_has_part())?,
         };
-        store.snapshot_orphaned_entity_ids(&self.snapshot, context, graph, &vocab)
+        store.snapshot_orphan_ids(&self.snapshot, context, graph, &vocab)
     }
 }
 
 impl GraphStore {
+    fn query_spaces(&self, slot: IndexSlot) -> IndexSpaces<'_> {
+        match slot {
+            IndexSlot::Primary => IndexSpaces {
+                gspo: &self.qv2_gspo,
+                gpos: &self.qv2_gpos,
+                spog: &self.qv2_spog,
+                posg: &self.qv2_posg,
+                ospg: &self.qv2_ospg,
+                gosp: &self.qv2_gosp,
+                term_to_query: &self.primary_term_map,
+                query_to_term: &self.primary_query_map,
+                meta: &self.qv2_meta,
+            },
+            IndexSlot::Secondary => IndexSpaces {
+                gspo: &self.qv3_gspo,
+                gpos: &self.qv3_gpos,
+                spog: &self.qv3_spog,
+                posg: &self.qv3_posg,
+                ospg: &self.qv3_ospg,
+                gosp: &self.qv3_gosp,
+                term_to_query: &self.secondary_term_map,
+                query_to_term: &self.secondary_query_map,
+                meta: &self.qv3_meta,
+            },
+        }
+    }
+
+    fn active_query_spaces(&self, snapshot: &Snapshot) -> Result<Option<IndexSpaces<'_>>> {
+        let slot = match self.snapshot_index_header(snapshot)? {
+            IndexHeaderRead::Valid(header) => IndexSlot::decode(header.active_slot),
+            IndexHeaderRead::Legacy(_) => Some(IndexSlot::Primary),
+            IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
+        };
+        Ok(slot.map(|slot| self.query_spaces(slot)))
+    }
+
     fn term_lock_index(&self, id: TermId) -> usize {
         (id.0 as usize) % self.term_locks.len()
     }
 
-    // ── Locking ────────────────────────────────────────────────────
+    // Locking.
 
-    /// Serialize the whole read→write→commit cycle for `graph`.
-    ///
-    /// See [`GraphCommitGuard`] for the lock order and the list of
-    /// self-guarding functions that must not be called while this is held.
+    /// Serializes the complete read-write-commit cycle for one graph.
     pub(crate) fn graph_commit_guard(&self, graph: &GraphId) -> GraphCommitGuard<'_> {
-        self.graph_commit_guard_by_id(hash_term(&EncodedTerm::from_named_node(&graph.0)))
+        self.graph_id_guard(hash_term(&EncodedTerm::from_named_node(&graph.0)))
     }
 
     /// Id-keyed twin of [`GraphStore::graph_commit_guard`]. The shard is chosen
     /// from the graph term id, so both entry points map to the same lock.
-    pub(crate) fn graph_commit_guard_by_id(&self, graph_id: TermId) -> GraphCommitGuard<'_> {
+    pub(crate) fn graph_id_guard(&self, graph_id: TermId) -> GraphCommitGuard<'_> {
         let shard = (graph_id.0 as usize) % self.commit_locks.len();
         #[cfg(feature = "shacl-core")]
         let wait_started = Instant::now();
@@ -3036,9 +3052,29 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(feature = "shacl-core")]
-        self.graph_commit_lock_wait_ns
+        self.graph_lock_wait
             .fetch_add(elapsed_ns(wait_started.elapsed()), Ordering::Relaxed);
         GraphCommitGuard(guard)
+    }
+
+    /// Order publication and local apply without coupling independent stores.
+    pub(crate) fn graph_write_guard(&self, graph: &GraphId) -> GraphWriteGuard<'_> {
+        let hash = blake3::hash(graph.as_str().as_bytes());
+        let shard = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap()) as usize;
+        let guard = self.write_locks[shard % self.write_locks.len()]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        GraphWriteGuard(guard)
+    }
+
+    /// Hold through receipt staging and source commit for one stable identity.
+    pub(crate) fn receipt_guard(&self, id: &MutationId) -> ReceiptGuard<'_> {
+        let shard = u64::from_be_bytes(id.0[..8].try_into().unwrap()) as usize;
+        ReceiptGuard(
+            self.receipt_locks[shard % self.receipt_locks.len()]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     #[cfg(feature = "shacl-core")]
@@ -3048,12 +3084,12 @@ impl GraphStore {
             .binding_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        self.binding_lock_wait_ns
+        self.binding_wait_ns
             .fetch_add(elapsed_ns(wait_started.elapsed()), Ordering::Relaxed);
         BindingGuard {
             guard,
             hold_started: Instant::now(),
-            hold_ns: &self.binding_lock_hold_ns,
+            hold_ns: &self.binding_hold_ns,
         }
     }
 
@@ -3085,16 +3121,16 @@ impl GraphStore {
     #[cfg(feature = "shacl-core")]
     pub(crate) fn shacl_runtime_statistics(&self) -> crate::ShaclRuntimeStatistics {
         crate::ShaclRuntimeStatistics {
-            binding_lock_wait_ns: self.binding_lock_wait_ns.load(Ordering::Relaxed),
-            binding_lock_hold_ns: self.binding_lock_hold_ns.load(Ordering::Relaxed),
-            graph_commit_lock_wait_ns: self.graph_commit_lock_wait_ns.load(Ordering::Relaxed),
+            binding_lock_wait_ns: self.binding_wait_ns.load(Ordering::Relaxed),
+            binding_lock_hold_ns: self.binding_hold_ns.load(Ordering::Relaxed),
+            graph_commit_lock_wait_ns: self.graph_lock_wait.load(Ordering::Relaxed),
             validation_ns: self.validation_ns.load(Ordering::Relaxed),
             settlement_ns: self.settlement_ns.load(Ordering::Relaxed),
             settlement_failures: self.settlement_failures.load(Ordering::Relaxed),
             status_bindings_read: self.status_bindings_read.load(Ordering::Relaxed),
             status_version_checks: self.status_version_checks.load(Ordering::Relaxed),
             status_shape_compilations: self.status_shape_compilations.load(Ordering::Relaxed),
-            status_full_shape_scans: self.status_full_shape_scans.load(Ordering::Relaxed),
+            status_full_shape_scans: self.status_shape_scans.load(Ordering::Relaxed),
         }
     }
 
@@ -3134,84 +3170,101 @@ impl GraphStore {
         self.validation_active.load(Ordering::SeqCst)
     }
 
-    fn indexes_read(&self) -> RwLockReadGuard<'_, IndexState> {
+    fn indexes_read(&self) -> ReadGuard<'_, IndexState> {
         self.indexes.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn indexes_write(&self) -> RwLockWriteGuard<'_, IndexState> {
+    fn indexes_write(&self) -> WriteGuard<'_, IndexState> {
         self.indexes.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn query_index_header_from_snapshot(
-        &self,
-        snapshot: &Snapshot,
-    ) -> Result<QueryIndexHeaderRead> {
-        Ok(
-            match snapshot.get(&self.qv2_meta, QUERY_INDEX_HEADER_KEY)? {
-                Some(bytes) => decode_query_index_header(bytes.as_ref()),
-                None => QueryIndexHeaderRead::Absent,
-            },
-        )
+    fn snapshot_index_header(&self, snapshot: &Snapshot) -> Result<IndexHeaderRead> {
+        let Some(bytes) = snapshot.get(&self.qv2_meta, QV_HEADER_KEY)? else {
+            return Ok(IndexHeaderRead::Absent);
+        };
+        if bytes.len() >= 8 && bytes.as_ref()[..4] == QV_HEADER_MAGIC {
+            let version = u32::from_be_bytes(bytes.as_ref()[4..8].try_into().unwrap());
+            if version > QV_SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedIndexFormat {
+                    found: version,
+                    supported: QV_SCHEMA_VERSION,
+                });
+            }
+        }
+        Ok(decode_index_header(bytes.as_ref()))
     }
 
-    fn stage_query_index_header(
-        &self,
-        batch: &mut fjall::OwnedWriteBatch,
-        header: &QueryIndexHeader,
-    ) {
-        batch.insert(
-            &self.qv2_meta,
-            QUERY_INDEX_HEADER_KEY,
-            encode_query_index_header(header),
-        );
+    fn query_header_digest(&self, snapshot: &Snapshot) -> Result<[u8; 32]> {
+        let mut hash = blake3::Hasher::new();
+        match snapshot.get(&self.qv2_meta, QV_HEADER_KEY)? {
+            Some(value) => {
+                hash.update(&[1]);
+                hash.update(value.as_ref());
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
+        Ok(*hash.finalize().as_bytes())
     }
 
-    fn stage_query_index_failed(
+    fn stage_index_header(&self, batch: &mut fjall::OwnedWriteBatch, header: &IndexHeader) {
+        batch.insert(&self.qv2_meta, QV_HEADER_KEY, encode_index_header(header));
+    }
+
+    fn stage_index_failure(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
-        previous: Option<&QueryIndexHeader>,
+        previous: Option<&IndexHeader>,
         reason: &'static str,
     ) {
-        self.stage_query_index_header(batch, &QueryIndexHeader::failed_from(previous, reason));
+        self.stage_index_header(batch, &IndexHeader::failed_from(previous, reason));
     }
 
-    fn query_term_id_from_snapshot(
-        &self,
-        snapshot: &Snapshot,
-        term: TermId,
-    ) -> Result<Option<QueryTermId>> {
+    fn snapshot_query_id(&self, snapshot: &Snapshot, term: TermId) -> Result<Option<QueryTermId>> {
+        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+            return Ok(None);
+        };
         snapshot
-            .get(&self.qv2_term_to_query, term.to_be_bytes())?
-            .map(|value| decode_query_term_id_value(value.as_ref(), "term-to-query mapping"))
+            .get(spaces.term_to_query, term.to_be_bytes())?
+            .map(|value| decode_query_id(value.as_ref(), "term-to-query mapping"))
             .transpose()
     }
 
-    fn source_term_id_from_snapshot(
-        &self,
-        snapshot: &Snapshot,
-        term: QueryTermId,
-    ) -> Result<Option<TermId>> {
-        snapshot
-            .get(&self.qv2_query_to_term, term.to_be_bytes())?
-            .map(|value| decode_query_source_term_value(value.as_ref(), "query-to-term mapping"))
-            .transpose()
-    }
-
-    fn query_quad_from_snapshot(
+    #[cfg(test)]
+    fn snapshot_query_quad(
         &self,
         snapshot: &Snapshot,
         quad: EncodedQuad,
     ) -> Result<Option<QueryQuad>> {
-        let Some(graph) = self.query_term_id_from_snapshot(snapshot, quad.graph)? else {
+        let Some(spaces) = self.active_query_spaces(snapshot)? else {
             return Ok(None);
         };
-        let Some(subject) = self.query_term_id_from_snapshot(snapshot, quad.subject)? else {
+        self.spaces_query_quad(snapshot, spaces, quad)
+    }
+
+    fn spaces_query_quad(
+        &self,
+        snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
+        quad: EncodedQuad,
+    ) -> Result<Option<QueryQuad>> {
+        let decode = |term: TermId| {
+            snapshot
+                .get(spaces.term_to_query, term.to_be_bytes())?
+                .map(|value| decode_query_id(value.as_ref(), "term-to-query mapping"))
+                .transpose()
+        };
+        let Some(graph) = decode(quad.graph)? else {
             return Ok(None);
         };
-        let Some(predicate) = self.query_term_id_from_snapshot(snapshot, quad.predicate)? else {
+        let Some(subject) = decode(quad.subject)? else {
             return Ok(None);
         };
-        let Some(object) = self.query_term_id_from_snapshot(snapshot, quad.object)? else {
+        let Some(predicate) = decode(quad.predicate)? else {
+            return Ok(None);
+        };
+        let Some(object) = decode(quad.object)? else {
             return Ok(None);
         };
         Ok(Some(QueryQuad {
@@ -3222,21 +3275,28 @@ impl GraphStore {
         }))
     }
 
-    fn source_quad_from_snapshot(
+    fn spaces_source_quad(
         &self,
         snapshot: &Snapshot,
+        spaces: IndexSpaces<'_>,
         quad: QueryQuad,
     ) -> Result<Option<EncodedQuad>> {
-        let Some(graph) = self.source_term_id_from_snapshot(snapshot, quad.graph)? else {
+        let decode = |term: QueryTermId| {
+            snapshot
+                .get(spaces.query_to_term, term.to_be_bytes())?
+                .map(|value| decode_source_id(value.as_ref(), "query-to-term mapping"))
+                .transpose()
+        };
+        let Some(graph) = decode(quad.graph)? else {
             return Ok(None);
         };
-        let Some(subject) = self.source_term_id_from_snapshot(snapshot, quad.subject)? else {
+        let Some(subject) = decode(quad.subject)? else {
             return Ok(None);
         };
-        let Some(predicate) = self.source_term_id_from_snapshot(snapshot, quad.predicate)? else {
+        let Some(predicate) = decode(quad.predicate)? else {
             return Ok(None);
         };
-        let Some(object) = self.source_term_id_from_snapshot(snapshot, quad.object)? else {
+        let Some(object) = decode(quad.object)? else {
             return Ok(None);
         };
         Ok(Some(EncodedQuad {
@@ -3247,14 +3307,14 @@ impl GraphStore {
         }))
     }
 
-    fn count_live_source_rows(&self, snapshot: &Snapshot) -> Result<u64> {
+    fn count_live_rows(&self, snapshot: &Snapshot) -> Result<u64> {
         let mut rows = 0u64;
         for guard in snapshot.iter(&self.quads) {
             let (_, value) = guard.into_inner()?;
-            if !dot_payload_is_empty(value.as_ref()) {
+            if !dots_empty(value.as_ref()) {
                 rows = rows
                     .checked_add(1)
-                    .ok_or(StoreError::QueryIndexVerificationFailed(
+                    .ok_or(StoreError::IndexVerificationFailed(
                         "source-row-count-overflow",
                     ))?;
             }
@@ -3269,7 +3329,7 @@ impl GraphStore {
             let (key, value) = guard.into_inner()?;
             rows = rows
                 .checked_add(1)
-                .ok_or(StoreError::QueryIndexVerificationFailed(
+                .ok_or(StoreError::IndexVerificationFailed(
                     "index-row-count-overflow",
                 ))?;
             well_formed &= key.as_ref().len() == 32 && value.as_ref().is_empty();
@@ -3277,21 +3337,24 @@ impl GraphStore {
         Ok((rows, well_formed))
     }
 
-    fn query_index_keyspaces_are_empty(&self, snapshot: &Snapshot) -> Result<bool> {
-        for keyspace in [
-            &self.qv2_gspo,
-            &self.qv2_gpos,
-            &self.qv2_spog,
-            &self.qv2_posg,
-            &self.qv2_ospg,
-            &self.qv2_gosp,
-            &self.qv2_term_to_query,
-            &self.qv2_query_to_term,
-            &self.qv2_meta,
-        ] {
-            if let Some(guard) = snapshot.iter(keyspace).next() {
-                let _ = guard.into_inner()?;
-                return Ok(false);
+    fn index_spaces_empty(&self, snapshot: &Snapshot) -> Result<bool> {
+        for slot in [IndexSlot::Primary, IndexSlot::Secondary] {
+            let spaces = self.query_spaces(slot);
+            for keyspace in [
+                spaces.gspo,
+                spaces.gpos,
+                spaces.spog,
+                spaces.posg,
+                spaces.ospg,
+                spaces.gosp,
+                spaces.term_to_query,
+                spaces.query_to_term,
+                spaces.meta,
+            ] {
+                if let Some(guard) = snapshot.iter(keyspace).next() {
+                    let _ = guard.into_inner()?;
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -3303,6 +3366,26 @@ impl GraphStore {
         StoreReadSnapshot {
             snapshot: self.db.snapshot(),
         }
+    }
+
+    pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
+        SearchSnapshot {
+            snapshot: self.db.snapshot(),
+            terms: self.terms.clone(),
+            quads: self.quads.clone(),
+            graphs: self.graphs.clone(),
+        }
+    }
+
+    pub(crate) fn search_manifest_snapshot(&self) -> Result<SearchManifestSnapshot> {
+        let _queue = self.fts_queue_guard();
+        Ok(SearchManifestSnapshot {
+            snapshot: self.db.snapshot(),
+            terms: self.terms.clone(),
+            graphs: self.graphs.clone(),
+            search_meta: self.search_meta.clone(),
+            search_queue: self.search_queue.clone(),
+        })
     }
 
     fn query_index_snapshot(&self) -> Snapshot {
