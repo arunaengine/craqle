@@ -4580,6 +4580,7 @@ mod tests {
 
         let store = reopen_store(dir.path());
         let search = Arc::new(SearchIndex::open(dir.path().join("search")).unwrap());
+        search.bind_store(&store).unwrap();
         assert_eq!(3, search.search("recoveryneedle", 50).unwrap().len());
 
         // An older queue entry, so it consumes the first drain pass on its own.
@@ -4605,7 +4606,7 @@ mod tests {
     /// One entry that always fails must not stop a different graph's queued
     /// work, and the flush that covered it must say so.
     #[test]
-    fn drain_isolates_failure() {
+    fn failure_retry_bounded() {
         let dir = tempdir().unwrap();
         let healthy = GraphId::new("urn:test:isolation-healthy");
         let broken = GraphId::new("urn:test:isolation-broken");
@@ -4635,10 +4636,14 @@ mod tests {
             .fail_graph
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(broken.as_str().to_string());
+        search.set_retry_now(1);
 
+        let first_error = crate::flush_search_queue(&store, &search)
+            .expect_err("a flush covering a failed entry must not report success");
         assert!(
-            crate::flush_search_queue(&store, &search).is_err(),
-            "a flush covering a failed entry must not report success"
+            first_error.to_string().contains(broken.as_str())
+                && first_error.to_string().contains("store-transient"),
+            "unexpected first flush error: {first_error}"
         );
 
         let hits = search.search("isolationneedle", 50).unwrap();
@@ -4649,17 +4654,37 @@ mod tests {
         );
         assert_eq!(healthy.as_str(), hits[0].graph_id);
 
-        for _ in 0..10 {
+        for attempt in 1..MAX_RETRY_ATTEMPTS {
+            search.set_retry_now(u64::from(attempt).saturating_mul(RETRY_MAX_MS + 1));
             assert!(crate::flush_search_queue(&store, &search).is_err());
         }
+        let id = graph_queue_id(QueueKind::Reindex, &broken);
+        let failure = store
+            .fts_failure(&id)
+            .unwrap()
+            .expect("failure state must survive the retry cap");
+        assert_eq!(MAX_RETRY_ATTEMPTS, failure.attempts);
+        assert_eq!(u64::MAX, failure.retry_at_ms);
+        assert_eq!(failure.code, "store-transient");
+        assert_eq!(
+            failure.error_kind,
+            crate::CraqleErrorKind::CorruptDerivedData
+        );
         *search
             .hooks
             .fail_graph
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+        assert!(crate::flush_search_queue(&store, &search).is_err());
+
+        let mut batch = store.new_batch();
+        store
+            .enqueue_fts_reindex(&mut batch, graph_term(&store, &broken))
+            .unwrap();
+        store.commit(batch).unwrap();
         crate::flush_search_queue(&store, &search)
-            .expect("a recovered entry must remain retryable after repeated failures");
+            .expect("newer debt resets the capped failure identity");
         assert_eq!(2, search.search("isolationneedle", 50).unwrap().len());
-        assert!(store.drain_fts_reindex_queue(10).unwrap().is_empty());
+        assert!(store.drain_reindex_queue(10).unwrap().is_empty());
     }
 }
