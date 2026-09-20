@@ -679,4 +679,151 @@ impl FjallBm25 {
             .transpose()?
             .ok_or(EngineError::Corrupt("forward row missing"))
     }
+
+    fn read_forward_at(&self, snapshot: &Snapshot, id: u64) -> Result<Vec<TermFreq>> {
+        snapshot
+            .get(&self.forward, id.to_be_bytes())?
+            .map(|value| {
+                postcard::from_bytes::<Vec<TermFreq>>(value.as_ref()).map_err(EngineError::from)
+            })
+            .transpose()?
+            .ok_or(EngineError::Corrupt("forward row missing"))
+    }
+
+    fn read_df(&self, snapshot: &Snapshot, term: &str) -> Result<u64> {
+        snapshot
+            .get(&self.stats, term.as_bytes())?
+            .map(|value| decode_u64(value.as_ref()))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    fn write_stat(&self, batch: &mut OwnedWriteBatch, change: &TermChange) -> Result<()> {
+        if change.old.is_some() == change.new.is_some() {
+            return Ok(());
+        }
+        let current = self
+            .stats
+            .get(change.term.as_bytes())?
+            .map(|value| decode_u64(value.as_ref()))
+            .transpose()?
+            .unwrap_or_default();
+        let updated = if change.new.is_some() {
+            current.checked_add(1).ok_or(EngineError::Overflow)?
+        } else {
+            current
+                .checked_sub(1)
+                .ok_or(EngineError::Corrupt("document frequency invalid"))?
+        };
+        if updated == 0 {
+            batch.remove(&self.stats, change.term.as_bytes());
+        } else {
+            batch.insert(&self.stats, change.term.as_bytes(), updated.to_be_bytes());
+        }
+        Ok(())
+    }
+
+    fn write_posting(&self, batch: &mut OwnedWriteBatch, req: PostingChange<'_>) -> Result<()> {
+        match self.options.layout {
+            PostingLayout::Simple => {
+                let key = posting_key(&req.change.term, req.id)?;
+                if let Some(freq) = req.change.new {
+                    batch.insert(&self.postings, key, freq.to_be_bytes());
+                } else {
+                    batch.remove(&self.postings, key);
+                }
+            }
+            PostingLayout::Block { docs } => {
+                let block = req.id / u64::from(docs);
+                let key = block_key(&req.change.term, block)?;
+                let mut entries: Vec<Posting> = self
+                    .postings
+                    .get(&key)?
+                    .map(|value| postcard::from_bytes(value.as_ref()).map_err(EngineError::from))
+                    .transpose()?
+                    .unwrap_or_default();
+                entries.retain(|entry| entry.doc != req.id);
+                if let Some(freq) = req.change.new {
+                    entries.push(Posting { doc: req.id, freq });
+                    entries.sort_unstable_by_key(|entry| entry.doc);
+                }
+                if entries.len() > usize::from(docs) {
+                    return Err(EngineError::Corrupt("posting block exceeded bound"));
+                }
+                if entries.is_empty() {
+                    batch.remove(&self.postings, key);
+                } else {
+                    batch.insert(&self.postings, key, postcard::to_allocvec(&entries)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_postings(&self, mut scan: PostingScan<'_>) -> Result<()> {
+        let prefix = term_prefix(scan.term)?;
+        for guard in scan.snapshot.prefix(&self.postings, &prefix) {
+            let (key, value) = guard.into_inner()?;
+            charge_bytes(
+                scan.work,
+                scan.bounds.bytes,
+                key.len().saturating_add(value.len()),
+            )?;
+            match self.options.layout {
+                PostingLayout::Simple => {
+                    let id = decode_posting(key.as_ref(), prefix.len())?;
+                    let freq = decode_u32(value.as_ref())?;
+                    self.score_posting(&mut scan, Posting { doc: id, freq })?;
+                }
+                PostingLayout::Block { docs } => {
+                    let entries: Vec<Posting> = postcard::from_bytes(value.as_ref())?;
+                    if entries.len() > usize::from(docs) {
+                        return Err(EngineError::Corrupt("posting block exceeded bound"));
+                    }
+                    for posting in entries {
+                        self.score_posting(&mut scan, posting)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn score_posting(&self, scan: &mut PostingScan<'_>, posting: Posting) -> Result<()> {
+        scan.work.posting_rows = scan.work.posting_rows.saturating_add(1);
+        check_limit("posting rows", scan.bounds.postings, scan.work.posting_rows)?;
+        if scan.rejected.contains(&posting.doc) {
+            return Ok(());
+        }
+        if let Some(candidate) = scan.candidates.get_mut(&posting.doc) {
+            candidate.score += scan.weight.score(candidate.record.norm, posting.freq);
+            return Ok(());
+        }
+        check_limit(
+            "candidate documents",
+            scan.bounds.candidates,
+            scan.candidates.len().saturating_add(1),
+        )?;
+        let value = scan
+            .snapshot
+            .get(&self.docs, record_key(posting.doc))?
+            .ok_or(EngineError::Corrupt("active posting lacks document"))?;
+        charge_bytes(scan.work, scan.bounds.bytes, value.len())?;
+        let record: DocRecord = postcard::from_bytes(value.as_ref())?;
+        scan.work.metadata_reads = scan.work.metadata_reads.saturating_add(1);
+        if !record.active {
+            return Err(EngineError::Corrupt("inactive document has posting"));
+        }
+        if scan.allows.is_some_and(|allows| !allows(&record.graph)) {
+            scan.work.rejected_docs = scan.work.rejected_docs.saturating_add(1);
+            scan.rejected.insert(posting.doc);
+            return Ok(());
+        }
+        let score = scan.weight.score(record.norm, posting.freq);
+        scan.work.candidate_docs = scan.work.candidate_docs.saturating_add(1);
+        scan.work.scored_docs = scan.work.scored_docs.saturating_add(1);
+        scan.candidates
+            .insert(posting.doc, Candidate { record, score });
+        Ok(())
+    }
 }
