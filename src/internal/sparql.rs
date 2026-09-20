@@ -7,17 +7,28 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange};
 use crate::planner::{JoinKind, JoinMode, PlannedJoin, PlannerTrace};
-use crate::query::context::{QueryCancellation, QueryReadMode, ReadContext, ReadStatistics};
-use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
+use crate::query::budget::BudgetShape;
+pub(crate) use crate::query::budget::{QueryBudget, QueryLimitExceeded};
+use crate::query::context::{
+    MAX_QUERY_REGISTRATIONS, QueryCancellation, QueryReadMode, ReadContext, ReadStatistics,
+    RequestOutcome,
+};
+use crate::query::cursor::{DenseResolver, DenseTerm, RawIndexPattern};
+use crate::query::deadline::{MAX_DEADLINE_REGISTRATIONS, RequestClock};
+use crate::rdf_read::{DenseScan, GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::search::SearchIndex;
-use crate::sparql_fast_path::{FastPathPlan, QueryFastPathKind, QueryFastPathMode};
-use crate::store::{GraphStore, QueryTermId, StoreError, StoreReadSnapshot, TermId};
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
+use crate::sparql_fast_path::{
+    FastPathPlan, QueryFastPathKind as FastPathKind, QueryFastPathMode as FastPathMode,
+};
+use crate::store::{GraphStore, StoreError, StoreReadSnapshot, TermId};
+use oxrdf::{
+    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode as GraphNode, Term, Triple, Variable,
+};
 use spareval::{
     DeleteInsertQuad, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
     QueryableDataset,
@@ -81,15 +92,25 @@ pub enum QueryResults {
     Graph(Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>),
 }
 
-/// A parsed SPARQL query that can be executed repeatedly.
-///
-/// It contains no store snapshot, graph-visibility decision, or execution
-/// statistics. FTS rewriting, physical planning, and dense query-ID resolution
-/// run against current state on every execution.
+/// A reusable parsed query without a snapshot or visibility decision.
+/// Rewriting, planning, and query ID resolution use current state per execution.
 #[derive(Clone)]
 pub struct PreparedQuery {
     query: Arc<Query>,
     query_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct QueryRun<'a> {
+    pub(crate) sparql: &'a str,
+    pub(crate) options: &'a QueryOptions,
+}
+
+pub(crate) struct GraphQuery<'a> {
+    pub(crate) auth: &'a dyn crate::Authorizer,
+    pub(crate) graphs: &'a [GraphId],
+    pub(crate) sparql: &'a str,
+    pub(crate) options: &'a QueryOptions,
 }
 
 impl fmt::Debug for PreparedQuery {
@@ -100,7 +121,8 @@ impl fmt::Debug for PreparedQuery {
     }
 }
 
-/// Per-execution resource limits for guarded SPARQL operators.
+/// Bounds parsing, adapter reads, native operators, and returned results.
+/// Locked evaluator buffers observe cancellation cooperatively and are not byte-metered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct QueryLimits {
@@ -133,6 +155,24 @@ impl QueryLimits {
             deadline: Some(Duration::from_secs(30)),
         }
     }
+
+    /// Disables enforceable query limits for trusted semantic-oracle executions.
+    /// Cancellation inside locked evaluator buffers remains best effort.
+    pub fn unbounded() -> Self {
+        Self {
+            max_query_bytes: usize::MAX,
+            max_result_rows: usize::MAX,
+            max_result_cells: usize::MAX,
+            max_result_bytes: usize::MAX,
+            max_graph_triples: usize::MAX,
+            max_intermediate_rows: usize::MAX,
+            max_hash_entries: usize::MAX,
+            max_hash_bytes: usize::MAX,
+            max_property_path_edges: usize::MAX,
+            max_property_path_depth: usize::MAX,
+            deadline: None,
+        }
+    }
 }
 
 impl Default for QueryLimits {
@@ -143,260 +183,74 @@ impl Default for QueryLimits {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct QueryFeatures {
-    property_path: bool,
-    property_path_depth: usize,
-    guarded_hash: bool,
+    budget: BudgetShape,
     /// Statically derivable row estimate, not a measured count. Leaves whose
     /// cardinality only the store knows count as one row.
     estimated_rows: usize,
 }
 
-#[derive(Clone, Copy, Debug, thiserror::Error)]
-#[error("{resource} exceeds limit {limit}")]
-pub(crate) struct QueryLimitExceeded {
-    resource: &'static str,
-    limit: usize,
-}
-
 impl From<QueryLimitExceeded> for SparqlError {
     fn from(error: QueryLimitExceeded) -> Self {
-        Self::QueryLimit {
-            resource: error.resource,
-            limit: error.limit,
+        match error {
+            QueryLimitExceeded::Limit { resource, limit } => Self::QueryLimit { resource, limit },
+            QueryLimitExceeded::Cancelled => Self::Cancelled,
         }
     }
-}
-
-/// Retained bytes per buffered row. An estimate, not a measurement.
-const HASH_ROW_BYTES_ESTIMATE: usize = 128;
-
-/// One deadline and cancellation context for a whole request.
-///
-/// `started` may predate construction so an already measured stage, such as
-/// parsing, stays inside the same deadline.
-#[derive(Clone)]
-pub(crate) struct RequestClock {
-    started: Instant,
-    deadline: Option<Duration>,
-    cancellation: QueryCancellation,
 }
 
 impl RequestClock {
-    fn start(
-        deadline: Option<Duration>,
-        cancellation: QueryCancellation,
-        started: Instant,
-    ) -> Self {
-        Self {
-            started,
-            deadline,
-            cancellation,
-        }
-    }
-
-    fn check(&self) -> std::result::Result<(), QueryLimitExceeded> {
-        if self
-            .deadline
-            .is_some_and(|deadline| self.started.elapsed() >= deadline)
-        {
-            return Err(QueryLimitExceeded {
+    fn check_stage(&self) -> Result<()> {
+        match self.outcome() {
+            RequestOutcome::Active => Ok(()),
+            RequestOutcome::Explicit => Err(SparqlError::Cancelled),
+            RequestOutcome::Deadline => Err(QueryLimitExceeded::Limit {
                 resource: "query deadline",
                 limit: 0,
-            });
-        }
-        Ok(())
-    }
-
-    /// Stage boundary check. A caller's cancellation outranks the deadline.
-    fn check_stage(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(SparqlError::Cancelled);
-        }
-        Ok(self.check()?)
-    }
-}
-
-pub(crate) struct QueryBudget {
-    limits: QueryLimits,
-    clock: RequestClock,
-    features: QueryFeatures,
-    intermediate_rows: AtomicUsize,
-    property_path_edges: AtomicUsize,
-    result_rows: AtomicUsize,
-    result_cells: AtomicUsize,
-    result_bytes: AtomicUsize,
-    graph_triples: AtomicUsize,
-}
-
-impl QueryBudget {
-    fn new(
-        features: QueryFeatures,
-        limits: QueryLimits,
-        clock: RequestClock,
-    ) -> std::result::Result<Self, QueryLimitExceeded> {
-        if features.property_path_depth > limits.max_property_path_depth {
-            return Err(QueryLimitExceeded {
-                resource: "property path depth",
-                limit: limits.max_property_path_depth,
-            });
-        }
-        let budget = Self {
-            limits,
-            clock,
-            features,
-            intermediate_rows: AtomicUsize::new(0),
-            property_path_edges: AtomicUsize::new(0),
-            result_rows: AtomicUsize::new(0),
-            result_cells: AtomicUsize::new(0),
-            result_bytes: AtomicUsize::new(0),
-            graph_triples: AtomicUsize::new(0),
-        };
-        // The plan's own row estimate is charged before the first pull.
-        budget.observe_intermediate(features.estimated_rows)?;
-        Ok(budget)
-    }
-
-    pub(crate) fn check(&self) -> std::result::Result<(), QueryLimitExceeded> {
-        self.clock.check()
-    }
-
-    pub(crate) fn observe_intermediate(
-        &self,
-        rows: usize,
-    ) -> std::result::Result<(), QueryLimitExceeded> {
-        self.check()?;
-        let total = add_limited(
-            &self.intermediate_rows,
-            rows,
-            self.limits.max_intermediate_rows,
-            "intermediate rows",
-        )?;
-        if self.features.guarded_hash {
-            if total > self.limits.max_hash_entries {
-                return Err(QueryLimitExceeded {
-                    resource: "hash entries",
-                    limit: self.limits.max_hash_entries,
-                });
             }
-            let bytes = total.saturating_mul(HASH_ROW_BYTES_ESTIMATE);
-            if bytes > self.limits.max_hash_bytes {
-                return Err(QueryLimitExceeded {
-                    resource: "hash bytes",
-                    limit: self.limits.max_hash_bytes,
-                });
+            .into()),
+            RequestOutcome::QueryCapacity => Err(QueryLimitExceeded::Limit {
+                resource: "active query registrations",
+                limit: MAX_QUERY_REGISTRATIONS,
             }
+            .into()),
+            RequestOutcome::DeadlineCapacity => Err(QueryLimitExceeded::Limit {
+                resource: "active deadline registrations",
+                limit: MAX_DEADLINE_REGISTRATIONS,
+            }
+            .into()),
+            RequestOutcome::DeadlineUnavailable => Err(QueryLimitExceeded::Limit {
+                resource: "deadline service",
+                limit: 0,
+            }
+            .into()),
         }
-        if self.features.property_path {
-            add_limited(
-                &self.property_path_edges,
-                rows,
-                self.limits.max_property_path_edges,
-                "property path edges",
-            )?;
+    }
+
+    fn cancel_error(&self) -> SparqlError {
+        match self.outcome() {
+            RequestOutcome::Explicit | RequestOutcome::Active => SparqlError::Cancelled,
+            RequestOutcome::Deadline => QueryLimitExceeded::Limit {
+                resource: "query deadline",
+                limit: 0,
+            }
+            .into(),
+            RequestOutcome::QueryCapacity => QueryLimitExceeded::Limit {
+                resource: "active query registrations",
+                limit: MAX_QUERY_REGISTRATIONS,
+            }
+            .into(),
+            RequestOutcome::DeadlineCapacity => QueryLimitExceeded::Limit {
+                resource: "active deadline registrations",
+                limit: MAX_DEADLINE_REGISTRATIONS,
+            }
+            .into(),
+            RequestOutcome::DeadlineUnavailable => QueryLimitExceeded::Limit {
+                resource: "deadline service",
+                limit: 0,
+            }
+            .into(),
         }
-        Ok(())
     }
-
-    pub(crate) fn check_hash(
-        &self,
-        entries: usize,
-        bytes: usize,
-    ) -> std::result::Result<(), QueryLimitExceeded> {
-        self.check()?;
-        if entries > self.limits.max_hash_entries {
-            return Err(QueryLimitExceeded {
-                resource: "hash entries",
-                limit: self.limits.max_hash_entries,
-            });
-        }
-        if bytes > self.limits.max_hash_bytes {
-            return Err(QueryLimitExceeded {
-                resource: "hash bytes",
-                limit: self.limits.max_hash_bytes,
-            });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn observe_solution(
-        &self,
-        row: &HashMap<String, EncodedTerm>,
-    ) -> std::result::Result<(), QueryLimitExceeded> {
-        self.observe_result(
-            row.len(),
-            row.iter().fold(0usize, |bytes, (variable, term)| {
-                bytes
-                    .saturating_add(variable.len())
-                    .saturating_add(term.0.len())
-            }),
-        )
-    }
-
-    fn observe_graph_triple(
-        &self,
-        triple: &(EncodedTerm, EncodedTerm, EncodedTerm),
-    ) -> std::result::Result<(), QueryLimitExceeded> {
-        add_limited(
-            &self.graph_triples,
-            1,
-            self.limits.max_graph_triples,
-            "graph triples",
-        )?;
-        self.observe_result(
-            3,
-            triple
-                .0
-                .0
-                .len()
-                .saturating_add(triple.1.0.len())
-                .saturating_add(triple.2.0.len()),
-        )
-    }
-
-    pub(crate) fn observe_boolean(&self) -> std::result::Result<(), QueryLimitExceeded> {
-        self.observe_result(1, 1)
-    }
-
-    fn observe_result(
-        &self,
-        cells: usize,
-        bytes: usize,
-    ) -> std::result::Result<(), QueryLimitExceeded> {
-        self.check()?;
-        add_limited(
-            &self.result_rows,
-            1,
-            self.limits.max_result_rows,
-            "result rows",
-        )?;
-        add_limited(
-            &self.result_cells,
-            cells,
-            self.limits.max_result_cells,
-            "result cells",
-        )?;
-        add_limited(
-            &self.result_bytes,
-            bytes,
-            self.limits.max_result_bytes,
-            "result bytes",
-        )?;
-        Ok(())
-    }
-}
-
-fn add_limited(
-    counter: &AtomicUsize,
-    amount: usize,
-    limit: usize,
-    resource: &'static str,
-) -> std::result::Result<usize, QueryLimitExceeded> {
-    let previous = counter.fetch_add(amount, Ordering::Relaxed);
-    let total = previous.saturating_add(amount);
-    if total > limit {
-        return Err(QueryLimitExceeded { resource, limit });
-    }
-    Ok(total)
 }
 
 fn query_features(query: &Query) -> QueryFeatures {
@@ -410,25 +264,38 @@ fn query_features(query: &Query) -> QueryFeatures {
 }
 
 fn merge_features(left: QueryFeatures, right: QueryFeatures) -> QueryFeatures {
+    let estimated_rows = left.estimated_rows.saturating_add(right.estimated_rows);
     QueryFeatures {
-        property_path: left.property_path || right.property_path,
-        property_path_depth: left.property_path_depth.max(right.property_path_depth),
-        guarded_hash: left.guarded_hash || right.guarded_hash,
-        estimated_rows: left.estimated_rows.saturating_add(right.estimated_rows),
+        budget: BudgetShape {
+            property_path: left.budget.property_path || right.budget.property_path,
+            property_path_depth: left
+                .budget
+                .property_path_depth
+                .max(right.budget.property_path_depth),
+            guarded_hash: left.budget.guarded_hash || right.budget.guarded_hash,
+            estimated_rows,
+        },
+        estimated_rows,
     }
 }
 
 fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
     match pattern {
         GraphPattern::Bgp { patterns } => QueryFeatures {
-            guarded_hash: patterns.len() > 1,
+            budget: BudgetShape {
+                guarded_hash: patterns.len() > 1,
+                estimated_rows: 1,
+                ..BudgetShape::default()
+            },
             estimated_rows: 1,
-            ..QueryFeatures::default()
         },
         GraphPattern::Path { path, .. } => QueryFeatures {
-            property_path: true,
-            property_path_depth: property_path_depth(path),
-            guarded_hash: true,
+            budget: BudgetShape {
+                property_path: true,
+                property_path_depth: property_path_depth(path),
+                guarded_hash: true,
+                estimated_rows: 1,
+            },
             estimated_rows: 1,
         },
         GraphPattern::Join { left, right }
@@ -437,7 +304,7 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
         | GraphPattern::Minus { left, right } => {
             let sides = (pattern_features(left), pattern_features(right));
             let mut features = merge_features(sides.0, sides.1);
-            features.guarded_hash = true;
+            features.budget.guarded_hash = true;
             // Independent sides multiply. Sharing a variable cannot produce
             // more rows than the larger side under this estimate.
             features.estimated_rows = if shares_variable(left, right) {
@@ -448,6 +315,7 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
                     .estimated_rows
                     .saturating_mul(sides.1.estimated_rows)
             };
+            features.budget.estimated_rows = features.estimated_rows;
             if let GraphPattern::LeftJoin {
                 expression: Some(expression),
                 ..
@@ -471,12 +339,15 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
             inner, expression, ..
         } => merge_features(pattern_features(inner), expression_features(expression)),
         GraphPattern::Values { bindings, .. } => QueryFeatures {
+            budget: BudgetShape {
+                estimated_rows: bindings.len(),
+                ..BudgetShape::default()
+            },
             estimated_rows: bindings.len(),
-            ..QueryFeatures::default()
         },
         GraphPattern::OrderBy { inner, expression } => {
             let mut features = pattern_features(inner);
-            features.guarded_hash = true;
+            features.budget.guarded_hash = true;
             for expression in expression {
                 let expression = match expression {
                     spargebra::algebra::OrderExpression::Asc(expression)
@@ -486,16 +357,17 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
             }
             features
         }
-        GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } => {
+        GraphPattern::Distinct { inner } => {
             let mut features = pattern_features(inner);
-            features.guarded_hash = true;
+            features.budget.guarded_hash = true;
             features
         }
+        GraphPattern::Reduced { inner } => pattern_features(inner),
         GraphPattern::Group {
             inner, aggregates, ..
         } => {
             let mut features = pattern_features(inner);
-            features.guarded_hash = true;
+            features.budget.guarded_hash = true;
             for (_, aggregate) in aggregates {
                 if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
                     features = merge_features(features, expression_features(expr));
@@ -505,9 +377,12 @@ fn pattern_features(pattern: &GraphPattern) -> QueryFeatures {
         }
         #[allow(unreachable_patterns)]
         _ => QueryFeatures {
-            guarded_hash: true,
+            budget: BudgetShape {
+                guarded_hash: true,
+                estimated_rows: 1,
+                ..BudgetShape::default()
+            },
             estimated_rows: 1,
-            ..QueryFeatures::default()
         },
     }
 }
@@ -555,21 +430,29 @@ fn expression_features(expression: &Expression) -> QueryFeatures {
         }
         Expression::Exists(pattern) => {
             let mut features = pattern_features(pattern);
-            features.guarded_hash = true;
+            features.budget.guarded_hash = true;
             features
         }
         Expression::If(condition, left, right) => merge_features(
             expression_features(condition),
             merge_features(expression_features(left), expression_features(right)),
         ),
-        Expression::Coalesce(expressions) | Expression::FunctionCall(_, expressions) => expressions
+        Expression::Coalesce(expressions) => expressions
+            .iter()
+            .fold(QueryFeatures::default(), |features, expression| {
+                merge_features(features, expression_features(expression))
+            }),
+        Expression::FunctionCall(_, expressions) => expressions
             .iter()
             .fold(QueryFeatures::default(), |features, expression| {
                 merge_features(features, expression_features(expression))
             }),
         #[allow(unreachable_patterns)]
         _ => QueryFeatures {
-            guarded_hash: true,
+            budget: BudgetShape {
+                guarded_hash: true,
+                ..BudgetShape::default()
+            },
             ..QueryFeatures::default()
         },
     }
@@ -601,7 +484,11 @@ pub struct QueryOptions {
     pub read_mode: QueryReadMode,
     pub optimize: bool,
     pub join_mode: JoinMode,
-    pub fast_paths: QueryFastPathMode,
+    pub fast_paths: FastPathMode,
+    /// Collects request-local storage cost counters for this execution.
+    pub collect_costs: bool,
+    /// Collects per-operator evaluator timings and row counts.
+    pub collect_plan_statistics: bool,
     pub limits: QueryLimits,
 }
 
@@ -612,7 +499,9 @@ impl Default for QueryOptions {
             read_mode: QueryReadMode::Auto,
             optimize: planner_enabled(),
             join_mode: JoinMode::Auto,
-            fast_paths: QueryFastPathMode::Auto,
+            fast_paths: FastPathMode::Auto,
+            collect_costs: false,
+            collect_plan_statistics: true,
             limits: QueryLimits::default(),
         }
     }
@@ -638,6 +527,22 @@ impl UpdateLimits {
             max_graphs: 16,
             deadline: Some(Duration::from_secs(30)),
         }
+    }
+
+    /// Disables update materialization and deadline limits for trusted input.
+    /// Fixed parser nesting protection remains active.
+    pub fn unbounded() -> Self {
+        Self {
+            max_update_bytes: usize::MAX,
+            max_materialized_bindings: usize::MAX,
+            max_changes: usize::MAX,
+            max_graphs: usize::MAX,
+            deadline: None,
+        }
+    }
+
+    fn is_unbounded(&self) -> bool {
+        *self == Self::unbounded()
     }
 }
 
@@ -700,7 +605,7 @@ pub enum QueryLogicalOperator {
 pub enum QueryPhysicalOperator {
     #[default]
     Generic,
-    FastPath(QueryFastPathKind),
+    FastPath(FastPathKind),
     PlannedJoin(JoinKind),
     Evaluator(String),
 }
@@ -714,7 +619,7 @@ pub struct QueryExecutionStatistics {
     pub execution_time: Duration,
     pub result_collection_time: Duration,
     pub time_to_first_internal_result: Option<Duration>,
-    pub fast_path: Option<QueryFastPathKind>,
+    pub fast_path: Option<FastPathKind>,
     pub planned_joins: Vec<PlannedJoin>,
     pub selected_access_paths: Vec<crate::query::context::ReadAccessPath>,
     pub plan_fingerprint: String,
@@ -729,6 +634,16 @@ pub struct QueryExecutionStatistics {
     pub source_bytes_read: u64,
     pub qv_keys_read: u64,
     pub qv_bytes_read: u64,
+    pub reverse_mapping_reads: u64,
+    pub reverse_mapping_bytes: u64,
+    pub forward_mapping_reads: u64,
+    pub forward_mapping_bytes: u64,
+    pub planner_index_entries: u64,
+    pub planner_point_reads: u64,
+    pub planner_cache_hits: u64,
+    pub planner_cache_misses: u64,
+    pub planner_memo_hits: u64,
+    pub planner_memo_misses: u64,
     pub candidate_quads: u64,
     pub matching_quads: u64,
     pub graphs_considered: u64,
@@ -741,6 +656,8 @@ pub struct QueryExecutionStatistics {
     pub encoded_quad_constructions: u64,
     pub terms_decoded: u64,
     pub intermediate_rows: u64,
+    /// Whether `intermediate_rows` was measured for this execution.
+    pub intermediate_rows_available: bool,
     pub result_rows: u64,
     pub result_cells: u64,
     pub plan: QueryPlan,
