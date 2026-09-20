@@ -489,9 +489,9 @@ impl StallHook {
 struct ResourceDoc<'a> {
     graph_id: &'a str,
     subject_iri: &'a str,
+    generation: GenerationId,
     all_text: Option<&'a str>,
-    /// Delete any existing document with the same key first. Skipped by bulk
-    /// reindex, which already dropped every document of the graph.
+    /// Delete any existing document key in this generation first.
     delete_existing: bool,
 }
 
@@ -502,10 +502,7 @@ pub struct GraphSetQuery<'a> {
     pub limit: usize,
 }
 
-/// A subject update read from the store, ready to apply to the index.
-///
-/// Produced with no writer lock held so the (potentially very large) store
-/// read phase does not block searches or other index writers.
+/// Subject update prepared from the store without holding the writer lock.
 enum PreparedDocOp {
     /// The subject is gone, orphaned, or its graph is unknown: drop it.
     Delete { doc: DocIdentity },
@@ -517,11 +514,15 @@ enum PreparedDocOp {
 }
 
 impl PreparedDocOp {
-    /// Prepared text this op holds, charged against the pass byte budget.
-    fn text_bytes(&self) -> usize {
+    /// Retained identity and text charged against the pass byte budget.
+    fn held_bytes(&self) -> usize {
         match self {
-            Self::Delete { .. } => 0,
-            Self::Upsert { all_text, .. } => all_text.as_ref().map_or(0, String::len),
+            Self::Delete { doc } => doc.graph_iri.len().saturating_add(doc.subject_iri.len()),
+            Self::Upsert { doc, all_text } => doc
+                .graph_iri
+                .len()
+                .saturating_add(doc.subject_iri.len())
+                .saturating_add(all_text.as_ref().map_or(0, String::len)),
         }
     }
 }
@@ -529,6 +530,7 @@ impl PreparedDocOp {
 struct DocIdentity {
     graph_iri: String,
     subject_iri: String,
+    generation: GenerationId,
 }
 
 /// Store reads needed to prepare one subject's index update.
@@ -536,12 +538,75 @@ struct PrepareSubject<'a> {
     store: &'a GraphStore,
     graph: &'a GraphId,
     subject: TermId,
+    byte_limit: usize,
+    generation: GenerationId,
 }
 
-#[derive(Default)]
+struct OrphanInput<'a> {
+    graph: &'a GraphId,
+    graph_tid: TermId,
+    byte_limit: usize,
+}
+
 struct StoreSyncCaches {
-    orphaned_subjects: HashMap<GraphId, HashSet<String>>,
+    snapshot: SearchSnapshot,
+    orphaned_subjects: HashMap<GraphId, HashSet<TermId>>,
+    orphan_bytes: usize,
     graph_terms: HashMap<GraphId, Option<TermId>>,
+}
+
+impl StoreSyncCaches {
+    fn new(store: &GraphStore) -> Self {
+        Self {
+            snapshot: store.search_snapshot(),
+            orphaned_subjects: HashMap::new(),
+            orphan_bytes: 0,
+            graph_terms: HashMap::new(),
+        }
+    }
+
+    fn orphaned(&mut self, input: OrphanInput<'_>) -> Result<&HashSet<TermId>> {
+        if !self.orphaned_subjects.contains_key(input.graph) {
+            let artifact_limit = input.byte_limit / 32;
+            let orphaned = match self.snapshot.orphaned_ids(input.graph_tid, artifact_limit) {
+                Ok(orphaned) => orphaned,
+                Err(crate::store::StoreError::LimitExceeded {
+                    resource: "search diagnostics rows",
+                    limit,
+                    actual,
+                }) => {
+                    return Err(SearchError::SourceTooLarge {
+                        rows: usize::try_from(actual).unwrap_or(usize::MAX),
+                        limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                    });
+                }
+                Err(crate::store::StoreError::LimitExceeded { limit, actual, .. }) => {
+                    return Err(SearchError::ItemTooLarge {
+                        bytes: usize::try_from(actual).unwrap_or(usize::MAX),
+                        limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let bytes = STAGE_SOURCE_BYTES.saturating_add(
+                orphaned
+                    .len()
+                    .saturating_mul(std::mem::size_of::<TermId>() * 4),
+            );
+            if bytes > input.byte_limit {
+                return Err(SearchError::ItemTooLarge {
+                    bytes,
+                    limit: input.byte_limit,
+                });
+            }
+            self.orphan_bytes = self.orphan_bytes.saturating_add(bytes);
+            self.orphaned_subjects.insert(input.graph.clone(), orphaned);
+        }
+        Ok(self
+            .orphaned_subjects
+            .get(input.graph)
+            .expect("orphan cache inserted"))
+    }
 }
 
 fn build_schema() -> Schema {
@@ -549,6 +614,10 @@ fn build_schema() -> Schema {
     builder.add_text_field("doc_key", STRING | STORED);
     builder.add_text_field("graph_id", STRING | STORED);
     builder.add_text_field("subject_iri", STRING | STORED);
+    builder.add_text_field("generation_key", STRING);
+    builder.add_u64_field(GENERATION_FIELD, FAST | STORED);
+    builder.add_bytes_field(GENERATION_SCOPE_FIELD, FAST);
+    builder.add_bytes_field(STABLE_KEY_FIELD, FAST);
     builder.add_text_field(
         "all_text",
         TEXT.set_indexing_options(
@@ -561,13 +630,19 @@ fn build_schema() -> Schema {
     builder.build()
 }
 
-fn schema_fields(schema: &Schema) -> tantivy::Result<(Field, Field, Field, Field)> {
+fn schema_fields(
+    schema: &Schema,
+) -> tantivy::Result<(Field, Field, Field, Field, Field, Field, Field, Field)> {
     schema.get_field(INDEX_VERSION_FIELD)?;
     Ok((
         schema.get_field("doc_key")?,
         schema.get_field("graph_id")?,
         schema.get_field("subject_iri")?,
         schema.get_field("all_text")?,
+        schema.get_field("generation_key")?,
+        schema.get_field(GENERATION_FIELD)?,
+        schema.get_field(GENERATION_SCOPE_FIELD)?,
+        schema.get_field(STABLE_KEY_FIELD)?,
     ))
 }
 
@@ -596,6 +671,26 @@ fn recreate_index_dir(dir: &Path, schema: &Schema) -> tantivy::Result<Index> {
         })?;
     }
     create_index_dir(dir, schema)
+}
+
+fn load_index_id(dir: &Path) -> Result<Option<[u8; 16]>> {
+    let path = dir.join(INDEX_ID_FILE);
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(bytes.try_into().ok())
+}
+
+fn store_index_id(dir: &Path, index_id: [u8; 16]) -> Result<()> {
+    let pending = dir.join(".craqle-index-id.pending");
+    let mut file = std::fs::File::create(&pending)?;
+    file.write_all(&index_id)?;
+    file.sync_all()?;
+    std::fs::rename(pending, dir.join(INDEX_ID_FILE))?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 impl SearchIndex {
