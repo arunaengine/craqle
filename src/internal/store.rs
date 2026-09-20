@@ -1475,12 +1475,10 @@ fn encode_dirty_tokens(tokens: DirtyTokens) -> [u8; 16] {
     value
 }
 
-/// Decode a queue entry's tokens, accepting the single-token form a store
-/// written before `oldest` existed still holds: that token was the latest, and
-/// with nothing older recorded it is also the oldest unindexed one.
+/// Decodes current two-token debt and the legacy single-token representation.
 fn decode_dirty_tokens(bytes: &[u8], context: &'static str) -> Result<DirtyTokens> {
     if bytes.len() == 8 {
-        let token = decode_u64_bytes(bytes, context)?;
+        let token = decode_u64(bytes, context)?;
         return Ok(DirtyTokens {
             oldest: token,
             latest: token,
@@ -1493,17 +1491,217 @@ fn decode_dirty_tokens(bytes: &[u8], context: &'static str) -> Result<DirtyToken
         });
     }
     Ok(DirtyTokens {
-        oldest: decode_u64_bytes(&bytes[..8], context)?,
-        latest: decode_u64_bytes(&bytes[8..], context)?,
+        oldest: decode_u64(&bytes[..8], context)?,
+        latest: decode_u64(&bytes[8..], context)?,
     })
 }
 
-fn decode_u64_bytes(bytes: &[u8], context: &'static str) -> Result<u64> {
+fn decode_u64(bytes: &[u8], context: &'static str) -> Result<u64> {
     let raw: [u8; 8] = bytes.try_into().map_err(|_| StoreError::InvalidEncoding {
         context,
         message: format!("expected 8 bytes, found {}", bytes.len()),
     })?;
     Ok(u64::from_be_bytes(raw))
+}
+
+fn queue_kind_tag(kind: QueueKind) -> u8 {
+    match kind {
+        QueueKind::Delete => 0,
+        QueueKind::Reindex => 1,
+        QueueKind::Subject => 2,
+    }
+}
+
+fn decode_queue_kind(tag: u8) -> Result<QueueKind> {
+    match tag {
+        0 => Ok(QueueKind::Delete),
+        1 => Ok(QueueKind::Reindex),
+        2 => Ok(QueueKind::Subject),
+        _ => Err(StoreError::InvalidSearchState("queue-kind-invalid")),
+    }
+}
+
+fn search_order_key(cursor: QueueCursor) -> [u8; 42] {
+    let mut key = [0u8; 42];
+    key[0] = SEARCH_ORDER_PREFIX;
+    key[1..9].copy_from_slice(&cursor.token.to_be_bytes());
+    key[9] = queue_kind_tag(cursor.kind);
+    key[10..26].copy_from_slice(&cursor.graph.to_be_bytes());
+    if let Some(subject) = cursor.subject {
+        key[26..42].copy_from_slice(&subject.to_be_bytes());
+    }
+    key
+}
+
+fn decode_search_order(bytes: &[u8]) -> Result<QueueCursor> {
+    if bytes.len() != 42 || bytes[0] != SEARCH_ORDER_PREFIX {
+        return Err(StoreError::InvalidSearchState("queue-order-key-invalid"));
+    }
+    let kind = decode_queue_kind(bytes[9])?;
+    let subject = TermId::from_be_bytes(bytes[26..42].try_into().unwrap());
+    Ok(QueueCursor {
+        token: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
+        kind,
+        graph: TermId::from_be_bytes(bytes[10..26].try_into().unwrap()),
+        subject: matches!(kind, QueueKind::Subject).then_some(subject),
+    })
+}
+
+fn search_failure_key(cursor: QueueCursor) -> [u8; 34] {
+    let mut key = [0u8; 34];
+    key[0] = SEARCH_FAILURE_PREFIX;
+    key[1] = queue_kind_tag(cursor.kind);
+    key[2..18].copy_from_slice(&cursor.graph.to_be_bytes());
+    if let Some(subject) = cursor.subject {
+        key[18..34].copy_from_slice(&subject.to_be_bytes());
+    }
+    key
+}
+
+fn search_generation_key(graph: &GraphId) -> [u8; 17] {
+    let term = hash_term(&EncodedTerm::from_named_node(&graph.0));
+    let mut key = [0u8; 17];
+    key[0] = SEARCH_GENERATION_PREFIX;
+    key[1..].copy_from_slice(&term.to_be_bytes());
+    key
+}
+
+fn search_stage_key(graph: &GraphId) -> [u8; 17] {
+    let mut key = search_generation_key(graph);
+    key[0] = SEARCH_STAGE_PREFIX;
+    key
+}
+
+fn search_cleanup_key(generation: GenerationId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = SEARCH_CLEANUP_PREFIX;
+    key[1..].copy_from_slice(&generation.0.to_be_bytes());
+    key
+}
+
+fn encode_search_coverage(coverage: &SearchCoverage) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&SEARCH_COVERAGE_MAGIC);
+    bytes.extend_from_slice(&coverage.format.to_be_bytes());
+    bytes.extend_from_slice(&postcard::to_allocvec(coverage)?);
+    Ok(bytes)
+}
+
+fn encode_search_generation(stored: &StoredGeneration) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&SEARCH_GENERATION_MAGIC);
+    bytes.extend_from_slice(&stored.format.to_be_bytes());
+    bytes.extend_from_slice(&stored.index_id);
+    bytes.extend_from_slice(&postcard::to_allocvec(&stored.generation)?);
+    Ok(bytes)
+}
+
+fn encode_search_stage(stored: &StoredStage) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&SEARCH_STAGE_MAGIC);
+    bytes.extend_from_slice(&stored.format.to_be_bytes());
+    bytes.extend_from_slice(&stored.index_id);
+    bytes.extend_from_slice(&postcard::to_allocvec(&stored.job)?);
+    Ok(bytes)
+}
+
+fn decode_search_generation(bytes: &[u8]) -> Result<StoredGeneration> {
+    if !bytes.starts_with(&SEARCH_GENERATION_MAGIC) {
+        return Ok(postcard::from_bytes(bytes)?);
+    }
+    if bytes.len() < 20 {
+        return Err(StoreError::InvalidSearchState(
+            "search-generation-header-invalid",
+        ));
+    }
+    let format = u16::from_be_bytes(bytes[2..4].try_into().unwrap());
+    if format > SEARCH_META_FORMAT {
+        return Err(StoreError::UnsupportedSearchFormat {
+            found: format,
+            supported: SEARCH_META_FORMAT,
+        });
+    }
+    Ok(StoredGeneration {
+        format,
+        index_id: bytes[4..20].try_into().unwrap(),
+        generation: postcard::from_bytes(&bytes[20..])?,
+    })
+}
+
+fn decode_search_stage(bytes: &[u8]) -> Result<StoredStage> {
+    if !bytes.starts_with(&SEARCH_STAGE_MAGIC) {
+        return Ok(postcard::from_bytes(bytes)?);
+    }
+    if bytes.len() < 20 {
+        return Err(StoreError::InvalidSearchState(
+            "search-stage-header-invalid",
+        ));
+    }
+    let format = u16::from_be_bytes(bytes[2..4].try_into().unwrap());
+    if format > SEARCH_META_FORMAT {
+        return Err(StoreError::UnsupportedSearchFormat {
+            found: format,
+            supported: SEARCH_META_FORMAT,
+        });
+    }
+    Ok(StoredStage {
+        format,
+        index_id: bytes[4..20].try_into().unwrap(),
+        job: postcard::from_bytes(&bytes[20..])?,
+    })
+}
+
+fn receipt_order_key(receipt: &MutationReceipt) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    let ordered_time = (receipt.updated_unix_nanos as u64) ^ (1 << 63);
+    key[..8].copy_from_slice(&ordered_time.to_be_bytes());
+    key[8..].copy_from_slice(&receipt.id.0);
+    key
+}
+
+fn batch_receipt_key(link: &BatchReceiptLink) -> [u8; 58] {
+    let mut key = [0u8; 58];
+    key[..2].copy_from_slice(&BATCH_RECEIPT_PREFIX);
+    key[2..18].copy_from_slice(&link.graph.to_be_bytes());
+    key[18..50].copy_from_slice(link.actor.as_bytes());
+    key[50..].copy_from_slice(&link.counter.to_be_bytes());
+    key
+}
+
+fn batch_reverse_key(id: &MutationId) -> [u8; 34] {
+    let mut key = [0u8; 34];
+    key[..2].copy_from_slice(&BATCH_REVERSE_PREFIX);
+    key[2..].copy_from_slice(&id.0);
+    key
+}
+
+fn batch_order_key(sequence: u64) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[..2].copy_from_slice(&BATCH_ORDER_PREFIX);
+    key[2..].copy_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+fn receipt_is_terminal(receipt: &MutationReceipt) -> bool {
+    use crate::sync::PersistenceOutcome;
+    matches!(
+        receipt.persistence,
+        PersistenceOutcome::Buffered
+            | PersistenceOutcome::DataSynced
+            | PersistenceOutcome::FullySynced
+    ) && [
+        receipt.repairs.diagnostics,
+        receipt.repairs.shacl,
+        receipt.repairs.search,
+        receipt.repairs.query_view,
+    ]
+    .into_iter()
+    .all(|outcome| {
+        matches!(
+            outcome,
+            RepairOutcome::NotRequired | RepairOutcome::Complete
+        )
+    })
 }
 
 fn encode_dots(dots: &[Dot]) -> Vec<u8> {
@@ -1537,12 +1735,8 @@ fn decode_dots(bytes: &[u8]) -> Result<Vec<Dot>> {
     Ok(dots)
 }
 
-/// Is a stored dot payload the empty set?
-///
-/// Both encodings start with one header byte — the `DOT_ENCODING_TAG` for the
-/// packed form, a postcard length prefix of `0` for the legacy form — so any
-/// payload of one byte or less carries no dots and the quad is dead.
-fn dot_payload_is_empty(bytes: &[u8]) -> bool {
+/// Both dot encodings represent an empty set in at most one byte.
+fn dots_empty(bytes: &[u8]) -> bool {
     bytes.len() <= 1
 }
 
@@ -1578,7 +1772,7 @@ fn graph_dirty_key(graph: TermId, subject: TermId) -> [u8; 33] {
     key
 }
 
-fn graph_dirty_graph_prefix(graph: TermId) -> [u8; 17] {
+fn graph_dirty_scope(graph: TermId) -> [u8; 17] {
     let mut key = [0u8; 17];
     key[0] = GRAPH_DIRTY_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
@@ -1600,15 +1794,15 @@ fn graph_reindex_prefix() -> [u8; 1] {
     [GRAPH_REINDEX_PREFIX]
 }
 
-fn graph_search_delete_key(graph: TermId) -> [u8; 17] {
+fn graph_delete_key(graph: TermId) -> [u8; 17] {
     let mut key = [0u8; 17];
-    key[0] = GRAPH_SEARCH_DELETE_PREFIX;
+    key[0] = GRAPH_DELETE_PREFIX;
     key[1..17].copy_from_slice(&graph.to_be_bytes());
     key
 }
 
-fn graph_search_delete_prefix() -> [u8; 1] {
-    [GRAPH_SEARCH_DELETE_PREFIX]
+fn graph_delete_prefix() -> [u8; 1] {
+    [GRAPH_DELETE_PREFIX]
 }
 
 fn graph_meta_prefix() -> [u8; 1] {
@@ -1698,6 +1892,13 @@ fn graph_tombstone_key(graph: TermId) -> [u8; 17] {
     key
 }
 
+fn deleted_policy_key(graph: TermId) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = DELETED_POLICY_PREFIX;
+    key[1..].copy_from_slice(&graph.to_be_bytes());
+    key
+}
+
 fn replication_rejection_key(topic: &irokle::TopicId, record: &irokle::OpId) -> [u8; 65] {
     let mut key = [0u8; 65];
     key[0] = REPLICATION_REJECTION_PREFIX;
@@ -1710,9 +1911,9 @@ fn replication_rejection_prefix() -> [u8; 1] {
     [REPLICATION_REJECTION_PREFIX]
 }
 
-fn cursor_repair_audit_key(audit: &crate::sync::TopicCursorRepairAudit) -> [u8; 97] {
+fn cursor_audit_key(audit: &crate::sync::TopicCursorRepairAudit) -> [u8; 97] {
     let mut key = [0u8; 97];
-    key[0] = CURSOR_REPAIR_AUDIT_PREFIX;
+    key[0] = CURSOR_AUDIT_PREFIX;
     key[1..33].copy_from_slice(audit.topic.as_bytes());
     key[33..65].copy_from_slice(&audit.old_cursor_digest);
     key[65..97].copy_from_slice(&audit.replacement_cursor_digest);
@@ -1742,21 +1943,18 @@ fn log_head_prefix(graph: TermId) -> [u8; 17] {
     key
 }
 
-/// Confirm that the bytes already stored under a term id really are `term`.
-///
-/// Compares raw bytes and only decodes on mismatch, i.e. on the
-/// (astronomically unlikely) hash-collision path that needs a message.
+/// Confirms an interned term, decoding only to report a hash collision.
 fn confirm_stored_term(stored: &[u8], term: &EncodedTerm) -> Result<()> {
     if stored == term.0.as_bytes() {
         return Ok(());
     }
     Err(StoreError::TermCollision {
         attempted: term.0.clone(),
-        existing: decode_term_utf8(stored)?,
+        existing: decode_term_text(stored)?,
     })
 }
 
-fn decode_term_utf8(bytes: &[u8]) -> Result<String> {
+fn decode_term_text(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|error| StoreError::InvalidEncoding {
         context: "terms",
         message: error.to_string(),
@@ -1771,43 +1969,50 @@ fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<TermId> {
     Ok(TermId::from_be_bytes(raw))
 }
 
-fn decode_query_index_u64(bytes: &[u8]) -> Option<u64> {
+fn decode_index_count(bytes: &[u8]) -> Option<u64> {
     let raw: [u8; 8] = bytes.try_into().ok()?;
     Some(u64::from_be_bytes(raw))
 }
 
 fn projection_debt_key(debt: u64) -> [u8; 9] {
     let mut key = [0u8; 9];
-    key[0] = QUERY_INDEX_PROJECTION_DEBT_TAG;
+    key[0] = QV_DEBT_TAG;
     key[1..9].copy_from_slice(&debt.to_be_bytes());
     key
 }
 
-fn query_index_failure_code_is_valid(code: &str) -> bool {
+fn query_delta_key(delta: u64) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = QV_DELTA_TAG;
+    key[1..].copy_from_slice(&delta.to_be_bytes());
+    key
+}
+
+fn valid_index_failure(code: &str) -> bool {
     !code.is_empty()
-        && code.len() <= QUERY_INDEX_FAILURE_MAX_BYTES
+        && code.len() <= QV_FAILURE_BYTES
         && code.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
 }
 
-fn encode_query_index_header(header: &QueryIndexHeader) -> Vec<u8> {
+fn encode_index_header(header: &IndexHeader) -> Vec<u8> {
     let (state_tag, failure) = match &header.state {
-        StoredQueryIndexState::Building => (1, ""),
-        StoredQueryIndexState::Ready => (2, ""),
-        StoredQueryIndexState::Failed(reason) => (3, reason.as_str()),
+        StoredIndexState::Building => (1, ""),
+        StoredIndexState::Ready => (2, ""),
+        StoredIndexState::Failed(reason) => (3, reason.as_str()),
     };
-    let failure =
-        if query_index_failure_code_is_valid(failure) || (failure.is_empty() && state_tag != 3) {
-            failure
-        } else {
-            "metadata-malformed"
-        };
-    let mut bytes = Vec::with_capacity(QUERY_INDEX_HEADER_BASE_LEN + failure.len());
-    bytes.extend_from_slice(&QUERY_INDEX_HEADER_MAGIC);
-    bytes.extend_from_slice(&QUERY_INDEX_SCHEMA_VERSION.to_be_bytes());
+    let failure = if valid_index_failure(failure) || (failure.is_empty() && state_tag != 3) {
+        failure
+    } else {
+        "metadata-malformed"
+    };
+    let mut bytes = Vec::with_capacity(QV_HEADER_LEN + failure.len());
+    bytes.extend_from_slice(&QV_HEADER_MAGIC);
+    bytes.extend_from_slice(&QV_SCHEMA_VERSION.to_be_bytes());
     bytes.push(state_tag);
     bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.push(header.active_slot);
     bytes.extend_from_slice(&header.source_epoch.to_be_bytes());
     bytes.extend_from_slice(&header.index_epoch.to_be_bytes());
     bytes.extend_from_slice(&header.source_live_quads.to_be_bytes());
@@ -1820,66 +2025,77 @@ fn encode_query_index_header(header: &QueryIndexHeader) -> Vec<u8> {
     bytes
 }
 
-fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
-    if bytes.len() < QUERY_INDEX_HEADER_BASE_LEN
-        || bytes[0..4] != QUERY_INDEX_HEADER_MAGIC
+fn decode_index_header(bytes: &[u8]) -> IndexHeaderRead {
+    if bytes.len() < 12
+        || bytes[0..4] != QV_HEADER_MAGIC
         || bytes[8] == 0
         || bytes[9..12] != [0, 0, 0]
     {
-        return QueryIndexHeaderRead::Malformed;
+        return IndexHeaderRead::Malformed;
     }
     let schema_version = u32::from_be_bytes(
         bytes[4..8]
             .try_into()
             .expect("fixed query-index header slice"),
     );
-    if schema_version != QUERY_INDEX_SCHEMA_VERSION
-        && schema_version != QUERY_INDEX_LEGACY_SCHEMA_VERSION
+    if schema_version != QV_SCHEMA_VERSION
+        && schema_version != QV_ATOMIC_VERSION
+        && schema_version != QV_LEGACY_VERSION
     {
-        return QueryIndexHeaderRead::Malformed;
+        return IndexHeaderRead::Malformed;
     }
-    let legacy = schema_version == QUERY_INDEX_LEGACY_SCHEMA_VERSION;
-    let Some(source_epoch) = decode_query_index_u64(&bytes[12..20]) else {
-        return QueryIndexHeaderRead::Malformed;
+    let legacy = schema_version != QV_SCHEMA_VERSION;
+    let (base_len, offset, active_slot) = if legacy {
+        (QV_LEGACY_LEN, 12, 0)
+    } else {
+        if bytes.len() < QV_HEADER_LEN || IndexSlot::decode(bytes[12]).is_none() {
+            return IndexHeaderRead::Malformed;
+        }
+        (QV_HEADER_LEN, 13, bytes[12])
     };
-    let Some(index_epoch) = decode_query_index_u64(&bytes[20..28]) else {
-        return QueryIndexHeaderRead::Malformed;
+    if bytes.len() < base_len {
+        return IndexHeaderRead::Malformed;
+    }
+    let Some(source_epoch) = decode_index_count(&bytes[offset..offset + 8]) else {
+        return IndexHeaderRead::Malformed;
     };
-    let Some(source_live_quads) = decode_query_index_u64(&bytes[28..36]) else {
-        return QueryIndexHeaderRead::Malformed;
+    let Some(index_epoch) = decode_index_count(&bytes[offset + 8..offset + 16]) else {
+        return IndexHeaderRead::Malformed;
     };
-    let Some(indexed_quads) = decode_query_index_u64(&bytes[36..44]) else {
-        return QueryIndexHeaderRead::Malformed;
+    let Some(source_live_quads) = decode_index_count(&bytes[offset + 16..offset + 24]) else {
+        return IndexHeaderRead::Malformed;
     };
-    let Some(last_build_sequence) = decode_query_index_u64(&bytes[44..52]) else {
-        return QueryIndexHeaderRead::Malformed;
+    let Some(indexed_quads) = decode_index_count(&bytes[offset + 24..offset + 32]) else {
+        return IndexHeaderRead::Malformed;
     };
-    let Some(query_id_generation) = decode_query_index_u64(&bytes[52..60]) else {
-        return QueryIndexHeaderRead::Malformed;
+    let Some(last_build_sequence) = decode_index_count(&bytes[offset + 32..offset + 40]) else {
+        return IndexHeaderRead::Malformed;
     };
-    let Some(next_query_id) = decode_query_index_u64(&bytes[60..68]) else {
-        return QueryIndexHeaderRead::Malformed;
+    let Some(query_id_generation) = decode_index_count(&bytes[offset + 40..offset + 48]) else {
+        return IndexHeaderRead::Malformed;
+    };
+    let Some(next_query_id) = decode_index_count(&bytes[offset + 48..offset + 56]) else {
+        return IndexHeaderRead::Malformed;
     };
     let failure_len = u16::from_be_bytes(
-        bytes[68..70]
+        bytes[offset + 56..offset + 58]
             .try_into()
             .expect("fixed query-index header slice"),
     ) as usize;
-    if failure_len > QUERY_INDEX_FAILURE_MAX_BYTES
-        || bytes.len() != QUERY_INDEX_HEADER_BASE_LEN + failure_len
-    {
-        return QueryIndexHeaderRead::Malformed;
+    if failure_len > QV_FAILURE_BYTES || bytes.len() != base_len + failure_len {
+        return IndexHeaderRead::Malformed;
     }
-    let failure = std::str::from_utf8(&bytes[QUERY_INDEX_HEADER_BASE_LEN..]).ok();
+    let failure = std::str::from_utf8(&bytes[base_len..]).ok();
     let state = match (bytes[8], failure) {
-        (1, Some("")) => StoredQueryIndexState::Building,
-        (2, Some("")) => StoredQueryIndexState::Ready,
-        (3, Some(reason)) if query_index_failure_code_is_valid(reason) => {
-            StoredQueryIndexState::Failed(reason.to_owned())
+        (1, Some("")) => StoredIndexState::Building,
+        (2, Some("")) => StoredIndexState::Ready,
+        (3, Some(reason)) if valid_index_failure(reason) => {
+            StoredIndexState::Failed(reason.to_owned())
         }
-        _ => return QueryIndexHeaderRead::Malformed,
+        _ => return IndexHeaderRead::Malformed,
     };
-    let header = QueryIndexHeader {
+    let header = IndexHeader {
+        active_slot,
         state,
         source_epoch,
         index_epoch,
@@ -1890,13 +2106,13 @@ fn decode_query_index_header(bytes: &[u8]) -> QueryIndexHeaderRead {
         next_query_id,
     };
     if legacy {
-        QueryIndexHeaderRead::Legacy(header)
+        IndexHeaderRead::Legacy(header)
     } else {
-        QueryIndexHeaderRead::Valid(header)
+        IndexHeaderRead::Valid(header)
     }
 }
 
-fn query_index_term_at(bytes: &[u8], offset: usize) -> QueryTermId {
+fn index_term_at(bytes: &[u8], offset: usize) -> QueryTermId {
     QueryTermId::from_be_bytes(
         bytes[offset..offset + 8]
             .try_into()
@@ -1904,58 +2120,52 @@ fn query_index_term_at(bytes: &[u8], offset: usize) -> QueryTermId {
     )
 }
 
-fn decode_query_index_counter_key(bytes: &[u8]) -> QueryIndexCounterKeyRead {
+fn predicate_revision_key(predicate: QueryTermId) -> [u8; 9] {
+    let mut key = [0; 9];
+    key[0] = QV_VERSION_TAG;
+    key[1..].copy_from_slice(&predicate.to_be_bytes());
+    key
+}
+
+fn decode_counter_key(bytes: &[u8]) -> CounterKeyRead {
     match bytes.first().copied() {
-        Some(b'H') if bytes.len() == 1 => QueryIndexCounterKeyRead::Header,
-        Some(b'H') => QueryIndexCounterKeyRead::InvalidLength,
-        Some(b'T') if bytes.len() == 1 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Total)
+        Some(b'H') if bytes.len() == 1 => CounterKeyRead::Header,
+        Some(b'H') => CounterKeyRead::InvalidLength,
+        Some(b'T') if bytes.len() == 1 => CounterKeyRead::Counter(IndexCounterKey::Total),
+        Some(b'T') => CounterKeyRead::InvalidLength,
+        Some(QV_UNION_TAG) if bytes.len() == 1 => {
+            CounterKeyRead::Counter(IndexCounterKey::UnionDuplicateFree)
         }
-        Some(b'T') => QueryIndexCounterKeyRead::InvalidLength,
-        Some(QUERY_INDEX_UNION_DUPLICATE_FREE_TAG) if bytes.len() == 1 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::UnionDuplicateFree)
+        Some(QV_UNION_TAG) => CounterKeyRead::InvalidLength,
+        Some(QV_GRAPH_TAG) if bytes.len() == 9 => {
+            CounterKeyRead::Counter(IndexCounterKey::Graph(index_term_at(bytes, 1)))
         }
-        Some(QUERY_INDEX_UNION_DUPLICATE_FREE_TAG) => QueryIndexCounterKeyRead::InvalidLength,
-        Some(QUERY_INDEX_GRAPH_COUNT_TAG) if bytes.len() == 9 => QueryIndexCounterKeyRead::Counter(
-            QueryIndexCounterKey::Graph(query_index_term_at(bytes, 1)),
+        Some(QV_PREDICATE_TAG) if bytes.len() == 9 => {
+            CounterKeyRead::Counter(IndexCounterKey::Predicate(index_term_at(bytes, 1)))
+        }
+        Some(QV_VERSION_TAG) if bytes.len() == 9 => CounterKeyRead::Revision,
+        Some(QV_GP_TAG) if bytes.len() == 17 => CounterKeyRead::Counter(
+            IndexCounterKey::GraphPredicate(index_term_at(bytes, 1), index_term_at(bytes, 9)),
         ),
-        Some(QUERY_INDEX_PREDICATE_COUNT_TAG) if bytes.len() == 9 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::Predicate(query_index_term_at(
-                bytes, 1,
-            )))
-        }
-        Some(QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG) if bytes.len() == 17 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicate(
-                query_index_term_at(bytes, 1),
-                query_index_term_at(bytes, 9),
-            ))
-        }
-        Some(QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 17 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::PredicateObject(
-                query_index_term_at(bytes, 1),
-                query_index_term_at(bytes, 9),
-            ))
-        }
-        Some(QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG) if bytes.len() == 25 => {
-            QueryIndexCounterKeyRead::Counter(QueryIndexCounterKey::GraphPredicateObject(
-                query_index_term_at(bytes, 1),
-                query_index_term_at(bytes, 9),
-                query_index_term_at(bytes, 17),
+        Some(QV_PO_TAG) if bytes.len() == 17 => CounterKeyRead::Counter(
+            IndexCounterKey::PredicateObject(index_term_at(bytes, 1), index_term_at(bytes, 9)),
+        ),
+        Some(QV_GPO_TAG) if bytes.len() == 25 => {
+            CounterKeyRead::Counter(IndexCounterKey::GraphPredicateObject(
+                index_term_at(bytes, 1),
+                index_term_at(bytes, 9),
+                index_term_at(bytes, 17),
             ))
         }
         Some(
-            QUERY_INDEX_GRAPH_COUNT_TAG
-            | QUERY_INDEX_PREDICATE_COUNT_TAG
-            | QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG
-            | QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG
-            | QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG,
-        ) => QueryIndexCounterKeyRead::InvalidLength,
-        Some(QUERY_INDEX_PROJECTION_DEBT_TAG) if bytes.len() == 9 => {
-            QueryIndexCounterKeyRead::ProjectionDebt
-        }
-        Some(QUERY_INDEX_PROJECTION_DEBT_TAG) => QueryIndexCounterKeyRead::InvalidLength,
-        Some(_) => QueryIndexCounterKeyRead::UnknownTag,
-        None => QueryIndexCounterKeyRead::InvalidLength,
+            QV_GRAPH_TAG | QV_PREDICATE_TAG | QV_VERSION_TAG | QV_GP_TAG | QV_PO_TAG | QV_GPO_TAG,
+        ) => CounterKeyRead::InvalidLength,
+        Some(QV_DEBT_TAG) if bytes.len() == 9 => CounterKeyRead::ProjectionDebt,
+        Some(QV_DEBT_TAG) => CounterKeyRead::InvalidLength,
+        Some(b'B' | b'C') if bytes.len() == 1 => CounterKeyRead::Control,
+        Some(QV_DELTA_TAG) if bytes.len() == 9 => CounterKeyRead::Control,
+        Some(_) => CounterKeyRead::UnknownTag,
+        None => CounterKeyRead::InvalidLength,
     }
 }
 
@@ -1975,27 +2185,27 @@ fn query_index_prefix(parts: &[QueryTermId]) -> Vec<u8> {
     prefix
 }
 
-fn qv2_gspo_key(quad: QueryQuad) -> QueryQuadKey {
+fn gspo_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.graph, quad.subject, quad.predicate, quad.object])
 }
 
-fn qv2_gpos_key(quad: QueryQuad) -> QueryQuadKey {
+fn gpos_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.graph, quad.predicate, quad.object, quad.subject])
 }
 
-fn qv2_spog_key(quad: QueryQuad) -> QueryQuadKey {
+fn spog_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.subject, quad.predicate, quad.object, quad.graph])
 }
 
-fn qv2_posg_key(quad: QueryQuad) -> QueryQuadKey {
+fn posg_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.predicate, quad.object, quad.subject, quad.graph])
 }
 
-fn qv2_ospg_key(quad: QueryQuad) -> QueryQuadKey {
+fn ospg_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.object, quad.subject, quad.predicate, quad.graph])
 }
 
-fn qv2_gosp_key(quad: QueryQuad) -> QueryQuadKey {
+fn gosp_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.graph, quad.object, quad.subject, quad.predicate])
 }
 
