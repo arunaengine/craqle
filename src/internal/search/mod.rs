@@ -1854,83 +1854,303 @@ impl SearchIndex {
 
         // Every epoch bump happens under the writer lock, so nothing can slip
         // in between reading the epoch and committing it.
-        let covered = {
+        let committed = {
             let mut writer = self.writer()?;
             let covered = self.write_epoch.load(Ordering::SeqCst);
-            writer.commit()?;
-            covered
+            writer.commit().map(|_| covered)
         };
-        self.reader.reload()?;
+        let covered = match committed {
+            Ok(covered) => covered,
+            Err(error) => {
+                self.reset_writer()?;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.reader.reload() {
+            self.reset_writer()?;
+            return Err(error.into());
+        }
+        self.publish_searcher();
         self.committed_epoch.store(covered, Ordering::SeqCst);
         Ok(())
     }
 
-    /// Sync queued updates from the RDF store into Tantivy.
-    ///
-    /// All three durable queues get a share of the pass, in delete, then
-    /// whole-graph, then per-subject order. Returning as soon as one class had
-    /// work let a steady stream of deletes starve every queued subject, and a
-    /// single failing entry aborted the pass before any commit, so the work
-    /// prepared ahead of it was thrown away and redone on every retry.
-    ///
-    /// Each branch commits the index *before* acknowledging the entries it
-    /// covered: a crash in between only re-does work, whereas acknowledging
-    /// first would silently drop updates Tantivy never committed (G7). An
-    /// entry that fails is left unacknowledged and named in the result, so a
-    /// flush covering it cannot report success.
-    /// Entries this drain committed and acknowledged.
-    ///
-    /// A count only. [`SearchIndex::drain_queues`] carries the rest of the
-    /// outcome: work still owed, entries that failed, and a recovery target a
-    /// repair raised.
-    pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
-        Ok(self.drain_queues(store, bound)?.covered)
+    /// Drain every queue class, committing before acknowledgement.
+    /// Returns only the acknowledged count; [`Self::drain_queues`] retains detail.
+    #[cfg(test)]
+    pub(crate) fn process_queued_updates(
+        &self,
+        store: &GraphStore,
+        bound: QueueBound,
+    ) -> Result<usize> {
+        Ok(self
+            .drain_queues(
+                store,
+                DrainRequest {
+                    bound,
+                    control: DrainControl::default(),
+                },
+            )?
+            .covered)
     }
 
-    pub fn drain_queues(&self, store: &GraphStore, bound: QueueBound) -> Result<DrainProgress> {
-        let (bound, recovery) = self.settle_poisoned_writer(store, bound)?;
-        // One share per class, so no class can consume the whole pass.
-        let quota = bound.chunk.div_ceil(3).max(1);
+    pub(crate) fn drain_queues(
+        &self,
+        store: &GraphStore,
+        request: DrainRequest,
+    ) -> Result<DrainProgress> {
+        let _work = self
+            .work_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let coverage = store.search_coverage()?;
+        if !self.pin_view().bound
+            || coverage.is_none_or(|coverage| coverage.index_id != self.index_id)
+        {
+            self.bind_store(store)?;
+        }
+        self.check_cancel(&request.control)?;
+        let (bound, recovery) = self.settle_poisoned_writer(store, request.bound)?;
+        if bound.chunk == 0 {
+            return Ok(DrainProgress {
+                recovery,
+                remaining: true,
+                ..DrainProgress::default()
+            });
+        }
+        let quotas = self.drain_quotas(bound.chunk);
         let mut pass = DrainPass {
             store,
-            bound: QueueBound {
-                chunk: quota,
-                ..bound
-            },
+            control: request.control,
+            bound: QueueBound { chunk: 0, ..bound },
             progress: DrainProgress {
                 recovery,
                 ..DrainProgress::default()
             },
+            byte_limit: self.work_bytes(),
+            advanced: false,
         };
 
+        pass.byte_limit = self.work_bytes();
+        pass.bound.chunk = quotas[1];
         self.drain_deleted_graphs(&mut pass)?;
+        pass.byte_limit = self.work_bytes();
+        pass.bound.chunk = quotas[2];
         self.drain_rebuilt_graphs(&mut pass)?;
+        pass.byte_limit = self.work_bytes();
+        pass.bound.chunk = quotas[3];
         self.drain_dirty_subjects(&mut pass)?;
+        pass.byte_limit = self.work_bytes();
+        pass.bound.chunk = quotas[4];
+        self.drain_cleanup(&mut pass)?;
+        pass.byte_limit = self.work_bytes();
+        pass.bound.chunk = quotas[0];
+        self.queue_rebuild(&mut pass)?;
+        // Durable failures are reported after independent bounded work drains;
+        // otherwise one bad item can hide a healthy inactive generation.
+        if pass.progress.remaining && (pass.progress.covered != 0 || pass.advanced) {
+            pass.progress.failures.clear();
+        }
         Ok(pass.progress)
+    }
+
+    fn drain_quotas(&self, chunk: usize) -> [usize; 5] {
+        let mut quotas = [chunk / 5; 5];
+        let start = (self.fair_cursor.fetch_add(1, Ordering::SeqCst) % 5) as usize;
+        for offset in 0..(chunk % 5) {
+            quotas[(start + offset) % 5] += 1;
+        }
+        quotas
+    }
+
+    fn queue_rebuild(&self, pass: &mut DrainPass<'_>) -> Result<()> {
+        let Some(coverage) = pass.store.search_coverage()? else {
+            return Ok(());
+        };
+        if coverage.index_id != self.index_id || coverage.rebuild.is_none() {
+            return Ok(());
+        }
+        let page = pass.store.queue_search_rebuild(&RebuildScan {
+            index_id: self.index_id,
+            row_limit: pass.bound.chunk,
+            byte_limit: pass.byte_limit,
+        })?;
+        pass.progress.rows_read = pass.progress.rows_read.saturating_add(page.rows);
+        pass.advanced |= page.rows != 0;
+        pass.progress.queue_bytes = pass.progress.queue_bytes.saturating_add(page.bytes);
+        pass.progress.remaining |= page.remaining;
+        let target = pass
+            .bound
+            .max_token
+            .map_or(page.target, |current| current.max(page.target));
+        pass.bound.max_token = Some(target);
+        pass.progress.recovery = Some(
+            pass.progress
+                .recovery
+                .map_or(target, |current| current.max(target)),
+        );
+        if let Some(oversized) = page.oversized {
+            return Err(SearchError::ItemTooLarge {
+                bytes: oversized.bytes,
+                limit: oversized.limit,
+            });
+        }
+        Ok(())
+    }
+
+    fn drain_cleanup(&self, pass: &mut DrainPass<'_>) -> Result<()> {
+        let after = self
+            .scan_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cleanup;
+        let page = pass.store.scan_search_cleanup(&CleanupScan {
+            after,
+            row_limit: pass.bound.chunk,
+            byte_limit: pass.byte_limit,
+        })?;
+        self.scan_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cleanup = page.remaining.then_some(page.next).flatten();
+        pass.progress.rows_read = pass.progress.rows_read.saturating_add(page.rows);
+        pass.progress.queue_bytes = pass.progress.queue_bytes.saturating_add(page.bytes);
+        pass.progress.remaining |= page.remaining;
+        if let Some(oversized) = page.oversized {
+            pass.progress.cleanup_failures.push(CleanupFailure {
+                generation: oversized.generation,
+                bytes: oversized.bytes,
+                limit: oversized.limit,
+            });
+        }
+        if page.entries.is_empty() {
+            return Ok(());
+        }
+        {
+            let writer = self.writer()?;
+            for job in &page.entries {
+                self.check_cancel(&pass.control)?;
+                writer.delete_term(Term::from_field_text(
+                    self.f_generation_key,
+                    &generation_key(self.index_id, job.graph.as_str(), job.generation),
+                ));
+                self.write_epoch.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        self.commit()?;
+        #[cfg(test)]
+        self.hooks.cleanup.run();
+        pass.store.ack_search_cleanup(&page.entries)?;
+        Ok(())
+    }
+
+    fn queue_scan(&self, input: QueueInput<'_>) -> QueueScan {
+        let cursors = self
+            .scan_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let cursor = match input.kind {
+            QueueKind::Delete => cursors.deletes,
+            QueueKind::Reindex => cursors.reindexes,
+            QueueKind::Subject => cursors.subjects,
+        };
+        let after = cursor.filter(|cursor| {
+            input
+                .bound
+                .max_token
+                .is_none_or(|max_token| cursor.token <= max_token)
+        });
+        QueueScan {
+            max_token: input.bound.max_token,
+            after,
+            row_limit: input.bound.chunk,
+            byte_limit: input.byte_limit,
+        }
+    }
+
+    fn save_scan<T>(&self, save: ScanSave<'_, T>) -> bool {
+        let mut cursors = self
+            .scan_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let next = save.page.remaining.then_some(save.page.next).flatten();
+        match save.kind {
+            QueueKind::Delete => cursors.deletes = next,
+            QueueKind::Reindex => cursors.reindexes = next,
+            QueueKind::Subject => cursors.subjects = next,
+        }
+        !save.page.remaining && save.started
     }
 
     /// Settle the graphs whose search documents a removal invalidated.
     fn drain_deleted_graphs(&self, pass: &mut DrainPass<'_>) -> Result<()> {
-        let slice = drain_upto(&pass.bound, |chunk| {
-            pass.store.drain_fts_delete_queue(chunk)
-        })?;
-        pass.progress.remaining |= slice.remaining;
-        if slice.entries.is_empty() {
+        let scan = self.queue_scan(QueueInput {
+            kind: QueueKind::Delete,
+            bound: &pass.bound,
+            byte_limit: pass.byte_limit,
+        });
+        let started = scan.after.is_some();
+        let page = pass.store.scan_fts_deletes(&scan)?;
+        pass.progress.remaining |= self.save_scan(ScanSave {
+            kind: QueueKind::Delete,
+            page: &page,
+            started,
+        });
+        pass.progress.rows_read = pass.progress.rows_read.saturating_add(page.rows);
+        pass.progress.queue_bytes = pass.progress.queue_bytes.saturating_add(page.bytes);
+        pass.progress.remaining |= page.remaining;
+        if let Some(id) = page.oversized.as_ref() {
+            pass.progress
+                .failures
+                .push(self.record_oversized(pass.store, id)?);
+        }
+        if page.entries.is_empty() {
             return Ok(());
         }
 
-        let mut covered = Vec::with_capacity(slice.entries.len());
-        for entry in &slice.entries {
-            let key = FailureKey::graph(&entry.graph);
-            match self.settle_deleted_graph(pass.store, &entry.graph) {
-                Ok(()) => {
-                    self.clear_failure(&key);
-                    covered.push(entry.clone());
+        let mut covered = Vec::with_capacity(page.entries.len());
+        for entry in &page.entries {
+            self.check_cancel(&pass.control)?;
+            let id = graph_queue_id(QueueKind::Delete, &entry.graph);
+            let input = FailureInput {
+                id: &id,
+                owed_from: entry.tokens.oldest,
+                target: entry.tokens.latest,
+            };
+            if let Some(failure) = self.retry_failure(pass.store, input)? {
+                pass.progress.failures.push(failure);
+                continue;
+            }
+            match self.settle_deleted_graph(
+                GraphWork {
+                    store: pass.store,
+                    graph: &entry.graph,
+                    control: &pass.control,
+                    byte_limit: pass.byte_limit.saturating_sub(page.bytes),
+                },
+                entry.tokens.latest,
+            ) {
+                Ok(StageOutcome::Covered(target)) => {
+                    self.clear_failure(pass.store, &id)?;
+                    let mut settled = entry.clone();
+                    settled.tokens.latest = target;
+                    covered.push(settled);
                 }
-                Err(error) => pass
-                    .progress
-                    .failures
-                    .push(self.record_failure(key, &error)),
+                Ok(StageOutcome::Pending(_)) => {
+                    pass.advanced = true;
+                    pass.progress.remaining = true;
+                }
+                Err(error) if matches!(error, SearchError::Cancelled) => return Err(error),
+                Err(error) => {
+                    let input = FailureInput {
+                        id: &id,
+                        owed_from: entry.tokens.oldest,
+                        target: entry.tokens.latest,
+                    };
+                    pass.progress
+                        .failures
+                        .push(self.record_failure(pass.store, FailedItem { input, error })?);
+                }
             }
         }
         if covered.is_empty() {
