@@ -2846,41 +2846,10 @@ impl SearchIndex {
         }
     }
 
-    fn flush_pending_documents(
-        &self,
-        graph_iri: &str,
-        pending_documents: &mut Vec<(String, Option<String>)>,
-    ) -> Result<()> {
-        if pending_documents.is_empty() {
-            return Ok(());
-        }
-
-        // Guards the Tantivy writer. Reindex already dropped every document of
-        // this graph, so the per-document delete is unnecessary here.
-        let mut writer = self.writer()?;
-        for (subject_iri, extra_text) in pending_documents.drain(..) {
-            self.add_document(
-                &mut writer,
-                ResourceDoc {
-                    graph_id: graph_iri,
-                    subject_iri: &subject_iri,
-                    all_text: extra_text.as_deref(),
-                    delete_existing: false,
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn delete_resource_with_writer(
-        &self,
-        writer: &mut IndexWriter,
-        graph_id: &str,
-        subject_iri: &str,
-    ) {
+    fn delete_doc(&self, writer: &mut IndexWriter, doc: &DocIdentity) {
         writer.delete_term(Term::from_field_text(
             self.f_doc_key,
-            &doc_key(graph_id, subject_iri),
+            &doc_key(&doc.graph_iri, doc.generation, &doc.subject_iri),
         ));
         self.write_epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -2902,10 +2871,7 @@ impl SearchIndex {
     }
 }
 
-/// Read everything one queued subject needs from the store and decide whether
-/// its document should be replaced or dropped.
-///
-/// Pure store reads: no Tantivy writer lock is held while this runs.
+/// Prepare one subject replacement or deletion without the writer lock.
 fn prepare_subject_op(
     req: PrepareSubject<'_>,
     caches: &mut StoreSyncCaches,
@@ -2914,14 +2880,16 @@ fn prepare_subject_op(
     let doc = DocIdentity {
         graph_iri: req.graph.as_str().to_string(),
         subject_iri: term_to_string(&subject_term),
+        generation: req.generation,
     };
-
-    // Orphaned entities are invisible to search, exactly as they are to export
-    // and SPARQL (G6).
-    let orphaned = load_orphaned_subjects(&mut caches.orphaned_subjects, req.store, req.graph)?;
-    if orphaned.contains(doc.subject_iri.as_str()) {
-        return Ok(PreparedDocOp::Delete { doc });
+    let identity_bytes = doc.graph_iri.len().saturating_add(doc.subject_iri.len());
+    if identity_bytes > req.byte_limit {
+        return Err(SearchError::ItemTooLarge {
+            bytes: identity_bytes,
+            limit: req.byte_limit,
+        });
     }
+    let text_limit = req.byte_limit.saturating_sub(identity_bytes);
 
     let graph_tid = match caches.graph_terms.entry(req.graph.clone()) {
         std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
@@ -2933,17 +2901,72 @@ fn prepare_subject_op(
     let Some(graph_tid) = graph_tid else {
         return Ok(PreparedDocOp::Delete { doc });
     };
-
-    let triples = req.store.triples_for_subject(graph_tid, req.subject)?;
-    if triples.is_empty() {
+    let cache_before = caches.orphan_bytes;
+    let hidden = caches
+        .orphaned(OrphanInput {
+            graph: req.graph,
+            graph_tid,
+            byte_limit: text_limit,
+        })?
+        .contains(&req.subject);
+    if hidden {
         return Ok(PreparedDocOp::Delete { doc });
     }
+    let remaining = text_limit.saturating_sub(caches.orphan_bytes.saturating_sub(cache_before));
+    let source_limit = remaining / 2;
+    let text_limit = remaining.saturating_sub(source_limit);
 
     let mut all_text = String::new();
-    for (predicate, object) in triples {
-        if is_searchable_predicate(&predicate) {
-            append_searchable_text(&mut all_text, &object);
+    let mut after = None;
+    let mut found = false;
+    let mut source_bytes = 0usize;
+    let mut source_rows = 0usize;
+    loop {
+        let page = caches.snapshot.scan_subject(&SubjectScan {
+            graph: graph_tid,
+            subject: req.subject,
+            after,
+            row_limit: SOURCE_PAGE_ROWS,
+            byte_limit: source_limit.saturating_sub(source_bytes),
+        })?;
+        if let Some(oversized) = page.oversized {
+            return Err(SearchError::ItemTooLarge {
+                bytes: oversized.bytes,
+                limit: oversized.limit,
+            });
         }
+        found |= !page.entries.is_empty();
+        source_rows = source_rows.saturating_add(page.rows);
+        source_bytes = source_bytes.saturating_add(page.bytes);
+        for (predicate, object) in page.entries {
+            if is_searchable_predicate(&predicate) {
+                append_searchable_text(&mut all_text, &object, text_limit)?;
+            }
+        }
+        if !page.remaining {
+            break;
+        }
+        if source_rows >= SOURCE_PAGE_ROWS {
+            return Err(SearchError::SourceTooLarge {
+                rows: source_rows.saturating_add(1),
+                limit: SOURCE_PAGE_ROWS,
+            });
+        }
+        if source_bytes >= source_limit {
+            return Err(SearchError::ItemTooLarge {
+                bytes: source_bytes.saturating_add(1),
+                limit: source_limit,
+            });
+        }
+        after = page.next;
+        if after.is_none() {
+            return Err(SearchError::Store(
+                crate::store::StoreError::InvalidSearchState("subject-scan-continuation-missing"),
+            ));
+        }
+    }
+    if !found {
+        return Ok(PreparedDocOp::Delete { doc });
     }
 
     Ok(PreparedDocOp::Upsert {
@@ -2959,13 +2982,63 @@ fn first_text(doc: &TantivyDocument, field: Field) -> Option<String> {
         .and_then(|value| value.as_str().map(str::to_string))
 }
 
-fn doc_key(graph_id: &str, subject_iri: &str) -> String {
-    format!("{graph_id}\u{1f}{subject_iri}")
+fn doc_key(graph_id: &str, generation: GenerationId, subject_iri: &str) -> String {
+    format!("{graph_id}\u{1f}{}\u{1f}{subject_iri}", generation.0)
 }
 
 fn split_doc_key(doc_key: &str) -> Option<(String, String)> {
-    let (graph_id, subject_iri) = doc_key.split_once('\u{1f}')?;
+    let (graph_id, remainder) = doc_key.split_once('\u{1f}')?;
+    let (_, subject_iri) = remainder.split_once('\u{1f}')?;
     Some((graph_id.to_string(), subject_iri.to_string()))
+}
+
+fn generation_key(index_id: [u8; 16], graph_id: &str, generation: GenerationId) -> String {
+    format!(
+        "{}\u{1f}{graph_id}\u{1f}{}",
+        uuid::Uuid::from_bytes(index_id),
+        generation.0
+    )
+}
+
+fn generation_scope(index_id: [u8; 16], graph_id: &str, generation: GenerationId) -> Vec<u8> {
+    let mut scope = Vec::with_capacity(16 + graph_id.len() + 8);
+    scope.extend_from_slice(&index_id);
+    scope.extend_from_slice(graph_id.as_bytes());
+    scope.extend_from_slice(&generation.0.to_be_bytes());
+    scope
+}
+
+fn scope_graph(scope: &[u8]) -> Option<&str> {
+    if scope.len() < 24 {
+        return None;
+    }
+    std::str::from_utf8(&scope[16..scope.len() - 8]).ok()
+}
+
+fn first_bytes(column: Option<&tantivy::columnar::BytesColumn>, doc: DocId) -> Option<Vec<u8>> {
+    let column = column?;
+    let ord = column.term_ords(doc).next()?;
+    let mut bytes = Vec::new();
+    column
+        .ord_to_bytes(ord, &mut bytes)
+        .ok()
+        .and_then(|found| found.then_some(bytes))
+}
+
+pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(graph_id.len() as u64).to_be_bytes());
+    hasher.update(graph_id.as_bytes());
+    hasher.update(&(subject_iri.len() as u64).to_be_bytes());
+    hasher.update(subject_iri.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn subject_cursor(graph: TermId, subject: TermId) -> [u8; 64] {
+    let mut cursor = [u8::MAX; 64];
+    cursor[..16].copy_from_slice(&graph.to_be_bytes());
+    cursor[16..32].copy_from_slice(&subject.to_be_bytes());
+    cursor
 }
 
 fn rebuild_shard(graph_iri: &str) -> usize {
@@ -2995,14 +3068,6 @@ fn sanitize_query(query: &str) -> String {
         .join(" ")
 }
 
-fn orphaned_subjects(store: &GraphStore, graph: &GraphId) -> Result<HashSet<String>> {
-    Ok(store
-        .graph_diagnostics(graph)?
-        .orphaned_entities
-        .into_iter()
-        .collect())
-}
-
 /// Convert an EncodedTerm to a plain string (IRI without angle brackets,
 /// or the raw string representation for other term types).
 fn term_to_string(term: &EncodedTerm) -> String {
@@ -3013,19 +3078,26 @@ fn term_to_string(term: &EncodedTerm) -> String {
     }
 }
 
-fn append_searchable_text(buffer: &mut String, term: &EncodedTerm) {
+fn append_searchable_text(buffer: &mut String, term: &EncodedTerm, limit: usize) -> Result<()> {
     let Some(value) = searchable_term_text(term) else {
-        return;
+        return Ok(());
     };
+    let separator = usize::from(!buffer.is_empty());
+    let bytes = buffer
+        .len()
+        .saturating_add(separator)
+        .saturating_add(value.len());
+    if bytes > limit {
+        return Err(SearchError::ItemTooLarge { bytes, limit });
+    }
     if !buffer.is_empty() {
         buffer.push(' ');
     }
     buffer.push_str(&value);
+    Ok(())
 }
 
-/// `https://schema.org/` and `http://schema.org/` name the same predicate; the
-/// table is interned in the `http` form, so an `https` term is normalized
-/// before comparison rather than being silently dropped from the index.
+/// Normalize HTTPS schema predicates to the interned HTTP form.
 fn is_searchable_predicate(predicate: &EncodedTerm) -> bool {
     let normalized = predicate
         .0
@@ -3052,16 +3124,83 @@ fn searchable_term_text(term: &EncodedTerm) -> Option<Cow<'_, str>> {
     }
 }
 
-fn load_orphaned_subjects<'a>(
-    cache: &'a mut HashMap<GraphId, HashSet<String>>,
-    store: &GraphStore,
-    graph: &GraphId,
-) -> Result<&'a HashSet<String>> {
-    if !cache.contains_key(graph) {
-        cache.insert(graph.clone(), orphaned_subjects(store, graph)?);
+fn failure_code(error: &SearchError) -> &'static str {
+    match error {
+        SearchError::ItemTooLarge { .. } => "item-too-large",
+        SearchError::SourceTooLarge { .. } => "item-too-large",
+        SearchError::Cancelled => "cancelled",
+        SearchError::Unbound => "index-unbound",
+        SearchError::Store(error) if error.rejects_record() => "item-invalid",
+        SearchError::Store(_) => "store-transient",
+        SearchError::Tantivy(_) => "index-transient",
+        SearchError::QueryParse(_) => "query-invalid",
+        SearchError::Io(_) => "io-transient",
     }
-    Ok(cache.get(graph).expect("orphan cache inserted"))
 }
+
+fn failure_class(error: &SearchError) -> FailureClass {
+    match error {
+        SearchError::ItemTooLarge { .. } | SearchError::SourceTooLarge { .. } => {
+            FailureClass::ItemPermanent
+        }
+        SearchError::Store(error) if error.rejects_record() => FailureClass::ItemPermanent,
+        SearchError::Store(crate::store::StoreError::InvalidSearchState(code))
+            if matches!(
+                *code,
+                "search-diagnostics-missing" | "search-diagnostics-stale"
+            ) =>
+        {
+            FailureClass::ItemRetryable
+        }
+        SearchError::Store(crate::store::StoreError::GraphNotFound(_)) => {
+            FailureClass::ItemRetryable
+        }
+        SearchError::Tantivy(_) => FailureClass::Rebuild,
+        SearchError::Store(_)
+        | SearchError::QueryParse(_)
+        | SearchError::Io(_)
+        | SearchError::Cancelled
+        | SearchError::Unbound => FailureClass::Global,
+    }
+}
+
+fn graph_queue_id(kind: QueueKind, graph: &GraphId) -> QueueId {
+    QueueId {
+        kind,
+        graph: graph.clone(),
+        subject: None,
+    }
+}
+
+fn subject_queue_id(graph: &GraphId, subject: TermId) -> QueueId {
+    QueueId {
+        kind: QueueKind::Subject,
+        graph: graph.clone(),
+        subject: Some(subject),
+    }
+}
+
+fn drain_failure(state: &RetryState, diagnostic: &str) -> DrainFailure {
+    DrainFailure {
+        kind: state.id.kind,
+        error_kind: state.error_kind,
+        graph: state.id.graph.clone(),
+        owed_from: state.owed_from,
+        target: state.target,
+        attempts: state.attempts,
+        retry_at_ms: state.retry_at_ms,
+        code: state.code.clone(),
+        diagnostic: diagnostic.to_string(),
+    }
+}
+
+#[cfg(test)]
+#[path = "bench.rs"]
+mod search_bench;
+
+#[cfg(test)]
+#[path = "recovery.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
