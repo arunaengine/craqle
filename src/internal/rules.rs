@@ -18,10 +18,7 @@ thread_local! {
     static SNAPSHOT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// ── Constant term table ─────────────────────────────────────────────────────
-//
-// `vocab` hands out freshly parsed `NamedNode`s, so every rule used to re-encode
-// the same dozen IRIs on every call. These are interned once per process.
+// Intern these vocabulary terms once instead of encoding them for every rule call.
 
 fn encoded_nn(nn: &oxrdf::NamedNode) -> EncodedTerm {
     EncodedTerm::from_named_node(nn)
@@ -49,13 +46,8 @@ vocab_terms! {
 static DCTERMS_CONFORMS_TO: LazyLock<EncodedTerm> =
     LazyLock::new(|| EncodedTerm("<http://purl.org/dc/terms/conformsTo>".to_string()));
 
-/// The three properties RO-Crate requires on the root data entity, in the order
-/// they are reported. `DeltaSummary::touches_required_root_properties` is
-/// indexed by this order.
-///
-/// `schema:license` is deliberately absent: a crate may be created without one
-/// (genesis takes `Option<License>`), and the submitted licence shape is
-/// preserved out of band by the store rather than as a required root triple.
+/// Required root properties in reporting order; `required_root_hits` uses this order.
+/// License is optional and stored separately, so it is deliberately absent.
 static REQUIRED_ROOT_PROPERTIES: LazyLock<[(EncodedTerm, &'static str); 3]> = LazyLock::new(|| {
     [
         (SCHEMA_NAME.clone(), "schema:name"),
@@ -70,8 +62,6 @@ const DATE_PUBLISHED_SLOT: usize = 2;
 fn graph_root(graph: &GraphId) -> EncodedTerm {
     EncodedTerm::from_named_node(&graph.0)
 }
-
-// ── Small key bundles ───────────────────────────────────────────────────────
 
 /// A `(subject, predicate, object)` lookup key. Bundled so every helper that
 /// needs a whole triple stays inside the three-parameter budget.
@@ -98,16 +88,12 @@ pub(crate) struct ChangeSet<'a> {
     pub delta: &'a [MaterializedQuadChange],
 }
 
-// ── Snapshots ───────────────────────────────────────────────────────────────
-
 /// A snapshot view of a graph for validation.
 pub(crate) struct GraphSnapshot {
     pub graph: GraphId,
     /// All quads in the graph, as (subject, predicate, object) encoded terms.
     pub triples: Vec<(EncodedTerm, EncodedTerm, EncodedTerm)>,
-    /// Lazily built index over `triples`, so the post-state rules cost O(T)
-    /// instead of one full scan per lookup. `triples` is never mutated after
-    /// construction, so a single build can never go stale.
+    /// Lazy immutable index that keeps post-state validation linear in triple count.
     lookup: OnceCell<SnapshotLookup>,
 }
 
@@ -202,8 +188,6 @@ impl GraphSnapshot {
             .any(|&row| &self.triples[row].2 == triple.object)
     }
 }
-
-// ── Rules ───────────────────────────────────────────────────────────────────
 
 /// Everything a candidate check may read: the post-delta view of the store plus
 /// the pre-computed summary of what the delta touches.
@@ -370,9 +354,7 @@ pub(crate) trait Rule: Send + Sync {
         None
     }
 
-    /// Validate against the delta alone where possible. Returning
-    /// [`CandidateCheck::NeedSnapshot`] falls back to materialising the whole
-    /// post state.
+    /// Validate from the delta when possible, requesting a full post-state snapshot when needed.
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck>;
 
     /// Validate the post-state snapshot. Return `Err` if a violation is found.
@@ -447,10 +429,7 @@ pub(crate) enum RuleEvaluationError {
     Violations(Vec<CrateViolation>),
 }
 
-// ── Delta summary ───────────────────────────────────────────────────────────
-
-/// What a change set touches, in the terms the rules care about. Cheap to
-/// compute (one pass over the delta) and shared by every rule.
+/// One-pass summary of the change shapes used by validation rules.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DeltaSummary {
     inserted_subjects: BTreeSet<EncodedTerm>,
@@ -458,29 +437,20 @@ pub(crate) struct DeltaSummary {
     /// Entities whose whole `hasPart` subtree may have changed reachability.
     /// Expanded to all descendants before the orphan check.
     reachability_seeds: BTreeSet<EncodedTerm>,
-    /// Entities whose *own* data-entity status may have changed but whose
-    /// reachability and subtree cannot have. Checked directly, without
-    /// expansion — gaining or losing an outgoing `hasPart` edge changes whether
-    /// a node counts as a data entity, never whether it is reachable.
+    /// Entities whose own data-entity status may change without changing subtree reachability.
     reachability_probes: BTreeSet<EncodedTerm>,
     touches_root_dataset: bool,
     touches_metadata_descriptor: bool,
-    touches_required_root_properties: [bool; 3],
+    required_root_hits: [bool; 3],
     touches_reachability: bool,
 }
 
 impl DeltaSummary {
-    fn touches_any_required_root_property(&self) -> bool {
-        self.touches_required_root_properties.iter().any(|hit| *hit)
+    fn touches_required_root(&self) -> bool {
+        self.required_root_hits.iter().any(|hit| *hit)
     }
 
-    /// True when the change set can move an entity into or out of
-    /// `orphaned_data_entities`.
-    ///
-    /// `orphaned_data_entities` reads exactly two triple shapes — `rdf:type` with
-    /// object `schema:Dataset` or `schema:MediaObject`, and `schema:hasPart` —
-    /// and those are exactly the shapes that set this flag. A change set that
-    /// sets none of them therefore leaves the orphan set bit-for-bit unchanged.
+    /// True for the `rdf:type` and `schema:hasPart` shapes that can change orphan status.
     pub(crate) fn touches_reachability(&self) -> bool {
         self.touches_reachability
     }
@@ -516,7 +486,7 @@ fn summarize<'t>(
 
         if subject == &root {
             for (slot, (required, _)) in summary
-                .touches_required_root_properties
+                .required_root_hits
                 .iter_mut()
                 .zip(REQUIRED_ROOT_PROPERTIES.iter())
             {
@@ -584,7 +554,7 @@ pub(crate) fn summarize_delta(graph: &GraphId, delta: &[MaterializedQuadChange])
     )
 }
 
-/// Summarize a replicated batch's ops. `QuadOp`s carry no graph of their own —
+/// Summarize a replicated batch's ops. `QuadOp`s carry no graph of their own,
 /// they all belong to their batch's graph.
 pub(crate) fn summarize_ops(graph: &GraphId, ops: &[QuadOp]) -> DeltaSummary {
     summarize(
@@ -615,8 +585,6 @@ pub(crate) fn summarize_ops(graph: &GraphId, ops: &[QuadOp]) -> DeltaSummary {
         }),
     )
 }
-
-// ── Orphan detection ────────────────────────────────────────────────────────
 
 pub(crate) fn orphaned_data_entities(snapshot: &GraphSnapshot) -> BTreeSet<EncodedTerm> {
     let root = snapshot.root();
@@ -667,19 +635,14 @@ pub(crate) fn orphaned_data_entities(snapshot: &GraphSnapshot) -> BTreeSet<Encod
         .collect()
 }
 
-/// A bounded walk of the `hasPart` graph as it will be after the change set.
-///
-/// Owns the per-validation memos: children, parents, and settled reachability
-/// verdicts are reused across every candidate entity.
+/// Bounded post-change `hasPart` walk with per-validation adjacency and verdict caches.
 struct ReachabilityWalk<'a> {
     view: &'a RuleContext<'a>,
     root: EncodedTerm,
     children: HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
     parents: HashMap<EncodedTerm, BTreeSet<EncodedTerm>>,
     reachable: HashMap<EncodedTerm, bool>,
-    /// Entities on the current depth-first path. A node reached again while it
-    /// is still being resolved counts as unreachable *through that edge*, which
-    /// is what breaks `hasPart` cycles.
+    /// Current depth-first path; revisiting an unresolved node breaks that cyclic edge.
     visiting: HashSet<EncodedTerm>,
 }
 
@@ -689,9 +652,7 @@ struct ReachabilityFrame {
     /// Remaining parents to try, in ascending term order.
     parents: std::vec::IntoIter<EncodedTerm>,
     reachable: bool,
-    /// Whether reaching this verdict meant treating a node on the current path
-    /// as unreachable. A `false` that leant on the cycle break is only valid
-    /// *for this path*, so it must not be memoized.
+    /// True when a path-local cycle break produced a false verdict that cannot be memoized.
     used_cycle_break: bool,
 }
 
@@ -766,18 +727,8 @@ impl<'a> ReachabilityWalk<'a> {
             || !self.cached_parents(entity)?.is_empty())
     }
 
-    /// Is `entity` reachable from the root over `hasPart` edges?
-    ///
-    /// Explicit stack rather than recursion: a crate is free to contain a
-    /// thousands-deep `hasPart` chain and a recursive walk overflows on it (K3).
-    ///
-    /// Cycles are broken by treating a node that is still on the current path as
-    /// unreachable *through that edge*. Such a verdict is only valid for the path
-    /// that produced it, so a `false` that leant on the break is returned but not
-    /// memoized: in `root ▸ a`, `a ▸ b`, `b ▸ a`, resolving `a` first would
-    /// otherwise cache "b is unreachable" and report a reachable entity as an
-    /// orphan. A `true` never depends on the break — it is witnessed by a real
-    /// path to the root — so it is always memoized.
+    /// Tests root reachability with an explicit stack, breaking cyclic edges without caching false.
+    /// True results have a witnessed path and are safe to memoize.
     fn is_reachable(&mut self, entity: &EncodedTerm) -> crate::store::Result<bool> {
         if entity == &self.root {
             return Ok(true);
@@ -869,8 +820,6 @@ impl<'a> ReachabilityWalk<'a> {
     }
 }
 
-// ── Rule implementations ────────────────────────────────────────────────────
-
 pub(crate) struct RootEntityRule;
 
 impl Rule for RootEntityRule {
@@ -961,22 +910,22 @@ impl Rule for MetadataDescriptorRule {
     }
 }
 
-pub(crate) struct RequiredRootPropertiesRule;
+pub(crate) struct RequiredRootRule;
 
-impl Rule for RequiredRootPropertiesRule {
+impl Rule for RequiredRootRule {
     fn rule_id(&self) -> Option<RuleId> {
         Some(RuleId::RequiredProperties)
     }
 
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
-        if !cx.delta_is_empty() && !cx.summary.touches_any_required_root_property() {
+        if !cx.delta_is_empty() && !cx.summary.touches_required_root() {
             return Ok(CandidateCheck::Pass);
         }
 
         let root = cx.root();
         for ((predicate, label), touched) in REQUIRED_ROOT_PROPERTIES
             .iter()
-            .zip(cx.summary.touches_required_root_properties)
+            .zip(cx.summary.required_root_hits)
         {
             if !cx.delta_is_empty() && !touched {
                 continue;
@@ -1016,15 +965,15 @@ impl Rule for RequiredRootPropertiesRule {
     }
 }
 
-pub(crate) struct DatePublishedCardinalityRule;
+pub(crate) struct PublishedCardinalityRule;
 
-impl Rule for DatePublishedCardinalityRule {
+impl Rule for PublishedCardinalityRule {
     fn rule_id(&self) -> Option<RuleId> {
         Some(RuleId::DatePublished)
     }
 
     fn check_candidate(&self, cx: &RuleContext<'_>) -> crate::store::Result<CandidateCheck> {
-        let touched = cx.summary.touches_required_root_properties[DATE_PUBLISHED_SLOT];
+        let touched = cx.summary.required_root_hits[DATE_PUBLISHED_SLOT];
         if !cx.delta_is_empty() && !touched {
             return Ok(CandidateCheck::Pass);
         }
@@ -1150,8 +1099,8 @@ pub(crate) fn default_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(RootEntityRule),
         Box::new(MetadataDescriptorRule),
-        Box::new(RequiredRootPropertiesRule),
-        Box::new(DatePublishedCardinalityRule),
+        Box::new(RequiredRootRule),
+        Box::new(PublishedCardinalityRule),
         Box::new(EntityTypeRule),
         Box::new(ReachabilityRule),
     ]
@@ -1204,7 +1153,7 @@ pub(crate) fn validate_change_set(
     }
 }
 
-pub(crate) fn post_merge_violations_from_store(
+pub(crate) fn post_merge_violations(
     store: &GraphStore,
     graph: &GraphId,
 ) -> crate::store::Result<Vec<CrateViolation>> {
@@ -1247,10 +1196,7 @@ pub(crate) fn post_merge_violations_from_store(
     Ok(violations)
 }
 
-/// Materialize the graph as the change set would leave it.
-///
-/// Only used by the `NeedSnapshot` fallback in [`validate_change_set`]; the
-/// candidate checks never pay for this.
+/// Materialize post-change state only for the `NeedSnapshot` validation fallback.
 fn post_state_after(cx: &RuleContext<'_>) -> crate::store::Result<GraphSnapshot> {
     GraphSnapshot::from_read_view(&cx.view, &cx.context, cx.graph)
 }
@@ -1258,17 +1204,7 @@ fn post_state_after(cx: &RuleContext<'_>) -> crate::store::Result<GraphSnapshot>
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// W1 — the diagnostics fast path must agree with a full recompute.
-    ///
-    /// `ReplicationEngine::settle_diagnostics` skips the recompute whenever
-    /// `DeltaSummary::touches_reachability` is clear, and re-stamps the previous
-    /// verdict against the new clock instead. A triple shape that
-    /// `summarize` fails to recognise would therefore persist a *wrong* orphan
-    /// set carrying a matching tag, and nothing ever re-checks such a record —
-    /// not the open-time repair pass, not a later read. These tests drive the
-    /// engine through the same public entry points the node uses and compare
-    /// the verdict it leaves behind against a from-scratch recompute of the
-    /// same final graph, while pinning which side of the branch was taken.
+    /// The diagnostics fast path must match a full recompute for every summarized shape.
     mod diagnostics_fast_path {
         use std::sync::Arc;
 
@@ -1329,9 +1265,7 @@ mod tests {
                 .collect()
         }
 
-        /// Root Dataset, one reachable child, and one detached data entity, so
-        /// every case starts from a graph that already has an orphan and can
-        /// gain or lose one in either direction.
+        /// Seed one reachable child and one detached data entity for bidirectional orphan changes.
         fn seed(graph: &GraphId) -> Vec<Triple> {
             vec![
                 (
@@ -1346,14 +1280,12 @@ mod tests {
             ]
         }
 
-        /// The orphan set a store that has never seen a diagnostics record
-        /// computes for `triples`. Written through the deferred plan, so the
-        /// stored record's tag is stale and the read recomputes from the quads.
+        /// Compute orphans from quads through a deferred write with no current diagnostic record.
         fn recomputed(graph: &GraphId, triples: &[Triple]) -> GraphDiagnostics {
             let dir = tempfile::tempdir().unwrap();
             let (store, engine) = engine_at(dir.path());
             engine
-                .local_apply_bulk_bypassing_structural_rules(graph, inserts(graph, triples))
+                .apply_bulk_unchecked(graph, inserts(graph, triples))
                 .unwrap();
             store.graph_diagnostics(graph).unwrap()
         }
@@ -1487,15 +1419,12 @@ mod tests {
                 let (store, engine) = engine_at(dir.path());
                 let mut triples = seed(&graph);
                 engine
-                    .local_apply_changes_bypassing_structural_rules(
-                        &graph,
-                        inserts(&graph, &triples),
-                    )
+                    .apply_changes_unchecked(&graph, inserts(&graph, &triples))
                     .unwrap();
 
                 let before = store.diagnostics_compute_count();
                 engine
-                    .local_apply_changes_bypassing_structural_rules(&graph, case.changes.clone())
+                    .apply_changes_unchecked(&graph, case.changes.clone())
                     .unwrap();
                 let settled = store.diagnostics_compute_count();
                 assert_eq!(
@@ -1546,14 +1475,11 @@ mod tests {
                 (iri(CHILD), RDF_TYPE.clone(), SCHEMA_MEDIA_OBJECT.clone()),
             ];
             engine
-                .local_apply_changes_bypassing_structural_rules(&graph, inserts(&graph, &triples))
+                .apply_changes_unchecked(&graph, inserts(&graph, &triples))
                 .unwrap();
             assert!(!store.graph_diagnostics(&graph).unwrap().has_orphans());
 
-            // Reachability *is* touched, so this must recompute. Trusting
-            // validation to imply orphan-freeness was unsound: two writes that
-            // each validate against the same pre-state can jointly orphan an
-            // entity, and stamping clean recorded that as permanent.
+            // Reachability changes require recompute because separately valid writes can jointly orphan data.
             let grow = inserts(
                 &graph,
                 &[
@@ -1683,7 +1609,7 @@ mod tests {
                     )
                     .unwrap()
             );
-            let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+            let mut clock = store.vector_clock_id(graph_id).unwrap();
             clock.advance(actor, counter);
             store
                 .set_vector_clock(

@@ -75,9 +75,7 @@ impl QuadKey {
     }
 }
 
-/// Last-change-wins state for one selected graph. Its term map is bounded by
-/// the caller's delta (one graph id, fixed vocabulary, and at most three
-/// terms per operation), and no term is interned while building it.
+/// Last-change-wins state whose terms and rows are bounded by one graph's delta.
 #[derive(Debug)]
 pub(crate) struct DeltaIndex {
     graph: TermId,
@@ -330,14 +328,12 @@ impl OverlayCursor<'_> {
     }
 }
 
-/// The two-source state machine behind a delta read. It never copies the base
-/// graph: only base rows touched by a final live delta state are remembered,
-/// so the seen set is bounded by the delta.
+/// Two-source cursor that remembers only base rows touched by final live delta state.
 pub(crate) struct DeltaQuadCursor<'delta> {
     base: Option<RawQuadCursor>,
     overlay: OverlayCursor<'delta>,
     index: &'delta DeltaIndex,
-    base_live_delta_rows: HashSet<QuadKey>,
+    base_delta_rows: HashSet<QuadKey>,
 }
 
 impl<'delta> DeltaQuadCursor<'delta> {
@@ -350,7 +346,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
             base: Some(base),
             overlay: index.overlay(pattern),
             index,
-            base_live_delta_rows: HashSet::new(),
+            base_delta_rows: HashSet::new(),
         }
     }
 
@@ -362,7 +358,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
                         match self.index.state(candidate.quad) {
                             Some(false) => candidate.live = false,
                             Some(true) => {
-                                self.base_live_delta_rows
+                                self.base_delta_rows
                                     .insert(QuadKey::from_quad(candidate.quad));
                             }
                             None => {}
@@ -380,7 +376,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
             quad: key.quad(),
             // A deletion or a row already emitted from the base remains a
             // candidate for exact accounting, never a matching row.
-            live: present && !self.base_live_delta_rows.contains(&key),
+            live: present && !self.base_delta_rows.contains(&key),
             storage: CandidateStorage::Delta,
             bytes_read: 0,
             key_fields_extracted: 0,
@@ -389,9 +385,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
     }
 }
 
-/// Post-change RDF view layered over the durable read view. The base remains
-/// authoritative; this adapter only supplies the candidate write's final
-/// last-change-wins overlay.
+/// Post-change RDF view layering a final last-change-wins overlay over durable truth.
 pub(crate) struct DeltaReadView<'store, 'delta> {
     base: StoreReadView<'store>,
     index: &'delta DeltaIndex,
@@ -406,9 +400,7 @@ impl<'store, 'delta> DeltaReadView<'store, 'delta> {
         self.index.graph()
     }
 
-    /// Whether the durable pre-state had any row for `subject`. Rules use this
-    /// only to preserve their existing "newly introduced untyped subject"
-    /// scope; all normal candidate reads use the final delta view.
+    /// Test pre-state subject existence only for newly introduced untyped-subject scope.
     pub(crate) fn base_subject_exists(
         &self,
         context: &ReadContext<'_>,
@@ -668,7 +660,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        let mut clock = store.vector_clock_id(graph_id).unwrap();
         clock.advance(actor, counter);
         store
             .set_vector_clock(

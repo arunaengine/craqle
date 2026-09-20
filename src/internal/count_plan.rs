@@ -63,7 +63,7 @@ pub(crate) fn analyze(pattern: &GraphPattern) -> Option<FastPathPlan> {
         AggregateExpression::CountSolutions { distinct: false }
     );
     if count_all && let Some((mandatory, optional)) = optional_subject_triples(inner) {
-        return Some(FastPathPlan::OptionalSubjectStarCount {
+        return Some(FastPathPlan::OptionalStarCount {
             mandatory,
             optional,
             output: output.as_str().to_owned(),
