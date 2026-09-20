@@ -6,16 +6,55 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
-    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
-    QuadOp, RoCrateRenderHints, TaggedGraphPolicy, TaggedRoCrateRenderHints, VectorClock,
+    ActorId, Batch, ContextTag, CrateRenderHints as RenderHints, Dot, EncodedTerm, GraphId,
+    GraphTombstone, MaterializedQuadChange, QuadOp, TaggedGraphPolicy, TaggedRenderHints,
+    VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
-use irokle::history::DagQuery;
 use irokle::oplog::Oplog;
 use irokle::reducer::{EventRecord, OpMeta};
 use irokle::{Event, PublishOptions, ReplicationPolicy, TopicGenesis, WriteConcern};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphHints {
+    pub context: Option<String>,
+    pub license: Option<String>,
+    pub license_digest: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRenderHints {
+    pub hints: GraphHints,
+    pub tag: ContextTag,
+}
+
+impl From<TaggedRenderHints> for GraphRenderHints {
+    fn from(tagged: TaggedRenderHints) -> Self {
+        Self {
+            hints: GraphHints {
+                context: tagged.hints.context,
+                license: tagged.hints.license,
+                license_digest: tagged.hints.license_digest,
+            },
+            tag: tagged.tag,
+        }
+    }
+}
+
+impl From<GraphRenderHints> for TaggedRenderHints {
+    fn from(wire: GraphRenderHints) -> Self {
+        Self {
+            hints: RenderHints {
+                context: wire.hints.context,
+                license: wire.hints.license,
+                license_digest: wire.hints.license_digest,
+            },
+            tag: wire.tag,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
 #[irokle(type_id = "craqle.graph.v1")]
@@ -39,6 +78,12 @@ pub enum CraqleGraphEvent {
     GraphDeleted {
         tombstone: GraphTombstone,
     },
+    Mutation {
+        id: MutationId,
+        graph: GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: Option<GraphRenderHints>,
+    },
 }
 
 impl CraqleGraphEvent {
@@ -46,7 +91,8 @@ impl CraqleGraphEvent {
         match self {
             Self::QuadChanges { graph, .. }
             | Self::RoCrateMutation { graph, .. }
-            | Self::Policy { graph, .. } => graph,
+            | Self::Policy { graph, .. }
+            | Self::Mutation { graph, .. } => graph,
             Self::GraphDeleted { tombstone } => &tombstone.graph,
         }
     }
@@ -114,19 +160,265 @@ pub struct TopicCursorRepairAudit {
     pub repaired_at_unix_nanos: i64,
 }
 
+/// Stable identity used to inspect or retry one logical mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MutationId(pub [u8; 32]);
+
+impl MutationId {
+    pub fn new() -> Self {
+        Self(*ActorId::random().as_bytes())
+    }
+
+    pub fn from_op(id: irokle::OpId) -> Self {
+        Self(*id.as_bytes())
+    }
+}
+
+impl Default for MutationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceOutcome {
+    Prepared,
+    Applied,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistenceOutcome {
+    Pending,
+    Buffered,
+    DataSynced,
+    FullySynced,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairOutcome {
+    NotRequired,
+    Pending,
+    Complete,
+    Failed(crate::CraqleErrorKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairState {
+    pub diagnostics: RepairOutcome,
+    pub shacl: RepairOutcome,
+    pub search: RepairOutcome,
+    pub query_view: RepairOutcome,
+}
+
+/// Durable state of a mutation after its source commit point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationReceipt {
+    pub id: MutationId,
+    pub admission_sequence: u64,
+    pub graph: GraphId,
+    pub request_digest: [u8; 32],
+    pub event_id: Option<[u8; 32]>,
+    pub topic: Option<irokle::TopicId>,
+    pub publish_after: Option<irokle::ActorClock>,
+    pub topic_epoch: Option<u64>,
+    pub topic_genesis: Option<irokle::OpId>,
+    pub search_token: Option<u64>,
+    pub repair_graphs: Vec<GraphId>,
+    pub source: SourceOutcome,
+    pub persistence: PersistenceOutcome,
+    pub repairs: RepairState,
+    pub source_version: [u8; 32],
+    pub updated_unix_nanos: i64,
+}
+
+impl MutationReceipt {
+    pub(crate) fn outbound(mut self) -> Self {
+        let includes_graph = self.repair_graphs.iter().any(|graph| graph == &self.graph);
+        self.repair_graphs.clear();
+        if includes_graph {
+            self.repair_graphs.push(self.graph.clone());
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationRequest {
+    pub id: MutationId,
+    pub admission_sequence: Option<u64>,
+    pub graph: GraphId,
+    pub changes: Vec<MaterializedQuadChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationLookup {
+    pub graph: GraphId,
+    pub id: MutationId,
+    pub admission_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationStatus {
+    Known(MutationReceipt),
+    Expired,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupProof {
+    pub location: String,
+    pub archive_digest: [u8; 32],
+    pub source_revision: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairMode {
+    DryRun,
+    Apply,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairAuthority {
+    History {
+        topic: irokle::TopicId,
+        target: irokle::ActorClock,
+    },
+    HealthySnapshot {
+        source: String,
+        digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairResult {
+    Exact,
+    Differs,
+    Applied,
+    Tombstoned,
+    HistoryMissing,
+    BackupRequired,
+    ChangedDuringRepair,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairAudit {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub mode: RepairMode,
+    pub authority: RepairAuthority,
+    pub before_digest: [u8; 32],
+    pub after_digest: Option<[u8; 32]>,
+    pub backup: Option<BackupProof>,
+    pub result: RepairResult,
+    pub updated_unix_nanos: i64,
+}
+
+/// Exact states compared by an authorized reconciliation dry run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairDiff {
+    pub local: crate::GraphReplicaSnapshot,
+    pub authoritative: crate::GraphReplicaSnapshot,
+    pub unresolved: Vec<Dot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairReport {
+    pub audit: RepairAudit,
+    pub diff: Option<RepairDiff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairRequest {
+    pub id: MutationId,
+    pub authority: RepairAuthority,
+    pub authoritative: crate::GraphReplicaSnapshot,
+    pub mode: RepairMode,
+    pub backup: Option<BackupProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconcileSource {
+    History {
+        topic: irokle::TopicId,
+    },
+    HealthySnapshot {
+        source: String,
+        snapshot: crate::GraphReplicaSnapshot,
+        digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileRequest {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub mode: RepairMode,
+    pub source: ReconcileSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRequest {
+    pub topic: irokle::TopicId,
+    pub graph: GraphId,
+    pub target: irokle::ActorClock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistorySnapshot {
+    Live(crate::GraphReplicaSnapshot),
+    Tombstoned,
+}
+
+pub(crate) struct HistoryFailure {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub authority: RepairAuthority,
+    pub mode: RepairMode,
+}
+
 pub(crate) struct TopicCatchup {
     pub records: Vec<TopicRecord>,
     pub cursor: TopicCursor,
+    pub more: bool,
 }
 
 pub(crate) struct ReplicatedGraphMutation {
     pub(crate) batch: Batch,
-    pub(crate) render_hints: Option<TaggedRoCrateRenderHints>,
+    pub(crate) render_hints: Option<TaggedRenderHints>,
+    pub(crate) mutation_id: MutationId,
+    pub(crate) request_digest: [u8; 32],
+    pub(crate) event_id: irokle::OpId,
+}
+
+fn request_digest(
+    graph: &GraphId,
+    changes: &[MaterializedQuadChange],
+    hints: Option<&TaggedRenderHints>,
+) -> SyncResult<[u8; 32]> {
+    let bytes = postcard::to_allocvec(&(graph, changes, hints))
+        .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+pub(crate) struct OutgoingMutation {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub changes: Vec<MaterializedQuadChange>,
+    pub render_hints: Option<TaggedRenderHints>,
+}
+
+pub(crate) struct TopicFrontier {
+    pub clock: irokle::ActorClock,
+    pub epoch: u64,
+    pub genesis: irokle::OpId,
 }
 
 pub(crate) enum TopicRecord {
     Event(EventRecord<CraqleGraphEvent>),
     Rejected(RejectedTopicRecord),
+    Control(OpMeta),
 }
 
 pub(crate) struct RejectedTopicRecord {
@@ -141,32 +433,90 @@ impl TopicRecord {
         match self {
             Self::Event(record) => &record.meta,
             Self::Rejected(record) => &record.meta,
+            Self::Control(meta) => meta,
         }
     }
 }
 
-/// How far a reconcile pass has consumed a topic's history.
-///
-/// Records are consumed one at a time, so a record the pass could not apply
-/// leaves the cursor behind it and the next pass redelivers it (G3).
+const TOPIC_PAGE_RECORDS: usize = 1024;
+const TOPIC_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordCandidate {
+    generation: u64,
+    actor: irokle::ActorId,
+    sequence: u64,
+    id: irokle::OpId,
+}
+
+impl Ord for RecordCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.generation, self.actor, self.sequence, self.id).cmp(&(
+            other.generation,
+            other.actor,
+            other.sequence,
+            other.id,
+        ))
+    }
+}
+
+impl PartialOrd for RecordCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActorPoint {
+    actor: irokle::ActorId,
+    after: u64,
+}
+
+fn next_record(
+    read: &dyn irokle::storage::SnapshotRead,
+    topic: &irokle::TopicId,
+    point: ActorPoint,
+) -> irokle::Result<Option<RecordCandidate>> {
+    let Some((sequence, id)) = read
+        .actor_range(topic, &point.actor, point.after, 1)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let header = read
+        .get_header(&id)?
+        .ok_or_else(|| irokle::Error::Storage(format!("missing op header for {id}")))?;
+    if header.topic_id != *topic || header.actor_id != point.actor || header.actor_seq != sequence {
+        return Err(irokle::Error::Storage(format!(
+            "actor index disagrees with op header for {id}"
+        )));
+    }
+    Ok(Some(RecordCandidate {
+        generation: header.generation,
+        actor: point.actor,
+        sequence,
+        id,
+    }))
+}
+
+/// Consumed topic history; a failed record leaves the cursor behind it for redelivery.
 pub(crate) struct TopicCursor {
-    topic: irokle::TopicId,
-    clock: irokle::ActorClock,
+    state: TopicCursorPayload,
     consumed: bool,
 }
 
 impl TopicCursor {
-    fn resuming(topic: irokle::TopicId, clock: irokle::ActorClock) -> Self {
+    fn resuming(state: TopicCursorPayload) -> Self {
         Self {
-            topic,
-            clock,
+            state,
             consumed: false,
         }
     }
 
     pub(crate) fn consume(&mut self, record: &TopicRecord) {
         let meta = record.meta();
-        self.clock.observe(meta.actor_id, meta.actor_seq);
+        self.state.clock.observe(meta.actor_id, meta.actor_seq);
         self.consumed = true;
     }
 
@@ -176,17 +526,20 @@ impl TopicCursor {
         if !self.consumed {
             return Ok(None);
         }
-        encode_topic_cursor(self.topic, &self.clock).map(Some)
+        encode_topic_cursor(&self.state).map(Some)
     }
 }
 
-const TOPIC_CURSOR_FORMAT_VERSION: u8 = 1;
+const TOPIC_CURSOR_VERSION: u8 = 2;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TopicCursorPayload {
     version: u8,
     topic: irokle::TopicId,
+    epoch: u64,
+    genesis: irokle::OpId,
     clock: irokle::ActorClock,
+    target: Option<irokle::ActorClock>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,19 +548,24 @@ struct TopicCursorEnvelope {
     checksum: [u8; 32],
 }
 
-pub(crate) fn encode_topic_cursor(
+#[derive(Serialize, Deserialize)]
+struct LegacyCursorPayload {
+    version: u8,
     topic: irokle::TopicId,
-    clock: &irokle::ActorClock,
-) -> SyncResult<Vec<u8>> {
-    let payload = TopicCursorPayload {
-        version: TOPIC_CURSOR_FORMAT_VERSION,
-        topic,
-        clock: clock.clone(),
-    };
+    clock: irokle::ActorClock,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyCursorEnvelope {
+    payload: LegacyCursorPayload,
+    checksum: [u8; 32],
+}
+
+fn encode_topic_cursor(payload: &TopicCursorPayload) -> SyncResult<Vec<u8>> {
     let payload_bytes = postcard::to_allocvec(&payload)
         .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
     postcard::to_allocvec(&TopicCursorEnvelope {
-        payload,
+        payload: payload.clone(),
         checksum: *blake3::hash(&payload_bytes).as_bytes(),
     })
     .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))
@@ -216,13 +574,36 @@ pub(crate) fn encode_topic_cursor(
 fn decode_topic_cursor(
     expected_topic: irokle::TopicId,
     bytes: &[u8],
-) -> SyncResult<irokle::ActorClock> {
-    let envelope: TopicCursorEnvelope =
-        postcard::from_bytes(bytes).map_err(|error| CraqleSyncError::CorruptCursor {
-            topic: expected_topic,
-            reason: error.to_string(),
-        })?;
-    if envelope.payload.version != TOPIC_CURSOR_FORMAT_VERSION {
+) -> SyncResult<TopicCursorPayload> {
+    let envelope: TopicCursorEnvelope = match postcard::from_bytes(bytes) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            if let Ok(legacy) = postcard::from_bytes::<LegacyCursorEnvelope>(bytes) {
+                let payload = postcard::to_allocvec(&legacy.payload).map_err(|legacy_error| {
+                    CraqleSyncError::CorruptCursor {
+                        topic: expected_topic,
+                        reason: legacy_error.to_string(),
+                    }
+                })?;
+                if legacy.payload.version == 1
+                    && legacy.payload.topic == expected_topic
+                    && legacy.checksum == *blake3::hash(&payload).as_bytes()
+                {
+                    return Err(CraqleSyncError::ExpiredCursor {
+                        topic: expected_topic,
+                        reason:
+                            "version 1 cursor lacks a branch fence; authorized repair is required"
+                                .to_owned(),
+                    });
+                }
+            }
+            return Err(CraqleSyncError::CorruptCursor {
+                topic: expected_topic,
+                reason: error.to_string(),
+            });
+        }
+    };
+    if envelope.payload.version != TOPIC_CURSOR_VERSION {
         return Err(CraqleSyncError::CorruptCursor {
             topic: expected_topic,
             reason: format!("unsupported cursor version {}", envelope.payload.version),
@@ -246,7 +627,7 @@ fn decode_topic_cursor(
             reason: "cursor checksum mismatch".to_owned(),
         });
     }
-    Ok(envelope.payload.clock)
+    Ok(envelope.payload)
 }
 
 pub fn topic_cursor_digest(bytes: &[u8]) -> [u8; 32] {
@@ -307,6 +688,11 @@ pub enum CraqleSyncError {
         topic: irokle::TopicId,
         reason: String,
     },
+    #[error("expired authoritative cursor for topic {topic}: {reason}")]
+    ExpiredCursor {
+        topic: irokle::TopicId,
+        reason: String,
+    },
 }
 
 impl CraqleSyncError {
@@ -318,6 +704,7 @@ impl CraqleSyncError {
             Self::InvalidEvent(_) | Self::CorruptCursor { .. } => {
                 crate::CraqleErrorKind::CorruptAuthoritativeData
             }
+            Self::ExpiredCursor { .. } => crate::CraqleErrorKind::Conflict,
             Self::Irokle(_) => crate::CraqleErrorKind::Storage,
         }
     }
@@ -327,7 +714,7 @@ impl CraqleSyncError {
     pub fn rejects_record(&self) -> bool {
         match self {
             Self::InvalidEvent(_) => true,
-            Self::CorruptCursor { .. } => false,
+            Self::CorruptCursor { .. } | Self::ExpiredCursor { .. } => false,
             Self::Store(error) => error.rejects_record(),
             Self::Irokle(error) => matches!(
                 error,
@@ -343,6 +730,19 @@ impl CraqleSyncError {
 pub(crate) type SyncResult<T> = std::result::Result<T, CraqleSyncError>;
 
 pub(crate) trait CraqleGraphSync: Send + Sync {
+    fn publish_mutation(
+        &self,
+        store: &GraphStore,
+        mutation: OutgoingMutation,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        match mutation.render_hints {
+            Some(hints) => {
+                self.publish_rocrate_mutation(store, &mutation.graph, mutation.changes, hints)
+            }
+            None => self.publish_changes(store, &mutation.graph, mutation.changes),
+        }
+    }
+
     fn publish_changes(
         &self,
         store: &GraphStore,
@@ -355,7 +755,7 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         store: &GraphStore,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: TaggedRoCrateRenderHints,
+        render_hints: TaggedRenderHints,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
     fn publish_policy(
@@ -397,20 +797,14 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         topic_id: irokle::TopicId,
     ) -> SyncResult<()>;
 
-    /// Bind the graph's deterministic topic id only if its genesis is already
-    /// present locally (self-minted or adopted from a peer). Never mints, so a
-    /// concurrent caller cannot fork a rival genesis. Returns `None` when no
-    /// genesis exists yet.
-    fn bind_graph_topic_if_present(
+    /// Bind an existing deterministic topic genesis without minting a competing branch.
+    fn bind_existing_topic(
         &self,
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<Option<irokle::TopicId>>;
 
-    /// Mint the graph's deterministic topic genesis with an explicit member set,
-    /// or bind an existing one if a concurrent admission already created it. The
-    /// single-minter discipline lives in the embedder; this is the only path
-    /// that creates a graph genesis.
+    /// Mint a deterministic topic with explicit members, or bind a concurrently admitted genesis.
     fn mint_graph_topic(
         &self,
         store: &GraphStore,
