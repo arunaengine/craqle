@@ -3033,6 +3033,11 @@ where
         dyn Iterator<Item = std::result::Result<InternalQuad<Self::InternalTerm>, Self::Error>>
             + 'context,
     > {
+        if let Some(query_budget) = &self.query_budget
+            && let Err(error) = query_budget.check()
+        {
+            return Box::new(std::iter::once(Err(error.into())));
+        }
         let subject = self.resolve_pattern_term(subject);
         let predicate = self.resolve_pattern_term(predicate);
         let object = self.resolve_pattern_term(object);
@@ -3047,27 +3052,151 @@ where
             return Box::new(std::iter::empty());
         }
 
-        let bound = |term: ResolvedPatternTerm| match term {
-            ResolvedPatternTerm::Any => None,
-            ResolvedPatternTerm::Existing(id) => Some(id),
+        let source = |term: ResolvedPatternTerm| match term {
+            ResolvedPatternTerm::Any => Ok(None),
+            ResolvedPatternTerm::Existing { source, dense } => {
+                self.source_term(source, dense).map(Some)
+            }
             ResolvedPatternTerm::Missing | ResolvedPatternTerm::DefaultUnion => {
                 unreachable!("non-stored terms short-circuit above")
             }
         };
-        let pattern = QuadPattern {
-            subject: bound(subject),
-            predicate: bound(predicate),
-            object: bound(object),
-            ..QuadPattern::default()
+        let dense = |term: ResolvedPatternTerm| match term {
+            ResolvedPatternTerm::Any => Some(None),
+            ResolvedPatternTerm::Existing { dense, .. } => dense.map(|term| Some(term.query())),
+            ResolvedPatternTerm::Missing | ResolvedPatternTerm::DefaultUnion => {
+                unreachable!("non-stored terms short-circuit above")
+            }
         };
-        let selector = match graph_name {
-            Some(Some(StoreTerm::Existing(graph))) => GraphSelector::Named(graph.source),
+        let shape = |term: ResolvedPatternTerm| match term {
+            ResolvedPatternTerm::Any => None,
+            ResolvedPatternTerm::Existing { source, .. } => Some(source.unwrap_or(TermId(0))),
+            ResolvedPatternTerm::Missing | ResolvedPatternTerm::DefaultUnion => {
+                unreachable!("non-stored terms short-circuit above")
+            }
+        };
+        let source_hint = |term: ResolvedPatternTerm| match term {
+            ResolvedPatternTerm::Existing { source, dense } => dense
+                .zip(source)
+                .map(|(dense, source)| (dense.query(), source)),
+            ResolvedPatternTerm::Any
+            | ResolvedPatternTerm::Missing
+            | ResolvedPatternTerm::DefaultUnion => None,
+        };
+        let (selector, graph_dense, graph_source) = match graph_name {
+            Some(Some(
+                graph @ (StoreTerm::Source(_) | StoreTerm::Mapped { .. } | StoreTerm::Dense(_)),
+            )) => {
+                let (source, dense) = Self::term_identity(graph).expect("stored graph term");
+                let graph_source = match self.source_term(source, dense) {
+                    Ok(graph) => graph,
+                    Err(error) => return Box::new(std::iter::once(Err(error))),
+                };
+                (
+                    GraphSelector::Named(graph_source),
+                    dense,
+                    Some(graph_source),
+                )
+            }
             Some(Some(StoreTerm::Missing(_))) => return Box::new(std::iter::empty()),
-            Some(Some(StoreTerm::DefaultUnion)) => GraphSelector::DefaultUnion,
+            Some(Some(StoreTerm::DefaultUnion)) => (GraphSelector::DefaultUnion, None, None),
             // Compatibility callers use `Some(None)` for the distinct union
             // default; the cursor owns its constant-state semantics.
-            Some(None) => GraphSelector::DefaultUnion,
-            None => GraphSelector::Union,
+            Some(None) => (GraphSelector::DefaultUnion, None, None),
+            None => (GraphSelector::Union, None, None),
+        };
+        let dense_terms = [
+            graph_dense,
+            match subject {
+                ResolvedPatternTerm::Existing { dense, .. } => dense,
+                _ => None,
+            },
+            match predicate {
+                ResolvedPatternTerm::Existing { dense, .. } => dense,
+                _ => None,
+            },
+            match object {
+                ResolvedPatternTerm::Existing { dense, .. } => dense,
+                _ => None,
+            },
+        ];
+        if let (Some(subject_id), Some(predicate_id), Some(object_id)) =
+            (dense(subject), dense(predicate), dense(object))
+            && (graph_dense.is_some() || !matches!(selector, GraphSelector::Named(_)))
+            && let Some(scope) = self.dense_scope
+        {
+            let (cache_entries, cache_bytes) = self
+                .query_budget
+                .as_ref()
+                .map_or((0, 0), |budget| budget.dense_cache_limits());
+            let scan = DenseScan {
+                selector,
+                shape: QuadPattern {
+                    subject: shape(subject),
+                    predicate: shape(predicate),
+                    object: shape(object),
+                    ..QuadPattern::default()
+                },
+                pattern: RawIndexPattern::from_terms([
+                    graph_dense.map(DenseTerm::query),
+                    subject_id,
+                    predicate_id,
+                    object_id,
+                ]),
+                source_hints: [
+                    graph_dense
+                        .zip(graph_source)
+                        .map(|(dense, source)| (dense.query(), source)),
+                    source_hint(subject),
+                    source_hint(predicate),
+                    source_hint(object),
+                ],
+                scope,
+                resolver: self.dense_resolver.borrow().clone(),
+                cache_entries,
+                cache_bytes,
+            };
+            match self.view.dense_keys(self.context, scan) {
+                Ok(Some(cursor)) => {
+                    if let Err(error) = self.accept_resolver(cursor.resolver(), dense_terms) {
+                        return Box::new(std::iter::once(Err(error)));
+                    }
+                    let query_budget = self.query_budget.clone();
+                    let has_graph =
+                        !matches!(graph_name, Some(None) | Some(Some(StoreTerm::DefaultUnion)));
+                    return Box::new(cursor.map(move |quad| {
+                        if let Some(query_budget) = &query_budget {
+                            query_budget.observe_intermediate(1)?;
+                        }
+                        let quad = quad.map_err(StoreDatasetError::from)?;
+                        Ok(InternalQuad {
+                            subject: Self::dense_store_term(quad.subject, quad.subject_source()),
+                            predicate: Self::dense_store_term(quad.predicate, None),
+                            object: Self::dense_store_term(quad.object, quad.object_source()),
+                            graph_name: has_graph.then(|| {
+                                Self::dense_store_term(quad.graph, Some(quad.graph_source))
+                            }),
+                        })
+                    }));
+                }
+                Ok(None) => {}
+                Err(error) => return Box::new(std::iter::once(Err(error.into()))),
+            }
+        }
+        let pattern = QuadPattern {
+            subject: match source(subject) {
+                Ok(term) => term,
+                Err(error) => return Box::new(std::iter::once(Err(error))),
+            },
+            predicate: match source(predicate) {
+                Ok(term) => term,
+                Err(error) => return Box::new(std::iter::once(Err(error))),
+            },
+            object: match source(object) {
+                Ok(term) => term,
+                Err(error) => return Box::new(std::iter::once(Err(error))),
+            },
+            ..QuadPattern::default()
         };
         let quads = match self.view.scan(self.context, selector, pattern) {
             Ok(quads) => quads,
@@ -3080,109 +3209,46 @@ where
             }
             quad.map_err(StoreDatasetError::from)
         });
-        let view = self.view;
-        let context = self.context;
+        let writer = self.term_writer();
 
         match graph_name {
-            Some(Some(StoreTerm::DefaultUnion)) => Box::new(quads.map(|quad| {
+            Some(Some(StoreTerm::DefaultUnion)) => Box::new(quads.map(move |quad| {
                 let quad = quad?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.subject,
-                        true,
-                    )?),
-                    predicate: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.predicate,
-                        true,
-                    )?),
-                    object: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.object,
-                        true,
-                    )?),
+                    subject: writer.stored_term(quad.subject, true)?,
+                    predicate: writer.stored_term(quad.predicate, true)?,
+                    object: writer.stored_term(quad.object, true)?,
                     graph_name: None,
                 })
             })),
-            Some(Some(StoreTerm::Existing(_))) => Box::new(quads.map(|quad| {
-                let quad = quad?;
-                Ok(InternalQuad {
-                    subject: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.subject,
-                        true,
-                    )?),
-                    predicate: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.predicate,
-                        true,
-                    )?),
-                    object: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.object,
-                        true,
-                    )?),
-                    graph_name: Some(StoreTerm::Existing(Self::stored_term(
-                        view, context, quad.graph, true,
-                    )?)),
-                })
-            })),
+            Some(Some(StoreTerm::Source(_) | StoreTerm::Mapped { .. } | StoreTerm::Dense(_))) => {
+                Box::new(quads.map(move |quad| {
+                    let quad = quad?;
+                    Ok(InternalQuad {
+                        subject: writer.stored_term(quad.subject, true)?,
+                        predicate: writer.stored_term(quad.predicate, true)?,
+                        object: writer.stored_term(quad.object, true)?,
+                        graph_name: Some(writer.stored_term(quad.graph, true)?),
+                    })
+                }))
+            }
             Some(Some(StoreTerm::Missing(_))) => unreachable!("missing graph short-circuits above"),
-            Some(None) => Box::new(quads.map(|quad| {
+            Some(None) => Box::new(quads.map(move |quad| {
                 let quad = quad?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.subject,
-                        true,
-                    )?),
-                    predicate: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.predicate,
-                        true,
-                    )?),
-                    object: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.object,
-                        true,
-                    )?),
+                    subject: writer.stored_term(quad.subject, true)?,
+                    predicate: writer.stored_term(quad.predicate, true)?,
+                    object: writer.stored_term(quad.object, true)?,
                     graph_name: None,
                 })
             })),
-            None => Box::new(quads.map(|quad| {
+            None => Box::new(quads.map(move |quad| {
                 let quad = quad?;
                 Ok(InternalQuad {
-                    subject: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.subject,
-                        true,
-                    )?),
-                    predicate: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.predicate,
-                        true,
-                    )?),
-                    object: StoreTerm::Existing(Self::stored_term(
-                        view,
-                        context,
-                        quad.object,
-                        true,
-                    )?),
-                    graph_name: Some(StoreTerm::Existing(Self::stored_term(
-                        view, context, quad.graph, true,
-                    )?)),
+                    subject: writer.stored_term(quad.subject, true)?,
+                    predicate: writer.stored_term(quad.predicate, true)?,
+                    object: writer.stored_term(quad.object, true)?,
+                    graph_name: Some(writer.stored_term(quad.graph, true)?),
                 })
             })),
         }
@@ -3195,18 +3261,16 @@ where
     {
         let view = self.view;
         let context = self.context;
+        let writer = self.term_writer();
         let query_budget = self.query_budget.clone();
-        Box::new(view.graph_term_id_iter().filter_map(move |graph_id| {
+        Box::new(view.graph_term_iter().filter_map(move |graph_id| {
             match graph_id {
                 Ok(graph_id) => match view.graph_is_visible(context, graph_id) {
                     Ok(true) => Some(
                         query_budget
                             .as_ref()
                             .map_or(Ok(()), |budget| budget.check().map_err(Into::into))
-                            .and_then(|()| {
-                                Self::stored_term(view, context, graph_id, false)
-                                    .map(StoreTerm::Existing)
-                            }),
+                            .and_then(|()| writer.stored_term(graph_id, false)),
                     ),
                     Ok(false) => None,
                     Err(error) => Some(Err(error.into())),
@@ -3216,43 +3280,38 @@ where
         }))
     }
 
-    /// Graph existence for `GRAPH <g> { ... }` (charter G9).
-    ///
-    /// A named graph exists iff its metadata record exists **and** the caller
-    /// may see it. spareval's default implementation instead probes for one
-    /// visible quad, which makes an empty graph — or one whose entities are
-    /// all orphan-hidden — report as non-existent, and which disagrees with
-    /// the explicit-dataset regime used for small visible sets.
+    /// Graph existence requires visible metadata, including for empty graphs.
+    /// This matches explicit datasets instead of probing for a visible quad.
     fn contains_internal_graph_name(
         &self,
         graph_name: &Self::InternalTerm,
     ) -> std::result::Result<bool, Self::Error> {
-        let StoreTerm::Existing(graph) = graph_name else {
+        let Some((source, dense)) = Self::term_identity(graph_name) else {
             // The marker is never a named graph, and a missing term was never
             // a graph in this execution snapshot.
             return Ok(false);
         };
-        Ok(self.view.contains_graph_by_id(graph.source)?
-            && self.view.graph_is_visible(self.context, graph.source)?)
+        let graph = self.source_term(source, dense)?;
+        Ok(self.view.contains_graph_id(graph)?
+            && self.view.graph_is_visible(self.context, graph)?)
     }
 
     fn internalize_term(&self, term: Term) -> std::result::Result<Self::InternalTerm, Self::Error> {
-        if self.default_union_marker_pending.get()
+        if self.union_marker_pending.get()
             && let Term::BlankNode(node) = &term
             && self
                 .default_union_marker
                 .as_ref()
                 .is_some_and(|marker| marker == node)
         {
-            // spareval encodes the configured default graph before evaluating
-            // query terms. Claim exactly that first internalization; a later
-            // matching user term remains ordinary stored or missing data.
-            self.default_union_marker_pending.set(false);
+            // Claim the evaluator's first default-graph encoding only.
+            // A later matching user term remains ordinary data.
+            self.union_marker_pending.set(false);
             return Ok(StoreTerm::DefaultUnion);
         }
         let encoded = EncodedTerm::from_term(&term)?;
         Ok(match self.view.lookup_term(self.context, &encoded)? {
-            Some(id) => StoreTerm::Existing(Self::stored_term(self.view, self.context, id, false)?),
+            Some(id) => self.stored_term(id, false)?,
             None => StoreTerm::Missing(encoded),
         })
     }
@@ -3261,18 +3320,8 @@ where
         self.externalize_store_term(term)
     }
 
-    /// Expression-term hooks: pinned to our cached decode/lookup path rather
-    /// than left to spareval's defaults, which are defined in terms of
-    /// `externalize_term`/`internalize_term` and would silently change shape
-    /// if the trait's defaults ever do.
-    ///
-    /// `internal_term_effective_boolean_value` is deliberately *not*
-    /// overridden: spareval defines it as
-    /// `externalize_expression_term(term)?.effective_boolean_value()`, and
-    /// `ExpressionTerm::effective_boolean_value` is crate-private. Any override
-    /// would have to restate spareval's EBV table by hand and could drift from
-    /// it — silently changing FILTER results. Inheriting the default keeps EBV
-    /// exact and still routes through the cached externalization below.
+    /// These hooks keep term conversion on the cached dataset path.
+    /// The inherited EBV hook preserves spareval's private truth table.
     fn internalize_expression_term(
         &self,
         term: ExpressionTerm,
