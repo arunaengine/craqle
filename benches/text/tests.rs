@@ -366,4 +366,248 @@ mod cases {
         assert_ranked(&full.hits);
         assert_hits(&full.hits, &pruned.hits);
     }
+
+    #[test]
+    fn join_reinsert_dedupes() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = open_engine(root.path(), PostingLayout::Simple);
+        engine
+            .upsert(doc_input("g", "s", "needle replacement"))
+            .unwrap();
+        let (index, fields) = text_index();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let key = "g\u{1f}s";
+        writer
+            .add_document(doc!(
+                fields.key => key,
+                fields.graph => "g",
+                fields.subject => "s",
+                fields.text => "g s needle stale",
+                fields.stable => hit_key("g", "s").as_slice(),
+                fields.visible => 1u64,
+            ))
+            .unwrap();
+        writer.delete_term(Term::from_field_text(fields.key, key));
+        writer
+            .add_document(doc!(
+                fields.key => key,
+                fields.graph => "g",
+                fields.subject => "s",
+                fields.text => "g s needle replacement",
+                fields.stable => hit_key("g", "s").as_slice(),
+                fields.visible => 1u64,
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        writer
+            .add_document(doc!(
+                fields.key => key,
+                fields.graph => "g",
+                fields.subject => "s",
+                fields.text => "g s needle replacement",
+                fields.stable => hit_key("g", "s").as_slice(),
+                fields.visible => 1u64,
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let query = QueryParser::for_index(&index, vec![fields.text])
+            .parse_query("needle")
+            .unwrap();
+        let stats = engine
+            .load_stats(StatsRequest {
+                field: fields.text,
+                max_terms: 100,
+                max_bytes: 1 << 20,
+            })
+            .unwrap();
+        let candidates = [doc_key("g", "s"), doc_key("g", "s")];
+        let report = joins::score_candidates(joins::JoinRequest {
+            searcher: &searcher,
+            query: query.as_ref(),
+            statistics: &stats,
+            key_field: fields.key,
+            candidates: &candidates,
+            generation: engine.generation().unwrap(),
+            limit: 10,
+            bounds: QueryBounds::default(),
+        })
+        .unwrap();
+        assert_eq!(1, report.hits.len());
+        assert_eq!(
+            ("g", "s"),
+            (
+                report.hits[0].graph.as_str(),
+                report.hits[0].subject.as_str()
+            )
+        );
+        assert_eq!(2, report.work.candidate_docs);
+        assert_eq!(2, report.work.deduplicated_docs);
+        assert_eq!(0, report.work.final_reads);
+        assert!(report.work.bytes <= QueryBounds::default().bytes);
+
+        let single = joins::score_candidates(joins::JoinRequest {
+            searcher: &searcher,
+            query: query.as_ref(),
+            statistics: &stats,
+            key_field: fields.key,
+            candidates: &candidates[..1],
+            generation: engine.generation().unwrap(),
+            limit: 10,
+            bounds: QueryBounds::default(),
+        })
+        .unwrap();
+        assert_eq!(2, single.work.candidate_docs);
+        let growth = std::mem::size_of::<(tantivy::DocAddress, DocumentKey<'_>)>();
+        let payload = "g".len() + "s".len();
+        let before_growth = single
+            .work
+            .bytes
+            .saturating_sub(growth)
+            .saturating_sub(payload);
+        let error = joins::score_candidates(joins::JoinRequest {
+            searcher: &searcher,
+            query: query.as_ref(),
+            statistics: &stats,
+            key_field: fields.key,
+            candidates: &candidates[..1],
+            generation: engine.generation().unwrap(),
+            limit: 10,
+            bounds: QueryBounds {
+                bytes: before_growth + growth / 2,
+                ..QueryBounds::default()
+            },
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Limit {
+                resource: "join bytes",
+                ..
+            }
+        ));
+    }
+
+    fn open_engine(path: &std::path::Path, layout: PostingLayout) -> FjallBm25 {
+        FjallBm25::open(
+            path,
+            EngineOptions {
+                layout,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn doc_input<'a>(graph: &'a str, subject: &'a str, text: &'a str) -> DocumentInput<'a> {
+        DocumentInput {
+            graph,
+            subject,
+            text,
+        }
+    }
+
+    fn doc_key<'a>(graph: &'a str, subject: &'a str) -> DocumentKey<'a> {
+        DocumentKey { graph, subject }
+    }
+
+    fn search(engine: &FjallBm25, query: &str) -> Vec<super::text::SearchHit> {
+        engine
+            .search(SearchRequest {
+                query,
+                limit: 100,
+                bounds: QueryBounds::default(),
+                allows: None,
+            })
+            .unwrap()
+            .hits
+    }
+
+    fn assert_hits(left: &[super::text::SearchHit], right: &[super::text::SearchHit]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!((&left.graph, &left.subject), (&right.graph, &right.subject));
+            assert_eq!(left.score.to_bits(), right.score.to_bits());
+        }
+    }
+
+    fn analyzed_len(text: &str) -> u32 {
+        let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(40))
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build();
+        let mut count = 0u32;
+        analyzer.token_stream(text).process(&mut |_| count += 1);
+        count
+    }
+
+    fn text_index() -> (Index, TextFields) {
+        let mut schema = Schema::builder();
+        let key = schema.add_text_field("key", STRING);
+        let graph = schema.add_text_field("graph", STRING | STORED);
+        let subject = schema.add_text_field("subject", STRING | STORED);
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("craqle_text_v2")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
+        let stable = schema.add_bytes_field("stable", FAST);
+        let visible = schema.add_u64_field("visible", FAST);
+        let index = Index::create_in_ram(schema.build());
+        index.tokenizers().register(
+            "craqle_text_v2",
+            TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(RemoveLongFilter::limit(40))
+                .filter(LowerCaser)
+                .filter(AsciiFoldingFilter)
+                .build(),
+        );
+        (
+            index,
+            TextFields {
+                key,
+                graph,
+                subject,
+                text,
+                stable,
+                visible,
+            },
+        )
+    }
+
+    fn first_bytes(column: &BytesColumn, doc: u32) -> Option<Vec<u8>> {
+        let ord = column.term_ords(doc).next()?;
+        let mut bytes = Vec::new();
+        column
+            .ord_to_bytes(ord, &mut bytes)
+            .ok()
+            .and_then(|found| found.then_some(bytes))
+    }
+
+    fn hit_key(graph: &str, subject: &str) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(graph.len() as u64).to_be_bytes());
+        hasher.update(graph.as_bytes());
+        hasher.update(&(subject.len() as u64).to_be_bytes());
+        hasher.update(subject.as_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    fn assert_ranked(hits: &[super::text::SearchHit]) {
+        for pair in hits.windows(2) {
+            assert!(pair[0].score >= pair[1].score);
+            if pair[0].score.to_bits() == pair[1].score.to_bits() {
+                assert!(
+                    hit_key(&pair[0].graph, &pair[0].subject)
+                        <= hit_key(&pair[1].graph, &pair[1].subject)
+                );
+            }
+        }
+    }
 }
