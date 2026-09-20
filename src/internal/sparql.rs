@@ -488,6 +488,7 @@ pub struct QueryOptions {
     /// Collects request-local storage cost counters for this execution.
     pub collect_costs: bool,
     /// Collects per-operator evaluator timings and row counts.
+    /// Enabled by default; disable it for results-only execution.
     pub collect_plan_statistics: bool,
     pub limits: QueryLimits,
 }
@@ -741,6 +742,12 @@ enum GraphScope<'a> {
     All,
     List(&'a [GraphId]),
     Predicate(&'a VisibleFn<'a>),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Evaluations on this thread that collected per-operator statistics.
+    static DETAILED_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Small graph sets populate spareval's named graph list. Larger sets use the
@@ -1171,6 +1178,8 @@ impl SparqlEngine {
 
         let mut evaluator = QueryEvaluator::new().with_cancellation_token(stages.clock.evaluator());
         if collect_plan_statistics {
+            #[cfg(test)]
+            DETAILED_RUNS.with(|runs| runs.set(runs.get() + 1));
             evaluator = evaluator.compute_statistics();
         }
         let mut prepared = evaluator.prepare(&query);
@@ -6009,5 +6018,46 @@ mod tests {
                 .unwrap(),
         );
         assert!(hidden_rows.is_empty());
+    }
+
+    #[test]
+    fn graph_skips_timings() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:graph-results");
+        let insert = |subject: &str, predicate: &str| MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: EncodedTerm(format!("<{subject}>")),
+            predicate: EncodedTerm(format!("<{predicate}>")),
+            object: EncodedTerm("<urn:test:graph-results:key>".to_owned()),
+        };
+        node.apply_changes(
+            &crate::AllowAllAuthorizer,
+            &graph,
+            vec![
+                insert("urn:test:graph-results:a", "urn:test:graph-results:left"),
+                insert("urn:test:graph-results:b", "urn:test:graph-results:right"),
+            ],
+        )
+        .unwrap();
+        let sparql = "SELECT ?a ?b WHERE { ?a <urn:test:graph-results:left> ?key . \
+                      ?b <urn:test:graph-results:right> ?key }";
+        let graphs = std::slice::from_ref(&graph);
+        let runs = || DETAILED_RUNS.with(std::cell::Cell::get);
+        let before = runs();
+        let results = node
+            .query_in_graphs(&crate::AllowAllAuthorizer, graphs, sparql)
+            .unwrap();
+        assert_eq!(before, runs());
+        let detailed = node
+            .query_in_graphs_with_options(
+                &crate::AllowAllAuthorizer,
+                graphs,
+                sparql,
+                &QueryOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(before + 1, runs());
+        assert_eq!(results, detailed.results);
     }
 }

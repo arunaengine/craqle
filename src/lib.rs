@@ -3687,8 +3687,12 @@ impl CraqleNode {
         graphs: &[GraphId],
         sparql: &str,
     ) -> Result<QueryResults> {
+        let options = QueryOptions {
+            collect_plan_statistics: false,
+            ..QueryOptions::default()
+        };
         Ok(self
-            .query_in_graphs_with_options(auth, graphs, sparql, &QueryOptions::default())?
+            .query_in_graphs_with_options(auth, graphs, sparql, &options)?
             .results)
     }
 
