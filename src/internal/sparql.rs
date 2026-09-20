@@ -2675,46 +2675,54 @@ fn ground_named_node(iri: &str) -> GroundTerm {
     GroundTerm::NamedNode(NamedNode::new_unchecked(iri))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StoredQueryTerm {
-    source: TermId,
-    query: Option<QueryTermId>,
-}
-
-impl PartialEq for StoredQueryTerm {
-    fn eq(&self, other: &Self) -> bool {
-        match (self.query, other.query) {
-            (Some(left), Some(right)) => left == right,
-            (None, None) => self.source == other.source,
-            (Some(_), None) | (None, Some(_)) => false,
-        }
-    }
-}
-
-impl Eq for StoredQueryTerm {}
-
-impl Hash for StoredQueryTerm {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self.query {
-            Some(query) => {
-                1u8.hash(state);
-                query.hash(state);
-            }
-            None => {
-                0u8.hash(state);
-                self.source.hash(state);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 enum StoreTerm {
-    Existing(StoredQueryTerm),
+    Source(TermId),
+    Mapped {
+        source: TermId,
+        dense: DenseTerm,
+    },
+    Dense(DenseTerm),
     Missing(EncodedTerm),
-    /// Claimed exactly once while spareval encodes the per-execution default
-    /// graph marker. It is never a stored RDF term.
+    /// Claimed exactly once while spareval encodes the default graph marker.
     DefaultUnion,
+}
+
+impl PartialEq for StoreTerm {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Source(left), Self::Source(right)) => left == right,
+            (
+                Self::Mapped { dense: left, .. } | Self::Dense(left),
+                Self::Mapped { dense: right, .. } | Self::Dense(right),
+            ) => left == right,
+            (Self::Missing(left), Self::Missing(right)) => left == right,
+            (Self::DefaultUnion, Self::DefaultUnion) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for StoreTerm {}
+
+impl Hash for StoreTerm {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Source(source) => {
+                0u8.hash(state);
+                source.hash(state);
+            }
+            Self::Mapped { dense, .. } | Self::Dense(dense) => {
+                1u8.hash(state);
+                dense.hash(state);
+            }
+            Self::Missing(term) => {
+                2u8.hash(state);
+                term.hash(state);
+            }
+            Self::DefaultUnion => 3u8.hash(state),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2726,22 +2734,72 @@ enum StoreDatasetError {
     #[error("invalid RDF term: {0}")]
     InvalidTerm(String),
     #[error(transparent)]
-    UnsupportedRdfStarTerm(#[from] crate::UnsupportedRdfStarTerm),
+    UnsupportedStarTerm(#[from] crate::UnsupportedRdfStarTerm),
 }
 
+#[derive(Clone, Copy)]
 enum ResolvedPatternTerm {
     Any,
-    Existing(TermId),
+    Existing {
+        source: Option<TermId>,
+        dense: Option<DenseTerm>,
+    },
     Missing,
     DefaultUnion,
+}
+
+#[derive(Clone, Copy)]
+struct TermWriter<'store, 'context, 'visibility> {
+    view: &'context StoreReadView<'store>,
+    context: &'context ReadContext<'visibility>,
+    dense_scope: Option<u64>,
+}
+
+impl TermWriter<'_, '_, '_> {
+    fn stored_term(
+        &self,
+        source: TermId,
+        require_query_id: bool,
+    ) -> std::result::Result<StoreTerm, StoreDatasetError> {
+        let query = if self.view.query_ids_trusted(self.context)? {
+            let query = self.view.query_term_id(self.context, source)?;
+            if require_query_id && query.is_none() {
+                return Err(
+                    StoreError::IndexVerificationFailed("term-to-query-mapping-missing").into(),
+                );
+            }
+            query
+        } else {
+            None
+        };
+        Ok(match (query, self.dense_scope) {
+            (Some(query), Some(scope)) => StoreTerm::Mapped {
+                source,
+                dense: DenseTerm::new(query, scope),
+            },
+            _ => StoreTerm::Source(source),
+        })
+    }
 }
 
 struct StoreDataset<'store, 'context, 'visibility> {
     view: &'context StoreReadView<'store>,
     context: &'context ReadContext<'visibility>,
     default_union_marker: Option<BlankNode>,
-    default_union_marker_pending: Cell<bool>,
+    union_marker_pending: Cell<bool>,
     query_budget: Option<Arc<QueryBudget>>,
+    dense_resolver: RefCell<Option<DenseResolver>>,
+    dense_scope: Option<u64>,
+}
+
+static NEXT_DENSE_SCOPE: AtomicU64 = AtomicU64::new(1);
+
+fn next_dense_scope() -> Option<u64> {
+    NEXT_DENSE_SCOPE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |scope| {
+            scope.checked_add(1)
+        })
+        .ok()
 }
 
 impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> {
@@ -2754,8 +2812,10 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             view,
             context,
             default_union_marker: None,
-            default_union_marker_pending: Cell::new(false),
+            union_marker_pending: Cell::new(false),
             query_budget: None,
+            dense_resolver: RefCell::new(None),
+            dense_scope: next_dense_scope(),
         }
     }
 
@@ -2769,8 +2829,10 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             view,
             context,
             default_union_marker: Some(marker),
-            default_union_marker_pending: Cell::new(true),
+            union_marker_pending: Cell::new(true),
             query_budget: None,
+            dense_resolver: RefCell::new(None),
+            dense_scope: next_dense_scope(),
         }
     }
 
@@ -2784,17 +2846,39 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             view,
             context,
             default_union_marker: Some(marker),
-            default_union_marker_pending: Cell::new(true),
+            union_marker_pending: Cell::new(true),
             query_budget: Some(query_budget),
+            dense_resolver: RefCell::new(None),
+            dense_scope: next_dense_scope(),
         }
     }
 
     fn resolve_pattern_term(&self, term: Option<&StoreTerm>) -> ResolvedPatternTerm {
         match term {
             None => ResolvedPatternTerm::Any,
-            Some(StoreTerm::Existing(term)) => ResolvedPatternTerm::Existing(term.source),
+            Some(StoreTerm::Source(source)) => ResolvedPatternTerm::Existing {
+                source: Some(*source),
+                dense: None,
+            },
+            Some(StoreTerm::Mapped { source, dense }) => ResolvedPatternTerm::Existing {
+                source: Some(*source),
+                dense: Some(*dense),
+            },
+            Some(StoreTerm::Dense(dense)) => ResolvedPatternTerm::Existing {
+                source: None,
+                dense: Some(*dense),
+            },
             Some(StoreTerm::Missing(_)) => ResolvedPatternTerm::Missing,
             Some(StoreTerm::DefaultUnion) => ResolvedPatternTerm::DefaultUnion,
+        }
+    }
+
+    fn term_identity(term: &StoreTerm) -> Option<(Option<TermId>, Option<DenseTerm>)> {
+        match term {
+            StoreTerm::Source(source) => Some((Some(*source), None)),
+            StoreTerm::Mapped { source, dense } => Some((Some(*source), Some(*dense))),
+            StoreTerm::Dense(dense) => Some((None, Some(*dense))),
+            StoreTerm::Missing(_) | StoreTerm::DefaultUnion => None,
         }
     }
 
@@ -2804,25 +2888,89 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             .map_err(Into::into)
     }
 
+    fn source_term(
+        &self,
+        source: Option<TermId>,
+        dense: Option<DenseTerm>,
+    ) -> std::result::Result<TermId, StoreDatasetError> {
+        if let Some(dense) = dense {
+            if Some(dense.scope()) != self.dense_scope {
+                return Err(
+                    StoreError::IndexVerificationFailed("dense-term-scope-mismatch").into(),
+                );
+            }
+            if let Some(resolver) = self.dense_resolver.borrow().as_ref() {
+                if dense.scope() != resolver.scope() {
+                    return Err(
+                        StoreError::IndexVerificationFailed("dense-term-scope-mismatch").into(),
+                    );
+                }
+                if let Some(source) = source {
+                    return Ok(source);
+                }
+                return resolver.source(dense).map_err(Into::into);
+            }
+        }
+        source.ok_or_else(|| {
+            StoreError::IndexVerificationFailed("stored-term-identity-missing").into()
+        })
+    }
+
+    fn accept_resolver(
+        &self,
+        resolver: DenseResolver,
+        terms: [Option<DenseTerm>; 4],
+    ) -> std::result::Result<(), StoreDatasetError> {
+        let Some(scope) = self.dense_scope else {
+            return Err(StoreError::IndexVerificationFailed("dense-scope-exhausted").into());
+        };
+        if resolver.scope() != scope
+            || terms
+                .into_iter()
+                .flatten()
+                .any(|term| term.scope() != scope)
+        {
+            return Err(StoreError::IndexVerificationFailed("dense-term-scope-mismatch").into());
+        }
+        let mut current = self.dense_resolver.borrow_mut();
+        if current
+            .as_ref()
+            .is_some_and(|current| current.space() != resolver.space())
+        {
+            return Err(
+                StoreError::IndexVerificationFailed("dense-resolver-snapshot-mismatch").into(),
+            );
+        }
+        if current.is_none() {
+            *current = Some(resolver);
+        }
+        Ok(())
+    }
+
+    fn dense_store_term(term: DenseTerm, source: Option<TermId>) -> StoreTerm {
+        match source {
+            Some(source) => StoreTerm::Mapped {
+                source,
+                dense: term,
+            },
+            None => StoreTerm::Dense(term),
+        }
+    }
+
     fn stored_term(
-        view: &StoreReadView<'_>,
-        context: &ReadContext<'_>,
+        &self,
         source: TermId,
         require_query_id: bool,
-    ) -> std::result::Result<StoredQueryTerm, StoreDatasetError> {
-        let query = if view.query_ids_trusted(context)? {
-            let query = view.query_term_id(context, source)?;
-            if require_query_id && query.is_none() {
-                return Err(StoreError::QueryIndexVerificationFailed(
-                    "term-to-query-mapping-missing",
-                )
-                .into());
-            }
-            query
-        } else {
-            None
-        };
-        Ok(StoredQueryTerm { source, query })
+    ) -> std::result::Result<StoreTerm, StoreDatasetError> {
+        self.term_writer().stored_term(source, require_query_id)
+    }
+
+    fn term_writer(&self) -> TermWriter<'store, 'context, 'visibility> {
+        TermWriter {
+            view: self.view,
+            context: self.context,
+            dense_scope: self.dense_scope,
+        }
     }
 
     fn externalize_encoded_term(
@@ -2838,8 +2986,16 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
         term: StoreTerm,
     ) -> std::result::Result<Term, StoreDatasetError> {
         match term {
-            StoreTerm::Existing(term) => {
-                let decoded = self.decode_term(term.source)?;
+            StoreTerm::Source(source) => {
+                let decoded = self.decode_term(source)?;
+                self.externalize_encoded_term(&decoded)
+            }
+            StoreTerm::Mapped { source, dense } => {
+                let decoded = self.decode_term(self.source_term(Some(source), Some(dense))?)?;
+                self.externalize_encoded_term(&decoded)
+            }
+            StoreTerm::Dense(dense) => {
+                let decoded = self.decode_term(self.source_term(None, Some(dense))?)?;
                 self.externalize_encoded_term(&decoded)
             }
             StoreTerm::Missing(term) => self.externalize_encoded_term(&term),
