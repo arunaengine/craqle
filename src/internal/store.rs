@@ -10472,12 +10472,222 @@ impl GraphStore {
         Ok(rebuild)
     }
 
-    /// Drop the subject entries the indexer just covered, keeping any that were
-    /// re-dirtied since it read them.
-    ///
-    /// The queue lock spans the token read and the commit: an enqueue landing
-    /// in between would otherwise be erased by a removal that never covered it.
-    pub fn acknowledge_fts_queue(&self, queued: &[DirtySubject]) -> Result<()> {
+    pub(crate) fn queue_search_rebuild(&self, scan: &RebuildScan) -> Result<RebuildPage> {
+        let _queue = self.fts_queue_guard();
+        let coverage = self
+            .search_coverage()?
+            .ok_or(StoreError::InvalidSearchState("search-coverage-missing"))?;
+        let rebuild = coverage.rebuild.ok_or(StoreError::InvalidSearchState(
+            "search-rebuild-not-required",
+        ))?;
+        if coverage.index_id != scan.index_id {
+            return Err(StoreError::InvalidSearchState(
+                "search-rebuild-index-mismatch",
+            ));
+        }
+        let mut state = self
+            .search_meta
+            .get(SEARCH_REBUILD_KEY)?
+            .map(|value| postcard::from_bytes::<SearchRebuildScan>(value.as_ref()))
+            .transpose()?
+            .ok_or(StoreError::InvalidSearchState(
+                "search-rebuild-cursor-missing",
+            ))?;
+        if state.format != SEARCH_META_FORMAT
+            || state.index_id != scan.index_id
+            || state.target != rebuild
+        {
+            return Err(StoreError::InvalidSearchState(
+                "search-rebuild-cursor-mismatch",
+            ));
+        }
+        if state.done {
+            return Ok(RebuildPage {
+                remaining: false,
+                rows: 0,
+                bytes: 0,
+                target: self.locked_dirty_token(),
+                oversized: None,
+            });
+        }
+        let lower = state.after.map_or_else(
+            || Included(vec![GRAPH_META_PREFIX]),
+            |graph| Excluded(graph_meta_key(graph).to_vec()),
+        );
+        let upper = Excluded(vec![GRAPH_META_PREFIX.saturating_add(1)]);
+        let mut iterator = self.graphs.range((lower, upper));
+        let mut batch = self.buffered_batch();
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        let mut highest = self.locked_dirty_token();
+        let mut remaining = false;
+        let mut oversized = None;
+        while let Some(guard) = iterator.next() {
+            let (key, value) = guard.into_inner()?;
+            if rows == scan.row_limit {
+                remaining = true;
+                break;
+            }
+            let graph = decode_term_id(&key.as_ref()[1..], "graph meta key")?;
+            let term_bytes = self
+                .terms
+                .size_of(graph.to_be_bytes())?
+                .ok_or(StoreError::TermNotFound(graph.0))? as usize;
+            let encoded = key
+                .len()
+                .saturating_add(value.len())
+                .saturating_add(term_bytes);
+            if bytes.saturating_add(encoded) > scan.byte_limit {
+                if encoded > scan.byte_limit {
+                    highest =
+                        highest.max(self.stage_fts_entry(&mut batch, FtsQueueKey::Reindex(graph))?);
+                    state.after = Some(graph);
+                    rows += 1;
+                    oversized = Some(OversizedSource {
+                        bytes: encoded,
+                        limit: scan.byte_limit,
+                    });
+                }
+                remaining = true;
+                break;
+            }
+            highest = highest.max(self.stage_fts_entry(&mut batch, FtsQueueKey::Reindex(graph))?);
+            state.after = Some(graph);
+            rows += 1;
+            bytes = bytes.saturating_add(encoded);
+        }
+        if !remaining {
+            state.done = true;
+        }
+        batch.insert(
+            &self.search_meta,
+            SEARCH_REBUILD_KEY,
+            postcard::to_allocvec(&state)?,
+        );
+        batch.insert(&self.search_meta, SEARCH_HEAD_KEY, highest.to_be_bytes());
+        self.commit_fjall_batch(batch)?;
+        self.dirty_committed.fetch_max(highest, Ordering::SeqCst);
+        Ok(RebuildPage {
+            remaining,
+            rows,
+            bytes,
+            target: highest,
+            oversized,
+        })
+    }
+
+    pub(crate) fn finish_search_rebuild(&self, coverage: &SearchCoverage) -> Result<()> {
+        let _queue = self.fts_queue_guard();
+        let current = self
+            .search_coverage()?
+            .ok_or(StoreError::InvalidSearchState("search-coverage-missing"))?;
+        if current.rebuild != coverage.rebuild
+            || current.index_id != coverage.index_id
+            || coverage.format != SEARCH_META_FORMAT
+            || !coverage
+                .rebuild
+                .is_some_and(|rebuild| coverage.covered >= rebuild)
+            || coverage.covered < current.covered
+        {
+            return Err(StoreError::InvalidSearchState(
+                "search-rebuild-target-mismatch",
+            ));
+        }
+        let enumeration = self
+            .search_meta
+            .get(SEARCH_REBUILD_KEY)?
+            .map(|value| postcard::from_bytes::<SearchRebuildScan>(value.as_ref()))
+            .transpose()?
+            .ok_or(StoreError::InvalidSearchState(
+                "search-rebuild-cursor-missing",
+            ))?;
+        if enumeration.format != SEARCH_META_FORMAT
+            || enumeration.index_id != coverage.index_id
+            || Some(enumeration.target) != coverage.rebuild
+            || !enumeration.done
+        {
+            return Err(StoreError::InvalidSearchState("search-rebuild-incomplete"));
+        }
+        let manifest = self.search_manifest_digest(coverage.index_id)?;
+        if manifest.epoch != coverage.manifest_epoch {
+            return Err(StoreError::InvalidSearchState("search-manifest-changed"));
+        }
+        if let Some(guard) = self.search_queue.prefix([SEARCH_ORDER_PREFIX]).next() {
+            let (key, _) = guard.into_inner()?;
+            if decode_search_order(key.as_ref())?.token <= coverage.covered {
+                return Err(StoreError::InvalidSearchState(
+                    "search-coverage-debt-remains",
+                ));
+            }
+        }
+        let settled = SearchCoverage {
+            rebuild: None,
+            ..*coverage
+        };
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            SEARCH_MANIFEST_KEY,
+            postcard::to_allocvec(&StoredManifest {
+                format: SEARCH_META_FORMAT,
+                index_id: coverage.index_id,
+                count: coverage.manifest_count,
+                hash: coverage.manifest_hash,
+                epoch: coverage.manifest_epoch,
+            })?,
+        );
+        batch.insert(
+            &self.search_meta,
+            SEARCH_COVERAGE_KEY,
+            encode_search_coverage(&settled)?,
+        );
+        batch.remove(&self.search_meta, SEARCH_REBUILD_KEY);
+        self.commit_fjall_batch(batch)
+    }
+
+    pub(crate) fn advance_search_coverage(&self, coverage: &SearchCoverage) -> Result<()> {
+        let _queue = self.fts_queue_guard();
+        if coverage.format != SEARCH_META_FORMAT {
+            return Err(StoreError::UnsupportedSearchFormat {
+                found: coverage.format,
+                supported: SEARCH_META_FORMAT,
+            });
+        }
+        let manifest = self.search_manifest_digest(coverage.index_id)?;
+        if manifest.epoch != coverage.manifest_epoch
+            || manifest.count != coverage.manifest_count
+            || manifest.hash != coverage.manifest_hash
+        {
+            return Err(StoreError::InvalidSearchState("search-manifest-changed"));
+        }
+        if let Some(guard) = self.search_queue.prefix([SEARCH_ORDER_PREFIX]).next() {
+            let (key, _) = guard.into_inner()?;
+            if decode_search_order(key.as_ref())?.token <= coverage.covered {
+                return Err(StoreError::InvalidSearchState(
+                    "search-coverage-debt-remains",
+                ));
+            }
+        }
+        if let Some(current) = self.search_coverage()?
+            && (current.rebuild.is_some()
+                || (current.index_id != [0; 16]
+                    && current.index_id != coverage.index_id
+                    && current.rebuild != Some(coverage.covered))
+                || coverage.covered < current.covered)
+        {
+            return Err(StoreError::InvalidSearchState("search-coverage-regression"));
+        }
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            SEARCH_COVERAGE_KEY,
+            encode_search_coverage(coverage)?,
+        );
+        self.commit_fjall_batch(batch)
+    }
+
+    /// Acknowledges covered subjects while preserving later redirty events.
+    pub(crate) fn acknowledge_fts_queue(&self, queued: &[DirtySubject]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
@@ -10505,7 +10715,7 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn acknowledge_fts_reindex_queue(&self, queued: &[DirtyGraph]) -> Result<()> {
+    pub(crate) fn acknowledge_reindex(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
@@ -10531,7 +10741,7 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn acknowledge_fts_delete_queue(&self, queued: &[DirtyGraph]) -> Result<()> {
+    pub(crate) fn acknowledge_deletes(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
@@ -10546,7 +10756,7 @@ impl GraphStore {
             dirty |= self.settle_fts_entry(
                 &mut batch,
                 AckedEntry {
-                    key: graph_search_delete_key(graph_id).to_vec(),
+                    key: graph_delete_key(graph_id).to_vec(),
                     covered: entry.tokens.latest,
                 },
             )?;
@@ -10557,10 +10767,7 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn acknowledge_fts_subjects_for_reindexed_graphs(
-        &self,
-        queued: &[DirtyGraph],
-    ) -> Result<()> {
+    pub(crate) fn acknowledge_reindexed(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
@@ -10572,12 +10779,16 @@ impl GraphStore {
             let Some(graph_id) = self.graph_id_for(&entry.graph)? else {
                 continue;
             };
-            for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+            for guard in self.graphs.prefix(graph_dirty_scope(graph_id)) {
                 let (key, value) = guard.into_inner()?;
                 let tokens = decode_dirty_tokens(value.as_ref(), "graph dirty tokens")?;
                 // `latest`: a subject dirtied past the reindex token is not
                 // covered by the scan that token bounded.
                 if tokens.latest <= entry.tokens.latest {
+                    let cursor =
+                        self.queue_cursor(QueueKind::Subject, key.as_ref(), value.as_ref())?;
+                    batch.remove(&self.search_queue, search_order_key(cursor));
+                    batch.remove(&self.search_meta, search_failure_key(cursor));
                     batch.remove(&self.graphs, key);
                     dirty = true;
                 }
@@ -10590,7 +10801,7 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn acknowledge_fts_queues_for_deleted_graphs(&self, queued: &[DirtyGraph]) -> Result<()> {
+    pub(crate) fn acknowledge_deleted(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
         }
@@ -10603,22 +10814,30 @@ impl GraphStore {
                 continue;
             };
             let delete_token = entry.tokens.latest;
-            for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+            for guard in self.graphs.prefix(graph_dirty_scope(graph_id)) {
                 let (key, value) = guard.into_inner()?;
                 let tokens = decode_dirty_tokens(value.as_ref(), "graph dirty tokens")?;
                 if tokens.latest <= delete_token {
+                    let cursor =
+                        self.queue_cursor(QueueKind::Subject, key.as_ref(), value.as_ref())?;
+                    batch.remove(&self.search_queue, search_order_key(cursor));
+                    batch.remove(&self.search_meta, search_failure_key(cursor));
                     batch.remove(&self.graphs, key);
                     dirty = true;
                 }
             }
 
             let reindex_key = graph_reindex_key(graph_id);
-            if self.graphs.get(reindex_key)?.is_some_and(|current| {
-                decode_dirty_tokens(current.as_ref(), "graph reindex tokens")
-                    .is_ok_and(|tokens| tokens.latest <= delete_token)
-            }) {
-                batch.remove(&self.graphs, reindex_key);
-                dirty = true;
+            if let Some(current) = self.graphs.get(reindex_key)? {
+                let tokens = decode_dirty_tokens(current.as_ref(), "graph reindex tokens")?;
+                if tokens.latest <= delete_token {
+                    let cursor =
+                        self.queue_cursor(QueueKind::Reindex, &reindex_key, current.as_ref())?;
+                    batch.remove(&self.search_queue, search_order_key(cursor));
+                    batch.remove(&self.search_meta, search_failure_key(cursor));
+                    batch.remove(&self.graphs, reindex_key);
+                    dirty = true;
+                }
             }
         }
 
@@ -10628,13 +10847,8 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Retire this graph's queue entries up to `upto`, the token a scan pinned
-    /// before it started reading.
-    ///
-    /// Entries dirtied past that token survive: the scan never saw those
-    /// writes, and clearing them would leave the subjects unindexed with
-    /// nothing left to re-queue them (G7).
-    pub fn clear_fts_queue_for_graph(&self, graph: &GraphId, upto: u64) -> Result<()> {
+    /// Retires graph queue entries only through the scan's pinned token.
+    pub fn clear_graph_queue(&self, graph: &GraphId, upto: u64) -> Result<()> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(());
         };
@@ -10642,12 +10856,12 @@ impl GraphStore {
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
         let mut keys: Vec<Vec<u8>> = Vec::new();
-        for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
+        for guard in self.graphs.prefix(graph_dirty_scope(graph_id)) {
             let (key, _) = guard.into_inner()?;
             keys.push(key.to_vec());
         }
         keys.push(graph_reindex_key(graph_id).to_vec());
-        keys.push(graph_search_delete_key(graph_id).to_vec());
+        keys.push(graph_delete_key(graph_id).to_vec());
 
         let mut dirty = false;
         for key in keys {
