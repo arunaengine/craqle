@@ -4433,7 +4433,6 @@ impl CraqleNode {
     }
 }
 
-#[cfg(feature = "shacl-core")]
 /// Keeps store-wide counts only for callers that may read every graph.
 fn scoped_execution(auth: &dyn Authorizer, mut execution: QueryExecution) -> QueryExecution {
     if !auth.reads_all() {
@@ -4449,6 +4448,7 @@ fn scoped_plan(auth: &dyn Authorizer, mut plan: QueryPlan) -> QueryPlan {
     plan
 }
 
+#[cfg(feature = "shacl-core")]
 fn rocrate_policy_id(shapes_graph: &GraphId, schema: &CompiledShaclSchema) -> PolicyId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"craqle-rocrate-policy-v1");
