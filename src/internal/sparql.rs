@@ -611,6 +611,7 @@ pub enum QueryPhysicalOperator {
 }
 
 /// Work and stage timings for one complete query execution.
+/// Store-wide counts and estimates are zero unless the authorizer reads every graph.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryExecutionStatistics {
     pub parse_time: Duration,
@@ -661,6 +662,66 @@ pub struct QueryExecutionStatistics {
     pub result_rows: u64,
     pub result_cells: u64,
     pub plan: QueryPlan,
+}
+
+impl QueryExecutionStatistics {
+    /// Clears counts that scans and planner statistics gather across unreadable graphs.
+    pub(crate) fn withhold_counts(&mut self) {
+        for join in &mut self.planned_joins {
+            *join = PlannedJoin {
+                physical_operator: join.physical_operator,
+                estimated_left_rows: 0,
+                estimated_right_rows: 0,
+                estimated_distinct_join_keys: 0,
+                estimated_output_rows: 0,
+                estimated_lateral_cost: 0,
+                estimated_hash_cost: 0,
+            };
+        }
+        for count in [
+            &mut self.index_seeks,
+            &mut self.source_keys_read,
+            &mut self.source_bytes_read,
+            &mut self.qv_keys_read,
+            &mut self.qv_bytes_read,
+            &mut self.reverse_mapping_reads,
+            &mut self.reverse_mapping_bytes,
+            &mut self.forward_mapping_reads,
+            &mut self.forward_mapping_bytes,
+            &mut self.planner_index_entries,
+            &mut self.planner_point_reads,
+            &mut self.planner_cache_hits,
+            &mut self.planner_cache_misses,
+            &mut self.planner_memo_hits,
+            &mut self.planner_memo_misses,
+            &mut self.candidate_quads,
+            &mut self.graphs_considered,
+            &mut self.orphan_checks,
+            &mut self.duplicate_groups,
+            &mut self.duplicate_copies_skipped,
+            &mut self.key_fields_extracted,
+            &mut self.authoritative_terms_decoded,
+            &mut self.result_terms_decoded,
+            &mut self.encoded_quad_constructions,
+            &mut self.terms_decoded,
+        ] {
+            *count = 0;
+        }
+        self.plan.withhold_counts();
+    }
+}
+
+impl QueryPlan {
+    /// Clears row estimates and scan counts from every plan node.
+    pub(crate) fn withhold_counts(&mut self) {
+        let mut pending = vec![&mut self.root];
+        while let Some(node) = pending.pop() {
+            node.estimated_rows = None;
+            node.index_seeks = 0;
+            node.candidate_rows = 0;
+            pending.extend(node.children.iter_mut());
+        }
+    }
 }
 
 pub(crate) struct SparqlEngine {

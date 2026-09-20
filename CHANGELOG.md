@@ -17,6 +17,9 @@ All notable changes to Craqle are documented here.
   before a short publication fence.
 - Dropping a node joins its maintenance worker; an active storage or search call
   must finish before shutdown completes.
+- Query statistics, explain, and analyze report zero for store-wide counts and no
+  row estimates unless the authorizer reads every graph. `Authorizer::reads_all`
+  defaults to `false`; `AllowAllAuthorizer` returns `true`.
 
 ### Added
 

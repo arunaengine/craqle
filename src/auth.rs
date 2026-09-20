@@ -64,6 +64,12 @@ pub trait Authorizer: Send + Sync {
         policy: &GraphPolicy,
         action: Action,
     ) -> Result<(), AuthorizationError>;
+
+    /// Whether `Read` is granted on every graph.
+    /// Only such callers receive store-wide counts in query diagnostics.
+    fn reads_all(&self) -> bool {
+        false
+    }
 }
 
 impl<F> Authorizer for F
@@ -210,6 +216,10 @@ impl Authorizer for AllowAllAuthorizer {
         _action: Action,
     ) -> Result<(), AuthorizationError> {
         Ok(())
+    }
+
+    fn reads_all(&self) -> bool {
+        true
     }
 }
 

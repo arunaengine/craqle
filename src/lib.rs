@@ -3578,7 +3578,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         request: QueryRequest<'_>,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.query_with_options(
+        let execution = self.sparql.query_with_options(
             sparql::QueryRun {
                 sparql: request.sparql,
                 options: request.options,
@@ -3590,7 +3590,8 @@ impl CraqleNode {
                     .flatten()
                     .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
             },
-        )?)
+        )?;
+        Ok(scoped_execution(auth, execution))
     }
 
     /// Execute a SPARQL query and return its complete result with diagnostics.
@@ -3599,15 +3600,16 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         sparql: &str,
     ) -> Result<QueryExecution> {
-        Ok(self
-            .sparql
-            .query_snapshot_stats(sparql, &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            })?)
+        let execution =
+            self.sparql
+                .query_snapshot_stats(sparql, &|snapshot, graph: &GraphId| {
+                    snapshot
+                        .graph_policy(&self.store, graph)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
+                })?;
+        Ok(scoped_execution(auth, execution))
     }
 
     /// Execute a prepared query against a fresh authorized store snapshot.
@@ -3617,7 +3619,7 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.execute_prepared_snapshot(
+        let execution = self.sparql.execute_prepared_snapshot(
             query,
             &|snapshot, graph: &GraphId| {
                 snapshot
@@ -3629,7 +3631,8 @@ impl CraqleNode {
             options,
             Duration::ZERO,
             true,
-        )?)
+        )?;
+        Ok(scoped_execution(auth, execution))
     }
 
     /// Inspect the current logical and physical plan without executing it.
@@ -3639,7 +3642,7 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryPlan> {
-        Ok(self.sparql.explain_prepared_snapshot(
+        let plan = self.sparql.explain_prepared_snapshot(
             query,
             &|snapshot, graph: &GraphId| {
                 snapshot
@@ -3649,7 +3652,8 @@ impl CraqleNode {
                     .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
             },
             options,
-        )?)
+        )?;
+        Ok(scoped_plan(auth, plan))
     }
 
     /// Execute a prepared query completely and return its measured plan.
@@ -3682,12 +3686,13 @@ impl CraqleNode {
         sparql: &str,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.query_graphs_options(sparql::GraphQuery {
+        let execution = self.sparql.query_graphs_options(sparql::GraphQuery {
             auth,
             graphs,
             sparql,
             options,
-        })?)
+        })?;
+        Ok(scoped_execution(auth, execution))
     }
 
     /// Execute a prepared query over an explicit, wholly authorized graph set.
@@ -3698,9 +3703,10 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        Ok(self
+        let execution = self
             .sparql
-            .execute_prepared_graphs(auth, query, graphs, options)?)
+            .execute_prepared_graphs(auth, query, graphs, options)?;
+        Ok(scoped_execution(auth, execution))
     }
 
     /// Inspect a prepared plan for an explicit, wholly authorized graph set.
@@ -3711,9 +3717,10 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryPlan> {
-        Ok(self
+        let plan = self
             .sparql
-            .explain_prepared_graphs(auth, query, graphs, options)?)
+            .explain_prepared_graphs(auth, query, graphs, options)?;
+        Ok(scoped_plan(auth, plan))
     }
 
     /// Execute over explicit authorized graphs and return the measured plan.
@@ -4427,6 +4434,21 @@ impl CraqleNode {
 }
 
 #[cfg(feature = "shacl-core")]
+/// Keeps store-wide counts only for callers that may read every graph.
+fn scoped_execution(auth: &dyn Authorizer, mut execution: QueryExecution) -> QueryExecution {
+    if !auth.reads_all() {
+        execution.statistics.withhold_counts();
+    }
+    execution
+}
+
+fn scoped_plan(auth: &dyn Authorizer, mut plan: QueryPlan) -> QueryPlan {
+    if !auth.reads_all() {
+        plan.withhold_counts();
+    }
+    plan
+}
+
 fn rocrate_policy_id(shapes_graph: &GraphId, schema: &CompiledShaclSchema) -> PolicyId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"craqle-rocrate-policy-v1");

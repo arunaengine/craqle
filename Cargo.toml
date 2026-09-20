@@ -244,6 +244,10 @@ name = "query_budgets"
 path = "tests/query/budgets.rs"
 
 [[test]]
+name = "query_diagnostics"
+path = "tests/query/diagnostics.rs"
+
+[[test]]
 name = "query_differential"
 path = "tests/query/differential.rs"
 
