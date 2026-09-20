@@ -10023,6 +10023,455 @@ impl GraphStore {
             .map(|stored| stored.job))
     }
 
+    pub(crate) fn begin_search_stage(&self, req: &StageRequest) -> Result<StageJob> {
+        let _queue = self.fts_queue_guard();
+        if self.graph_tombstoned(&req.graph)? {
+            return Err(StoreError::GraphNotFound(req.graph.to_string()));
+        }
+        if let Some(stored) = self.stored_search_stage(&req.graph)?
+            && stored.format == SEARCH_META_FORMAT
+            && stored.index_id == req.index_id
+            && stored.job.target == req.target
+            && (stored.job.complete || stored.job.session == req.session)
+        {
+            return Ok(stored.job);
+        }
+        let mut batch = self.buffered_batch();
+        if let Some(stored) = self.stored_search_stage(&req.graph)? {
+            self.queue_search_cleanup(
+                &mut batch,
+                &CleanupJob {
+                    graph: req.graph.clone(),
+                    generation: stored.job.generation,
+                },
+            )?;
+        }
+        let generation = self.next_search_generation(&mut batch)?;
+        let job = StageJob {
+            graph: req.graph.clone(),
+            target: req.target,
+            generation,
+            cursor: None,
+            rows: 0,
+            bytes: 0,
+            complete: false,
+            session: req.session,
+        };
+        batch.insert(
+            &self.search_meta,
+            search_stage_key(&req.graph),
+            encode_search_stage(&StoredStage {
+                format: SEARCH_META_FORMAT,
+                index_id: req.index_id,
+                job: job.clone(),
+            })?,
+        );
+        self.commit_fjall_batch(batch)?;
+        Ok(job)
+    }
+
+    pub(crate) fn advance_search_stage(&self, job: &StageJob) -> Result<()> {
+        let _queue = self.fts_queue_guard();
+        let mut stored = self
+            .stored_search_stage(&job.graph)?
+            .ok_or(StoreError::InvalidSearchState("search-stage-missing"))?;
+        if stored.job.generation != job.generation
+            || stored.job.session != job.session
+            || stored.job.target != job.target
+            || stored.job.complete
+            || job.rows < stored.job.rows
+            || job.bytes < stored.job.bytes
+            || stored
+                .job
+                .cursor
+                .zip(job.cursor)
+                .is_some_and(|(current, next)| next < current)
+        {
+            return Err(StoreError::InvalidSearchState(
+                "search-stage-compare-failed",
+            ));
+        }
+        stored.job = job.clone();
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            search_stage_key(&job.graph),
+            encode_search_stage(&stored)?,
+        );
+        self.commit_fjall_batch(batch)
+    }
+
+    pub(crate) fn finish_search_stage(&self, job: &StageJob) -> Result<()> {
+        let _queue = self.fts_queue_guard();
+        let mut stored = self
+            .stored_search_stage(&job.graph)?
+            .ok_or(StoreError::InvalidSearchState("search-stage-missing"))?;
+        if stored.job.generation != job.generation
+            || stored.job.session != job.session
+            || stored.job.target != job.target
+            || stored.job.cursor != job.cursor
+            || stored.job.rows != job.rows
+            || stored.job.bytes != job.bytes
+        {
+            return Err(StoreError::InvalidSearchState(
+                "search-stage-compare-failed",
+            ));
+        }
+        stored.job.complete = true;
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            search_stage_key(&job.graph),
+            encode_search_stage(&stored)?,
+        );
+        self.commit_fjall_batch(batch)
+    }
+
+    pub(crate) fn switch_search_stage(&self, job: &StageJob) -> Result<GenerationSwitch> {
+        let _queue = self.fts_queue_guard();
+        let stored = self
+            .stored_search_stage(&job.graph)?
+            .ok_or(StoreError::InvalidSearchState("search-stage-missing"))?;
+        if stored.job != *job || !stored.job.complete {
+            return Err(StoreError::InvalidSearchState("search-stage-incomplete"));
+        }
+        if self.graph_tombstoned(&job.graph)? || !self.contains_graph(&job.graph)? {
+            return Err(StoreError::InvalidSearchState("search-stage-tombstoned"));
+        }
+        let graph_id = self
+            .graph_id_for(&job.graph)?
+            .ok_or(StoreError::InvalidSearchState("search-stage-graph-missing"))?;
+        let debt =
+            self.graphs
+                .get(graph_reindex_key(graph_id))?
+                .ok_or(StoreError::InvalidSearchState(
+                    "search-reindex-debt-missing",
+                ))?;
+        let tokens = decode_dirty_tokens(debt.as_ref(), "graph reindex tokens")?;
+        if job.target < tokens.oldest {
+            return Err(StoreError::InvalidSearchState(
+                "search-stage-target-mismatch",
+            ));
+        }
+        let current = self.stored_generation(&job.graph)?;
+        let previous = current
+            .as_ref()
+            .filter(|current| current.index_id == stored.index_id)
+            .and_then(|current| current.generation.active);
+        let generation = GraphGeneration {
+            graph: job.graph.clone(),
+            active: Some(job.generation),
+            covered: job.target,
+        };
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            search_generation_key(&job.graph),
+            encode_search_generation(&StoredGeneration {
+                format: SEARCH_META_FORMAT,
+                index_id: stored.index_id,
+                generation: generation.clone(),
+            })?,
+        );
+        batch.remove(&self.search_meta, search_stage_key(&job.graph));
+        self.stage_manifest(
+            &mut batch,
+            ManifestChange {
+                index_id: stored.index_id,
+                graph: &job.graph,
+                previous,
+                active: Some(job.generation),
+            },
+        )?;
+        if let Some(previous) = previous.filter(|previous| *previous != job.generation) {
+            self.queue_search_cleanup(
+                &mut batch,
+                &CleanupJob {
+                    graph: job.graph.clone(),
+                    generation: previous,
+                },
+            )?;
+        }
+        self.commit_fjall_batch(batch)?;
+        Ok(GenerationSwitch {
+            graph: job.graph.clone(),
+            previous,
+            active: Some(job.generation),
+            covered: job.target,
+        })
+    }
+
+    pub(crate) fn delete_search_graph(&self, req: &DeleteGeneration) -> Result<GenerationSwitch> {
+        let _queue = self.fts_queue_guard();
+        let current = self.stored_generation(&req.graph)?;
+        let previous = current
+            .as_ref()
+            .filter(|stored| stored.index_id == req.index_id)
+            .and_then(|stored| stored.generation.active);
+        let stage = self
+            .stored_search_stage(&req.graph)?
+            .filter(|stored| stored.index_id == req.index_id);
+        let generation = GraphGeneration {
+            graph: req.graph.clone(),
+            active: None,
+            covered: req.covered,
+        };
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            search_generation_key(&req.graph),
+            encode_search_generation(&StoredGeneration {
+                format: SEARCH_META_FORMAT,
+                index_id: req.index_id,
+                generation,
+            })?,
+        );
+        batch.remove(&self.search_meta, search_stage_key(&req.graph));
+        self.stage_manifest(
+            &mut batch,
+            ManifestChange {
+                index_id: req.index_id,
+                graph: &req.graph,
+                previous,
+                active: None,
+            },
+        )?;
+        for generation in previous
+            .into_iter()
+            .chain(stage.as_ref().map(|stored| stored.job.generation))
+        {
+            self.queue_search_cleanup(
+                &mut batch,
+                &CleanupJob {
+                    graph: req.graph.clone(),
+                    generation,
+                },
+            )?;
+        }
+        self.commit_fjall_batch(batch)?;
+        Ok(GenerationSwitch {
+            graph: req.graph.clone(),
+            previous,
+            active: None,
+            covered: req.covered,
+        })
+    }
+
+    pub(crate) fn scan_search_cleanup(&self, scan: &CleanupScan) -> Result<CleanupPage> {
+        let mut entries = Vec::with_capacity(scan.row_limit);
+        let mut next = scan.after;
+        let mut remaining = false;
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        let mut oversized = None;
+        for guard in self.search_meta.prefix([SEARCH_CLEANUP_PREFIX]) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 9 {
+                return Err(StoreError::InvalidSearchState("search-cleanup-key-invalid"));
+            }
+            let generation =
+                GenerationId(u64::from_be_bytes(key.as_ref()[1..].try_into().unwrap()));
+            if scan.after.is_some_and(|after| generation <= after) {
+                continue;
+            }
+            if rows == scan.row_limit {
+                remaining = true;
+                break;
+            }
+            let raw_bytes = key.len().saturating_add(value.len());
+            if raw_bytes > scan.byte_limit {
+                rows += 1;
+                next = Some(generation);
+                remaining = true;
+                oversized = Some(OversizedCleanup {
+                    generation,
+                    bytes: raw_bytes,
+                    limit: scan.byte_limit,
+                });
+                break;
+            }
+            let job: CleanupJob = postcard::from_bytes(value.as_ref())?;
+            let encoded = raw_bytes.saturating_add(job.graph.as_str().len());
+            if bytes.saturating_add(encoded) > scan.byte_limit {
+                if encoded > scan.byte_limit {
+                    rows += 1;
+                    next = Some(generation);
+                    oversized = Some(OversizedCleanup {
+                        generation,
+                        bytes: encoded,
+                        limit: scan.byte_limit,
+                    });
+                }
+                remaining = true;
+                break;
+            }
+            entries.push(job);
+            rows += 1;
+            bytes = bytes.saturating_add(encoded);
+            next = Some(generation);
+        }
+        Ok(CleanupPage {
+            entries,
+            next,
+            remaining,
+            rows,
+            bytes,
+            oversized,
+        })
+    }
+
+    pub(crate) fn ack_search_cleanup(&self, jobs: &[CleanupJob]) -> Result<()> {
+        let _queue = self.fts_queue_guard();
+        let mut batch = self.buffered_batch();
+        for job in jobs {
+            let active = self
+                .stored_generation(&job.graph)?
+                .and_then(|stored| stored.generation.active);
+            let staged = self
+                .stored_search_stage(&job.graph)?
+                .map(|stored| stored.job.generation);
+            if active == Some(job.generation) || staged == Some(job.generation) {
+                return Err(StoreError::InvalidSearchState(
+                    "search-cleanup-generation-live",
+                ));
+            }
+            let key = search_cleanup_key(job.generation);
+            if let Some(value) = self.search_meta.get(key)? {
+                let current: CleanupJob = postcard::from_bytes(value.as_ref())?;
+                if current == *job {
+                    batch.remove(&self.search_meta, key);
+                }
+            }
+        }
+        self.commit_fjall_batch(batch)
+    }
+
+    pub(crate) fn search_coverage(&self) -> Result<Option<SearchCoverage>> {
+        let Some(value) = self.search_meta.get(SEARCH_COVERAGE_KEY)? else {
+            return Ok(None);
+        };
+        let bytes = value.as_ref();
+        if !bytes.starts_with(&SEARCH_COVERAGE_MAGIC) {
+            let legacy: LegacySearchCoverage = postcard::from_bytes(bytes)?;
+            if legacy.format > SEARCH_META_FORMAT {
+                return Err(StoreError::UnsupportedSearchFormat {
+                    found: legacy.format,
+                    supported: SEARCH_META_FORMAT,
+                });
+            }
+            let _ = (legacy.index_id, legacy.covered, legacy.rebuild);
+            return Ok(None);
+        }
+        if bytes.len() < 4 {
+            return Err(StoreError::InvalidSearchState(
+                "search-coverage-header-invalid",
+            ));
+        }
+        let format = u16::from_be_bytes(bytes[2..4].try_into().unwrap());
+        if format > SEARCH_META_FORMAT {
+            return Err(StoreError::UnsupportedSearchFormat {
+                found: format,
+                supported: SEARCH_META_FORMAT,
+            });
+        }
+        let coverage: SearchCoverage = postcard::from_bytes(&bytes[4..])?;
+        if coverage.format > SEARCH_META_FORMAT {
+            return Err(StoreError::UnsupportedSearchFormat {
+                found: coverage.format,
+                supported: SEARCH_META_FORMAT,
+            });
+        }
+        if coverage.format != SEARCH_META_FORMAT {
+            return Ok(None);
+        }
+        Ok(Some(coverage))
+    }
+
+    #[cfg(any(not(feature = "search"), test))]
+    pub(crate) fn require_search_rebuild(&self) -> Result<u64> {
+        let _queue = self.fts_queue_guard();
+        let mut coverage = self.search_coverage()?.unwrap_or(SearchCoverage {
+            format: SEARCH_META_FORMAT,
+            index_id: [0; 16],
+            index_revision: 0,
+            covered: 0,
+            rebuild: None,
+            manifest_count: 0,
+            manifest_hash: [0; 32],
+            manifest_epoch: 0,
+        });
+        if let Some(rebuild) = coverage.rebuild {
+            return Ok(rebuild);
+        }
+        let rebuild = self.locked_dirty_token();
+        coverage.rebuild = Some(rebuild);
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            SEARCH_COVERAGE_KEY,
+            encode_search_coverage(&coverage)?,
+        );
+        self.commit_fjall_batch(batch)?;
+        Ok(rebuild)
+    }
+
+    pub(crate) fn bind_search_rebuild(&self, req: &RebuildRequest) -> Result<u64> {
+        let _queue = self.fts_queue_guard();
+        if let Some(coverage) = self.search_coverage()?
+            && coverage.index_id == req.index_id
+            && req.index_revision >= coverage.index_revision
+            && let Some(rebuild) = coverage.rebuild
+        {
+            if self.search_meta.get(SEARCH_REBUILD_KEY)?.is_none() {
+                let mut batch = self.buffered_batch();
+                batch.insert(
+                    &self.search_meta,
+                    SEARCH_REBUILD_KEY,
+                    postcard::to_allocvec(&SearchRebuildScan {
+                        format: SEARCH_META_FORMAT,
+                        index_id: req.index_id,
+                        target: rebuild,
+                        after: None,
+                        done: false,
+                    })?,
+                );
+                self.commit_fjall_batch(batch)?;
+            }
+            return Ok(rebuild);
+        }
+        let rebuild = self.locked_dirty_token();
+        let manifest = self.search_manifest_digest(req.index_id)?;
+        let coverage = SearchCoverage {
+            format: SEARCH_META_FORMAT,
+            index_id: req.index_id,
+            index_revision: req.index_revision,
+            covered: 0,
+            rebuild: Some(rebuild),
+            manifest_count: manifest.count,
+            manifest_hash: manifest.hash,
+            manifest_epoch: manifest.epoch,
+        };
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            SEARCH_COVERAGE_KEY,
+            encode_search_coverage(&coverage)?,
+        );
+        batch.insert(
+            &self.search_meta,
+            SEARCH_REBUILD_KEY,
+            postcard::to_allocvec(&SearchRebuildScan {
+                format: SEARCH_META_FORMAT,
+                index_id: req.index_id,
+                target: rebuild,
+                after: None,
+                done: false,
+            })?,
+        );
+        self.commit_fjall_batch(batch)?;
+        Ok(rebuild)
+    }
+
     /// Drop the subject entries the indexer just covered, keeping any that were
     /// re-dirtied since it read them.
     ///
