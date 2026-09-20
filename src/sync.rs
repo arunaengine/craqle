@@ -1240,54 +1240,463 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 "injected history failure".to_owned(),
             )));
         }
-        let clock: irokle::ActorClock = match cursor {
-            Some(bytes) => decode_topic_cursor(topic_id, bytes)?,
-            None => irokle::ActorClock::default(),
-        };
-        let topic = self.node.open_topic::<CraqleGraphEvent>(topic_id)?;
-        let mut records = Vec::new();
-        for op in topic.dag(DagQuery::default())? {
-            let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload else {
-                continue;
-            };
-            if clock.get(&op.signed.body.actor_id) >= op.signed.body.actor_seq {
-                continue;
+        let stored = cursor
+            .map(|bytes| decode_topic_cursor(topic_id, bytes))
+            .transpose()?;
+        let page = self.node.storage().read_snapshot(|read| {
+            let view = read.topic_view(&topic_id, None)?.ok_or_else(|| {
+                irokle::Error::Storage(format!("missing topic state for {topic_id}"))
+            })?;
+            let mut state = stored.unwrap_or_else(|| TopicCursorPayload {
+                version: TOPIC_CURSOR_VERSION,
+                topic: topic_id,
+                epoch: view.epoch,
+                genesis: view.state.genesis,
+                clock: irokle::ActorClock::default(),
+                target: None,
+            });
+            if state.epoch != view.epoch || state.genesis != view.state.genesis {
+                return Err(irokle::Error::Storage(
+                    "expired replication cursor: topic branch changed".to_owned(),
+                ));
             }
-            let stored_meta =
-                self.node.storage().get_meta(&op.id)?.ok_or_else(|| {
-                    irokle::Error::Storage(format!("missing op meta for {}", op.id))
+            let target = state.target.clone().unwrap_or_else(|| view.clock.clone());
+            for (actor, sequence) in state.clock.iter() {
+                if *sequence > target.get(actor) {
+                    return Err(irokle::Error::Storage(format!(
+                        "expired replication cursor: progress exceeds target for actor {actor}"
+                    )));
+                }
+            }
+            let mut candidates = Vec::with_capacity(target.iter().count());
+            for (actor, target_sequence) in target.iter() {
+                let after = state.clock.get(actor);
+                if after >= *target_sequence {
+                    continue;
+                }
+                if let Some(candidate) = next_record(
+                    read,
+                    &topic_id,
+                    ActorPoint {
+                        actor: *actor,
+                        after,
+                    },
+                )? {
+                    if candidate.sequence > *target_sequence {
+                        return Err(irokle::Error::Storage(format!(
+                            "expired replication cursor: position missing for actor {actor}"
+                        )));
+                    }
+                    candidates.push(candidate);
+                } else {
+                    return Err(irokle::Error::Storage(format!(
+                        "expired replication cursor: position missing for actor {actor}"
+                    )));
+                }
+            }
+
+            let mut records = Vec::new();
+            let mut used_bytes = 0usize;
+            while records.len() < TOPIC_PAGE_RECORDS && !candidates.is_empty() {
+                let index = candidates
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, candidate)| **candidate)
+                    .map(|(index, _)| index)
+                    .expect("non-empty candidate set has a minimum");
+                let candidate = candidates.swap_remove(index);
+                let mut op_bytes = 0usize;
+                let mut over_budget = false;
+                let op = match read.get_reserved_op(&candidate.id, &mut |bytes| {
+                    if bytes > TOPIC_PAGE_BYTES.saturating_sub(used_bytes) {
+                        over_budget = true;
+                        return Err(irokle::Error::SyncCapacity(format!(
+                            "replication record {} exceeds the remaining {} byte page budget",
+                            candidate.id,
+                            TOPIC_PAGE_BYTES.saturating_sub(used_bytes)
+                        )));
+                    }
+                    op_bytes = bytes;
+                    Ok(())
+                }) {
+                    Ok(Some(op)) => op,
+                    Ok(None) => {
+                        return Err(irokle::Error::Storage(format!(
+                            "missing op for {}",
+                            candidate.id
+                        )));
+                    }
+                    Err(_) if over_budget && !records.is_empty() => {
+                        candidates.push(candidate);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                used_bytes = used_bytes.saturating_add(op_bytes);
+                let stored_meta = read.get_meta(&candidate.id)?.ok_or_else(|| {
+                    irokle::Error::Storage(format!("missing op meta for {}", candidate.id))
                 })?;
+                let meta = OpMeta {
+                    op_id: candidate.id,
+                    actor_id: stored_meta.actor_id,
+                    actor_seq: stored_meta.actor_seq,
+                    observed_clock: stored_meta.observed_clock,
+                };
+                let record = match &op.signed.body.payload {
+                    irokle::TopicPayload::Event(envelope) => {
+                        match envelope.decode_event::<CraqleGraphEvent>() {
+                            Ok(event) => TopicRecord::Event(EventRecord { event, meta }),
+                            Err(error) => {
+                                let error_kind =
+                                    if matches!(error, irokle::Error::EventTypeMismatch { .. }) {
+                                        crate::CraqleErrorKind::Unsupported
+                                    } else {
+                                        crate::CraqleErrorKind::CorruptAuthoritativeData
+                                    };
+                                TopicRecord::Rejected(RejectedTopicRecord {
+                                    meta,
+                                    payload_digest: *blake3::hash(&envelope.payload).as_bytes(),
+                                    error_kind,
+                                    reason: if error_kind == crate::CraqleErrorKind::Unsupported {
+                                        "unsupported graph-event version or type".to_owned()
+                                    } else {
+                                        "malformed or poison graph-event payload".to_owned()
+                                    },
+                                })
+                            }
+                        }
+                    }
+                    _ => TopicRecord::Control(meta),
+                };
+                records.push(record);
+                if candidate.sequence < target.get(&candidate.actor) {
+                    let next = next_record(
+                        read,
+                        &topic_id,
+                        ActorPoint {
+                            actor: candidate.actor,
+                            after: candidate.sequence,
+                        },
+                    )?
+                    .ok_or_else(|| {
+                        irokle::Error::Storage(format!(
+                            "expired replication cursor: position missing for actor {}",
+                            candidate.actor
+                        ))
+                    })?;
+                    if next.sequence > target.get(&candidate.actor) {
+                        return Err(irokle::Error::Storage(format!(
+                            "expired replication cursor: position missing for actor {}",
+                            candidate.actor
+                        )));
+                    }
+                    candidates.push(next);
+                }
+            }
+            let more = !candidates.is_empty();
+            state.target = more.then_some(target);
+            Ok((records, state, more))
+        });
+        let (records, state, more) = match page {
+            Err(irokle::Error::Storage(reason))
+                if reason.starts_with("expired replication cursor: ") =>
+            {
+                return Err(CraqleSyncError::ExpiredCursor {
+                    topic: topic_id,
+                    reason,
+                });
+            }
+            result => result?,
+        };
+        Ok(TopicCatchup {
+            records,
+            cursor: TopicCursor::resuming(state),
+            more,
+        })
+    }
+
+    fn topic_cursor_at(
+        &self,
+        topic_id: irokle::TopicId,
+        clock: &irokle::ActorClock,
+    ) -> SyncResult<Vec<u8>> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic_id, None)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing topic state for {topic_id}")))?;
+        for (actor, sequence) in clock.iter() {
+            if *sequence > view.clock.get(actor) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "replacement cursor exceeds topic history for actor {actor}"
+                )));
+            }
+        }
+        encode_topic_cursor(&TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic: topic_id,
+            epoch: view.epoch,
+            genesis: view.state.genesis,
+            clock: clock.clone(),
+            target: None,
+        })
+    }
+
+    fn topic_frontier(&self, topic_id: irokle::TopicId) -> SyncResult<TopicFrontier> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic_id, None)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing topic state for {topic_id}")))?;
+        Ok(TopicFrontier {
+            clock: view.clock,
+            epoch: view.epoch,
+            genesis: view.state.genesis,
+        })
+    }
+
+    fn topic_record(
+        &self,
+        topic_id: irokle::TopicId,
+        id: irokle::OpId,
+    ) -> SyncResult<Option<TopicRecord>> {
+        Ok(self.node.storage().read_snapshot(|read| {
+            if read.topic_view(&topic_id, None)?.is_none() {
+                return Ok(None);
+            }
+            let Some(stored_meta) = read.get_meta(&id)? else {
+                return Ok(None);
+            };
+            if stored_meta.topic_id != topic_id {
+                return Ok(None);
+            }
+            let Some(op) = read.get_reserved_op(&id, &mut |bytes| {
+                if bytes > TOPIC_PAGE_BYTES {
+                    return Err(irokle::Error::SyncCapacity(format!(
+                        "replication record {id} exceeds the {TOPIC_PAGE_BYTES} byte limit"
+                    )));
+                }
+                Ok(())
+            })?
+            else {
+                return Err(irokle::Error::Storage(format!("missing op for {id}")));
+            };
+            if op.signed.body.topic_id != topic_id
+                || op.signed.body.actor_id != stored_meta.actor_id
+                || op.signed.body.actor_seq != stored_meta.actor_seq
+            {
+                return Err(irokle::Error::Storage(format!(
+                    "op body disagrees with stored metadata for {id}"
+                )));
+            }
             let meta = OpMeta {
-                op_id: op.id,
+                op_id: id,
                 actor_id: stored_meta.actor_id,
                 actor_seq: stored_meta.actor_seq,
                 observed_clock: stored_meta.observed_clock,
             };
-            match envelope.decode_event::<CraqleGraphEvent>() {
-                Ok(event) => records.push(TopicRecord::Event(EventRecord { event, meta })),
-                Err(error) => {
-                    let error_kind = if matches!(error, irokle::Error::EventTypeMismatch { .. }) {
-                        crate::CraqleErrorKind::Unsupported
-                    } else {
-                        crate::CraqleErrorKind::CorruptAuthoritativeData
-                    };
-                    records.push(TopicRecord::Rejected(RejectedTopicRecord {
-                        meta,
-                        payload_digest: *blake3::hash(&envelope.payload).as_bytes(),
-                        error_kind,
-                        reason: if error_kind == crate::CraqleErrorKind::Unsupported {
-                            "unsupported graph-event version or type".to_owned()
-                        } else {
-                            "malformed or poison graph-event payload".to_owned()
-                        },
-                    }));
+            let record = match &op.signed.body.payload {
+                irokle::TopicPayload::Event(envelope) => {
+                    match envelope.decode_event::<CraqleGraphEvent>() {
+                        Ok(event) => TopicRecord::Event(EventRecord { event, meta }),
+                        Err(error) => {
+                            let error_kind =
+                                if matches!(error, irokle::Error::EventTypeMismatch { .. }) {
+                                    crate::CraqleErrorKind::Unsupported
+                                } else {
+                                    crate::CraqleErrorKind::CorruptAuthoritativeData
+                                };
+                            TopicRecord::Rejected(RejectedTopicRecord {
+                                meta,
+                                payload_digest: *blake3::hash(&envelope.payload).as_bytes(),
+                                error_kind,
+                                reason: if error_kind == crate::CraqleErrorKind::Unsupported {
+                                    "unsupported graph-event version or type".to_owned()
+                                } else {
+                                    "malformed or poison graph-event payload".to_owned()
+                                },
+                            })
+                        }
+                    }
                 }
+                _ => TopicRecord::Control(meta),
+            };
+            Ok(Some(record))
+        })?)
+    }
+
+    fn history_snapshot(&self, request: &HistoryRequest) -> SyncResult<HistorySnapshot> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&request.topic, None)?
+            .ok_or_else(|| {
+                irokle::Error::Storage(format!("missing topic state for {}", request.topic))
+            })?;
+        if request.target != view.clock {
+            return Err(CraqleSyncError::InvalidEvent(
+                "history repair target is not the current branch frontier".to_owned(),
+            ));
+        }
+        for (actor, sequence) in request.target.iter() {
+            if *sequence > view.clock.get(actor) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "history target exceeds stored topic position for actor {actor}"
+                )));
             }
         }
-        Ok(TopicCatchup {
-            records,
-            cursor: TopicCursor::resuming(topic_id, clock),
-        })
+        let initial = TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic: request.topic,
+            epoch: view.epoch,
+            genesis: view.state.genesis,
+            clock: irokle::ActorClock::default(),
+            target: Some(request.target.clone()),
+        };
+        let mut cursor = Some(encode_topic_cursor(&initial)?);
+        let mut state = HistoryBuild {
+            snapshot: crate::GraphReplicaSnapshot {
+                graph: request.graph.clone(),
+                clock: VectorClock::default(),
+                quads: Vec::new(),
+            },
+            bytes: 0,
+        };
+        loop {
+            let catchup = self.topic_records_since(request.topic, cursor.as_deref())?;
+            let TopicCatchup {
+                records,
+                cursor: mut progress,
+                more,
+            } = catchup;
+            for record in &records {
+                match record {
+                    TopicRecord::Rejected(record) => {
+                        return Err(CraqleSyncError::InvalidEvent(format!(
+                            "authoritative history contains rejected record {}",
+                            record.meta.op_id
+                        )));
+                    }
+                    TopicRecord::Control(_) => {}
+                    TopicRecord::Event(record) => {
+                        if apply_history(&mut state, record)? {
+                            return Ok(HistorySnapshot::Tombstoned);
+                        }
+                    }
+                }
+                progress.consume(record);
+            }
+            if !more {
+                for quad in &mut state.snapshot.quads {
+                    quad.dots
+                        .sort_unstable_by_key(|dot| (dot.actor, dot.counter));
+                }
+                state.snapshot.quads.sort_unstable_by(|left, right| {
+                    (&left.subject, &left.predicate, &left.object).cmp(&(
+                        &right.subject,
+                        &right.predicate,
+                        &right.object,
+                    ))
+                });
+                return Ok(HistorySnapshot::Live(state.snapshot));
+            }
+            cursor = progress.encode()?;
+            if cursor.is_none() {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "history page made no cursor progress".to_owned(),
+                ));
+            }
+        }
+    }
+
+    fn find_mutation(
+        &self,
+        receipt: &MutationReceipt,
+    ) -> SyncResult<Option<EventRecord<CraqleGraphEvent>>> {
+        let (Some(topic), Some(after), Some(epoch), Some(genesis)) = (
+            receipt.topic,
+            receipt.publish_after.as_ref(),
+            receipt.topic_epoch,
+            receipt.topic_genesis,
+        ) else {
+            return Ok(None);
+        };
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic, None)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing topic state for {topic}")))?;
+        if view.epoch != epoch || view.state.genesis != genesis {
+            return Err(CraqleSyncError::ExpiredCursor {
+                topic,
+                reason: "prepared mutation belongs to an expired topic branch".to_owned(),
+            });
+        }
+        if let Some(event_id) = receipt.event_id {
+            let id = irokle::OpId::from_bytes(event_id);
+            return match self.topic_record(topic, id)? {
+                Some(TopicRecord::Event(record))
+                    if matches!(
+                        &record.event,
+                        CraqleGraphEvent::Mutation { id, .. } if *id == receipt.id
+                    ) =>
+                {
+                    Ok(Some(record))
+                }
+                Some(_) => Err(CraqleSyncError::InvalidEvent(
+                    "receipt event does not carry its stable mutation id".to_owned(),
+                )),
+                None => Err(CraqleSyncError::ExpiredCursor {
+                    topic,
+                    reason: "receipt event is no longer available".to_owned(),
+                }),
+            };
+        }
+        let initial = TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic,
+            epoch,
+            genesis,
+            clock: after.clone(),
+            target: Some(view.clock),
+        };
+        let mut cursor = Some(encode_topic_cursor(&initial)?);
+        loop {
+            let catchup = self.topic_records_since(topic, cursor.as_deref())?;
+            let TopicCatchup {
+                records,
+                cursor: mut progress,
+                more,
+            } = catchup;
+            for record in &records {
+                match record {
+                    TopicRecord::Event(record)
+                        if matches!(
+                            &record.event,
+                            CraqleGraphEvent::Mutation { id, .. } if *id == receipt.id
+                        ) =>
+                    {
+                        return Ok(Some(record.clone()));
+                    }
+                    TopicRecord::Rejected(record) => {
+                        return Err(CraqleSyncError::InvalidEvent(format!(
+                            "prepared mutation search reached rejected record {}",
+                            record.meta.op_id
+                        )));
+                    }
+                    _ => progress.consume(record),
+                }
+            }
+            if !more {
+                return Ok(None);
+            }
+            cursor = progress.encode()?;
+            if cursor.is_none() {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "prepared mutation search made no cursor progress".to_owned(),
+                ));
+            }
+        }
     }
 
     fn is_local_record(
@@ -1352,12 +1761,7 @@ struct EventBatchCtx<'a> {
     meta: &'a OpMeta,
 }
 
-/// Turn one event's changes into a replication [`Batch`].
-///
-/// Op order is the event's change order, unchanged — irokle delivers records in
-/// causal order and craqle applies them in delivery order (G3), so reordering
-/// here would break both the OR-Set semantics of a delete-then-add pair and the
-/// publish-first contract (G4).
+/// Convert an event to a [`Batch`] without changing its causally delivered operation order.
 fn batch_from_changes<I>(cx: EventBatchCtx<'_>, changes: I) -> SyncResult<Batch>
 where
     I: IntoIterator<Item = MaterializedQuadChange>,
@@ -1428,11 +1832,8 @@ fn rejected(text: &str) -> CraqleSyncError {
     ))
 }
 
-/// N-Triples IRIREF body: no control character, space, or delimiter that would
-/// end the term early, so the encoded form has exactly one reading.
-///
-/// Relative references are accepted: RO-Crate entity ids such as
-/// `ro-crate-metadata.json` are stored in that form.
+/// Accepts unambiguous N-Triples IRIREF bodies, including relative RO-Crate
+/// entity identifiers.
 fn iri_body_ok(body: &str) -> bool {
     !body.is_empty()
         && !body.chars().any(|ch| {
