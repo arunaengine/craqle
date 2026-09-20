@@ -10879,17 +10879,26 @@ impl GraphStore {
         let mut batch = self.buffered_batch();
         let mut dirty = false;
         for guard in self.graphs.prefix(graph_dirty_prefix()) {
-            let (key, _) = guard.into_inner()?;
+            let (key, value) = guard.into_inner()?;
+            let cursor = self.queue_cursor(QueueKind::Subject, key.as_ref(), value.as_ref())?;
+            batch.remove(&self.search_queue, search_order_key(cursor));
+            batch.remove(&self.search_meta, search_failure_key(cursor));
             batch.remove(&self.graphs, key);
             dirty = true;
         }
         for guard in self.graphs.prefix(graph_reindex_prefix()) {
-            let (key, _) = guard.into_inner()?;
+            let (key, value) = guard.into_inner()?;
+            let cursor = self.queue_cursor(QueueKind::Reindex, key.as_ref(), value.as_ref())?;
+            batch.remove(&self.search_queue, search_order_key(cursor));
+            batch.remove(&self.search_meta, search_failure_key(cursor));
             batch.remove(&self.graphs, key);
             dirty = true;
         }
-        for guard in self.graphs.prefix(graph_search_delete_prefix()) {
-            let (key, _) = guard.into_inner()?;
+        for guard in self.graphs.prefix(graph_delete_prefix()) {
+            let (key, value) = guard.into_inner()?;
+            let cursor = self.queue_cursor(QueueKind::Delete, key.as_ref(), value.as_ref())?;
+            batch.remove(&self.search_queue, search_order_key(cursor));
+            batch.remove(&self.search_meta, search_failure_key(cursor));
             batch.remove(&self.graphs, key);
             dirty = true;
         }
@@ -10897,6 +10906,363 @@ impl GraphStore {
             self.commit_fjall_batch(batch)?;
         }
         Ok(())
+    }
+
+    fn trim_receipts(&self, batch: &mut fjall::OwnedWriteBatch, adding: bool) -> Result<()> {
+        if !adding {
+            return Ok(());
+        }
+        let mut oldest = None;
+        let mut count = 0usize;
+        for guard in self.receipt_order.iter() {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 40 {
+                continue;
+            }
+            if oldest.is_none() {
+                oldest = Some((key.to_vec(), value.to_vec()));
+            }
+            count += 1;
+            if count == RECEIPT_RETENTION {
+                break;
+            }
+        }
+        if count == RECEIPT_RETENTION
+            && let Some((order, id)) = oldest
+        {
+            if let Some(value) = self.receipts.get(&id)? {
+                let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
+                let expired = self
+                    .receipt_order
+                    .get(RECEIPT_EXPIRED_KEY)?
+                    .and_then(|value| decode_index_count(value.as_ref()))
+                    .unwrap_or(0)
+                    .max(receipt.admission_sequence);
+                batch.insert(
+                    &self.receipt_order,
+                    RECEIPT_EXPIRED_KEY,
+                    expired.to_be_bytes(),
+                );
+            }
+            batch.remove(&self.receipt_order, order);
+            batch.remove(&self.receipts, id);
+        }
+        Ok(())
+    }
+
+    /// Stage first acceptance evidence in the caller's source batch.
+    pub(crate) fn stage_receipt(
+        &self,
+        batch: &mut WriteBatch,
+        receipt: &MutationReceipt,
+    ) -> Result<Option<MutationReceipt>> {
+        if let Some(existing) = self.mutation_receipt(&receipt.id)? {
+            if existing.graph != receipt.graph
+                || existing.request_digest != receipt.request_digest
+                || existing.event_id != receipt.event_id
+                || existing.topic != receipt.topic
+                || existing.topic_epoch != receipt.topic_epoch
+                || existing.topic_genesis != receipt.topic_genesis
+                || existing.publish_after != receipt.publish_after
+                || existing.repair_graphs != receipt.repair_graphs
+            {
+                return Err(StoreError::ReceiptConflict);
+            }
+            return Ok(Some(existing));
+        }
+        let mut stored = receipt.clone();
+        if stored.admission_sequence == 0 {
+            stored.admission_sequence = self.receipt_next.fetch_add(1, Ordering::SeqCst);
+        }
+        #[cfg(test)]
+        self.receipt_writes.fetch_add(1, Ordering::Relaxed);
+        let terminal = receipt_is_terminal(&stored);
+        self.trim_receipts(&mut batch.inner, terminal)?;
+        batch
+            .inner
+            .insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
+        batch.pending_receipts.push(stored.clone());
+        if terminal {
+            batch
+                .inner
+                .insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn mutation_receipt(&self, id: &MutationId) -> Result<Option<MutationReceipt>> {
+        #[cfg(test)]
+        self.receipt_lookups.fetch_add(1, Ordering::Relaxed);
+        self.receipts
+            .get(id.0)?
+            .map(|value| postcard::from_bytes(value.as_ref()).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub(crate) fn bind_receipt_event(
+        &self,
+        id: &MutationId,
+        event_id: [u8; 32],
+    ) -> Result<MutationReceipt> {
+        let _guard = self.receipt_guard(id);
+        let mut receipt = self
+            .mutation_receipt(id)?
+            .ok_or(StoreError::ReceiptConflict)?;
+        if receipt.source != SourceOutcome::Prepared
+            || receipt.event_id.is_some_and(|current| current != event_id)
+        {
+            return Err(StoreError::ReceiptConflict);
+        }
+        receipt.event_id = Some(event_id);
+        #[cfg(test)]
+        self.receipt_writes.fetch_add(1, Ordering::Relaxed);
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.receipts,
+            receipt.id.0,
+            postcard::to_allocvec(&receipt)?,
+        );
+        self.commit_fjall_batch(batch)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn receipt_status(&self, lookup: &MutationLookup) -> Result<MutationStatus> {
+        if let Some(receipt) = self.mutation_receipt(&lookup.id)? {
+            if receipt.graph != lookup.graph
+                || lookup
+                    .admission_sequence
+                    .is_some_and(|sequence| sequence != receipt.admission_sequence)
+            {
+                return Ok(MutationStatus::Unknown);
+            }
+            return Ok(MutationStatus::Known(receipt));
+        }
+        let expired = self
+            .receipt_order
+            .get(RECEIPT_EXPIRED_KEY)?
+            .and_then(|value| decode_index_count(value.as_ref()))
+            .unwrap_or(0);
+        Ok(match lookup.admission_sequence {
+            Some(sequence) if sequence <= expired => MutationStatus::Expired,
+            Some(_) | None => MutationStatus::Unknown,
+        })
+    }
+
+    fn trim_batch_receipts(&self, batch: &mut fjall::OwnedWriteBatch) -> Result<()> {
+        let mut oldest = None;
+        let mut count = 0usize;
+        for guard in self.receipt_order.prefix(BATCH_ORDER_PREFIX) {
+            let (key, value) = guard.into_inner()?;
+            if oldest.is_none() {
+                oldest = Some((key.to_vec(), value.to_vec()));
+            }
+            count += 1;
+            if count == RECEIPT_RETENTION {
+                break;
+            }
+        }
+        if count == RECEIPT_RETENTION
+            && let Some((order, mapping_key)) = oldest
+        {
+            if let Some(value) = self.receipts.get(&mapping_key)? {
+                let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
+                batch.remove(&self.receipts, batch_reverse_key(&mapping.id));
+            }
+            batch.remove(&self.receipt_order, order);
+            batch.remove(&self.receipts, mapping_key);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_batch_receipt(
+        &self,
+        batch: &mut WriteBatch,
+        link: &BatchReceiptLink,
+    ) -> Result<()> {
+        let receipt = batch
+            .pending_receipts
+            .iter()
+            .find(|receipt| receipt.id == link.id)
+            .cloned()
+            .or_else(|| self.mutation_receipt(&link.id).ok().flatten())
+            .ok_or(StoreError::ReceiptConflict)?;
+        let mapping = StoredBatchReceipt {
+            id: link.id,
+            sequence: receipt.admission_sequence,
+        };
+        let key = batch_receipt_key(link);
+        if let Some(value) = self.receipts.get(key)? {
+            let existing: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
+            if existing.id != mapping.id || existing.sequence != mapping.sequence {
+                return Err(StoreError::ReceiptConflict);
+            }
+            return Ok(());
+        }
+        if let Some(reverse) = self.receipts.get(batch_reverse_key(&link.id))?
+            && reverse.as_ref() != key
+        {
+            return Err(StoreError::ReceiptConflict);
+        }
+        self.trim_batch_receipts(&mut batch.inner)?;
+        batch
+            .inner
+            .insert(&self.receipts, key, postcard::to_allocvec(&mapping)?);
+        batch
+            .inner
+            .insert(&self.receipts, batch_reverse_key(&link.id), key);
+        batch
+            .inner
+            .insert(&self.receipt_order, batch_order_key(mapping.sequence), key);
+        Ok(())
+    }
+
+    pub(crate) fn receipt_for_batch(&self, batch: &Batch) -> Result<MutationStatus> {
+        let graph = hash_term(&EncodedTerm::from_named_node(&batch.graph.0));
+        let link = BatchReceiptLink {
+            graph,
+            actor: batch.actor,
+            counter: batch.counter,
+            id: MutationId([0; 32]),
+        };
+        let Some(value) = self.receipts.get(batch_receipt_key(&link))? else {
+            return Ok(MutationStatus::Unknown);
+        };
+        let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
+        if let Some(receipt) = self.mutation_receipt(&mapping.id)? {
+            return Ok(MutationStatus::Known(receipt));
+        }
+        let expired = self
+            .receipt_order
+            .get(RECEIPT_EXPIRED_KEY)?
+            .and_then(|value| decode_index_count(value.as_ref()))
+            .unwrap_or(0);
+        Ok(if mapping.sequence <= expired {
+            MutationStatus::Expired
+        } else {
+            MutationStatus::Unknown
+        })
+    }
+
+    pub(crate) fn query_view_covered(&self, receipt: &MutationReceipt) -> Result<bool> {
+        if !matches!(
+            receipt.source,
+            SourceOutcome::Applied | SourceOutcome::Duplicate
+        ) {
+            return Ok(false);
+        }
+        let snapshot = self.db.snapshot();
+        Ok(self.snapshot_admission(&snapshot)?.trusted)
+    }
+
+    pub(crate) fn search_covered(&self, receipt: &MutationReceipt) -> Result<bool> {
+        let Some(target) = receipt.search_token else {
+            return Ok(matches!(receipt.repairs.search, RepairOutcome::NotRequired));
+        };
+        Ok(self
+            .search_coverage()?
+            .is_some_and(|coverage| coverage.rebuild.is_none() && coverage.covered >= target))
+    }
+
+    /// Stage the Prepared to Applied transition in the source mutation batch.
+    pub(crate) fn stage_receipt_update(
+        &self,
+        batch: &mut WriteBatch,
+        receipt: &MutationReceipt,
+    ) -> Result<()> {
+        let previous = self
+            .mutation_receipt(&receipt.id)?
+            .ok_or(StoreError::ReceiptConflict)?;
+        if previous.graph != receipt.graph
+            || previous.request_digest != receipt.request_digest
+            || previous.event_id != receipt.event_id
+            || previous.topic != receipt.topic
+            || previous.topic_epoch != receipt.topic_epoch
+            || previous.topic_genesis != receipt.topic_genesis
+            || previous.publish_after != receipt.publish_after
+            || previous.repair_graphs != receipt.repair_graphs
+            || previous.source != SourceOutcome::Prepared
+        {
+            return Err(StoreError::ReceiptConflict);
+        }
+        let mut stored = receipt.clone();
+        if stored.admission_sequence == 0 {
+            stored.admission_sequence = previous.admission_sequence;
+        }
+        if stored.admission_sequence != previous.admission_sequence {
+            return Err(StoreError::ReceiptConflict);
+        }
+        #[cfg(test)]
+        self.receipt_writes.fetch_add(1, Ordering::Relaxed);
+        batch
+            .inner
+            .insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
+        batch.pending_receipts.push(stored);
+        Ok(())
+    }
+
+    /// Compare-fenced update for post-commit persistence and repair settlement.
+    pub(crate) fn update_receipt(&self, receipt: &MutationReceipt) -> Result<MutationReceipt> {
+        let _guard = self.receipt_guard(&receipt.id);
+        let previous = self
+            .mutation_receipt(&receipt.id)?
+            .ok_or(StoreError::ReceiptConflict)?;
+        let mut stored = receipt.clone();
+        if stored.admission_sequence == 0 {
+            stored.admission_sequence = previous.admission_sequence;
+        }
+        if previous.graph != stored.graph
+            || previous.request_digest != receipt.request_digest
+            || previous.event_id != receipt.event_id
+            || previous.topic != receipt.topic
+            || previous.topic_epoch != receipt.topic_epoch
+            || previous.topic_genesis != receipt.topic_genesis
+            || previous.publish_after != receipt.publish_after
+            || previous.repair_graphs != receipt.repair_graphs
+            || previous.source_version != receipt.source_version
+            || previous.admission_sequence != stored.admission_sequence
+        {
+            return Err(StoreError::ReceiptConflict);
+        }
+        let was_terminal = receipt_is_terminal(&previous);
+        let terminal = receipt_is_terminal(&stored);
+        let mut batch = self.buffered_batch();
+        if was_terminal {
+            batch.remove(&self.receipt_order, receipt_order_key(&previous));
+        }
+        self.trim_receipts(&mut batch, terminal && !was_terminal)?;
+        batch.insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
+        if terminal {
+            batch.insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
+        }
+        #[cfg(test)]
+        self.receipt_writes.fetch_add(1, Ordering::Relaxed);
+        self.commit_fjall_batch(batch)?;
+        Ok(stored)
+    }
+
+    pub(crate) fn stage_repair_audit(
+        &self,
+        batch: &mut WriteBatch,
+        audit: &RepairAudit,
+    ) -> Result<()> {
+        if let Some(existing) = self.repair_audit(&audit.id)?
+            && existing != *audit
+        {
+            return Err(StoreError::ReceiptConflict);
+        }
+        batch.inner.insert(
+            &self.repair_audits,
+            audit.id.0,
+            postcard::to_allocvec(audit)?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn repair_audit(&self, id: &MutationId) -> Result<Option<RepairAudit>> {
+        self.repair_audits
+            .get(id.0)?
+            .map(|value| postcard::from_bytes(value.as_ref()).map_err(StoreError::from))
+            .transpose()
     }
 
     pub fn new_batch(&self) -> WriteBatch {
@@ -10931,18 +11297,7 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Retire the part of a queue entry an indexing pass just covered.
-    ///
-    /// Removes the entry when nothing was queued since the drain read it.
-    /// Otherwise the entry stays — the newer write still owes an index — but
-    /// its `oldest` moves past the covered tokens. Leaving it whole instead
-    /// would keep it matching the bound a flush pinned, and a writer that
-    /// keeps dirtying the same subject would hold that flush open forever.
-    ///
-    /// Every token at or below `covered` was durable before the drain read
-    /// the entry, so the pass that followed indexed it.
-    ///
-    /// The caller MUST hold the FTS queue lock.
+    /// Retires covered queue debt while preserving later tokens under the queue lock.
     fn settle_fts_entry(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -10952,14 +11307,45 @@ impl GraphStore {
             return Ok(false);
         };
         let stored = decode_dirty_tokens(current.as_ref(), "fts queue tokens")?;
+        let kind = match entry.key.first().copied() {
+            Some(GRAPH_DIRTY_PREFIX) => QueueKind::Subject,
+            Some(GRAPH_REINDEX_PREFIX) => QueueKind::Reindex,
+            Some(GRAPH_DELETE_PREFIX) => QueueKind::Delete,
+            _ => {
+                return Err(StoreError::InvalidSearchState(
+                    "queue-identity-prefix-invalid",
+                ));
+            }
+        };
+        let old_cursor = self.queue_cursor(kind, &entry.key, current.as_ref())?;
+        batch.remove(&self.search_queue, search_order_key(old_cursor));
         if stored.latest <= entry.covered {
-            batch.remove(&self.graphs, entry.key);
+            batch.remove(&self.graphs, entry.key.clone());
+            batch.remove(&self.search_meta, search_failure_key(old_cursor));
         } else {
             let narrowed = DirtyTokens {
                 oldest: entry.covered + 1,
                 latest: stored.latest,
             };
-            batch.insert(&self.graphs, entry.key, encode_dirty_tokens(narrowed));
+            batch.insert(
+                &self.graphs,
+                entry.key.clone(),
+                encode_dirty_tokens(narrowed),
+            );
+            batch.insert(
+                &self.search_queue,
+                search_order_key(QueueCursor {
+                    token: narrowed.oldest,
+                    ..old_cursor
+                }),
+                entry.key,
+            );
+            if let Some(failure) = self.search_meta.get(search_failure_key(old_cursor))?
+                && postcard::from_bytes::<RetryState>(failure.as_ref())
+                    .is_ok_and(|state| state.target != narrowed.latest)
+            {
+                batch.remove(&self.search_meta, search_failure_key(old_cursor));
+            }
         }
         Ok(true)
     }
@@ -10972,23 +11358,22 @@ impl GraphStore {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stamp `key` with a fresh dirty token and stage its queue entry,
-    /// coalescing into whatever the queue already holds for that key.
-    ///
-    /// Keeps the older `oldest`. Coalescing a second enqueue by overwriting
-    /// would lift the entry above a bound a flush pinned between the two, and
-    /// the drain would filter out work the flush promised to index. Widening
-    /// the other way only ever over-includes, which costs a reindex.
-    ///
-    /// The caller MUST hold the FTS queue lock: it makes this read-modify-write
-    /// atomic against acknowledgement, and minting under it is what makes
-    /// "every entry below the token a flush pinned is already durable" true.
-    fn stage_fts_entry(&self, batch: &mut fjall::OwnedWriteBatch, key: FtsQueueKey) -> Result<()> {
-        let token = self.dirty_counter.fetch_add(1, Ordering::SeqCst);
+    /// Coalesces a newly tokenized entry while the caller holds the queue lock.
+    fn stage_fts_entry(&self, batch: &mut fjall::OwnedWriteBatch, key: FtsQueueKey) -> Result<u64> {
+        let token = self
+            .dirty_counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| StoreError::InvalidSearchState("search-token-exhausted"))?;
         let bytes = key.bytes();
         let tokens = match self.graphs.get(&bytes)? {
             Some(current) => {
                 let stored = decode_dirty_tokens(current.as_ref(), "fts queue tokens")?;
+                batch.remove(
+                    &self.search_queue,
+                    search_order_key(key.cursor(stored.oldest)),
+                );
                 DirtyTokens {
                     oldest: stored.oldest.min(token),
                     latest: stored.latest.max(token),
@@ -11000,6 +11385,30 @@ impl GraphStore {
             },
         };
         batch.insert(&self.graphs, bytes, encode_dirty_tokens(tokens));
+        batch.insert(
+            &self.search_queue,
+            search_order_key(key.cursor(tokens.oldest)),
+            key.bytes(),
+        );
+        Ok(token)
+    }
+
+    /// Removes older graph work atomically before publishing its delete token.
+    fn stage_delete_queue(&self, batch: &mut fjall::OwnedWriteBatch, graph: TermId) -> Result<()> {
+        for guard in self.graphs.prefix(graph_dirty_scope(graph)) {
+            let (key, value) = guard.into_inner()?;
+            let cursor = self.queue_cursor(QueueKind::Subject, key.as_ref(), value.as_ref())?;
+            batch.remove(&self.search_queue, search_order_key(cursor));
+            batch.remove(&self.search_meta, search_failure_key(cursor));
+            batch.remove(&self.graphs, key);
+        }
+        let key = graph_reindex_key(graph);
+        if let Some(value) = self.graphs.get(key)? {
+            let cursor = self.queue_cursor(QueueKind::Reindex, &key, value.as_ref())?;
+            batch.remove(&self.search_queue, search_order_key(cursor));
+            batch.remove(&self.search_meta, search_failure_key(cursor));
+            batch.remove(&self.graphs, key);
+        }
         Ok(())
     }
 
