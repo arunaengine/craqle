@@ -1,15 +1,13 @@
 //! Search coverage across a change of build features.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! The three phases run as separate processes over one shared directory, so
-//! they need separate `cargo test` invocations with different features. Each
-//! phase does nothing unless `CRAQLE_SEARCH_PHASE` and `CRAQLE_SEARCH_DIR`
-//! name it, which keeps an ordinary suite run independent of the others.
+// Run selected phases in separate processes using CRAQLE_SEARCH_PHASE and
+// CRAQLE_SEARCH_DIR; ordinary suite runs do not share state.
 
 use craqle::{AllowAllAuthorizer, CraqleNode, GraphId, GraphPolicy};
 
-const GRAPH: &str = "urn:test:feature-transition";
+const UPDATED_GRAPH: &str = "urn:test:feature-transition";
+const DELETED_GRAPH: &str = "urn:test:feature-transition-deleted";
 
 fn phase_dir(phase: &str) -> Option<std::path::PathBuf> {
     if std::env::var("CRAQLE_SEARCH_PHASE").ok()? != phase {
@@ -20,7 +18,7 @@ fn phase_dir(phase: &str) -> Option<std::path::PathBuf> {
     ))
 }
 
-fn crate_document(description: &str) -> String {
+fn crate_document(graph: &str, description: &str) -> String {
     serde_json::json!({
         "@context": "https://w3id.org/ro/crate/1.2/context",
         "@graph": [
@@ -28,10 +26,10 @@ fn crate_document(description: &str) -> String {
                 "@id": "ro-crate-metadata.json",
                 "@type": "CreativeWork",
                 "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
-                "about": {"@id": GRAPH}
+                "about": {"@id": graph}
             },
             {
-                "@id": GRAPH,
+                "@id": graph,
                 "@type": "Dataset",
                 "name": "Feature Transition Crate",
                 "description": description,
@@ -43,11 +41,11 @@ fn crate_document(description: &str) -> String {
     .to_string()
 }
 
-fn apply(node: &CraqleNode, description: &str) {
+fn apply(node: &CraqleNode, graph: &str, description: &str) {
     node.apply_rocrate_document_with_policy(
         &AllowAllAuthorizer,
-        GraphId::new(GRAPH),
-        &crate_document(description),
+        GraphId::new(graph),
+        &crate_document(graph, description),
         GraphPolicy {
             public: true,
             permission_paths: Vec::new(),
@@ -64,10 +62,11 @@ fn phase_writes_index() {
         return;
     };
     let node = CraqleNode::open(&dir).unwrap();
-    apply(&node, "oldneedle");
+    apply(&node, UPDATED_GRAPH, "oldneedle");
+    apply(&node, DELETED_GRAPH, "oldneedle");
     node.flush_search_updates().unwrap();
 
-    assert_eq!(1, matches(&node, "oldneedle"));
+    assert_eq!(2, matches(&node, "oldneedle"));
 }
 
 /// Phase two: a build with no index changes the source text. It may coalesce
@@ -79,8 +78,11 @@ fn phase_mutates_source() {
         return;
     };
     let node = CraqleNode::open(&dir).unwrap();
-    apply(&node, "newneedle");
-    node.flush_search_updates().unwrap();
+    apply(&node, UPDATED_GRAPH, "newneedle");
+    node.delete_graph(&AllowAllAuthorizer, &GraphId::new(DELETED_GRAPH))
+        .unwrap();
+    let error = node.flush_search_updates().unwrap_err();
+    assert_eq!(craqle::CraqleErrorKind::Unsupported, error.kind());
 }
 
 /// Phase three: an indexing build must repair the index it left behind rather

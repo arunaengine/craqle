@@ -2,10 +2,13 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "internal/search/queue.rs"]
+pub(crate) mod queue;
+
 use std::path::Path;
 
 use crate::core::GraphId;
-pub(crate) use crate::search_queue::{DrainFailure, QueueBound};
+pub(crate) use crate::search::queue::{DrainRequest, QueueBound};
 use crate::store::GraphStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +44,30 @@ pub struct GraphSetQuery<'a> {
     pub limit: usize,
 }
 
+pub(crate) struct AuthorizedQuery<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub subject: Option<&'a str>,
+    pub allows: &'a dyn Fn(&str) -> crate::Result<bool>,
+}
+
+pub(crate) struct FilterQuery<'a, E> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub subject: Option<&'a str>,
+    pub allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
+    pub check: &'a dyn Fn() -> std::result::Result<(), E>,
+}
+
+pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(graph_id.len() as u64).to_be_bytes());
+    hasher.update(graph_id.as_bytes());
+    hasher.update(&(subject_iri.len() as u64).to_be_bytes());
+    hasher.update(subject_iri.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 #[derive(Debug, Default)]
 pub struct SearchIndex;
 
@@ -53,15 +80,20 @@ impl SearchIndex {
         Ok(Self)
     }
 
-    /// Test-only parity with the real index; the stub never indexes, so there
-    /// is no drain cycle to make panic.
+    pub fn open_with_budget(
+        _path: impl AsRef<Path>,
+        _budget: crate::memory::MemoryBudget,
+    ) -> Result<Self> {
+        Ok(Self)
+    }
+
     /// Parity with the real index; the stub has no drain to make panic.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn arm_drain_panic(&self) {}
 
     #[cfg(test)]
-    pub(crate) fn take_armed_drain_panic(&self) -> bool {
+    pub(crate) fn take_drain_panic(&self) -> bool {
         false
     }
 
@@ -69,8 +101,32 @@ impl SearchIndex {
         Ok(Self)
     }
 
+    pub fn memory_with_budget(_budget: crate::memory::MemoryBudget) -> Result<Self> {
+        Ok(Self)
+    }
+
     pub fn needs_rebuild(&self) -> bool {
         false
+    }
+
+    pub(crate) fn query_bytes(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn check_query_bytes(&self, _bytes: usize) -> crate::Result<()> {
+        Err(SearchError::Disabled.into())
+    }
+
+    pub(crate) fn coverage_target(&self, store: &GraphStore) -> Result<Option<u64>> {
+        Ok(Some(store.require_search_rebuild()?))
+    }
+
+    pub(crate) fn bind_store(&self, store: &GraphStore) -> Result<Option<u64>> {
+        self.coverage_target(store)
+    }
+
+    pub(crate) fn complete_coverage(&self, _store: &GraphStore, _target: u64) -> Result<()> {
+        Err(SearchError::Disabled)
     }
 
     pub fn index_resource(
@@ -84,6 +140,25 @@ impl SearchIndex {
 
     pub fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>> {
         Err(SearchError::Disabled)
+    }
+
+    pub(crate) fn search_authorized(
+        &self,
+        req: AuthorizedQuery<'_>,
+    ) -> crate::Result<Vec<SearchHit>> {
+        let _ = (req.query, req.limit, req.subject, req.allows);
+        Err(SearchError::Disabled.into())
+    }
+
+    pub(crate) fn collect_filtered<E>(
+        &self,
+        req: FilterQuery<'_, E>,
+    ) -> std::result::Result<Vec<SearchHit>, E>
+    where
+        E: From<SearchError>,
+    {
+        let _ = (req.query, req.limit, req.subject, req.allows, req.check);
+        Err(E::from(SearchError::Disabled))
     }
 
     pub fn search_in_graph(
@@ -103,25 +178,25 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Retain every queued update without indexing it.
-    ///
-    /// This build has no index, so it cannot cover any queue entry. Draining
-    /// and acknowledging them anyway destroyed the only durable record of what
-    /// a later search-enabled build still owed: that build finds a
-    /// schema-compatible index and an empty queue, certifies the index it
-    /// wrote before the feature was turned off, and serves text the store no
-    /// longer holds. The entries coalesce per `(graph, subject)`, so the
-    /// retained debt is bounded by the corpus rather than by the write count.
+    /// Retain coalesced queue debt for a later search-enabled build.
     pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
-        Ok(self.drain_queues(store, bound)?.covered)
+        Ok(self
+            .drain_queues(
+                store,
+                DrainRequest {
+                    bound,
+                    control: crate::search::queue::DrainControl::default(),
+                },
+            )?
+            .covered)
     }
 
     pub fn drain_queues(
         &self,
         _store: &GraphStore,
-        _bound: QueueBound,
-    ) -> Result<crate::search_queue::DrainProgress> {
-        Ok(crate::search_queue::DrainProgress::default())
+        _request: DrainRequest,
+    ) -> Result<crate::search::queue::DrainProgress> {
+        Ok(crate::search::queue::DrainProgress::default())
     }
 
     pub fn reindex_from_store(&self, _store: &GraphStore, _graph: &GraphId) -> Result<usize> {
@@ -131,9 +206,7 @@ impl SearchIndex {
 
 #[cfg(test)]
 mod tests {
-    /// A build without an index must not acknowledge queue rows it never
-    /// indexed: those rows are the only record of what a later search-enabled
-    /// build still owes.
+    /// A search-disabled build must retain every unindexed queue row.
     #[test]
     fn drain_keeps_debt() {
         let dir = tempfile::tempdir().unwrap();

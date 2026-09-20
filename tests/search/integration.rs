@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 /// Every test here asserts on real tantivy results, so the `search`-off stub —
@@ -193,10 +194,14 @@ mod tests {
             graph.as_str()
         );
 
+        let prepared = net.peer(1).prepare_query(&query).unwrap();
+        let mut options = QueryOptions::default();
+        options.limits = QueryLimits::unbounded();
         let rows = solution_rows(
             net.peer(1)
-                .query(&GrantAuthorizer::default(), &query)
-                .unwrap(),
+                .execute_prepared(&GrantAuthorizer::default(), &prepared, &options)
+                .unwrap()
+                .results,
         );
         assert!(!rows.is_empty());
         assert!(rows.iter().any(|row| {
@@ -298,14 +303,14 @@ mod tests {
             .append_new_root_data_entities(
                 &writer,
                 &graph,
-                benchmark_media_object_entities(
-                    0,
-                    50,
-                    "remote-batch-keyword",
-                    "Remote Batch Entity",
-                    "remote batch record",
-                    "RBATCH",
-                ),
+                benchmark_entities(EntityBatch {
+                    start: 0,
+                    count: 50,
+                    keyword: "remote-batch-keyword",
+                    name_prefix: "Remote Batch Entity",
+                    description_label: "remote batch record",
+                    identifier_prefix: "RBATCH",
+                }),
             )
             .unwrap();
         net.sync_until_converged(10).unwrap();
@@ -399,13 +404,7 @@ mod tests {
         );
     }
 
-    /// G8 completeness: an authorized caller must never be shown a short page
-    /// while matching, readable documents exist.
-    ///
-    /// Tantivy collects a global top-k by score, so unreadable graphs can fill
-    /// the whole over-fetch window and starve the authorization filter. With a
-    /// fixed `limit * 4` over-fetch this returned 21 hits for `limit = 25` and
-    /// 41 for `limit = 50` (finding K2).
+    /// Unreadable high-scoring matches must not displace readable results from a full page.
     #[test]
     fn search_returns_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -477,12 +476,7 @@ mod tests {
         }
     }
 
-    /// G7: `flush_search_updates()` must terminate even while a writer keeps
-    /// enqueueing, and everything enqueued *before* the call must be indexed
-    /// when it returns.
-    ///
-    /// The unbounded drain re-read work enqueued between drain and
-    /// acknowledgement, so the flush could spin forever (finding W15b).
+    /// A flush must cover its submission cutoff and finish while later writes continue.
     #[test]
     fn flush_survives_ingest() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -574,9 +568,7 @@ mod tests {
         });
     }
 
-    /// Produce an orphan through two individually valid writes: each replica
-    /// removes one of two reachability paths while partitioned, and the merge
-    /// removes both paths.
+    /// Each partition removes one reachability path; their merge must remove both.
     fn make_replicated_orphan(net: &mut CraqleCluster, graph: &GraphId) -> SnapshotQuadState {
         let has_part = EncodedTerm::from_named_node(&vocab::schema_has_part());
         let root = EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(graph.as_str()));
@@ -689,14 +681,7 @@ mod tests {
         edge
     }
 
-    /// An entity that becomes orphaned by a write that never touches it must leave
-    /// the search index (G6, G7).
-    ///
-    /// Deleting `root hasPart child` orphans the child without naming it in the
-    /// change set. The diagnostics settle then has to notice that the orphan set
-    /// moved and re-queue the child for indexing — otherwise search keeps returning
-    /// an entity that export and SPARQL now hide, and nothing repairs it until some
-    /// unrelated write happens to dirty that subject.
+    /// A reachability-only change must remove the indirectly orphaned entity from search.
     #[test]
     fn orphan_leaves_index() {
         let (_dir, mut net) = setup_network(2);
@@ -776,17 +761,7 @@ mod tests {
         );
     }
 
-    /// The other direction: re-attaching an orphan must put it *back* in the
-    /// search index (G6, G7).
-    ///
-    /// The re-queue diffs the orphan set with `symmetric_difference`, so both
-    /// transitions have to be covered. With a one-sided `difference` the hiding
-    /// direction still passes and this one does not: the child is un-orphaned
-    /// everywhere except in search, where it stays invisible until some
-    /// unrelated write happens to dirty it.
-    /// Re-attaching through the public append API, with no manual rebuild.
-    /// The append path defers diagnostics, so nothing else settles the record
-    /// and the entity has to come back to search on the write alone (G7).
+    /// Deferred append diagnostics must restore a reattached entity without manual reindexing.
     #[test]
     fn append_restores_index() {
         let (_dir, mut net) = setup_network(2);
@@ -867,9 +842,7 @@ mod tests {
         assert_eq!(1, searchable(), "the re-appended entity must be findable");
     }
 
-    /// An append can adopt an entity it never touches: `additional_triples`
-    /// carries a `hasPart` edge to an existing orphan. Nothing enqueues that
-    /// entity, so only a settled orphan record can return it to search (G7).
+    /// Adding a link to an untouched orphan must also restore that orphan's search entry.
     #[test]
     fn append_adopts_orphan() {
         let (_dir, mut net) = setup_network(2);
@@ -1063,13 +1036,7 @@ mod tests {
         .len()
     }
 
-    /// Orphan one data entity, re-link it with a deferred bulk write, then land
-    /// an unrelated commit before the diagnostics rebuild.
-    ///
-    /// The unrelated write touches neither `rdf:type` nor `hasPart`, so the
-    /// settle takes its re-stamp path — and re-stamping a read that already
-    /// reflects the bulk write would move the re-queue baseline past the
-    /// re-link without queueing it.
+    /// An unrelated write must not advance the diagnostic baseline past an unqueued relink.
     fn interleave_relink(net: &mut CraqleCluster, graph: &GraphId) {
         net.peer(0)
             .create_crate(
