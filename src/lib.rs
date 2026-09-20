@@ -3511,17 +3511,12 @@ impl CraqleNode {
         self.finish_batch(graph, batch)
     }
 
-    /// Execute a SPARQL query against the local node.
-    ///
-    /// Visibility is decided lazily, once per graph the evaluation touches,
-    /// rather than by materializing the whole visible set up front.
-    ///
-    /// Persisted graph policy is read from the same durable snapshot as query
-    /// data. A policy read error or missing graph denies visibility (G8).
+    /// Query with lazy graph visibility from the same snapshot as policy.
+    /// Missing policy and policy read errors deny visibility.
     pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
         Ok(self
             .sparql
-            .query_with_snapshot_visibility(sparql, &|snapshot, graph: &GraphId| {
+            .query_snapshot(sparql, &|snapshot, graph: &GraphId| {
                 snapshot
                     .graph_policy(&self.store, graph)
                     .ok()
@@ -3530,22 +3525,25 @@ impl CraqleNode {
             })?)
     }
 
-    /// Parse a SPARQL query for repeated execution.
-    ///
-    /// The prepared value contains no store snapshot or authorization state;
-    /// both are acquired afresh on every execution.
+    /// Parse a reusable query without snapshot or authorization state.
     pub fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
         Ok(self.sparql.prepare_query(sparql)?)
     }
 
-    /// Execute a SPARQL query and return its complete result with diagnostics.
-    pub fn query_with_statistics(
+    pub fn prepare_with_limits(&self, sparql: &str, limits: &QueryLimits) -> Result<PreparedQuery> {
+        Ok(self.sparql.prepare_with_limits(sparql, limits)?)
+    }
+
+    pub fn query_with_options(
         &self,
         auth: &dyn Authorizer,
-        sparql: &str,
+        request: QueryRequest<'_>,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.query_with_snapshot_visibility_statistics(
-            sparql,
+        Ok(self.sparql.query_with_options(
+            sparql::QueryRun {
+                sparql: request.sparql,
+                options: request.options,
+            },
             &|snapshot, graph: &GraphId| {
                 snapshot
                     .graph_policy(&self.store, graph)
@@ -3556,6 +3554,23 @@ impl CraqleNode {
         )?)
     }
 
+    /// Execute a SPARQL query and return its complete result with diagnostics.
+    pub fn query_with_statistics(
+        &self,
+        auth: &dyn Authorizer,
+        sparql: &str,
+    ) -> Result<QueryExecution> {
+        Ok(self
+            .sparql
+            .query_snapshot_stats(sparql, &|snapshot, graph: &GraphId| {
+                snapshot
+                    .graph_policy(&self.store, graph)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
+            })?)
+    }
+
     /// Execute a prepared query against a fresh authorized store snapshot.
     pub fn execute_prepared(
         &self,
@@ -3563,7 +3578,7 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.execute_prepared_with_snapshot_visibility(
+        Ok(self.sparql.execute_prepared_snapshot(
             query,
             &|snapshot, graph: &GraphId| {
                 snapshot
@@ -3585,7 +3600,7 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryPlan> {
-        Ok(self.sparql.explain_prepared_with_snapshot_visibility(
+        Ok(self.sparql.explain_prepared_snapshot(
             query,
             &|snapshot, graph: &GraphId| {
                 snapshot
@@ -3608,10 +3623,7 @@ impl CraqleNode {
         Ok(self.execute_prepared(auth, query, options)?.statistics.plan)
     }
 
-    /// Execute a SPARQL query against an explicit, wholly authorized graph set.
-    ///
-    /// Missing and unreadable graph names both fail the complete request with
-    /// an authorization error; neither is silently removed from the dataset.
+    /// Query an explicit graph set, failing on missing or unreadable graphs.
     pub fn query_in_graphs(
         &self,
         auth: &dyn Authorizer,
@@ -3631,8 +3643,12 @@ impl CraqleNode {
         sparql: &str,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        let query = self.prepare_query(sparql)?;
-        self.execute_prepared_in_graphs(auth, graphs, &query, options)
+        Ok(self.sparql.query_graphs_options(sparql::GraphQuery {
+            auth,
+            graphs,
+            sparql,
+            options,
+        })?)
     }
 
     /// Execute a prepared query over an explicit, wholly authorized graph set.
@@ -3645,7 +3661,7 @@ impl CraqleNode {
     ) -> Result<QueryExecution> {
         Ok(self
             .sparql
-            .execute_prepared_in_graphs(auth, query, graphs, options)?)
+            .execute_prepared_graphs(auth, query, graphs, options)?)
     }
 
     /// Inspect a prepared plan for an explicit, wholly authorized graph set.
@@ -3658,7 +3674,7 @@ impl CraqleNode {
     ) -> Result<QueryPlan> {
         Ok(self
             .sparql
-            .explain_prepared_in_graphs(auth, query, graphs, options)?)
+            .explain_prepared_graphs(auth, query, graphs, options)?)
     }
 
     /// Execute over explicit authorized graphs and return the measured plan.
@@ -3675,146 +3691,107 @@ impl CraqleNode {
             .plan)
     }
 
-    /// Allows visibility-controlled query fixtures in search tests.
-    #[cfg(all(test, feature = "search"))]
-    pub(crate) fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
-    where
-        F: Fn(&GraphId) -> bool,
-    {
-        Ok(self.sparql.query_with_visibility(sparql, &visible)?)
-    }
-
     /// Compatibility no-op: durable qv indexes are maintained with graph
     /// commits and source storage remains the fallback authority.
     pub fn ensure_query_indexes(&self) {
         self.store.ensure_derived_indexes();
     }
 
-    /// Search visible resources in the local search index.
-    ///
-    /// Readable-graph membership is resolved before the index retains a page,
-    /// so the result is one top-k collection over exactly the graphs this
-    /// caller may read. Filtering afterwards instead meant asking the index
-    /// for a multiple of the requested page and asking again, four times
-    /// larger, whenever too few hits survived authorization: a one-row page
-    /// over an unreadable corpus walked up to the whole matching corpus, once
-    /// per pass, on a different reader each time (G8).
-    ///
-    /// The page is complete for the policy read at the start of the call. A
-    /// permission granted concurrently is picked up by the next call.
+    /// Search one pinned index view and recheck permissions before returning hits.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         self.search.ensure_available()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let mut readable = ReadableGraphs::new(self, auth);
-        let mut selected = Vec::new();
-        for graph in self.store.graphs()? {
-            if readable.allows(graph.as_str())? {
-                selected.push(graph);
-            }
-        }
-        // No readable graph is a complete empty page, not an exhausted budget.
-        if selected.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let hits = self.search.search_in_graphs(search::GraphSetQuery {
-            graphs: &selected,
+        let readable = Mutex::new(ReadableGraphs::new(self, auth));
+        let allows = |graph: &str| {
+            readable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allows(graph)
+        };
+        let hits = self.search.search_authorized(search::AuthorizedQuery {
             query: req.query,
             limit,
+            subject: None,
+            allows: &allows,
         })?;
-        Ok(limit_search_hits(hits, limit))
+        drop(readable);
+        self.recheck_hits(auth, hits)
     }
 
-    /// Search visible resources in an explicit set of graph IRIs.
-    ///
-    /// `req.limit` is clamped to [`MAX_SEARCH_LIMIT`] (10_000), never rejected.
-    ///
-    /// Every selected graph is authorized against its stored policy *before*
-    /// the index is consulted, so no post-filtering — and therefore no
-    /// escalation loop — is needed: every hit the index can return already
-    /// belongs to a graph the caller may read. Missing or non-readable graphs
-    /// are ignored, matching [`CraqleNode::search`].
+    /// Search a graph set with one parse, one index view, and final authorization.
     pub fn search_graphs(
         &self,
         auth: &dyn Authorizer,
         req: GraphSearchRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
         self.search.ensure_available()?;
-        // Clamped once here, so both arms and the final ordering agree on it.
-        let req = GraphSearchRequest {
-            limit: req.limit.min(MAX_SEARCH_LIMIT),
-            ..req
-        };
-        if req.limit == 0 {
+        let limit = req.limit.min(MAX_SEARCH_LIMIT);
+        if limit == 0 || req.graphs.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut seen = std::collections::HashSet::new();
-        let mut selected = Vec::new();
-        for graph in req.graphs {
-            if !seen.insert(graph.as_str()) {
-                continue;
-            }
-            if !self.store.contains_graph(graph)?
-                || auth
-                    .authorize(graph, &self.store.graph_policy(graph)?, Action::Read)
-                    .is_err()
-            {
-                continue;
-            }
-            selected.push(graph.clone());
-        }
-
-        if selected.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // A per-graph search is a full top-k collection each, so it only pays
-        // off for a handful of graphs; beyond that one filtered search over
-        // the whole set is cheaper. This is a performance fork only — the two
-        // arms must answer identically, which `graph_arms_agree` pins down.
-        let hits = if selected.len() <= SEARCH_GRAPHS_PER_GRAPH_LIMIT {
-            self.search_graph_arm(&selected, &req)?
+        let selected = if req.graphs.len() > LINEAR_GRAPH_LIMIT {
+            let bytes = req
+                .graphs
+                .len()
+                .saturating_mul(std::mem::size_of::<&str>() * 4);
+            self.search.check_query_bytes(bytes.saturating_mul(4))?;
+            Some(
+                req.graphs
+                    .iter()
+                    .map(GraphId::as_str)
+                    .collect::<HashSet<_>>(),
+            )
         } else {
-            self.search_set_arm(&selected, &req)?
+            None
         };
-
-        // Both arms are ordered here rather than in one of them, so a tie
-        // cannot resolve differently either side of the threshold.
-        Ok(limit_search_hits(hits, req.limit))
-    }
-
-    /// One full top-k collection per graph, concatenated for the caller to order.
-    fn search_graph_arm(
-        &self,
-        selected: &[GraphId],
-        req: &GraphSearchRequest<'_>,
-    ) -> Result<Vec<SearchHit>> {
-        let mut hits = Vec::new();
-        for graph in selected {
-            hits.extend(
-                self.search
-                    .search_in_graph(graph.as_str(), req.query, req.limit)?,
+        let readable = Mutex::new(ReadableGraphs::new(self, auth));
+        let allows = |graph: &str| {
+            let selected = selected.as_ref().map_or_else(
+                || {
+                    req.graphs
+                        .iter()
+                        .any(|candidate| candidate.as_str() == graph)
+                },
+                |selected| selected.contains(graph),
             );
-        }
-        Ok(hits)
+            if !selected {
+                return Ok(false);
+            }
+            readable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allows(graph)
+        };
+        let hits = self.search.search_authorized(search::AuthorizedQuery {
+            query: req.query,
+            limit,
+            subject: None,
+            allows: &allows,
+        })?;
+        drop(readable);
+        drop(selected);
+        self.recheck_hits(auth, hits)
     }
 
-    /// One collection over the whole set, narrowed by a graph filter.
-    fn search_set_arm(
-        &self,
-        selected: &[GraphId],
-        req: &GraphSearchRequest<'_>,
-    ) -> Result<Vec<SearchHit>> {
-        Ok(self.search.search_in_graphs(search::GraphSetQuery {
-            graphs: selected,
-            query: req.query,
-            limit: req.limit,
-        })?)
+    fn recheck_hits(&self, auth: &dyn Authorizer, hits: Vec<SearchHit>) -> Result<Vec<SearchHit>> {
+        let mut readable = ReadableGraphs::new(self, auth);
+        let keep = {
+            let mut seen = HashSet::new();
+            hits.iter()
+                .map(|hit| {
+                    Ok(readable.allows(&hit.graph_id)?
+                        && seen.insert((hit.graph_id.as_str(), hit.subject_iri.as_str())))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(hits
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(hit, keep)| keep.then_some(hit))
+            .collect())
     }
 
     /// Resolve one visible subject into `(predicate, object)` pairs.
@@ -3828,13 +3805,7 @@ impl CraqleNode {
         self.describe_in_ctx(&ctx, req.subject_id)
     }
 
-    /// Hydrate search hits with visible RDF properties.
-    ///
-    /// Search results usually cluster into a handful of graphs, so the policy
-    /// read and the orphan-set rebuild are memoized per graph rather than
-    /// repeated per hit. Hits in a graph the caller may not read
-    /// are skipped rather than failing the whole call, matching how
-    /// [`CraqleNode::search`] drops them.
+    /// Hydrate visible hits with policy and orphan state memoized per graph.
     pub fn hydrate_search_hits(
         &self,
         auth: &dyn Authorizer,
@@ -3879,64 +3850,58 @@ impl CraqleNode {
         self.hydrate_search_hits(auth, &hits)
     }
 
-    /// Block until the background full-text indexer has processed queued work.
-    ///
-    /// Without the `search` feature there is no index and no reader, so this
-    /// reports only that the indexer had nothing it could do. It does not
-    /// claim that any search state is current: the queued updates stay owed
-    /// until a search-enabled build indexes them.
+    /// Wait for queued search work; search-disabled builds keep it owed.
     pub fn flush_search_updates(&self) -> Result<()> {
         self.search_worker.flush()
     }
 
-    /// Rebuild the full-text index from store state.
-    ///
-    /// Commits Tantivy and persists Fjall once per batch of graphs rather than
-    /// once per graph: every commit replays the queued deletes against every
-    /// segment, which made a per-graph commit super-linear in corpus size.
+    /// Wait for maintenance to stop without discarding a still-running worker.
+    pub fn shutdown(&mut self, timeout: Duration) -> Result<ShutdownState> {
+        self.search_worker.shutdown_within(timeout)
+    }
+
+    pub fn flush_search(&self, options: &SearchFlushOptions) -> Result<SearchReceipt> {
+        self.search_worker.flush_with(options)
+    }
+
+    /// Rebuild search with one commit and persist per graph batch.
     pub fn reindex_search(&self) -> Result<()> {
-        let mut covered = Vec::with_capacity(REINDEX_COMMIT_BATCH_GRAPHS);
-        for graph in self.store.graphs()? {
-            // Pinned before the scan reads anything: a write landing later is
-            // not covered by it and must outlive the clear below.
-            // `current_dirty_token` is the next token to be minted, so the
-            // highest one this scan can cover is the one before it.
-            let upto = self.store.current_dirty_token().saturating_sub(1);
+        let mut covered = Vec::with_capacity(REINDEX_BATCH_GRAPHS);
+        let snapshot = self.store.read_snapshot();
+        for graph in snapshot.graph_term_iter(&self.store) {
+            let term = self.store.decode_term(graph?)?;
+            let graph = term.to_named_node().map(GraphId).ok_or_else(|| {
+                store::StoreError::InvalidEncoding {
+                    context: "reindex graph identity",
+                    message: "graph name is not an IRI".to_owned(),
+                }
+            })?;
+            // Later writes must survive acknowledgement of this scan's cutoff.
+            let upto = self.store.current_dirty_token();
             self.search.reindex_from_store(&self.store, &graph)?;
             covered.push(ScannedGraph { graph, upto });
             #[cfg(test)]
             self.gate_after_scan();
-            if covered.len() >= REINDEX_COMMIT_BATCH_GRAPHS {
+            if covered.len() >= REINDEX_BATCH_GRAPHS {
                 self.commit_reindexed_graphs(&mut covered)?;
             }
         }
         self.commit_reindexed_graphs(&mut covered)
     }
 
-    /// Commit the Tantivy work for `covered`, then clear those graphs' FTS
-    /// queue entries, then persist once.
-    ///
-    /// ORDERING HAZARD (G7): the queue clearing MUST follow the Tantivy commit
-    /// that covers these graphs. Clear first and crash before the commit, and
-    /// those updates are lost permanently — nothing would ever re-enqueue
-    /// them. Crash after the commit but before the clear and the worker merely
-    /// re-does the work on its next drain. Only the second direction is safe,
-    /// so the order below is not an implementation detail.
+    // Commit before acknowledgement so a crash cannot erase unindexed work.
     fn commit_reindexed_graphs(&self, covered: &mut Vec<ScannedGraph>) -> Result<()> {
         if covered.is_empty() {
             return Ok(());
         }
         self.search.commit()?;
         for scanned in covered.drain(..) {
-            self.store
-                .clear_fts_queue_for_graph(&scanned.graph, scanned.upto)?;
+            self.store.clear_graph_queue(&scanned.graph, scanned.upto)?;
         }
         self.persist_fjall()
     }
 
-    /// Hold a reindex between a graph's scan and the clear that covers it,
-    /// reporting arrival and waiting for release. Test-only: it makes a window
-    /// that is otherwise microseconds wide something a test can step through.
+    /// Hold a reindex after scan so tests can control the queue-clear window.
     #[cfg(test)]
     fn gate_after_scan(&self) {
         let gate = self
@@ -3979,7 +3944,7 @@ impl CraqleNode {
 
     /// Return query-index v2 readiness using metadata and exact counters only.
     pub fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
-        Ok(self.store.query_index_status_fast()?)
+        Ok(self.store.index_status_fast()?)
     }
 
     /// Rebuild the disposable persistent query indexes from canonical CRDT quad state.
@@ -3998,25 +3963,16 @@ impl CraqleNode {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_graph_policy_bypassing_authorization(
-        &self,
-        graph: &GraphId,
-        policy: GraphPolicy,
-    ) -> Result<()> {
+    pub(crate) fn set_policy_unchecked(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
         self.set_test_policy(graph, policy.normalized())?;
         self.persist_fjall()
     }
 
-    /// Every graph the caller may read.
-    ///
-    /// Streams graph term ids and decodes each name through the shared term
-    /// cache instead of materializing the full graph list first. This is O(corpus)
-    /// by definition; prefer [`CraqleNode::query`], which checks visibility
-    /// only for the graphs a query touches.
+    /// Stream every readable graph; prefer lazy [`CraqleNode::query`] for queries.
     pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
         let mut visible = Vec::new();
-        for graph_id in self.store.graph_term_id_iter() {
+        for graph_id in self.store.graph_term_iter() {
             let term = self.store.decode_term(graph_id?)?;
             let Some(graph) = term.to_named_node().map(GraphId) else {
                 continue;
@@ -4039,44 +3995,16 @@ impl CraqleNode {
 
     pub fn delete_graph(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<()> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.delete_graph_after_authorization(graph)
+        self.delete_authorized(graph)
     }
 
-    fn delete_graph_after_authorization(&self, graph: &GraphId) -> Result<()> {
-        // Orders the tombstone against this graph's writes, and the publish
-        // against its own apply; see `replication::GRAPH_WRITE_LOCKS`. Every
-        // tombstone writer takes it, so a write that checks the tombstone
-        // before applying cannot race one halfway through.
-        let _write_guard = replication::graph_write_guard(graph);
-
-        if self.store.graph_tombstoned(graph)? {
+    fn delete_authorized(&self, graph: &GraphId) -> Result<()> {
+        let Some(receipt) = self.replication.delete_graph(graph, true)? else {
             return Ok(());
-        }
-        let mut delete_clock = self.store.get_vector_clock(graph)?;
-        let delete_counter = delete_clock
-            .0
-            .get(&self.actor)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
-        delete_clock.advance(self.actor, delete_counter);
-        let tombstone = GraphTombstone {
-            graph: graph.clone(),
-            delete_event: EventId::graph_delete(graph, self.actor, &delete_clock),
-            delete_actor: self.actor,
-            delete_clock,
         };
-
-        if let Some(sync) = &self.sync
-            && sync.graph_topic_id(&self.store, graph)?.is_some()
-        {
-            let record = sync.publish_delete(&self.store, tombstone)?;
-            self.apply_irokle_record_locked(&record, true)?;
-            return self.persist_fjall();
-        }
-        self.store.delete_graph_tombstoned(&tombstone)?;
         self.schedule_search_update();
-        self.persist_fjall()
+        self.persist_receipt(receipt)?;
+        Ok(())
     }
 
     pub fn vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
@@ -4087,75 +4015,56 @@ impl CraqleNode {
         Ok(self.store.graph_fingerprint(graph)?)
     }
 
-    /// Read-only dump of one graph's quad and dot state.
-    ///
-    /// Quads and each quad's dots are sorted by value, so two replicas holding
-    /// the same state produce equal snapshots regardless of local term ids or
-    /// arrival order. That makes this both a diagnostic and the state an
-    /// application replicates with [`CraqleNode::install_graph_snapshot`].
-    ///
-    /// A graph this node does not hold reports an empty clock and no quads.
+    /// Return deterministic sorted quad and dot state for diagnosis or replication.
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
         Ok(self.store.graph_snapshot(graph)?)
     }
 
-    /// Merge a batch authored on another replica that reached this node
-    /// through the application's own transport instead of irokle.
-    ///
-    /// Applies the batch's ops in order under the graph's write lock with the
-    /// OR-Set semantics of replicated records: adds carry the batch dot,
-    /// removes drop exactly the dots they witnessed, and the graph is created
-    /// when it is missing. Nothing is published back to irokle.
-    ///
-    /// Idempotent by the batch dot: merging a batch whose `(actor, counter)`
-    /// this graph's clock already contains reports `applied: false`, as does
-    /// merging into a graph this node has tombstoned.
-    ///
-    /// Fails when an op carries a term the store cannot hold: an RDF-star
-    /// term, a term over four megabytes, or one that is not an encoded IRI,
-    /// literal or blank node.
+    /// Merge an external batch with idempotent OR-Set semantics.
+    /// Invalid terms and tombstoned graphs fail without Irokle publication.
     pub fn merge_batch(&self, batch: &Batch) -> Result<MergeResult> {
-        // Orders this merge against every other write to the same graph; see
-        // `replication::GRAPH_WRITE_LOCKS`.
-        let _write_guard = replication::graph_write_guard(&batch.graph);
-        let merged = self.replication.merge_batch(batch)?;
-        if merged.applied {
-            self.schedule_search_update_for_graph(&batch.graph)?;
+        let merged = {
+            let _write_guard = self.store.graph_write_guard(&batch.graph);
+            self.replication.merge_batch(batch)?
+        };
+        let status = self.replication.receipt_for_batch(batch)?;
+        if merged.applied
+            && let Err(error) = self.schedule_graph_search(&batch.graph)
+        {
+            return match status {
+                MutationStatus::Known(receipt) => Err(accepted_error(receipt, error)),
+                MutationStatus::Expired | MutationStatus::Unknown => Err(error),
+            };
         }
-        self.persist_fjall()?;
+        match status {
+            MutationStatus::Known(receipt) => {
+                self.persist_receipt(receipt)?;
+            }
+            MutationStatus::Expired | MutationStatus::Unknown => self.persist_fjall()?,
+        }
         Ok(merged)
     }
 
-    /// Install a snapshot taken on another replica, seeding or repairing a
-    /// local copy of that graph.
-    ///
-    /// The result is the state-based OR-Set join of the two states: a snapshot
-    /// dot joins a quad's local dot set only when this graph's clock does not
-    /// already cover it, the graph clock then becomes the element-wise maximum
-    /// of the two clocks, and a graph this node does not hold is created.
-    ///
-    /// A dot the local clock covers but the local quad no longer carries is a
-    /// removal this node has already seen, so it stays removed: installing a
-    /// lagging replica's snapshot never resurrects a quad, and a device may be
-    /// seeded from several holders in any order.
-    ///
-    /// Later [`CraqleNode::merge_batch`] calls compose with the join, so a
-    /// remove that witnessed the snapshot's dots still removes them.
-    ///
-    /// Installing the same snapshot twice reports `applied: false`, as does
-    /// installing a snapshot this node's clock already covers or installing
-    /// into a graph this node has tombstoned.
-    ///
-    /// Fails when a quad carries a term the store cannot hold, as for
-    /// [`CraqleNode::merge_batch`].
+    /// Join a replica snapshot without resurrecting covered removals.
+    /// Repeated, covered, tombstoned, and invalid input does not alter state.
     pub fn install_graph_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<MergeResult> {
-        let _write_guard = replication::graph_write_guard(&snapshot.graph);
-        let merged = self.replication.install_snapshot(snapshot)?;
-        if merged.applied {
-            self.schedule_search_update_for_graph(&snapshot.graph)?;
+        let _write_guard = self.store.graph_write_guard(&snapshot.graph);
+        let outcome = self.replication.install_with_receipt(snapshot)?;
+        drop(_write_guard);
+        if outcome.result.applied
+            && let Err(error) = self.schedule_graph_search(&snapshot.graph)
+        {
+            return match outcome.receipt {
+                Some(receipt) => Err(accepted_error(receipt, error)),
+                None => Err(error),
+            };
         }
-        self.persist_fjall()?;
-        Ok(merged)
+        if let Some(receipt) = outcome.receipt {
+            self.persist_receipt(receipt)?;
+        } else {
+            self.persist_fjall()?;
+        }
+        Ok(outcome.result)
     }
 
     /// Build the per-graph state `describe_in_ctx` needs.
@@ -4167,18 +4076,8 @@ impl CraqleNode {
         })
     }
 
-    /// Resolve a subject's visible `(predicate, object)` pairs within a graph
-    /// whose readability the caller has already established.
-    ///
-    /// The orphan set is load-bearing twice: it hides orphaned subjects, and it
-    /// drops triples whose *object* points at an orphan. Both are required for
-    /// G6 ("invalid visible crates are never exported"). Returning an empty
-    /// list for an orphaned subject, rather than an error, is deliberate.
-    ///
-    /// `subject_id` may name a blank node (`_:b0`) — search indexes and returns
-    /// them in that form — so it is encoded with `from_subject_id`. Encoding it
-    /// as an IRI both let an orphaned blank node through the check below and
-    /// made every non-orphaned blank node describe as empty.
+    /// Resolve visible subject pairs while hiding orphan subjects and objects.
+    /// Subject encoding preserves blank-node identifiers returned by search.
     fn describe_in_ctx(
         &self,
         ctx: &DescribeCtx,
