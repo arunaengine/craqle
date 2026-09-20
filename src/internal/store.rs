@@ -8935,6 +8935,96 @@ impl GraphStore {
         &self,
         snapshot: &GraphReplicaSnapshot,
         audit: &RepairAudit,
+    ) -> Result<()> {
+        let _write = self.graph_write_guard(&snapshot.graph);
+        let _commit = self.graph_commit_guard(&snapshot.graph);
+        if self.graph_tombstoned(&snapshot.graph)? {
+            return Err(StoreError::ReceiptConflict);
+        }
+        let missing = !self.contains_graph(&snapshot.graph)?;
+        let before = self.graph_snapshot_bounded(
+            &snapshot.graph,
+            SnapshotLimits {
+                max_rows: 1_048_576,
+                max_bytes: 64 * 1_048_576,
+            },
+        )?;
+        let before_digest = *blake3::hash(&postcard::to_allocvec(&before)?).as_bytes();
+        let after_digest = *blake3::hash(&postcard::to_allocvec(snapshot)?).as_bytes();
+        let backup = audit.backup.as_ref().ok_or(StoreError::ReceiptConflict)?;
+        let backup_bytes = self
+            .repair_backups
+            .get(backup.archive_digest)?
+            .ok_or(StoreError::ReceiptConflict)?;
+        let stored_digest = *blake3::hash(backup_bytes.as_ref()).as_bytes();
+        let backup_snapshot: GraphReplicaSnapshot = postcard::from_bytes(backup_bytes.as_ref())?;
+        let expected_location =
+            backup
+                .archive_digest
+                .iter()
+                .fold(String::from("craqle:backup:"), |mut value, byte| {
+                    use std::fmt::Write;
+                    let _ = write!(value, "{byte:02x}");
+                    value
+                });
+        if audit.graph != snapshot.graph
+            || audit.mode != RepairMode::Apply
+            || audit.result != RepairResult::Applied
+            || audit.before_digest != before_digest
+            || audit.after_digest != Some(after_digest)
+            || backup.source_revision != before_digest
+            || backup.archive_digest != stored_digest
+            || backup_snapshot != before
+            || backup.location != expected_location
+        {
+            return Err(StoreError::ReceiptConflict);
+        }
+        let mut batch = self.new_batch();
+        let graph_id = match self.graph_id_for(&snapshot.graph)? {
+            Some(graph_id) if !missing => graph_id,
+            Some(_) | None
+                if missing && before.quads.is_empty() && before.clock == VectorClock::new() =>
+            {
+                self.stage_graph(&mut batch, &snapshot.graph)?
+            }
+            Some(_) | None => {
+                return Err(StoreError::GraphNotFound(snapshot.graph.to_string()));
+            }
+        };
+        let mut subjects = HashSet::new();
+        self.visit_graph_quads::<StoreError, _>(graph_id, |quad| {
+            subjects.insert(quad.subject);
+            self.write_quad_state(&mut batch, quad, Vec::new())?;
+            Ok(())
+        })?;
+        for state in &snapshot.quads {
+            let quad = EncodedQuad {
+                graph: graph_id,
+                subject: self.encode_term_internal(Some(&mut batch), &state.subject)?,
+                predicate: self.encode_term_internal(Some(&mut batch), &state.predicate)?,
+                object: self.encode_term_internal(Some(&mut batch), &state.object)?,
+            };
+            subjects.insert(quad.subject);
+            self.write_quad_state(&mut batch, quad, state.dots.clone())?;
+        }
+        self.set_vector_clock(
+            &mut batch,
+            ClockUpdate {
+                graph_id,
+                clock: &snapshot.clock,
+            },
+        )?;
+        self.enqueue_fts_subjects(
+            &mut batch,
+            FtsEnqueue {
+                graph_id,
+                subjects: &subjects,
+            },
+        )?;
+        self.stage_repair_audit(&mut batch, audit)?;
+        self.commit(batch)
+    }
+
     pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             let empty = *blake3::hash(&[]).as_bytes();
@@ -8947,7 +9037,7 @@ impl GraphStore {
         let snapshot = self.db.snapshot();
         for guard in snapshot.prefix(&self.quads, graph_id.to_be_bytes()) {
             let (key, value) = guard.into_inner()?;
-            if dot_payload_is_empty(value.as_ref()) {
+            if dots_empty(value.as_ref()) {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
@@ -8967,14 +9057,11 @@ impl GraphStore {
         Ok((count, xor, sum))
     }
 
-    pub fn subject_triple_count_by_ids(&self, graph: TermId, subject: TermId) -> Result<usize> {
+    pub fn subject_triple_count(&self, graph: TermId, subject: TermId) -> Result<usize> {
         Ok(self.subject_entries((graph, subject), None)?.len())
     }
 
-    /// OR-Set add: stage `add.dot` into the quad's dot set (G1).
-    ///
-    /// Does not lock — the caller must hold the graph commit guard, otherwise
-    /// two concurrent adds can read the same dot set and one add is lost.
+    /// Stages one OR-Set add while the caller holds the graph guard.
     pub fn insert_quad(&self, batch: &mut WriteBatch, add: QuadAdd) -> Result<bool> {
         let QuadAdd { quad, dot } = add;
         let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
@@ -8986,10 +9073,7 @@ impl GraphStore {
         self.write_quad_state(batch, quad, dots)
     }
 
-    /// OR-Set remove: drop exactly the dots contained in the witnessed clock,
-    /// never a dot the remover did not witness (G1).
-    ///
-    /// Does not lock — the caller must hold the graph commit guard.
+    /// Removes only witnessed dots while the caller holds the graph guard.
     pub fn remove_quad(&self, batch: &mut WriteBatch, removal: QuadRemove<'_>) -> Result<bool> {
         let QuadRemove { quad, witnessed } = removal;
         let key = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
@@ -9035,18 +9119,17 @@ impl GraphStore {
                 quad.predicate,
                 quad.object,
             ))?
-            .is_some_and(|value| !dot_payload_is_empty(value.as_ref())))
+            .is_some_and(|value| !dots_empty(value.as_ref())))
     }
 
-    /// The token the next FTS queue entry will receive, pinned under the queue
-    /// lock so every entry below it is already durable.
-    ///
-    /// That is what makes it usable as a flush bound: read it outside the lock
-    /// and a commit could be mid-flight, holding a lower token that the drain
-    /// would not yet see.
+    /// Returns the highest committed FTS token under the queue lock.
     pub(crate) fn current_dirty_token(&self) -> u64 {
         let _queue = self.fts_queue_guard();
-        self.dirty_counter.load(Ordering::SeqCst)
+        self.locked_dirty_token()
+    }
+
+    fn locked_dirty_token(&self) -> u64 {
+        self.dirty_committed.load(Ordering::SeqCst)
     }
 
     pub fn quads_for_pattern(
@@ -9074,10 +9157,8 @@ impl GraphStore {
         Ok(quads)
     }
 
-    /// Returns an in-memory range only when it still describes `snapshot_seqno`.
-    /// A newer commit falls back to the caller-owned durable snapshot instead
-    /// of mixing two execution states.
-    fn current_derived_raw_cursor(
+    /// Returns a derived range only when it matches the requested snapshot.
+    fn derived_raw_cursor(
         &self,
         _snapshot_seqno: u64,
         _pattern: crate::rdf_read::QuadPattern,
@@ -9085,11 +9166,7 @@ impl GraphStore {
         None
     }
 
-    pub fn for_each_quad_in_graph<E, F>(
-        &self,
-        graph: TermId,
-        mut visit: F,
-    ) -> std::result::Result<(), E>
+    pub fn visit_graph_quads<E, F>(&self, graph: TermId, mut visit: F) -> std::result::Result<(), E>
     where
         E: From<StoreError>,
         F: FnMut(EncodedQuad) -> std::result::Result<(), E>,
@@ -9100,12 +9177,8 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Stream a graph's quads straight off the durable `quads` keyspace,
-    /// handing each one to `visit` together with its raw dot-set bytes.
-    ///
-    /// One sequential prefix scan replaces "in-memory scan + one point read per
-    /// quad to fetch its dots". Reads committed state only.
-    pub(crate) fn for_each_stored_quad<F>(&self, graph: TermId, mut visit: F) -> Result<()>
+    /// Streams committed graph quads with their raw dot-set bytes.
+    pub(crate) fn visit_stored_quads<F>(&self, graph: TermId, mut visit: F) -> Result<()>
     where
         F: FnMut(EncodedQuad, &[u8]) -> Result<()>,
     {
@@ -9115,7 +9188,7 @@ impl GraphStore {
                 continue;
             }
             let dots = value.as_ref();
-            if dot_payload_is_empty(dots) {
+            if dots_empty(dots) {
                 continue;
             }
             visit(Self::decode_quad_key(key.as_ref())?, dots)?;
@@ -9127,51 +9200,15 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(VectorClock::new());
         };
-        self.get_vector_clock_by_id(graph_id)
+        self.vector_clock_id(graph_id)
     }
 
-    /// A graph's vector clock as published by its last commit.
-    ///
-    /// Reads the in-memory mirror, never the `'K'` key: a fjall batch becomes
-    /// visible key by key, so the durable clock still reads pre-commit while
-    /// the same batch's quads are already visible. A freshness check trusting
-    /// that clock accepts the pre-write orphan set as current (G6).
-    pub(crate) fn get_vector_clock_by_id(&self, graph_id: TermId) -> Result<VectorClock> {
-        Ok(self
-            .indexes_read()
-            .clocks
-            .get(&graph_id)
-            .cloned()
-            .unwrap_or_default())
+    /// Reads one graph clock from a coherent Fjall snapshot.
+    pub(crate) fn vector_clock_id(&self, graph_id: TermId) -> Result<VectorClock> {
+        self.snapshot_vector_clock(&self.db.snapshot(), graph_id)
     }
 
-    /// Read a graph's vector clock from its own `'K'` key. Open-time only —
-    /// everything else reads the mirror seeded from this.
-    ///
-    /// Falls back to the clock embedded in the legacy metadata record when no
-    /// `'K'` key exists yet, which is the one-time migration path for stores
-    /// written before the split; the first [`GraphStore::set_vector_clock`]
-    /// writes `'K'` and the legacy copy is ignored from then on.
-    fn durable_vector_clock(&self, graph_id: TermId) -> Result<VectorClock> {
-        if let Some(bytes) = self.graphs.get(graph_clock_key(graph_id))? {
-            return Ok(postcard::from_bytes(bytes.as_ref())?);
-        }
-        Ok(self
-            .read_graph_meta_by_id(graph_id)?
-            .unwrap_or_default()
-            .clock)
-    }
-
-    /// Write **only** the graph's clock key; the metadata record (policy,
-    /// context, topic binding) is never rewritten, so a commit cannot clobber a
-    /// concurrent policy or context write.
-    ///
-    /// The mirror update is staged, not applied: the batch can still fail, and
-    /// only [`GraphStore::commit_with_index`] knows when the clock is really
-    /// visible.
-    ///
-    /// Does not lock — the caller must hold the graph commit guard, which is
-    /// what makes the read-clock → advance → write-clock cycle atomic (G2).
+    /// Stages only the graph clock while the caller holds the graph guard.
     pub fn set_vector_clock(&self, batch: &mut WriteBatch, update: ClockUpdate<'_>) -> Result<()> {
         batch.insert(
             &self.graphs,
@@ -9185,15 +9222,11 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Next per-(graph, actor) event counter, staged into `batch`.
-    ///
-    /// The caller MUST hold the graph commit guard: the read-then-write of the
-    /// log head is what guarantees two concurrent local writes never mint the
-    /// same dot (G1).
+    /// Stages the next actor counter while the caller holds the graph guard.
     pub fn next_counter(&self, batch: &mut WriteBatch, key: CounterKey) -> Result<u64> {
         let head = log_head_key(key.graph_id, &key.actor);
         let counter = match self.log.get(head)? {
-            Some(value) => decode_u64_bytes(value.as_ref(), "log head")? + 1,
+            Some(value) => decode_u64(value.as_ref(), "log head")? + 1,
             None => 1,
         };
         batch.insert(&self.log, head, counter.to_be_bytes());
@@ -9213,13 +9246,7 @@ impl GraphStore {
         Ok(term)
     }
 
-    /// Queue one subject for search reindexing, in the same durable batch as the
-    /// store mutation that dirtied it (G7).
-    ///
-    /// The token is minted when the batch commits, not here: a token handed out
-    /// now but made durable later could sit below a bound a flush pinned in
-    /// between, and the flush would return without the entry ever being visible
-    /// to its drain.
+    /// Queues one subject in the source batch; commit later mints its token.
     pub fn enqueue_fts(&self, batch: &mut WriteBatch, key: FtsSubject) -> Result<()> {
         batch.pending_fts.push(FtsQueueKey::Subject {
             graph: key.graph_id,
@@ -9228,16 +9255,12 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Queue a set of subjects, collapsing to a whole-graph reindex only when
-    /// the rescan is genuinely the cheaper of the two.
-    ///
-    /// See [`GraphStore::fts_reindex_is_cheaper`] for the rule and for why
-    /// picking the per-subject branch cannot lose search freshness (G7).
+    /// Queues subjects or a cheaper whole-graph reindex.
     pub fn enqueue_fts_subjects(&self, batch: &mut WriteBatch, req: FtsEnqueue<'_>) -> Result<()> {
         if req.subjects.is_empty() {
             return Ok(());
         }
-        if self.fts_reindex_is_cheaper(req.graph_id, req.subjects.len())? {
+        if self.reindex_is_cheaper(req.graph_id, req.subjects.len())? {
             return self.enqueue_fts_reindex(batch, req.graph_id);
         }
         for subject in req.subjects {
@@ -9252,14 +9275,9 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Whether rescanning the whole graph beats queueing `subjects` dirty
-    /// entries: the batch must be large *and* cover much of the graph.
-    ///
-    /// Safe to take the per-subject branch (G7) because callers pass exactly the
-    /// subjects their write changed, and orphan-status flips on untouched
-    /// subjects are queued separately by the diagnostics settle.
-    fn fts_reindex_is_cheaper(&self, graph_id: TermId, subjects: usize) -> Result<bool> {
-        Ok(subjects >= FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD
+    /// Chooses a full graph scan only for a large, dense subject set.
+    fn reindex_is_cheaper(&self, graph_id: TermId, subjects: usize) -> Result<bool> {
+        Ok(subjects >= FTS_REINDEX_THRESHOLD
             && subjects * 2 >= self.graph_subject_count(graph_id)?)
     }
 
@@ -9268,7 +9286,8 @@ impl GraphStore {
         Ok(())
     }
 
-    pub fn drain_fts_queue(&self, limit: usize) -> Result<Vec<DirtySubject>> {
+    #[cfg(test)]
+    pub(crate) fn drain_fts_queue(&self, limit: usize) -> Result<Vec<DirtySubject>> {
         let mut result = Vec::new();
         let mut term_cache = HashMap::new();
 
@@ -9299,7 +9318,8 @@ impl GraphStore {
         Ok(result)
     }
 
-    pub fn drain_fts_reindex_queue(&self, limit: usize) -> Result<Vec<DirtyGraph>> {
+    #[cfg(test)]
+    pub(crate) fn drain_reindex_queue(&self, limit: usize) -> Result<Vec<DirtyGraph>> {
         let mut result = Vec::new();
         let mut term_cache = HashMap::new();
 
@@ -9325,11 +9345,12 @@ impl GraphStore {
         Ok(result)
     }
 
-    pub fn drain_fts_delete_queue(&self, limit: usize) -> Result<Vec<DirtyGraph>> {
+    #[cfg(test)]
+    pub(crate) fn drain_delete_queue(&self, limit: usize) -> Result<Vec<DirtyGraph>> {
         let mut result = Vec::new();
         let mut term_cache = HashMap::new();
 
-        for guard in self.graphs.prefix(graph_search_delete_prefix()) {
+        for guard in self.graphs.prefix(graph_delete_prefix()) {
             let (key, value) = guard.into_inner()?;
             if key.len() != 17 {
                 continue;
@@ -9349,6 +9370,198 @@ impl GraphStore {
         }
 
         Ok(result)
+    }
+
+    fn ordered_queue(&self, kind: QueueKind, scan: &QueueScan) -> Result<OrderedQueuePage> {
+        let after = scan.after.map(search_order_key);
+        let mut page = OrderedQueuePage {
+            rows: Vec::new(),
+            next: scan.after,
+            remaining: false,
+            visited: 0,
+            bytes: 0,
+            oversized: None,
+        };
+        for guard in self.search_queue.prefix([SEARCH_ORDER_PREFIX]) {
+            let (key, identity) = guard.into_inner()?;
+            if after
+                .as_ref()
+                .is_some_and(|after| key.as_ref() <= after.as_slice())
+            {
+                continue;
+            }
+            let cursor = decode_search_order(key.as_ref())?;
+            if scan.max_token.is_some_and(|bound| cursor.token > bound) {
+                break;
+            }
+            if page.visited == scan.row_limit {
+                page.remaining = true;
+                break;
+            }
+            page.visited += 1;
+            if cursor.kind != kind {
+                page.next = Some(cursor);
+                continue;
+            }
+            let current = self
+                .graphs
+                .get(identity.as_ref())?
+                .ok_or(StoreError::InvalidSearchState("queue-order-orphan"))?;
+            let tokens = decode_dirty_tokens(current.as_ref(), "fts queue tokens")?;
+            if tokens.oldest != cursor.token {
+                return Err(StoreError::InvalidSearchState("queue-order-token-mismatch"));
+            }
+            let graph_bytes =
+                self.terms
+                    .size_of(cursor.graph.to_be_bytes())?
+                    .ok_or(StoreError::TermNotFound(cursor.graph.0))? as usize;
+            let encoded = key
+                .len()
+                .saturating_add(identity.len())
+                .saturating_add(current.len())
+                .saturating_add(graph_bytes);
+            if page.bytes.saturating_add(encoded) > scan.byte_limit {
+                if encoded > scan.byte_limit {
+                    page.oversized = Some((cursor, tokens.latest, encoded));
+                    page.next = Some(cursor);
+                }
+                page.remaining = true;
+                break;
+            }
+            page.bytes = page.bytes.saturating_add(encoded);
+            page.rows.push((cursor, tokens));
+            page.next = Some(cursor);
+        }
+        Ok(page)
+    }
+
+    fn queue_id(&self, cursor: QueueCursor) -> Result<QueueId> {
+        let graph = self
+            .decode_term(cursor.graph)?
+            .to_named_node()
+            .map(GraphId)
+            .ok_or(StoreError::InvalidSearchState("queue-graph-not-named"))?;
+        Ok(QueueId {
+            kind: cursor.kind,
+            graph,
+            subject: cursor.subject,
+        })
+    }
+
+    pub(crate) fn scan_fts_subjects(&self, scan: &QueueScan) -> Result<QueuePage<DirtySubject>> {
+        let page = self.ordered_queue(QueueKind::Subject, scan)?;
+        let mut entries = Vec::with_capacity(page.rows.len());
+        for (cursor, tokens) in page.rows {
+            let id = self.queue_id(cursor)?;
+            entries.push(DirtySubject {
+                graph: id.graph,
+                subject: cursor.subject.ok_or(StoreError::InvalidSearchState(
+                    "subject-queue-subject-missing",
+                ))?,
+                tokens,
+            });
+        }
+        Ok(QueuePage {
+            entries,
+            next: page.next,
+            remaining: page.remaining,
+            rows: page.visited,
+            bytes: page.bytes,
+            oversized: page
+                .oversized
+                .map(|(cursor, target, bytes)| {
+                    Ok::<OversizedEntry, StoreError>(OversizedEntry {
+                        id: self.queue_id(cursor)?,
+                        owed_from: cursor.token,
+                        target,
+                        bytes,
+                    })
+                })
+                .transpose()?,
+        })
+    }
+
+    pub(crate) fn scan_fts_reindexes(&self, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
+        self.scan_fts_graphs(QueueKind::Reindex, scan)
+    }
+
+    pub(crate) fn scan_fts_deletes(&self, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
+        self.scan_fts_graphs(QueueKind::Delete, scan)
+    }
+
+    fn scan_fts_graphs(&self, kind: QueueKind, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
+        let page = self.ordered_queue(kind, scan)?;
+        let mut entries = Vec::with_capacity(page.rows.len());
+        for (cursor, tokens) in page.rows {
+            entries.push(DirtyGraph {
+                graph: self.queue_id(cursor)?.graph,
+                tokens,
+            });
+        }
+        Ok(QueuePage {
+            entries,
+            next: page.next,
+            remaining: page.remaining,
+            rows: page.visited,
+            bytes: page.bytes,
+            oversized: page
+                .oversized
+                .map(|(cursor, target, bytes)| {
+                    Ok::<OversizedEntry, StoreError>(OversizedEntry {
+                        id: self.queue_id(cursor)?,
+                        owed_from: cursor.token,
+                        target,
+                        bytes,
+                    })
+                })
+                .transpose()?,
+        })
+    }
+
+    fn queue_id_cursor(&self, id: &QueueId) -> Result<Option<QueueCursor>> {
+        let Some(graph) = self.graph_id_for(&id.graph)? else {
+            return Ok(None);
+        };
+        Ok(Some(QueueCursor {
+            token: 0,
+            kind: id.kind,
+            graph,
+            subject: id.subject,
+        }))
+    }
+
+    pub(crate) fn fts_failure(&self, id: &QueueId) -> Result<Option<RetryState>> {
+        let Some(cursor) = self.queue_id_cursor(id)? else {
+            return Ok(None);
+        };
+        self.search_meta
+            .get(search_failure_key(cursor))?
+            .map(|value| postcard::from_bytes(value.as_ref()).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub(crate) fn set_fts_failure(&self, state: &RetryState) -> Result<()> {
+        let cursor = self
+            .queue_id_cursor(&state.id)?
+            .ok_or(StoreError::InvalidSearchState(
+                "failure-queue-identity-missing",
+            ))?;
+        let mut batch = self.buffered_batch();
+        batch.insert(
+            &self.search_meta,
+            search_failure_key(cursor),
+            postcard::to_allocvec(state)?,
+        );
+        self.commit_fjall_batch(batch)
+    }
+
+    pub(crate) fn clear_fts_failure(&self, id: &QueueId) -> Result<()> {
+        let Some(cursor) = self.queue_id_cursor(id)? else {
+            return Ok(());
+        };
+        let mut batch = self.buffered_batch();
+        batch.remove(&self.search_meta, search_failure_key(cursor));
+        self.commit_fjall_batch(batch)
     }
 
     /// Drop the subject entries the indexer just covered, keeping any that were
