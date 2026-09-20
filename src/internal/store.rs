@@ -4907,11 +4907,186 @@ impl GraphStore {
         }
     }
 
+    fn recover_query_build(&self, stop: Option<&AtomicBool>) -> Result<()> {
+        let snapshot = self.db.snapshot();
+        let active = match self.snapshot_index_header(&snapshot)? {
+            IndexHeaderRead::Valid(header) => IndexSlot::decode(header.active_slot),
+            IndexHeaderRead::Legacy(_) => Some(IndexSlot::Primary),
+            IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
+        };
+        if let Some(build) = self.query_build(&snapshot)? {
+            let slot = IndexSlot::decode(build.slot)
+                .ok_or(StoreError::IndexVerificationFailed("build-slot-invalid"))?;
+            if Some(slot) == active {
+                return Err(StoreError::IndexVerificationFailed("build-target-active"));
+            }
+            self.clear_query_slot(slot, stop)?;
+            {
+                let _projection = self
+                    .projection_lock
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let owner = self
+                    .qv_gate
+                    .acquire_timeout(self.qv_commit_wait)
+                    .ok_or(StoreError::QueryIndexBusy)?;
+                let current = self.query_build(&self.db.snapshot())?.ok_or(
+                    StoreError::QueryIndexUnavailable("query-index build record missing"),
+                )?;
+                if current.format != build.format
+                    || current.slot != build.slot
+                    || current.source_sequence != build.source_sequence
+                    || current.control_digest != build.control_digest
+                {
+                    return Err(StoreError::QueryIndexUnavailable(
+                        "query-index build changed during recovery",
+                    ));
+                }
+                #[cfg(test)]
+                self.run_rebuild_hook(RebuildPhase::Retire);
+                let mut batch = self.buffered_batch();
+                batch.remove(&self.qv2_meta, QV_BUILD_KEY);
+                self.commit_fjall_batch(batch)?;
+                owner.finish();
+            }
+            self.clear_query_deltas(stop)?;
+        }
+        let snapshot = self.db.snapshot();
+        let cleanup = snapshot
+            .get(&self.qv2_meta, QV_CLEANUP_KEY)?
+            .map(|value| postcard::from_bytes::<QueryCleanupRecord>(value.as_ref()))
+            .transpose()?;
+        if let Some(cleanup) = cleanup {
+            if cleanup.format > QV_SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedIndexFormat {
+                    found: cleanup.format,
+                    supported: QV_SCHEMA_VERSION,
+                });
+            }
+            if cleanup.format != QV_SCHEMA_VERSION {
+                return Ok(());
+            }
+            let slot = IndexSlot::decode(cleanup.slot)
+                .ok_or(StoreError::IndexVerificationFailed("cleanup-slot-invalid"))?;
+            let current = match self.snapshot_index_header(&self.db.snapshot())? {
+                IndexHeaderRead::Valid(header) => IndexSlot::decode(header.active_slot),
+                IndexHeaderRead::Legacy(_) => Some(IndexSlot::Primary),
+                IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
+            };
+            if Some(slot) != current {
+                self.clear_query_slot(slot, stop)?;
+                self.clear_query_deltas(stop)?;
+                let mut batch = self.buffered_batch();
+                batch.remove(&self.qv2_meta, QV_CLEANUP_KEY);
+                self.commit_fjall_batch(batch)?;
+            } else {
+                return Err(StoreError::IndexVerificationFailed("cleanup-target-active"));
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_query_deltas(
+        &self,
+        build: &mut QueryBuildRecord,
+        candidate: &mut IndexHeader,
+        target: u64,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        while build.replay_cursor < target {
+            if stop.load(Ordering::Relaxed) {
+                return Err(StoreError::Cancelled);
+            }
+            let owner = self
+                .qv_gate
+                .acquire_timeout(self.qv_commit_wait)
+                .ok_or(StoreError::QueryIndexBusy)?;
+            let result = self.replay_query_delta(build, candidate, target);
+            owner.finish();
+            result?;
+        }
+        Ok(())
+    }
+
+    fn replay_query_delta(
+        &self,
+        build: &mut QueryBuildRecord,
+        candidate: &mut IndexHeader,
+        target: u64,
+    ) -> Result<()> {
+        let snapshot = self.db.snapshot();
+        let current = self
+            .query_build(&snapshot)?
+            .ok_or(StoreError::QueryIndexUnavailable(
+                "query-index build record missing",
+            ))?;
+        if current.replay_cursor != build.replay_cursor {
+            return Err(StoreError::QueryIndexUnavailable(
+                "query-index replay cursor changed",
+            ));
+        }
+        *build = current;
+        if build.replay_cursor < target {
+            let delta_id = build
+                .replay_cursor
+                .checked_add(1)
+                .ok_or(StoreError::IndexVerificationFailed("delta-cursor-overflow"))?;
+            let value = snapshot
+                .get(&self.qv2_meta, query_delta_key(delta_id))?
+                .ok_or(StoreError::IndexVerificationFailed("delta-row-missing"))?;
+            let delta: QueryDeltaRecord = postcard::from_bytes(value.as_ref())?;
+            let mut plan = self
+                .plan_index_update(&snapshot, candidate, delta.transitions)?
+                .ok_or(StoreError::IndexVerificationFailed("delta-replay-failed"))?;
+            let next = plan.header.take();
+            let mut batch = self.buffered_batch();
+            self.stage_index_plan(&mut batch, plan);
+            build.replay_cursor = delta_id;
+            build.phase = QueryBuildPhase::Replay;
+            build.target = Some(target);
+            batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(build)?);
+            self.commit_fjall_batch(batch)?;
+            #[cfg(test)]
+            self.run_rebuild_hook(RebuildPhase::ReplayPage);
+            if let Some(mut next) = next {
+                next.state = StoredIndexState::Building;
+                *candidate = next;
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_owned_deltas(
+        &self,
+        build: &mut QueryBuildRecord,
+        candidate: &mut IndexHeader,
+        target: u64,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        while build.replay_cursor < target {
+            if stop.load(Ordering::Relaxed) {
+                return Err(StoreError::Cancelled);
+            }
+            self.replay_query_delta(build, candidate, target)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn repair_query_indexes(&self) -> Result<()> {
+        self.repair_query_with(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn repair_query_with(&self, stop: &AtomicBool) -> Result<()> {
+        let _maintenance = self
+            .qv_maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.recover_query_build(Some(stop))?;
         if self.snapshot_admission(&self.db.snapshot())?.trusted {
             return Ok(());
         }
-        match self.rebuild_query_indexes() {
+        match self.rebuild_query_inner(stop) {
             Err(StoreError::QueryIndexUnavailable(_)) => Ok(()),
             result => result,
         }
