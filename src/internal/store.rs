@@ -12499,9 +12499,7 @@ mod tests {
         assert_index_ready(&store, 1);
     }
 
-    /// Warming unrelated cache entries must not make a write pay for them.
-    /// Publication bumps one generation per changed graph, so the caches are
-    /// never scanned per changed quad and their recency order is never rebuilt.
+    /// Unrelated warmed entries do not add cache work to a write.
     #[test]
     fn writes_skip_scans() {
         let (_dir, store) = setup_store();
@@ -12519,7 +12517,7 @@ mod tests {
         for quad in &warmed_quads {
             store.triples_for_subject(quad.graph, quad.subject).unwrap();
             store
-                .ordered_objects_for_subject_predicate(quad.graph, quad.subject, quad.predicate)
+                .ordered_objects(quad.graph, quad.subject, quad.predicate)
                 .unwrap();
         }
         let warmed = store.cache_statistics();
@@ -12679,14 +12677,14 @@ mod tests {
     fn small_budget_unfloored() {
         let tight = CacheBudget::from_limit(Some(256 * 1_048_576));
         assert!(
-            tight.database < DEFAULT_DB_CACHE_BYTES,
+            tight.database < DEFAULT_DB_BYTES,
             "a 256 MiB process must not be given a 1 GiB block cache"
         );
-        assert!(tight.database >= MIN_DB_CACHE_BYTES);
-        assert!(tight.terms < TERM_DECODE_CACHE_BYTES);
-        assert!(tight.subjects < QUAD_SUBJECT_CACHE_BYTES);
-        assert!(tight.objects < OBJECT_ORDER_CACHE_BYTES);
-        assert!(tight.terms >= MIN_APP_CACHE_BYTES);
+        assert!(tight.database >= MIN_DB_BYTES);
+        assert!(tight.terms < TERM_CACHE_BYTES);
+        assert!(tight.subjects < SUBJECT_CACHE_BYTES);
+        assert!(tight.objects < ORDER_CACHE_BYTES);
+        assert!(tight.terms >= MIN_APP_BYTES);
 
         let application = tight.terms + tight.subjects + tight.objects + tight.planner;
         assert!(
@@ -12698,16 +12696,16 @@ mod tests {
     #[test]
     fn large_budget_defaults() {
         let roomy = CacheBudget::from_limit(Some(64 * 1_024 * 1_048_576));
-        assert_eq!(roomy.database, MAX_DB_CACHE_BYTES);
-        assert_eq!(roomy.terms, TERM_DECODE_CACHE_BYTES);
-        assert_eq!(roomy.subjects, QUAD_SUBJECT_CACHE_BYTES);
-        assert_eq!(roomy.objects, OBJECT_ORDER_CACHE_BYTES);
-        assert_eq!(roomy.planner, PLANNER_DISTINCT_CACHE_BYTES);
+        assert_eq!(roomy.database, MAX_DB_BYTES);
+        assert_eq!(roomy.terms, TERM_CACHE_BYTES);
+        assert_eq!(roomy.subjects, SUBJECT_CACHE_BYTES);
+        assert_eq!(roomy.objects, ORDER_CACHE_BYTES);
+        assert_eq!(roomy.planner, PLANNER_CACHE_BYTES);
 
         // No ceiling readable keeps the historical sizes rather than guessing.
         let unknown = CacheBudget::from_limit(None);
-        assert_eq!(unknown.database, DEFAULT_DB_CACHE_BYTES);
-        assert_eq!(unknown.terms, TERM_DECODE_CACHE_BYTES);
+        assert_eq!(unknown.database, DEFAULT_DB_BYTES);
+        assert_eq!(unknown.terms, TERM_CACHE_BYTES);
     }
 
     #[test]
@@ -12725,9 +12723,7 @@ mod tests {
         assert_eq!(meminfo_available(&dir.path().join("absent")), None);
     }
 
-    /// Runs `mutate` on another thread while this thread owns query-view
-    /// maintenance, and reports whether that commit published durable projection
-    /// debt before its repair could run.
+    /// Reports whether a mutation publishes debt while QV maintenance is owned.
     fn debt_seen_during(store: &GraphStore, mutate: impl FnOnce() + Send) -> bool {
         let held = store.qv_gate.try_acquire().expect("gate starts free");
         let mut observed = false;
@@ -12745,10 +12741,7 @@ mod tests {
         observed
     }
 
-    /// Every authoritative mutation path reaches the same commit point, so each
-    /// one either publishes its query-view rows in the source batch or publishes
-    /// durable projection debt. Exercised here through a real remove and a real
-    /// graph deletion, not through a hand-built batch.
+    /// Real remove and delete paths publish QV rows or durable debt.
     #[test]
     fn mutations_record_debt() {
         let (_dir, store) = setup_store();
@@ -12758,7 +12751,7 @@ mod tests {
         let doomed = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
         commit_add(&store, &graph, kept);
         let dot = commit_add(&store, &graph, doomed);
-        assert_query_index_ready(&store, 2);
+        assert_index_ready(&store, 2);
 
         let mut witnessed = VectorClock::new();
         witnessed.advance(dot.actor, dot.counter);
@@ -12768,7 +12761,7 @@ mod tests {
             }),
             "a removal that skipped maintenance must publish projection debt"
         );
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
 
         let actor = ActorId::random();
         let clock = store.get_vector_clock(&graph).unwrap();
@@ -12784,7 +12777,7 @@ mod tests {
             }),
             "a graph deletion that skipped maintenance must publish projection debt"
         );
-        assert_query_index_ready(&store, 0);
+        assert_index_ready(&store, 0);
     }
 
     #[test]
@@ -12813,43 +12806,127 @@ mod tests {
         assert_eq!(store.predicate_object_count(first.predicate), 1);
     }
 
-    fn query_index_header_for_test(store: &GraphStore) -> QueryIndexHeader {
+    #[test]
+    fn predicate_cache_scopes() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:planner-cache-scope");
+        store.create_graph(&graph).unwrap();
+        let first = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o:1"));
+        let second = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o:2"));
+        commit_add(&store, &graph, first);
+        assert_index_ready(&store, 1);
+        let measure = || {
+            let costs = QueryCost::planner(true);
+            let count = store.planner_stat(PlannerStat::PredicateSubjects(first.predicate), &costs);
+            (count, costs.snapshot())
+        };
+
+        let (count, cold) = measure();
+        assert_eq!(count, 1);
+        assert!(cold.planner_index_entries > 0);
+        let (_, warm) = measure();
+        assert_eq!(warm.planner_index_entries, 0);
+
+        let unrelated = encode_quad(&store, &graph, ("urn:s:3", "urn:q", "urn:o:3"));
+        commit_add(&store, &graph, unrelated);
+        let (_, unrelated_write) = measure();
+        assert_eq!(unrelated_write.planner_index_entries, 0);
+
+        commit_add(&store, &graph, first);
+        let (_, duplicate_write) = measure();
+        assert_eq!(duplicate_write.planner_index_entries, 0);
+
+        let clock = store.get_vector_clock(&graph).unwrap();
+        commit_remove(&store, &graph, first, &clock);
+        let (count, relevant_delete) = measure();
+        assert_eq!(count, 0);
+        assert!(relevant_delete.planner_cache_misses > 0);
+        assert_index_ready(&store, 1);
+
+        commit_adds(&store, &graph, &[first, second]);
+        let (count, reinserted) = measure();
+        assert_eq!(count, 2);
+        assert!(reinserted.planner_index_entries > 0);
+        assert_index_ready(&store, 3);
+
+        store.rebuild_query_indexes().unwrap();
+        let (count, rebuilt) = measure();
+        assert_eq!(count, 2);
+        assert!(rebuilt.planner_index_entries > 0);
+    }
+
+    #[test]
+    fn fallback_stays_unknown() {
+        let (_dir, store) = setup_store();
+        let mut batch = store.buffered_batch();
+        let dot = Dot {
+            actor: ActorId::from_bytes([7; 32]),
+            counter: 1,
+        };
+        for index in 0..=PLANNER_SAMPLE_ROWS {
+            let quad = EncodedQuad {
+                graph: TermId(1),
+                subject: TermId(index as u128),
+                predicate: TermId(2),
+                object: TermId(3),
+            };
+            batch.insert(
+                &store.quads,
+                GraphStore::quad_key(quad.graph, quad.subject, quad.predicate, quad.object),
+                encode_dots(&[dot]),
+            );
+        }
+        store.stage_index_failure(&mut batch, Some(&test_index_header(&store)), "test-failure");
+        store.commit_fjall_batch(batch).unwrap();
+
+        let costs = QueryCost::planner(true);
+        let estimate = store.planner_estimate(PlannerStat::Subject(TermId(u128::MAX)), &costs);
+        assert_eq!(estimate, PlannerEstimate::Unknown);
+        assert_eq!(
+            costs.snapshot().planner_index_entries,
+            PLANNER_SAMPLE_ROWS as u64 + 1
+        );
+    }
+
+    fn test_index_header(store: &GraphStore) -> IndexHeader {
         let snapshot = store.db.snapshot();
-        match store.query_index_header_from_snapshot(&snapshot).unwrap() {
-            QueryIndexHeaderRead::Valid(header) => header,
-            QueryIndexHeaderRead::Absent
-            | QueryIndexHeaderRead::Legacy(_)
-            | QueryIndexHeaderRead::Malformed => {
+        match store.snapshot_index_header(&snapshot).unwrap() {
+            IndexHeaderRead::Valid(header) => header,
+            IndexHeaderRead::Absent | IndexHeaderRead::Legacy(_) | IndexHeaderRead::Malformed => {
                 panic!("query-index header must be present and valid")
             }
         }
     }
 
-    fn query_index_counter_for_test(store: &GraphStore, key: QueryIndexCounterKey) -> Option<u64> {
+    fn test_index_counter(store: &GraphStore, key: IndexCounterKey) -> Option<u64> {
         let snapshot = store.db.snapshot();
-        snapshot
-            .get(&store.qv2_meta, key.bytes())
+        let spaces = store
+            .active_query_spaces(&snapshot)
             .unwrap()
-            .map(|value| decode_query_index_u64(value.as_ref()).unwrap())
+            .expect("query-index header must select an active slot");
+        snapshot
+            .get(spaces.meta, key.bytes())
+            .unwrap()
+            .map(|value| decode_index_count(value.as_ref()).unwrap())
     }
 
-    fn query_term_id_for_test(store: &GraphStore, term: TermId) -> QueryTermId {
+    fn test_query_id(store: &GraphStore, term: TermId) -> QueryTermId {
         let snapshot = store.db.snapshot();
         store
-            .query_term_id_from_snapshot(&snapshot, term)
+            .snapshot_query_id(&snapshot, term)
             .unwrap()
             .expect("live query-index term must have a dense id")
     }
 
-    fn query_quad_for_test(store: &GraphStore, quad: EncodedQuad) -> QueryQuad {
+    fn test_query_quad(store: &GraphStore, quad: EncodedQuad) -> QueryQuad {
         let snapshot = store.db.snapshot();
         store
-            .query_quad_from_snapshot(&snapshot, quad)
+            .snapshot_query_quad(&snapshot, quad)
             .unwrap()
             .expect("live query-index quad must have dense ids")
     }
 
-    fn assert_query_index_ready(store: &GraphStore, source_rows: u64) {
+    fn assert_index_ready(store: &GraphStore, source_rows: u64) {
         let status = store.query_index_status().unwrap();
         assert_eq!(status.state, QueryIndexState::Ready);
         assert_eq!(status.source_live_quads, source_rows);
@@ -12857,7 +12934,7 @@ mod tests {
         assert!(store.verify_query_indexes(true).unwrap().valid);
     }
 
-    fn assert_query_index_problem(report: &QueryIndexVerification, problem: &str) {
+    fn assert_index_problem(report: &QueryIndexVerification, problem: &str) {
         assert!(
             report.problems.iter().any(|current| current == problem),
             "expected query-index problem {problem}, got {:?}",
@@ -12865,13 +12942,13 @@ mod tests {
         );
     }
 
-    fn stage_query_index_header_for_test(store: &GraphStore, header: &QueryIndexHeader) {
+    fn stage_test_header(store: &GraphStore, header: &IndexHeader) {
         let mut batch = store.buffered_batch();
-        store.stage_query_index_header(&mut batch, header);
+        store.stage_index_header(&mut batch, header);
         store.commit_fjall_batch(batch).unwrap();
     }
 
-    fn stage_query_index_value_for_test(
+    fn stage_test_value(
         store: &GraphStore,
         keyspace: &Keyspace,
         key: impl Into<fjall::UserKey>,
@@ -12882,17 +12959,13 @@ mod tests {
         store.commit_fjall_batch(batch).unwrap();
     }
 
-    fn remove_query_index_key_for_test(
-        store: &GraphStore,
-        keyspace: &Keyspace,
-        key: impl Into<fjall::UserKey>,
-    ) {
+    fn remove_test_key(store: &GraphStore, keyspace: &Keyspace, key: impl Into<fjall::UserKey>) {
         let mut batch = store.buffered_batch();
         batch.remove(keyspace, key);
         store.commit_fjall_batch(batch).unwrap();
     }
 
-    fn read_rows_for_test(
+    fn read_test_rows(
         store: &GraphStore,
         selector: GraphSelector,
         pattern: QuadPattern,
@@ -12949,14 +13022,14 @@ mod tests {
         let graph = GraphId::new("urn:test:qv:old-source");
         {
             let store = GraphStore::open(dir.path()).unwrap();
-            assert_query_index_ready(&store, 0);
+            assert_index_ready(&store, 0);
 
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             commit_add(&store, &graph, quad);
-            assert_query_index_ready(&store, 1);
+            assert_index_ready(&store, 1);
 
-            remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
+            remove_test_key(&store, &store.qv2_meta, QV_HEADER_KEY);
             store.persist().unwrap();
         }
 
@@ -12972,6 +13045,28 @@ mod tests {
                 .len(),
             1,
             "Missing must leave canonical fallback reads available"
+        );
+    }
+
+    #[test]
+    fn prior_header_rebuilds() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:prior-query-format");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        store.rebuild_query_indexes().unwrap();
+        let header = test_index_header(&store);
+        assert_eq!(header.active_slot, IndexSlot::Secondary.encode());
+        let mut bytes = encode_index_header(&header);
+        bytes[4..8].copy_from_slice(&4u32.to_be_bytes());
+        stage_test_value(&store, &store.qv2_meta, QV_HEADER_KEY, bytes);
+
+        store.rebuild_query_indexes().unwrap();
+        assert_index_ready(&store, 1);
+        assert_eq!(
+            store.quads_for_pattern(None, None, None, None).unwrap(),
+            vec![quad]
         );
     }
 
@@ -13041,12 +13136,12 @@ mod tests {
                 object: query_object,
             };
             let v2_keys = [
-                qv2_gspo_key(query_quad),
-                qv2_gpos_key(query_quad),
-                qv2_spog_key(query_quad),
-                qv2_posg_key(query_quad),
-                qv2_ospg_key(query_quad),
-                qv2_gosp_key(query_quad),
+                gspo_key(query_quad),
+                gpos_key(query_quad),
+                spog_key(query_quad),
+                posg_key(query_quad),
+                ospg_key(query_quad),
+                gosp_key(query_quad),
             ];
             let u128_keys = [
                 GraphStore::quad_key(graph, subject, predicate, object),
@@ -13149,12 +13244,12 @@ mod tests {
         assert_eq!(1, stats.qv_admission_checks);
         assert_eq!(5, stats.qv_counter_reads);
 
-        stage_query_index_value_for_test(
+        stage_test_value(
             &store,
             &store.qv2_meta,
-            QueryIndexCounterKey::GraphPredicate(
-                query_term_id_for_test(&store, quad.graph),
-                query_term_id_for_test(&store, quad.predicate),
+            IndexCounterKey::GraphPredicate(
+                test_query_id(&store, quad.graph),
+                test_query_id(&store, quad.predicate),
             )
             .bytes(),
             [0_u8],
@@ -13166,9 +13261,9 @@ mod tests {
                 .unwrap()
         );
 
-        let mut failed = query_index_header_for_test(&store);
-        failed.state = StoredQueryIndexState::Failed("test-failed".to_owned());
-        stage_query_index_header_for_test(&store, &failed);
+        let mut failed = test_index_header(&store);
+        failed.state = StoredIndexState::Failed("test-failed".to_owned());
+        stage_test_header(&store, &failed);
         let context = ReadContext::default();
         assert_eq!(
             None,
@@ -13215,43 +13310,43 @@ mod tests {
         let trusted: Vec<_> = patterns
             .iter()
             .copied()
-            .map(|pattern| read_rows_for_test(&store, GraphSelector::Named(first.graph), pattern))
+            .map(|pattern| read_test_rows(&store, GraphSelector::Named(first.graph), pattern))
             .collect();
-        let ready = query_index_header_for_test(&store);
+        let ready = test_index_header(&store);
 
-        remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
+        remove_test_key(&store, &store.qv2_meta, QV_HEADER_KEY);
         for (shape, expected) in patterns.iter().zip(&trusted) {
             assert_eq!(
                 expected,
-                &read_rows_for_test(&store, GraphSelector::Named(first.graph), *shape),
+                &read_test_rows(&store, GraphSelector::Named(first.graph), *shape),
                 "Missing changed binding shape {shape:?}"
             );
         }
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
 
         let mut building = ready.clone();
-        building.state = StoredQueryIndexState::Building;
-        stage_query_index_header_for_test(&store, &building);
+        building.state = StoredIndexState::Building;
+        stage_test_header(&store, &building);
         for (shape, expected) in patterns.iter().zip(&trusted) {
             assert_eq!(
                 expected,
-                &read_rows_for_test(&store, GraphSelector::Named(first.graph), *shape),
+                &read_test_rows(&store, GraphSelector::Named(first.graph), *shape),
                 "Building changed binding shape {shape:?}"
             );
         }
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
 
         let mut failed = ready.clone();
-        failed.state = StoredQueryIndexState::Failed("test-failed".to_owned());
-        stage_query_index_header_for_test(&store, &failed);
+        failed.state = StoredIndexState::Failed("test-failed".to_owned());
+        stage_test_header(&store, &failed);
         for (shape, expected) in patterns.iter().zip(&trusted) {
             assert_eq!(
                 expected,
-                &read_rows_for_test(&store, GraphSelector::Named(first.graph), *shape),
+                &read_test_rows(&store, GraphSelector::Named(first.graph), *shape),
                 "Failed changed binding shape {shape:?}"
             );
         }
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
     }
 
     #[test]
@@ -13312,7 +13407,7 @@ mod tests {
                     .is_ok()
             );
         }
-        let ready = query_index_header_for_test(&store);
+        let ready = test_index_header(&store);
 
         let assert_unavailable = |label: &str| {
             for pattern in &patterns {
@@ -13332,21 +13427,21 @@ mod tests {
             }
         };
 
-        remove_query_index_key_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY);
+        remove_test_key(&store, &store.qv2_meta, QV_HEADER_KEY);
         assert_unavailable("Missing");
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
 
         let mut building = ready.clone();
-        building.state = StoredQueryIndexState::Building;
-        stage_query_index_header_for_test(&store, &building);
+        building.state = StoredIndexState::Building;
+        stage_test_header(&store, &building);
         assert_unavailable("Building");
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
 
         let mut failed = ready.clone();
-        failed.state = StoredQueryIndexState::Failed("test-failed".to_owned());
-        stage_query_index_header_for_test(&store, &failed);
+        failed.state = StoredIndexState::Failed("test-failed".to_owned());
+        stage_test_header(&store, &failed);
         assert_unavailable("Failed");
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
     }
 
     #[test]
@@ -13362,22 +13457,22 @@ mod tests {
             object: Some(quad.object),
             ..QuadPattern::default()
         };
-        let expected = read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern);
-        let ready = query_index_header_for_test(&store);
+        let expected = read_test_rows(&store, GraphSelector::Named(quad.graph), pattern);
+        let ready = test_index_header(&store);
 
-        stage_query_index_value_for_test(&store, &store.qv2_meta, QUERY_INDEX_HEADER_KEY, [0_u8]);
+        stage_test_value(&store, &store.qv2_meta, QV_HEADER_KEY, [0_u8]);
         assert_eq!(
             expected,
-            read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern)
+            read_test_rows(&store, GraphSelector::Named(quad.graph), pattern)
         );
-        stage_query_index_header_for_test(&store, &ready);
+        stage_test_header(&store, &ready);
 
         let mut stale = ready.clone();
         stale.index_epoch = stale.index_epoch.saturating_add(1);
-        stage_query_index_header_for_test(&store, &stale);
+        stage_test_header(&store, &stale);
         assert_eq!(
             expected,
-            read_rows_for_test(&store, GraphSelector::Named(quad.graph), pattern)
+            read_test_rows(&store, GraphSelector::Named(quad.graph), pattern)
         );
     }
 
@@ -13392,17 +13487,17 @@ mod tests {
         commit_add(&store, &graph, second);
         settle_diagnostics(&store, &graph);
 
-        let (first, corrupt) = if qv2_gspo_key(query_quad_for_test(&store, first))
-            < qv2_gspo_key(query_quad_for_test(&store, second))
+        let (first, corrupt) = if gspo_key(test_query_quad(&store, first))
+            < gspo_key(test_query_quad(&store, second))
         {
             (first, second)
         } else {
             (second, first)
         };
-        stage_query_index_value_for_test(
+        stage_test_value(
             &store,
             &store.qv2_gspo,
-            qv2_gspo_key(query_quad_for_test(&store, corrupt)),
+            gspo_key(test_query_quad(&store, corrupt)),
             [1_u8],
         );
 
@@ -13421,7 +13516,7 @@ mod tests {
         assert!(matches!(cursor.next(), Some(Ok(quad)) if quad == first));
         assert!(matches!(
             cursor.next(),
-            Some(Err(StoreError::InvalidQueryIndexEncoding { .. }))
+            Some(Err(StoreError::InvalidIndexEncoding { .. }))
         ));
         assert!(
             cursor.next().is_none(),
@@ -13438,9 +13533,9 @@ mod tests {
             store.create_graph(&graph).unwrap();
             let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
             let dot = commit_add(&store, &graph, quad);
-            assert_query_index_ready(&store, 1);
-            let query_quad = query_quad_for_test(&store, quad);
-            let header = query_index_header_for_test(&store);
+            assert_index_ready(&store, 1);
+            let query_quad = test_query_quad(&store, quad);
+            let header = test_index_header(&store);
             assert_eq!(header.next_query_id, 4);
             store.persist().unwrap();
             (quad, query_quad, dot)
@@ -13448,19 +13543,19 @@ mod tests {
 
         {
             let store = GraphStore::open(dir.path()).unwrap();
-            assert_query_index_ready(&store, 1);
-            assert_eq!(query_quad_for_test(&store, quad), query_quad);
+            assert_index_ready(&store, 1);
+            assert_eq!(test_query_quad(&store, quad), query_quad);
             let mut witnessed = VectorClock::new();
             witnessed.advance(dot.actor, dot.counter);
             commit_remove(&store, &graph, quad, &witnessed);
-            assert_query_index_ready(&store, 0);
-            assert_eq!(query_quad_for_test(&store, quad), query_quad);
+            assert_index_ready(&store, 0);
+            assert_eq!(test_query_quad(&store, quad), query_quad);
             store.persist().unwrap();
         }
 
         let reopened = GraphStore::open(dir.path()).unwrap();
-        assert_query_index_ready(&reopened, 0);
-        assert_eq!(query_quad_for_test(&reopened, quad), query_quad);
+        assert_index_ready(&reopened, 0);
+        assert_eq!(test_query_quad(&reopened, quad), query_quad);
     }
 
     #[test]
@@ -13483,18 +13578,18 @@ mod tests {
         };
         let first = first.join().unwrap();
         let second = second.join().unwrap();
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
 
         let mut first_only = VectorClock::new();
         first_only.advance(first.actor, first.counter);
         commit_remove(&store, &graph, quad, &first_only);
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
 
         let mut all_dots = VectorClock::new();
         all_dots.advance(first.actor, first.counter);
         all_dots.advance(second.actor, second.counter);
         commit_remove(&store, &graph, quad, &all_dots);
-        assert_query_index_ready(&store, 0);
+        assert_index_ready(&store, 0);
     }
 
     #[test]
@@ -13550,46 +13645,40 @@ mod tests {
         first_writer.join().unwrap();
         second_writer.join().unwrap();
 
-        assert_query_index_ready(&store, 2);
-        let first_query = query_quad_for_test(&store, first);
-        let second_query = query_quad_for_test(&store, second);
+        assert_index_ready(&store, 2);
+        let first_query = test_query_quad(&store, first);
+        let second_query = test_query_quad(&store, second);
+        assert_eq!(test_index_counter(&store, IndexCounterKey::Total), Some(2));
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
+            test_index_counter(&store, IndexCounterKey::Graph(first_query.graph)),
+            Some(1)
+        );
+        assert_eq!(
+            test_index_counter(&store, IndexCounterKey::Graph(second_query.graph)),
+            Some(1)
+        );
+        assert_eq!(
+            test_index_counter(&store, IndexCounterKey::Predicate(first_query.predicate),),
             Some(2)
         );
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(first_query.graph)),
-            Some(1)
-        );
-        assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(second_query.graph)),
-            Some(1)
-        );
-        assert_eq!(
-            query_index_counter_for_test(
+            test_index_counter(
                 &store,
-                QueryIndexCounterKey::Predicate(first_query.predicate),
+                IndexCounterKey::PredicateObject(first_query.predicate, first_query.object)
             ),
             Some(2)
         );
         assert_eq!(
-            query_index_counter_for_test(
+            test_index_counter(
                 &store,
-                QueryIndexCounterKey::PredicateObject(first_query.predicate, first_query.object)
-            ),
-            Some(2)
-        );
-        assert_eq!(
-            query_index_counter_for_test(
-                &store,
-                QueryIndexCounterKey::GraphPredicate(first_query.graph, first_query.predicate)
+                IndexCounterKey::GraphPredicate(first_query.graph, first_query.predicate)
             ),
             Some(1)
         );
         assert_eq!(
-            query_index_counter_for_test(
+            test_index_counter(
                 &store,
-                QueryIndexCounterKey::GraphPredicate(second_query.graph, second_query.predicate)
+                IndexCounterKey::GraphPredicate(second_query.graph, second_query.predicate)
             ),
             Some(1)
         );
@@ -13631,9 +13720,9 @@ mod tests {
                 .unwrap();
             store.commit(batch).unwrap();
         }
-        let header = query_index_header_for_test(&store);
+        let header = test_index_header(&store);
         assert_eq!(header.source_epoch, 1);
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
 
         {
             let _guard = store.graph_commit_guard(&graph);
@@ -13658,8 +13747,8 @@ mod tests {
                 .unwrap();
             store.commit(batch).unwrap();
         }
-        assert_eq!(query_index_header_for_test(&store).source_epoch, 1);
-        assert_query_index_ready(&store, 1);
+        assert_eq!(test_index_header(&store).source_epoch, 1);
+        assert_index_ready(&store, 1);
     }
 
     #[test]
@@ -13681,32 +13770,32 @@ mod tests {
         );
 
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            test_index_counter(&store, IndexCounterKey::UnionDuplicateFree),
             Some(1)
         );
         commit_add(&store, &first_graph, first);
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            test_index_counter(&store, IndexCounterKey::UnionDuplicateFree),
             Some(1)
         );
         commit_add(&store, &second_graph, second);
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            test_index_counter(&store, IndexCounterKey::UnionDuplicateFree),
             Some(0)
         );
 
         let clock = store.get_vector_clock(&second_graph).unwrap();
         commit_remove(&store, &second_graph, second, &clock);
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            test_index_counter(&store, IndexCounterKey::UnionDuplicateFree),
             Some(0)
         );
         store.rebuild_query_indexes().unwrap();
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::UnionDuplicateFree),
+            test_index_counter(&store, IndexCounterKey::UnionDuplicateFree),
             Some(1)
         );
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
     }
 
     #[test]
@@ -13740,43 +13829,37 @@ mod tests {
         commit_add(&store, &graph_one, two);
         let three_dot = commit_add(&store, &graph_one, three);
         commit_add(&store, &graph_two, four);
-        assert_query_index_ready(&store, 4);
-        let one_query = query_quad_for_test(&store, one);
-        let three_query = query_quad_for_test(&store, three);
+        assert_index_ready(&store, 4);
+        let one_query = test_query_quad(&store, one);
+        let three_query = test_query_quad(&store, three);
 
+        assert_eq!(test_index_counter(&store, IndexCounterKey::Total), Some(4));
         assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
-            Some(4)
-        );
-        assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Graph(one_query.graph)),
+            test_index_counter(&store, IndexCounterKey::Graph(one_query.graph)),
             Some(3)
         );
         assert_eq!(
-            query_index_counter_for_test(
-                &store,
-                QueryIndexCounterKey::Predicate(one_query.predicate),
-            ),
+            test_index_counter(&store, IndexCounterKey::Predicate(one_query.predicate),),
             Some(3)
         );
         assert_eq!(
-            query_index_counter_for_test(
+            test_index_counter(
                 &store,
-                QueryIndexCounterKey::GraphPredicate(one_query.graph, one_query.predicate)
+                IndexCounterKey::GraphPredicate(one_query.graph, one_query.predicate)
             ),
             Some(2)
         );
         assert_eq!(
-            query_index_counter_for_test(
+            test_index_counter(
                 &store,
-                QueryIndexCounterKey::PredicateObject(one_query.predicate, one_query.object)
+                IndexCounterKey::PredicateObject(one_query.predicate, one_query.object)
             ),
             Some(2)
         );
         assert_eq!(
-            query_index_counter_for_test(
+            test_index_counter(
                 &store,
-                QueryIndexCounterKey::GraphPredicateObject(
+                IndexCounterKey::GraphPredicateObject(
                     one_query.graph,
                     one_query.predicate,
                     one_query.object,
@@ -13787,18 +13870,18 @@ mod tests {
         let mut witnessed = VectorClock::new();
         witnessed.advance(three_dot.actor, three_dot.counter);
         commit_remove(&store, &graph_one, three, &witnessed);
-        assert_query_index_ready(&store, 3);
+        assert_index_ready(&store, 3);
         for key in [
-            QueryIndexCounterKey::Predicate(three_query.predicate),
-            QueryIndexCounterKey::GraphPredicate(three_query.graph, three_query.predicate),
-            QueryIndexCounterKey::PredicateObject(three_query.predicate, three_query.object),
-            QueryIndexCounterKey::GraphPredicateObject(
+            IndexCounterKey::Predicate(three_query.predicate),
+            IndexCounterKey::GraphPredicate(three_query.graph, three_query.predicate),
+            IndexCounterKey::PredicateObject(three_query.predicate, three_query.object),
+            IndexCounterKey::GraphPredicateObject(
                 three_query.graph,
                 three_query.predicate,
                 three_query.object,
             ),
         ] {
-            assert_eq!(query_index_counter_for_test(&store, key), None);
+            assert_eq!(test_index_counter(&store, key), None);
         }
     }
 
@@ -13809,32 +13892,29 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         let dot = commit_add(&store, &graph, quad);
-        let query_quad = query_quad_for_test(&store, quad);
+        let query_quad = test_query_quad(&store, quad);
 
         let mut witnessed = VectorClock::new();
         witnessed.advance(dot.actor, dot.counter);
         commit_remove(&store, &graph, quad, &witnessed);
 
-        assert_query_index_ready(&store, 0);
-        let header = query_index_header_for_test(&store);
+        assert_index_ready(&store, 0);
+        let header = test_index_header(&store);
         assert_eq!(header.source_live_quads, 0);
         assert_eq!(header.indexed_quads, 0);
-        assert_eq!(
-            query_index_counter_for_test(&store, QueryIndexCounterKey::Total),
-            Some(0)
-        );
+        assert_eq!(test_index_counter(&store, IndexCounterKey::Total), Some(0));
         for key in [
-            QueryIndexCounterKey::Graph(query_quad.graph),
-            QueryIndexCounterKey::Predicate(query_quad.predicate),
-            QueryIndexCounterKey::GraphPredicate(query_quad.graph, query_quad.predicate),
-            QueryIndexCounterKey::PredicateObject(query_quad.predicate, query_quad.object),
-            QueryIndexCounterKey::GraphPredicateObject(
+            IndexCounterKey::Graph(query_quad.graph),
+            IndexCounterKey::Predicate(query_quad.predicate),
+            IndexCounterKey::GraphPredicate(query_quad.graph, query_quad.predicate),
+            IndexCounterKey::PredicateObject(query_quad.predicate, query_quad.object),
+            IndexCounterKey::GraphPredicateObject(
                 query_quad.graph,
                 query_quad.predicate,
                 query_quad.object,
             ),
         ] {
-            assert_eq!(query_index_counter_for_test(&store, key), None);
+            assert_eq!(test_index_counter(&store, key), None);
         }
         let snapshot = store.db.snapshot();
         for keyspace in [
@@ -13857,14 +13937,14 @@ mod tests {
         let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
         commit_add(&store, &graph, quad);
         let snapshot = store.db.snapshot();
-        let query_quad = query_quad_for_test(&store, quad);
+        let query_quad = test_query_quad(&store, quad);
         for (keyspace, key) in [
-            (&store.qv2_gspo, qv2_gspo_key(query_quad)),
-            (&store.qv2_gpos, qv2_gpos_key(query_quad)),
-            (&store.qv2_spog, qv2_spog_key(query_quad)),
-            (&store.qv2_posg, qv2_posg_key(query_quad)),
-            (&store.qv2_ospg, qv2_ospg_key(query_quad)),
-            (&store.qv2_gosp, qv2_gosp_key(query_quad)),
+            (&store.qv2_gspo, gspo_key(query_quad)),
+            (&store.qv2_gpos, gpos_key(query_quad)),
+            (&store.qv2_spog, spog_key(query_quad)),
+            (&store.qv2_posg, posg_key(query_quad)),
+            (&store.qv2_ospg, ospg_key(query_quad)),
+            (&store.qv2_gosp, gosp_key(query_quad)),
         ] {
             let value = snapshot.get(keyspace, key).unwrap().unwrap();
             assert!(value.as_ref().is_empty());
