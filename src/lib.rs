@@ -1,19 +1,7 @@
 //! Craqle stores, validates, queries, searches, and replicates RO-Crates.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! The integration surface is the root API: [`CraqleNode`], the typed request
-//! structs, and RO-Crate JSON-LD import/export. Everything under
-//! `src/internal/` is private to the crate.
-//!
-//! # Compatibility in 0.2.x
-//!
-//! Documented public APIs remain source compatible throughout 0.2.x unless a
-//! correctness or security defect makes that impossible. Authoritative CRDT
-//! data written by 0.2 remains readable by later 0.2 releases. Query and search
-//! indexes and compiled SHACL caches are derived data and may be rebuilt or
-//! discarded. Unsupported forms return an error. The 0.3 Irokle upgrade requires
-//! the migration steps documented in `CHANGELOG.md`.
+//! Public compatibility and migration details are in README.md and CHANGELOG.md.
 
 #![warn(unreachable_pub)]
 
@@ -25,6 +13,8 @@ mod core;
 mod count_exec;
 #[path = "internal/count_plan.rs"]
 mod count_plan;
+#[path = "internal/memory.rs"]
+mod memory;
 #[path = "internal/planner.rs"]
 mod planner;
 #[path = "internal/query/mod.rs"]
@@ -33,6 +23,9 @@ mod query;
 mod qv_gate;
 #[path = "internal/rdf_read.rs"]
 mod rdf_read;
+#[cfg(test)]
+#[path = "receipt_tests.rs"]
+mod receipt_tests;
 #[path = "internal/replication.rs"]
 mod replication;
 #[path = "internal/rocrate.rs"]
@@ -40,13 +33,11 @@ mod rocrate;
 #[path = "internal/rules.rs"]
 mod rules;
 #[cfg(feature = "search")]
-#[path = "internal/search.rs"]
+#[path = "internal/search/mod.rs"]
 mod search;
 #[cfg(not(feature = "search"))]
 #[path = "search_stub.rs"]
 mod search;
-#[path = "internal/search_queue.rs"]
-mod search_queue;
 #[cfg(feature = "shacl-core")]
 #[path = "internal/shacl/mod.rs"]
 mod shacl_impl;
@@ -64,21 +55,16 @@ mod auth;
 pub mod shacl;
 mod sync;
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::panic;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
-#[cfg(feature = "shacl-core")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::core::{
-    EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
-};
+use crate::core::{EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreChange};
 #[cfg(feature = "shacl-core")]
 use crate::query::context::ReadContext;
 #[cfg(feature = "shacl-core")]
@@ -101,6 +87,7 @@ pub use crate::core::{
     TaggedGraphPolicy, UnsupportedRdfStarTerm, VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
+pub use crate::memory::{MemoryBudget, MemoryBudgetError};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
 pub use crate::query::context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
 pub use crate::replication::{
@@ -128,8 +115,12 @@ pub use crate::sparql::{
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{
-    CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, DenyRemotePolicyChanges,
-    IrokleGraphSync, RejectedReplicationRecord, RemotePolicyAuthorizer, TopicCursorRepairAudit,
+    BackupProof, CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, DenyRemotePolicyChanges,
+    GraphHints, GraphRenderHints, HistoryRequest, HistorySnapshot, IrokleGraphSync, MutationId,
+    MutationLookup, MutationReceipt, MutationRequest, MutationStatus, PersistenceOutcome,
+    ReconcileRequest, ReconcileSource, RejectedReplicationRecord, RemotePolicyAuthorizer,
+    RepairAudit, RepairAuthority, RepairDiff, RepairMode, RepairOutcome, RepairReport,
+    RepairRequest, RepairResult, RepairState, SourceOutcome, TopicCursorRepairAudit,
     topic_cursor_digest,
 };
 pub use auth::{
@@ -139,9 +130,7 @@ pub use auth::{
 pub use irokle;
 
 /// Stable high-level classification for public Craqle failures.
-///
-/// Detailed error variants may gain additional context during 0.2.x. Callers
-/// that need durable control flow should use [`CraqleError::kind`].
+/// Use [`CraqleError::kind`] for durable control flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[non_exhaustive]
 pub enum CraqleErrorKind {
@@ -157,13 +146,10 @@ pub enum CraqleErrorKind {
     CorruptAuthoritativeData,
     DependencyUnavailable,
     Cancelled,
+    ResourceLimit,
 }
 
-/// Authoritative on-disk format understood by this release.
-///
-/// The version covers CRDT source state, graph recovery metadata, and committed
-/// policy bindings. Disposable indexes and caches have their own format
-/// markers and do not change this version.
+/// Format for authoritative state, recovery metadata, and policy bindings.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
 )]
@@ -181,32 +167,22 @@ impl DiskFormatVersion {
 /// Current authoritative disk format written by Craqle 0.2.
 pub const DISK_FORMAT_VERSION: DiskFormatVersion = DiskFormatVersion::new(1, 0);
 
-/// Test-only stall between a publish and its own apply, in microseconds.
-///
-/// The pair is one critical section: the window between the two is exactly
-/// where a concurrent write slips in and makes apply order differ from publish
-/// order. In a real run that window is a few instructions wide, far too narrow
-/// to hit on purpose, so tests widen it. Compiled out of every non-test build.
+/// Test-only delay widens the publish-before-apply race without shipping it.
+/// Jitter prevents equal delays from preserving writer entry order.
 #[cfg(test)]
-static PUBLISH_APPLY_STALL_MICROS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PUBLISH_STALL_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 fn stall_publish_apply() {
-    let micros = PUBLISH_APPLY_STALL_MICROS.load(Ordering::Relaxed);
+    let micros = PUBLISH_STALL_MICROS.load(Ordering::Relaxed);
     if micros == 0 {
         return;
     }
-    // Jittered: a fixed stall would delay every writer equally and so preserve
-    // the order they entered in, which is the order under test.
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| u64::from(since.subsec_nanos()));
     std::thread::sleep(Duration::from_micros(jitter % micros + 1));
 }
-
-#[cfg(not(test))]
-fn stall_publish_apply() {}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -224,11 +200,11 @@ pub enum CraqleError {
     #[error("SPARQL query cancelled")]
     QueryCancelled,
     #[error("update: {0}")]
-    Update(#[from] replication::UpdateError),
+    Update(#[source] replication::UpdateError),
     #[error("merge: {0}")]
-    Merge(#[from] replication::MergeError),
+    Merge(#[source] replication::MergeError),
     #[error("rocrate: {0}")]
-    RoCrate(#[from] rocrate::RoCrateError),
+    RoCrate(#[source] rocrate::RoCrateError),
     #[cfg(feature = "shacl-core")]
     #[error("shacl: {0}")]
     Shacl(#[from] ShaclError),
@@ -244,12 +220,30 @@ pub enum CraqleError {
     Sync(#[from] sync::CraqleSyncError),
     #[error("search worker: {0}")]
     SearchWorker(String),
+    #[error("search wait for target {target}: {reason}")]
+    SearchWait {
+        target: u64,
+        reason: SearchWaitError,
+    },
+    #[error("search maintenance for target {target}: {source}")]
+    SearchMaintenance {
+        target: u64,
+        kind: CraqleErrorKind,
+        #[source]
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
     #[error(transparent)]
     UnsupportedRdfStarTerm(#[from] UnsupportedRdfStarTerm),
     #[error("replication record rejected: {reason}")]
     ReplicationRejected {
+        error_kind: CraqleErrorKind,
+        reason: String,
+    },
+    #[error("authoritative repair was accepted but follow-up work failed: {reason}")]
+    RepairAccepted {
+        report: Box<RepairReport>,
         error_kind: CraqleErrorKind,
         reason: String,
     },
@@ -266,11 +260,68 @@ impl From<sparql::SparqlError> for CraqleError {
     }
 }
 
+impl From<replication::UpdateError> for CraqleError {
+    fn from(error: replication::UpdateError) -> Self {
+        Self::Update(outbound_update(error))
+    }
+}
+
+impl From<rocrate::RoCrateError> for CraqleError {
+    fn from(error: rocrate::RoCrateError) -> Self {
+        Self::RoCrate(match error {
+            rocrate::RoCrateError::Update(error) => {
+                rocrate::RoCrateError::Update(outbound_update(error))
+            }
+            error => error,
+        })
+    }
+}
+
+fn outbound_update(error: replication::UpdateError) -> replication::UpdateError {
+    match error {
+        replication::UpdateError::Accepted {
+            receipt,
+            error_kind,
+            reason,
+        } => replication::UpdateError::Accepted {
+            receipt: receipt.outbound(),
+            error_kind,
+            reason,
+        },
+        error => error,
+    }
+}
+
+impl From<replication::MergeError> for CraqleError {
+    fn from(error: replication::MergeError) -> Self {
+        Self::Merge(match error {
+            replication::MergeError::Accepted {
+                receipt,
+                error_kind,
+                reason,
+            } => replication::MergeError::Accepted {
+                receipt: receipt.outbound(),
+                error_kind,
+                reason,
+            },
+            error => error,
+        })
+    }
+}
+
 impl CraqleError {
-    /// Stable category for programmatic error handling in the 0.2 series.
+    /// Stable category for programmatic error handling.
     pub fn kind(&self) -> CraqleErrorKind {
         match self {
             Self::Io(_) | Self::SearchWorker(_) => CraqleErrorKind::Storage,
+            Self::SearchMaintenance { kind, .. } => *kind,
+            Self::SearchWait { reason, .. } => match reason {
+                SearchWaitError::Capacity | SearchWaitError::Deadline => {
+                    CraqleErrorKind::ResourceLimit
+                }
+                SearchWaitError::Cancelled => CraqleErrorKind::Cancelled,
+                SearchWaitError::Stopped => CraqleErrorKind::DependencyUnavailable,
+            },
             Self::Authorization(_) => CraqleErrorKind::Unauthorized,
             Self::Store(error) => error.kind(),
             Self::Search(error) => error.kind(),
@@ -290,6 +341,7 @@ impl CraqleError {
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
             Self::UnsupportedRdfStarTerm(_) => CraqleErrorKind::Unsupported,
             Self::ReplicationRejected { error_kind, .. } => *error_kind,
+            Self::RepairAccepted { error_kind, .. } => *error_kind,
         }
     }
 
@@ -360,10 +412,7 @@ impl CraqleFjallPersistMode {
     }
 }
 
-/// Lifecycle state of Craqle's disposable persistent query indexes.
-///
-/// The canonical CRDT quad state remains authoritative in every state. A
-/// non-ready state affects query-index availability only, never source reads.
+/// Lifecycle state of disposable query indexes; CRDT source remains authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum QueryIndexState {
@@ -390,10 +439,7 @@ pub struct QueryIndexStatus {
     pub last_build_sequence: u64,
 }
 
-/// A bounded diagnostic report for persistent-query-index verification.
-///
-/// Problems are stable implementation identifiers only; no RDF term or value
-/// bytes are included.
+/// Bounded query-index verification without RDF term or value bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct QueryIndexVerification {
@@ -451,9 +497,9 @@ impl RoCrateVersion {
 
     pub(crate) const fn context_bytes(self) -> &'static [u8] {
         match self {
-            Self::V1_1 => include_bytes!("resources/ro_crate_1_1.jsonld"),
-            Self::V1_2 => include_bytes!("resources/ro_crate_1_2.jsonld"),
-            Self::V1_3 => include_bytes!("resources/ro_crate_1_3.jsonld"),
+            Self::V1_1 => include_bytes!("rocrate/1_1.jsonld"),
+            Self::V1_2 => include_bytes!("rocrate/1_2.jsonld"),
+            Self::V1_3 => include_bytes!("rocrate/1_3.jsonld"),
         }
     }
 }
@@ -617,105 +663,316 @@ pub struct DescribeRequest<'a> {
     pub subject_id: &'a str,
 }
 
-/// Hard cap on a caller-supplied search limit, applied at every entry point.
-///
-/// Tantivy's top-k collector pre-allocates `limit * 2`, so an unbounded limit
-/// is an allocation the caller picks: `fts:limit 10000000000000` from a remote
-/// query aborted the process. Ten thousand rows is well past any real page
-/// and still a trivially sized collector.
+/// Hard cap applied before Tantivy allocates its top-k collector.
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
 
 #[cfg(test)]
-const MAX_SYNC_POLICY_PATHS: usize = 1_024;
-const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
+const MAX_POLICY_PATHS: usize = 1_024;
+const SEARCH_FLUSH_CHUNK: usize = 50_000;
 /// Control messages one worker cycle collects before it goes back to work.
 /// Anything past this stays in the channel for the next cycle.
-const SEARCH_MAX_CONTROL_MESSAGES: usize = 1_024;
+const MAX_CONTROL_MESSAGES: usize = 1_024;
 /// Above this many selected graphs, `search_graphs` runs one filtered search
 /// instead of one full top-k collection per graph.
-const SEARCH_GRAPHS_PER_GRAPH_LIMIT: usize = 8;
+const LINEAR_GRAPH_LIMIT: usize = 8;
 /// Graphs reindexed between Tantivy commits in `reindex_search`.
-const REINDEX_COMMIT_BATCH_GRAPHS: usize = 64;
+const REINDEX_BATCH_GRAPHS: usize = 64;
 
+/// Completion of an explicit maintenance shutdown attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownState {
+    Complete,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SearchWaitError {
+    #[error("maintenance worker stopped")]
+    Stopped,
+    #[error("maintenance waiter capacity exhausted")]
+    Capacity,
+    #[error("maintenance wait cancelled; durable work remains queued")]
+    Cancelled,
+    #[error("maintenance wait deadline expired; durable work remains queued")]
+    Deadline,
+}
+
+pub struct QueryRequest<'a> {
+    pub sparql: &'a str,
+    pub options: &'a QueryOptions,
+}
+
+/// Waiting limits do not discard the durable indexing obligation.
+#[derive(Clone, Debug, Default)]
+pub struct SearchFlushOptions {
+    pub timeout: Option<Duration>,
+    pub cancellation: QueryCancellation,
+}
+
+/// Reader coverage includes the submitted target and attached recovery work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchReceipt {
+    pub target: u64,
+    pub covered: u64,
+    pub recovery: Option<u64>,
+    pub index_id: [u8; 16],
+}
+
+const MAX_PENDING_FLUSHES: usize = 1_024;
+const SEARCH_WAIT_POLL: Duration = Duration::from_millis(5);
+
+type SearchReply = std::result::Result<SearchReceipt, MaintenanceFailure>;
+
+#[derive(Clone, Debug)]
+struct MaintenanceFailure {
+    kind: CraqleErrorKind,
+    source: Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl MaintenanceFailure {
+    fn search(error: search::SearchError) -> Self {
+        Self {
+            kind: error.kind(),
+            source: Arc::new(error),
+        }
+    }
+
+    fn store(error: store::StoreError) -> Self {
+        Self {
+            kind: error.kind(),
+            source: Arc::new(error),
+        }
+    }
+
+    fn message(kind: CraqleErrorKind, message: String) -> Self {
+        Self {
+            kind,
+            source: Arc::new(std::io::Error::other(message)),
+        }
+    }
+
+    fn into_error(self, target: u64) -> CraqleError {
+        CraqleError::SearchMaintenance {
+            target,
+            kind: self.kind,
+            source: self.source,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FlushPermit {
+    pending: Arc<AtomicUsize>,
+    released: AtomicBool,
+}
+
+impl FlushPermit {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for FlushPermit {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct FlushWaiter {
+    control: search::queue::DrainControl,
+    permit: Arc<FlushPermit>,
+}
+
+impl Drop for FlushWaiter {
+    fn drop(&mut self) {
+        self.control.cancel();
+        self.permit.release();
+    }
+}
+
+#[derive(Debug)]
+struct FlushRequest {
+    requested: u64,
+    target: u64,
+    recovery: Option<u64>,
+    control: search::queue::DrainControl,
+    reply: mpsc::Sender<SearchReply>,
+    _permit: Option<Arc<FlushPermit>>,
+}
+
+#[derive(Debug)]
 enum SearchWorkerMessage {
     Wake,
-    Flush(mpsc::Sender<std::result::Result<(), String>>),
+    Flush(FlushRequest),
     Stop,
 }
 
+impl SearchWorkerMessage {
+    #[cfg(test)]
+    fn flush_reply(reply: mpsc::Sender<SearchReply>, target: u64) -> Self {
+        Self::Flush(FlushRequest {
+            requested: target,
+            target,
+            recovery: None,
+            control: search::queue::DrainControl::default(),
+            reply,
+            _permit: None,
+        })
+    }
+}
+
 struct SearchUpdateWorker {
-    sender: mpsc::Sender<SearchWorkerMessage>,
-    /// `true` once a wake has been sent and not yet consumed by the worker.
-    /// Collapses a burst of writes into a single channel message instead of
-    /// one unbounded-channel send per write.
+    sender: mpsc::SyncSender<SearchWorkerMessage>,
+    store: Arc<GraphStore>,
     wake_pending: Arc<AtomicBool>,
-    /// Set by [`SearchUpdateWorker::shutdown`]. The indexer reads this between
-    /// work slices, so shutdown is observable without it first having to
-    /// consume however many control messages callers have queued ahead of the
-    /// stop request.
     stopping: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SearchUpdateWorker {
     fn start(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_FLUSHES + 2);
         let wake_pending = Arc::new(AtomicBool::new(false));
         let stopping = Arc::new(AtomicBool::new(false));
         let ctx = SearchWorkerCtx {
-            store,
+            store: store.clone(),
             search,
             wake_pending: wake_pending.clone(),
             stopping: stopping.clone(),
         };
-        let handle = std::thread::spawn(move || {
-            run_search_worker(receiver, ctx);
-        });
-
+        let handle = std::thread::spawn(move || run_search_worker(receiver, ctx));
         Self {
             sender,
+            store,
             wake_pending,
             stopping,
+            pending: Arc::new(AtomicUsize::new(0)),
             handle: Some(handle),
         }
     }
 
-    /// Stop between work slices and join before releasing the index owner.
-    /// An active dependency call must return before its writer can be released.
-    fn shutdown(&mut self) -> bool {
-        self.stopping.store(true, Ordering::SeqCst);
-        let _ = self.sender.send(SearchWorkerMessage::Stop);
-        let Some(handle) = self.handle.take() else {
-            return true;
-        };
-
-        handle.join().is_ok()
+    fn stop(&self) {
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.try_send(SearchWorkerMessage::Stop);
+        }
     }
 
-    /// Ask the worker to drain the FTS queues.
-    ///
-    /// Skipping the send while a wake is already outstanding is safe: the
-    /// worker clears the flag *before* it starts draining, so any enqueue that
-    /// observed the flag set is guaranteed to be visible to that drain. A
-    /// one-second receive timeout backstops the flag either way.
+    fn shutdown(&mut self) -> bool {
+        self.stop();
+        self.handle
+            .take()
+            .is_none_or(|handle| handle.join().is_ok())
+    }
+
+    fn shutdown_within(&mut self, timeout: Duration) -> Result<ShutdownState> {
+        self.stop();
+        let started = Instant::now();
+        while self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(ShutdownState::TimedOut);
+            }
+            // JoinHandle has no timed join; ownership stays here until it finishes.
+            std::thread::sleep(remaining.min(SEARCH_WAIT_POLL));
+        }
+        if self.shutdown() {
+            Ok(ShutdownState::Complete)
+        } else {
+            Err(CraqleError::SearchWorker(
+                "maintenance thread panicked".to_owned(),
+            ))
+        }
+    }
+
     fn wake(&self) {
-        if self.wake_pending.swap(true, Ordering::SeqCst) {
+        if self.stopping.load(Ordering::Acquire) || self.wake_pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if self.sender.send(SearchWorkerMessage::Wake).is_err() {
-            self.wake_pending.store(false, Ordering::SeqCst);
+        if self.sender.try_send(SearchWorkerMessage::Wake).is_err() {
+            self.wake_pending.store(false, Ordering::Release);
         }
     }
 
     fn flush(&self) -> Result<()> {
-        let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(SearchWorkerMessage::Flush(sender))
-            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?;
-        receiver
-            .recv()
-            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?
-            .map_err(CraqleError::SearchWorker)
+        self.flush_with(&SearchFlushOptions::default()).map(|_| ())
+    }
+
+    fn flush_with(&self, options: &SearchFlushOptions) -> Result<SearchReceipt> {
+        #[cfg(not(feature = "search"))]
+        {
+            let _ = options;
+            return Err(search::SearchError::Disabled.into());
+        }
+        #[cfg(feature = "search")]
+        {
+            let target = self.store.current_dirty_token();
+            let failure = |reason| CraqleError::SearchWait { target, reason };
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(failure(SearchWaitError::Stopped));
+            }
+            if options.cancellation.is_cancelled() {
+                return Err(failure(SearchWaitError::Cancelled));
+            }
+            self.pending
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < MAX_PENDING_FLUSHES).then(|| count + 1)
+                })
+                .map_err(|_| failure(SearchWaitError::Capacity))?;
+            let permit = Arc::new(FlushPermit {
+                pending: self.pending.clone(),
+                released: AtomicBool::new(false),
+            });
+            let control = search::queue::DrainControl::with_stop(self.stopping.clone());
+            let _waiter = FlushWaiter {
+                control: control.clone(),
+                permit: permit.clone(),
+            };
+            let (reply, receiver) = mpsc::channel();
+            let request = FlushRequest {
+                requested: target,
+                target,
+                recovery: None,
+                control,
+                reply,
+                _permit: Some(permit),
+            };
+            self.sender
+                .try_send(SearchWorkerMessage::Flush(request))
+                .map_err(|error| {
+                    failure(match error {
+                        mpsc::TrySendError::Full(_) => SearchWaitError::Capacity,
+                        mpsc::TrySendError::Disconnected(_) => SearchWaitError::Stopped,
+                    })
+                })?;
+            let started = Instant::now();
+            loop {
+                if options.cancellation.is_cancelled() {
+                    return Err(failure(SearchWaitError::Cancelled));
+                }
+                let remaining = options
+                    .timeout
+                    .map(|timeout| timeout.saturating_sub(started.elapsed()));
+                if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                    return Err(failure(SearchWaitError::Deadline));
+                }
+                match receiver
+                    .recv_timeout(remaining.unwrap_or(SEARCH_WAIT_POLL).min(SEARCH_WAIT_POLL))
+                {
+                    Ok(result) => return result.map_err(|error| error.into_error(target)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(failure(SearchWaitError::Stopped));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -725,7 +982,6 @@ impl Drop for SearchUpdateWorker {
     }
 }
 
-/// Everything the background indexer thread owns.
 struct SearchWorkerCtx {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
