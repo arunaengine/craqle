@@ -6,7 +6,7 @@ pub(crate) mod queue;
 
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 #[cfg(test)]
@@ -49,6 +49,8 @@ const STAGE_SOURCE_BYTES: usize = 256;
 /// Rebuild-lock shards. Comfortably above the indexer's concurrency while
 /// staying a fixed, tiny allocation.
 const REBUILD_SHARDS: usize = 64;
+/// Damaged graphs awaiting a reindex; later detections repeat once these are repaired.
+const DAMAGED_GRAPHS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v5";
 const INDEX_ID_FILE: &str = ".craqle-index-id";
@@ -99,6 +101,8 @@ pub enum SearchError {
     ItemTooLarge { bytes: usize, limit: usize },
     #[error("search item uses {rows} source rows, limit is {limit}")]
     SourceTooLarge { rows: usize, limit: usize },
+    #[error("search index document has malformed {detail}")]
+    Damaged { detail: &'static str },
 }
 
 impl SearchError {
@@ -110,6 +114,7 @@ impl SearchError {
                 crate::CraqleErrorKind::QueryLimit
             }
             Self::Tantivy(_) | Self::Io(_) | Self::Unbound => crate::CraqleErrorKind::Storage,
+            Self::Damaged { .. } => crate::CraqleErrorKind::CorruptDerivedData,
             Self::Store(error) => error.kind(),
         }
     }
@@ -238,6 +243,15 @@ pub(crate) struct FilterQuery<'a, E> {
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
 }
 
+/// One scored document whose required metadata the collector decodes.
+struct ActiveDoc<'a, E> {
+    view: &'a SearchView,
+    scopes: Option<&'a tantivy::columnar::BytesColumn>,
+    stable: Option<&'a tantivy::columnar::BytesColumn>,
+    doc: DocId,
+    allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
+}
+
 #[derive(Clone, Debug)]
 struct RankedDoc {
     score: Score,
@@ -333,6 +347,7 @@ pub struct SearchIndex {
     prepared_bytes: usize,
     work_lock: Mutex<()>,
     stage_sources: Mutex<HashMap<GenerationId, Arc<StageSource>>>,
+    damaged: Mutex<BTreeSet<String>>,
     session: [u8; 16],
     #[cfg(test)]
     hooks: TestHooks,
@@ -373,6 +388,8 @@ struct TestHooks {
     decoded: std::sync::atomic::AtomicUsize,
     /// Every queue entry naming this graph fails, modelling a bad item.
     fail_graph: Mutex<Option<String>>,
+    /// Fails the next required metadata read, modelling an index I/O error.
+    metadata_io: AtomicBool,
 }
 
 #[cfg(test)]
@@ -782,6 +799,7 @@ impl SearchIndex {
             prepared_bytes,
             work_lock: Mutex::new(()),
             stage_sources: Mutex::new(HashMap::new()),
+            damaged: Mutex::new(BTreeSet::new()),
             session: *uuid::Uuid::new_v4().as_bytes(),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -850,6 +868,7 @@ impl SearchIndex {
             prepared_bytes,
             work_lock: Mutex::new(()),
             stage_sources: Mutex::new(HashMap::new()),
+            damaged: Mutex::new(BTreeSet::new()),
             session: *uuid::Uuid::new_v4().as_bytes(),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -1675,12 +1694,13 @@ impl SearchIndex {
                 if reader
                     .alive_bitset()
                     .is_none_or(|alive| alive.is_alive(doc))
-                    && let Some(scope) = first_bytes(scopes.as_ref(), doc)
-                    && view.generations.active.contains(scope.as_slice())
-                    && let Some(graph) = scope_graph(&scope)
-                    && (req.allows)(graph)?
-                    && let Some(stable) = first_bytes(stable.as_ref(), doc)
-                    && let Ok(stable) = <[u8; 32]>::try_from(stable.as_slice())
+                    && let Some(stable) = self.active_key(ActiveDoc {
+                        view: &view,
+                        scopes: scopes.as_ref(),
+                        stable: stable.as_ref(),
+                        doc,
+                        allows: req.allows,
+                    })?
                 {
                     let score = scorer.score();
                     if !score.is_finite() {
@@ -1743,7 +1763,15 @@ impl SearchIndex {
                 .doc(ranked.address)
                 .map_err(SearchError::from)
                 .map_err(E::from)?;
-            let hit = self.doc_to_hit(doc, ranked.score);
+            let hit = self.doc_to_hit(doc, ranked.score).map_err(E::from)?;
+            if stable_hit_key(&hit.graph_id, &hit.subject_iri) != ranked.stable {
+                if let Some(graph) = scope_graph_at(&view, ranked.address) {
+                    self.mark_damaged(&graph);
+                }
+                return Err(E::from(SearchError::Damaged {
+                    detail: "stored identity",
+                }));
+            }
             retained = retained
                 .saturating_add(hit.graph_id.len())
                 .saturating_add(hit.subject_iri.len());
@@ -1837,7 +1865,7 @@ impl SearchIndex {
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = req.view.searcher.doc(doc_address)?;
-            hits.push(self.doc_to_hit(doc, score));
+            hits.push(self.doc_to_hit(doc, score)?);
         }
         Ok(hits)
     }
@@ -2857,22 +2885,71 @@ impl SearchIndex {
         }
     }
 
-    fn doc_to_hit(&self, doc: TantivyDocument, score: f32) -> SearchHit {
+    fn doc_to_hit(&self, doc: TantivyDocument, score: f32) -> Result<SearchHit> {
         let graph_id = first_text(&doc, self.f_graph_id);
         let subject_iri = first_text(&doc, self.f_subject_iri);
         let (graph_id, subject_iri) = match (graph_id, subject_iri) {
             (Some(graph_id), Some(subject_iri)) => (graph_id, subject_iri),
-            _ => {
-                let doc_key = first_text(&doc, self.f_doc_key).unwrap_or_default();
-                split_doc_key(&doc_key).unwrap_or_default()
-            }
+            _ => first_text(&doc, self.f_doc_key)
+                .as_deref()
+                .and_then(split_doc_key)
+                .ok_or(SearchError::Damaged {
+                    detail: "stored identity",
+                })?,
         };
-
-        SearchHit {
+        if graph_id.is_empty() || subject_iri.is_empty() {
+            return Err(SearchError::Damaged {
+                detail: "stored identity",
+            });
+        }
+        Ok(SearchHit {
             graph_id,
             subject_iri,
             score,
+        })
+    }
+
+    /// Returns the stable key of an active, allowed document, or `None` for skipped ones.
+    fn active_key<E>(&self, req: ActiveDoc<'_, E>) -> std::result::Result<Option<[u8; 32]>, E>
+    where
+        E: From<SearchError>,
+    {
+        #[cfg(test)]
+        if self.hooks.metadata_io.swap(false, Ordering::SeqCst) {
+            return Err(E::from(SearchError::Io(std::io::Error::other(
+                "injected metadata read failure",
+            ))));
         }
+        let scope = column_bytes(req.scopes, req.doc).map_err(E::from)?;
+        let graph = scope_graph(&scope).ok_or(E::from(SearchError::Damaged {
+            detail: "generation scope",
+        }))?;
+        if !req.view.generations.active.contains(scope.as_slice()) || !(req.allows)(graph)? {
+            return Ok(None);
+        }
+        let stable = column_bytes(req.stable, req.doc).map_err(E::from)?;
+        match <[u8; 32]>::try_from(stable.as_slice()) {
+            Ok(stable) => Ok(Some(stable)),
+            Err(_) => {
+                self.mark_damaged(graph);
+                Err(E::from(SearchError::Damaged {
+                    detail: "stable key",
+                }))
+            }
+        }
+    }
+
+    /// Records a readable damaged graph for the maintenance worker to reindex.
+    fn mark_damaged(&self, graph: &str) {
+        let mut damaged = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
+        if damaged.len() < DAMAGED_GRAPHS {
+            damaged.insert(graph.to_owned());
+        }
+    }
+
+    /// Takes the damaged graphs recorded since the previous call.
+    pub(crate) fn take_damaged(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.damaged.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn delete_doc(&self, writer: &mut IndexWriter, doc: &DocIdentity) {
@@ -3045,14 +3122,26 @@ fn scope_graph(scope: &[u8]) -> Option<&str> {
     std::str::from_utf8(&scope[16..scope.len() - 8]).ok()
 }
 
-fn first_bytes(column: Option<&tantivy::columnar::BytesColumn>, doc: DocId) -> Option<Vec<u8>> {
-    let column = column?;
-    let ord = column.term_ords(doc).next()?;
+/// Reads the graph named by one document's generation scope.
+fn scope_graph_at(view: &SearchView, address: DocAddress) -> Option<String> {
+    let reader = view.searcher.segment_reader(address.segment_ord);
+    let scopes = reader.fast_fields().bytes(GENERATION_SCOPE_FIELD).ok()?;
+    let scope = column_bytes(scopes.as_ref(), address.doc_id).ok()?;
+    scope_graph(&scope).map(str::to_owned)
+}
+
+/// Reads a required single-value bytes field that every current document carries.
+fn column_bytes(column: Option<&tantivy::columnar::BytesColumn>, doc: DocId) -> Result<Vec<u8>> {
+    let damaged = || SearchError::Damaged {
+        detail: "metadata column",
+    };
+    let column = column.ok_or_else(damaged)?;
+    let ord = column.term_ords(doc).next().ok_or_else(damaged)?;
     let mut bytes = Vec::new();
     column
-        .ord_to_bytes(ord, &mut bytes)
-        .ok()
-        .and_then(|found| found.then_some(bytes))
+        .ord_to_bytes(ord, &mut bytes)?
+        .then_some(bytes)
+        .ok_or_else(damaged)
 }
 
 pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
@@ -3152,6 +3241,7 @@ fn failure_code(error: &SearchError) -> &'static str {
         SearchError::Store(error) if error.rejects_record() => "item-invalid",
         SearchError::Store(_) => "store-transient",
         SearchError::Tantivy(_) => "index-transient",
+        SearchError::Damaged { .. } => "index-damaged",
         SearchError::QueryParse(_) => "query-invalid",
         SearchError::Io(_) => "io-transient",
     }
@@ -3174,7 +3264,7 @@ fn failure_class(error: &SearchError) -> FailureClass {
         SearchError::Store(crate::store::StoreError::GraphNotFound(_)) => {
             FailureClass::ItemRetryable
         }
-        SearchError::Tantivy(_) => FailureClass::Rebuild,
+        SearchError::Tantivy(_) | SearchError::Damaged { .. } => FailureClass::Rebuild,
         SearchError::Store(_)
         | SearchError::QueryParse(_)
         | SearchError::Io(_)
@@ -3727,6 +3817,206 @@ mod tests {
             stable_hit_key(&pair[0].graph_id, &pair[0].subject_iri)
                 < stable_hit_key(&pair[1].graph_id, &pair[1].subject_iri)
         }));
+    }
+
+    /// Field values for a hand-built document whose metadata may be missing or malformed.
+    struct RawDoc<'a> {
+        scope: Option<Vec<u8>>,
+        stable: Option<Vec<u8>>,
+        identity: Option<(&'a str, &'a str)>,
+    }
+
+    const RAW_GRAPH: &str = "urn:test:raw-graph";
+    const RAW_SUBJECT: &str = "urn:test:raw-subject";
+
+    impl RawDoc<'_> {
+        fn valid(index: &SearchIndex) -> Self {
+            Self {
+                scope: Some(generation_scope(
+                    index.index_id,
+                    RAW_GRAPH,
+                    DIRECT_GENERATION,
+                )),
+                stable: Some(stable_hit_key(RAW_GRAPH, RAW_SUBJECT).to_vec()),
+                identity: Some((RAW_GRAPH, RAW_SUBJECT)),
+            }
+        }
+    }
+
+    fn write_raw(index: &SearchIndex, raw: RawDoc<'_>) {
+        let mut document = TantivyDocument::default();
+        document.add_text(index.f_doc_key, "unsplittable");
+        if let Some((graph, subject)) = raw.identity {
+            document.add_text(index.f_graph_id, graph);
+            document.add_text(index.f_subject_iri, subject);
+        }
+        if let Some(scope) = raw.scope {
+            document.add_bytes(index.f_generation_scope, &scope);
+        }
+        if let Some(stable) = raw.stable {
+            document.add_bytes(index.f_stable_key, &stable);
+        }
+        document.add_text(index.f_all_text, "rawneedle");
+        index.writer().unwrap().add_document(document).unwrap();
+        index.write_epoch.fetch_add(1, Ordering::SeqCst);
+        index.commit().unwrap();
+    }
+
+    fn raw_search(index: &SearchIndex) -> Result<Vec<SearchHit>> {
+        index.search_in_graphs(GraphSetQuery {
+            graphs: &[GraphId::new(RAW_GRAPH)],
+            query: "rawneedle",
+            limit: 8,
+        })
+    }
+
+    #[test]
+    fn damaged_metadata_errors() {
+        type Damage = fn(&mut RawDoc<'static>);
+        let cases: [(&str, Damage, &str, bool); 6] = [
+            (
+                "missing scope",
+                |raw| raw.scope = None,
+                "metadata column",
+                false,
+            ),
+            (
+                "missing stable",
+                |raw| raw.stable = None,
+                "metadata column",
+                false,
+            ),
+            (
+                "short scope",
+                |raw| raw.scope = Some(vec![0; 8]),
+                "generation scope",
+                false,
+            ),
+            (
+                "short stable",
+                |raw| raw.stable = Some(vec![0; 16]),
+                "stable key",
+                true,
+            ),
+            (
+                "no identity",
+                |raw| raw.identity = None,
+                "stored identity",
+                false,
+            ),
+            (
+                "foreign identity",
+                |raw| raw.identity = Some(("urn:test:elsewhere", RAW_SUBJECT)),
+                "stored identity",
+                true,
+            ),
+        ];
+        for (label, damage, expected, repairs) in cases {
+            let index = SearchIndex::open_in_memory().unwrap();
+            index.set_generation(RAW_GRAPH, Some(DIRECT_GENERATION));
+            let mut raw = RawDoc::valid(&index);
+            damage(&mut raw);
+            write_raw(&index, raw);
+            let error = raw_search(&index).expect_err(label);
+            assert!(
+                matches!(error, SearchError::Damaged { detail } if detail == expected),
+                "{label}: {error:?}"
+            );
+            assert_eq!(error.kind(), crate::CraqleErrorKind::CorruptDerivedData);
+            let damaged = index.take_damaged();
+            assert_eq!(damaged.contains(RAW_GRAPH), repairs, "{label}");
+        }
+    }
+
+    #[test]
+    fn inactive_generation_skipped() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        index.set_generation(RAW_GRAPH, Some(DIRECT_GENERATION));
+        write_raw(&index, RawDoc::valid(&index));
+        let mut stale = RawDoc::valid(&index);
+        stale.scope = Some(generation_scope(
+            index.index_id,
+            RAW_GRAPH,
+            GenerationId(99),
+        ));
+        stale.stable = Some(vec![0; 16]);
+        write_raw(&index, stale);
+        let hits = raw_search(&index).unwrap();
+        assert_eq!(1, hits.len());
+        assert_eq!(RAW_SUBJECT, hits[0].subject_iri);
+        assert!(index.take_damaged().is_empty());
+    }
+
+    #[test]
+    fn metadata_io_fails() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        index.set_generation(RAW_GRAPH, Some(DIRECT_GENERATION));
+        write_raw(&index, RawDoc::valid(&index));
+        index.hooks.metadata_io.store(true, Ordering::SeqCst);
+        let error = raw_search(&index).unwrap_err();
+        assert!(matches!(error, SearchError::Io(_)), "{error:?}");
+        assert_eq!(1, raw_search(&index).unwrap().len());
+    }
+
+    #[test]
+    fn damaged_graph_repaired() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:damaged-repair");
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        let auth = crate::AllowAllAuthorizer;
+        node.create_crate(&auth, crate_request(&graph, "repairneedle", true))
+            .unwrap();
+        node.flush_search_updates().unwrap();
+        let search = |node: &crate::CraqleNode| {
+            node.search(
+                &auth,
+                crate::SearchRequest {
+                    query: "repairneedle",
+                    limit: 10,
+                },
+            )
+        };
+        let expected = search(&node).unwrap();
+        assert!(!expected.is_empty());
+        let generation = node.search.active_generation(graph.as_str()).unwrap();
+        let mut document = TantivyDocument::default();
+        document.add_text(node.search.f_graph_id, graph.as_str());
+        document.add_text(node.search.f_subject_iri, "urn:test:damaged");
+        let scope = generation_scope(node.search.index_id, graph.as_str(), generation);
+        document.add_bytes(node.search.f_generation_scope, &scope);
+        document.add_bytes(node.search.f_stable_key, &[0; 16]);
+        document.add_text(node.search.f_all_text, "repairneedle");
+        node.search
+            .writer()
+            .unwrap()
+            .add_document(document)
+            .unwrap();
+        node.search.write_epoch.fetch_add(1, Ordering::SeqCst);
+        node.search.commit().unwrap();
+        let pinned = node.search.pin_view();
+
+        let error = search(&node).unwrap_err();
+        assert_eq!(error.kind(), crate::CraqleErrorKind::CorruptDerivedData);
+        // The worker queues the reindex on its next pass; a flush then drains it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let repaired = loop {
+            node.flush_search_updates().unwrap();
+            if let Ok(hits) = search(&node) {
+                break hits;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "damage was never repaired"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let identities = |hits: &[SearchHit]| {
+            hits.iter()
+                .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(identities(&expected), identities(&repaired));
+        assert!(pinned.generations.active.contains(scope.as_slice()));
     }
 
     #[test]
