@@ -1496,7 +1496,7 @@ fn authorize_update_dataset(
     Ok(())
 }
 
-fn authorize_update_template_graph(
+fn authorize_template_graph(
     view: &StoreReadView<'_>,
     auth: &dyn crate::Authorizer,
     graph: &GraphNamePattern,
@@ -1655,7 +1655,7 @@ fn authorize_update_expression(
     }
 }
 
-fn update_graph_target_graphs(
+fn update_target_graphs(
     store: &GraphStore,
     target: &GraphTarget,
     max_graphs: usize,
@@ -1664,7 +1664,7 @@ fn update_graph_target_graphs(
         GraphTarget::NamedNode(graph) => Ok(vec![GraphId(graph.clone())]),
         GraphTarget::NamedGraphs | GraphTarget::AllGraphs => {
             let mut graphs = Vec::new();
-            for graph_id in store.graph_term_id_iter() {
+            for graph_id in store.graph_term_iter() {
                 if graphs.len() >= max_graphs {
                     return Err(SparqlError::QueryLimit {
                         resource: "update graphs",
@@ -1688,7 +1688,7 @@ fn scope_read_context<'scope>(
     scope: GraphScope<'scope>,
     view: &StoreReadView<'_>,
     cancellation: QueryCancellation,
-) -> Result<(ReadContext<'scope>, Option<Vec<NamedOrBlankNode>>)> {
+) -> Result<(ReadContext<'scope>, Option<Vec<GraphNode>>)> {
     match scope {
         #[cfg(test)]
         GraphScope::All => Ok((ReadContext::new(cancellation), None)),
@@ -1700,7 +1700,7 @@ fn scope_read_context<'scope>(
                 None,
             ))
         }
-        GraphScope::List(graphs) if graphs.len() <= EXPLICIT_DATASET_GRAPH_LIMIT => {
+        GraphScope::List(graphs) if graphs.len() <= EXPLICIT_GRAPH_LIMIT => {
             // Named-graph enumeration uses the metadata record, while default
             // patterns retain the sentinel union selected by the evaluator.
             let mut seen = HashSet::with_capacity(graphs.len());
@@ -1722,7 +1722,7 @@ fn scope_read_context<'scope>(
     }
 }
 
-fn authorize_explicit_graph_scope(
+fn authorize_graph_scope(
     view: &StoreReadView<'_>,
     scope: GraphScope<'_>,
     auth: Option<&dyn crate::Authorizer>,
@@ -1762,6 +1762,7 @@ struct QueryStageStatistics {
 struct ExplanationMetrics {
     planning_time: Duration,
     intermediate_rows: u64,
+    rows_available: bool,
     plan: Option<QueryPlanNode>,
 }
 
@@ -1769,7 +1770,7 @@ struct ExplanationMetrics {
 struct CollectionMetrics {
     execution_time: Duration,
     collection_time: Duration,
-    time_to_first_internal_result: Option<Duration>,
+    first_result_time: Option<Duration>,
     result_rows: u64,
     result_cells: u64,
 }
@@ -1912,12 +1913,19 @@ fn plan_query(
             )))
         };
     }
-    crate::planner::optimize_query_with_mode(query, store, options.join_mode)
-        .map_err(|error| SparqlError::Planning(error.to_string()))
+    crate::planner::optimize_with_costs(
+        query,
+        store,
+        crate::planner::PlanMode {
+            join: options.join_mode,
+            collect_costs: options.collect_costs,
+        },
+    )
+    .map_err(|error| SparqlError::Planning(error.to_string()))
 }
 
 fn fast_path_plan(query: &Query, options: &QueryOptions) -> Option<FastPathPlan> {
-    if matches!(options.fast_paths, QueryFastPathMode::Disabled) {
+    if matches!(options.fast_paths, FastPathMode::Disabled) {
         return None;
     }
     let plan = crate::sparql_fast_path::analyze(query)?;
@@ -1966,6 +1974,7 @@ fn read_explanation_metrics(
     Ok(ExplanationMetrics {
         planning_time,
         intermediate_rows,
+        rows_available: true,
         plan,
     })
 }
@@ -2025,6 +2034,7 @@ fn build_execution_statistics(
     collection: CollectionMetrics,
     explanation: ExplanationMetrics,
 ) -> QueryExecutionStatistics {
+    let planner_costs = stages.planner_trace.costs;
     let execution_time = initial_execution_time
         .saturating_sub(explanation.planning_time)
         .saturating_add(collection.execution_time);
@@ -2065,7 +2075,7 @@ fn build_execution_statistics(
             .saturating_add(explanation.planning_time),
         execution_time,
         result_collection_time: collection.collection_time,
-        time_to_first_internal_result: collection.time_to_first_internal_result,
+        time_to_first_internal_result: collection.first_result_time,
         fast_path: None,
         planned_joins: stages.planner_trace.joins,
         selected_access_paths: reads.selected_access_paths,
@@ -2081,6 +2091,24 @@ fn build_execution_statistics(
         source_bytes_read: reads.source_bytes_read,
         qv_keys_read: reads.qv_keys_read,
         qv_bytes_read: reads.qv_bytes_read,
+        reverse_mapping_reads: reads
+            .reverse_mapping_reads
+            .saturating_add(planner_costs.reverse_mapping_reads),
+        reverse_mapping_bytes: reads
+            .reverse_mapping_bytes
+            .saturating_add(planner_costs.reverse_mapping_bytes),
+        forward_mapping_reads: reads
+            .forward_mapping_reads
+            .saturating_add(planner_costs.forward_mapping_reads),
+        forward_mapping_bytes: reads
+            .forward_mapping_bytes
+            .saturating_add(planner_costs.forward_mapping_bytes),
+        planner_index_entries: planner_costs.planner_index_entries,
+        planner_point_reads: planner_costs.planner_point_reads,
+        planner_cache_hits: planner_costs.planner_cache_hits,
+        planner_cache_misses: planner_costs.planner_cache_misses,
+        planner_memo_hits: planner_costs.planner_memo_hits,
+        planner_memo_misses: planner_costs.planner_memo_misses,
         candidate_quads: reads.candidate_quads,
         matching_quads: reads.matching_quads,
         graphs_considered: reads.graphs_considered,
@@ -2093,6 +2121,7 @@ fn build_execution_statistics(
         encoded_quad_constructions: reads.encoded_quad_constructions,
         terms_decoded: reads.terms_decoded,
         intermediate_rows: explanation.intermediate_rows,
+        intermediate_rows_available: explanation.rows_available,
         result_rows: collection.result_rows,
         result_cells: collection.result_cells,
         plan,
