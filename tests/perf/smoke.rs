@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -67,13 +68,15 @@ mod tests {
         let load_start = Instant::now();
         for start in (0..entity_count).step_by(chunk_size) {
             let batch_count = usize::min(chunk_size, entity_count - start);
-            append_benchmark_media_objects(
+            append_benchmark_entities(
                 net.peer(0),
                 &writer_auth(),
-                &graph,
-                start,
-                batch_count,
-                "proteomics",
+                AppendBatch {
+                    graph: &graph,
+                    start,
+                    count: batch_count,
+                    keyword: "proteomics",
+                },
             );
         }
         let load_elapsed = load_start.elapsed();
@@ -92,9 +95,7 @@ mod tests {
         let page_elapsed = page_start.elapsed();
 
         let cursor_page_start = Instant::now();
-        let cursor_page = mgr_peer1
-            .export_jsonld_page_after(&graph, None, 1000)
-            .unwrap();
+        let cursor_page = mgr_peer1.export_page_after(&graph, None, 1000).unwrap();
         let cursor_page_elapsed = cursor_page_start.elapsed();
 
         let count_query = format!(

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -14,7 +15,7 @@ mod tests {
 
     const DEFAULT_TOTAL_ENTITIES: usize = 300_000;
     const DEFAULT_BATCH_SIZES: &[usize] = &[10_000, 50_000, 100_000];
-    const DEFAULT_SYNC_EVERY_BATCHES: usize = 1;
+    const DEFAULT_SYNC_BATCHES: usize = 1;
 
     #[test]
     #[ignore = "release-only batched ingest workflow profile"]
@@ -25,7 +26,7 @@ mod tests {
         );
         let sync_every_batches = env_usize(
             "CRAQLE_BATCH_PROFILE_SYNC_EVERY_BATCHES",
-            DEFAULT_SYNC_EVERY_BATCHES,
+            DEFAULT_SYNC_BATCHES,
         );
         let batch_sizes = env_usize_list("CRAQLE_BATCH_PROFILE_BATCH_SIZES", DEFAULT_BATCH_SIZES);
         assert!(total_entities > 0, "total_entities must be > 0");
@@ -64,14 +65,14 @@ mod tests {
                 let batch_count = usize::min(batch_size, total_entities - start);
 
                 let build_start = Instant::now();
-                let entities = benchmark_media_object_entities(
+                let entities = benchmark_entities(EntityBatch {
                     start,
-                    batch_count,
-                    "batch-profile",
-                    "Proteomics sample",
-                    "benchmark record",
-                    "BENCH",
-                );
+                    count: batch_count,
+                    keyword: "batch-profile",
+                    name_prefix: "Proteomics sample",
+                    description_label: "benchmark record",
+                    identifier_prefix: "BENCH",
+                });
                 build_latencies.push(build_start.elapsed());
 
                 let apply_start = Instant::now();

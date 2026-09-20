@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -13,7 +14,7 @@ mod tests {
     use crate::support::*;
 
     const DEFAULT_GRAPH_COUNT: usize = 50_000;
-    const DEFAULT_FILES_PER_GRAPH: usize = 3;
+    const DEFAULT_GRAPH_FILES: usize = 3;
     const DEFAULT_QUERY_SAMPLES: usize = 5;
     const NEEDLE: &str = "needle-7";
     const NEEDLE_EVERY: usize = 10_000;
@@ -176,7 +177,7 @@ mod tests {
     #[ignore = "release-only multi-graph query-path profile"]
     fn multigraph_query_latency() {
         let graph_count = env_usize("CRAQLE_MULTI_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
-        let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_FILES_PER_GRAPH);
+        let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_GRAPH_FILES);
         let samples = env_usize("CRAQLE_MULTI_QUERY_SAMPLES", DEFAULT_QUERY_SAMPLES);
         assert!(graph_count > 0);
 
@@ -198,14 +199,13 @@ mod tests {
         });
         measure("trivial ASK (predicate all)", samples, || {
             let result =
-                query_with_test_visibility(&node, |_: &GraphId| true, "ASK { ?s ?p ?o }").unwrap();
+                query_with_visibility(&node, |_: &GraphId| true, "ASK { ?s ?p ?o }").unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         });
         measure("trivial ASK (predicate 90%)", samples, || {
             let result =
-                query_with_test_visibility(&node, ninety_percent_visible, "ASK { ?s ?p ?o }")
-                    .unwrap();
+                query_with_visibility(&node, ninety_percent_visible, "ASK { ?s ?p ?o }").unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         });
@@ -221,14 +221,14 @@ mod tests {
         });
         measure("SELECT name LIMIT 25 (predicate all)", samples, || {
             let rows = solution_rows(
-                query_with_test_visibility(&node, |_: &GraphId| true, select_limited).unwrap(),
+                query_with_visibility(&node, |_: &GraphId| true, select_limited).unwrap(),
             );
             assert_eq!(rows.len(), 25);
             rows.len()
         });
         measure("SELECT name LIMIT 25 (predicate 90%)", samples, || {
             let rows = solution_rows(
-                query_with_test_visibility(&node, ninety_percent_visible, select_limited).unwrap(),
+                query_with_visibility(&node, ninety_percent_visible, select_limited).unwrap(),
             );
             assert_eq!(rows.len(), 25);
             rows.len()
@@ -248,14 +248,14 @@ mod tests {
         });
         measure("FILTER CONTAINS scan (predicate all)", samples, || {
             let rows = solution_rows(
-                query_with_test_visibility(&node, |_: &GraphId| true, &filter_scan).unwrap(),
+                query_with_visibility(&node, |_: &GraphId| true, &filter_scan).unwrap(),
             );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
         });
         measure("FILTER CONTAINS scan (predicate 90%)", samples, || {
             let rows = solution_rows(
-                query_with_test_visibility(&node, ninety_percent_visible, &filter_scan).unwrap(),
+                query_with_visibility(&node, ninety_percent_visible, &filter_scan).unwrap(),
             );
             assert_eq!(rows.len(), expected_needles);
             rows.len()
@@ -279,7 +279,7 @@ mod tests {
             samples,
             || {
                 let rows = solution_rows(
-                    query_with_test_visibility(&node, |_: &GraphId| true, graph_bound).unwrap(),
+                    query_with_visibility(&node, |_: &GraphId| true, graph_bound).unwrap(),
                 );
                 assert_eq!(rows.len(), 25);
                 rows.len()
@@ -291,7 +291,7 @@ mod tests {
     #[ignore = "release-only concurrent multi-graph query-path profile"]
     fn concurrent_query_latency() {
         let graph_count = env_usize("CRAQLE_MULTI_GRAPH_COUNT", 40_000);
-        let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_FILES_PER_GRAPH);
+        let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_GRAPH_FILES);
         let samples = env_usize("CRAQLE_MULTI_QUERY_SAMPLES", DEFAULT_QUERY_SAMPLES);
         let threads = env_usize("CRAQLE_MULTI_CONCURRENCY", 8);
         assert!(graph_count > 0);
@@ -321,8 +321,7 @@ mod tests {
             1
         };
         let ask_pred = || {
-            let result =
-                query_with_test_visibility(&node, ninety_percent_visible, ask_query).unwrap();
+            let result = query_with_visibility(&node, ninety_percent_visible, ask_query).unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         };
@@ -336,7 +335,7 @@ mod tests {
         };
         let select_limited_pred = || {
             let rows = solution_rows(
-                query_with_test_visibility(&node, ninety_percent_visible, select_query).unwrap(),
+                query_with_visibility(&node, ninety_percent_visible, select_query).unwrap(),
             );
             assert_eq!(rows.len(), 25);
             rows.len()
@@ -351,7 +350,7 @@ mod tests {
         };
         let filter_scan_pred = || {
             let rows = solution_rows(
-                query_with_test_visibility(&node, ninety_percent_visible, &scan_query).unwrap(),
+                query_with_visibility(&node, ninety_percent_visible, &scan_query).unwrap(),
             );
             assert_eq!(rows.len(), expected_needles);
             rows.len()

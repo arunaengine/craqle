@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -13,7 +14,7 @@ mod tests {
     use crate::support::*;
 
     const DEFAULT_GRAPH_COUNT: usize = 50_000;
-    const DEFAULT_FILES_PER_GRAPH: usize = 3;
+    const DEFAULT_GRAPH_FILES: usize = 3;
 
     fn term_iri(iri: &str) -> EncodedTerm {
         EncodedTerm(format!("<{iri}>"))
@@ -96,7 +97,7 @@ mod tests {
     #[ignore = "release-only derived-index open/readiness profile"]
     fn reopened_index_readiness() {
         let graph_count = env_usize("CRAQLE_MULTI_GRAPH_COUNT", DEFAULT_GRAPH_COUNT);
-        let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_FILES_PER_GRAPH);
+        let files_per_graph = env_usize("CRAQLE_MULTI_FILES_PER_GRAPH", DEFAULT_GRAPH_FILES);
         let quads_per_graph = 5 + files_per_graph * 5;
 
         let tmp = tempfile::tempdir().unwrap();

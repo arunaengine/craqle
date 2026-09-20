@@ -2,12 +2,11 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
-/// Query-shape matrix for the craqle plan optimizer over the aruna-shaped
-/// 40k corpus: every shape is measured with the optimizer off (raw sparopt
-/// plan, the BEFORE column) and on (craqle-owned plan, the AFTER column),
-/// sequentially and 8-way concurrent for the headline shapes.
+/// Compares raw and Craqle query plans over the Aruna-shaped 40k corpus,
+/// sequentially and concurrently for headline shapes.
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -51,10 +50,8 @@ mod tests {
         EncodedTerm(format!("\"{value}\""))
     }
 
-    /// Aruna-shaped graphs through the fast apply path: even idx mirrors the
-    /// scaffold crate (Dataset root, no parts), odd idx mirrors the bench.py
-    /// RO-Crate payload (Dataset root + File part). Every DELETE_EVERY-th
-    /// graph is deleted again, like the cluster repro.
+    /// Alternates scaffold and file-bearing Aruna-shaped graphs through the
+    /// fast path, deleting every configured interval as in the cluster case.
     fn load_corpus(node: &CraqleNode, graph_count: usize) -> Vec<String> {
         let started = Instant::now();
         let mut live = Vec::with_capacity(graph_count);
@@ -185,7 +182,7 @@ mod tests {
             needle_idx += 2;
         }
         let needle = format!("Bench Dataset {}", doc_path(needle_idx));
-        let dataset_count_per_25 = 25;
+        let datasets_per_25 = 25;
 
         vec![
             shape(
@@ -200,7 +197,7 @@ mod tests {
                 "SELECT ?d ?name WHERE { ?d a <http://schema.org/Dataset> ; \
                  <http://schema.org/name> ?name . } LIMIT 25"
                     .into(),
-                Some(dataset_count_per_25),
+                Some(datasets_per_25),
                 true,
                 false,
             ),
@@ -413,7 +410,7 @@ mod tests {
         let visible = |graph: &GraphId| registry_visible(&registry, graph);
 
         let count_rows = |sparql: &str, optimize: bool| -> usize {
-            match query_with_test_planner(&node, visible, sparql, optimize).unwrap() {
+            match query_with_planner(&node, visible, (sparql, optimize)).unwrap() {
                 QueryResults::Solutions(rows) => rows.len(),
                 QueryResults::Boolean(value) => {
                     assert!(value, "ASK shapes must hold on the corpus");

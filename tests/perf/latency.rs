@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -14,8 +15,8 @@ mod tests {
 
     const PAGE_SIZE: usize = 1_000;
     const DEFAULT_CRATE_COUNT: usize = 24;
-    const DEFAULT_ENTITIES_PER_CRATE: usize = 50_000;
-    const DEFAULT_CONTEXTUALS_PER_CRATE: usize = 6;
+    const DEFAULT_CRATE_ENTITIES: usize = 50_000;
+    const DEFAULT_CRATE_CONTEXTUALS: usize = 6;
     const DEFAULT_BATCH_SIZE: usize = 10_000;
     const DEFAULT_QUERY_SAMPLES: usize = 12;
 
@@ -34,11 +35,11 @@ mod tests {
                 crate_count: env_usize("CRAQLE_PERF_CRATE_COUNT", DEFAULT_CRATE_COUNT),
                 entities_per_crate: env_usize(
                     "CRAQLE_PERF_ENTITIES_PER_CRATE",
-                    DEFAULT_ENTITIES_PER_CRATE,
+                    DEFAULT_CRATE_ENTITIES,
                 ),
                 contextuals_per_crate: env_usize(
                     "CRAQLE_PERF_CONTEXTUALS_PER_CRATE",
-                    DEFAULT_CONTEXTUALS_PER_CRATE,
+                    DEFAULT_CRATE_CONTEXTUALS,
                 ),
                 batch_size: env_usize("CRAQLE_PERF_BATCH_SIZE", DEFAULT_BATCH_SIZE),
                 query_samples: env_usize("CRAQLE_PERF_QUERY_SAMPLES", DEFAULT_QUERY_SAMPLES),
@@ -90,13 +91,15 @@ mod tests {
             let crate_keyword = format!("crate-keyword-{crate_idx:02}");
             for start in (0..config.entities_per_crate).step_by(config.batch_size) {
                 let batch_count = usize::min(config.batch_size, config.entities_per_crate - start);
-                append_benchmark_media_objects(
+                append_benchmark_entities(
                     net.peer(0),
                     &writer_auth(),
-                    &graph,
-                    start,
-                    batch_count,
-                    &crate_keyword,
+                    AppendBatch {
+                        graph: &graph,
+                        start,
+                        count: batch_count,
+                        keyword: &crate_keyword,
+                    },
                 );
             }
         }
@@ -108,7 +111,7 @@ mod tests {
 
         let reindex_start = Instant::now();
         net.reindex_search().unwrap();
-        let reindex_elapsed = reindex_start.elapsed();
+        let initial_reindex = reindex_start.elapsed();
 
         let mut summary_latencies = Vec::new();
         let mut page_start_latencies = Vec::new();
@@ -275,9 +278,9 @@ mod tests {
         net.sync_until_converged(100).unwrap();
         let partial_sync_elapsed = partial_sync_start.elapsed();
 
-        let post_write_reindex_start = Instant::now();
+        let reindex_start = Instant::now();
         net.reindex_search().unwrap();
-        let post_write_reindex_elapsed = post_write_reindex_start.elapsed();
+        let reindex_elapsed = reindex_start.elapsed();
 
         println!(
             "large perf config: {} crates x {} entities ({} total), {} contextual entities per crate, batch {}",
@@ -289,7 +292,7 @@ mod tests {
         );
         println!(
             "load {:?}, sync {:?}, initial fts reindex {:?}",
-            load_elapsed, sync_elapsed, reindex_elapsed,
+            load_elapsed, sync_elapsed, initial_reindex,
         );
         println!("{}", format_stats("summary export", &summary_latencies));
         println!(
@@ -317,7 +320,7 @@ mod tests {
             update_sync_elapsed,
             partial_update_elapsed,
             partial_sync_elapsed,
-            post_write_reindex_elapsed,
+            reindex_elapsed,
         );
     }
 

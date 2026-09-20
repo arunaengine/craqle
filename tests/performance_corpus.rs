@@ -2,7 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-#[path = "../benches/support/mod.rs"]
+#[path = "../benches/support.rs"]
 mod corpus;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,7 +108,7 @@ fn rejects_impossible_dimensions() {
     );
     assert_eq!(
         CorpusConfig::new(10_000, 1, 25, DEFAULT_SEED),
-        Err(CorpusConfigError::OneGraphCannotDuplicate {
+        Err(CorpusConfigError::SingleGraphDuplicate {
             graphs: 1,
             duplicate_percent: 25,
         })
@@ -322,8 +322,5 @@ fn golden_prefix_stable() {
         })
         .collect::<String>();
 
-    assert_eq!(
-        actual,
-        include_str!("fixtures/performance/corpus-small.golden")
-    );
+    assert_eq!(actual, include_str!("fixtures/corpus-small.golden"));
 }

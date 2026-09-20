@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use craqle::{
-    AppendDataEntitiesReport, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
-    NewDataEntity, PermissionGrant, PermissionLevel,
+    AppendDataEntitiesReport as AppendReport, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId,
+    GraphPolicy, NewDataEntity, PermissionGrant, PermissionLevel,
 };
 use oxrdf::{NamedNode, Term};
 
@@ -53,14 +53,24 @@ pub fn literal_term(value: &str) -> EncodedTerm {
     EncodedTerm(format!("\"{value}\""))
 }
 
-pub fn benchmark_media_object_entities(
-    start: usize,
-    count: usize,
-    keyword: &str,
-    name_prefix: &str,
-    description_label: &str,
-    identifier_prefix: &str,
-) -> Vec<NewDataEntity> {
+pub struct EntityBatch<'a> {
+    pub start: usize,
+    pub count: usize,
+    pub keyword: &'a str,
+    pub name_prefix: &'a str,
+    pub description_label: &'a str,
+    pub identifier_prefix: &'a str,
+}
+
+pub fn benchmark_entities(batch: EntityBatch<'_>) -> Vec<NewDataEntity> {
+    let EntityBatch {
+        start,
+        count,
+        keyword,
+        name_prefix,
+        description_label,
+        identifier_prefix,
+    } = batch;
     let description = NamedNode::new_unchecked("http://schema.org/description");
     let keywords = NamedNode::new_unchecked("http://schema.org/keywords");
     let identifier = NamedNode::new_unchecked("http://schema.org/identifier");
@@ -146,25 +156,35 @@ pub fn benchmark_rocrate_document(
     .to_string()
 }
 
-pub fn append_benchmark_media_objects(
+pub struct AppendBatch<'a> {
+    pub graph: &'a GraphId,
+    pub start: usize,
+    pub count: usize,
+    pub keyword: &'a str,
+}
+
+pub fn append_benchmark_entities(
     node: &CraqleNode,
     auth: &GrantAuthorizer,
-    graph: &GraphId,
-    start: usize,
-    count: usize,
-    keyword: &str,
-) -> AppendDataEntitiesReport {
+    batch: AppendBatch<'_>,
+) -> AppendReport {
+    let AppendBatch {
+        graph,
+        start,
+        count,
+        keyword,
+    } = batch;
     node.append_new_root_data_entities(
         auth,
         graph,
-        benchmark_media_object_entities(
+        benchmark_entities(EntityBatch {
             start,
             count,
             keyword,
-            "Proteomics sample",
-            "benchmark record",
-            "BENCH",
-        ),
+            name_prefix: "Proteomics sample",
+            description_label: "benchmark record",
+            identifier_prefix: "BENCH",
+        }),
     )
     .unwrap()
 }

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -27,9 +28,9 @@ mod tests {
 
         run_import_workflow(entity_count, include_validated_baseline);
         run_replace_workflow(entity_count);
-        run_append_like_replace_workflow(entity_count);
-        run_incremental_update_workflow(entity_count);
-        run_batched_append_workflow(entity_count, batch_size);
+        run_append_replace(entity_count);
+        run_incremental_update(entity_count);
+        run_batched_append(entity_count, batch_size);
     }
 
     fn run_import_workflow(entity_count: usize, include_validated_baseline: bool) {
@@ -128,7 +129,7 @@ mod tests {
         );
     }
 
-    fn run_batched_append_workflow(entity_count: usize, batch_size: usize) {
+    fn run_batched_append(entity_count: usize, batch_size: usize) {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let writer = writer_auth();
@@ -155,14 +156,14 @@ mod tests {
             let batch_count = usize::min(batch_size, entity_count - start);
 
             let build_start = Instant::now();
-            let entities = benchmark_media_object_entities(
+            let entities = benchmark_entities(EntityBatch {
                 start,
-                batch_count,
-                "workflow-append-keyword",
-                "Workflow Append Entity",
-                "workflow append record",
-                "APPEND",
-            );
+                count: batch_count,
+                keyword: "workflow-append-keyword",
+                name_prefix: "Workflow Append Entity",
+                description_label: "workflow append record",
+                identifier_prefix: "APPEND",
+            });
             build_latencies.push(build_start.elapsed());
 
             let apply_start = Instant::now();
@@ -259,7 +260,7 @@ mod tests {
         );
     }
 
-    fn run_incremental_update_workflow(entity_count: usize) {
+    fn run_incremental_update(entity_count: usize) {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let writer = writer_auth();
@@ -308,7 +309,7 @@ mod tests {
         );
     }
 
-    fn run_append_like_replace_workflow(entity_count: usize) {
+    fn run_append_replace(entity_count: usize) {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
         let writer = writer_auth();
@@ -326,8 +327,12 @@ mod tests {
             .unwrap();
 
         let replace_build_start = Instant::now();
-        let updated_jsonld =
-            append_entities_to_rocrate_document(&jsonld, graph.as_str(), entity_count, extra_count);
+        let updated_jsonld = append_rocrate_entities(AppendInput {
+            jsonld: &jsonld,
+            root_id: graph.as_str(),
+            start: entity_count,
+            count: extra_count,
+        });
         let replace_build_elapsed = replace_build_start.elapsed();
 
         let replace_start = Instant::now();
@@ -372,12 +377,20 @@ mod tests {
         value.to_string()
     }
 
-    fn append_entities_to_rocrate_document(
-        jsonld: &str,
-        root_id: &str,
+    struct AppendInput<'a> {
+        jsonld: &'a str,
+        root_id: &'a str,
         start: usize,
         count: usize,
-    ) -> String {
+    }
+
+    fn append_rocrate_entities(input: AppendInput<'_>) -> String {
+        let AppendInput {
+            jsonld,
+            root_id,
+            start,
+            count,
+        } = input;
         let mut value: serde_json::Value = serde_json::from_str(jsonld).unwrap();
         let graph = value["@graph"].as_array_mut().unwrap();
         let root_index = graph
