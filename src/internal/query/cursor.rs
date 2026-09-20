@@ -529,9 +529,287 @@ impl RawIndexCursor {
     }
 }
 
+impl DenseTerm {
+    pub(crate) fn new(query: QueryTermId, scope: u64) -> Self {
+        Self { query, scope }
+    }
+
+    pub(crate) fn query(self) -> QueryTermId {
+        self.query
+    }
+
+    pub(crate) fn scope(self) -> u64 {
+        self.scope
+    }
+}
+
+impl DenseResolver {
+    pub(crate) fn space(&self) -> DenseSpace {
+        self.inner.space
+    }
+
+    pub(crate) fn scope(&self) -> u64 {
+        self.inner.space.scope
+    }
+
+    pub(crate) fn source(&self, term: DenseTerm) -> Result<TermId> {
+        if term.scope != self.inner.space.scope {
+            return Err(crate::store::StoreError::IndexVerificationFailed(
+                "dense-term-scope-mismatch",
+            ));
+        }
+        if let Some(source) = self.inner.sources.borrow_mut().get_cloned(&term.query) {
+            return Ok(source);
+        }
+        let (source, bytes) = GraphStore::decode_query_term(
+            &self.inner.snapshot,
+            &self.inner.query_to_term,
+            term.query,
+        )?;
+        self.inner.costs.reverse_mapping(bytes);
+        self.inner
+            .sources
+            .borrow_mut()
+            .insert(term.query, source, 0);
+        Ok(source)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DenseRequest {
+    pub(crate) scope: u64,
+    pub(crate) cache_entries: usize,
+    pub(crate) cache_bytes: usize,
+}
+
+pub(crate) struct DenseInput<'store, 'context, 'visibility> {
+    pub(crate) store: &'store GraphStore,
+    pub(crate) snapshot: &'store StoreReadSnapshot,
+    pub(crate) context: &'context ReadContext<'visibility>,
+    pub(crate) raw: RawIndexCursor,
+    pub(crate) generation: u64,
+    pub(crate) scope: u64,
+    pub(crate) resolver: Option<DenseResolver>,
+    pub(crate) cache_entries: usize,
+    pub(crate) cache_bytes: usize,
+    pub(crate) default_union: bool,
+    pub(crate) source_hints: [Option<(QueryTermId, TermId)>; 4],
+}
+
+pub(crate) struct DenseCursor<'store, 'context, 'visibility> {
+    store: &'store GraphStore,
+    snapshot: &'store StoreReadSnapshot,
+    context: &'context ReadContext<'visibility>,
+    raw: RawIndexCursor,
+    resolver: DenseResolver,
+    last_graph: Option<(QueryTermId, TermId)>,
+    current_group: Option<(QueryTermId, QueryTermId, QueryTermId)>,
+    group_emitted: bool,
+    default_union: bool,
+    source_hints: [Option<(QueryTermId, TermId)>; 4],
+    candidates_since_check: usize,
+    finished: bool,
+}
+
+impl<'store, 'context, 'visibility> DenseCursor<'store, 'context, 'visibility> {
+    pub(crate) fn new(input: DenseInput<'store, 'context, 'visibility>) -> Self {
+        let space = DenseSpace {
+            generation: input.generation,
+            snapshot: input.raw.snapshot.seqno(),
+            scope: input.scope,
+        };
+        let resolver = match input.resolver {
+            Some(resolver) if resolver.space() == space => resolver,
+            _ => input.raw.resolver(
+                input.generation,
+                DenseRequest {
+                    scope: input.scope,
+                    cache_entries: input.cache_entries,
+                    cache_bytes: input.cache_bytes,
+                },
+            ),
+        };
+        Self {
+            store: input.store,
+            snapshot: input.snapshot,
+            context: input.context,
+            raw: input.raw,
+            resolver,
+            last_graph: None,
+            current_group: None,
+            group_emitted: false,
+            default_union: input.default_union,
+            source_hints: input.source_hints,
+            candidates_since_check: 0,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn resolver(&self) -> DenseResolver {
+        self.resolver.clone()
+    }
+
+    fn fail(&mut self, error: crate::store::StoreError) -> Option<Result<DenseQuad>> {
+        self.finished = true;
+        Some(Err(error))
+    }
+
+    fn source_hint(&self, index: usize, query: QueryTermId) -> Option<TermId> {
+        self.source_hints[index]
+            .filter(|(hint, _)| *hint == query)
+            .map(|(_, source)| source)
+    }
+
+    fn graph_source(&mut self, graph: QueryTermId) -> Result<TermId> {
+        let source = if let Some(source) = self.source_hint(0, graph) {
+            source
+        } else if let Some((cached, source)) = self.last_graph {
+            if cached == graph {
+                source
+            } else {
+                self.resolver
+                    .source(DenseTerm::new(graph, self.resolver.space().scope))?
+            }
+        } else {
+            self.resolver
+                .source(DenseTerm::new(graph, self.resolver.space().scope))?
+        };
+        self.last_graph = Some((graph, source));
+        Ok(source)
+    }
+
+    fn resolve_source(&self, query: QueryTermId) -> Result<TermId> {
+        self.resolver
+            .source(DenseTerm::new(query, self.resolver.space().scope))
+    }
+
+    fn account(&mut self, bytes: u64, fields: u64) -> Result<()> {
+        self.context.increment_candidate_quads();
+        self.context.record_qv_read(bytes);
+        self.context.record_key_fields(fields);
+        self.candidates_since_check += 1;
+        if self.candidates_since_check == CANCELLATION_CHECK_INTERVAL {
+            self.candidates_since_check = 0;
+            self.context.check_cancelled()?;
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for DenseCursor<'_, '_, '_> {
+    type Item = Result<DenseQuad>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if let Err(error) = self.context.check_cancelled() {
+            return self.fail(error);
+        }
+        loop {
+            let key = match self.raw.next_key()? {
+                Ok(key) => key,
+                Err(error) => return self.fail(error),
+            };
+            let (matches, _) = self.raw.matches(key);
+            let query = [key.graph(), key.subject(), key.predicate(), key.object()];
+            if let Err(error) = self.account(key.bytes_read, 4) {
+                return self.fail(error);
+            }
+            if query.iter().any(|term| term.0 >= self.raw.query_id_limit) {
+                return self.fail(crate::store::StoreError::InvalidIndexEncoding {
+                    context: "qv2 query index key",
+                    message: "query ID exceeds the admitted generation bound".to_owned(),
+                });
+            }
+            if !matches {
+                continue;
+            }
+            let graph_source = match self.graph_source(query[0]) {
+                Ok(source) => source,
+                Err(error) => return self.fail(error),
+            };
+            let orphaned = graph_orphans(GraphVisibilityInput {
+                store: self.store,
+                snapshot: self.snapshot,
+                context: self.context,
+                graph: graph_source,
+            });
+            let orphaned = match orphaned {
+                Ok(Some(orphaned)) => orphaned,
+                Ok(None) => continue,
+                Err(error) => return self.fail(error),
+            };
+            let mut subject_source = self.source_hint(1, query[1]);
+            let mut object_source = self.source_hint(3, query[3]);
+            if !orphaned.is_empty() {
+                if subject_source.is_none() {
+                    subject_source = Some(if query[1] == query[0] {
+                        graph_source
+                    } else {
+                        match self.resolve_source(query[1]) {
+                            Ok(source) => source,
+                            Err(error) => return self.fail(error),
+                        }
+                    });
+                }
+                if object_source.is_none() {
+                    object_source = Some(if query[3] == query[0] {
+                        graph_source
+                    } else if query[3] == query[1] {
+                        subject_source.expect("subject was resolved for orphan filtering")
+                    } else {
+                        match self.resolve_source(query[3]) {
+                            Ok(source) => source,
+                            Err(error) => return self.fail(error),
+                        }
+                    });
+                }
+                if orphaned.contains(&subject_source.expect("subject source is present"))
+                    || orphaned.contains(&object_source.expect("object source is present"))
+                {
+                    continue;
+                }
+            }
+            if self.context.validation_graph().is_none() {
+                self.context.increment_orphan_checks();
+            }
+            if self.default_union {
+                let group = (query[1], query[2], query[3]);
+                if self.current_group != Some(group) {
+                    self.current_group = Some(group);
+                    self.group_emitted = false;
+                    self.context.increment_duplicate_groups();
+                } else {
+                    self.context.record_skipped_copies(1);
+                }
+                if self.group_emitted {
+                    continue;
+                }
+                self.group_emitted = true;
+            }
+            self.context.increment_matching_quads();
+            let scope = self.resolver.space().scope;
+            let source_mask =
+                u8::from(subject_source.is_some()) | (u8::from(object_source.is_some()) << 1);
+            return Some(Ok(DenseQuad {
+                graph: DenseTerm::new(query[0], scope),
+                graph_source,
+                subject: DenseTerm::new(query[1], scope),
+                subject_source: subject_source.unwrap_or(TermId(0)),
+                predicate: DenseTerm::new(query[2], scope),
+                object: DenseTerm::new(query[3], scope),
+                object_source: object_source.unwrap_or(TermId(0)),
+                source_mask,
+            }));
+        }
+    }
+}
+
 /// Owns a durable snapshot or a single candidate without holding index locks.
 pub(crate) struct RawQuadCursor {
     source: SourceIterator,
+    costs: QueryCost,
 }
 
 impl RawQuadCursor {
@@ -544,10 +822,8 @@ impl RawQuadCursor {
             _ => unreachable!("quad columns are four terms"),
         };
         match &self.source {
-            SourceIterator::Durable { .. } => {
-                count_grouping_for_order(QueryIndexCursorOrder::Gspo, fixed)
-            }
-            SourceIterator::QueryIndex { order, .. } => count_grouping_for_order(*order, fixed),
+            SourceIterator::Durable { .. } => grouping_for_order(IndexCursorOrder::Gspo, fixed),
+            SourceIterator::QueryIndex { order, .. } => grouping_for_order(*order, fixed),
             SourceIterator::Single(_) | SourceIterator::Empty => CountGrouping::None,
         }
     }
@@ -555,6 +831,7 @@ impl RawQuadCursor {
     pub(crate) fn single(candidate: Option<RawQuadCandidate>) -> Self {
         Self {
             source: SourceIterator::Single(candidate),
+            costs: QueryCost::default(),
         }
     }
 
@@ -582,35 +859,37 @@ impl RawQuadCursor {
                 _keyspace: quads.clone(),
                 iterator,
             },
+            costs: QueryCost::default(),
         }
     }
 
-    pub(crate) fn query_index(
-        snapshot: Snapshot,
-        keyspace: &Keyspace,
-        query_to_term: &Keyspace,
-        order: QueryIndexCursorOrder,
-        prefix: Vec<u8>,
-    ) -> Self {
-        let iterator = if prefix.is_empty() {
-            snapshot.iter(keyspace)
+    pub(crate) fn query_index(snapshot: Snapshot, scan: QueryIndexScan<'_>) -> Self {
+        let iterator = if scan.prefix.is_empty() {
+            snapshot.iter(scan.keyspace)
         } else {
-            snapshot.prefix(keyspace, prefix)
+            snapshot.prefix(scan.keyspace, scan.prefix)
         };
         Self {
             source: SourceIterator::QueryIndex {
                 snapshot,
-                query_to_term: query_to_term.clone(),
+                query_to_term: scan.query_to_term.clone(),
                 iterator,
-                order,
+                order: scan.order,
             },
+            costs: QueryCost::default(),
         }
     }
 
     pub(crate) fn empty() -> Self {
         Self {
             source: SourceIterator::Empty,
+            costs: QueryCost::default(),
         }
+    }
+
+    pub(crate) fn track_costs(mut self, costs: QueryCost) -> Self {
+        self.costs = costs;
+        self
     }
 
     pub(crate) fn next_candidate(&mut self) -> Option<Result<RawQuadCandidate>> {
@@ -628,7 +907,7 @@ impl RawQuadCursor {
                 };
                 Some(Ok(RawQuadCandidate {
                     quad,
-                    live: GraphStore::quad_value_is_live(value.as_ref()),
+                    live: GraphStore::quad_is_live(value.as_ref()),
                     storage: CandidateStorage::Source,
                     bytes_read: (key.len() + value.len()) as u64,
                     key_fields_extracted: 4,
@@ -647,17 +926,21 @@ impl RawQuadCursor {
                     Err(error) => return Some(Err(error.into())),
                 };
                 if !value.as_ref().is_empty() {
-                    return Some(Err(crate::store::StoreError::InvalidQueryIndexEncoding {
+                    return Some(Err(crate::store::StoreError::InvalidIndexEncoding {
                         context: "qv2 query index value",
                         message: format!("expected empty value, found {} bytes", value.len()),
                     }));
                 }
-                let query_quad = match GraphStore::decode_query_index_key(*order, key.as_ref()) {
+                let query_quad = match GraphStore::decode_query_key(*order, key.as_ref()) {
                     Ok(quad) => quad,
                     Err(error) => return Some(Err(error)),
                 };
-                let decode =
-                    |term| GraphStore::decode_query_source_term(snapshot, query_to_term, term);
+                let decode = |term| {
+                    let (term, bytes) =
+                        GraphStore::decode_query_term(snapshot, query_to_term, term)?;
+                    self.costs.reverse_mapping(bytes);
+                    Ok::<TermId, crate::store::StoreError>(term)
+                };
                 let quad = match (|| {
                     Ok(EncodedQuad {
                         graph: decode(query_quad.graph)?,
@@ -813,9 +1096,9 @@ impl<'store, 'context, 'visibility> QueryCursor<'store, 'context, 'visibility> {
     fn account_candidate(&mut self, candidate: &RawQuadCandidate) -> Result<()> {
         self.context.increment_candidate_quads();
         self.context
-            .record_key_fields_extracted(u64::from(candidate.key_fields_extracted));
+            .record_key_fields(u64::from(candidate.key_fields_extracted));
         if candidate.encoded_quad_constructed {
-            self.context.increment_encoded_quad_constructions();
+            self.context.increment_quad_builds();
         }
         match candidate.storage {
             CandidateStorage::Source => self.context.record_source_read(candidate.bytes_read),
@@ -967,7 +1250,7 @@ pub(crate) fn point_candidate(
     };
     Ok(Some(RawQuadCandidate {
         quad,
-        live: GraphStore::quad_value_is_live(value.as_ref()),
+        live: GraphStore::quad_is_live(value.as_ref()),
         storage: CandidateStorage::Source,
         bytes_read: (64 + value.len()) as u64,
         key_fields_extracted: 0,
@@ -986,36 +1269,18 @@ mod tests {
         let predicate = QueryTermId(3);
         let object = QueryTermId(4);
         for (order, terms) in [
-            (
-                QueryIndexCursorOrder::Gspo,
-                [graph, subject, predicate, object],
-            ),
-            (
-                QueryIndexCursorOrder::Gpos,
-                [graph, predicate, object, subject],
-            ),
-            (
-                QueryIndexCursorOrder::Spog,
-                [subject, predicate, object, graph],
-            ),
-            (
-                QueryIndexCursorOrder::Posg,
-                [predicate, object, subject, graph],
-            ),
-            (
-                QueryIndexCursorOrder::Ospg,
-                [object, subject, predicate, graph],
-            ),
-            (
-                QueryIndexCursorOrder::Gosp,
-                [graph, object, subject, predicate],
-            ),
+            (IndexCursorOrder::Gspo, [graph, subject, predicate, object]),
+            (IndexCursorOrder::Gpos, [graph, predicate, object, subject]),
+            (IndexCursorOrder::Spog, [subject, predicate, object, graph]),
+            (IndexCursorOrder::Posg, [predicate, object, subject, graph]),
+            (IndexCursorOrder::Ospg, [object, subject, predicate, graph]),
+            (IndexCursorOrder::Gosp, [graph, object, subject, predicate]),
         ] {
             let mut bytes = [0_u8; 32];
             for (index, term) in terms.into_iter().enumerate() {
                 bytes[index * 8..(index + 1) * 8].copy_from_slice(&term.0.to_be_bytes());
             }
-            let key = RawQueryIndexKey {
+            let key = RawIndexKey {
                 bytes,
                 order,
                 bytes_read: 32,
