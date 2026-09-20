@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ops::Bound::{Excluded, Included};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard as ReadGuard,
+    RwLockWriteGuard as WriteGuard, TryLockError,
 };
 use std::time::Duration;
 #[cfg(feature = "shacl-core")]
@@ -15,12 +17,30 @@ use std::time::Instant;
 use crate::cache::BoundedCache;
 #[cfg(test)]
 use crate::cache::CacheStatistics;
-use crate::core::*;
+use crate::core::{
+    ActorId, Batch, ContextTag, Dot, EncodedTerm, GraphDiagnostics, GraphId, GraphPolicy,
+    GraphReplicaSnapshot, GraphTombstone, PolicyTag, SnapshotQuadState, TaggedGraphPolicy,
+    TaggedRenderHints, VectorClock,
+};
+#[cfg(test)]
+use crate::core::{CrateRenderHints as RenderHints, EventId};
+use crate::memory::{MemoryBudget, MemoryLease};
 use crate::qv_gate::QvCommitGate;
-use crate::search_queue::{DirtyGraph, DirtySubject, DirtyTokens};
+use crate::search::queue::{
+    CleanupJob, CleanupPage, CleanupScan, DeleteGeneration, DirtyGraph, DirtySubject, DirtyTokens,
+    GenerationId, GenerationRequest, GenerationSwitch, GraphGeneration, GraphScan, ManifestDigest,
+    ManifestPage, ManifestRow, ManifestScan, OversizedCleanup, OversizedEntry, OversizedSource,
+    QuadPage, QueueCursor, QueueId, QueueKind, QueuePage, QueueScan, RebuildPage, RebuildRequest,
+    RebuildScan, RetryState, SEARCH_META_FORMAT, SearchCoverage, StageFailure, StageJob,
+    StageRequest, SubjectPage, SubjectScan,
+};
+use crate::sync::{
+    BackupProof, MutationId, MutationLookup, MutationReceipt, MutationStatus, RepairAudit,
+    RepairMode, RepairOutcome, RepairResult, SourceOutcome,
+};
 use crate::{
     CraqleErrorKind, DISK_FORMAT_VERSION, DiskFormatVersion, QueryIndexState, QueryIndexStatus,
-    QueryIndexVerification, QueryIndexVerificationMode,
+    QueryIndexVerification, QueryIndexVerificationMode as IndexVerifyMode,
 };
 use fjall::{
     CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable, Snapshot,
@@ -35,6 +55,8 @@ pub enum StoreError {
     Fjall(#[from] fjall::Error),
     #[error("postcard: {0}")]
     Postcard(#[from] postcard::Error),
+    #[error("memory budget: {0}")]
+    Memory(#[from] crate::memory::MemoryBudgetError),
     #[error("term not found: {0:032x}")]
     TermNotFound(u128),
     #[error("term hash collision for `{attempted}` against existing `{existing}`")]
@@ -47,9 +69,9 @@ pub enum StoreError {
         message: String,
     },
     #[error("query index verification failed: {0}")]
-    QueryIndexVerificationFailed(&'static str),
+    IndexVerificationFailed(&'static str),
     #[error("invalid query-index encoding for {context}: {message}")]
-    InvalidQueryIndexEncoding {
+    InvalidIndexEncoding {
         context: &'static str,
         message: String,
     },
@@ -57,6 +79,22 @@ pub enum StoreError {
     QueryIndexUnavailable(&'static str),
     #[error("query-index maintenance is busy; the write was not applied")]
     QueryIndexBusy,
+    #[error("query-view delta capacity is exhausted; the write was not applied")]
+    QueryIndexCapacity,
+    #[error("{resource} limit {limit} exceeded by {actual}")]
+    LimitExceeded {
+        resource: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("invalid search-derived state: {0}")]
+    InvalidSearchState(&'static str),
+    #[error("unsupported search metadata format {found}; this release supports {supported}")]
+    UnsupportedSearchFormat { found: u16, supported: u16 },
+    #[error("unsupported query-view format {found}; this release supports {supported}")]
+    UnsupportedIndexFormat { found: u32, supported: u32 },
+    #[error("mutation identity was reused with different request content")]
+    ReceiptConflict,
     #[error("authoritative disk-format marker is missing from a non-empty store")]
     MissingAuthoritativeFormat,
     #[error("invalid authoritative disk-format marker")]
@@ -78,19 +116,24 @@ impl StoreError {
     pub(crate) fn kind(&self) -> CraqleErrorKind {
         match self {
             Self::Cancelled => CraqleErrorKind::Cancelled,
-            Self::TermCollision { .. } | Self::CursorCompareFailed | Self::QueryIndexBusy => {
-                CraqleErrorKind::Conflict
-            }
-            Self::GraphNotFound(_) => CraqleErrorKind::InvalidInput,
-            Self::QueryIndexVerificationFailed(_)
-            | Self::InvalidQueryIndexEncoding { .. }
-            | Self::QueryIndexUnavailable(_) => CraqleErrorKind::CorruptDerivedData,
+            Self::TermCollision { .. }
+            | Self::CursorCompareFailed
+            | Self::QueryIndexBusy
+            | Self::QueryIndexCapacity
+            | Self::ReceiptConflict => CraqleErrorKind::Conflict,
+            Self::GraphNotFound(_) | Self::LimitExceeded { .. } => CraqleErrorKind::InvalidInput,
+            Self::IndexVerificationFailed(_)
+            | Self::InvalidIndexEncoding { .. }
+            | Self::QueryIndexUnavailable(_)
+            | Self::InvalidSearchState(_) => CraqleErrorKind::CorruptDerivedData,
             Self::TermNotFound(_)
             | Self::InvalidEncoding { .. }
             | Self::MissingAuthoritativeFormat
             | Self::InvalidAuthoritativeFormat => CraqleErrorKind::CorruptAuthoritativeData,
-            Self::UnsupportedAuthoritativeFormat { .. } => CraqleErrorKind::Unsupported,
-            Self::Fjall(_) | Self::Postcard(_) => CraqleErrorKind::Storage,
+            Self::UnsupportedAuthoritativeFormat { .. }
+            | Self::UnsupportedSearchFormat { .. }
+            | Self::UnsupportedIndexFormat { .. } => CraqleErrorKind::Unsupported,
+            Self::Fjall(_) | Self::Postcard(_) | Self::Memory(_) => CraqleErrorKind::Storage,
         }
     }
 
@@ -137,7 +180,7 @@ impl QueryTermId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EncodedQuad {
     pub graph: TermId,
     pub subject: TermId,
@@ -157,14 +200,36 @@ const DOT_ENCODING_TAG: u8 = b'D';
 const GRAPH_META_PREFIX: u8 = b'M';
 const GRAPH_DIRTY_PREFIX: u8 = b'D';
 const GRAPH_REINDEX_PREFIX: u8 = b'R';
-const GRAPH_SEARCH_DELETE_PREFIX: u8 = b'X';
+const GRAPH_DELETE_PREFIX: u8 = b'X';
+const SEARCH_ORDER_PREFIX: u8 = b'O';
+const SEARCH_FAILURE_PREFIX: u8 = b'F';
+const SEARCH_GENERATION_PREFIX: u8 = b'G';
+const SEARCH_STAGE_PREFIX: u8 = b'S';
+const SEARCH_CLEANUP_PREFIX: u8 = b'L';
+const SEARCH_NEXT_KEY: &[u8] = b"N";
+const SEARCH_COVERAGE_KEY: &[u8] = b"C";
+const SEARCH_HEAD_KEY: &[u8] = b"H";
+const SEARCH_SCHEMA_KEY: &[u8] = b"V";
+const SEARCH_MANIFEST_KEY: &[u8] = b"M";
+const SEARCH_REBUILD_KEY: &[u8] = b"E";
+const SEARCH_COVERAGE_MAGIC: [u8; 2] = *b"SC";
+const SEARCH_GENERATION_MAGIC: [u8; 2] = *b"SG";
+const SEARCH_STAGE_MAGIC: [u8; 2] = *b"SS";
+const SEARCH_ORDER_KEY: &[u8] = b"Q";
+const SEARCH_ORDER_FORMAT: u16 = 1;
+const RECEIPT_RETENTION: usize = 4_096;
+const RECEIPT_EXPIRED_KEY: &[u8] = b"\0receipt-expired";
+const BATCH_RECEIPT_PREFIX: [u8; 2] = [0, b'B'];
+const BATCH_REVERSE_PREFIX: [u8; 2] = [0, b'R'];
+const BATCH_ORDER_PREFIX: [u8; 2] = [0, b'M'];
 const LOG_HEAD_PREFIX: u8 = b'H';
 const LOG_BATCH_PREFIX: u8 = b'B';
 const TOPIC_CLOCK_PREFIX: u8 = b'C';
 const TOPIC_BINDING_PREFIX: u8 = b'T';
 const GRAPH_TOMBSTONE_PREFIX: u8 = b'Z';
+const DELETED_POLICY_PREFIX: u8 = b'Y';
 const REPLICATION_REJECTION_PREFIX: u8 = b'J';
-const CURSOR_REPAIR_AUDIT_PREFIX: u8 = b'A';
+const CURSOR_AUDIT_PREFIX: u8 = b'A';
 /// Per-graph vector clock, split out of the graph meta record so a
 /// commit writes only the clock and never rewrites policy/context/topic bytes.
 const GRAPH_CLOCK_PREFIX: u8 = b'K';
@@ -179,68 +244,53 @@ const SHACL_REVERSE_PREFIX: u8 = b's';
 #[cfg(feature = "shacl-core")]
 const SHACL_PENDING_PREFIX: u8 = b'V';
 #[cfg(feature = "shacl-core")]
-const SHACL_PENDING_QUEUE_SCHEMA_KEY: &[u8] = b"vshacl-pending-queue";
+const SHACL_QUEUE_KEY: &[u8] = b"vshacl-pending-queue";
 #[cfg(feature = "shacl-core")]
-const SHACL_PENDING_QUEUE_SCHEMA_VERSION: u8 = 1;
+const SHACL_QUEUE_VERSION: u8 = 1;
 const TERM_LOCK_SHARDS: usize = 64;
 const COMMIT_LOCK_SHARDS: usize = 64;
-/// How long a graph commit waits for query-view maintenance ownership before it
-/// reports the store busy. A full rebuild owns the gate for its whole duration,
-/// so the wait is generous and the caller is refused rather than stalled forever.
+const GRAPH_LOCK_SHARDS: usize = 32;
+const INDEX_EPOCH_SHARDS: usize = 256;
+/// Maximum wait for query-view maintenance ownership before reporting busy.
 const QV_COMMIT_WAIT: Duration = Duration::from_secs(120);
-const TERM_DECODE_CACHE_CAP: usize = 1_000_000;
-const TERM_DECODE_CACHE_BYTES: usize = 128 * 1_048_576;
-const QUAD_SUBJECT_CACHE_CAP: usize = 65_536;
-const QUAD_SUBJECT_CACHE_BYTES: usize = 64 * 1_048_576;
-const OBJECT_ORDER_CACHE_CAP: usize = 4_096;
-const OBJECT_ORDER_CACHE_BYTES: usize = 64 * 1_048_576;
-const PLANNER_DISTINCT_CACHE_CAP: usize = 4_096;
-const PLANNER_DISTINCT_CACHE_BYTES: usize = 1_048_576;
-const FTS_GRAPH_REINDEX_SUBJECT_THRESHOLD: usize = 10_000;
+const TERM_CACHE_CAP: usize = 1_000_000;
+const TERM_CACHE_BYTES: usize = 128 * 1_048_576;
+const SUBJECT_CACHE_CAP: usize = 65_536;
+const SUBJECT_CACHE_BYTES: usize = 64 * 1_048_576;
+const ORDER_CACHE_CAP: usize = 4_096;
+const ORDER_CACHE_BYTES: usize = 64 * 1_048_576;
+const PLANNER_CACHE_CAP: usize = 4_096;
+const PLANNER_SAMPLE_ROWS: usize = 4_096;
+const PLANNER_CACHE_BYTES: usize = 1_048_576;
+const FTS_REINDEX_THRESHOLD: usize = 10_000;
 /// Used only when no memory ceiling can be established.
-const DEFAULT_DB_CACHE_BYTES: u64 = 1_024 * 1_024 * 1_024;
-const MAX_DB_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
+#[cfg(test)]
+const DEFAULT_DB_BYTES: u64 = 1_024 * 1_024 * 1_024;
+#[cfg(test)]
+const MAX_DB_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
 /// Smallest useful block cache. Applied instead of the former 1 GiB floor, which
 /// exceeded the whole budget of a small container.
-const MIN_DB_CACHE_BYTES: u64 = 16 * 1_048_576;
+#[cfg(test)]
+const MIN_DB_BYTES: u64 = 16 * 1_048_576;
 /// Share of the process budget for the storage block cache, and again for all
 /// application caches together.
+#[cfg(test)]
 const CACHE_BUDGET_SHARE: u64 = 8;
 /// Control groups report an unlimited controller as a very large number rather
 /// than as `max`, so anything at or above this is treated as no ceiling.
+#[cfg(test)]
 const CGROUP_UNLIMITED_BYTES: u64 = 1 << 62;
 /// Floor for one application cache, so a tight budget still caches something.
-const MIN_APP_CACHE_BYTES: usize = 262_144;
-/// Memtable ceiling for the append-heavy keyspaces (`quads`, `log`).
-///
-/// This is the *only* knob that makes fjall 3.1.6 flush at all, and therefore
-/// the only knob that lets a journal be reclaimed: journal rotation and the
-/// `max_journaling_size` eviction both live inside the flush worker's message
-/// handler, which is reached solely from `check_memtable_rotate`, i.e. from a
-/// memtable exceeding this value. The previous 1 GiB never filled — the `quads`
-/// keyspace is ~84 MB at 40,000 graphs — so nothing ever flushed, the store held
-/// zero SSTables and the single journal grew with total write churn, making cold
-/// start O(bytes ever written) rather than O(data) (findings C1/C2).
-const WRITE_HEAVY_MEMTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
-/// Memtable ceiling for the point-read keyspaces (`terms`, `graphs`).
-///
-/// Deliberately smaller than [`WRITE_HEAVY_MEMTABLE_BYTES`]: a journal file is
-/// only deleted once *every* keyspace holding a watermark in it has flushed, so
-/// a lightly written keyspace sitting on a large memtable pins journals that the
-/// busy keyspaces have long since flushed past.
-const POINT_READ_MEMTABLE_BYTES: u64 = 32 * 1_024 * 1_024;
-/// Ceiling on retained journal bytes, and hence on crash-recovery replay.
-///
-/// fjall rotates a journal file at a hard-coded ~61 MiB and only then checks
-/// this budget, so this is the tightest value that still bounds anything: the
-/// check fires on essentially every rotation and leaves just the active file
-/// behind. Replay is therefore bounded by one journal file (~2 s at the ~31
-/// ms/MiB this store replays at) instead of growing until the old 16 GiB
-/// ceiling forced a rotation.
+const MIN_APP_BYTES: usize = 262_144;
+/// Memtable ceiling that makes append-heavy keyspaces flush and reclaim journals.
+const WRITE_MEMTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
+/// Smaller point-read memtables prevent quiet keyspaces from pinning journals.
+const READ_MEMTABLE_BYTES: u64 = 32 * 1_024 * 1_024;
+/// Retained journal ceiling that bounds crash-recovery replay to one rotation.
 const MAX_JOURNALING_BYTES: u64 = 64 * 1_024 * 1_024;
-const WRITE_HEAVY_TABLE_TARGET_BYTES: u64 = 256 * 1_024 * 1_024;
-const WRITE_HEAVY_L0_THRESHOLD: u8 = 12;
-const WRITE_HEAVY_LEVEL_RATIO: f32 = 20.0;
+const WRITE_TABLE_BYTES: u64 = 256 * 1_024 * 1_024;
+const WRITE_LEVEL_LIMIT: u8 = 12;
+const WRITE_LEVEL_RATIO: f32 = 20.0;
 
 fn encode_disk_format(version: DiskFormatVersion) -> [u8; 4] {
     let mut bytes = [0u8; 4];
@@ -259,10 +309,7 @@ fn decode_disk_format(bytes: &[u8]) -> Result<DiskFormatVersion> {
     })
 }
 
-/// Byte ceilings for one store's caches, derived from the memory this process may
-/// use. Each ceiling keeps its historical value when the budget allows it and is
-/// scaled down in proportion otherwise; none is ever scaled up. These are
-/// accounted value bytes only, so they bound the caches, not resident memory.
+/// Per-store cache ceilings derived from the admitted process memory budget.
 #[derive(Clone, Copy)]
 struct CacheBudget {
     database: u64,
@@ -270,35 +317,60 @@ struct CacheBudget {
     subjects: usize,
     objects: usize,
     planner: usize,
+    shacl: usize,
+}
+
+struct OpenMemory {
+    budget: MemoryBudget,
+    lease: MemoryLease,
 }
 
 impl CacheBudget {
+    #[cfg(test)]
     fn from_limit(limit: Option<u64>) -> Self {
         let Some(limit) = limit else {
             return Self {
-                database: DEFAULT_DB_CACHE_BYTES,
-                terms: TERM_DECODE_CACHE_BYTES,
-                subjects: QUAD_SUBJECT_CACHE_BYTES,
-                objects: OBJECT_ORDER_CACHE_BYTES,
-                planner: PLANNER_DISTINCT_CACHE_BYTES,
+                database: DEFAULT_DB_BYTES,
+                terms: TERM_CACHE_BYTES,
+                subjects: SUBJECT_CACHE_BYTES,
+                objects: ORDER_CACHE_BYTES,
+                planner: PLANNER_CACHE_BYTES,
+                shacl: 0,
             };
         };
         let allowed = limit / CACHE_BUDGET_SHARE;
-        let total = (TERM_DECODE_CACHE_BYTES
-            + QUAD_SUBJECT_CACHE_BYTES
-            + OBJECT_ORDER_CACHE_BYTES
-            + PLANNER_DISTINCT_CACHE_BYTES) as u64;
+        let total =
+            (TERM_CACHE_BYTES + SUBJECT_CACHE_BYTES + ORDER_CACHE_BYTES + PLANNER_CACHE_BYTES)
+                as u64;
         Self {
-            database: (limit / CACHE_BUDGET_SHARE).clamp(MIN_DB_CACHE_BYTES, MAX_DB_CACHE_BYTES),
-            terms: scaled_ceiling(TERM_DECODE_CACHE_BYTES, allowed, total),
-            subjects: scaled_ceiling(QUAD_SUBJECT_CACHE_BYTES, allowed, total),
-            objects: scaled_ceiling(OBJECT_ORDER_CACHE_BYTES, allowed, total),
-            planner: scaled_ceiling(PLANNER_DISTINCT_CACHE_BYTES, allowed, total),
+            database: (limit / CACHE_BUDGET_SHARE).clamp(MIN_DB_BYTES, MAX_DB_BYTES),
+            terms: scaled_ceiling(TERM_CACHE_BYTES, allowed, total),
+            subjects: scaled_ceiling(SUBJECT_CACHE_BYTES, allowed, total),
+            objects: scaled_ceiling(ORDER_CACHE_BYTES, allowed, total),
+            planner: scaled_ceiling(PLANNER_CACHE_BYTES, allowed, total),
+            shacl: 0,
         }
     }
 
-    fn current() -> Self {
-        Self::from_limit(process_memory_limit())
+    fn from_budget(budget: MemoryBudget) -> Self {
+        let total =
+            (TERM_CACHE_BYTES + SUBJECT_CACHE_BYTES + ORDER_CACHE_BYTES + PLANNER_CACHE_BYTES)
+                as u64;
+        let allowed = budget.application_bytes();
+        let shacl = if cfg!(feature = "shacl-core") {
+            usize::try_from(allowed / 4).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let cache_allowed = allowed.saturating_sub(shacl as u64);
+        Self {
+            database: budget.storage_bytes(),
+            terms: scaled_ceiling(TERM_CACHE_BYTES, cache_allowed, total),
+            subjects: scaled_ceiling(SUBJECT_CACHE_BYTES, cache_allowed, total),
+            objects: scaled_ceiling(ORDER_CACHE_BYTES, cache_allowed, total),
+            planner: scaled_ceiling(PLANNER_CACHE_BYTES, cache_allowed, total),
+            shacl,
+        }
     }
 }
 
@@ -307,24 +379,10 @@ fn scaled_ceiling(bytes: usize, allowed: u64, total: u64) -> usize {
         return bytes;
     }
     let scaled = (bytes as u64).saturating_mul(allowed) / total;
-    usize::try_from(scaled)
-        .unwrap_or(bytes)
-        .max(MIN_APP_CACHE_BYTES)
+    usize::try_from(scaled).unwrap_or(bytes).max(MIN_APP_BYTES)
 }
 
-/// Memory available to this process, as the smaller of the host's available
-/// memory and any control-group ceiling. `None` when neither can be read, which
-/// keeps the historical fixed sizes rather than guessing a small budget.
-fn process_memory_limit() -> Option<u64> {
-    let host = meminfo_available(Path::new("/proc/meminfo"));
-    let cgroup = cgroup_memory_limit(Path::new("/proc/self/cgroup"), Path::new("/sys/fs/cgroup"));
-    match (host, cgroup) {
-        (Some(host), Some(cgroup)) => Some(host.min(cgroup)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
+#[cfg(test)]
 fn meminfo_available(path: &Path) -> Option<u64> {
     let meminfo = std::fs::read_to_string(path).ok()?;
     meminfo.lines().find_map(|line| {
@@ -334,10 +392,8 @@ fn meminfo_available(path: &Path) -> Option<u64> {
     })
 }
 
-/// Smallest memory ceiling that applies to this process. Control-group version 2
-/// keeps `memory.max` in the process's own directory and in every ancestor;
-/// version 1 keeps `memory.limit_in_bytes` under the memory controller mount. A
-/// missing, unreadable, or non-numeric file contributes no ceiling.
+/// Returns the smallest applicable cgroup v1 or v2 memory ceiling.
+#[cfg(test)]
 fn cgroup_memory_limit(mapping: &Path, root: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(mapping).ok()?;
     let mut limit: Option<u64> = None;
@@ -368,6 +424,7 @@ fn cgroup_memory_limit(mapping: &Path, root: &Path) -> Option<u64> {
 
 /// Reads `file` in `root` and in each directory along `relative`, keeping the
 /// smallest ceiling found, because an ancestor's limit also binds this process.
+#[cfg(test)]
 fn smallest_limit(root: &Path, relative: &Path, file: &str) -> Option<u64> {
     let mut limit = numeric_limit(&root.join(file));
     let mut directory = root.to_path_buf();
@@ -385,6 +442,7 @@ fn smallest_limit(root: &Path, relative: &Path, file: &str) -> Option<u64> {
 
 /// `max`, an absent file, a denied read, and a malformed value all mean "no
 /// ceiling here". Version 1 reports an unlimited controller as a huge sentinel.
+#[cfg(test)]
 fn numeric_limit(path: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(path).ok()?;
     let value = text.trim().parse::<u64>().ok()?;
@@ -396,21 +454,14 @@ struct StoredGraphMeta {
     policy: GraphPolicy,
     #[serde(default)]
     policy_tag: PolicyTag,
-    /// Legacy home of the per-graph vector clock. The clock now lives
-    /// under its own `'K' || graph_id` key and this field is only read as a
-    /// one-time migration fallback for stores written before the split; it is
-    /// ignored as soon as the `'K'` key exists. Never written by
-    /// [`GraphStore::set_vector_clock`] any more.
+    /// Legacy clock retained only as the fallback before the separate clock key exists.
     clock: VectorClock,
     #[serde(default)]
     irokle_topic: Option<[u8; 32]>,
-    /// Raw RO-Crate `@context` JSON submitted on import, stored verbatim so it
-    /// can be spliced back into exported documents. `None` means the graph uses
-    /// the bare default RO-Crate context.
+    /// Verbatim imported RO-Crate context, or `None` for the default context.
     #[serde(default)]
     rocrate_context: Option<String>,
-    /// Raw root `license` JSON submitted on import, retained so exports can
-    /// preserve its JSON-LD surface shape while the graph remains unchanged.
+    /// Verbatim root license JSON retained for export fidelity.
     #[serde(default)]
     rocrate_license: Option<String>,
     #[serde(default)]
@@ -431,37 +482,50 @@ enum QuadMutation {
 type QuadKey = [u8; 64];
 type QueryQuadKey = [u8; 32];
 
-const QUERY_INDEX_SCHEMA_VERSION: u32 = 3;
+const QV_SCHEMA_VERSION: u32 = 5;
 /// Version 2 headers predate atomic source-plus-query-view publication, so a
 /// `Ready` state from one is not evidence of coverage until it is verified.
-const QUERY_INDEX_LEGACY_SCHEMA_VERSION: u32 = 2;
-const QUERY_INDEX_HEADER_KEY: [u8; 1] = *b"H";
-const QUERY_INDEX_TOTAL_KEY: [u8; 1] = *b"T";
-const QUERY_INDEX_HEADER_MAGIC: [u8; 4] = *b"QVI2";
-const QUERY_INDEX_HEADER_BASE_LEN: usize = 70;
-const QUERY_INDEX_FAILURE_MAX_BYTES: usize = 256;
-const QUERY_INDEX_BUILD_CHUNK_ROWS: usize = 1_024;
-const QUERY_INDEX_SAMPLE_ROWS: u64 = 128;
-const QUERY_INDEX_PROBLEM_LIMIT: usize = 32;
+const QV_LEGACY_VERSION: u32 = 2;
+const QV_ATOMIC_VERSION: u32 = 3;
+const QV_HEADER_KEY: [u8; 1] = *b"H";
+const PRIMARY_TERM_MAP: &str = "qv2_term_to_query";
+const PRIMARY_QUERY_MAP: &str = "qv2_query_to_term";
+const SECONDARY_TERM_MAP: &str = "qv3_term_to_query";
+const SECONDARY_QUERY_MAP: &str = "qv3_query_to_term";
+const QV_TOTAL_KEY: [u8; 1] = *b"T";
+const QV_HEADER_MAGIC: [u8; 4] = *b"QVI2";
+const QV_HEADER_LEN: usize = 71;
+const QV_LEGACY_LEN: usize = 70;
+const QV_FAILURE_BYTES: usize = 256;
+const QV_BUILD_ROWS: usize = 1_024;
+const QV_SAMPLE_ROWS: u64 = 128;
+const QV_PROBLEM_LIMIT: usize = 32;
 
-const QUERY_INDEX_GRAPH_COUNT_TAG: u8 = b'G';
-const QUERY_INDEX_PREDICATE_COUNT_TAG: u8 = b'P';
-const QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG: u8 = b'A';
-const QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG: u8 = b'O';
-const QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG: u8 = b'X';
-const QUERY_INDEX_UNION_DUPLICATE_FREE_TAG: u8 = b'U';
-const QUERY_INDEX_PROJECTION_DEBT_TAG: u8 = b'W';
+const QV_GRAPH_TAG: u8 = b'G';
+const QV_PREDICATE_TAG: u8 = b'P';
+const QV_VERSION_TAG: u8 = b'V';
+const QV_GP_TAG: u8 = b'A';
+const QV_PO_TAG: u8 = b'O';
+const QV_GPO_TAG: u8 = b'X';
+const QV_UNION_TAG: u8 = b'U';
+const QV_DEBT_TAG: u8 = b'W';
+const QV_BUILD_KEY: &[u8] = b"B";
+const QV_CLEANUP_KEY: &[u8] = b"C";
+const QV_DELTA_TAG: u8 = b'D';
+const QV_DELTA_ROWS: u64 = 65_536;
+const QV_DELTA_BYTES: u64 = 64 * 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StoredQueryIndexState {
+enum StoredIndexState {
     Building,
     Ready,
     Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct QueryIndexHeader {
-    state: StoredQueryIndexState,
+struct IndexHeader {
+    active_slot: u8,
+    state: StoredIndexState,
     source_epoch: u64,
     index_epoch: u64,
     source_live_quads: u64,
@@ -471,10 +535,11 @@ struct QueryIndexHeader {
     next_query_id: u64,
 }
 
-impl QueryIndexHeader {
+impl IndexHeader {
     fn empty_ready() -> Self {
         Self {
-            state: StoredQueryIndexState::Ready,
+            active_slot: 0,
+            state: StoredIndexState::Ready,
             source_epoch: 0,
             index_epoch: 0,
             source_live_quads: 0,
@@ -487,26 +552,26 @@ impl QueryIndexHeader {
 
     fn failed_from(previous: Option<&Self>, reason: &'static str) -> Self {
         let mut header = previous.cloned().unwrap_or_else(Self::empty_ready);
-        header.state = StoredQueryIndexState::Failed(reason.to_owned());
+        header.state = StoredIndexState::Failed(reason.to_owned());
         header
     }
 
     fn state(&self) -> QueryIndexState {
         match &self.state {
-            StoredQueryIndexState::Building => QueryIndexState::Building,
-            StoredQueryIndexState::Ready => QueryIndexState::Ready,
-            StoredQueryIndexState::Failed(reason) => QueryIndexState::Failed(reason.clone()),
+            StoredIndexState::Building => QueryIndexState::Building,
+            StoredIndexState::Ready => QueryIndexState::Ready,
+            StoredIndexState::Failed(reason) => QueryIndexState::Failed(reason.clone()),
         }
     }
 
     fn ready_is_coherent(&self) -> bool {
-        matches!(self.state, StoredQueryIndexState::Ready)
+        matches!(self.state, StoredIndexState::Ready)
             && self.source_epoch == self.index_epoch
             && self.source_live_quads == self.indexed_quads
             && self.query_id_generation != 0
     }
 
-    fn is_not_ahead_of_snapshot(&self, snapshot_sequence: u64) -> bool {
+    fn fits_snapshot(&self, snapshot_sequence: u64) -> bool {
         self.source_epoch <= snapshot_sequence
             && self.index_epoch <= snapshot_sequence
             && self.last_build_sequence <= snapshot_sequence
@@ -514,7 +579,50 @@ impl QueryIndexHeader {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueryIndexCounterKey {
+enum IndexSlot {
+    Primary,
+    Secondary,
+}
+
+impl IndexSlot {
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Primary),
+            1 => Some(Self::Secondary),
+            _ => None,
+        }
+    }
+
+    fn encode(self) -> u8 {
+        match self {
+            Self::Primary => 0,
+            Self::Secondary => 1,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Primary => Self::Secondary,
+            Self::Secondary => Self::Primary,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IndexSpaces<'a> {
+    gspo: &'a Keyspace,
+    gpos: &'a Keyspace,
+    spog: &'a Keyspace,
+    posg: &'a Keyspace,
+    ospg: &'a Keyspace,
+    gosp: &'a Keyspace,
+    term_to_query: &'a Keyspace,
+    query_to_term: &'a Keyspace,
+    meta: &'a Keyspace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexCounterKey {
     Total,
     UnionDuplicateFree,
     Graph(QueryTermId),
@@ -524,36 +632,36 @@ enum QueryIndexCounterKey {
     GraphPredicateObject(QueryTermId, QueryTermId, QueryTermId),
 }
 
-impl QueryIndexCounterKey {
+impl IndexCounterKey {
     fn bytes(self) -> Vec<u8> {
         let mut key = match self {
-            Self::Total => return QUERY_INDEX_TOTAL_KEY.to_vec(),
-            Self::UnionDuplicateFree => return vec![QUERY_INDEX_UNION_DUPLICATE_FREE_TAG],
+            Self::Total => return QV_TOTAL_KEY.to_vec(),
+            Self::UnionDuplicateFree => return vec![QV_UNION_TAG],
             Self::Graph(_) | Self::Predicate(_) => vec![0; 9],
             Self::GraphPredicate(_, _) | Self::PredicateObject(_, _) => vec![0; 17],
             Self::GraphPredicateObject(_, _, _) => vec![0; 25],
         };
         match self {
             Self::Graph(graph) => {
-                key[0] = QUERY_INDEX_GRAPH_COUNT_TAG;
+                key[0] = QV_GRAPH_TAG;
                 key[1..9].copy_from_slice(&graph.to_be_bytes());
             }
             Self::Predicate(predicate) => {
-                key[0] = QUERY_INDEX_PREDICATE_COUNT_TAG;
+                key[0] = QV_PREDICATE_TAG;
                 key[1..9].copy_from_slice(&predicate.to_be_bytes());
             }
             Self::GraphPredicate(graph, predicate) => {
-                key[0] = QUERY_INDEX_GRAPH_PREDICATE_COUNT_TAG;
+                key[0] = QV_GP_TAG;
                 key[1..9].copy_from_slice(&graph.to_be_bytes());
                 key[9..17].copy_from_slice(&predicate.to_be_bytes());
             }
             Self::PredicateObject(predicate, object) => {
-                key[0] = QUERY_INDEX_PREDICATE_OBJECT_COUNT_TAG;
+                key[0] = QV_PO_TAG;
                 key[1..9].copy_from_slice(&predicate.to_be_bytes());
                 key[9..17].copy_from_slice(&object.to_be_bytes());
             }
             Self::GraphPredicateObject(graph, predicate, object) => {
-                key[0] = QUERY_INDEX_GRAPH_PREDICATE_OBJECT_COUNT_TAG;
+                key[0] = QV_GPO_TAG;
                 key[1..9].copy_from_slice(&graph.to_be_bytes());
                 key[9..17].copy_from_slice(&predicate.to_be_bytes());
                 key[17..25].copy_from_slice(&object.to_be_bytes());
@@ -567,22 +675,24 @@ impl QueryIndexCounterKey {
     }
 }
 
-enum QueryIndexHeaderRead {
+enum IndexHeaderRead {
     Absent,
-    Valid(QueryIndexHeader),
-    Legacy(QueryIndexHeader),
+    Valid(IndexHeader),
+    Legacy(IndexHeader),
     Malformed,
 }
 
-enum QueryIndexCounterKeyRead {
+enum CounterKeyRead {
     Header,
-    Counter(QueryIndexCounterKey),
+    Counter(IndexCounterKey),
+    Revision,
     ProjectionDebt,
+    Control,
     UnknownTag,
     InvalidLength,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct NetQuadTransition {
     quad: EncodedQuad,
     was_live: bool,
