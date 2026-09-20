@@ -284,7 +284,7 @@ fn outbound_update(error: replication::UpdateError) -> replication::UpdateError 
             error_kind,
             reason,
         } => replication::UpdateError::Accepted {
-            receipt: receipt.outbound(),
+            receipt: Box::new((*receipt).outbound()),
             error_kind,
             reason,
         },
@@ -300,7 +300,7 @@ impl From<replication::MergeError> for CraqleError {
                 error_kind,
                 reason,
             } => replication::MergeError::Accepted {
-                receipt: receipt.outbound(),
+                receipt: Box::new((*receipt).outbound()),
                 error_kind,
                 reason,
             },
@@ -921,7 +921,7 @@ impl SearchUpdateWorker {
                 return Err(failure(SearchWaitError::Cancelled));
             }
             self.pending
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                     (count < MAX_PENDING_FLUSHES).then(|| count + 1)
                 })
                 .map_err(|_| failure(SearchWaitError::Capacity))?;
@@ -1219,11 +1219,11 @@ fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
                 "search test flush exceeded its deadlock cap".to_owned(),
             ));
         }
-        if let Some(recovery) = progress.recovery {
-            if recovery > target {
-                target = recovery;
-                continue;
-            }
+        if let Some(recovery) = progress.recovery
+            && recovery > target
+        {
+            target = recovery;
+            continue;
         }
         if !progress.failures.is_empty() {
             return Err(CraqleError::SearchWorker(describe_search_failures(
@@ -2322,7 +2322,9 @@ impl CraqleNode {
             self.ensure_graph_action(&lookup.graph, auth, Action::Read)?;
         }
         Ok(match self.replication.mutation_status(&lookup)? {
-            MutationStatus::Known(receipt) => MutationStatus::Known(receipt.outbound()),
+            MutationStatus::Known(receipt) => {
+                MutationStatus::Known(Box::new((*receipt).outbound()))
+            }
             status => status,
         })
     }
@@ -4032,13 +4034,13 @@ impl CraqleNode {
             && let Err(error) = self.schedule_graph_search(&batch.graph)
         {
             return match status {
-                MutationStatus::Known(receipt) => Err(accepted_error(receipt, error)),
+                MutationStatus::Known(receipt) => Err(accepted_error(*receipt, error)),
                 MutationStatus::Expired | MutationStatus::Unknown => Err(error),
             };
         }
         match status {
             MutationStatus::Known(receipt) => {
-                self.persist_receipt(receipt)?;
+                self.persist_receipt(*receipt)?;
             }
             MutationStatus::Expired | MutationStatus::Unknown => self.persist_fjall()?,
         }
@@ -4206,7 +4208,9 @@ impl CraqleNode {
         let status = self.replication.receipt_for_batch(&request.batch)?;
         if let Err(error) = self.schedule_graph_search(request.graph) {
             return match &status {
-                MutationStatus::Known(receipt) => Err(accepted_error(receipt.clone(), error)),
+                MutationStatus::Known(receipt) => {
+                    Err(accepted_error(receipt.as_ref().clone(), error))
+                }
                 MutationStatus::Expired => Err(CraqleError::Update(UpdateError::ReceiptExpired)),
                 MutationStatus::Unknown => Err(error),
             };
@@ -4214,7 +4218,7 @@ impl CraqleNode {
         if request.durability.persists_fjall() {
             match status {
                 MutationStatus::Known(receipt) => {
-                    self.persist_receipt(receipt)?;
+                    self.persist_receipt(*receipt)?;
                 }
                 MutationStatus::Expired => {
                     return Err(CraqleError::Update(UpdateError::ReceiptExpired));
@@ -4233,14 +4237,16 @@ impl CraqleNode {
         let status = self.replication.receipt_for_batch(&report.batch)?;
         if let Err(error) = self.schedule_graph_search(graph) {
             return match &status {
-                MutationStatus::Known(receipt) => Err(accepted_error(receipt.clone(), error)),
+                MutationStatus::Known(receipt) => {
+                    Err(accepted_error(receipt.as_ref().clone(), error))
+                }
                 MutationStatus::Expired => Err(CraqleError::Update(UpdateError::ReceiptExpired)),
                 MutationStatus::Unknown => Err(error),
             };
         }
         match status {
             MutationStatus::Known(receipt) => {
-                self.persist_receipt(receipt)?;
+                self.persist_receipt(*receipt)?;
             }
             MutationStatus::Expired => {
                 return Err(CraqleError::Update(UpdateError::ReceiptExpired));
@@ -4464,7 +4470,7 @@ fn accepted_error(receipt: MutationReceipt, error: CraqleError) -> CraqleError {
     CraqleError::Update(UpdateError::Accepted {
         error_kind: error.kind(),
         reason: error.to_string(),
-        receipt: receipt.outbound(),
+        receipt: Box::new(receipt.outbound()),
     })
 }
 

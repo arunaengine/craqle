@@ -52,7 +52,7 @@ enum Access {
 impl Access {
     fn allows(self, graph: usize) -> bool {
         matches!(self, Self::All)
-            || matches!(self, Self::Half) && graph % 2 == 0
+            || matches!(self, Self::Half) && graph.is_multiple_of(2)
             || matches!(self, Self::One) && graph == 0
     }
     fn label(self) -> &'static str {
@@ -917,10 +917,10 @@ fn build_corpus(config: &Config) -> Corpus {
         let desc = format!("deterministic benchmark record {i:012}");
         let ident = format!("DOC-{i:012}");
         let mut terms = vec![format!("bucket{:04}", state % 127)];
-        if state % config.common_mod == 0 || i == 0 {
+        if state.is_multiple_of(config.common_mod) || i == 0 {
             terms.push(config.common.clone());
         }
-        if state % config.rare_mod == 0 || i == 1 {
+        if state.is_multiple_of(config.rare_mod) || i == 1 {
             terms.push(config.rare.clone());
         }
         if i < config.graphs * 2 {

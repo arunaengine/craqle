@@ -94,7 +94,7 @@ impl QvCommitGate {
         let queued = state
             .waiters
             .iter()
-            .position(|queued| Arc::ptr_eq(queued, &waiter));
+            .position(|queued| Arc::ptr_eq(queued, waiter));
         if let Some(queued) = queued {
             state.waiters.remove(queued);
             return None;

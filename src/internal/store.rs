@@ -621,6 +621,15 @@ struct IndexSpaces<'a> {
     meta: &'a Keyspace,
 }
 
+struct TermResolver<'a> {
+    snapshot: &'a Snapshot,
+    spaces: IndexSpaces<'a>,
+    allow_allocate: bool,
+    resolved: HashMap<TermId, QueryTermId>,
+    mappings: Vec<(TermId, QueryTermId)>,
+    next_query_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IndexCounterKey {
     Total,
@@ -718,6 +727,9 @@ pub(crate) enum RebuildPhase {
     CleanupPage,
     Retire,
 }
+
+#[cfg(test)]
+pub(crate) type RebuildCallback = Arc<dyn Fn(RebuildPhase) + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) struct RebuildHook<'a> {
@@ -1323,7 +1335,7 @@ pub struct GraphStore {
     #[cfg(test)]
     rebuild_stalled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    rebuild_hook: RwLock<Option<Arc<dyn Fn(RebuildPhase) + Send + Sync>>>,
+    rebuild_hook: RwLock<Option<RebuildCallback>>,
     #[cfg(test)]
     delta_row_limit: AtomicU64,
     #[cfg(test)]
@@ -2340,6 +2352,14 @@ fn live_counter_keys(quad: QueryQuad) -> [IndexCounterKey; 6] {
 
 struct IndexVerifyBuilder {
     report: QueryIndexVerification,
+}
+
+struct CounterCheck<'a> {
+    snapshot: &'a Snapshot,
+    spaces: IndexSpaces<'a>,
+    key: IndexCounterKey,
+    expected: u64,
+    problems: (&'static str, &'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -4001,19 +4021,14 @@ impl GraphStore {
 
     fn verify_index_counter(
         &self,
-        snapshot: &Snapshot,
-        spaces: IndexSpaces<'_>,
-        key: IndexCounterKey,
-        expected: u64,
-        missing_problem: &'static str,
-        mismatch_problem: &'static str,
+        check: CounterCheck<'_>,
         report: &mut IndexVerifyBuilder,
     ) -> Result<()> {
-        match snapshot.get(spaces.meta, key.bytes())? {
-            None => report.problem(missing_problem),
+        match check.snapshot.get(check.spaces.meta, check.key.bytes())? {
+            None => report.problem(check.problems.0),
             Some(value) => match decode_index_count(value.as_ref()) {
-                Some(actual) if actual == expected => {}
-                _ => report.problem(mismatch_problem),
+                Some(actual) if actual == check.expected => {}
+                _ => report.problem(check.problems.1),
             },
         }
         Ok(())
@@ -4047,12 +4062,13 @@ impl GraphStore {
             _ => unreachable!("only GPOS counter dimensions are used"),
         };
         self.verify_index_counter(
-            snapshot,
-            spaces,
-            key,
-            expected,
-            missing_problem,
-            mismatch_problem,
+            CounterCheck {
+                snapshot,
+                spaces,
+                key,
+                expected,
+                problems: (missing_problem, mismatch_problem),
+            },
             report,
         )
     }
@@ -4114,12 +4130,13 @@ impl GraphStore {
             _ => unreachable!("only POSG counter dimensions are used"),
         };
         self.verify_index_counter(
-            snapshot,
-            spaces,
-            key,
-            expected,
-            missing_problem,
-            mismatch_problem,
+            CounterCheck {
+                snapshot,
+                spaces,
+                key,
+                expected,
+                problems: (missing_problem, mismatch_problem),
+            },
             report,
         )
     }
@@ -5445,10 +5462,7 @@ impl GraphStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn install_rebuild_hook(
-        &self,
-        hook: Arc<dyn Fn(RebuildPhase) + Send + Sync>,
-    ) -> RebuildHook<'_> {
+    pub(crate) fn install_rebuild_hook(&self, hook: RebuildCallback) -> RebuildHook<'_> {
         *self
             .rebuild_hook
             .write()
@@ -5471,10 +5485,10 @@ impl GraphStore {
     fn delta_limits(&self) -> (u64, u64) {
         #[cfg(test)]
         {
-            return (
+            (
                 self.delta_row_limit.load(Ordering::SeqCst),
                 self.delta_byte_limit.load(Ordering::SeqCst),
-            );
+            )
         }
         #[cfg(not(test))]
         {
@@ -5484,12 +5498,11 @@ impl GraphStore {
 
     #[cfg(test)]
     pub(crate) fn set_delta_limits(&self, rows: u64, bytes: u64) -> DeltaLimitGuard<'_> {
-        let previous = DeltaLimitGuard {
+        DeltaLimitGuard {
             store: self,
             rows: self.delta_row_limit.swap(rows, Ordering::SeqCst),
             bytes: self.delta_byte_limit.swap(bytes, Ordering::SeqCst),
-        };
-        previous
+        }
     }
 
     /// Stall a graph delete between its queue scan and its commit. Test-only.
@@ -5592,50 +5605,52 @@ impl GraphStore {
 
     fn resolve_query_term(
         &self,
-        snapshot: &Snapshot,
-        spaces: IndexSpaces<'_>,
         term: TermId,
-        allow_allocate: bool,
-        resolved: &mut HashMap<TermId, QueryTermId>,
-        mappings: &mut Vec<(TermId, QueryTermId)>,
-        next_query_id: &mut u64,
+        resolver: &mut TermResolver<'_>,
     ) -> Result<Option<QueryTermId>> {
-        if let Some(query) = resolved.get(&term) {
+        if let Some(query) = resolver.resolved.get(&term) {
             return Ok(Some(*query));
         }
-        if let Some(value) = snapshot.get(spaces.term_to_query, term.to_be_bytes())? {
+        if let Some(value) = resolver
+            .snapshot
+            .get(resolver.spaces.term_to_query, term.to_be_bytes())?
+        {
             let Ok(raw) = <[u8; 8]>::try_from(value.as_ref()) else {
                 return Ok(None);
             };
             let query = QueryTermId::from_be_bytes(raw);
-            if query.0 >= *next_query_id {
+            if query.0 >= resolver.next_query_id {
                 return Ok(None);
             }
-            let Some(reverse) = snapshot.get(spaces.query_to_term, query.to_be_bytes())? else {
+            let Some(reverse) = resolver
+                .snapshot
+                .get(resolver.spaces.query_to_term, query.to_be_bytes())?
+            else {
                 return Ok(None);
             };
             if reverse.as_ref() != term.to_be_bytes() {
                 return Ok(None);
             }
-            resolved.insert(term, query);
+            resolver.resolved.insert(term, query);
             return Ok(Some(query));
         }
-        if !allow_allocate {
+        if !resolver.allow_allocate {
             return Ok(None);
         }
-        let query = QueryTermId(*next_query_id);
-        let Some(next) = next_query_id.checked_add(1) else {
+        let query = QueryTermId(resolver.next_query_id);
+        let Some(next) = resolver.next_query_id.checked_add(1) else {
             return Ok(None);
         };
-        if snapshot
-            .get(spaces.query_to_term, query.to_be_bytes())?
+        if resolver
+            .snapshot
+            .get(resolver.spaces.query_to_term, query.to_be_bytes())?
             .is_some()
         {
             return Ok(None);
         }
-        *next_query_id = next;
-        resolved.insert(term, query);
-        mappings.push((term, query));
+        resolver.next_query_id = next;
+        resolver.resolved.insert(term, query);
+        resolver.mappings.push((term, query));
         Ok(Some(query))
     }
 
@@ -5722,57 +5737,30 @@ impl GraphStore {
             | IndexCounterRead::Value(_) => return Ok(None),
         };
 
-        let mut resolved = HashMap::new();
-        let mut mappings = Vec::new();
-        let mut next_query_id = header.next_query_id;
+        let mut resolver = TermResolver {
+            snapshot,
+            spaces,
+            allow_allocate: false,
+            resolved: HashMap::new(),
+            mappings: Vec::new(),
+            next_query_id: header.next_query_id,
+        };
         let mut query_transitions = Vec::with_capacity(transitions.len());
         for transition in transitions {
-            let allow_allocate = transition.is_live;
-            let Some(graph) = self.resolve_query_term(
-                snapshot,
-                spaces,
-                transition.quad.graph,
-                allow_allocate,
-                &mut resolved,
-                &mut mappings,
-                &mut next_query_id,
-            )?
+            resolver.allow_allocate = transition.is_live;
+            let Some(graph) = self.resolve_query_term(transition.quad.graph, &mut resolver)? else {
+                return Ok(None);
+            };
+            let Some(subject) = self.resolve_query_term(transition.quad.subject, &mut resolver)?
             else {
                 return Ok(None);
             };
-            let Some(subject) = self.resolve_query_term(
-                snapshot,
-                spaces,
-                transition.quad.subject,
-                allow_allocate,
-                &mut resolved,
-                &mut mappings,
-                &mut next_query_id,
-            )?
+            let Some(predicate) =
+                self.resolve_query_term(transition.quad.predicate, &mut resolver)?
             else {
                 return Ok(None);
             };
-            let Some(predicate) = self.resolve_query_term(
-                snapshot,
-                spaces,
-                transition.quad.predicate,
-                allow_allocate,
-                &mut resolved,
-                &mut mappings,
-                &mut next_query_id,
-            )?
-            else {
-                return Ok(None);
-            };
-            let Some(object) = self.resolve_query_term(
-                snapshot,
-                spaces,
-                transition.quad.object,
-                allow_allocate,
-                &mut resolved,
-                &mut mappings,
-                &mut next_query_id,
-            )?
+            let Some(object) = self.resolve_query_term(transition.quad.object, &mut resolver)?
             else {
                 return Ok(None);
             };
@@ -5809,6 +5797,8 @@ impl GraphStore {
             }
             query_transitions.push((quad, transition.is_live));
         }
+        let mappings = resolver.mappings;
+        let next_query_id = resolver.next_query_id;
 
         if query_transitions.is_empty() {
             return Ok(Some(IndexUpdatePlan {
@@ -6678,15 +6668,16 @@ impl GraphStore {
         let estimate = match (predicate, stat.domain) {
             (Some(predicate), DistinctDomain::Subject) => {
                 let mut subjects = HashSet::new();
-                let mut visited = 0usize;
                 let mut truncated = false;
-                for guard in snapshot.prefix(spaces.posg, predicate.to_be_bytes()) {
+                for (visited, guard) in snapshot
+                    .prefix(spaces.posg, predicate.to_be_bytes())
+                    .enumerate()
+                {
                     costs.planner_entries(1);
                     if visited == PLANNER_SAMPLE_ROWS {
                         truncated = true;
                         break;
                     }
-                    visited += 1;
                     let (key, _) = guard.into_inner().ok()?;
                     subjects.insert(decode_posg_key(key.as_ref())?.subject);
                 }
@@ -6698,15 +6689,16 @@ impl GraphStore {
             }
             (Some(predicate), DistinctDomain::Object) => {
                 let mut objects = HashSet::new();
-                let mut visited = 0usize;
                 let mut truncated = false;
-                for guard in snapshot.prefix(spaces.posg, predicate.to_be_bytes()) {
+                for (visited, guard) in snapshot
+                    .prefix(spaces.posg, predicate.to_be_bytes())
+                    .enumerate()
+                {
                     costs.planner_entries(1);
                     if visited == PLANNER_SAMPLE_ROWS {
                         truncated = true;
                         break;
                     }
-                    visited += 1;
                     let (key, _) = guard.into_inner().ok()?;
                     objects.insert(decode_posg_key(key.as_ref())?.object);
                 }
@@ -6718,15 +6710,13 @@ impl GraphStore {
             }
             (None, DistinctDomain::Subject) => {
                 let mut subjects = HashSet::new();
-                let mut visited = 0usize;
                 let mut truncated = false;
-                for guard in snapshot.iter(spaces.spog) {
+                for (visited, guard) in snapshot.iter(spaces.spog).enumerate() {
                     costs.planner_entries(1);
                     if visited == PLANNER_SAMPLE_ROWS {
                         truncated = true;
                         break;
                     }
-                    visited += 1;
                     let (key, _) = guard.into_inner().ok()?;
                     subjects.insert(decode_spog_key(key.as_ref())?.subject);
                 }
@@ -6738,15 +6728,13 @@ impl GraphStore {
             }
             (None, DistinctDomain::Object) => {
                 let mut objects = HashSet::new();
-                let mut visited = 0usize;
                 let mut truncated = false;
-                for guard in snapshot.iter(spaces.ospg) {
+                for (visited, guard) in snapshot.iter(spaces.ospg).enumerate() {
                     costs.planner_entries(1);
                     if visited == PLANNER_SAMPLE_ROWS {
                         truncated = true;
                         break;
                     }
-                    visited += 1;
                     let (key, _) = guard.into_inner().ok()?;
                     objects.insert(decode_ospg_key(key.as_ref())?.object);
                 }
@@ -7286,7 +7274,7 @@ impl GraphStore {
             .transpose()?;
         if let Some(highest) = stored_head {
             self.dirty_counter
-                .store(highest.checked_add(1).unwrap_or(u64::MAX), Ordering::SeqCst);
+                .store(highest.saturating_add(1), Ordering::SeqCst);
             self.dirty_committed.store(highest, Ordering::SeqCst);
             return Ok(());
         }
@@ -7324,7 +7312,7 @@ impl GraphStore {
             self.commit_fjall_batch(batch)?;
         }
         self.dirty_counter
-            .store(highest.checked_add(1).unwrap_or(u64::MAX), Ordering::SeqCst);
+            .store(highest.saturating_add(1), Ordering::SeqCst);
         self.dirty_committed.store(highest, Ordering::SeqCst);
         Ok(())
     }
@@ -9848,11 +9836,10 @@ impl GraphStore {
 
         let mut entries = Vec::new();
         let mut next = scan.after;
-        let mut rows = 0usize;
         let mut bytes = 0usize;
         let mut remaining = false;
         let mut oversized = None;
-        for graph in candidates {
+        for (rows, graph) in candidates.into_iter().enumerate() {
             if rows == scan.row_limit {
                 remaining = true;
                 break;
@@ -9924,7 +9911,6 @@ impl GraphStore {
                 delete_owed,
                 stage_target: stage.map(|stored| stored.job.target),
             });
-            rows += 1;
             bytes = bytes.saturating_add(raw_bytes);
             next = Some(graph);
         }
@@ -10515,14 +10501,14 @@ impl GraphStore {
             |graph| Excluded(graph_meta_key(graph).to_vec()),
         );
         let upper = Excluded(vec![GRAPH_META_PREFIX.saturating_add(1)]);
-        let mut iterator = self.graphs.range((lower, upper));
+        let iterator = self.graphs.range((lower, upper));
         let mut batch = self.buffered_batch();
         let mut rows = 0usize;
         let mut bytes = 0usize;
         let mut highest = self.locked_dirty_token();
         let mut remaining = false;
         let mut oversized = None;
-        while let Some(guard) = iterator.next() {
+        for guard in iterator {
             let (key, value) = guard.into_inner()?;
             if rows == scan.row_limit {
                 remaining = true;
@@ -11035,7 +11021,7 @@ impl GraphStore {
             {
                 return Ok(MutationStatus::Unknown);
             }
-            return Ok(MutationStatus::Known(receipt));
+            return Ok(MutationStatus::Known(Box::new(receipt)));
         }
         let expired = self
             .receipt_order
@@ -11129,7 +11115,7 @@ impl GraphStore {
         };
         let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
         if let Some(receipt) = self.mutation_receipt(&mapping.id)? {
-            return Ok(MutationStatus::Known(receipt));
+            return Ok(MutationStatus::Known(Box::new(receipt)));
         }
         let expired = self
             .receipt_order
@@ -11362,7 +11348,7 @@ impl GraphStore {
     fn stage_fts_entry(&self, batch: &mut fjall::OwnedWriteBatch, key: FtsQueueKey) -> Result<u64> {
         let token = self
             .dirty_counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| StoreError::InvalidSearchState("search-token-exhausted"))?;

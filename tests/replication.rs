@@ -539,7 +539,7 @@ mod tests {
         };
         let merge_receipt = receipt.clone();
         let error: CraqleError = UpdateError::Accepted {
-            receipt,
+            receipt: Box::new(receipt),
             error_kind: CraqleErrorKind::Storage,
             reason: "injected post-commit failure".to_owned(),
         }
@@ -557,7 +557,7 @@ mod tests {
         );
 
         let error: CraqleError = MergeError::Accepted {
-            receipt: merge_receipt,
+            receipt: Box::new(merge_receipt),
             error_kind: CraqleErrorKind::Storage,
             reason: "injected merge settlement failure".to_owned(),
         }

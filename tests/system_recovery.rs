@@ -16,6 +16,7 @@ mod tests {
     use crate::support::*;
 
     type WorkerResult = std::result::Result<(), CraqleErrorKind>;
+    type TestResult<T> = std::result::Result<T, Box<CraqleError>>;
 
     fn node_options(irokle: irokle::Irokle, peers: BTreeSet<irokle::PeerId>) -> CraqleOptions {
         CraqleOptions::new()
@@ -51,7 +52,7 @@ mod tests {
         Ok(moved)
     }
 
-    fn query_values(node: &CraqleNode, graph: &GraphId) -> craqle::Result<Vec<String>> {
+    fn query_values(node: &CraqleNode, graph: &GraphId) -> TestResult<Vec<String>> {
         let query = format!(
             "SELECT ?value WHERE {{ GRAPH <{}> {{ <{}> <http://schema.org/keywords> ?value }} }} ORDER BY ?value",
             graph.as_str(),
@@ -146,7 +147,7 @@ mod tests {
         let writer_done = done_tx.clone();
         let writer = thread::spawn(move || {
             writer_barrier.wait();
-            let outcome = (|| -> craqle::Result<Vec<MutationReceipt>> {
+            let outcome = (|| -> TestResult<Vec<MutationReceipt>> {
                 let mut receipts = Vec::new();
                 for index in 0..4u8 {
                     let id = MutationId([index + 1; 32]);
@@ -188,7 +189,7 @@ mod tests {
         let reader_done = done_tx.clone();
         let reader = thread::spawn(move || {
             reader_barrier.wait();
-            let outcome = (|| -> craqle::Result<()> {
+            let outcome = (|| -> TestResult<()> {
                 for _ in 0..8 {
                     let _ = reader_node.graph_snapshot(&reader_graph)?;
                     let _ = query_values(&reader_node, &reader_graph)?;
@@ -205,7 +206,7 @@ mod tests {
         let maintenance_done = done_tx.clone();
         let maintenance = thread::spawn(move || {
             maintenance_barrier.wait();
-            let outcome = (|| -> craqle::Result<()> {
+            let outcome = (|| -> TestResult<()> {
                 maintenance_node.rebuild_query_indexes()?;
                 maintenance_node.flush_search(&SearchFlushOptions::default())?;
                 Ok(())

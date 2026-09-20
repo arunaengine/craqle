@@ -158,7 +158,7 @@ pub struct SearchReport {
     pub work: WorkCount,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpdateWork {
     pub generation: u64,
     pub terms: usize,
@@ -825,17 +825,6 @@ impl FjallBm25 {
         scan.candidates
             .insert(posting.doc, Candidate { record, score });
         Ok(())
-    }
-}
-
-impl Default for UpdateWork {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            terms: 0,
-            postings: 0,
-            bytes: 0,
-        }
     }
 }
 

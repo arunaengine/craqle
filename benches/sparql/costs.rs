@@ -282,13 +282,15 @@ impl Fixture {
         }
     }
 
-    fn execute(&self) -> craqle::Result<QueryExecution> {
-        self.node.execute_prepared_in_graphs(
-            &AllowAllAuthorizer,
-            std::slice::from_ref(&self.graph),
-            &self.query,
-            &self.options,
-        )
+    fn execute(&self) -> Result<QueryExecution, Box<craqle::CraqleError>> {
+        self.node
+            .execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                std::slice::from_ref(&self.graph),
+                &self.query,
+                &self.options,
+            )
+            .map_err(Box::new)
     }
 }
 

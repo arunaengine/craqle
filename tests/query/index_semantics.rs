@@ -164,12 +164,13 @@ fn query_unbounded(
     node: &CraqleNode,
     auth: &dyn Authorizer,
     sparql: &str,
-) -> craqle::Result<QueryResults> {
+) -> Result<QueryResults, Box<craqle::CraqleError>> {
     let prepared = node.prepare_query(sparql)?;
     let mut options = QueryOptions::default();
     options.limits = QueryLimits::unbounded();
     node.execute_prepared(auth, &prepared, &options)
         .map(|execution| execution.results)
+        .map_err(Box::new)
 }
 
 fn expected_shared_rows() -> Vec<Vec<(String, EncodedTerm)>> {

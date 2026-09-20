@@ -56,6 +56,7 @@ const DIRECT_GENERATION: GenerationId = GenerationId(1);
 const GENERATION_FIELD: &str = "doc_generation";
 const GENERATION_SCOPE_FIELD: &str = "generation_scope";
 const STABLE_KEY_FIELD: &str = "stable_key";
+type SchemaFields = (Field, Field, Field, Field, Field, Field, Field, Field);
 
 /// Cached predicates whose objects contribute searchable document text.
 static SEARCHABLE_PREDICATES: LazyLock<[EncodedTerm; 4]> = LazyLock::new(|| {
@@ -630,9 +631,7 @@ fn build_schema() -> Schema {
     builder.build()
 }
 
-fn schema_fields(
-    schema: &Schema,
-) -> tantivy::Result<(Field, Field, Field, Field, Field, Field, Field, Field)> {
+fn schema_fields(schema: &Schema) -> tantivy::Result<SchemaFields> {
     schema.get_field(INDEX_VERSION_FIELD)?;
     Ok((
         schema.get_field("doc_key")?,

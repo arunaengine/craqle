@@ -101,9 +101,7 @@ impl QueryCancellation {
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let id = if self.is_cancelled() {
-            None
-        } else if registry.evaluators.len() >= limit {
+        let id = if self.is_cancelled() || registry.evaluators.len() >= limit {
             None
         } else if let Some(next_id) = registry.next_id.checked_add(1) {
             let id = registry.next_id;
@@ -401,7 +399,7 @@ impl QueryCost {
     }
 
     fn add(counter: &AtomicU64, amount: u64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(amount))
         });
     }

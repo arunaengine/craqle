@@ -261,7 +261,7 @@ pub struct MutationLookup {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationStatus {
-    Known(MutationReceipt),
+    Known(Box<MutationReceipt>),
     Expired,
     Unknown,
 }

@@ -52,7 +52,7 @@ pub enum UpdateError {
     GraphDeleted { tombstone: GraphTombstone },
     #[error("mutation {:?} has a durable outcome but did not finish: {reason}", .receipt.id)]
     Accepted {
-        receipt: crate::sync::MutationReceipt,
+        receipt: Box<crate::sync::MutationReceipt>,
         error_kind: crate::CraqleErrorKind,
         reason: String,
     },
@@ -74,7 +74,7 @@ pub enum MergeError {
     MissingDependencies(Vec<Dot>),
     #[error("mutation {:?} was accepted but follow-up work failed: {reason}", .receipt.id)]
     Accepted {
-        receipt: crate::sync::MutationReceipt,
+        receipt: Box<crate::sync::MutationReceipt>,
         error_kind: crate::CraqleErrorKind,
         reason: String,
     },
@@ -529,7 +529,7 @@ impl ReplicationEngine {
                 if self.refresh_state(&mut receipt)? {
                     receipt.updated_unix_nanos =
                         Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-                    receipt = self.store.update_receipt(&receipt)?;
+                    receipt = Box::new(self.store.update_receipt(&receipt)?);
                     self.store.persist_receipts()?;
                 }
                 Ok(crate::sync::MutationStatus::Known(receipt))
@@ -552,7 +552,7 @@ impl ReplicationEngine {
     ) -> UpdateError {
         match self.store.mutation_receipt(&id) {
             Ok(Some(receipt)) => UpdateError::Accepted {
-                receipt,
+                receipt: Box::new(receipt),
                 error_kind: error.kind(),
                 reason: error.to_string(),
             },
@@ -563,7 +563,7 @@ impl ReplicationEngine {
     fn accepted_merge(&self, id: crate::sync::MutationId, error: MergeError) -> UpdateError {
         match self.store.mutation_receipt(&id) {
             Ok(Some(receipt)) => UpdateError::Accepted {
-                receipt,
+                receipt: Box::new(receipt),
                 error_kind: error.kind(),
                 reason: error.to_string(),
             },
@@ -578,7 +578,7 @@ impl ReplicationEngine {
     ) -> UpdateError {
         match self.store.mutation_receipt(&id) {
             Ok(Some(receipt)) => UpdateError::Accepted {
-                receipt,
+                receipt: Box::new(receipt),
                 error_kind: error.kind(),
                 reason: error.to_string(),
             },
@@ -590,7 +590,7 @@ impl ReplicationEngine {
         UpdateError::Accepted {
             error_kind: error.kind(),
             reason: error.to_string(),
-            receipt,
+            receipt: Box::new(receipt),
         }
     }
 
@@ -755,17 +755,16 @@ impl ReplicationEngine {
                 return Ok(receipt);
             }
             retry_guard = Some(self.store.graph_write_guard(&request.graph));
-            if let Some(sync) = &self.sync {
-                if let Some(record) = sync
+            if let Some(sync) = &self.sync
+                && let Some(record) = sync
                     .find_mutation(&receipt)
                     .map_err(|error| self.accepted_sync(request.id, error))?
-                {
-                    self.apply_irokle_record(&record)
-                        .map_err(|error| self.accepted_merge(request.id, error))?;
-                    return self.store.mutation_receipt(&request.id)?.ok_or_else(|| {
-                        UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
-                    });
-                }
+            {
+                self.apply_irokle_record(&record)
+                    .map_err(|error| self.accepted_merge(request.id, error))?;
+                return self.store.mutation_receipt(&request.id)?.ok_or_else(|| {
+                    UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
+                });
             }
         } else if request.admission_sequence.is_none() {
             return self.prepare_mutation(&request);
@@ -776,7 +775,7 @@ impl ReplicationEngine {
                 admission_sequence: request.admission_sequence,
             })? {
                 crate::sync::MutationStatus::Expired => Err(UpdateError::ReceiptExpired),
-                crate::sync::MutationStatus::Known(receipt) => Ok(receipt),
+                crate::sync::MutationStatus::Known(receipt) => Ok(*receipt),
                 crate::sync::MutationStatus::Unknown => Err(UpdateError::ReceiptUnknown),
             };
         }
@@ -2900,7 +2899,7 @@ impl ReplicationEngine {
                     return Err(MergeError::Store(error));
                 };
                 return Err(MergeError::Accepted {
-                    receipt,
+                    receipt: Box::new(receipt),
                     error_kind: error.kind(),
                     reason: error.to_string(),
                 });
@@ -3160,10 +3159,10 @@ impl ReplicationEngine {
         let _receipt_guard = staged_receipt
             .as_ref()
             .map(|receipt| self.store.receipt_guard(&receipt.id));
-        if let Some(receipt) = &staged_receipt {
-            if self.store.stage_receipt(&mut batch, receipt)?.is_some() {
-                return Err(MergeError::Store(crate::store::StoreError::ReceiptConflict));
-            }
+        if let Some(receipt) = &staged_receipt
+            && self.store.stage_receipt(&mut batch, receipt)?.is_some()
+        {
+            return Err(MergeError::Store(crate::store::StoreError::ReceiptConflict));
         }
         self.store.commit(batch)?;
         drop(_receipt_guard);
@@ -3173,7 +3172,7 @@ impl ReplicationEngine {
                 .and_then(|receipt| self.store.mutation_receipt(&receipt.id).ok().flatten())
             {
                 return Err(MergeError::Accepted {
-                    receipt,
+                    receipt: Box::new(receipt),
                     error_kind: error.kind(),
                     reason: error.to_string(),
                 });

@@ -187,13 +187,15 @@ impl Fixture {
         }
     }
 
-    fn execute(&self) -> craqle::Result<QueryExecution> {
-        self.node.execute_prepared_in_graphs(
-            &AllowAllAuthorizer,
-            &self.graphs,
-            &self.query,
-            &self.options,
-        )
+    fn execute(&self) -> Result<QueryExecution, Box<craqle::CraqleError>> {
+        self.node
+            .execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                &self.graphs,
+                &self.query,
+                &self.options,
+            )
+            .map_err(Box::new)
     }
 
     fn cold_sample(&self) -> ColdSample {

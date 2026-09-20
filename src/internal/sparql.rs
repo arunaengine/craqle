@@ -2795,7 +2795,7 @@ static NEXT_DENSE_SCOPE: AtomicU64 = AtomicU64::new(1);
 
 fn next_dense_scope() -> Option<u64> {
     NEXT_DENSE_SCOPE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |scope| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |scope| {
             scope.checked_add(1)
         })
         .ok()
@@ -3849,9 +3849,11 @@ mod tests {
             )
             .unwrap();
         let run = |collect_costs| {
-            let mut options = QueryOptions::default();
-            options.collect_costs = collect_costs;
-            options.fast_paths = FastPathMode::Disabled;
+            let options = QueryOptions {
+                collect_costs,
+                fast_paths: FastPathMode::Disabled,
+                ..QueryOptions::default()
+            };
             engine
                 .execute_prepared_graphs(
                     &crate::AllowAllAuthorizer,
@@ -3903,10 +3905,12 @@ mod tests {
             )
             .unwrap();
         let run = |collect_plan_statistics| {
-            let mut options = QueryOptions::default();
-            options.fast_paths = FastPathMode::Disabled;
-            options.join_mode = JoinMode::ForceHash;
-            options.collect_plan_statistics = collect_plan_statistics;
+            let options = QueryOptions {
+                fast_paths: FastPathMode::Disabled,
+                join_mode: JoinMode::ForceHash,
+                collect_plan_statistics,
+                ..QueryOptions::default()
+            };
             engine
                 .execute_prepared_graphs(
                     &crate::AllowAllAuthorizer,
@@ -3965,11 +3969,13 @@ mod tests {
                  ?s <urn:test:dense-mapping:q> ?value }",
             )
             .unwrap();
-        let mut options = QueryOptions::default();
-        options.collect_costs = true;
-        options.fast_paths = FastPathMode::Disabled;
-        options.join_mode = JoinMode::ForceLateral;
-        options.read_mode = QueryReadMode::ForceQv;
+        let options = QueryOptions {
+            collect_costs: true,
+            fast_paths: FastPathMode::Disabled,
+            join_mode: JoinMode::ForceLateral,
+            read_mode: QueryReadMode::ForceQv,
+            ..QueryOptions::default()
+        };
         let execution = engine
             .execute_prepared_graphs(
                 &crate::AllowAllAuthorizer,
@@ -4023,11 +4029,13 @@ mod tests {
                 graph.as_str()
             ))
             .unwrap();
-        let mut options = QueryOptions::default();
-        options.collect_costs = true;
-        options.fast_paths = FastPathMode::Disabled;
-        options.join_mode = JoinMode::ForceLateral;
-        options.read_mode = QueryReadMode::ForceQv;
+        let options = QueryOptions {
+            collect_costs: true,
+            fast_paths: FastPathMode::Disabled,
+            join_mode: JoinMode::ForceLateral,
+            read_mode: QueryReadMode::ForceQv,
+            ..QueryOptions::default()
+        };
         let run = || {
             engine
                 .execute_prepared_graphs(
@@ -4093,10 +4101,12 @@ mod tests {
         let prepared = engine
             .prepare_query(&format!("SELECT ?s ?p ?o WHERE {{ {union} }}"))
             .unwrap();
-        let mut options = QueryOptions::default();
-        options.collect_costs = true;
-        options.fast_paths = FastPathMode::Disabled;
-        options.read_mode = QueryReadMode::ForceQv;
+        let options = QueryOptions {
+            collect_costs: true,
+            fast_paths: FastPathMode::Disabled,
+            read_mode: QueryReadMode::ForceQv,
+            ..QueryOptions::default()
+        };
         let execution = engine
             .execute_prepared_graphs(
                 &crate::AllowAllAuthorizer,
@@ -4133,9 +4143,11 @@ mod tests {
         let prepared = engine
             .prepare_query("SELECT ?s ?o WHERE { ?s <urn:test:dense-generation:p> ?o }")
             .unwrap();
-        let mut options = QueryOptions::default();
-        options.fast_paths = FastPathMode::Disabled;
-        options.read_mode = QueryReadMode::ForceQv;
+        let options = QueryOptions {
+            fast_paths: FastPathMode::Disabled,
+            read_mode: QueryReadMode::ForceQv,
+            ..QueryOptions::default()
+        };
         let first = engine
             .execute_prepared_graphs(
                 &crate::AllowAllAuthorizer,
@@ -4175,8 +4187,10 @@ mod tests {
             );
             settle_diagnostics(&store, graph);
         }
-        let mut options = QueryOptions::default();
-        options.fast_paths = FastPathMode::Disabled;
+        let options = QueryOptions {
+            fast_paths: FastPathMode::Disabled,
+            ..QueryOptions::default()
+        };
         let named = solution_rows(
             engine
                 .query_with_options(

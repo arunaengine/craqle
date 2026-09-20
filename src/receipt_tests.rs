@@ -103,7 +103,7 @@ fn persistence_reports_acceptance() {
 
     // The worker is stopped, so only the receipt update can consume this fault.
     node.store.arm_commit_failure();
-    let error = node.persist_receipt(accepted.clone()).unwrap_err();
+    let error = node.persist_receipt(accepted.as_ref().clone()).unwrap_err();
     let CraqleError::Update(UpdateError::Accepted { receipt, .. }) = error else {
         panic!("post-source failure lost its accepted outcome: {error:?}");
     };
@@ -125,7 +125,7 @@ fn persistence_reports_acceptance() {
     assert_eq!(receipt.persistence, PersistenceOutcome::Pending);
     assert_eq!(reopened.graph_snapshot(&graph).unwrap(), expected);
     assert_eq!(
-        reopened.persist_receipt(receipt).unwrap().persistence,
+        reopened.persist_receipt(*receipt).unwrap().persistence,
         PersistenceOutcome::FullySynced
     );
 }
