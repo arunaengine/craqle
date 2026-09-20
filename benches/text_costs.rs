@@ -604,3 +604,448 @@ fn run_joins(ctx: &RunCtx<'_>) {
     run_join(ctx, &broad);
     run_join(ctx, &selective);
 }
+
+fn run_join(ctx: &RunCtx<'_>, case: &JoinCase<'_>) {
+    let rdf = rdf_candidates(ctx, &case.sparql);
+    let rdf_set: BTreeSet<_> = rdf.keys.iter().cloned().collect();
+    assert_eq!(rdf.rows, rdf_set.len(), "RDF candidates must be a set");
+    let rdf_keys = rdf
+        .keys
+        .iter()
+        .map(|(graph, subject)| DocumentKey { graph, subject })
+        .collect::<Vec<_>>();
+    let stable: BTreeSet<_> = rdf_keys
+        .iter()
+        .map(|key| text::stable_key(key.graph, key.subject))
+        .collect();
+    let bounds = QueryBounds {
+        terms: 4,
+        postings: 2_000_000,
+        candidates: 1_000_000,
+        bytes: 128 << 20,
+    };
+    let started = Instant::now();
+    let searcher = ctx.baseline.reader.searcher();
+    let metadata = load_meta(&searcher).unwrap();
+    let parser = QueryParser::for_index(&ctx.baseline.index, vec![ctx.baseline.fields.text]);
+    let query = parser.parse_query(case.query).unwrap();
+    let prepare_ns = started.elapsed().as_nanos();
+    let auth_candidate = |address| candidate_key(&metadata, address, ctx.config.access);
+    let identity = |address| decode_identity(&metadata, address);
+    let generation = ctx.engine.generation().unwrap();
+
+    let started = Instant::now();
+    let mut reference = text::collect_full(text::TantivyRequest {
+        searcher: &searcher,
+        query: query.as_ref(),
+        statistics: ctx.stats,
+        candidate: &auth_candidate,
+        identity: &identity,
+        generation,
+        limit: ctx.config.docs.saturating_add(ctx.config.graphs * 2),
+        bounds,
+    })
+    .unwrap();
+    reference
+        .hits
+        .retain(|hit| rdf_set.contains(&(hit.graph.clone(), hit.subject.clone())));
+    reference.hits.truncate(ctx.config.limit);
+    let reference_ns = started.elapsed().as_nanos();
+
+    let started = Instant::now();
+    let rdf_first = joins::score_candidates(joins::JoinRequest {
+        searcher: &searcher,
+        query: query.as_ref(),
+        statistics: ctx.stats,
+        key_field: ctx.baseline.fields.key,
+        candidates: &rdf_keys,
+        generation,
+        limit: ctx.config.limit,
+        bounds,
+    })
+    .unwrap();
+    let rdf_first_ns = started.elapsed().as_nanos();
+
+    let combined_candidate = |address| {
+        Ok::<_, text::EngineError>(
+            candidate_key(&metadata, address, ctx.config.access)?
+                .filter(|stable_key| stable.contains(stable_key)),
+        )
+    };
+    let started = Instant::now();
+    let combined = text::collect_pruned(text::TantivyRequest {
+        searcher: &searcher,
+        query: query.as_ref(),
+        statistics: ctx.stats,
+        candidate: &combined_candidate,
+        identity: &identity,
+        generation,
+        limit: ctx.config.limit,
+        bounds,
+    })
+    .unwrap();
+    let combined_ns = started.elapsed().as_nanos();
+
+    let started = Instant::now();
+    let mut fjall = ctx
+        .engine
+        .score_candidates(ScoreRequest {
+            query: case.query,
+            documents: &rdf_keys,
+            bounds,
+        })
+        .unwrap();
+    fjall.hits.truncate(ctx.config.limit);
+    let fjall_ns = started.elapsed().as_nanos();
+    assert_reports(&reference, &rdf_first, 0.0);
+    assert_reports(&reference, &combined, 0.0);
+    assert_reports(&reference, &fjall, ctx.config.tolerance);
+    for (variant, score_ns, report) in [
+        ("text_first_exhaustive", reference_ns, &reference),
+        ("rdf_first_tantivy", rdf_first_ns, &rdf_first),
+        ("combined_pruned", combined_ns, &combined),
+        ("rdf_first_fjall", fjall_ns, &fjall),
+    ] {
+        emit_join(
+            ctx,
+            case,
+            JoinMetric {
+                rdf: &rdf,
+                variant,
+                prepare_ns,
+                score_ns,
+                report,
+            },
+        );
+    }
+}
+
+fn rdf_candidates(ctx: &RunCtx<'_>, sparql: &str) -> RdfCandidates {
+    let started = Instant::now();
+    let result = ctx.node.query(ctx.reader, sparql).unwrap();
+    let query_ns = started.elapsed().as_nanos();
+    let QueryResults::Solutions(rows) = result else {
+        panic!("RDF candidate query must return solutions");
+    };
+    let row_count = rows.len();
+    let started = Instant::now();
+    let keys = rows
+        .into_iter()
+        .map(|row| {
+            let graph = row.get("g").and_then(|term| term.to_named_node()).unwrap();
+            let subject = row.get("s").and_then(|term| term.to_named_node()).unwrap();
+            (graph.as_str().to_string(), subject.as_str().to_string())
+        })
+        .collect();
+    RdfCandidates {
+        keys,
+        query_ns,
+        map_ns: started.elapsed().as_nanos(),
+        rows: row_count,
+    }
+}
+
+struct JoinMetric<'a> {
+    rdf: &'a RdfCandidates,
+    variant: &'a str,
+    prepare_ns: u128,
+    score_ns: u128,
+    report: &'a text::SearchReport,
+}
+
+fn emit_join(ctx: &RunCtx<'_>, case: &JoinCase<'_>, metric: JoinMetric<'_>) {
+    let JoinMetric {
+        rdf,
+        variant,
+        prepare_ns,
+        score_ns,
+        report,
+    } = metric;
+    emit(json!({
+        "kind":"rdf_text_join", "scenario":case.label, "variant":variant,
+        "query":case.query, "permissions":ctx.config.access.label(),
+        "rdf_rows":rdf.rows, "rdf_query_ns":rdf.query_ns, "rdf_map_ns":rdf.map_ns,
+        "text_prepare_ns":prepare_ns, "text_score_ns":score_ns,
+        "outer_ns":rdf.query_ns.saturating_add(rdf.map_ns).saturating_add(prepare_ns).saturating_add(score_ns),
+        "outer_composed_from_nonoverlapping_spans":true,
+        "hits":report.hits.len(),
+        "work":{"pruning_fallback":report.work.pruning_fallback,
+            "posting_rows":report.work.posting_rows,"candidate_docs":report.work.candidate_docs,
+            "scored_docs":report.work.scored_docs,"rejected_docs":report.work.rejected_docs,
+            "metadata_reads":report.work.metadata_reads,"final_reads":report.work.final_reads,
+            "deduplicated_docs":report.work.deduplicated_docs,"bytes":report.work.bytes},
+        "semantics":"Top K text matches satisfying the RDF set; distinct from public SERVICE pre-join limits"
+    }));
+}
+
+fn update_costs(config: &Config, corpus: &Corpus, targets: (&FjallBm25, &mut Baseline)) {
+    let (engine, baseline) = targets;
+    let doc = corpus.docs.iter().find(|doc| doc.entity.is_some()).unwrap();
+    let changed = format!("{} updateprobe", doc.body);
+    let io = io_bytes();
+    let started = Instant::now();
+    let work = engine
+        .upsert(DocumentInput {
+            graph: &doc.graph,
+            subject: &doc.subject,
+            text: &changed,
+        })
+        .unwrap();
+    engine.persist(fjall::PersistMode::SyncAll).unwrap();
+    emit_update(
+        "fjall_upsert",
+        (started.elapsed().as_nanos(), io_delta(io)),
+        update_json(work),
+    );
+    let io = io_bytes();
+    let started = Instant::now();
+    let work = engine.delete(key(doc)).unwrap();
+    engine.persist(fjall::PersistMode::SyncAll).unwrap();
+    emit_update(
+        "fjall_delete",
+        (started.elapsed().as_nanos(), io_delta(io)),
+        update_json(work),
+    );
+    let io = io_bytes();
+    let started = Instant::now();
+    let work = engine.upsert(input(doc)).unwrap();
+    engine.persist(fjall::PersistMode::SyncAll).unwrap();
+    emit_update(
+        "fjall_reinsert",
+        (started.elapsed().as_nanos(), io_delta(io)),
+        update_json(work),
+    );
+    let io = io_bytes();
+    let started = Instant::now();
+    replace_tantivy(baseline, doc, Some(&changed));
+    emit_update(
+        "tantivy_upsert",
+        (started.elapsed().as_nanos(), io_delta(io)),
+        json!({"documents":1,"input_bytes":changed.len()}),
+    );
+    let io = io_bytes();
+    let started = Instant::now();
+    replace_tantivy(baseline, doc, None);
+    emit_update(
+        "tantivy_delete",
+        (started.elapsed().as_nanos(), io_delta(io)),
+        json!({"documents":1,"input_bytes":0}),
+    );
+    let io = io_bytes();
+    let started = Instant::now();
+    add_tantivy(&mut baseline.writer, &baseline.fields, (doc, &doc.body));
+    commit_tantivy(baseline);
+    emit_update(
+        "tantivy_reinsert",
+        (started.elapsed().as_nanos(), io_delta(io)),
+        json!({"documents":1,"input_bytes":doc.body.len()}),
+    );
+    let stats = engine
+        .load_stats(StatsRequest {
+            field: baseline.fields.text,
+            max_terms: 1_000_000,
+            max_bytes: 64 << 20,
+        })
+        .unwrap();
+    let searcher = baseline.reader.searcher();
+    let metadata = load_meta(&searcher).unwrap();
+    let parser = QueryParser::for_index(&baseline.index, vec![baseline.fields.text]);
+    let query = parser.parse_query(&config.common).unwrap();
+    let allows = |_: &str| true;
+    let candidate = |address| candidate_all(&metadata, address);
+    let identity = |address| decode_identity(&metadata, address);
+    let bounds = QueryBounds {
+        terms: 4,
+        postings: 2_000_000,
+        candidates: 1_000_000,
+        bytes: 128 << 20,
+    };
+    let left = text::collect_full(text::TantivyRequest {
+        searcher: &searcher,
+        query: query.as_ref(),
+        statistics: &stats,
+        candidate: &candidate,
+        identity: &identity,
+        generation: engine.generation().unwrap(),
+        limit: config.limit,
+        bounds,
+    })
+    .unwrap();
+    let right = engine
+        .search(FjallSearch {
+            query: &config.common,
+            limit: config.limit,
+            bounds,
+            allows: Some(&allows),
+        })
+        .unwrap();
+    assert_reports(&left, &right, config.tolerance);
+}
+
+fn build_corpus(config: &Config) -> Corpus {
+    let graphs = (0..config.graphs)
+        .map(|i| GraphId::new(&format!("urn:text:graph:{i:06}")))
+        .collect::<Vec<_>>();
+    let mut docs = Vec::with_capacity(config.docs + config.graphs * 2);
+    for (i, graph) in graphs.iter().enumerate() {
+        let name = format!("Text Graph {i:06}");
+        let desc = "Deterministic text benchmark graph";
+        docs.push(PreparedDoc {
+            graph_index: i,
+            graph: graph.as_str().to_string(),
+            subject: graph.as_str().to_string(),
+            body: format!("{name} {desc}"),
+            entity: None,
+        });
+        docs.push(PreparedDoc {
+            graph_index: i,
+            graph: graph.as_str().to_string(),
+            subject: "ro-crate-metadata.json".to_string(),
+            body: String::new(),
+            entity: None,
+        });
+    }
+    let mut state = config.seed;
+    for i in 0..config.docs {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let gi = i % config.graphs;
+        let graph = graphs[gi].as_str().to_string();
+        let subject = format!("urn:text:doc:{i:012}");
+        let name = format!("Document {i:012}");
+        let desc = format!("deterministic benchmark record {i:012}");
+        let ident = format!("DOC-{i:012}");
+        let mut terms = vec![format!("bucket{:04}", state % 127)];
+        if state % config.common_mod == 0 || i == 0 {
+            terms.push(config.common.clone());
+        }
+        if state % config.rare_mod == 0 || i == 1 {
+            terms.push(config.rare.clone());
+        }
+        if i < config.graphs * 2 {
+            terms.push(TIE.to_string());
+        }
+        let keywords = terms.join(" ");
+        let body = format!("{name} {desc} {keywords} {ident}");
+        let entity = NewDataEntity {
+            entity_id: subject.clone(),
+            entity_type: "http://schema.org/MediaObject".to_string(),
+            name,
+            additional_triples: vec![
+                literal("description", &desc),
+                literal("keywords", &keywords),
+                literal("identifier", &ident),
+            ],
+        };
+        docs.push(PreparedDoc {
+            graph_index: gi,
+            graph,
+            subject,
+            body,
+            entity: Some(entity),
+        });
+    }
+    Corpus { docs, graphs }
+}
+
+fn build_local(corpus: &Corpus) -> LocalFixture {
+    let root = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open_with_options(
+        root.path(),
+        craqle::CraqleOptions::new().with_search_storage(SearchStorage::Disk),
+    )
+    .unwrap();
+    let writer = GrantAuthorizer::new(vec![PermissionGrant::new(
+        "/bench/**",
+        PermissionLevel::Write,
+    )]);
+    for (i, graph) in corpus.graphs.iter().enumerate() {
+        node.create_crate(
+            &writer,
+            CreateCrateRequest::new(
+                graph.clone(),
+                format!("Text Graph {i:06}"),
+                "Deterministic text benchmark graph",
+                "2026-01-01",
+                None,
+                GraphPolicy {
+                    public: false,
+                    permission_paths: vec![format!("/bench/g/{i}")],
+                },
+            ),
+        )
+        .unwrap();
+        let entities = corpus
+            .docs
+            .iter()
+            .filter(|doc| doc.graph_index == i)
+            .filter_map(|doc| doc.entity.clone())
+            .collect();
+        node.append_new_root_data_entities(&writer, graph, entities)
+            .unwrap();
+    }
+    node.flush_search_updates().unwrap();
+    LocalFixture { root, node }
+}
+
+fn build_tantivy(corpus: &Corpus) -> Baseline {
+    let root = tempfile::tempdir().unwrap();
+    let mut schema = SchemaBuilder::default();
+    let fields = Fields {
+        key: schema.add_text_field("key", STRING),
+        graph: schema.add_bytes_field("graph", FAST),
+        subject: schema.add_bytes_field("subject", FAST),
+        graph_ord: schema.add_u64_field("graph_ord", FAST),
+        stable: schema.add_bytes_field("stable", FAST),
+        text: schema.add_text_field(
+            "all_text",
+            TEXT.set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(ANALYZER)
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        ),
+    };
+    let index = Index::create_in_dir(root.path(), schema.build()).unwrap();
+    index.tokenizers().register(ANALYZER, analyzer());
+    let mut writer = index.writer_with_num_threads(1, 64 << 20).unwrap();
+    for doc in &corpus.docs {
+        add_tantivy(&mut writer, &fields, (doc, &doc.body));
+    }
+    writer.commit().unwrap();
+    let reader = index.reader().unwrap();
+    reader.reload().unwrap();
+    Baseline {
+        root,
+        index,
+        writer,
+        reader,
+        fields,
+    }
+}
+
+fn add_tantivy(writer: &mut IndexWriter, fields: &Fields, input: (&PreparedDoc, &str)) {
+    let (doc, body) = input;
+    let text = full_text(doc, body);
+    let mut value = TantivyDocument::default();
+    value.add_text(fields.key, doc_key(doc));
+    value.add_bytes(fields.graph, doc.graph.as_bytes());
+    value.add_bytes(fields.subject, doc.subject.as_bytes());
+    value.add_bytes(fields.stable, &text::stable_key(&doc.graph, &doc.subject));
+    value.add_u64(fields.graph_ord, doc.graph_index as u64);
+    value.add_text(fields.text, text);
+    writer.add_document(value).unwrap();
+}
+fn full_text(doc: &PreparedDoc, body: &str) -> String {
+    format!("{} {} {}", doc.graph, doc.subject, body)
+}
+fn engine_text(doc: &PreparedDoc, body: &str) -> String {
+    let mut text = String::with_capacity(doc.graph.len() + doc.subject.len() + body.len() + 2);
+    text.push_str(&doc.graph);
+    text.push(' ');
+    text.push_str(&doc.subject);
+    text.push(' ');
+    text.push_str(body);
+    text
+}
