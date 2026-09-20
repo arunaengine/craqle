@@ -3345,10 +3345,8 @@ fn collect_query_results(
 ) -> Result<(QueryResults, CollectionMetrics)> {
     match results {
         spareval::QueryResults::Solutions(mut solutions) => {
-            // Each solution carries its own (variable, term) pairs and yields
-            // only the bound ones, so building the row from them is exactly
-            // the old "for every projected variable, look it up" loop without
-            // the per-cell linear scan and per-cell name clone.
+            // Solutions yield only bound pairs, avoiding projected-variable
+            // scans and repeated name clones.
             let mut rows = Vec::new();
             let mut metrics = CollectionMetrics::default();
             loop {
@@ -3359,22 +3357,27 @@ fn collect_query_results(
                 let Some(solution) = solution else {
                     break;
                 };
-                if metrics.time_to_first_internal_result.is_none() {
-                    metrics.time_to_first_internal_result = Some(execution_started.elapsed());
+                if metrics.first_result_time.is_none() {
+                    metrics.first_result_time = Some(execution_started.elapsed());
                 }
-                let solution = solution.map_err(map_eval_error)?;
+                let solution = solution.map_err(|error| map_eval_error(error, budget.clock()))?;
                 let collecting = Instant::now();
                 let mut row = HashMap::with_capacity(solution.len());
                 for (variable, term) in solution.iter() {
                     row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term)?);
-                    context.increment_result_terms_decoded();
+                    context.increment_result_decodes();
                 }
                 metrics.result_rows = metrics.result_rows.saturating_add(1);
                 metrics.result_cells = metrics
                     .result_cells
                     .saturating_add(u64::try_from(row.len()).unwrap_or(u64::MAX));
                 budget.observe_solution(&row)?;
+                let previous_capacity = rows.capacity();
                 rows.push(row);
+                budget.observe_capacity::<HashMap<String, EncodedTerm>>(
+                    previous_capacity,
+                    rows.capacity(),
+                )?;
                 metrics.collection_time =
                     metrics.collection_time.saturating_add(collecting.elapsed());
             }
@@ -3385,7 +3388,7 @@ fn collect_query_results(
             Ok((
                 QueryResults::Boolean(value),
                 CollectionMetrics {
-                    time_to_first_internal_result: Some(execution_started.elapsed()),
+                    first_result_time: Some(execution_started.elapsed()),
                     result_rows: 1,
                     result_cells: 1,
                     ..CollectionMetrics::default()
@@ -3403,24 +3406,29 @@ fn collect_query_results(
                 let Some(triple) = triple else {
                     break;
                 };
-                if metrics.time_to_first_internal_result.is_none() {
-                    metrics.time_to_first_internal_result = Some(execution_started.elapsed());
+                if metrics.first_result_time.is_none() {
+                    metrics.first_result_time = Some(execution_started.elapsed());
                 }
                 let Triple {
                     subject,
                     predicate,
                     object,
-                } = triple.map_err(map_eval_error)?;
+                } = triple.map_err(|error| map_eval_error(error, budget.clock()))?;
                 let collecting = Instant::now();
                 let triple = (
                     EncodedTerm::from(&subject),
                     EncodedTerm::from_named_node(&predicate),
                     EncodedTerm::from_term(&object)?,
                 );
-                budget.observe_graph_triple(&triple)?;
+                budget.observe_graph(&triple)?;
+                let previous_capacity = graph.capacity();
                 graph.push(triple);
+                budget.observe_capacity::<(EncodedTerm, EncodedTerm, EncodedTerm)>(
+                    previous_capacity,
+                    graph.capacity(),
+                )?;
                 for _ in 0..3 {
-                    context.increment_result_terms_decoded();
+                    context.increment_result_decodes();
                 }
                 metrics.result_rows = metrics.result_rows.saturating_add(1);
                 metrics.result_cells = metrics.result_cells.saturating_add(3);
@@ -3432,9 +3440,9 @@ fn collect_query_results(
     }
 }
 
-fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
+fn map_eval_error(error: QueryEvaluationError, clock: &RequestClock) -> SparqlError {
     match error {
-        QueryEvaluationError::Cancelled => SparqlError::Cancelled,
+        QueryEvaluationError::Cancelled => clock.cancel_error(),
         QueryEvaluationError::Dataset(error)
             if error
                 .downcast_ref::<StoreDatasetError>()
@@ -3461,10 +3469,10 @@ fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
             if error
                 .downcast_ref::<StoreDatasetError>()
                 .is_some_and(|error| {
-                    matches!(error, StoreDatasetError::UnsupportedRdfStarTerm(_))
+                    matches!(error, StoreDatasetError::UnsupportedStarTerm(_))
                 }) =>
         {
-            let StoreDatasetError::UnsupportedRdfStarTerm(error) = error
+            let StoreDatasetError::UnsupportedStarTerm(error) = error
                 .downcast_ref::<StoreDatasetError>()
                 .expect("RDF-star dataset error was matched")
             else {
@@ -3478,32 +3486,32 @@ fn map_eval_error(error: QueryEvaluationError) -> SparqlError {
 
 fn quad_to_insert(quad: &spargebra::term::Quad) -> Result<MaterializedQuadChange> {
     Ok(MaterializedQuadChange::Insert {
-        graph: spargebra_graph_name_to_graph_id(&quad.graph_name)?,
+        graph: spargebra_graph_id(&quad.graph_name)?,
         subject: EncodedTerm::from(&quad.subject),
         predicate: EncodedTerm::from_named_node(&quad.predicate),
         object: EncodedTerm::from_term(&quad.object)?,
     })
 }
 
-fn ground_quad_to_delete(quad: &spargebra::term::GroundQuad) -> Result<MaterializedQuadChange> {
+fn ground_quad_delete(quad: &spargebra::term::GroundQuad) -> Result<MaterializedQuadChange> {
     Ok(MaterializedQuadChange::Delete {
-        graph: spargebra_graph_name_to_graph_id(&quad.graph_name)?,
+        graph: spargebra_graph_id(&quad.graph_name)?,
         subject: EncodedTerm::from_named_node(&quad.subject),
         predicate: EncodedTerm::from_named_node(&quad.predicate),
-        object: ground_term_to_encoded(&quad.object)?,
+        object: encode_ground_term(&quad.object)?,
     })
 }
 
-fn delete_insert_quad_to_change(quad: DeleteInsertQuad) -> Result<MaterializedQuadChange> {
+fn update_quad_change(quad: DeleteInsertQuad) -> Result<MaterializedQuadChange> {
     match quad {
         DeleteInsertQuad::Delete(quad) => Ok(MaterializedQuadChange::Delete {
-            graph: oxrdf_graph_name_to_graph_id(&quad.graph_name)?,
+            graph: oxrdf_graph_id(&quad.graph_name)?,
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
             object: EncodedTerm::from_term(&quad.object)?,
         }),
         DeleteInsertQuad::Insert(quad) => Ok(MaterializedQuadChange::Insert {
-            graph: oxrdf_graph_name_to_graph_id(&quad.graph_name)?,
+            graph: oxrdf_graph_id(&quad.graph_name)?,
             subject: EncodedTerm::from(&quad.subject),
             predicate: EncodedTerm::from_named_node(&quad.predicate),
             object: EncodedTerm::from_term(&quad.object)?,
@@ -3511,7 +3519,7 @@ fn delete_insert_quad_to_change(quad: DeleteInsertQuad) -> Result<MaterializedQu
     }
 }
 
-fn spargebra_graph_name_to_graph_id(graph_name: &spargebra::term::GraphName) -> Result<GraphId> {
+fn spargebra_graph_id(graph_name: &spargebra::term::GraphName) -> Result<GraphId> {
     match graph_name {
         spargebra::term::GraphName::NamedNode(node) => Ok(GraphId(node.clone())),
         spargebra::term::GraphName::DefaultGraph => Err(SparqlError::Unsupported(
@@ -3520,7 +3528,7 @@ fn spargebra_graph_name_to_graph_id(graph_name: &spargebra::term::GraphName) -> 
     }
 }
 
-fn oxrdf_graph_name_to_graph_id(graph_name: &oxrdf::GraphName) -> Result<GraphId> {
+fn oxrdf_graph_id(graph_name: &oxrdf::GraphName) -> Result<GraphId> {
     match graph_name {
         oxrdf::GraphName::NamedNode(node) => Ok(GraphId(node.clone())),
         oxrdf::GraphName::BlankNode(node) => Err(SparqlError::Unsupported(format!(
@@ -3533,7 +3541,7 @@ fn oxrdf_graph_name_to_graph_id(graph_name: &oxrdf::GraphName) -> Result<GraphId
     }
 }
 
-fn ground_term_to_encoded(term: &spargebra::term::GroundTerm) -> Result<EncodedTerm> {
+fn encode_ground_term(term: &spargebra::term::GroundTerm) -> Result<EncodedTerm> {
     Ok(match term {
         spargebra::term::GroundTerm::NamedNode(node) => EncodedTerm::from_named_node(node),
         spargebra::term::GroundTerm::Literal(literal) => EncodedTerm(literal.to_string()),
@@ -3546,7 +3554,7 @@ fn ground_term_to_encoded(term: &spargebra::term::GroundTerm) -> Result<EncodedT
     })
 }
 
-fn materialize_graph_target_removals(
+fn materialize_removals(
     store: &GraphStore,
     graphs: Vec<GraphId>,
     changes: &mut Vec<MaterializedQuadChange>,
@@ -3560,7 +3568,7 @@ fn materialize_graph_target_removals(
             continue;
         };
 
-        store.for_each_quad_in_graph::<SparqlError, _>(graph_id, |quad| {
+        store.visit_graph_quads::<SparqlError, _>(graph_id, |quad| {
             push_update_change(
                 changes,
                 changed_graphs,
