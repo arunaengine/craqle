@@ -2209,57 +2209,57 @@ fn gosp_key(quad: QueryQuad) -> QueryQuadKey {
     query_index_key([quad.graph, quad.object, quad.subject, quad.predicate])
 }
 
-fn decode_qv2_gspo_key(bytes: &[u8]) -> Option<QueryQuad> {
+fn decode_gspo_key(bytes: &[u8]) -> Option<QueryQuad> {
     (bytes.len() == 32).then(|| QueryQuad {
-        graph: query_index_term_at(bytes, 0),
-        subject: query_index_term_at(bytes, 8),
-        predicate: query_index_term_at(bytes, 16),
-        object: query_index_term_at(bytes, 24),
+        graph: index_term_at(bytes, 0),
+        subject: index_term_at(bytes, 8),
+        predicate: index_term_at(bytes, 16),
+        object: index_term_at(bytes, 24),
     })
 }
 
-fn decode_qv2_gpos_key(bytes: &[u8]) -> Option<QueryQuad> {
+fn decode_gpos_key(bytes: &[u8]) -> Option<QueryQuad> {
     (bytes.len() == 32).then(|| QueryQuad {
-        graph: query_index_term_at(bytes, 0),
-        predicate: query_index_term_at(bytes, 8),
-        object: query_index_term_at(bytes, 16),
-        subject: query_index_term_at(bytes, 24),
+        graph: index_term_at(bytes, 0),
+        predicate: index_term_at(bytes, 8),
+        object: index_term_at(bytes, 16),
+        subject: index_term_at(bytes, 24),
     })
 }
 
-fn decode_qv2_spog_key(bytes: &[u8]) -> Option<QueryQuad> {
+fn decode_spog_key(bytes: &[u8]) -> Option<QueryQuad> {
     (bytes.len() == 32).then(|| QueryQuad {
-        subject: query_index_term_at(bytes, 0),
-        predicate: query_index_term_at(bytes, 8),
-        object: query_index_term_at(bytes, 16),
-        graph: query_index_term_at(bytes, 24),
+        subject: index_term_at(bytes, 0),
+        predicate: index_term_at(bytes, 8),
+        object: index_term_at(bytes, 16),
+        graph: index_term_at(bytes, 24),
     })
 }
 
-fn decode_qv2_posg_key(bytes: &[u8]) -> Option<QueryQuad> {
+fn decode_posg_key(bytes: &[u8]) -> Option<QueryQuad> {
     (bytes.len() == 32).then(|| QueryQuad {
-        predicate: query_index_term_at(bytes, 0),
-        object: query_index_term_at(bytes, 8),
-        subject: query_index_term_at(bytes, 16),
-        graph: query_index_term_at(bytes, 24),
+        predicate: index_term_at(bytes, 0),
+        object: index_term_at(bytes, 8),
+        subject: index_term_at(bytes, 16),
+        graph: index_term_at(bytes, 24),
     })
 }
 
-fn decode_qv2_ospg_key(bytes: &[u8]) -> Option<QueryQuad> {
+fn decode_ospg_key(bytes: &[u8]) -> Option<QueryQuad> {
     (bytes.len() == 32).then(|| QueryQuad {
-        object: query_index_term_at(bytes, 0),
-        subject: query_index_term_at(bytes, 8),
-        predicate: query_index_term_at(bytes, 16),
-        graph: query_index_term_at(bytes, 24),
+        object: index_term_at(bytes, 0),
+        subject: index_term_at(bytes, 8),
+        predicate: index_term_at(bytes, 16),
+        graph: index_term_at(bytes, 24),
     })
 }
 
-fn decode_qv2_gosp_key(bytes: &[u8]) -> Option<QueryQuad> {
+fn decode_gosp_key(bytes: &[u8]) -> Option<QueryQuad> {
     (bytes.len() == 32).then(|| QueryQuad {
-        graph: query_index_term_at(bytes, 0),
-        object: query_index_term_at(bytes, 8),
-        subject: query_index_term_at(bytes, 16),
-        predicate: query_index_term_at(bytes, 24),
+        graph: index_term_at(bytes, 0),
+        object: index_term_at(bytes, 8),
+        subject: index_term_at(bytes, 16),
+        predicate: index_term_at(bytes, 24),
     })
 }
 
@@ -2271,27 +2271,27 @@ fn source_term_at(bytes: &[u8], offset: usize) -> TermId {
     )
 }
 
-fn decode_query_term_id_value(bytes: &[u8], context: &'static str) -> Result<QueryTermId> {
+fn decode_query_id(bytes: &[u8], context: &'static str) -> Result<QueryTermId> {
     let raw: [u8; 8] = bytes
         .try_into()
-        .map_err(|_| StoreError::InvalidQueryIndexEncoding {
+        .map_err(|_| StoreError::InvalidIndexEncoding {
             context,
             message: format!("expected 8 bytes, found {}", bytes.len()),
         })?;
     Ok(QueryTermId::from_be_bytes(raw))
 }
 
-fn decode_query_source_term_value(bytes: &[u8], context: &'static str) -> Result<TermId> {
+fn decode_source_id(bytes: &[u8], context: &'static str) -> Result<TermId> {
     let raw: [u8; 16] = bytes
         .try_into()
-        .map_err(|_| StoreError::InvalidQueryIndexEncoding {
+        .map_err(|_| StoreError::InvalidIndexEncoding {
             context,
             message: format!("expected 16 bytes, found {}", bytes.len()),
         })?;
     Ok(TermId::from_be_bytes(raw))
 }
 
-fn decode_source_quad_key(bytes: &[u8]) -> Option<EncodedQuad> {
+fn decode_source_quad(bytes: &[u8]) -> Option<EncodedQuad> {
     (bytes.len() == 64).then(|| EncodedQuad {
         graph: source_term_at(bytes, 0),
         subject: source_term_at(bytes, 16),
@@ -2300,7 +2300,7 @@ fn decode_source_quad_key(bytes: &[u8]) -> Option<EncodedQuad> {
     })
 }
 
-fn coalesced_query_index_transitions(mutations: &[QuadMutation]) -> Vec<NetQuadTransition> {
+fn coalesced_transitions(mutations: &[QuadMutation]) -> Vec<NetQuadTransition> {
     let mut transitions = BTreeMap::<QuadKey, NetQuadTransition>::new();
     for mutation in mutations {
         let (quad, is_live) = match mutation {
@@ -2327,29 +2327,29 @@ fn coalesced_query_index_transitions(mutations: &[QuadMutation]) -> Vec<NetQuadT
         .collect()
 }
 
-fn query_index_live_counter_keys(quad: QueryQuad) -> [QueryIndexCounterKey; 6] {
+fn live_counter_keys(quad: QueryQuad) -> [IndexCounterKey; 6] {
     [
-        QueryIndexCounterKey::Total,
-        QueryIndexCounterKey::Graph(quad.graph),
-        QueryIndexCounterKey::Predicate(quad.predicate),
-        QueryIndexCounterKey::GraphPredicate(quad.graph, quad.predicate),
-        QueryIndexCounterKey::PredicateObject(quad.predicate, quad.object),
-        QueryIndexCounterKey::GraphPredicateObject(quad.graph, quad.predicate, quad.object),
+        IndexCounterKey::Total,
+        IndexCounterKey::Graph(quad.graph),
+        IndexCounterKey::Predicate(quad.predicate),
+        IndexCounterKey::GraphPredicate(quad.graph, quad.predicate),
+        IndexCounterKey::PredicateObject(quad.predicate, quad.object),
+        IndexCounterKey::GraphPredicateObject(quad.graph, quad.predicate, quad.object),
     ]
 }
 
-struct QueryIndexVerificationBuilder {
+struct IndexVerifyBuilder {
     report: QueryIndexVerification,
 }
 
 #[derive(Clone, Copy)]
-enum QueryIndexVerificationExpectation {
+enum IndexVerifyState {
     Ready,
     BuildingCandidate,
 }
 
 #[derive(Clone, Copy)]
-enum QueryIndexKeyOrder {
+enum IndexKeyOrder {
     Gspo,
     Gpos,
     Spog,
@@ -2361,7 +2361,7 @@ enum QueryIndexKeyOrder {
 /// The physical order selected for one trusted qv2 range. This remains
 /// crate-private so query readers never learn Fjall keyspace details.
 #[derive(Clone, Copy)]
-pub(crate) enum QueryIndexCursorOrder {
+pub(crate) enum IndexCursorOrder {
     Gspo,
     Gpos,
     Spog,
@@ -2374,7 +2374,7 @@ pub(crate) enum QueryIndexCursorOrder {
 pub(crate) struct QueryIndexAdmission {
     pub(crate) trusted: bool,
     pub(crate) query_id_generation: Option<u64>,
-    pub(crate) query_id_upper_bound: Option<u64>,
+    pub(crate) query_id_limit: Option<u64>,
     pub(crate) fallback_reason: Option<&'static str>,
     pub(crate) header_reads: u64,
     pub(crate) counter_reads: u64,
@@ -2382,15 +2382,254 @@ pub(crate) struct QueryIndexAdmission {
 }
 
 /// One immutable, publication-coherent durable read view.
-///
-/// It deliberately owns only the Fjall snapshot. Callers receive opaque
-/// cursor and metadata operations rather than Fjall objects or keyspaces.
 #[derive(Clone)]
 pub(crate) struct StoreReadSnapshot {
     snapshot: Snapshot,
 }
 
-impl QueryIndexVerificationBuilder {
+#[derive(Clone, Copy)]
+pub(crate) enum QvStat {
+    Graph(TermId),
+    Total,
+    UnionUnique,
+    Predicate(TermId),
+    PredicateObject(TermId, TermId),
+    GraphPredicate(TermId, TermId),
+    GraphPredicateObject(TermId, TermId, TermId),
+}
+
+pub(crate) struct QvRead<'a> {
+    pub(crate) stat: QvStat,
+    pub(crate) costs: &'a crate::query::context::QueryCost,
+}
+
+#[derive(Clone)]
+pub(crate) struct SearchSnapshot {
+    snapshot: Snapshot,
+    terms: Keyspace,
+    quads: Keyspace,
+    graphs: Keyspace,
+}
+
+#[derive(Clone)]
+pub(crate) struct SearchManifestSnapshot {
+    snapshot: Snapshot,
+    terms: Keyspace,
+    graphs: Keyspace,
+    search_meta: Keyspace,
+    search_queue: Keyspace,
+}
+
+impl SearchManifestSnapshot {
+    pub(crate) fn digest(&self, index_id: [u8; 16]) -> Result<ManifestDigest> {
+        let manifest = self
+            .snapshot
+            .get(&self.search_meta, SEARCH_MANIFEST_KEY)?
+            .and_then(|value| postcard::from_bytes::<StoredManifest>(value.as_ref()).ok());
+        Ok(manifest
+            .filter(|manifest| {
+                manifest.format == SEARCH_META_FORMAT && manifest.index_id == index_id
+            })
+            .map(|manifest| ManifestDigest {
+                count: manifest.count,
+                hash: manifest.hash,
+                epoch: manifest.epoch,
+            })
+            .unwrap_or(ManifestDigest {
+                count: 0,
+                hash: [0; 32],
+                epoch: 0,
+            }))
+    }
+
+    pub(crate) fn oldest_owed(&self) -> Result<Option<u64>> {
+        match self
+            .snapshot
+            .prefix(&self.search_queue, [SEARCH_ORDER_PREFIX])
+            .next()
+        {
+            Some(guard) => {
+                let (key, _) = guard.into_inner()?;
+                Ok(Some(decode_search_order(key.as_ref())?.token))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl SearchSnapshot {
+    pub(crate) fn scan_graph(&self, scan: &GraphScan) -> Result<QuadPage> {
+        scan_graph_snapshot(&self.snapshot, &self.quads, scan)
+    }
+
+    pub(crate) fn scan_subject(&self, scan: &SubjectScan) -> Result<SubjectPage> {
+        let mut prefix = [0u8; 32];
+        prefix[..16].copy_from_slice(&scan.graph.to_be_bytes());
+        prefix[16..].copy_from_slice(&scan.subject.to_be_bytes());
+        let mut entries = Vec::new();
+        let mut next = scan.after;
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        let mut remaining = false;
+        let mut oversized = None;
+        for guard in self.snapshot.prefix(&self.quads, prefix) {
+            let (key, value) = guard.into_inner()?;
+            if dots_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = GraphStore::decode_quad_key(key.as_ref())?;
+            let cursor = (quad.predicate, quad.object);
+            if scan.after.is_some_and(|after| cursor <= after) {
+                continue;
+            }
+            if rows == scan.row_limit {
+                remaining = true;
+                break;
+            }
+            let predicate_bytes =
+                self.snapshot
+                    .size_of(&self.terms, quad.predicate.to_be_bytes())?
+                    .ok_or(StoreError::TermNotFound(quad.predicate.0))? as usize;
+            let object_bytes =
+                self.snapshot
+                    .size_of(&self.terms, quad.object.to_be_bytes())?
+                    .ok_or(StoreError::TermNotFound(quad.object.0))? as usize;
+            let encoded = predicate_bytes.saturating_add(object_bytes);
+            if bytes.saturating_add(encoded) > scan.byte_limit {
+                if encoded > scan.byte_limit {
+                    oversized = Some(OversizedSource {
+                        bytes: encoded,
+                        limit: scan.byte_limit,
+                    });
+                }
+                remaining = true;
+                break;
+            }
+            let predicate = snapshot_term(&self.snapshot, &self.terms, quad.predicate)?;
+            let object = snapshot_term(&self.snapshot, &self.terms, quad.object)?;
+            entries.push((predicate, object));
+            next = Some(cursor);
+            rows += 1;
+            bytes = bytes.saturating_add(encoded);
+        }
+        Ok(SubjectPage {
+            entries,
+            next,
+            remaining,
+            rows,
+            bytes,
+            oversized,
+        })
+    }
+
+    pub(crate) fn orphaned_ids(&self, graph: TermId, byte_limit: usize) -> Result<HashSet<TermId>> {
+        let Some(meta) = self.snapshot.get(&self.graphs, graph_meta_key(graph))? else {
+            return Ok(HashSet::new());
+        };
+        let clock = match self.snapshot.get(&self.graphs, graph_clock_key(graph))? {
+            Some(value) => postcard::from_bytes(value.as_ref())?,
+            None => postcard::from_bytes::<StoredGraphMeta>(meta.as_ref())?.clock,
+        };
+        let value = self
+            .snapshot
+            .get(&self.graphs, graph_diagnostics_key(graph))?
+            .ok_or(StoreError::InvalidSearchState("search-diagnostics-missing"))?;
+        if value.len() > byte_limit {
+            return Err(StoreError::LimitExceeded {
+                resource: "search diagnostics bytes",
+                limit: u64::try_from(byte_limit).unwrap_or(u64::MAX),
+                actual: u64::try_from(value.len()).unwrap_or(u64::MAX),
+            });
+        }
+        let record: StoredDiagnostics = postcard::from_bytes(value.as_ref())?;
+        if record.at_clock != clock {
+            return Err(StoreError::InvalidSearchState("search-diagnostics-stale"));
+        }
+        let row_limit = byte_limit / 64;
+        if record.diagnostics.orphaned_entities.len() > row_limit {
+            return Err(StoreError::LimitExceeded {
+                resource: "search diagnostics rows",
+                limit: u64::try_from(row_limit).unwrap_or(u64::MAX),
+                actual: u64::try_from(record.diagnostics.orphaned_entities.len())
+                    .unwrap_or(u64::MAX),
+            });
+        }
+        let mut orphaned = HashSet::new();
+        let mut bytes = value.len();
+        for entity in record.diagnostics.orphaned_entities {
+            bytes = bytes.saturating_add(entity.len()).saturating_add(16);
+            if bytes > byte_limit {
+                return Err(StoreError::LimitExceeded {
+                    resource: "search diagnostics bytes",
+                    limit: u64::try_from(byte_limit).unwrap_or(u64::MAX),
+                    actual: u64::try_from(bytes).unwrap_or(u64::MAX),
+                });
+            }
+            let term = EncodedTerm::from_subject_id(&entity);
+            let id = hash_term(&term);
+            if self
+                .snapshot
+                .get(&self.terms, id.to_be_bytes())?
+                .is_some_and(|stored| stored.as_ref() == term.0.as_bytes())
+            {
+                orphaned.insert(id);
+            }
+        }
+        Ok(orphaned)
+    }
+}
+
+fn snapshot_term(snapshot: &Snapshot, terms: &Keyspace, id: TermId) -> Result<EncodedTerm> {
+    let value = snapshot
+        .get(terms, id.to_be_bytes())?
+        .ok_or(StoreError::TermNotFound(id.0))?;
+    Ok(EncodedTerm(decode_term_text(value.as_ref())?))
+}
+
+fn scan_graph_snapshot(
+    snapshot: &Snapshot,
+    quads: &Keyspace,
+    scan: &GraphScan,
+) -> Result<QuadPage> {
+    let mut entries = Vec::new();
+    let mut rows = 0usize;
+    let mut bytes = 0usize;
+    let mut oversized = None;
+    for guard in snapshot.prefix(quads, scan.graph.to_be_bytes()) {
+        let (key, value) = guard.into_inner()?;
+        let raw: [u8; 64] = key
+            .as_ref()
+            .try_into()
+            .map_err(|_| StoreError::InvalidSearchState("graph-scan-key-invalid"))?;
+        if scan.after.is_some_and(|after| raw <= after) || dots_empty(value.as_ref()) {
+            continue;
+        }
+        if rows == scan.row_limit {
+            break;
+        }
+        let encoded = key.len().saturating_add(value.len());
+        if bytes.saturating_add(encoded) > scan.byte_limit {
+            if encoded > scan.byte_limit {
+                oversized = Some(OversizedSource {
+                    bytes: encoded,
+                    limit: scan.byte_limit,
+                });
+            }
+            break;
+        }
+        entries.push(GraphStore::decode_quad_key(&raw)?);
+        rows += 1;
+        bytes = bytes.saturating_add(encoded);
+    }
+    Ok(QuadPage {
+        entries,
+        rows,
+        bytes,
+        oversized,
+    })
+}
+
+impl IndexVerifyBuilder {
     fn new(full: bool) -> Self {
         Self {
             report: QueryIndexVerification {
@@ -2407,7 +2646,7 @@ impl QueryIndexVerificationBuilder {
 
     fn problem(&mut self, problem: &'static str) {
         self.report.valid = false;
-        if self.report.problems.len() < QUERY_INDEX_PROBLEM_LIMIT
+        if self.report.problems.len() < QV_PROBLEM_LIMIT
             && !self
                 .report
                 .problems
@@ -2435,7 +2674,7 @@ impl StoreReadSnapshot {
         pattern: crate::rdf_read::QuadPattern,
     ) -> crate::query::cursor::RawQuadCursor {
         store
-            .current_derived_raw_cursor(self.sequence(), pattern)
+            .derived_raw_cursor(self.sequence(), pattern)
             .unwrap_or_else(|| {
                 crate::query::cursor::RawQuadCursor::new(
                     self.snapshot.clone(),
@@ -2464,65 +2703,76 @@ impl StoreReadSnapshot {
     pub(crate) fn query_index_cursor(
         &self,
         store: &GraphStore,
-        order: QueryIndexCursorOrder,
-        pattern: crate::rdf_read::QuadPattern,
+        scan: &crate::query::cursor::IndexScan<'_>,
     ) -> Result<crate::query::cursor::RawQuadCursor> {
-        let Some((keyspace, prefix)) = store.query_index_range(&self.snapshot, order, pattern)?
+        let Some((keyspace, query_to_term, prefix)) =
+            store.query_index_range(&self.snapshot, scan)?
         else {
             return Ok(crate::query::cursor::RawQuadCursor::empty());
         };
         Ok(crate::query::cursor::RawQuadCursor::query_index(
             self.snapshot.clone(),
-            keyspace,
-            &store.qv2_query_to_term,
-            order,
-            prefix,
+            crate::query::cursor::QueryIndexScan {
+                keyspace,
+                query_to_term,
+                order: scan.order,
+                prefix,
+            },
         ))
     }
 
-    pub(crate) fn query_index_key_cursor(
+    pub(crate) fn index_key_cursor(
         &self,
         store: &GraphStore,
-        order: QueryIndexCursorOrder,
-        pattern: crate::rdf_read::QuadPattern,
-        query_id_upper_bound: u64,
-    ) -> Result<Option<crate::query::cursor::RawQueryIndexKeyCursor>> {
+        scan: &crate::query::cursor::IndexScan<'_>,
+    ) -> Result<Option<crate::query::cursor::RawIndexCursor>> {
         let resolve = |term: Option<TermId>| -> Result<Option<Option<QueryTermId>>> {
             match term {
-                Some(term) => Ok(store
-                    .query_term_id_from_snapshot(&self.snapshot, term)?
-                    .map(Some)),
+                Some(term) => {
+                    let term = store.snapshot_query_id(&self.snapshot, term)?;
+                    scan.costs.forward_mapping(
+                        16 + term.map_or(0, |_| std::mem::size_of::<u64>() as u64),
+                    );
+                    Ok(term.map(Some))
+                }
                 None => Ok(Some(None)),
             }
         };
-        let Some(graph) = resolve(pattern.graph)? else {
+        let Some(graph) = resolve(scan.pattern.graph)? else {
             return Ok(None);
         };
-        let Some(subject) = resolve(pattern.subject)? else {
+        let Some(subject) = resolve(scan.pattern.subject)? else {
             return Ok(None);
         };
-        let Some(predicate) = resolve(pattern.predicate)? else {
+        let Some(predicate) = resolve(scan.pattern.predicate)? else {
             return Ok(None);
         };
-        let Some(object) = resolve(pattern.object)? else {
+        let Some(object) = resolve(scan.pattern.object)? else {
             return Ok(None);
         };
-        let Some((keyspace, prefix)) = store.query_index_range(&self.snapshot, order, pattern)?
+        let Some((keyspace, query_to_term, prefix)) =
+            store.query_index_range(&self.snapshot, scan)?
         else {
             return Ok(None);
         };
-        let filter =
-            crate::query::cursor::RawQueryIndexPattern::new(graph, subject, predicate, object)
-                .without_prefix(order, prefix.len() / 8);
-        Ok(Some(crate::query::cursor::RawQueryIndexKeyCursor::new(
-            self.snapshot.clone(),
-            keyspace,
-            &store.qv2_query_to_term,
-            order,
-            prefix,
-            filter,
-            query_id_upper_bound,
-        )))
+        let filter = crate::query::cursor::RawIndexPattern::new(graph, subject, predicate, object)
+            .without_prefix(scan.order, prefix.len() / 8);
+        Ok(Some(
+            crate::query::cursor::RawIndexCursor::new(
+                self.snapshot.clone(),
+                crate::query::cursor::RawIndexScan {
+                    keyspace,
+                    query_to_term,
+                    order: scan.order,
+                    prefix,
+                    pattern: filter,
+                    query_id_limit: scan
+                        .query_id_limit
+                        .expect("index-key scan requires a dense-ID upper bound"),
+                },
+            )
+            .track_costs(scan.costs.clone()),
+        ))
     }
 
     pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
@@ -2533,15 +2783,23 @@ impl StoreReadSnapshot {
         &self,
         store: &GraphStore,
         term: TermId,
-    ) -> Result<Option<QueryTermId>> {
-        store.query_term_id_from_snapshot(&self.snapshot, term)
+    ) -> Result<(Option<QueryTermId>, Option<u64>)> {
+        let Some(spaces) = store.active_query_spaces(&self.snapshot)? else {
+            return Ok((None, None));
+        };
+        let value = self
+            .snapshot
+            .get(spaces.term_to_query, term.to_be_bytes())?;
+        let bytes = 16 + value.as_ref().map_or(0, |value| value.len() as u64);
+        let term = value
+            .map(|value| decode_query_id(value.as_ref(), "term-to-query mapping"))
+            .transpose()?;
+        Ok((term, Some(bytes)))
     }
 
-    pub(crate) fn qv_g_count(&self, store: &GraphStore, graph: TermId) -> Result<Option<u64>> {
-        let Some(graph) = store.query_term_id_from_snapshot(&self.snapshot, graph)? else {
-            return Ok(Some(0));
-        };
-        self.qv_count(store, QueryIndexCounterKey::Graph(graph), false)
+    #[cfg(test)]
+    pub(crate) fn qv_total_count(&self, store: &GraphStore) -> Result<Option<u64>> {
+        self.qv_count(store, IndexCounterKey::Total, false)
     }
 
     pub(crate) fn qv_total_count(&self, store: &GraphStore) -> Result<Option<u64>> {
