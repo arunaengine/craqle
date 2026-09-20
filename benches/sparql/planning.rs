@@ -439,3 +439,148 @@ fn env_usize(name: &str, default: usize) -> usize {
         })
         .unwrap_or(default)
 }
+
+fn env_list(name: &str, defaults: &[usize]) -> Vec<usize> {
+    match env::var(name) {
+        Ok(value) => value
+            .split(',')
+            .map(|item| {
+                item.trim()
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("{name} must contain comma-separated integers"))
+            })
+            .collect(),
+        Err(env::VarError::NotPresent) => defaults.to_vec(),
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid UTF-8"),
+    }
+}
+
+fn run_scenario(spec: ScenarioSpec) {
+    let mut fixture = Fixture::new(spec);
+    let mut baseline = None;
+    let phases = [
+        PhaseRun {
+            label: "first_cold_stats",
+            mutation_kind: "none",
+            source_case: "cold_fixture",
+            mutation_ns: 0,
+            expected_cache: false,
+        },
+        PhaseRun {
+            label: "warm_storage",
+            mutation_kind: "none",
+            source_case: "warmed_fixture",
+            mutation_ns: 0,
+            expected_cache: true,
+        },
+        PhaseRun {
+            label: "repeat_warm_stats",
+            mutation_kind: "none",
+            source_case: "warmed_stats",
+            mutation_ns: 0,
+            expected_cache: true,
+        },
+    ];
+    for phase in phases {
+        let sample = run_phase(&fixture, phase, &mut baseline);
+        print_sample(&fixture, &sample);
+    }
+    let mut live_rows = fixture
+        .node
+        .query_index_status_fast()
+        .unwrap()
+        .source_live_quads;
+    for (label, mutation_kind, source_case, mutate, delta) in [
+        (
+            "after_unrelated_write",
+            "insert",
+            "unrelated_predicate",
+            Fixture::unrelated_write as fn(&mut Fixture) -> u64,
+            1_i64,
+        ),
+        (
+            "after_relevant_duplicate",
+            "duplicate_insert",
+            "queried_predicate_existing_fact",
+            Fixture::duplicate_write,
+            0,
+        ),
+        (
+            "after_relevant_replacement",
+            "replace",
+            "queried_predicate_object",
+            Fixture::replace_left,
+            0,
+        ),
+        (
+            "after_delete",
+            "delete",
+            "unrelated_predicate",
+            Fixture::delete_noise,
+            -1,
+        ),
+        (
+            "after_other_graph_write",
+            "insert",
+            "other_graph_unrelated_predicate",
+            Fixture::other_write,
+            1,
+        ),
+    ] {
+        let mutation_ns = mutate(&mut fixture);
+        live_rows = live_rows
+            .checked_add_signed(delta)
+            .expect("valid fixture delta");
+        assert_eq!(
+            fixture
+                .node
+                .query_index_status_fast()
+                .unwrap()
+                .source_live_quads,
+            live_rows,
+            "mutation phase {label} did not change the intended facts"
+        );
+        let phase = PhaseRun {
+            label,
+            mutation_kind,
+            source_case,
+            mutation_ns,
+            expected_cache: false,
+        };
+        let sample = run_phase(&fixture, phase, &mut baseline);
+        print_sample(&fixture, &sample);
+    }
+}
+
+fn main() {
+    let relevant = env_list("CRAQLE_PLAN_RELEVANT", &[512, 1_024]);
+    let unrelated = env_list("CRAQLE_PLAN_UNRELATED", &[0, 1_000, 10_000]);
+    let result_cap = env_usize("CRAQLE_PLAN_RESULT_CAP", DEFAULT_CAP);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "record": "planning_cost_provenance",
+            "commit": repository_commit(),
+            "binary_blake3": binary_blake3(),
+            "relevant_rows": &relevant,
+            "unrelated_rows": &unrelated,
+            "result_cap": result_cap,
+            "load_batch": env_usize("CRAQLE_PLAN_LOAD_BATCH", DEFAULT_BATCH),
+            "seed": FIXTURE_SEED,
+            "transport": "local_in_process",
+            "sync": null,
+            "statistics": "request_local_enabled",
+            "limits": "production_with_configured_result_cap",
+        }))
+        .expect("serialize planning provenance")
+    );
+    for relevant in relevant {
+        for &unrelated in &unrelated {
+            run_scenario(ScenarioSpec {
+                relevant,
+                unrelated,
+                result_cap,
+            });
+        }
+    }
+}
