@@ -4131,49 +4131,46 @@ impl CraqleNode {
     }
 
     fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
-        self.persist_graph_policy_with_durability(graph, policy, CraqleRequestDurability::Durable)
+        let receipt = self.persist_policy(PolicyWrite {
+            graph,
+            policy,
+            durability: CraqleRequestDurability::Durable,
+        })?;
+        if let Some(receipt) = receipt {
+            self.persist_receipt(receipt)?;
+        } else {
+            self.persist_fjall()?;
+        }
+        Ok(())
     }
 
-    fn persist_graph_policy_with_durability(
-        &self,
-        graph: &GraphId,
-        policy: GraphPolicy,
-        durability: CraqleRequestDurability,
-    ) -> Result<()> {
-        let _write_guard = replication::graph_write_guard(graph);
-        if let Some(tombstone) = self.store.graph_tombstone(graph)? {
-            return Err(UpdateError::GraphDeleted { tombstone }.into());
-        }
-        let previous = self.store.graph_tagged_policy(graph)?;
-        let policy = policy.normalized();
-        if self.store.contains_graph(graph)? && previous.policy == policy {
-            return Ok(());
+    fn persist_policy(&self, request: PolicyWrite<'_>) -> Result<Option<MutationReceipt>> {
+        let previous = self.store.graph_tagged_policy(request.graph)?;
+        let policy = request.policy.normalized();
+        if self.store.contains_graph(request.graph)? && previous.policy == policy {
+            return Ok(None);
         }
         let tagged = TaggedGraphPolicy {
             policy,
             tag: PolicyTag::next_local(previous.tag, self.actor),
         };
-
-        if durability.publishes_irokle()
-            && let Some(sync) = &self.sync
-        {
-            let record = sync.publish_policy(&self.store, graph, tagged)?;
-            stall_publish_apply();
-            self.apply_irokle_record_locked(&record, true)?;
-            return Ok(());
-        }
-
-        self.store.set_tagged_graph_policy(graph, &tagged)?;
-        Ok(())
+        Ok(self.replication.set_policy(replication::PolicyMutation {
+            graph: request.graph,
+            tagged,
+            publish: request.durability.publishes_irokle(),
+            #[cfg(test)]
+            before_apply: Some(stall_publish_apply),
+        })?)
     }
 
     #[cfg(test)]
     fn set_test_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
-        self.persist_graph_policy_with_durability(
+        self.persist_policy(PolicyWrite {
             graph,
             policy,
-            CraqleRequestDurability::WalAlreadyDurable,
-        )
+            durability: CraqleRequestDurability::WalAlreadyDurable,
+        })?;
+        Ok(())
     }
 
     fn orphaned_entities(&self, graph: &GraphId) -> Result<std::collections::HashSet<EncodedTerm>> {
@@ -4186,21 +4183,46 @@ impl CraqleNode {
             .collect())
     }
 
-    fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
-        self.finish_batch_with_durability(graph, batch, CraqleRequestDurability::Durable)
+    fn persist_receipt(&self, receipt: MutationReceipt) -> Result<MutationReceipt> {
+        match self.replication.mark_persisted(&receipt.id) {
+            Ok(Some(receipt)) => Ok(receipt),
+            Ok(None) => Err(accepted_error(
+                receipt,
+                CraqleError::Update(UpdateError::ReceiptUnknown),
+            )),
+            Err(error) => Err(accepted_error(receipt, error.into())),
+        }
     }
 
-    fn finish_batch_with_durability(
-        &self,
-        graph: &GraphId,
-        batch: Batch,
-        durability: CraqleRequestDurability,
-    ) -> Result<Batch> {
-        self.schedule_search_update_for_graph(graph)?;
-        if durability.persists_fjall() {
-            self.persist_fjall()?;
+    fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
+        self.settle_batch(BatchFinish {
+            graph,
+            batch,
+            durability: CraqleRequestDurability::Durable,
+        })
+    }
+
+    fn settle_batch(&self, request: BatchFinish<'_>) -> Result<Batch> {
+        let status = self.replication.receipt_for_batch(&request.batch)?;
+        if let Err(error) = self.schedule_graph_search(request.graph) {
+            return match &status {
+                MutationStatus::Known(receipt) => Err(accepted_error(receipt.clone(), error)),
+                MutationStatus::Expired => Err(CraqleError::Update(UpdateError::ReceiptExpired)),
+                MutationStatus::Unknown => Err(error),
+            };
         }
-        Ok(batch)
+        if request.durability.persists_fjall() {
+            match status {
+                MutationStatus::Known(receipt) => {
+                    self.persist_receipt(receipt)?;
+                }
+                MutationStatus::Expired => {
+                    return Err(CraqleError::Update(UpdateError::ReceiptExpired));
+                }
+                MutationStatus::Unknown => self.persist_fjall()?,
+            }
+        }
+        Ok(request.batch)
     }
 
     fn finish_report(
@@ -4208,23 +4230,27 @@ impl CraqleNode {
         graph: &GraphId,
         report: AppendDataEntitiesReport,
     ) -> Result<AppendDataEntitiesReport> {
-        self.schedule_search_update_for_graph(graph)?;
-        self.persist_fjall()?;
+        let status = self.replication.receipt_for_batch(&report.batch)?;
+        if let Err(error) = self.schedule_graph_search(graph) {
+            return match &status {
+                MutationStatus::Known(receipt) => Err(accepted_error(receipt.clone(), error)),
+                MutationStatus::Expired => Err(CraqleError::Update(UpdateError::ReceiptExpired)),
+                MutationStatus::Unknown => Err(error),
+            };
+        }
+        match status {
+            MutationStatus::Known(receipt) => {
+                self.persist_receipt(receipt)?;
+            }
+            MutationStatus::Expired => {
+                return Err(CraqleError::Update(UpdateError::ReceiptExpired));
+            }
+            MutationStatus::Unknown => self.persist_fjall()?,
+        }
         Ok(report)
     }
 
-    fn schedule_full_search_reindex(&self) -> Result<()> {
-        let mut batch = self.store.new_batch();
-        for graph_id in self.store.graph_term_ids()? {
-            self.store.enqueue_fts_reindex(&mut batch, graph_id)?;
-        }
-        self.store.commit(batch)?;
-        self.persist_fjall()?;
-        self.schedule_search_update();
-        Ok(())
-    }
-
-    fn schedule_search_update_for_graph(&self, graph: &GraphId) -> Result<()> {
+    fn schedule_graph_search(&self, graph: &GraphId) -> Result<()> {
         if self.store.contains_graph(graph)? {
             self.schedule_search_update();
         }
@@ -4239,15 +4265,8 @@ impl CraqleNode {
         Ok(self.store.persist()?)
     }
 
-    /// Apply one replicated record to local state.
-    ///
-    /// Every arm here is a compare-and-set — read the tombstone, the stored
-    /// policy or the stored context tag, then decide whether to write — so the
-    /// whole record has to be applied under the graph's write lock. Without it
-    /// two applies both read the same stored value, both conclude they win, and
-    /// the one that lands second decides the outcome by arrival order; for the
-    /// `@context` register that means the local value can end up superseded on
-    /// every peer but this one, with no later event to correct it (G5, G8).
+    /// Apply each replicated compare-and-set under the graph write lock.
+    /// This preserves tombstone, policy, and context ordering across peers.
     #[cfg(test)]
     fn apply_irokle_record(
         &self,
@@ -4255,21 +4274,21 @@ impl CraqleNode {
     ) -> Result<bool> {
         // Orders this apply against every other write to the same graph; see
         // `replication::GRAPH_WRITE_LOCKS`.
-        let _write_guard = replication::graph_write_guard(record.event.graph());
-        self.apply_irokle_record_locked(record, false)
+        let _write_guard = self.store.graph_write_guard(record.event.graph());
+        self.apply_record_locked(record, false)
     }
 
     /// **Call with the graph's write lock held**, so a publish and its own
     /// apply cannot be reordered against a concurrent one.
-    fn apply_irokle_record_locked(
+    fn apply_record_locked(
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
         local_record: bool,
     ) -> Result<bool> {
-        if let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event {
-            self.store.delete_graph_tombstoned(tombstone)?;
+        if matches!(&record.event, CraqleGraphEvent::GraphDeleted { .. }) {
+            let applied = self.replication.apply_delete_record(record)?.is_some();
             self.schedule_search_update();
-            return Ok(true);
+            return Ok(applied);
         }
         if let Some(tombstone) = self.store.graph_tombstone(record.event.graph())? {
             return Err(CraqleError::ReplicationRejected {
@@ -4303,24 +4322,16 @@ impl CraqleNode {
                         reason: "remote actor is not authorized to change graph policy".to_owned(),
                     });
                 }
-                let current = self.store.graph_tagged_policy(graph)?;
-                if tagged.tag <= current.tag {
-                    return Ok(false);
-                }
-                let tagged = TaggedGraphPolicy {
-                    policy: tagged.policy.clone().normalized(),
-                    tag: tagged.tag,
-                };
-                self.store.set_tagged_graph_policy(graph, &tagged)?;
-                Ok(true)
+                Ok(self.replication.apply_policy_record(record)?.is_some())
             }
             CraqleGraphEvent::QuadChanges { graph, .. }
-            | CraqleGraphEvent::RoCrateMutation { graph, .. } => {
+            | CraqleGraphEvent::RoCrateMutation { graph, .. }
+            | CraqleGraphEvent::Mutation { graph, .. } => {
                 let Some(result) = self.replication.apply_irokle_record(record)? else {
                     return Ok(false);
                 };
                 if result.applied {
-                    self.schedule_search_update_for_graph(graph)?;
+                    self.schedule_graph_search(graph)?;
                 }
                 Ok(result.applied)
             }
@@ -4329,11 +4340,11 @@ impl CraqleNode {
 
     #[cfg(test)]
     fn validate_sync_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
-        if policy.permission_paths.len() > MAX_SYNC_POLICY_PATHS {
+        if policy.permission_paths.len() > MAX_POLICY_PATHS {
             return Err(CraqleError::SyncInputRejected(format!(
                 "sync policy for graph `{}` exceeded {} permission paths",
                 graph.as_str(),
-                MAX_SYNC_POLICY_PATHS
+                MAX_POLICY_PATHS
             )));
         }
         Ok(())
@@ -4383,21 +4394,20 @@ fn rocrate_policy_id(shapes_graph: &GraphId, schema: &CompiledShaclSchema) -> Po
     PolicyId(*hasher.finalize().as_bytes())
 }
 
-fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<GraphId> {
+fn single_change_graph(changes: &[CoreChange]) -> Result<GraphId> {
     let Some(first) = changes.first() else {
         return Err(CraqleError::MultiGraphUpdateUnsupported);
     };
     let graph = match first {
-        CoreMaterializedQuadChange::Insert { graph, .. }
-        | CoreMaterializedQuadChange::Delete { graph, .. } => graph.clone(),
+        CoreChange::Insert { graph, .. } | CoreChange::Delete { graph, .. } => graph.clone(),
     };
 
     if changes.iter().all(|change| match change {
-        CoreMaterializedQuadChange::Insert {
+        CoreChange::Insert {
             graph: change_graph,
             ..
         }
-        | CoreMaterializedQuadChange::Delete {
+        | CoreChange::Delete {
             graph: change_graph,
             ..
         } => *change_graph == graph,
@@ -4408,23 +4418,18 @@ fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<Gr
     }
 }
 
-/// Per-graph state for resolving several subjects of the same graph.
-///
-/// `graph_tid` is `None` when the graph name was never interned, i.e. the
-/// graph holds no triples to describe.
+/// Per-graph subject state; an absent id means no stored triples.
 struct DescribeCtx {
     graph_tid: Option<store::TermId>,
     orphaned: std::collections::HashSet<EncodedTerm>,
 }
 
-/// Memo of "may this caller read this graph?", valid for one call.
-///
-/// Authorization is always re-evaluated against the policy currently in the
-/// store, so a policy change is picked up by the next call (G8).
+/// Memo of graph readability for one call and one policy view.
 struct ReadableGraphs<'a> {
     node: &'a CraqleNode,
     auth: &'a dyn Authorizer,
-    memo: HashMap<String, bool>,
+    snapshot: store::StoreReadSnapshot,
+    memo: cache::BoundedCache<String, bool>,
 }
 
 impl<'a> ReadableGraphs<'a> {
@@ -4432,55 +4437,35 @@ impl<'a> ReadableGraphs<'a> {
         Self {
             node,
             auth,
-            memo: HashMap::new(),
+            snapshot: node.store.read_snapshot(),
+            memo: cache::BoundedCache::new(1_024, node.search.query_bytes() / 4),
         }
     }
 
     fn allows(&mut self, graph_id: &str) -> Result<bool> {
-        if let Some(readable) = self.memo.get(graph_id) {
-            return Ok(*readable);
+        if let Some(readable) = self.memo.get_cloned(graph_id) {
+            return Ok(readable);
         }
-
         let graph = GraphId::new(graph_id);
-        let readable = self.node.store.contains_graph(&graph)?
-            && self
-                .auth
-                .authorize(&graph, &self.node.store.graph_policy(&graph)?, Action::Read)
-                .is_ok();
-        self.memo.insert(graph_id.to_string(), readable);
+        let readable = self
+            .snapshot
+            .graph_policy(&self.node.store, &graph)?
+            .is_some_and(|policy| self.auth.authorize(&graph, &policy, Action::Read).is_ok());
+        self.memo.insert(
+            graph_id.to_owned(),
+            readable,
+            graph_id.len().saturating_mul(2),
+        );
         Ok(readable)
     }
 }
 
-fn score_key(score: f32) -> i64 {
-    (score as f64 * 1_000_000.0) as i64
-}
-
-/// Remembers graph-and-subject pairs so later duplicates can be dropped.
-#[derive(Default)]
-pub(crate) struct SeenHits(std::collections::HashSet<(String, String)>);
-
-impl SeenHits {
-    /// True exactly once per pair: only the first occurrence is admitted.
-    pub(crate) fn admits(&mut self, hit: &SearchHit) -> bool {
-        self.0
-            .insert((hit.graph_id.clone(), hit.subject_iri.clone()))
-    }
-}
-
-/// Merge hits from several searches into one score-ordered page, keeping only
-/// the highest-scoring occurrence of each graph-and-subject pair.
-fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
-    hits.sort_unstable_by(|left, right| {
-        Reverse(score_key(left.score))
-            .cmp(&Reverse(score_key(right.score)))
-            .then_with(|| left.graph_id.cmp(&right.graph_id))
-            .then_with(|| left.subject_iri.cmp(&right.subject_iri))
-    });
-    let mut seen = SeenHits::default();
-    hits.retain(|hit| seen.admits(hit));
-    hits.truncate(limit);
-    hits
+fn accepted_error(receipt: MutationReceipt, error: CraqleError) -> CraqleError {
+    CraqleError::Update(UpdateError::Accepted {
+        error_kind: error.kind(),
+        reason: error.to_string(),
+        receipt: receipt.outbound(),
+    })
 }
 
 #[cfg(test)]
@@ -4556,11 +4541,11 @@ mod tests {
         let graph = GraphId::new("urn:test:durability:configured");
         let persists = node.store.persists();
 
-        node.finish_batch_with_durability(
-            &graph,
-            empty_test_batch(&graph, node.actor()),
-            CraqleRequestDurability::Durable,
-        )
+        node.settle_batch(BatchFinish {
+            graph: &graph,
+            batch: empty_test_batch(&graph, node.actor()),
+            durability: CraqleRequestDurability::Durable,
+        })
         .unwrap();
 
         assert_eq!(
@@ -4577,11 +4562,11 @@ mod tests {
         let graph = GraphId::new("urn:test:durability:external-wal");
         let persists = node.store.persists();
 
-        node.finish_batch_with_durability(
-            &graph,
-            empty_test_batch(&graph, node.actor()),
-            CraqleRequestDurability::WalAlreadyDurable,
-        )
+        node.settle_batch(BatchFinish {
+            graph: &graph,
+            batch: empty_test_batch(&graph, node.actor()),
+            durability: CraqleRequestDurability::WalAlreadyDurable,
+        })
         .unwrap();
 
         assert_eq!(persists, node.store.persists());
@@ -4640,7 +4625,7 @@ mod tests {
             let focus = format!("urn:test:{prefix}:focus:{index}");
             let shape = format!("urn:test:{prefix}:shape:{index}");
             let property = format!("urn:test:{prefix}:property:{index}");
-            node.apply_changes_bypassing_structural_rules(
+            node.apply_unchecked(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4663,8 +4648,7 @@ mod tests {
                 predicate: EncodedTerm(format!("<{sh_min_count}>")),
                 object: EncodedTerm(format!("\"1\"^^<{xsd_integer}>")),
             });
-            node.apply_changes_bypassing_structural_rules(&shapes, shape_changes)
-                .unwrap();
+            node.apply_unchecked(&shapes, shape_changes).unwrap();
             node.bind_shacl(
                 &AllowAllAuthorizer,
                 &ShaclBinding {
@@ -4698,7 +4682,7 @@ mod tests {
         );
 
         let error = node
-            .apply_changes_bypassing_structural_rules(
+            .apply_unchecked(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4853,7 +4837,7 @@ mod tests {
             let focus = format!("urn:test:shape-race:{label}:focus");
             let shape = format!("urn:test:shape-race:{label}:shape");
             let property = format!("urn:test:shape-race:{label}:property");
-            node.apply_changes_bypassing_structural_rules(
+            node.apply_unchecked(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4901,10 +4885,9 @@ mod tests {
                 predicate: EncodedTerm("<http://www.w3.org/ns/shacl#minCount>".to_owned()),
                 object: EncodedTerm("\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned()),
             });
-            node.apply_changes_bypassing_structural_rules(&dependency, shape_changes)
-                .unwrap();
+            node.apply_unchecked(&dependency, shape_changes).unwrap();
             if imported {
-                node.apply_changes_bypassing_structural_rules(
+                node.apply_unchecked(
                     &root,
                     vec![shacl_change(
                         &root,
@@ -4954,7 +4937,7 @@ mod tests {
                 assert!(wait_started.elapsed() < Duration::from_secs(5));
                 std::thread::yield_now();
             }
-            node.apply_changes_bypassing_structural_rules(
+            node.apply_unchecked(
                 &dependency,
                 vec![MaterializedQuadChange::Insert {
                     graph: dependency.clone(),
@@ -5080,7 +5063,20 @@ mod tests {
                     })
                 }
             };
-            node_for_query.query(&auth, &query).unwrap()
+            let options = QueryOptions {
+                limits: QueryLimits::unbounded(),
+                ..QueryOptions::default()
+            };
+            node_for_query
+                .query_with_options(
+                    &auth,
+                    QueryRequest {
+                        sparql: &query,
+                        options: &options,
+                    },
+                )
+                .unwrap()
+                .results
         });
 
         let reached = reached_rx
@@ -5167,7 +5163,20 @@ mod tests {
                     })
                 }
             };
-            node_for_query.query(&auth, &query).unwrap()
+            let options = QueryOptions {
+                limits: QueryLimits::unbounded(),
+                ..QueryOptions::default()
+            };
+            node_for_query
+                .query_with_options(
+                    &auth,
+                    QueryRequest {
+                        sparql: &query,
+                        options: &options,
+                    },
+                )
+                .unwrap()
+                .results
         });
 
         reached_rx
@@ -5194,9 +5203,7 @@ mod tests {
         ));
     }
 
-    /// Both node-level search entry points take a caller-supplied limit that
-    /// Tantivy turns into a `limit * 2` pre-allocation, so `usize::MAX` used
-    /// to abort the process rather than return a page.
+    /// Search entry points must clamp limits before Tantivy allocation.
     #[test]
     #[cfg(feature = "search")]
     fn huge_limit_clamps() {
@@ -5237,10 +5244,7 @@ mod tests {
         assert_eq!(1, hits.len());
     }
 
-    /// `search_graphs` forks strategy above `SEARCH_GRAPHS_PER_GRAPH_LIMIT`
-    /// graphs. That is a performance fork, so both arms must answer
-    /// identically — including for a query carrying characters the Tantivy
-    /// parser reads as syntax, which the set arm used to hand over unescaped.
+    /// Both graph-search strategies must handle Tantivy syntax identically.
     #[test]
     #[cfg(feature = "search")]
     fn graph_arms_agree() {
@@ -5252,9 +5256,7 @@ mod tests {
         .unwrap();
         let auth = writer_auth();
 
-        // Only the first seven graphs carry the needle, so querying seven
-        // graphs and querying all nine must return the same hits — one query
-        // either side of the threshold.
+        // Seven matching graphs exercise both sides of the strategy threshold.
         let graphs: Vec<GraphId> = (0..9)
             .map(|i| GraphId::new(&format!("urn:t:arm{i}")))
             .collect();
@@ -5289,10 +5291,7 @@ mod tests {
         assert_eq!(per_graph, run(&graphs), "the two arms disagree");
     }
 
-    /// A whole-graph rebuild clears the graph, then refills it from a store
-    /// scan. An upsert for the same graph landing in that window survived the
-    /// clear and was then duplicated by the refill, leaving two documents for
-    /// one subject that the acknowledged queue entries called settled (G7).
+    /// A rebuild must exclude an upsert between graph clearing and refill.
     #[test]
     #[cfg(feature = "search")]
     fn rebuild_excludes_upsert() {
@@ -5425,7 +5424,21 @@ mod tests {
                 }
             }
         "#;
-        let rows = match node.query_graphs_with(|_| true, sparql).unwrap() {
+        let options = QueryOptions {
+            limits: QueryLimits::unbounded(),
+            ..QueryOptions::default()
+        };
+        let rows = match node
+            .query_with_options(
+                &AllowAllAuthorizer,
+                QueryRequest {
+                    sparql,
+                    options: &options,
+                },
+            )
+            .unwrap()
+            .results
+        {
             QueryResults::Solutions(rows) => rows,
             other => panic!("expected solutions, got {other:?}"),
         };
@@ -5635,13 +5648,7 @@ mod tests {
         );
     }
 
-    /// G3 — a retryable apply failure must stop the pass at that record, and a
-    /// later pass must still deliver it.
-    ///
-    /// Quarantining it instead loses it twice over: the cursor moves past it,
-    /// and the record behind it raises the graph clock past its dot, so the
-    /// dedup gate would drop it even on redelivery. The replica then stays
-    /// short one write forever, with nothing left to repair it.
+    /// A retryable apply failure stops the pass without advancing its cursor.
     #[test]
     fn stall_retries_record() {
         let pair = replica_pair();
@@ -5742,7 +5749,7 @@ mod tests {
         let corrupt = vec![0x81, 0x02, 0x03];
         pair.replica
             .store
-            .set_applied_topic_clock(topic.as_bytes(), &corrupt)
+            .set_topic_clock(topic.as_bytes(), &corrupt)
             .unwrap();
         let error = pair.replica.reconcile_irokle().unwrap_err();
         assert_eq!(error.kind(), CraqleErrorKind::CorruptAuthoritativeData);
@@ -5966,12 +5973,7 @@ mod tests {
         );
     }
 
-    /// A panic inside the indexer drain must not take the worker thread down.
-    ///
-    /// The search index is derived state, and the thread that repairs it is the
-    /// same one that drains the queue. If a panic killed it, the index would
-    /// stay diverged from the store until the process restarted — the lingering
-    /// inconsistency the recovery rules forbid.
+    /// A drain panic must not stop the worker that repairs derived search state.
     #[test]
     #[cfg(feature = "search")]
     fn worker_survives_panic() {
@@ -6000,7 +6002,7 @@ mod tests {
         node.flush_search_updates()
             .expect("worker must still be alive after the panic");
         assert!(
-            !node.search.take_armed_drain_panic(),
+            !node.search.take_drain_panic(),
             "the injected panic must actually have fired, or this test is vacuous"
         );
 
@@ -6020,11 +6022,7 @@ mod tests {
         );
     }
 
-    /// G5 — two `@context` writes must never mint the same last-write-wins tag.
-    ///
-    /// The tag is `stored_counter + 1`, so an unsynchronised mint hands the
-    /// identical `(counter, actor)` to two different context values: a tie the
-    /// register cannot break, which leaves peers free to disagree forever.
+    /// Concurrent context writes must mint distinct last-write-wins tags.
     #[test]
     fn context_tags_distinct() {
         const WRITERS: usize = 8;
@@ -6063,14 +6061,7 @@ mod tests {
         );
     }
 
-    /// G5 — two RO-Crate render-hint mutations racing on one graph must converge on
-    /// the higher tag, not on whichever landed last.
-    ///
-    /// The apply is a compare-and-set: read the stored tag, decide, write. Run
-    /// unsynchronised, both applies read the same stored tag, both conclude
-    /// they dominate it, and arrival order picks the winner — so the register
-    /// can settle on a value every peer has already superseded, with no later
-    /// event to correct it.
+    /// Racing context mutations must converge on the higher tag.
     #[test]
     fn context_applies_converge() {
         const ROUNDS: usize = 32;
@@ -6093,8 +6084,8 @@ mod tests {
                     &node.store,
                     &graph,
                     Vec::new(),
-                    crate::core::TaggedRoCrateRenderHints {
-                        hints: crate::core::RoCrateRenderHints {
+                    crate::core::TaggedRenderHints {
+                        hints: crate::core::CrateRenderHints {
                             context: Some(value.to_string()),
                             license: None,
                             license_digest: None,
@@ -6142,14 +6133,7 @@ mod tests {
         }
     }
 
-    /// G8 — concurrent policy writes must leave this node on the policy their
-    /// publish sequence ends with, which is the one every peer converges to.
-    ///
-    /// A policy event carries no ordering tag, so publish order is the only
-    /// thing that decides the winner. Publishing and applying without a lock
-    /// between them lets two writes apply in the opposite order, leaving this
-    /// node on a policy its peers have already replaced — the permissive one,
-    /// if that is the one that lost.
+    /// Concurrent policy writes must settle locally in publication order.
     #[test]
     fn policy_writes_settle() {
         const ROUNDS: usize = 10;
@@ -6161,10 +6145,10 @@ mod tests {
 
         // Widen the publish→apply window, so a writer that does not hold it
         // open under a lock is overtaken instead of merely being able to be.
-        PUBLISH_APPLY_STALL_MICROS.store(STALL_MICROS, Ordering::Relaxed);
+        PUBLISH_STALL_MICROS.store(STALL_MICROS, Ordering::Relaxed);
         for round in 0..ROUNDS {
             let graph = GraphId::new(&format!("urn:test:policy-race-{round}"));
-            node.set_graph_policy_bypassing_authorization(&graph, policy_at("seed"))
+            node.set_policy_unchecked(&graph, policy_at("seed"))
                 .unwrap();
 
             let (tx, rx) = mpsc::channel();
@@ -6187,7 +6171,7 @@ mod tests {
                 "round {round} settled on a policy its peers have replaced"
             );
         }
-        PUBLISH_APPLY_STALL_MICROS.store(0, Ordering::Relaxed);
+        PUBLISH_STALL_MICROS.store(0, Ordering::Relaxed);
     }
 
     /// The policy a peer replaying this graph's topic ends up on.
@@ -6206,19 +6190,13 @@ mod tests {
                     CraqleGraphEvent::Policy { tagged, .. } => Some(tagged.policy.normalized()),
                     _ => None,
                 },
-                sync::TopicRecord::Rejected(_) => None,
+                sync::TopicRecord::Rejected(_) | sync::TopicRecord::Control(_) => None,
             })
             .next_back()
             .expect("at least one published policy")
     }
 
-    /// G4 — a write racing a delete must not resurrect the graph.
-    ///
-    /// The local write applies through the replication engine, which never
-    /// passes `CraqleNode::apply_irokle_record`'s tombstone check; without one
-    /// of its own it re-creates the graph the delete just tombstoned. Nothing
-    /// clears a tombstone, so every later replicated record for that graph is
-    /// dropped and the divergence can never be repaired.
+    /// A write racing a delete must not resurrect the tombstoned graph.
     #[test]
     fn write_never_resurrects() {
         const ROUNDS: usize = 16;
@@ -6229,7 +6207,7 @@ mod tests {
 
         for round in 0..ROUNDS {
             let graph = GraphId::new(&format!("urn:test:delete-race-{round}"));
-            node.set_graph_policy_bypassing_authorization(&graph, policy_at("delete-race"))
+            node.set_policy_unchecked(&graph, policy_at("delete-race"))
                 .unwrap();
             seed_write(&node, &graph);
 
@@ -6242,7 +6220,7 @@ mod tests {
                 std::thread::spawn(move || {
                     start.wait();
                     if racer == 0 {
-                        node.delete_graph_after_authorization(&graph).unwrap();
+                        node.delete_authorized(&graph).unwrap();
                     } else {
                         if let Err(error) = seed_write_result(&node, &graph) {
                             assert_eq!(error.kind(), CraqleErrorKind::Conflict);
@@ -6417,7 +6395,7 @@ mod tests {
         let shapes = GraphId::new("urn:test:delete-replay-shapes");
         let focus = EncodedTerm("<urn:test:delete-replay-focus>".to_owned());
         pair.origin
-            .apply_changes_bypassing_structural_rules(
+            .apply_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -6428,7 +6406,7 @@ mod tests {
             )
             .unwrap();
         pair.origin
-            .apply_changes_bypassing_structural_rules(
+            .apply_unchecked(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -6463,9 +6441,7 @@ mod tests {
             )
             .unwrap();
 
-        pair.origin
-            .delete_graph_after_authorization(&shapes)
-            .unwrap();
+        pair.origin.delete_authorized(&shapes).unwrap();
         pair.replica.store.set_graph_tombstone(&shapes).unwrap();
         pair.replica.store.arm_commit_failure();
         assert!(pair.replica.reconcile_irokle().is_err());
@@ -6579,7 +6555,7 @@ mod tests {
     }
 
     fn seed_write_result(node: &CraqleNode, graph: &GraphId) -> Result<Batch> {
-        node.apply_changes_bypassing_structural_rules(
+        node.apply_unchecked(
             graph,
             vec![MaterializedQuadChange::Insert {
                 graph: graph.clone(),
@@ -6590,39 +6566,37 @@ mod tests {
         )
     }
 
-    /// One work slice must not queue an unbounded number of control replies:
-    /// a client loop calling `flush_search_updates` can outrun the indexer.
-    /// What is left over stays queued rather than being dropped.
+    /// One work slice bounds replies and leaves excess control messages queued.
     #[test]
     fn control_messages_bounded() {
         let (sender, receiver) = mpsc::channel();
         let mut keep_alive = Vec::new();
         for _ in 0..10_000 {
             let (reply, waiter) = mpsc::channel();
-            sender.send(SearchWorkerMessage::Flush(reply)).unwrap();
+            sender
+                .send(SearchWorkerMessage::flush_reply(reply, 0))
+                .unwrap();
             keep_alive.push(waiter);
         }
 
         let mut replies = Vec::new();
-        collect_search_worker_messages(&receiver, &mut replies);
+        collect_search_messages(&receiver, &mut replies, Duration::ZERO);
 
         assert!(
-            replies.len() <= SEARCH_MAX_CONTROL_MESSAGES,
+            replies.len() <= MAX_CONTROL_MESSAGES,
             "collected {} pending flush replies in one cycle",
             replies.len()
         );
 
         let mut later = Vec::new();
-        collect_search_worker_messages(&receiver, &mut later);
+        collect_search_messages(&receiver, &mut later, Duration::ZERO);
         assert!(
             !later.is_empty(),
             "waiters past the cap must stay queued for the next cycle"
         );
     }
 
-    /// Shutdown must not be reachable only by consuming the control channel:
-    /// a caller flooding flush requests would otherwise delay it without
-    /// bound. The indexer reads a flag, so the backlog cannot starve it.
+    /// The shutdown flag must bypass a saturated control-channel backlog.
     #[test]
     fn shutdown_outruns_backlog() {
         let dir = tempfile::tempdir().unwrap();
@@ -6635,7 +6609,7 @@ mod tests {
             let (reply, waiter) = mpsc::channel();
             if worker
                 .sender
-                .send(SearchWorkerMessage::Flush(reply))
+                .try_send(SearchWorkerMessage::flush_reply(reply, 0))
                 .is_err()
             {
                 break;
@@ -6654,7 +6628,7 @@ mod tests {
 
     #[test]
     fn drop_joins_completion() {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let (entered, observed) = mpsc::channel();
         let (release, resume) = mpsc::channel();
         let finished = Arc::new(AtomicBool::new(false));
@@ -6668,12 +6642,21 @@ mod tests {
             resume.recv_timeout(PROGRESS_TIMEOUT).unwrap();
             completed.store(true, Ordering::SeqCst);
         });
-        let worker = SearchUpdateWorker {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open(directory.path()).unwrap());
+        let mut worker = SearchUpdateWorker {
             sender,
+            store,
+            pending: Arc::new(AtomicUsize::new(0)),
             wake_pending: Arc::new(AtomicBool::new(false)),
             stopping: Arc::new(AtomicBool::new(false)),
             handle: Some(handle),
         };
+        assert_eq!(
+            worker.shutdown_within(Duration::ZERO).unwrap(),
+            ShutdownState::TimedOut
+        );
+        assert!(worker.handle.is_some());
         let (done, result) = mpsc::channel();
         let owner = std::thread::spawn(move || {
             drop(worker);
