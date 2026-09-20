@@ -1286,15 +1286,7 @@ impl SearchIndex {
             .collect()
     }
 
-    /// Lock the Tantivy writer, repairing it if a panicking thread poisoned
-    /// the mutex.
-    ///
-    /// `lock().unwrap()` made a single panic anywhere in the process fatal to
-    /// the search index for the lifetime of that process: every later lock
-    /// panicked in turn, the background indexer died with the first of them,
-    /// and the index stopped converging with the store until a restart. The
-    /// index is derived state, and derived state gets a prompt automatic
-    /// repair — "fixed at next restart" is not a repair.
+    /// Lock the writer and recover poisoned derived state immediately.
     fn writer(&self) -> Result<MutexGuard<'_, IndexWriter>> {
         match self.writer.lock() {
             Ok(guard) => Ok(guard),
@@ -1302,13 +1294,7 @@ impl SearchIndex {
         }
     }
 
-    /// Roll a poisoned writer back to its last commit and record that the index
-    /// owes the store a re-derivation.
-    ///
-    /// The panic unwound at an unknown point, so uncommitted writer state cannot
-    /// be trusted. `rollback` discards it and builds a fresh writer from the same
-    /// `Index`, moving the directory lock across. The debt is recorded first, so a
-    /// failing rollback leaves the mutex poisoned and the repair is retried.
+    /// Roll back poisoned uncommitted state and retain re-derivation debt.
     fn recover_writer<'a>(
         &'a self,
         mut guard: MutexGuard<'a, IndexWriter>,
@@ -1319,17 +1305,7 @@ impl SearchIndex {
         Ok(guard)
     }
 
-    /// Repair a poisoned writer and durably queue the reindex it owes.
-    ///
-    /// Runs at the top of every drain, so the indexer's one-second tick is the
-    /// detection point. The reindex is queued rather than run inline so it stays
-    /// crash-safe and keeps G7's acknowledge-after-commit rule.
-    ///
-    /// The rebuild it queues carries tokens above the caller's bound, so the
-    /// raised target is returned alongside the bound and travels back to the
-    /// owning flush in [`DrainProgress::recovery`]. Widening only this call's
-    /// local bound lost that obligation as soon as a higher-priority queue
-    /// class ended the pass, and the next pass rebuilt the original cutoff.
+    /// Queue poison recovery durably and return its raised flush target.
     fn settle_poisoned_writer(
         &self,
         store: &GraphStore,
@@ -1342,13 +1318,17 @@ impl SearchIndex {
             return Ok((bound, None));
         }
 
-        if let Err(error) = self.enqueue_full_rebuild(store) {
-            // Put the debt back: the next pass, one tick later, retries it.
-            self.rebuild_owed.store(true, Ordering::SeqCst);
-            return Err(error);
-        }
-
-        let raised = bound.max_token.map(|_| store.current_dirty_token());
+        let revision = self.index.load_metas()?.opstamp;
+        let raised = match store.bind_search_rebuild(&RebuildRequest {
+            index_id: self.index_id,
+            index_revision: revision,
+        }) {
+            Ok(target) => bound.max_token.map(|_| target),
+            Err(error) => {
+                self.rebuild_owed.store(true, Ordering::SeqCst);
+                return Err(error.into());
+            }
+        };
         Ok((
             QueueBound {
                 max_token: raised.or(bound.max_token),
@@ -1358,42 +1338,160 @@ impl SearchIndex {
         ))
     }
 
-    /// Note that one entry failed, and report it with its attempt count.
-    fn record_failure(&self, key: FailureKey, error: &SearchError) -> DrainFailure {
-        let mut failures = self
-            .item_failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let entry = failures.entry(key.clone()).or_insert_with(|| DrainFailure {
-            graph: GraphId::new(&key.graph),
-            attempts: 0,
-            diagnostic: String::new(),
-        });
-        entry.attempts = entry.attempts.saturating_add(1);
-        entry.diagnostic = error.to_string();
-        entry.clone()
-    }
-
-    fn clear_failure(&self, key: &FailureKey) {
-        self.item_failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(key);
-    }
-
-    fn enqueue_full_rebuild(&self, store: &GraphStore) -> Result<()> {
-        let mut batch = store.new_batch();
-        for graph_id in store.graph_term_ids()? {
-            store.enqueue_fts_reindex(&mut batch, graph_id)?;
+    fn now_ms(&self) -> u64 {
+        let injected = self.retry_now.load(Ordering::SeqCst);
+        if injected != 0 {
+            return injected;
         }
-        store.commit(batch)?;
-        Ok(store.persist()?)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
-    /// Add or update a document for the given resource.
-    ///
-    /// Deletes any existing document with the same `subject_iri` in the same
-    /// `graph_id` before inserting the new one.
+    #[cfg(test)]
+    fn set_retry_now(&self, now_ms: u64) {
+        self.retry_now.store(now_ms, Ordering::SeqCst);
+    }
+
+    fn retry_failure(
+        &self,
+        store: &GraphStore,
+        input: FailureInput<'_>,
+    ) -> Result<Option<DrainFailure>> {
+        let Some(state) = store.fts_failure(input.id)? else {
+            return Ok(None);
+        };
+        if state.target != input.target {
+            store.clear_fts_failure(input.id)?;
+            return Ok(None);
+        }
+        if state.retry_at_ms == u64::MAX && state.id.kind == QueueKind::Reindex {
+            let request = GenerationRequest {
+                index_id: self.index_id,
+                graph: state.id.graph.clone(),
+            };
+            let stage = store.search_stage(&request)?;
+            store.quarantine_search_failure(&StageFailure {
+                index_id: self.index_id,
+                state: state.clone(),
+                job: stage.clone(),
+            })?;
+            if let Some(stage) = stage {
+                self.stage_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&stage.generation);
+            }
+        }
+        if state.retry_at_ms <= self.now_ms() && state.attempts < MAX_RETRY_ATTEMPTS {
+            return Ok(None);
+        }
+        Ok(Some(drain_failure(&state, "retry deferred")))
+    }
+
+    fn record_failure(&self, store: &GraphStore, failed: FailedItem<'_>) -> Result<DrainFailure> {
+        let class = failure_class(&failed.error);
+        if matches!(class, FailureClass::Rebuild) {
+            self.reset_writer()?;
+            return Err(failed.error);
+        }
+        if matches!(class, FailureClass::Global) {
+            return Err(failed.error);
+        }
+        let previous = store.fts_failure(failed.input.id)?;
+        let attempts = previous
+            .filter(|state| state.target == failed.input.target)
+            .map_or(1, |state| state.attempts.saturating_add(1));
+        let code = failure_code(&failed.error).to_string();
+        let permanent =
+            matches!(class, FailureClass::ItemPermanent) || attempts >= MAX_RETRY_ATTEMPTS;
+        let shift = attempts.saturating_sub(1).min(16);
+        let delay = RETRY_BASE_MS
+            .saturating_mul(1u64 << shift)
+            .min(RETRY_MAX_MS);
+        let state = RetryState {
+            id: failed.input.id.clone(),
+            owed_from: failed.input.owed_from,
+            target: failed.input.target,
+            attempts,
+            retry_at_ms: if permanent {
+                u64::MAX
+            } else {
+                self.now_ms().saturating_add(delay)
+            },
+            code,
+            error_kind: failed.error.kind(),
+        };
+        if permanent && state.id.kind == QueueKind::Reindex {
+            let request = GenerationRequest {
+                index_id: self.index_id,
+                graph: state.id.graph.clone(),
+            };
+            let stage = store.search_stage(&request)?;
+            store.quarantine_search_failure(&StageFailure {
+                index_id: self.index_id,
+                state: state.clone(),
+                job: stage.clone(),
+            })?;
+            if let Some(stage) = stage {
+                self.stage_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&stage.generation);
+            }
+        } else {
+            store.set_fts_failure(&state)?;
+        }
+        Ok(drain_failure(&state, &failed.error.to_string()))
+    }
+
+    fn reset_writer(&self) -> Result<()> {
+        self.rebuild_owed.store(true, Ordering::SeqCst);
+        let mut writer = self.writer()?;
+        writer.rollback()?;
+        let committed = self.committed_epoch.load(Ordering::SeqCst);
+        self.write_epoch.store(committed, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear_failure(&self, store: &GraphStore, id: &QueueId) -> Result<()> {
+        Ok(store.clear_fts_failure(id)?)
+    }
+
+    fn record_oversized(
+        &self,
+        store: &GraphStore,
+        oversized: &OversizedEntry,
+    ) -> Result<DrainFailure> {
+        let input = FailureInput {
+            id: &oversized.id,
+            owed_from: oversized.owed_from,
+            target: oversized.target,
+        };
+        if let Some(failure) = self.retry_failure(store, input)? {
+            return Ok(failure);
+        }
+        let error = SearchError::ItemTooLarge {
+            bytes: oversized.bytes,
+            limit: self.prepared_bytes,
+        };
+        self.record_failure(
+            store,
+            FailedItem {
+                input: FailureInput {
+                    id: &oversized.id,
+                    owed_from: oversized.owed_from,
+                    target: oversized.target,
+                },
+                error,
+            },
+        )
+    }
+
+    /// Replace one graph-and-subject document with current searchable text.
     pub fn index_resource(
         &self,
         graph_id: &str,
