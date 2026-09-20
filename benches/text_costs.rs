@@ -1049,3 +1049,386 @@ fn engine_text(doc: &PreparedDoc, body: &str) -> String {
     text.push_str(body);
     text
 }
+fn analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(AsciiFoldingFilter)
+        .build()
+}
+fn analyzed(text: &str) -> Vec<String> {
+    let mut analyzer = analyzer();
+    let mut tokens = Vec::new();
+    analyzer
+        .token_stream(text)
+        .process(&mut |token| tokens.push(token.text.clone()));
+    tokens
+}
+fn assert_token_parity(corpus: &Corpus) {
+    for doc in &corpus.docs {
+        assert_eq!(
+            analyzed(&full_text(doc, &doc.body)),
+            analyzed(&engine_text(doc, &doc.body)),
+            "prepared text mismatch for {} {}",
+            doc.graph,
+            doc.subject
+        );
+    }
+}
+fn replace_tantivy(base: &mut Baseline, doc: &PreparedDoc, text: Option<&str>) {
+    base.writer
+        .delete_term(IndexTerm::from_field_text(base.fields.key, &doc_key(doc)));
+    if let Some(text) = text {
+        add_tantivy(&mut base.writer, &base.fields, (doc, text));
+    }
+    commit_tantivy(base);
+}
+fn commit_tantivy(base: &mut Baseline) {
+    base.writer.commit().unwrap();
+    base.reader.reload().unwrap();
+}
+
+fn load_meta(searcher: &tantivy::Searcher) -> Result<Vec<SegmentMeta>, text::EngineError> {
+    searcher
+        .segment_readers()
+        .iter()
+        .map(|reader| {
+            Ok(SegmentMeta {
+                graph: reader
+                    .fast_fields()
+                    .bytes("graph")?
+                    .ok_or(text::EngineError::Corrupt("graph fast field"))?,
+                subject: reader
+                    .fast_fields()
+                    .bytes("subject")?
+                    .ok_or(text::EngineError::Corrupt("subject fast field"))?,
+                stable: reader
+                    .fast_fields()
+                    .bytes("stable")?
+                    .ok_or(text::EngineError::Corrupt("stable fast field"))?,
+                graph_ord: reader.fast_fields().u64("graph_ord")?,
+            })
+        })
+        .collect()
+}
+fn candidate_key(
+    metadata: &[SegmentMeta],
+    address: DocAddress,
+    access: Access,
+) -> Result<Option<[u8; 32]>, text::EngineError> {
+    let meta = &metadata[address.segment_ord as usize];
+    if !meta
+        .graph_ord
+        .first(address.doc_id)
+        .is_some_and(|i| usize::try_from(i).is_ok_and(|i| access.allows(i)))
+    {
+        return Ok(None);
+    }
+    stable_key(meta, address.doc_id)
+}
+fn candidate_all(
+    metadata: &[SegmentMeta],
+    address: DocAddress,
+) -> Result<Option<[u8; 32]>, text::EngineError> {
+    stable_key(&metadata[address.segment_ord as usize], address.doc_id)
+}
+fn stable_key(meta: &SegmentMeta, doc: u32) -> Result<Option<[u8; 32]>, text::EngineError> {
+    let Some(stable) = first_bytes(Some(&meta.stable), doc) else {
+        return Ok(None);
+    };
+    let stable = stable
+        .try_into()
+        .map_err(|_| text::EngineError::Corrupt("stable key length"))?;
+    Ok(Some(stable))
+}
+fn decode_identity(
+    metadata: &[SegmentMeta],
+    address: DocAddress,
+) -> Result<HitIdentity, text::EngineError> {
+    identity_fast(&metadata[address.segment_ord as usize], address.doc_id)?
+        .ok_or(text::EngineError::Corrupt("tantivy identity missing"))
+}
+fn identity_fast(meta: &SegmentMeta, doc: u32) -> Result<Option<HitIdentity>, text::EngineError> {
+    let graph = first_bytes(Some(&meta.graph), doc);
+    let subject = first_bytes(Some(&meta.subject), doc);
+    match (graph, subject) {
+        (Some(graph), Some(subject)) => Ok(Some(HitIdentity {
+            graph: String::from_utf8(graph)
+                .map_err(|_| text::EngineError::Corrupt("graph utf8"))?,
+            subject: String::from_utf8(subject)
+                .map_err(|_| text::EngineError::Corrupt("subject utf8"))?,
+        })),
+        _ => Ok(None),
+    }
+}
+fn first_bytes(column: Option<&tantivy::columnar::BytesColumn>, doc: u32) -> Option<Vec<u8>> {
+    let column = column?;
+    let ord = column.term_ords(doc).next()?;
+    let mut bytes = Vec::new();
+    column
+        .ord_to_bytes(ord, &mut bytes)
+        .ok()
+        .and_then(|found| found.then_some(bytes))
+}
+
+fn timed<F>(run: F) -> (text::SearchReport, u128)
+where
+    F: FnOnce() -> Result<text::SearchReport, text::EngineError>,
+{
+    let started = Instant::now();
+    let report = run().unwrap();
+    (report, started.elapsed().as_nanos())
+}
+fn assert_reports(left: &text::SearchReport, right: &text::SearchReport, tolerance: f32) {
+    assert_eq!(hit_ids(&left.hits), hit_ids(&right.hits));
+    for (left, right) in left.hits.iter().zip(&right.hits) {
+        assert!((left.score - right.score).abs() <= tolerance);
+    }
+}
+fn validate_public(hits: &[craqle::SearchHit], config: &Config) {
+    assert!(hits.len() <= config.limit);
+    let mut seen = BTreeSet::new();
+    for hit in hits {
+        assert!(graph_allowed(&hit.graph_id, config.access));
+        assert!(seen.insert((&hit.graph_id, &hit.subject_iri)));
+    }
+}
+fn assert_hydrated(raw: &[craqle::SearchHit], full: &[craqle::HydratedSearchHit]) {
+    assert_eq!(raw.len(), full.len());
+    for (raw, full) in raw.iter().zip(full) {
+        assert_eq!(
+            (&raw.graph_id, &raw.subject_iri, raw.score.to_bits()),
+            (
+                &full.hit.graph_id,
+                &full.hit.subject_iri,
+                full.hit.score.to_bits()
+            )
+        );
+    }
+}
+fn emit_parity(config: &Config, case: (&str, usize), reports: (&[craqle::SearchHit], &[BenchHit])) {
+    let (query, sample) = case;
+    let (public, corrected) = reports;
+    let p = public
+        .iter()
+        .map(|h| (h.graph_id.clone(), h.subject_iri.clone()))
+        .collect::<Vec<_>>();
+    let c = hit_ids(corrected);
+    let ps: BTreeSet<_> = p.iter().cloned().collect();
+    let cs: BTreeSet<_> = c.iter().cloned().collect();
+    let mut delta = 0.0f32;
+    for hit in public {
+        if let Some(other) = corrected
+            .iter()
+            .find(|o| o.graph == hit.graph_id && o.subject == hit.subject_iri)
+        {
+            delta = delta.max((hit.score - other.score).abs());
+        }
+    }
+    emit(
+        json!({"kind":"public_corrected_parity","query":query,"sample":sample,"identity_order_equal":p==c,
+        "identity_overlap":ps.intersection(&cs).count(),"public_hits":p.len(),"corrected_hits":c.len(),
+        "max_shared_score_delta":delta,"permissions":config.access.label(),
+        "interpretation":"potential scoring-population or document-text differences; public scores are not an equivalent corrected-corpus comparison"}),
+    );
+}
+fn metric(config: &Config, case: (&str, usize), m: (&str, u128, usize, Option<WorkCount>)) {
+    let (query, sample) = case;
+    let (variant, wall, hits, work) = m;
+    emit(
+        json!({"kind":"query","seed":config.seed,"documents":config.docs,
+        "graphs":config.graphs,"permissions":config.access.label(),"query":query,"limit":config.limit,
+        "sample":sample,"rotation":sample%3,"variant":variant,"wall_ns":wall,"hits":hits,
+        "work":work.map(|w|json!({"pruning_fallback":w.pruning_fallback,
+            "posting_rows":w.posting_rows,"candidate_docs":w.candidate_docs,
+            "scored_docs":w.scored_docs,"rejected_docs":w.rejected_docs,"metadata_reads":w.metadata_reads,
+            "final_reads":w.final_reads,"deduplicated_docs":w.deduplicated_docs,"bytes":w.bytes}))}),
+    );
+}
+
+fn total_metric(config: &Config, case: (&str, usize), timing: (&str, u128)) {
+    let (query, sample) = case;
+    emit(
+        json!({"kind":"query_total","seed":config.seed,"documents":config.docs,
+        "graphs":config.graphs,"permissions":config.access.label(),"query":query,
+        "limit":config.limit,"sample":sample,"variant":timing.0,"wall_ns":timing.1,
+        "timing":"composed from nonoverlapping parse, metadata, and collection spans"}),
+    );
+}
+
+fn outer_metric(config: &Config, case: (&str, usize), result: (u128, &text::SearchReport)) {
+    let (query, sample) = case;
+    let (wall_ns, report) = result;
+    emit(
+        json!({"kind":"query_total","seed":config.seed,"documents":config.docs,
+        "graphs":config.graphs,"permissions":config.access.label(),"query":query,
+        "limit":config.limit,"sample":sample,"variant":"tantivy_pruned_e2e",
+        "wall_ns":wall_ns,"timing":"actual outer parse plus metadata plus collection",
+        "hits":report.hits.len(),"work":{"pruning_fallback":report.work.pruning_fallback,
+            "posting_rows":report.work.posting_rows,
+            "candidate_docs":report.work.candidate_docs,"scored_docs":report.work.scored_docs,
+            "rejected_docs":report.work.rejected_docs,"metadata_reads":report.work.metadata_reads,
+            "final_reads":report.work.final_reads,"deduplicated_docs":report.work.deduplicated_docs,
+            "bytes":report.work.bytes}}),
+    );
+}
+
+fn reader_auth(access: Access, graphs: usize) -> GrantAuthorizer {
+    GrantAuthorizer::new(
+        (0..graphs)
+            .filter(|i| access.allows(*i))
+            .map(|i| PermissionGrant::new(format!("/bench/g/{i}"), PermissionLevel::Read))
+            .collect(),
+    )
+}
+fn graph_allowed(graph: &str, access: Access) -> bool {
+    graph
+        .rsplit(':')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .is_some_and(|i| access.allows(i))
+}
+fn literal(predicate: &str, value: &str) -> (NamedNode, Term) {
+    (
+        NamedNode::new_unchecked(format!("http://schema.org/{predicate}")),
+        Term::Literal(oxrdf::Literal::new_simple_literal(value)),
+    )
+}
+fn input(doc: &PreparedDoc) -> DocumentInput<'_> {
+    DocumentInput {
+        graph: &doc.graph,
+        subject: &doc.subject,
+        text: &doc.body,
+    }
+}
+fn key(doc: &PreparedDoc) -> DocumentKey<'_> {
+    DocumentKey {
+        graph: &doc.graph,
+        subject: &doc.subject,
+    }
+}
+fn doc_key(doc: &PreparedDoc) -> String {
+    format!("{}\u{1f}{}", doc.graph, doc.subject)
+}
+fn hit_ids(hits: &[BenchHit]) -> Vec<(String, String)> {
+    hits.iter()
+        .map(|h| (h.graph.clone(), h.subject.clone()))
+        .collect()
+}
+fn public_ids(hits: &[craqle::SearchHit]) -> Vec<(String, String)> {
+    hits.iter()
+        .map(|h| (h.graph_id.clone(), h.subject_iri.clone()))
+        .collect()
+}
+fn hydrated_ids(hits: &[craqle::HydratedSearchHit]) -> Vec<(String, String)> {
+    hits.iter()
+        .map(|h| (h.hit.graph_id.clone(), h.hit.subject_iri.clone()))
+        .collect()
+}
+fn update_json(work: text::UpdateWork) -> serde_json::Value {
+    json!({"generation":work.generation,"terms":work.terms,"postings":work.postings,"bytes":work.bytes})
+}
+fn emit_update(variant: &str, timing: (u128, Option<u64>), work: serde_json::Value) {
+    emit(
+        json!({"kind":"update","variant":variant,"wall_ns":timing.0,"write_bytes":timing.1,"work":work}),
+    );
+}
+fn emit(value: serde_json::Value) {
+    println!("{value}");
+}
+fn io_bytes() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/io").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("write_bytes: ")?.parse().ok())
+    })
+}
+fn io_delta(before: Option<u64>) -> Option<u64> {
+    before
+        .zip(io_bytes())
+        .map(|(before, after)| after.saturating_sub(before))
+}
+fn dir_bytes(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += entry.metadata().unwrap().len();
+            }
+        }
+    }
+    total
+}
+
+#[cfg(target_os = "linux")]
+fn dir_blocks(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut blocks = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let metadata = entry.metadata().ok()?;
+            blocks = blocks.saturating_add(metadata.blocks());
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Some(blocks.saturating_mul(512))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dir_blocks(_: &Path) -> Option<u64> {
+    None
+}
+
+fn read_config() -> Config {
+    Config {
+        seed: env("CRAQLE_TEXT_SEED", 7),
+        docs: env("CRAQLE_TEXT_DOCS", 200),
+        graphs: env("CRAQLE_TEXT_GRAPHS", 8),
+        limit: env("CRAQLE_TEXT_K", 10),
+        samples: env("CRAQLE_TEXT_SAMPLES", 3),
+        common: std::env::var("CRAQLE_TEXT_COMMON_TERM").unwrap_or_else(|_| COMMON.to_string()),
+        rare: std::env::var("CRAQLE_TEXT_RARE_TERM").unwrap_or_else(|_| RARE.to_string()),
+        common_mod: env::<u64>("CRAQLE_TEXT_COMMON_MOD", 2).max(1),
+        rare_mod: env::<u64>("CRAQLE_TEXT_RARE_MOD", 97).max(1),
+        tolerance: env("CRAQLE_TEXT_SCORE_TOLERANCE", 0.00001),
+        access: match std::env::var("CRAQLE_TEXT_PERMISSIONS")
+            .as_deref()
+            .unwrap_or("all")
+        {
+            "all" => Access::All,
+            "half" => Access::Half,
+            "one" => Access::One,
+            other => panic!("unknown permission profile {other}"),
+        },
+        layout: match std::env::var("CRAQLE_TEXT_LAYOUT") {
+            Ok(v) if v != "simple" => PostingLayout::Block {
+                docs: v
+                    .strip_prefix("block:")
+                    .and_then(|v| v.parse().ok())
+                    .expect("layout must be simple or block:<docs>"),
+            },
+            _ => PostingLayout::Simple,
+        },
+    }
+}
+fn env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    match std::env::var(key) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid numeric environment {key}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("non-Unicode numeric environment {key}")
+        }
+    }
+}
