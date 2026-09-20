@@ -993,19 +993,22 @@ fn collect_search_messages(
     receiver: &mpsc::Receiver<SearchWorkerMessage>,
     pending: &mut Vec<FlushRequest>,
     wait: Duration,
-) -> bool {
+) -> (bool, bool) {
+    let mut woke = false;
     let mut message = match receiver.recv_timeout(wait) {
         Ok(message) => Some(message),
         Err(mpsc::RecvTimeoutError::Timeout) => None,
-        Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+        Err(mpsc::RecvTimeoutError::Disconnected) => return (true, false),
     };
     for index in 0..MAX_CONTROL_MESSAGES {
         match message.take() {
-            Some(SearchWorkerMessage::Stop) => return true,
+            Some(SearchWorkerMessage::Stop) => return (true, woke),
             Some(SearchWorkerMessage::Flush(request)) if !request.control.is_cancelled() => {
-                pending.push(request)
+                pending.push(request);
+                woke = true;
             }
-            Some(SearchWorkerMessage::Wake | SearchWorkerMessage::Flush(_)) | None => {}
+            Some(SearchWorkerMessage::Wake) => woke = true,
+            Some(SearchWorkerMessage::Flush(_)) | None => {}
         }
         if index + 1 == MAX_CONTROL_MESSAGES {
             break;
@@ -1015,7 +1018,34 @@ fn collect_search_messages(
             break;
         }
     }
-    false
+    (false, woke)
+}
+
+fn settle_search_failures(
+    pending: &mut Vec<FlushRequest>,
+    failures: &[search::queue::DrainFailure],
+) -> Option<u64> {
+    let retry_at = failures
+        .iter()
+        .filter_map(|failure| (failure.retry_at_ms != u64::MAX).then_some(failure.retry_at_ms))
+        .min();
+    let mut kept = Vec::new();
+    for request in pending.drain(..) {
+        let permanent = failures
+            .iter()
+            .find(|failure| failure.owed_from <= request.target && failure.retry_at_ms == u64::MAX);
+        if let Some(failure) = permanent {
+            let failure = MaintenanceFailure::message(
+                failure.error_kind,
+                describe_search_failures(std::slice::from_ref(failure)),
+            );
+            let _ = request.reply.send(Err(failure));
+        } else {
+            kept.push(request);
+        }
+    }
+    *pending = kept;
+    retry_at
 }
 
 fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
@@ -1023,14 +1053,19 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
     let mut active = false;
     let mut certified = None;
     let mut cleanup_reported = false;
+    let mut retry_at = None;
     loop {
         pending.retain(|request| !request.control.is_cancelled());
-        let wait = if active || !pending.is_empty() {
+        let wait = if active {
+            Duration::ZERO
+        } else if let Some(retry_at) = retry_at {
+            ctx.search.retry_wait(retry_at).min(SEARCH_WAIT_POLL)
+        } else if !pending.is_empty() {
             Duration::ZERO
         } else {
             Duration::from_secs(1)
         };
-        let stop = collect_search_messages(&receiver, &mut pending, wait);
+        let (stop, woke) = collect_search_messages(&receiver, &mut pending, wait);
         if stop || ctx.stopping.load(Ordering::Acquire) {
             for request in pending.drain(..) {
                 request.control.cancel();
@@ -1042,6 +1077,13 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
             break;
         }
         ctx.wake_pending.store(false, Ordering::Release);
+        if let Some(due) = retry_at
+            && !woke
+            && !ctx.search.retry_wait(due).is_zero()
+        {
+            continue;
+        }
+        retry_at = None;
         let selected = pending
             .iter()
             .enumerate()
@@ -1099,24 +1141,8 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
                     }
                 }
                 if !progress.failures.is_empty() {
-                    let mut kept = Vec::new();
-                    for request in pending.drain(..) {
-                        if let Some(failure) = progress
-                            .failures
-                            .iter()
-                            .find(|failure| failure.owed_from <= request.target)
-                        {
-                            let failure = MaintenanceFailure::message(
-                                failure.error_kind,
-                                describe_search_failures(std::slice::from_ref(failure)),
-                            );
-                            let _ = request.reply.send(Err(failure));
-                        } else {
-                            kept.push(request);
-                        }
-                    }
-                    pending = kept;
-                    active = progress.covered != 0 && progress.remaining;
+                    retry_at = settle_search_failures(&mut pending, &progress.failures);
+                    active = retry_at.is_none() && progress.covered != 0 && progress.remaining;
                     continue;
                 }
                 active = progress.remaining;
@@ -5590,6 +5616,7 @@ mod tests {
             .create_crate(&writer_auth(), crate_request(&graph, "prefix"))
             .unwrap();
         replica.reconcile_irokle().unwrap();
+        #[cfg(feature = "search")]
         replica.flush_search_updates().unwrap();
         let topic = origin.irokle_topic_id(&graph).unwrap().unwrap();
         let baseline = topic_cursor(&replica, topic);
@@ -6600,6 +6627,65 @@ mod tests {
             !later.is_empty(),
             "waiters past the cap must stay queued for the next cycle"
         );
+    }
+
+    #[test]
+    fn retry_failure_settles() {
+        let (retry_reply, retry_result) = mpsc::channel();
+        let (permanent_reply, permanent_result) = mpsc::channel();
+        let (unrelated_reply, unrelated_result) = mpsc::channel();
+        let request = |reply, target| match SearchWorkerMessage::flush_reply(reply, target) {
+            SearchWorkerMessage::Flush(request) => request,
+            SearchWorkerMessage::Wake | SearchWorkerMessage::Stop => unreachable!(),
+        };
+        let mut pending = vec![
+            request(retry_reply, 10),
+            request(permanent_reply, 25),
+            request(unrelated_reply, 4),
+        ];
+        let graph = GraphId::new("urn:test:worker-retry");
+        let failures = [
+            search::queue::DrainFailure {
+                kind: search::queue::QueueKind::Reindex,
+                error_kind: CraqleErrorKind::CorruptDerivedData,
+                graph: graph.clone(),
+                owed_from: 5,
+                target: 10,
+                attempts: 1,
+                retry_at_ms: 250,
+                code: "store-transient".to_string(),
+                diagnostic: "retry deferred".to_string(),
+            },
+            search::queue::DrainFailure {
+                kind: search::queue::QueueKind::Reindex,
+                error_kind: CraqleErrorKind::QueryLimit,
+                graph,
+                owed_from: 20,
+                target: 25,
+                attempts: 1,
+                retry_at_ms: u64::MAX,
+                code: "item-too-large".to_string(),
+                diagnostic: "permanent".to_string(),
+            },
+        ];
+
+        assert_eq!(Some(250), settle_search_failures(&mut pending, &failures));
+        assert_eq!(
+            vec![10, 4],
+            pending
+                .iter()
+                .map(|request| request.target)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            retry_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(permanent_result.try_recv().unwrap().is_err());
+        assert!(matches!(
+            unrelated_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     /// The shutdown flag must bypass a saturated control-channel backlog.

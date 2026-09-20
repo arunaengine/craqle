@@ -117,6 +117,10 @@ impl SearchIndex {
         Err(SearchError::Disabled.into())
     }
 
+    pub(crate) fn retry_wait(&self, _retry_at_ms: u64) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     pub(crate) fn coverage_target(&self, store: &GraphStore) -> Result<Option<u64>> {
         Ok(Some(store.require_search_rebuild()?))
     }
@@ -223,7 +227,10 @@ mod tests {
             ),
         )
         .unwrap();
-        node.flush_search_updates().unwrap();
+        assert_eq!(
+            node.flush_search_updates().unwrap_err().kind(),
+            crate::CraqleErrorKind::Unsupported
+        );
 
         let owed = node.store.drain_fts_queue(usize::MAX).unwrap();
         assert!(

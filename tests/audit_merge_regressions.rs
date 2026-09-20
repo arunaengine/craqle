@@ -402,16 +402,21 @@ fn join_matches_query() {
     let temp = tempfile::tempdir().unwrap();
     let node = open(temp.path(), "query", 16);
     let graph = GraphId::new("urn:test:merge:join-query");
+    let predicate = "<http://schema.org/keywords>";
+    let indexed = |object, dots| SnapshotQuadState {
+        predicate: EncodedTerm(predicate.to_owned()),
+        ..quad(object, dots)
+    };
     let seeded = snap(
         &graph,
         &state(
             clock(&[(1, 1), (2, 1)]),
-            vec![quad("x", &[(1, 1)]), quad("y", &[(2, 1)])],
+            vec![indexed("x", &[(1, 1)]), indexed("y", &[(2, 1)])],
         ),
     );
     let removed = snap(
         &graph,
-        &state(clock(&[(1, 2), (2, 1)]), vec![quad("y", &[(2, 1)])]),
+        &state(clock(&[(1, 2), (2, 1)]), vec![indexed("y", &[(2, 1)])]),
     );
     node.install_graph_snapshot(&seeded).unwrap();
     node.install_graph_snapshot(&removed).unwrap();
@@ -420,7 +425,7 @@ fn join_matches_query() {
         .query_in_graphs(
             &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
-            &format!("SELECT ?o WHERE {{ {SUBJECT} {PREDICATE} ?o }}"),
+            &format!("SELECT ?o WHERE {{ {SUBJECT} {predicate} ?o }}"),
         )
         .unwrap();
     let QueryResults::Solutions(rows) = results else {
@@ -431,7 +436,16 @@ fn join_matches_query() {
         .map(|row| row.get("o").unwrap().0.clone())
         .collect::<Vec<_>>();
     visible.sort();
-    assert_eq!(visible, objects(&node, &graph));
+    let mut stored: Vec<_> = node
+        .graph_snapshot(&graph)
+        .unwrap()
+        .quads
+        .into_iter()
+        .filter(|quad| quad.subject.0 == SUBJECT && quad.predicate.0 == predicate)
+        .map(|quad| quad.object.0)
+        .collect();
+    stored.sort();
+    assert_eq!(visible, stored);
     assert_eq!(visible, vec!["\"y\"".to_owned()]);
 
     #[cfg(feature = "search")]

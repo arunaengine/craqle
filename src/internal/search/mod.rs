@@ -1355,6 +1355,10 @@ impl SearchIndex {
         self.retry_now.store(now_ms, Ordering::SeqCst);
     }
 
+    pub(crate) fn retry_wait(&self, retry_at_ms: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(retry_at_ms.saturating_sub(self.now_ms()))
+    }
+
     fn retry_failure(
         &self,
         store: &GraphStore,
