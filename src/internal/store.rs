@@ -8073,9 +8073,23 @@ impl GraphStore {
 
     pub(crate) fn delete_with_receipt(
         &self,
-        graph: &GraphId,
-        tombstone: Option<&GraphTombstone>,
-    ) -> Result<()> {
+        tombstone: &GraphTombstone,
+        receipt: &MutationReceipt,
+    ) -> Result<MutationReceipt> {
+        self.delete_graph_inner(DeleteGraph {
+            graph: &tombstone.graph,
+            tombstone: Some(tombstone),
+            receipt: Some(receipt),
+        })?
+        .ok_or(StoreError::ReceiptConflict)
+    }
+
+    fn delete_graph_inner(&self, request: DeleteGraph<'_>) -> Result<Option<MutationReceipt>> {
+        let DeleteGraph {
+            graph,
+            tombstone,
+            receipt,
+        } = request;
         let _commit_guard = self.graph_commit_guard(graph);
         #[cfg(feature = "shacl-core")]
         let _binding_guard = self.binding_guard();
@@ -8084,8 +8098,13 @@ impl GraphStore {
             Some(graph_id) => graph_id,
             None if tombstone.is_some() => self
                 .encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?,
-            None => return Ok(()),
+            None => return Ok(None),
         };
+        let deleted_policy = self
+            .read_graph_meta(graph_id)?
+            .unwrap_or_default()
+            .policy
+            .normalized();
         if let Some(tombstone) = tombstone {
             let retained = match self.graphs.get(graph_tombstone_key(graph_id))? {
                 Some(existing) => {
@@ -8103,8 +8122,13 @@ impl GraphStore {
                 graph_tombstone_key(graph_id),
                 postcard::to_allocvec(&retained)?,
             );
+            batch.insert(
+                &self.graphs,
+                deleted_policy_key(graph_id),
+                postcard::to_allocvec(&deleted_policy)?,
+            );
         }
-        self.for_each_quad_in_graph::<StoreError, _>(graph_id, |quad| {
+        self.visit_graph_quads::<StoreError, _>(graph_id, |quad| {
             self.write_quad_state(&mut batch, quad, Vec::new())?;
             Ok(())
         })?;
@@ -8117,11 +8141,6 @@ impl GraphStore {
         batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
         #[cfg(feature = "shacl-core")]
         batch.remove(&self.graphs, shacl_pending_key(graph_id));
-        for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
-            let (key, _) = guard.into_inner()?;
-            batch.remove(&self.graphs, key);
-        }
-
         #[cfg(feature = "shacl-core")]
         for key in self.binding_keys(graph_id)? {
             let Some(value) = self.graphs.get(key)? else {
@@ -8146,12 +8165,16 @@ impl GraphStore {
             }
         }
 
-        let reindex_key = graph_reindex_key(graph_id);
-        if self.graphs.get(reindex_key)?.is_some() {
-            batch.remove(&self.graphs, reindex_key);
-        }
-
         batch.pending_fts.push(FtsQueueKey::Delete(graph_id));
+
+        let _receipt_guard = receipt.map(|receipt| self.receipt_guard(&receipt.id));
+        if let Some(receipt) = receipt {
+            if self.mutation_receipt(&receipt.id)?.is_some() {
+                self.stage_receipt_update(&mut batch, receipt)?;
+            } else if self.stage_receipt(&mut batch, receipt)?.is_some() {
+                return Err(StoreError::ReceiptConflict);
+            }
+        }
 
         #[cfg(test)]
         self.stall_in_delete();
@@ -8166,43 +8189,20 @@ impl GraphStore {
         }
 
         self.commit(batch)?;
-        self.sweep_graph_queue(graph_id)?;
-        self.diagnostics_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&graph_id);
+        drop(_receipt_guard);
         let mut indexes = self.indexes_write();
         indexes
             .quad_subjects
             .remove_where(|(graph, _, _)| *graph == graph_id);
         indexes.object_order.drop_graph(graph_id);
-        let generation = indexes.generations.entry(graph_id).or_default();
-        *generation = generation.wrapping_add(1);
-        Ok(())
-    }
-
-    /// Drop the subject and reindex queue entries of a graph that is gone.
-    ///
-    /// The delete scans those keys without the queue lock, so an enqueue
-    /// landing before its commit would otherwise outlive the graph.
-    fn sweep_graph_queue(&self, graph_id: TermId) -> Result<()> {
-        let _queue = self.fts_queue_guard();
-        let mut batch = self.buffered_batch();
-        let mut dirty = false;
-        for guard in self.graphs.prefix(graph_dirty_graph_prefix(graph_id)) {
-            let (key, _) = guard.into_inner()?;
-            batch.remove(&self.graphs, key);
-            dirty = true;
-        }
-        let reindex_key = graph_reindex_key(graph_id);
-        if self.graphs.get(reindex_key)?.is_some() {
-            batch.remove(&self.graphs, reindex_key);
-            dirty = true;
-        }
-        if dirty {
-            self.commit_fjall_batch(batch)?;
-        }
-        Ok(())
+        let epoch = &mut indexes.epochs[(graph_id.0 as usize) % INDEX_EPOCH_SHARDS];
+        *epoch = epoch.wrapping_add(1);
+        receipt
+            .map(|receipt| {
+                self.mutation_receipt(&receipt.id)?
+                    .ok_or(StoreError::ReceiptConflict)
+            })
+            .transpose()
     }
 
     pub fn graph_is_empty(&self, graph: &GraphId) -> Result<bool> {
@@ -8217,7 +8217,7 @@ impl GraphStore {
         let mut count = 0usize;
         for guard in self.quads.prefix(graph_id.to_be_bytes()) {
             let (key, value) = guard.into_inner()?;
-            if dot_payload_is_empty(value.as_ref()) {
+            if dots_empty(value.as_ref()) {
                 continue;
             }
             let subject = Self::decode_quad_key(key.as_ref())?.subject;
@@ -8242,7 +8242,7 @@ impl GraphStore {
         prefix[16..].copy_from_slice(&subject_id.to_be_bytes());
         for guard in self.quads.prefix(prefix) {
             let (_, value) = guard.into_inner()?;
-            if !dot_payload_is_empty(value.as_ref()) {
+            if !dots_empty(value.as_ref()) {
                 return Ok(true);
             }
         }
@@ -8263,13 +8263,11 @@ impl GraphStore {
     /// Term ids of all graphs with stored metadata, without decoding the
     /// graph IRIs (the meta key embeds the term id).
     pub fn graph_term_ids(&self) -> Result<Vec<TermId>> {
-        self.graph_term_id_iter().collect()
+        self.graph_term_iter().collect()
     }
 
-    /// Lazily streams the graph term ids of [`GraphStore::graph_term_ids`],
-    /// so short-circuiting consumers (ASK, LIMIT) stop without scanning the
-    /// full graph list.
-    pub fn graph_term_id_iter(&self) -> impl Iterator<Item = Result<TermId>> {
+    /// Streams graph term ids lazily so short-circuiting avoids a full scan.
+    pub fn graph_term_iter(&self) -> impl Iterator<Item = Result<TermId>> {
         self.graphs
             .prefix(graph_meta_prefix())
             .filter_map(|guard| match guard.into_inner() {
@@ -8283,7 +8281,7 @@ impl GraphStore {
             })
     }
 
-    // ── Persisted, clock-tagged diagnostics ────────────
+    // Persisted, clock-tagged diagnostics.
 
     fn read_stored_diagnostics(&self, graph_id: TermId) -> Result<Option<StoredDiagnostics>> {
         self.graphs
@@ -8293,14 +8291,7 @@ impl GraphStore {
             .map_err(Into::into)
     }
 
-    /// The orphan set as last *persisted*, without verifying its clock tag and
-    /// without recomputing.
-    ///
-    /// This is the set the search index currently reflects, which is what a
-    /// re-queue must diff against. Every other reader wants
-    /// [`GraphStore::graph_diagnostics`], which refuses to serve a stale record;
-    /// this one is deliberately allowed to return one, so callers must not use
-    /// it to decide visibility.
+    /// Returns the persisted orphan baseline for search diffs without freshness checks.
     pub(crate) fn last_persisted_diagnostics(&self, graph: &GraphId) -> Result<GraphDiagnostics> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(GraphDiagnostics::default());
@@ -8323,31 +8314,20 @@ impl GraphStore {
             postcard::to_allocvec(&record)?,
         );
         batch.commit()?;
-        let diagnostics = record.diagnostics.clone();
-        // Guards the in-memory mirror of the persisted 'O' records.
-        self.diagnostics_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(graph_id, record);
-        Ok(diagnostics)
+        Ok(record.diagnostics)
     }
 
-    /// Recompute a graph's diagnostics from the store, tagged with the clock.
-    ///
-    /// The clock is read *before* computing so a concurrent commit can only
-    /// make the tag look older than it is. That direction is safe: it triggers
-    /// one more recomputation, never a stale record wrongly accepted as fresh
-    /// (G6).
+    /// Computes diagnostics after reading the clock, making concurrent tags only stale.
     fn compute_tagged_diagnostics(&self, graph_id: TermId) -> Result<StoredDiagnostics> {
-        let at_clock = self.get_vector_clock_by_id(graph_id)?;
-        let graph = self.graph_name_by_id(graph_id)?;
+        let at_clock = self.vector_clock_id(graph_id)?;
+        let graph = self.graph_name(graph_id)?;
         Ok(StoredDiagnostics {
             diagnostics: self.compute_graph_diagnostics(&graph)?,
             at_clock,
         })
     }
 
-    fn graph_name_by_id(&self, graph_id: TermId) -> Result<GraphId> {
+    fn graph_name(&self, graph_id: TermId) -> Result<GraphId> {
         let term = self.decode_term_arc(graph_id)?;
         term.to_named_node()
             .map(GraphId)
@@ -8357,13 +8337,7 @@ impl GraphStore {
             })
     }
 
-    /// Persist `diagnostics` for `graph`, tagged with the graph's current
-    /// vector clock, and refresh the memory cache.
-    ///
-    /// **Call while holding the graph commit guard** so no commit can slip
-    /// between the state the caller measured and the clock recorded here;
-    /// otherwise the record can be tagged with a clock newer than the state it
-    /// describes and readers would accept it as fresh.
+    /// Persists clock-tagged diagnostics while the caller holds the graph guard.
     pub fn set_graph_diagnostics(
         &self,
         graph: &GraphId,
@@ -8372,7 +8346,7 @@ impl GraphStore {
         let graph_id = self.encode_term(&EncodedTerm::from_named_node(&graph.0))?;
         let record = StoredDiagnostics {
             diagnostics: diagnostics.clone(),
-            at_clock: self.get_vector_clock_by_id(graph_id)?,
+            at_clock: self.vector_clock_id(graph_id)?,
         };
         self.store_diagnostics_record(graph_id, record)?;
         Ok(())
@@ -8382,68 +8356,36 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(GraphDiagnostics::default());
         };
-        self.graph_diagnostics_by_id(graph_id)
+        self.graph_diagnostics_id(graph_id)
     }
 
-    /// Like [`GraphStore::graph_diagnostics`] but keyed by term id. Verifies the
-    /// clock tag on every read and recomputes inline on a mismatch, so a stale
-    /// set is never served.
-    ///
-    /// **A read never persists.** The stored record is the baseline the search
-    /// re-queue diffs against, so a reader that saved its recomputation would
-    /// erase the difference a later rebuild must act on (G7).
-    pub fn graph_diagnostics_by_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
-        let clock = self.get_vector_clock_by_id(graph_id)?;
-
-        if let Some(record) = self
-            .diagnostics_cache
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&graph_id)
-            && record.at_clock == clock
-        {
-            return Ok(record.diagnostics.clone());
-        }
+    /// Reads clock-tagged diagnostics by term id without persisting recomputations.
+    pub fn graph_diagnostics_id(&self, graph_id: TermId) -> Result<GraphDiagnostics> {
+        let clock = self.vector_clock_id(graph_id)?;
 
         if let Some(record) = self.read_stored_diagnostics(graph_id)?
             && record.at_clock == clock
         {
-            let diagnostics = record.diagnostics.clone();
-            self.diagnostics_cache
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(graph_id, record);
-            return Ok(diagnostics);
+            return Ok(record.diagnostics);
         }
 
-        if !self.contains_graph_by_id(graph_id)? {
+        if !self.contains_graph_id(graph_id)? {
             return Ok(GraphDiagnostics::default());
         }
 
-        let record = self.compute_tagged_diagnostics(graph_id)?;
-        let diagnostics = record.diagnostics.clone();
-        // Guards the in-memory mirror of the persisted 'O' records.
-        self.diagnostics_cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(graph_id, record);
-        Ok(diagnostics)
+        Ok(self.compute_tagged_diagnostics(graph_id)?.diagnostics)
     }
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
-    pub fn set_tagged_graph_policy(
-        &self,
-        graph: &GraphId,
-        tagged: &TaggedGraphPolicy,
-    ) -> Result<()> {
+    pub fn set_tagged_policy(&self, graph: &GraphId, tagged: &TaggedGraphPolicy) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
         #[cfg(feature = "shacl-core")]
         let _binding_guard = self.binding_guard();
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
-        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        let mut meta = self.read_graph_meta(graph_id)?.unwrap_or_default();
         meta.policy = tagged.policy.clone().normalized();
         meta.policy_tag = tagged.tag;
         batch.insert(
@@ -8454,10 +8396,41 @@ impl GraphStore {
         self.commit(batch)
     }
 
+    pub(crate) fn set_policy_receipt(
+        &self,
+        graph: &GraphId,
+        update: PolicyReceipt<'_>,
+    ) -> Result<MutationReceipt> {
+        let _commit_guard = self.graph_commit_guard(graph);
+        #[cfg(feature = "shacl-core")]
+        let _binding_guard = self.binding_guard();
+        let _receipt_guard = self.receipt_guard(&update.receipt.id);
+        let mut batch = self.new_batch();
+        let graph_id =
+            self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
+        let mut meta = self.read_graph_meta(graph_id)?.unwrap_or_default();
+        meta.policy = update.tagged.policy.clone().normalized();
+        meta.policy_tag = update.tagged.tag;
+        batch.insert(
+            &self.graphs,
+            graph_meta_key(graph_id),
+            postcard::to_allocvec(&meta)?,
+        );
+        if self.mutation_receipt(&update.receipt.id)?.is_some() {
+            self.stage_receipt_update(&mut batch, update.receipt)?;
+        } else if self.stage_receipt(&mut batch, update.receipt)?.is_some() {
+            return Err(StoreError::ReceiptConflict);
+        }
+        self.commit(batch)?;
+        drop(_receipt_guard);
+        self.mutation_receipt(&update.receipt.id)?
+            .ok_or(StoreError::ReceiptConflict)
+    }
+
     #[cfg(test)]
     pub fn set_graph_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
         let current = self.graph_tagged_policy(graph)?;
-        self.set_tagged_graph_policy(
+        self.set_tagged_policy(
             graph,
             &TaggedGraphPolicy {
                 policy: policy.clone(),
@@ -8470,6 +8443,16 @@ impl GraphStore {
         Ok(self.graph_tagged_policy(graph)?.policy)
     }
 
+    pub(crate) fn deleted_graph_policy(&self, graph: &GraphId) -> Result<Option<GraphPolicy>> {
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(None);
+        };
+        self.graphs
+            .get(deleted_policy_key(graph_id))?
+            .map(|value| postcard::from_bytes(value.as_ref()).map_err(StoreError::from))
+            .transpose()
+    }
+
     pub fn graph_tagged_policy(&self, graph: &GraphId) -> Result<TaggedGraphPolicy> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(TaggedGraphPolicy {
@@ -8477,7 +8460,7 @@ impl GraphStore {
                 tag: PolicyTag::default(),
             });
         };
-        let meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        let meta = self.read_graph_meta(graph_id)?.unwrap_or_default();
         Ok(TaggedGraphPolicy {
             policy: meta.policy,
             tag: meta.policy_tag,
@@ -8489,14 +8472,14 @@ impl GraphStore {
             return Ok(None);
         };
         Ok(self
-            .read_graph_meta_by_id(graph_id)?
+            .read_graph_meta(graph_id)?
             .unwrap_or_default()
             .irokle_topic)
     }
 
     /// Self-guarding: takes the graph commit guard itself. Must NOT be called
     /// while a commit guard is held (see [`GraphCommitGuard`]).
-    pub fn set_irokle_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
+    pub fn set_topic_id(&self, graph: &GraphId, topic_id: [u8; 32]) -> Result<()> {
         let _commit_guard = self.graph_commit_guard(graph);
         self.set_topic_guarded(graph, topic_id)
     }
@@ -8506,7 +8489,7 @@ impl GraphStore {
         let mut batch = self.new_batch();
         let graph_id =
             self.encode_term_internal(Some(&mut batch), &EncodedTerm::from_named_node(&graph.0))?;
-        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        let mut meta = self.read_graph_meta(graph_id)?.unwrap_or_default();
         meta.irokle_topic = Some(topic_id);
         batch.insert(
             &self.graphs,
@@ -8527,7 +8510,7 @@ impl GraphStore {
             return Ok(None);
         };
         Ok(self
-            .read_graph_meta_by_id(graph_id)?
+            .read_graph_meta(graph_id)?
             .unwrap_or_default()
             .rocrate_context)
     }
@@ -8537,7 +8520,7 @@ impl GraphStore {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             return Ok(None);
         };
-        let meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        let meta = self.read_graph_meta(graph_id)?.unwrap_or_default();
         Ok(meta.rocrate_license.zip(meta.rocrate_license_digest))
     }
 
@@ -8548,15 +8531,12 @@ impl GraphStore {
             return Ok(ContextTag::GENESIS);
         };
         Ok(self
-            .read_graph_meta_by_id(graph_id)?
+            .read_graph_meta(graph_id)?
             .unwrap_or_default()
             .context_tag)
     }
 
-    /// Persist the raw RO-Crate render hints and their ordering tag.
-    ///
-    /// Self-guarding: takes the graph commit guard itself. Must NOT be called
-    /// while a commit guard is held (see [`GraphCommitGuard`]).
+    /// Persists raw RO-Crate render hints under its own graph guard.
     #[cfg(test)]
     pub fn set_graph_context(
         &self,
@@ -8573,8 +8553,8 @@ impl GraphStore {
         self.stage_graph_context(
             &mut batch,
             graph_id,
-            &TaggedRoCrateRenderHints {
-                hints: RoCrateRenderHints {
+            &TaggedRenderHints {
+                hints: RenderHints {
                     context: context.map(str::to_owned),
                     license: license.map(str::to_owned),
                     license_digest,
@@ -8591,9 +8571,9 @@ impl GraphStore {
         &self,
         batch: &mut WriteBatch,
         graph_id: TermId,
-        tagged: &TaggedRoCrateRenderHints,
+        tagged: &TaggedRenderHints,
     ) -> Result<bool> {
-        let mut meta = self.read_graph_meta_by_id(graph_id)?.unwrap_or_default();
+        let mut meta = self.read_graph_meta(graph_id)?.unwrap_or_default();
         if tagged.tag <= meta.context_tag {
             return Ok(false);
         }
@@ -8628,7 +8608,7 @@ impl GraphStore {
             .map(|bytes| bytes.to_vec()))
     }
 
-    pub fn set_applied_topic_clock(&self, topic_id: &[u8; 32], clock: &[u8]) -> Result<()> {
+    pub fn set_topic_clock(&self, topic_id: &[u8; 32], clock: &[u8]) -> Result<()> {
         let mut batch = self.buffered_batch();
         batch.insert(&self.graphs, topic_clock_key(topic_id), clock);
         batch.commit()?;
@@ -8721,7 +8701,7 @@ impl GraphStore {
         topic: irokle::TopicId,
         expected_old_digest: [u8; 32],
         replacement: &[u8],
-        repaired_at_unix_nanos: i64,
+        repair_time_ns: i64,
     ) -> Result<crate::sync::TopicCursorRepairAudit> {
         let key = topic_clock_key(topic.as_bytes());
         let old = self.graphs.get(key)?;
@@ -8734,13 +8714,13 @@ impl GraphStore {
             topic,
             old_cursor_digest: old_digest,
             replacement_cursor_digest: crate::sync::topic_cursor_digest(replacement),
-            repaired_at_unix_nanos,
+            repaired_at_unix_nanos: repair_time_ns,
         };
         let mut batch = self.buffered_batch();
         batch.insert(&self.graphs, key, replacement);
         batch.insert(
             &self.graphs,
-            cursor_repair_audit_key(&audit),
+            cursor_audit_key(&audit),
             postcard::to_allocvec(&audit)?,
         );
         batch.commit()?;
@@ -8799,14 +8779,12 @@ impl GraphStore {
         let mut quads = Vec::new();
         for guard in snapshot.prefix(&self.quads, graph_id.to_be_bytes()) {
             let (key, value) = guard.into_inner()?;
-            if dot_payload_is_empty(value.as_ref()) {
+            if dots_empty(value.as_ref()) {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
             let mut dots = decode_dots(value.as_ref())?;
-            // Term ids and dot arrival order are node-local, so both are sorted
-            // by value: two replicas holding the same state must produce equal
-            // snapshots.
+            // Value sorting makes equal replica state produce equal snapshots.
             dots.sort_unstable_by_key(|dot| (dot.actor, dot.counter));
             quads.push(SnapshotQuadState {
                 subject: self.decode_term_arc(quad.subject)?.as_ref().clone(),
@@ -8830,6 +8808,133 @@ impl GraphStore {
         })
     }
 
+    pub(crate) fn graph_snapshot_bounded(
+        &self,
+        graph: &GraphId,
+        limits: SnapshotLimits,
+    ) -> Result<GraphReplicaSnapshot> {
+        const MAX_ROWS: u64 = 1_048_576;
+        const MAX_BYTES: u64 = 64 * 1_048_576;
+
+        let row_limit = limits.max_rows.min(MAX_ROWS);
+        let byte_limit = limits.max_bytes.min(MAX_BYTES);
+        let Some(graph_id) = self.graph_id_for(graph)? else {
+            return Ok(GraphReplicaSnapshot {
+                graph: graph.clone(),
+                clock: VectorClock::new(),
+                quads: Vec::new(),
+            });
+        };
+        let snapshot = self.db.snapshot();
+        let clock = self.snapshot_vector_clock(&snapshot, graph_id)?;
+        let mut rows = 0u64;
+        let mut bytes = 0u64;
+        let mut quads = Vec::new();
+        for guard in snapshot.prefix(&self.quads, graph_id.to_be_bytes()) {
+            let (key, value) = guard.into_inner()?;
+            if dots_empty(value.as_ref()) {
+                continue;
+            }
+            let next_rows = rows.saturating_add(1);
+            if next_rows > row_limit {
+                return Err(StoreError::LimitExceeded {
+                    resource: "graph snapshot rows",
+                    limit: row_limit,
+                    actual: next_rows,
+                });
+            }
+            let quad = Self::decode_quad_key(key.as_ref())?;
+            let subject_bytes =
+                self.terms
+                    .size_of(quad.subject.to_be_bytes())?
+                    .ok_or(StoreError::TermNotFound(quad.subject.0))? as usize;
+            let predicate_bytes =
+                self.terms
+                    .size_of(quad.predicate.to_be_bytes())?
+                    .ok_or(StoreError::TermNotFound(quad.predicate.0))? as usize;
+            let object_bytes =
+                self.terms
+                    .size_of(quad.object.to_be_bytes())?
+                    .ok_or(StoreError::TermNotFound(quad.object.0))? as usize;
+            let row_bytes = u64::try_from(
+                subject_bytes
+                    .saturating_add(predicate_bytes)
+                    .saturating_add(object_bytes)
+                    .saturating_add(value.len()),
+            )
+            .unwrap_or(u64::MAX);
+            let next_bytes = bytes.saturating_add(row_bytes);
+            if next_bytes > byte_limit {
+                return Err(StoreError::LimitExceeded {
+                    resource: "graph snapshot bytes",
+                    limit: byte_limit,
+                    actual: next_bytes,
+                });
+            }
+            let subject = self.decode_term_arc(quad.subject)?.as_ref().clone();
+            let predicate = self.decode_term_arc(quad.predicate)?.as_ref().clone();
+            let object = self.decode_term_arc(quad.object)?.as_ref().clone();
+            let mut dots = decode_dots(value.as_ref())?;
+            dots.sort_unstable_by_key(|dot| (dot.actor, dot.counter));
+            quads.push(SnapshotQuadState {
+                subject,
+                predicate,
+                object,
+                dots,
+            });
+            rows = next_rows;
+            bytes = next_bytes;
+        }
+        quads.sort_unstable_by(|left, right| {
+            (&left.subject, &left.predicate, &left.object).cmp(&(
+                &right.subject,
+                &right.predicate,
+                &right.object,
+            ))
+        });
+        Ok(GraphReplicaSnapshot {
+            graph: graph.clone(),
+            clock,
+            quads,
+        })
+    }
+
+    /// Persist an exact, digest-addressed graph backup before authoritative repair.
+    pub(crate) fn backup_snapshot(&self, graph: &GraphId) -> Result<BackupProof> {
+        let _write = self.graph_write_guard(graph);
+        let _commit = self.graph_commit_guard(graph);
+        let snapshot = self.graph_snapshot_bounded(
+            graph,
+            SnapshotLimits {
+                max_rows: 1_048_576,
+                max_bytes: 64 * 1_048_576,
+            },
+        )?;
+        let bytes = postcard::to_allocvec(&snapshot)?;
+        let digest = *blake3::hash(&bytes).as_bytes();
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.repair_backups, digest, bytes);
+        self.commit_fjall_batch(batch)?;
+        self.db.persist(self.persist_mode)?;
+        let location = digest
+            .iter()
+            .fold(String::from("craqle:backup:"), |mut value, byte| {
+                use std::fmt::Write;
+                let _ = write!(value, "{byte:02x}");
+                value
+            });
+        Ok(BackupProof {
+            location,
+            archive_digest: digest,
+            source_revision: digest,
+        })
+    }
+
+    /// Replace one live graph from authorized healthy state after exact backup.
+    pub(crate) fn replace_snapshot(
+        &self,
+        snapshot: &GraphReplicaSnapshot,
+        audit: &RepairAudit,
     pub fn graph_fingerprint(&self, graph: &GraphId) -> Result<(u64, [u8; 32], [u8; 32])> {
         let Some(graph_id) = self.graph_id_for(graph)? else {
             let empty = *blake3::hash(&[]).as_bytes();
