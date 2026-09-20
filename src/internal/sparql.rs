@@ -3593,9 +3593,7 @@ mod tests {
     use super::*;
     use crate::core::{ActorId, Dot, GraphDiagnostics};
     use crate::query::context::ReadAccessPath;
-    #[cfg(feature = "search")]
-    use crate::search::QueueBound;
-    use crate::store::{EncodedQuad, FtsSubject, QuadAdd};
+    use crate::store::{EncodedQuad, FtsSubject, QuadAdd, QueryTermId};
     use oxrdf::{Literal, Term};
 
     fn setup_engine() -> (
@@ -3613,26 +3611,47 @@ mod tests {
 
     #[test]
     fn query_terms_compare() {
-        let first = StoredQueryTerm {
+        let first = StoreTerm::Mapped {
             source: TermId(1),
-            query: Some(QueryTermId(7)),
+            dense: DenseTerm::new(QueryTermId(7), 3),
         };
-        let same_query_id = StoredQueryTerm {
+        let same_query_id = StoreTerm::Mapped {
             source: TermId(2),
-            query: Some(QueryTermId(7)),
+            dense: DenseTerm::new(QueryTermId(7), 3),
         };
         assert_eq!(first, same_query_id);
-        assert_eq!(HashSet::from([first, same_query_id]).len(), 1);
+        assert_eq!(HashSet::from([first.clone(), same_query_id]).len(), 1);
 
-        let source_first = StoredQueryTerm {
-            source: TermId(1),
-            query: None,
-        };
-        let source_second = StoredQueryTerm {
-            source: TermId(2),
-            query: None,
-        };
+        let source_first = StoreTerm::Source(TermId(1));
+        let source_second = StoreTerm::Source(TermId(2));
         assert_ne!(source_first, source_second);
+        assert_ne!(StoreTerm::Source(TermId(1)), first);
+
+        let other_scope = StoreTerm::Mapped {
+            source: TermId(1),
+            dense: DenseTerm::new(QueryTermId(7), 4),
+        };
+        assert_ne!(first, other_scope);
+
+        #[allow(dead_code)]
+        enum LegacyTerm {
+            Existing(TermId, Option<QueryTermId>),
+            Missing(EncodedTerm),
+            DefaultUnion,
+        }
+        assert_eq!(
+            std::mem::size_of::<StoreTerm>(),
+            std::mem::size_of::<LegacyTerm>() + std::mem::size_of::<DenseTerm>(),
+            "scope fencing adds one dense identity to each binding"
+        );
+        assert_eq!(
+            std::mem::size_of::<DenseTerm>(),
+            std::mem::size_of::<QueryTermId>() + std::mem::size_of::<u64>()
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::query::cursor::DenseQuad>(),
+            4 * std::mem::size_of::<DenseTerm>() + 4 * std::mem::size_of::<TermId>()
+        );
     }
 
     fn insert_quad(
@@ -3692,6 +3711,74 @@ mod tests {
     fn settle_diagnostics(store: &GraphStore, graph: &GraphId) {
         let diagnostics = store.graph_diagnostics(graph).unwrap();
         store.set_graph_diagnostics(graph, &diagnostics).unwrap();
+    }
+
+    #[test]
+    fn dense_store_identity() {
+        let (_left_dir, left, _, _) = setup_engine();
+        let (_right_dir, right, _, _) = setup_engine();
+        let graph = GraphId::new("urn:test:dense-store");
+        insert_quad(
+            &left,
+            &graph,
+            "urn:test:dense-store:left",
+            "urn:test:dense-store:p",
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:dense-store:o")),
+        );
+        insert_quad(
+            &right,
+            &graph,
+            "urn:test:dense-store:right",
+            "urn:test:dense-store:p",
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:dense-store:o")),
+        );
+        settle_diagnostics(&left, &graph);
+        settle_diagnostics(&right, &graph);
+        let left_view = StoreReadView::new(&left);
+        let right_view = StoreReadView::new(&right);
+        assert_eq!(
+            left_view.snapshot().sequence(),
+            right_view.snapshot().sequence()
+        );
+        assert_eq!(
+            left.index_status_fast().unwrap().query_id_generation,
+            right.index_status_fast().unwrap().query_id_generation
+        );
+        let left_context = ReadContext::default();
+        let right_context = ReadContext::default();
+        let left_data = StoreDataset::new(&left_view, &left_context);
+        let right_data = StoreDataset::new(&right_view, &right_context);
+        let left_term = left_data
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(
+                "urn:test:dense-store:left",
+            )))
+            .unwrap();
+        let right_term = right_data
+            .internalize_term(Term::NamedNode(NamedNode::new_unchecked(
+                "urn:test:dense-store:right",
+            )))
+            .unwrap();
+        let StoreTerm::Mapped {
+            dense: left_dense, ..
+        } = left_term
+        else {
+            panic!("left term must use the trusted dense dictionary");
+        };
+        let StoreTerm::Mapped {
+            dense: right_dense, ..
+        } = right_term
+        else {
+            panic!("right term must use the trusted dense dictionary");
+        };
+        let left_collision = DenseTerm::new(QueryTermId(7), left_dense.scope());
+        let right_collision = DenseTerm::new(QueryTermId(7), right_dense.scope());
+        assert_ne!(left_collision, right_collision);
+        assert!(matches!(
+            left_data.source_term(None, Some(right_collision)),
+            Err(StoreDatasetError::Store(
+                StoreError::IndexVerificationFailed("dense-term-scope-mismatch")
+            ))
+        ));
     }
 
     fn solution_rows(results: QueryResults) -> Vec<HashMap<String, EncodedTerm>> {
