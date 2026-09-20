@@ -827,3 +827,242 @@ impl FjallBm25 {
         Ok(())
     }
 }
+
+impl Default for UpdateWork {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            terms: 0,
+            postings: 0,
+            bytes: 0,
+        }
+    }
+}
+
+struct PostingChange<'a> {
+    id: u64,
+    change: &'a TermChange,
+}
+
+struct PostingScan<'a> {
+    snapshot: &'a Snapshot,
+    term: &'a str,
+    weight: &'a Bm25Weight,
+    bounds: QueryBounds,
+    allows: Option<&'a dyn Fn(&str) -> bool>,
+    candidates: &'a mut BTreeMap<u64, Candidate>,
+    rejected: &'a mut BTreeSet<u64>,
+    work: &'a mut WorkCount,
+}
+
+struct Candidate {
+    record: DocRecord,
+    score: f32,
+}
+
+struct TermChange {
+    term: String,
+    old: Option<u32>,
+    new: Option<u32>,
+}
+
+fn analyze(text: &str) -> Result<Vec<TermFreq>> {
+    let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(AsciiFoldingFilter)
+        .build();
+    let mut frequencies = BTreeMap::new();
+    let mut overflow = false;
+    analyzer.token_stream(text).process(&mut |token| {
+        let entry = frequencies.entry(token.text.clone()).or_insert(0u32);
+        if let Some(updated) = entry.checked_add(1) {
+            *entry = updated;
+        } else {
+            overflow = true;
+        }
+    });
+    if overflow {
+        return Err(EngineError::Overflow);
+    }
+    Ok(frequencies
+        .into_iter()
+        .map(|(term, freq)| TermFreq { term, freq })
+        .collect())
+}
+
+fn parse_query(query: &str, max_terms: usize) -> Result<Vec<String>> {
+    let parts: Vec<_> = query.split_whitespace().collect();
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if parts.len() % 2 == 0 {
+        return Err(EngineError::Query(query.to_string()));
+    }
+    let mut terms = BTreeSet::new();
+    for (index, part) in parts.into_iter().enumerate() {
+        if index % 2 == 1 {
+            if !part.eq_ignore_ascii_case("OR") {
+                return Err(EngineError::Query(query.to_string()));
+            }
+            continue;
+        }
+        if part.eq_ignore_ascii_case("OR")
+            || part
+                .bytes()
+                .any(|byte| b"\"():+-*?[]{}^~\\".contains(&byte))
+        {
+            return Err(EngineError::Query(query.to_string()));
+        }
+        let analyzed = analyze(part)?;
+        if analyzed.len() != 1 || analyzed[0].freq != 1 {
+            return Err(EngineError::Query(query.to_string()));
+        }
+        terms.insert(analyzed[0].term.clone());
+        check_limit("query terms", max_terms, terms.len())?;
+    }
+    Ok(terms.into_iter().collect())
+}
+
+fn merge_terms(old: &[TermFreq], new: &[TermFreq]) -> Vec<TermChange> {
+    let mut changes = BTreeMap::new();
+    for term in old {
+        changes.insert(term.term.clone(), (Some(term.freq), None));
+    }
+    for term in new {
+        changes
+            .entry(term.term.clone())
+            .and_modify(|entry| entry.1 = Some(term.freq))
+            .or_insert((None, Some(term.freq)));
+    }
+    changes
+        .into_iter()
+        .map(|(term, (old, new))| TermChange { term, old, new })
+        .collect()
+}
+
+fn identity_key(key: DocumentKey<'_>) -> Result<Vec<u8>> {
+    let graph_len = u32::try_from(key.graph.len()).map_err(|_| EngineError::Limit {
+        resource: "graph bytes",
+        limit: u32::MAX as usize,
+        actual: key.graph.len(),
+    })?;
+    let mut encoded = Vec::with_capacity(5 + key.graph.len() + key.subject.len());
+    encoded.push(0);
+    encoded.extend_from_slice(&graph_len.to_be_bytes());
+    encoded.extend_from_slice(key.graph.as_bytes());
+    encoded.extend_from_slice(key.subject.as_bytes());
+    check_limit("document key bytes", KEY_LIMIT, encoded.len())?;
+    Ok(encoded)
+}
+
+fn record_key(id: u64) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = 1;
+    key[1..].copy_from_slice(&id.to_be_bytes());
+    key
+}
+
+fn term_prefix(term: &str) -> Result<Vec<u8>> {
+    let len = u16::try_from(term.len()).map_err(|_| EngineError::Limit {
+        resource: "term bytes",
+        limit: u16::MAX as usize,
+        actual: term.len(),
+    })?;
+    let mut key = Vec::with_capacity(2 + term.len());
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(term.as_bytes());
+    Ok(key)
+}
+
+fn posting_key(term: &str, doc: u64) -> Result<Vec<u8>> {
+    let mut key = term_prefix(term)?;
+    key.extend_from_slice(&doc.to_be_bytes());
+    Ok(key)
+}
+
+fn block_key(term: &str, block: u64) -> Result<Vec<u8>> {
+    posting_key(term, block)
+}
+
+fn decode_posting(key: &[u8], prefix_len: usize) -> Result<u64> {
+    let bytes = key
+        .get(prefix_len..)
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .ok_or(EngineError::Corrupt("posting key invalid"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn decode_u64(bytes: &[u8]) -> Result<u64> {
+    let bytes = <[u8; 8]>::try_from(bytes).map_err(|_| EngineError::Corrupt("u64 invalid"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn decode_u32(bytes: &[u8]) -> Result<u32> {
+    let bytes = <[u8; 4]>::try_from(bytes).map_err(|_| EngineError::Corrupt("u32 invalid"))?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn check_limit(resource: &'static str, limit: usize, actual: usize) -> Result<()> {
+    if actual > limit {
+        return Err(EngineError::Limit {
+            resource,
+            limit,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn charge_bytes(work: &mut WorkCount, limit: usize, bytes: usize) -> Result<()> {
+    work.bytes = work.bytes.saturating_add(bytes);
+    check_limit("query bytes", limit, work.bytes)
+}
+
+fn rank_hits(candidates: BTreeMap<u64, Candidate>, limit: usize) -> Vec<SearchHit> {
+    let mut hits: Vec<_> = candidates
+        .into_values()
+        .map(|candidate| SearchHit {
+            graph: candidate.record.graph,
+            subject: candidate.record.subject,
+            score: candidate.score,
+        })
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| {
+                stable_key(&left.graph, &left.subject)
+                    .cmp(&stable_key(&right.graph, &right.subject))
+            })
+            .then_with(|| left.graph.cmp(&right.graph))
+            .then_with(|| left.subject.cmp(&right.subject))
+    });
+    hits.truncate(limit);
+    hits
+}
+
+pub fn stable_key(graph: &str, subject: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(graph.len() as u64).to_be_bytes());
+    hasher.update(graph.as_bytes());
+    hasher.update(&(subject.len() as u64).to_be_bytes());
+    hasher.update(subject.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+pub fn next_down(score: f32) -> f32 {
+    if score.is_nan() || score == f32::NEG_INFINITY {
+        return score;
+    }
+    if score == 0.0 {
+        return -f32::from_bits(1);
+    }
+    let bits = score.to_bits();
+    if score > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
+    }
+}
