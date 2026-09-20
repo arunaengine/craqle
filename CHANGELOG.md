@@ -13,11 +13,30 @@ All notable changes to Craqle are documented here.
 - Integrates Irokle 0.3.0 at revision `fd29484e9281524efa692f59025ac6cca2443da8`.
 - Requires Rust 1.97.1 or newer. Craqle's authoritative RDF disk format remains `1.0`.
 - Background maintenance retries failed search entries and rebuilds uncovered query
-  indexes. Rebuilds exclude source commits while preserving concurrent normal writes.
+  indexes. Rebuilds prepare an inactive index and replay concurrent source changes
+  before a short publication fence.
 - Dropping a node joins its maintenance worker; an active storage or search call
   must finish before shutdown completes.
 
+### Added
+
+- Fixed-target search flush receipts, request cancellation, and explicit timed
+  shutdown that retains ownership of unfinished maintenance.
+- Mutation receipts with separate acceptance, durability, and repair outcomes.
+  Keyed mutations first return an admission ticket, then apply when that ticket
+  is supplied; expired tickets cannot silently repeat a mutation.
+- Authorized graph reconciliation from retained history or a verified healthy
+  snapshot, with a durable backup and an audit of the replacement.
+- Explicit process and store memory reservations shared by live stores.
+
 ### Upgrading from 0.2
+
+- Query and update limits cover storage reads and materialized results while
+  preserving supported SPARQL operators. Generic evaluator buffers are not fully
+  accounted for, and cancellation inside those operators remains cooperative.
+- Search-disabled builds retain index repair debt and report search flush as
+  unsupported. Reopening with search enabled repairs that debt before coverage
+  can be certified.
 
 - Applications that depend directly on Irokle must use the same revision as Craqle,
   or use the `craqle::irokle` re-export so both libraries share identical types.

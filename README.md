@@ -1,3 +1,7 @@
+<!-- Introduces Craqle and its public graph workflows. -->
+<!-- Copyright (c) 2026 ArunaStorage Team @ JLU Giessen -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Craqle
 
 Craqle is a Rust library for storing, editing, validating, searching, and replicating RO-Crates as RDF named graphs. It supports SPARQL queries and updates, SHACL validation, Tantivy full-text search, and RO-Crate JSON-LD import and export.
@@ -16,6 +20,9 @@ Every graph maps to a deterministic Irokle topic. Craqle publishes local operati
 - Synchronize graph state across machines with convergent replication through
   durable per-graph Irokle topics.
 - Control graph access through host-provided authorizers and persisted policies.
+
+Craqle 0.3 requires Rust 1.97.1 and integrates Irokle 0.3.0. See the
+[upgrade notes](CHANGELOG.md#upgrading-from-02) before opening an existing database.
 
 ## Open a node
 
@@ -116,6 +123,13 @@ let execution =
     node.execute_prepared(&auth, &prepared, &QueryOptions::default())?;
 ```
 
+Queries enforce limits on input, storage reads, native execution, and collected
+results by default. Generic sorting, grouping, joins, and property paths remain
+supported, but the upstream evaluator's internal buffers are not fully accounted
+for and cancellation inside those operators is cooperative. These limits are not
+a process memory ceiling. Trusted workloads can select `QueryLimits::unbounded()`
+through `QueryOptions` to remove the configurable resource ceilings.
+
 ## Update with SPARQL
 
 ```rust
@@ -154,6 +168,16 @@ let resources = node.search_resources(
     },
 )?;
 ```
+
+Search indexing is asynchronous. `flush_search_updates()` waits for work accepted
+before the call, plus any recovery that work requires. `flush_search()` accepts
+`SearchFlushOptions` for a timeout or cancellation and returns a coverage receipt.
+A timed-out or cancelled wait leaves durable indexing work queued. Search-disabled
+builds retain that work and return `Unsupported` from search and flush calls.
+
+Dropping a node joins its maintenance thread. `shutdown(timeout)` returns
+`ShutdownState::TimedOut` if the thread has not finished; the node retains the
+thread and a later shutdown or drop still joins it.
 
 ## Validate with SHACL
 

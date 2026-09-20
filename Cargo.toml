@@ -53,6 +53,8 @@ proptest = "1.11.0"
 tempfile = "3.27.0"
 
 [package]
+autobenches = false
+autotests = false
 name = "craqle"
 version = "0.3.0"
 edition = "2024"
@@ -67,6 +69,7 @@ categories = ["database", "data-structures", "science"]
 [features]
 default = ["search"]
 search = ["dep:tantivy"]
+allocation-metrics = []
 iroh = ["irokle/iroh"]
 shacl-core = [
     "dep:shacl",
@@ -123,6 +126,7 @@ harness = false
 
 [[bench]]
 name = "sparql_hot_path"
+path = "benches/sparql/hot_path.rs"
 harness = false
 
 [[bench]]
@@ -131,16 +135,19 @@ harness = false
 
 [[bench]]
 name = "shacl_external_baseline"
+path = "benches/shacl/external_baseline.rs"
 harness = false
 required-features = ["shacl-core"]
 
 [[bench]]
 name = "shacl_native_comparison"
+path = "benches/shacl/native_comparison.rs"
 harness = false
 required-features = ["shacl-core"]
 
 [[bench]]
 name = "shacl_incremental"
+path = "benches/shacl/incremental.rs"
 harness = false
 required-features = ["shacl-core"]
 
@@ -154,12 +161,279 @@ harness = false
 
 [[bench]]
 name = "sparql_join_choice"
+path = "benches/sparql/join_choice.rs"
 harness = false
 
 [[bench]]
 name = "sparql_access_path_scaling"
+path = "benches/sparql/access_path_scaling.rs"
 harness = false
 
 [[bench]]
 name = "oxigraph_comparison"
 harness = false
+
+[[bench]]
+name = "consistency_catalog"
+path = "benches/catalog/main.rs"
+harness = false
+
+[[bench]]
+name = "cache_churn"
+path = "benches/cache_churn.rs"
+harness = false
+
+[[test]]
+name = "perf_aruna_corpus_query"
+path = "tests/perf/aruna_corpus_query.rs"
+
+[[test]]
+name = "perf_batch_ingest"
+path = "tests/perf/batch_ingest.rs"
+
+[[test]]
+name = "perf_capacity"
+path = "tests/perf/capacity.rs"
+
+[[test]]
+name = "perf_cold_start"
+path = "tests/perf/cold_start.rs"
+
+[[test]]
+name = "perf_cross_graph"
+path = "tests/perf/cross_graph.rs"
+
+[[test]]
+name = "perf_derived_index_open"
+path = "tests/perf/derived_index_open.rs"
+
+[[test]]
+name = "perf_fjall_durability_policy"
+path = "tests/perf/fjall_durability_policy.rs"
+
+[[test]]
+name = "perf_irokle_writes"
+path = "tests/perf/irokle_writes.rs"
+
+[[test]]
+name = "perf_latency"
+path = "tests/perf/latency.rs"
+
+[[test]]
+name = "perf_materialization"
+path = "tests/perf/materialization.rs"
+
+[[test]]
+name = "perf_multigraph_query"
+path = "tests/perf/multigraph_query.rs"
+
+[[test]]
+name = "perf_query_matrix"
+path = "tests/perf/query_matrix.rs"
+
+[[test]]
+name = "perf_rocrate_workflows"
+path = "tests/perf/rocrate_workflows.rs"
+
+[[test]]
+name = "perf_smoke"
+path = "tests/perf/smoke.rs"
+
+[[test]]
+name = "query_budgets"
+path = "tests/query/budgets.rs"
+
+[[test]]
+name = "query_differential"
+path = "tests/query/differential.rs"
+
+[[test]]
+name = "query_fast_paths"
+path = "tests/query/fast_paths.rs"
+
+[[test]]
+name = "query_index_semantics"
+path = "tests/query/index_semantics.rs"
+
+[[test]]
+name = "query_limits"
+path = "tests/query/limits.rs"
+
+[[test]]
+name = "query_optimizer_equivalence"
+path = "tests/query/optimizer_equivalence.rs"
+
+[[test]]
+name = "query_prepared"
+path = "tests/query/prepared.rs"
+
+[[test]]
+name = "shacl_binding"
+path = "tests/shacl/binding.rs"
+
+[[test]]
+name = "shacl_bulk"
+path = "tests/shacl/bulk.rs"
+
+[[test]]
+name = "shacl_cache"
+path = "tests/shacl/cache.rs"
+
+[[test]]
+name = "shacl_compile"
+path = "tests/shacl/compile.rs"
+
+[[test]]
+name = "shacl_native"
+path = "tests/shacl/native.rs"
+
+[[test]]
+name = "shacl_policy"
+path = "tests/shacl/policy.rs"
+
+[[test]]
+name = "shacl_replication"
+path = "tests/shacl/replication.rs"
+
+[[test]]
+name = "shacl_write"
+path = "tests/shacl/write.rs"
+
+[[test]]
+name = "rocrate_fidelity"
+path = "tests/rocrate/fidelity.rs"
+
+[[test]]
+name = "rocrate"
+path = "tests/rocrate/main.rs"
+
+[[test]]
+name = "rocrate_policy"
+path = "tests/rocrate/policy.rs"
+
+[[test]]
+name = "rocrate_versions"
+path = "tests/rocrate/versions.rs"
+
+[[test]]
+name = "search_authorization"
+path = "tests/search/authorization.rs"
+
+[[test]]
+name = "search_disabled"
+path = "tests/search/disabled.rs"
+
+[[test]]
+name = "search_integration"
+path = "tests/search/integration.rs"
+
+[[test]]
+name = "search_recovery"
+path = "tests/search/recovery.rs"
+
+[[test]]
+name = "api"
+path = "tests/api.rs"
+
+[[test]]
+name = "audit_merge_regressions"
+path = "tests/audit_merge_regressions.rs"
+
+[[test]]
+name = "batch_ingest"
+path = "tests/batch_ingest.rs"
+
+[[test]]
+name = "concurrency_crdt"
+path = "tests/concurrency_crdt.rs"
+
+[[test]]
+name = "dependency_compat"
+path = "tests/dependency_compat.rs"
+
+[[test]]
+name = "graph_existence"
+path = "tests/graph_existence.rs"
+
+[[test]]
+name = "maintenance_crash"
+path = "tests/maintenance_crash.rs"
+
+[[test]]
+name = "merge_api"
+path = "tests/merge_api.rs"
+
+[[test]]
+name = "performance_corpus"
+path = "tests/performance_corpus.rs"
+
+[[test]]
+name = "prevalidated_apply"
+path = "tests/prevalidated_apply.rs"
+
+[[test]]
+name = "rdf_star"
+path = "tests/rdf_star.rs"
+
+[[test]]
+name = "replication"
+path = "tests/replication.rs"
+
+[[test]]
+name = "replication_ingress"
+path = "tests/replication_ingress.rs"
+
+[[test]]
+name = "restart_recovery"
+path = "tests/restart_recovery.rs"
+
+[[test]]
+name = "rules_versions"
+path = "tests/rules_versions.rs"
+
+[[test]]
+name = "sparql_fts"
+path = "tests/sparql_fts.rs"
+
+[[test]]
+name = "store_concurrency"
+path = "tests/store_concurrency.rs"
+
+[[test]]
+name = "system_recovery"
+path = "tests/system_recovery.rs"
+
+[[test]]
+name = "validation"
+path = "tests/validation.rs"
+
+[[bench]]
+name = "query_costs"
+path = "benches/sparql/costs.rs"
+harness = false
+
+[[bench]]
+name = "planning"
+path = "benches/sparql/planning.rs"
+harness = false
+
+[[bench]]
+name = "plan_quality"
+path = "benches/sparql/plan_quality.rs"
+harness = false
+
+[[bench]]
+name = "text_costs"
+path = "benches/text_costs.rs"
+harness = false
+required-features = ["search"]
+
+[[bench]]
+name = "fluree_craqle"
+path = "benches/fluree_craqle.rs"
+harness = false
+
+[[test]]
+name = "text_prototype"
+path = "benches/text/tests.rs"
+required-features = ["search"]

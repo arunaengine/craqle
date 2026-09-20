@@ -11,9 +11,9 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use craqle::{
         AllowAllAuthorizer, CraqleNode, CreateCrateRequest, EncodedTerm, GraphId, GraphPolicy,
-        PrepareRoCrateOptions, PreparedCommitMode, QueryOptions, RoCratePolicyOptions,
-        RoCrateVersion, ShaclBinding, ShaclBindingOptions, ShaclCompileOptions, ShaclWritePolicy,
-        UpdateOptions,
+        PrepareRoCrateOptions as PrepareOptions, PreparedCommitMode, QueryOptions,
+        RoCratePolicyOptions as PolicyOptions, RoCrateVersion, ShaclBinding, ShaclBindingOptions,
+        ShaclCompileOptions, ShaclWritePolicy, UpdateOptions,
     };
 
     let directory =
@@ -24,7 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = CraqleNode::open(&directory)?;
     let auth = AllowAllAuthorizer;
 
-    // Create a crate through the typed API.
     let created = GraphId::new("urn:example:created");
     node.create_crate(
         &auth,
@@ -38,7 +37,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )?;
 
-    // Import a complete document through the ordinary checked import path.
     let imported = GraphId::new("urn:example:imported");
     node.apply_rocrate_document_with_policy(
         &auth,
@@ -47,7 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         GraphPolicy::default(),
     )?;
 
-    // Install and compile a small Craqle SHACL Core Subset v1 policy.
     let shapes = GraphId::new("urn:example:shapes");
     let shape = iri("urn:example:dataset-shape");
     let property = EncodedTerm("_:identifier-property".to_owned());
@@ -96,16 +93,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // Prepare once, evaluate the policy, then commit the same encoded candidate.
     let prepared_graph = GraphId::new("urn:example:prepared");
     let prepared = node.prepare_rocrate_document(
         &auth,
         &prepared_graph,
         &rocrate_document(&prepared_graph, "Prepared crate"),
-        &PrepareRoCrateOptions::default(),
+        &PrepareOptions::default(),
     )?;
     let report =
-        node.evaluate_rocrate_policy(&auth, &prepared, &policy, &RoCratePolicyOptions::default())?;
+        node.evaluate_rocrate_policy(&auth, &prepared, &policy, &PolicyOptions::default())?;
     assert!(report.conforms && report.accepted_by_write_policy);
     node.commit_prepared_rocrate_document(
         &auth,
@@ -114,7 +110,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PreparedCommitMode::Enforce,
     )?;
 
-    // Execute a bounded authorized query.
     let query = node.prepare_query(&format!(
         "SELECT ?name WHERE {{ GRAPH <{}> {{ <{}> <http://schema.org/name> ?name }} }}",
         prepared_graph.as_str(),
@@ -125,7 +120,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     query_options.limits.max_result_cells = 10;
     let _execution = node.execute_prepared(&auth, &query, &query_options)?;
 
-    // Apply an authorized, bounded SPARQL update.
     let mut update_options = UpdateOptions::default();
     update_options.limits.max_changes = 10;
     node.apply_sparql_update_with_options(
@@ -138,7 +132,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &update_options,
     )?;
 
-    // Bind SHACL and read the persisted validation status.
     node.bind_shacl(
         &auth,
         &ShaclBinding {

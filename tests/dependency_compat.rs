@@ -6,7 +6,9 @@
 
 use oxrdf::{Literal, NamedNode, Term, Triple};
 use rocraters::ro_crate::context::RoCrateContext;
-use rocraters::ro_crate::rdf::{RdfError, RdfGraph, ResolvedContext, rdf_graph_to_rocrate};
+use rocraters::ro_crate::rdf::{
+    RdfError, RdfGraph, ResolvedContext, rdf_graph_to_rocrate as graph_to_crate,
+};
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 use shacl::ir::IRSchema;
@@ -32,7 +34,7 @@ fn quoted_terms_rejected() {
     ));
 
     assert!(matches!(
-        rdf_graph_to_rocrate(graph),
+        graph_to_crate(graph),
         Err(RdfError::UnsupportedRdfStarTerm)
     ));
 }
