@@ -11417,12 +11417,39 @@ impl GraphStore {
         let DurableCommit {
             mut batch,
             pending_fts,
+            mut pending_receipts,
         } = commit;
         let _queue = self.fts_queue_guard();
+        let mut search_token = None;
         for key in pending_fts.order {
-            self.stage_fts_entry(&mut batch, key)?;
+            if let FtsQueueKey::Delete(graph) = key {
+                self.stage_delete_queue(&mut batch, graph)?;
+            }
+            let token = self.stage_fts_entry(&mut batch, key)?;
+            search_token = Some(search_token.map_or(token, |current: u64| current.max(token)));
         }
-        self.commit_fjall_batch(batch)
+        if let Some(search_token) = search_token {
+            for receipt in &mut pending_receipts {
+                receipt.search_token = Some(search_token);
+                batch.insert(
+                    &self.receipts,
+                    receipt.id.0,
+                    postcard::to_allocvec(receipt)?,
+                );
+            }
+            batch.insert(
+                &self.search_meta,
+                SEARCH_HEAD_KEY,
+                search_token.to_be_bytes(),
+            );
+        }
+        let result = self.commit_fjall_batch(batch);
+        if result.is_ok()
+            && let Some(token) = search_token
+        {
+            self.dirty_committed.fetch_max(token, Ordering::SeqCst);
+        }
+        result
     }
 
     pub fn commit(&self, batch: WriteBatch) -> Result<()> {
@@ -11432,10 +11459,12 @@ impl GraphStore {
             pending_terms: _,
             publish,
             pending_fts,
+            pending_receipts,
         } = batch;
         let commit = DurableCommit {
             batch: inner,
             pending_fts,
+            pending_receipts,
         };
         self.apply_commit(commit, publish)
     }
@@ -11448,12 +11477,7 @@ impl GraphStore {
         excluded: Option<TermId>,
     ) -> Result<Vec<(TermId, TermId)>> {
         let (graph, subject) = key;
-        let generation = self
-            .indexes_read()
-            .generations
-            .get(&graph)
-            .copied()
-            .unwrap_or(0);
+        let generation = self.indexes_read().graph_epoch(graph);
         let cache_key = (graph, subject, generation);
         let entries =
             if let Some(entries) = self.indexes_write().quad_subjects.get_cloned(&cache_key) {
@@ -11465,7 +11489,7 @@ impl GraphStore {
                 let mut entries = Vec::new();
                 for guard in self.quads.prefix(prefix) {
                     let (quad_key, value) = guard.into_inner()?;
-                    if dot_payload_is_empty(value.as_ref()) {
+                    if dots_empty(value.as_ref()) {
                         continue;
                     }
                     let quad = Self::decode_quad_key(quad_key.as_ref())?;
@@ -11473,7 +11497,7 @@ impl GraphStore {
                 }
                 let entries = Arc::new(entries);
                 let mut indexes = self.indexes_write();
-                if indexes.generations.get(&graph).copied().unwrap_or(0) == generation {
+                if indexes.graph_epoch(graph) == generation {
                     indexes.quad_subjects.insert(
                         cache_key,
                         Arc::clone(&entries),
@@ -11514,7 +11538,7 @@ impl GraphStore {
         self.decode_entries(self.subject_entries((graph, subject), None)?)
     }
 
-    pub fn triples_for_subject_excluding_predicate(
+    pub fn triples_excluding_predicate(
         &self,
         graph: TermId,
         subject: TermId,
@@ -11523,7 +11547,7 @@ impl GraphStore {
         self.decode_entries(self.subject_entries((graph, subject), Some(excluded_predicate))?)
     }
 
-    pub fn count_objects_for_subject_predicate(
+    pub fn count_matching_objects(
         &self,
         graph: &GraphId,
         subject: &EncodedTerm,
@@ -11538,14 +11562,10 @@ impl GraphStore {
         let Some(predicate_id) = self.lookup_term(predicate)? else {
             return Ok(0);
         };
-        self.count_objects_for_ids(graph_id, subject_id, predicate_id)
+        self.count_object_ids(graph_id, subject_id, predicate_id)
     }
 
-    /// One page of the objects of `(graph, subject, predicate)`, in the stable
-    /// order defined by the decoded object terms.
-    ///
-    /// Returns `(total, page)`; `total` is the full object count for both
-    /// cursor kinds, so an `After` caller can still report progress.
+    /// Returns total objects and one decoded-term-ordered page.
     pub fn objects_page(
         &self,
         key: GraphSubjectPredicate<'_>,
@@ -11565,8 +11585,7 @@ impl GraphStore {
             return Ok((0, Vec::new()));
         };
 
-        let object_ids =
-            self.ordered_objects_for_subject_predicate(graph_id, subject_id, predicate_id)?;
+        let object_ids = self.ordered_objects(graph_id, subject_id, predicate_id)?;
         let total = object_ids.len();
 
         let start = match page.cursor {
@@ -11602,7 +11621,7 @@ impl GraphStore {
             .unwrap();
         entries.retain(|entry| *entry != (quad.predicate, quad.object));
         let mut indexes = self.indexes_write();
-        let generation = indexes.generations.get(&quad.graph).copied().unwrap_or(0);
+        let generation = indexes.graph_epoch(quad.graph);
         let entries = Arc::new(entries);
         indexes.quad_subjects.insert(
             (quad.graph, quad.subject, generation),
@@ -11622,11 +11641,18 @@ impl GraphStore {
 }
 
 #[cfg(test)]
+#[path = "store_bench.rs"]
+mod store_bench;
+
+#[cfg(test)]
+#[path = "store_recovery.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::context::{QueryReadMode, ReadContext};
+    use crate::query::context::{QueryCost, QueryReadMode, ReadContext};
     use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
-    use crate::search_queue::{QueueBound, drain_upto};
     use std::os::unix::fs::PermissionsExt;
 
     fn setup_store() -> (tempfile::TempDir, GraphStore) {
@@ -11635,7 +11661,7 @@ mod tests {
         (dir, store)
     }
 
-    fn seed_raw_graph_record(path: &Path, key: &[u8], value: &[u8]) {
+    fn seed_graph_record(path: &Path, key: &[u8], value: &[u8]) {
         let db = Database::builder(path).open().unwrap();
         let graphs = db
             .keyspace("graphs", KeyspaceCreateOptions::default)
@@ -11644,6 +11670,22 @@ mod tests {
         batch.insert(&graphs, key, value);
         batch.commit().unwrap();
         db.persist(PersistMode::SyncAll).unwrap();
+    }
+
+    #[test]
+    fn keyspace_names_stable() {
+        assert_eq!(PRIMARY_TERM_MAP, "qv2_term_to_query");
+        assert_eq!(PRIMARY_QUERY_MAP, "qv2_query_to_term");
+        assert_eq!(SECONDARY_TERM_MAP, "qv3_term_to_query");
+        assert_eq!(SECONDARY_QUERY_MAP, "qv3_query_to_term");
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn rebuild_target_stable() {
+        let (_dir, store) = setup_store();
+        let first = store.require_search_rebuild().unwrap();
+        assert_eq!(store.require_search_rebuild().unwrap(), first);
     }
 
     #[test]
@@ -11656,7 +11698,7 @@ mod tests {
     #[test]
     fn future_format_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        seed_raw_graph_record(
+        seed_graph_record(
             dir.path(),
             DISK_FORMAT_KEY,
             &encode_disk_format(DiskFormatVersion::new(DISK_FORMAT_VERSION.major + 1, 0)),
@@ -11671,7 +11713,7 @@ mod tests {
     #[test]
     fn malformed_format_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        seed_raw_graph_record(dir.path(), DISK_FORMAT_KEY, &[1, 2, 3]);
+        seed_graph_record(dir.path(), DISK_FORMAT_KEY, &[1, 2, 3]);
 
         assert!(matches!(
             GraphStore::open(dir.path()),
@@ -11682,7 +11724,7 @@ mod tests {
     #[test]
     fn unmarked_source_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        seed_raw_graph_record(dir.path(), b"Mlegacy", b"value");
+        seed_graph_record(dir.path(), b"Mlegacy", b"value");
 
         assert!(matches!(
             GraphStore::open(dir.path()),
@@ -11750,7 +11792,7 @@ mod tests {
         for count in [0, 100, 1_000, 10_000] {
             stage_binding_records(&store, previous, count);
             let started = Instant::now();
-            let scan = store.pending_shacl_queue_bounded(usize::MAX, None).unwrap();
+            let scan = store.bounded_shacl_queue(usize::MAX, None).unwrap();
             let elapsed = started.elapsed();
             assert_eq!(scan.entries_scanned, 0, "binding count {count}");
             assert!(scan.graphs.is_empty(), "binding count {count}");
@@ -11772,7 +11814,7 @@ mod tests {
         let mut batch = store.new_batch();
         store.stage_binding_pending(&mut batch, &status).unwrap();
         store.commit(batch).unwrap();
-        let scan = store.pending_shacl_queue_bounded(usize::MAX, None).unwrap();
+        let scan = store.bounded_shacl_queue(usize::MAX, None).unwrap();
         assert_eq!(scan.entries_scanned, 1);
         assert_eq!(scan.graphs, vec![data]);
     }
@@ -11797,19 +11839,19 @@ mod tests {
         store.commit(batch).unwrap();
 
         assert!(store.pending_shacl_queue().is_err());
-        assert!(store.pending_shacl_queue_repair_required().unwrap());
-        let repair = store.repair_pending_shacl_queue().unwrap();
+        assert!(store.shacl_repair_needed().unwrap());
+        let repair = store.repair_shacl_queue().unwrap();
         assert_eq!(repair.binding_records_scanned, 100);
-        assert_eq!(repair.pending_queue_entries_scanned, 1);
+        assert_eq!(repair.pending_entries_scanned, 1);
         assert_eq!(store.pending_shacl_queue().unwrap(), vec![data.clone()]);
-        assert!(!store.pending_shacl_queue_repair_required().unwrap());
+        assert!(!store.shacl_repair_needed().unwrap());
 
         let mut batch = store.new_batch();
         let data_id = store.graph_id_for(&data).unwrap().unwrap();
         batch.remove(&store.graphs, shacl_pending_key(data_id));
         store.commit(batch).unwrap();
         assert!(store.pending_shacl_queue().unwrap().is_empty());
-        let repair = store.repair_pending_shacl_queue().unwrap();
+        let repair = store.repair_shacl_queue().unwrap();
         assert_eq!(repair.binding_records_scanned, 100);
         assert_eq!(store.pending_shacl_queue().unwrap(), vec![data]);
     }
@@ -11820,8 +11862,7 @@ mod tests {
         let graph = GraphId::new("urn:test:persist-mode:sync-all");
 
         {
-            let store =
-                GraphStore::open_with_persist_mode(dir.path(), PersistMode::SyncAll).unwrap();
+            let store = GraphStore::open_with_mode(dir.path(), PersistMode::SyncAll).unwrap();
             assert_eq!(PersistMode::SyncAll, store.persist_mode());
             store.create_graph(&graph).unwrap();
             store.persist().unwrap();
@@ -11890,7 +11931,7 @@ mod tests {
         store
             .insert_quad(&mut batch, QuadAdd { quad, dot })
             .unwrap();
-        let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
+        let mut clock = store.vector_clock_id(quad.graph).unwrap();
         clock.advance(actor, counter);
         store
             .set_vector_clock(
@@ -11903,6 +11944,44 @@ mod tests {
             .unwrap();
         store.commit(batch).unwrap();
         dot
+    }
+
+    fn commit_adds(store: &GraphStore, graph: &GraphId, quads: &[EncodedQuad]) {
+        let _commit_guard = store.graph_commit_guard(graph);
+        let actor = ActorId::random();
+        let mut batch = store.new_batch();
+        let mut clock = store.vector_clock_id(quads[0].graph).unwrap();
+        for quad in quads {
+            let counter = store
+                .next_counter(
+                    &mut batch,
+                    CounterKey {
+                        graph_id: quad.graph,
+                        actor,
+                    },
+                )
+                .unwrap();
+            store
+                .insert_quad(
+                    &mut batch,
+                    QuadAdd {
+                        quad: *quad,
+                        dot: Dot { actor, counter },
+                    },
+                )
+                .unwrap();
+            clock.advance(actor, counter);
+        }
+        store
+            .set_vector_clock(
+                &mut batch,
+                ClockUpdate {
+                    graph_id: quads[0].graph,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
     }
 
     fn commit_remove(
@@ -11931,7 +12010,7 @@ mod tests {
         store
             .insert_quad(&mut batch, QuadAdd { quad, dot })
             .unwrap();
-        let mut clock = store.get_vector_clock_by_id(quad.graph).unwrap();
+        let mut clock = store.vector_clock_id(quad.graph).unwrap();
         clock.advance(actor, 1);
         store
             .set_vector_clock(
@@ -11948,14 +12027,281 @@ mod tests {
             pending_terms: _,
             publish,
             pending_fts,
+            pending_receipts: _,
         } = batch;
         (inner, publish, pending_fts)
     }
 
-    /// A read view captured while a contending commit published source rows
-    /// without query-view maintenance must never be admitted, and it must keep
-    /// that answer after the maintenance lands. Admission is a property of the
-    /// captured snapshot, not of a current process flag.
+    #[test]
+    fn rebuild_switches_slots() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-dual-slot");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        let old = store.read_snapshot();
+
+        store.rebuild_query_indexes().unwrap();
+        let first = match store.snapshot_index_header(&store.db.snapshot()).unwrap() {
+            IndexHeaderRead::Valid(header) => header,
+            _ => panic!("rebuilt header is valid"),
+        };
+        assert_eq!(first.active_slot, IndexSlot::Secondary.encode());
+        assert!(old.query_index_admission(&store).unwrap().trusted);
+        assert_eq!(old.qv_total_count(&store).unwrap(), Some(1));
+
+        store.rebuild_query_indexes().unwrap();
+        let second = match store.snapshot_index_header(&store.db.snapshot()).unwrap() {
+            IndexHeaderRead::Valid(header) => header,
+            _ => panic!("rebuilt header is valid"),
+        };
+        assert_eq!(second.active_slot, IndexSlot::Primary.encode());
+        assert!(old.query_index_admission(&store).unwrap().trusted);
+        assert_eq!(old.qv_total_count(&store).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn malformed_header_rebuilds() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-malformed-rebuild");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        let mut batch = store.buffered_batch();
+        batch.insert(&store.qv2_meta, QV_HEADER_KEY, [0]);
+        store.commit_fjall_batch(batch).unwrap();
+
+        store.rebuild_query_indexes().unwrap();
+
+        assert_index_ready(&store, 1);
+        assert!(
+            store
+                .snapshot_admission(&store.db.snapshot())
+                .unwrap()
+                .trusted
+        );
+    }
+
+    #[test]
+    fn rebuild_clears_residue() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-meta-residue");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        let mut batch = store.buffered_batch();
+        batch.insert(&store.qv3_meta, b"?", [1]);
+        store.commit_fjall_batch(batch).unwrap();
+        store.rebuild_query_indexes().unwrap();
+        assert!(store.qv3_meta.get(b"?").unwrap().is_none());
+
+        let mut batch = store.buffered_batch();
+        batch.insert(&store.qv2_meta, b"?", [1]);
+        store.commit_fjall_batch(batch).unwrap();
+        store.rebuild_query_indexes().unwrap();
+        assert!(store.qv2_meta.get(b"?").unwrap().is_none());
+        assert_index_ready(&store, 1);
+    }
+
+    #[test]
+    fn incomplete_build_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:qv-build-recovery");
+        let active_slot;
+        {
+            let store = GraphStore::open(directory.path()).unwrap();
+            store.create_graph(&graph).unwrap();
+            let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+            commit_add(&store, &graph, quad);
+            let header = match store.snapshot_index_header(&store.db.snapshot()).unwrap() {
+                IndexHeaderRead::Valid(header) => header,
+                _ => panic!("header is valid"),
+            };
+            active_slot = header.active_slot;
+            let build = QueryBuildRecord {
+                format: QV_SCHEMA_VERSION,
+                slot: IndexSlot::decode(active_slot).unwrap().other().encode(),
+                source_sequence: store.db.snapshot().seqno(),
+                source_epoch: header.source_epoch,
+                control_digest: [0; 32],
+                trusted_active: false,
+                scan_cursor: None,
+                replay_cursor: 0,
+                next_delta: 1,
+                delta_rows: 0,
+                delta_bytes: 0,
+                phase: QueryBuildPhase::Scan,
+                target: None,
+            };
+            let mut batch = store.buffered_batch();
+            batch.insert(
+                &store.qv2_meta,
+                QV_BUILD_KEY,
+                postcard::to_allocvec(&build).unwrap(),
+            );
+            store.commit_fjall_batch(batch).unwrap();
+            store.persist().unwrap();
+        }
+        let reopened = GraphStore::open(directory.path()).unwrap();
+        assert!(
+            reopened
+                .query_build(&reopened.db.snapshot())
+                .unwrap()
+                .is_none()
+        );
+        let header = match reopened
+            .snapshot_index_header(&reopened.db.snapshot())
+            .unwrap()
+        {
+            IndexHeaderRead::Valid(header) => header,
+            _ => panic!("active header survives recovery"),
+        };
+        assert_eq!(header.active_slot, active_slot);
+        assert!(
+            reopened
+                .snapshot_admission(&reopened.db.snapshot())
+                .unwrap()
+                .trusted
+        );
+    }
+
+    #[test]
+    fn delta_cap_rejects() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-delta-cap");
+        store.create_graph(&graph).unwrap();
+        let header = match store.snapshot_index_header(&store.db.snapshot()).unwrap() {
+            IndexHeaderRead::Valid(header) => header,
+            _ => panic!("header is valid"),
+        };
+        let build = QueryBuildRecord {
+            format: QV_SCHEMA_VERSION,
+            slot: IndexSlot::decode(header.active_slot)
+                .unwrap()
+                .other()
+                .encode(),
+            source_sequence: store.db.snapshot().seqno(),
+            source_epoch: header.source_epoch,
+            control_digest: [0; 32],
+            trusted_active: false,
+            scan_cursor: None,
+            replay_cursor: 0,
+            next_delta: 1,
+            delta_rows: QV_DELTA_ROWS,
+            delta_bytes: 0,
+            phase: QueryBuildPhase::Scan,
+            target: None,
+        };
+        let mut state = store.buffered_batch();
+        state.insert(
+            &store.qv2_meta,
+            QV_BUILD_KEY,
+            postcard::to_allocvec(&build).unwrap(),
+        );
+        store.commit_fjall_batch(state).unwrap();
+
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        let mut batch = store.new_batch();
+        store
+            .insert_quad(
+                &mut batch,
+                QuadAdd {
+                    quad,
+                    dot: Dot {
+                        actor: ActorId::random(),
+                        counter: 1,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(batch),
+            Err(StoreError::QueryIndexCapacity)
+        ));
+        assert!(!store.contains_quad(quad).unwrap());
+    }
+
+    #[test]
+    fn search_generations_unique() {
+        let (_dir, store) = setup_store();
+        let first = GraphId::new("urn:test:search-generation-one");
+        let second = GraphId::new("urn:test:search-generation-two");
+        store.create_graph(&first).unwrap();
+        store.create_graph(&second).unwrap();
+        let index_id = [7; 16];
+        let first = store
+            .ensure_search_generation(&GenerationRequest {
+                index_id,
+                graph: first,
+            })
+            .unwrap()
+            .active
+            .unwrap();
+        let second = store
+            .ensure_search_generation(&GenerationRequest {
+                index_id,
+                graph: second,
+            })
+            .unwrap()
+            .active
+            .unwrap();
+        assert_ne!(first.0, 0);
+        assert_ne!(second.0, 0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn stage_sessions_recover() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:search-stage-session");
+        store.create_graph(&graph).unwrap();
+        let index_id = [9; 16];
+        let first = store
+            .begin_search_stage(&StageRequest {
+                index_id,
+                graph: graph.clone(),
+                target: 4,
+                session: [1; 16],
+            })
+            .unwrap();
+        let second = store
+            .begin_search_stage(&StageRequest {
+                index_id,
+                graph: graph.clone(),
+                target: 4,
+                session: [2; 16],
+            })
+            .unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(
+            store
+                .scan_search_cleanup(&CleanupScan {
+                    after: None,
+                    row_limit: 8,
+                    byte_limit: 1_048_576,
+                })
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+
+        let mut complete = second.clone();
+        complete.complete = true;
+        store.finish_search_stage(&complete).unwrap();
+        let reused = store
+            .begin_search_stage(&StageRequest {
+                index_id,
+                graph,
+                target: 4,
+                session: [3; 16],
+            })
+            .unwrap();
+        assert_eq!(reused.generation, second.generation);
+        assert!(reused.complete);
+    }
+
+    /// A read view captured during a source-only gap keeps its own rejection.
     #[test]
     fn uncovered_snapshot_rejected() {
         let (_dir, store) = setup_store();
@@ -11963,7 +12309,7 @@ mod tests {
         store.create_graph(&graph).unwrap();
         let first = encode_quad(&store, &graph, ("urn:s:1", "urn:p", "urn:o"));
         commit_add(&store, &graph, first);
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
 
         // Hold maintenance so the next commit takes the contender path.
         let held = store.qv_gate.try_acquire().expect("gate starts free");
@@ -11974,6 +12320,7 @@ mod tests {
             .commit_durable(DurableCommit {
                 batch: inner,
                 pending_fts,
+                pending_receipts: Vec::new(),
             })
             .unwrap();
         store.indexes_write().publish(&publish);
@@ -11995,7 +12342,7 @@ mod tests {
             !admission.trusted,
             "an old view must keep its own answer after the repair"
         );
-        assert_query_index_ready(&store, 2);
+        assert_index_ready(&store, 2);
     }
 
     /// Reopened debt stays inadmissible until the maintenance worker rebuilds it.
@@ -12017,6 +12364,7 @@ mod tests {
                 .commit_durable(DurableCommit {
                     batch: inner,
                     pending_fts,
+                    pending_receipts: Vec::new(),
                 })
                 .unwrap();
             store.indexes_write().publish(&publish);
@@ -12036,7 +12384,7 @@ mod tests {
             QueryIndexState::Failed("projection-debt-unrepaired".to_owned())
         );
         maintenance_round(reopened.clone());
-        assert_query_index_ready(&reopened, 2);
+        assert_index_ready(&reopened, 2);
         assert!(
             !reopened
                 .snapshot_admission(&captured.snapshot)
@@ -12057,7 +12405,7 @@ mod tests {
         assert_eq!(store.qv_gate.owner_count(), 0);
         let second = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
         commit_add(&store, &graph, second);
-        assert_query_index_ready(&store, 2);
+        assert_index_ready(&store, 2);
     }
 
     #[test]
@@ -12079,8 +12427,9 @@ mod tests {
         );
         drop(held);
 
+        store.repair_diagnostics().unwrap();
         maintenance_round(store.clone());
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
         assert!(
             !store
                 .snapshot_admission(&captured.snapshot)
@@ -12090,17 +12439,24 @@ mod tests {
     }
 
     fn maintenance_round(store: Arc<GraphStore>) {
+        let target = store.current_dirty_token();
         let search = Arc::new(crate::SearchIndex::open_in_memory().unwrap());
-        let worker = crate::SearchUpdateWorker::start(store, search);
+        #[cfg(feature = "search")]
+        search.bind_store(&store).unwrap();
+        let worker = crate::SearchUpdateWorker::start(Arc::clone(&store), search);
         let (sender, receiver) = std::sync::mpsc::channel();
         worker
             .sender
-            .send(crate::SearchWorkerMessage::Flush(sender))
+            .send(crate::SearchWorkerMessage::flush_reply(sender, target))
             .unwrap();
-        receiver
-            .recv_timeout(Duration::from_secs(180))
-            .unwrap()
-            .unwrap();
+        let result = receiver.recv_timeout(Duration::from_secs(180)).unwrap();
+        #[cfg(feature = "search")]
+        result.unwrap();
+        #[cfg(not(feature = "search"))]
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == crate::CraqleErrorKind::Unsupported
+        ));
     }
 
     /// A failed commit releases maintenance ownership, so a healthy write that
@@ -12122,13 +12478,25 @@ mod tests {
                 },
             )
             .unwrap();
+        let subjects = HashSet::from([rejected.subject]);
+        store
+            .enqueue_fts_subjects(
+                &mut batch,
+                FtsEnqueue {
+                    graph_id: rejected.graph,
+                    subjects: &subjects,
+                },
+            )
+            .unwrap();
+        let committed = store.current_dirty_token();
         store.arm_commit_failure();
         assert!(store.commit(batch).is_err());
+        assert_eq!(store.current_dirty_token(), committed);
         assert_eq!(store.qv_gate.owner_count(), 0);
 
         let accepted = encode_quad(&store, &graph, ("urn:s:2", "urn:p", "urn:o"));
         commit_add(&store, &graph, accepted);
-        assert_query_index_ready(&store, 1);
+        assert_index_ready(&store, 1);
     }
 
     /// Warming unrelated cache entries must not make a write pay for them.
