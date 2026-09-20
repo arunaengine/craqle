@@ -447,3 +447,119 @@ fn env_usize(name: &str, default: usize) -> usize {
         .map(|value| value.parse().unwrap_or_else(|_| panic!("invalid {name}")))
         .unwrap_or(default)
 }
+
+fn case_specs() -> Vec<CaseSpec> {
+    let cap = env_usize("CRAQLE_PLAN_QUALITY_CAP", DEFAULT_CAP);
+    let asymmetric = CaseSpec {
+        distribution: Distribution::Asymmetric,
+        scope: Scope::Both,
+        left_rows: env_usize("CRAQLE_PLAN_LEFT_ROWS", 128),
+        right_rows: env_usize("CRAQLE_PLAN_RIGHT_ROWS", 2_048),
+        keys: env_usize("CRAQLE_PLAN_KEYS", 128),
+        hot_left: 0,
+        hot_right: 0,
+        limit: None,
+        result_cap: cap,
+    };
+    let skewed = CaseSpec {
+        distribution: Distribution::Skewed,
+        scope: Scope::Both,
+        left_rows: 256,
+        right_rows: 512,
+        keys: 129,
+        hot_left: 128,
+        hot_right: 256,
+        limit: None,
+        result_cap: cap,
+    };
+    let full = [
+        CaseSpec {
+            scope: Scope::Primary,
+            ..asymmetric
+        },
+        asymmetric,
+        skewed,
+    ];
+    full.into_iter()
+        .flat_map(|spec| {
+            [
+                spec,
+                CaseSpec {
+                    limit: Some(20),
+                    ..spec
+                },
+            ]
+        })
+        .collect()
+}
+
+fn plan_quality(c: &mut Criterion) {
+    let sample_size = env_usize("CRAQLE_BENCH_SAMPLE_SIZE", 10);
+    assert!(sample_size >= 10);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "record": "plan_quality_provenance",
+            "commit": repository_commit(),
+            "binary_blake3": binary_blake3(),
+            "seed": FIXTURE_SEED,
+            "transport": "local_in_process",
+            "fast_paths": "disabled",
+            "collect_costs": false,
+            "plan_statistics": false,
+        }))
+        .expect("serialize plan-quality provenance")
+    );
+    for spec in case_specs() {
+        let mut fixtures = Vec::new();
+        let mut expected_digest = None;
+        for mode in [JoinMode::Auto, JoinMode::ForceHash, JoinMode::ForceLateral] {
+            let fixture = Fixture::new(spec, mode);
+            let sample = fixture.cold_sample();
+            if spec.limit.is_none() {
+                if let Some(expected) = &expected_digest {
+                    assert_eq!(&sample.result_digest, expected);
+                } else {
+                    expected_digest = Some(sample.result_digest.clone());
+                }
+            }
+            fixture.validate_limit();
+            print_sample(&fixture, mode, &sample);
+            fixtures.push((mode, fixture));
+        }
+        let mut group = c.benchmark_group(format!(
+            "plan_quality/{:?}_{:?}_{}",
+            spec.distribution,
+            spec.scope,
+            spec.limit
+                .map_or("full".to_owned(), |limit| format!("limit_{limit}"))
+        ));
+        group.sample_size(sample_size);
+        group.warm_up_time(env_duration("CRAQLE_BENCH_WARMUP_SECS", 1));
+        group.measurement_time(env_duration("CRAQLE_BENCH_MEASUREMENT_SECS", 3));
+        group.throughput(Throughput::Elements(
+            spec.limit.map_or(fixtures[0].1.expected.len(), |limit| {
+                limit.min(fixtures[0].1.expected.len())
+            }) as u64,
+        ));
+        for (mode, fixture) in fixtures {
+            group.bench_with_input(
+                BenchmarkId::from_parameter(format!("{mode:?}")),
+                &fixture,
+                |b, fixture| {
+                    b.iter(|| {
+                        black_box(
+                            fixture
+                                .execute()
+                                .unwrap_or_else(|error| panic!("warm arm failed: {error}")),
+                        )
+                    })
+                },
+            );
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(benches, plan_quality);
+criterion_main!(benches);
