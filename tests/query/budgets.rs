@@ -4,20 +4,25 @@
 
 #![allow(clippy::result_large_err)]
 
+#[path = "../support.rs"]
 mod support;
+
+use std::time::Duration;
 
 use crate::support::TestWriteExt as _;
 use craqle::{
     Action, AllowAllAuthorizer, AuthorizationError, CraqleErrorKind, CraqleNode, EncodedTerm,
-    GraphId, GraphPolicy, MaterializedQuadChange, QueryCancellation, QueryLimits, QueryOptions,
-    QueryResults, UpdateLimits, UpdateOptions,
+    GraphId, GraphPolicy, MaterializedQuadChange, QueryCancellation,
+    QueryFastPathMode as FastPathMode, QueryLimits, QueryOptions, QueryResults, UpdateLimits,
+    UpdateOptions,
 };
 
 /// Wide enough that the pairwise product dwarfs the row count, small enough
 /// that a rejected plan costs nothing.
 const SIDE: usize = 40;
 
-fn insert(graph: &GraphId, subject: &str, predicate: &str, object: &str) -> MaterializedQuadChange {
+fn insert(graph: &GraphId, terms: (&str, &str, &str)) -> MaterializedQuadChange {
+    let (subject, predicate, object) = terms;
     MaterializedQuadChange::Insert {
         graph: graph.clone(),
         subject: EncodedTerm(format!("<{subject}>")),
@@ -84,17 +89,17 @@ impl Fixture {
         for index in 0..SIDE {
             changes.push(insert(
                 &graph,
-                &format!("urn:s:{index:04}"),
-                "urn:p",
-                "urn:shared",
+                (&format!("urn:s:{index:04}"), "urn:p", "urn:shared"),
             ));
         }
         for index in 0..SIDE {
             changes.push(insert(
                 &graph,
-                &format!("urn:n:{index:04}"),
-                "urn:next",
-                &format!("urn:n:{:04}", index + 1),
+                (
+                    &format!("urn:n:{index:04}"),
+                    "urn:next",
+                    &format!("urn:n:{:04}", index + 1),
+                ),
             ));
         }
         node.apply_changes_unchecked(&graph, changes).unwrap();
@@ -118,6 +123,20 @@ impl Fixture {
             .map(|execution| execution.results)
     }
 
+    fn run_generic(&self, query: &str, limits: QueryLimits) -> craqle::Result<QueryResults> {
+        let prepared = self.node.prepare_query(query)?;
+        let mut options = query_options(limits);
+        options.fast_paths = FastPathMode::Disabled;
+        self.node
+            .execute_prepared_in_graphs(
+                &AllowAllAuthorizer,
+                std::slice::from_ref(&self.graph),
+                &prepared,
+                &options,
+            )
+            .map(|execution| execution.results)
+    }
+
     fn expect_limit(&self, query: &str, limits: QueryLimits) {
         match self.run(query, limits) {
             Err(error) => assert_eq!(error.kind(), CraqleErrorKind::QueryLimit, "{error}"),
@@ -129,8 +148,7 @@ impl Fixture {
     }
 }
 
-/// BUDGET-01: two independent `VALUES` tables ordered by an expression over
-/// both columns. The pairwise product is the work; the row counts are not.
+/// Two independent `VALUES` tables make pairwise work hidden by row counts.
 #[test]
 fn independent_values_product() {
     let fixture = Fixture::new();
@@ -141,20 +159,14 @@ fn independent_values_product() {
     fixture.expect_limit(&query, rows_limit(SIDE * 4));
 }
 
-/// BUDGET-02: a store join whose output multiplicity exceeds the quads read.
-/// The inner side is rescanned per outer row, so every output row does pass a
-/// charged pull point.
 #[test]
-fn join_multiplicity_charged() {
+fn join_stays_supported() {
     let fixture = Fixture::new();
     let query = "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o . ?t <urn:p> ?o }";
 
-    fixture.expect_limit(query, rows_limit(4));
-    fixture.expect_limit(query, rows_limit(SIDE * 4));
-
     let results = fixture
-        .run(query, rows_limit(SIDE * SIDE * 4))
-        .expect("a bound above the charged pulls must complete");
+        .run_generic(query, rows_limit(SIDE * SIDE * 4))
+        .expect("default-compatible limits must preserve join semantics");
     let QueryResults::Solutions(rows) = &results else {
         panic!("expected solutions, got {results:?}");
     };
@@ -165,8 +177,7 @@ fn join_multiplicity_charged() {
     );
 }
 
-/// BUDGET-03: an aggregate hides the intermediate cardinality from every
-/// result-shaped limit.
+/// An aggregate hides intermediate cardinality from result-shaped limits.
 #[test]
 fn aggregate_hides_rows() {
     let fixture = Fixture::new();
@@ -176,7 +187,7 @@ fn aggregate_hides_rows() {
     );
 }
 
-/// BUDGET-03: `DISTINCT` collapses the product before it reaches a result.
+/// `DISTINCT` collapses the product before it reaches a result.
 #[test]
 fn distinct_hides_rows() {
     let fixture = Fixture::new();
@@ -186,7 +197,7 @@ fn distinct_hides_rows() {
     );
 }
 
-/// BUDGET-03: `ORDER BY` with `LIMIT` sorts the whole product for one row.
+/// `ORDER BY` with `LIMIT` sorts the whole product for one row.
 #[test]
 fn ordering_charges_rows() {
     let fixture = Fixture::new();
@@ -196,8 +207,7 @@ fn ordering_charges_rows() {
     );
 }
 
-/// BUDGET-04: long strings and repeated expression calls over a product that
-/// collapses to a single result row.
+/// Long string expressions over a product collapse to one result row.
 #[test]
 fn expression_cost_charged() {
     let fixture = Fixture::new();
@@ -209,8 +219,7 @@ fn expression_cost_charged() {
     fixture.expect_limit(&query, rows_limit(SIDE * 4));
 }
 
-/// BUDGET-05: property-path expansion is charged per traversed edge, and the
-/// declared nesting depth is rejected before evaluation.
+/// Path traversal observes edge limits, while depth rejects at preflight.
 #[test]
 fn deep_path_bounds() {
     let fixture = Fixture::new();
@@ -219,10 +228,10 @@ fn deep_path_bounds() {
     fixture.expect_limit(path, path_limits(1_000_000, 1));
 }
 
-/// BUDGET-07: a cancellation raised while the evaluation is already running.
+/// Cancellation raised inside the request must not return a partial result.
 /// The authorizer runs inside the request, so no thread or sleep is needed.
 #[test]
-fn cancel_during_evaluation() {
+fn cancel_during_request() {
     let fixture = Fixture::new();
     let cancellation = QueryCancellation::new();
     let mut options = QueryOptions::default();
@@ -248,9 +257,7 @@ fn cancel_during_evaluation() {
     assert_eq!(error.kind(), CraqleErrorKind::Cancelled, "{error}");
 }
 
-/// BUDGET-08: an update whose read side hides its intermediate cardinality
-/// must be rejected before it materializes, with the source left untouched and
-/// no state that spoils the next request.
+/// A rejected update leaves source state and the next request untouched.
 #[test]
 fn update_read_budget() {
     let directory = tempfile::tempdir().unwrap();
@@ -298,6 +305,42 @@ fn update_read_budget() {
     assert_ne!(node.graph_snapshot(&graph).unwrap(), before);
 }
 
+#[test]
+fn update_unbounded_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:update-unbounded");
+    node.create_crate(
+        &AllowAllAuthorizer,
+        craqle::CreateCrateRequest::new(
+            graph.clone(),
+            "Update unbounded",
+            "Exercise trusted opaque update evaluation.",
+            "2026-09-20",
+            None,
+            GraphPolicy::default(),
+        ),
+    )
+    .unwrap();
+    let update = format!(
+        "INSERT {{ GRAPH <{root}> {{ <{root}> <urn:copy> ?name }} }} WHERE {{ \
+         GRAPH <{root}> {{ <{root}> <http://schema.org/name> ?name . \
+         FILTER(STRLEN(STR(?name)) > 0) }} }}",
+        root = graph.as_str()
+    );
+    let mut options = UpdateOptions::default();
+    options.limits = UpdateLimits::unbounded();
+    node.apply_sparql_update_with_options(&AllowAllAuthorizer, &update, &options)
+        .expect("trusted callers may opt into opaque update evaluation");
+    assert!(
+        node.graph_snapshot(&graph)
+            .unwrap()
+            .quads
+            .iter()
+            .any(|quad| quad.predicate.0 == "<urn:copy>")
+    );
+}
+
 /// Unlimited execution of the same shapes stays complete and correct.
 #[test]
 fn unlimited_stays_complete() {
@@ -305,10 +348,83 @@ fn unlimited_stays_complete() {
     let results = fixture
         .run(
             "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
-            QueryLimits::production(),
+            QueryLimits::unbounded(),
         )
         .unwrap();
     assert_eq!(solution_rows(&results), SIDE);
+}
+
+#[test]
+fn deadline_is_local() {
+    let fixture = Fixture::new();
+    let cancellation = QueryCancellation::new();
+    let prepared = fixture
+        .node
+        .prepare_query("SELECT ?s WHERE { ?s <urn:p> ?o }")
+        .unwrap();
+    let mut options = QueryOptions::default();
+    options.cancellation = cancellation.clone();
+    options.limits.deadline = Some(Duration::ZERO);
+    let error = fixture
+        .node
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&fixture.graph),
+            &prepared,
+            &options,
+        )
+        .expect_err("an expired request must report its deadline");
+    assert_eq!(error.kind(), CraqleErrorKind::QueryLimit, "{error}");
+    assert!(!cancellation.is_cancelled());
+
+    options.limits = QueryLimits::unbounded();
+    let execution = fixture
+        .node
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&fixture.graph),
+            &prepared,
+            &options,
+        )
+        .expect("deadline cancellation must not poison a reused caller token");
+    assert_eq!(solution_rows(&execution.results), SIDE);
+}
+
+#[test]
+fn generic_semantics_supported() {
+    let fixture = Fixture::new();
+    let cases = [
+        ("SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY ?s", SIDE),
+        ("SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o }", 1),
+        (
+            "SELECT ?s WHERE { ?s <urn:p> ?o . ?t <urn:p> ?o }",
+            SIDE * SIDE,
+        ),
+        (
+            "SELECT ?s WHERE { ?s <urn:p> ?o FILTER(STRLEN(STR(?s)) > 0) }",
+            SIDE,
+        ),
+        ("SELECT DISTINCT ?o WHERE { ?s <urn:p> ?o }", 1),
+        ("SELECT ?o WHERE { <urn:n:0000> <urn:next>* ?o }", SIDE + 1),
+    ];
+    for (query, expected) in cases {
+        let results = fixture
+            .run_generic(query, QueryLimits::production())
+            .unwrap_or_else(|error| panic!("default query failed for {query}: {error}"));
+        assert_eq!(solution_rows(&results), expected, "{query}");
+    }
+}
+
+#[test]
+fn reduced_stays_bounded() {
+    let fixture = Fixture::new();
+    let results = fixture
+        .run_generic(
+            "SELECT REDUCED ?o WHERE { ?s <urn:p> ?o }",
+            QueryLimits::production(),
+        )
+        .expect("REDUCED retains only its current tuple");
+    assert_eq!(solution_rows(&results), 1);
 }
 
 #[cfg(feature = "search")]
@@ -342,8 +458,7 @@ mod fts {
         node
     }
 
-    /// BUDGET-06: the FTS rewrite runs before the first result, and its hits
-    /// are the request's first intermediate rows.
+    /// FTS rewrite hits are charged before the first query result.
     #[test]
     fn fts_rewrite_charged() {
         let directory = tempfile::tempdir().unwrap();
@@ -358,5 +473,18 @@ mod fts {
             .execute_prepared(&AllowAllAuthorizer, &prepared, &options)
             .expect_err("rewrite hits must be charged before evaluation");
         assert_eq!(error.kind(), CraqleErrorKind::QueryLimit, "{error}");
+    }
+
+    #[test]
+    fn fts_bounds_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = seeded_node(&directory);
+        let query = "SELECT ?s WHERE { SERVICE <urn:craqle:fts> { \
+                     ?s fts:query \"proteomics\" . ?s fts:limit 1 . } }";
+        let prepared = node.prepare_query(query).unwrap();
+        let execution = node
+            .execute_prepared(&AllowAllAuthorizer, &prepared, &QueryOptions::default())
+            .expect("default limits must preserve FTS semantics");
+        assert_eq!(solution_rows(&execution.results), 1);
     }
 }

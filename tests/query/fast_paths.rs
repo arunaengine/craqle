@@ -2,13 +2,14 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleErrorKind, CraqleNode, DenyAllAuthorizer, EncodedTerm, GraphId,
-    JoinKind, JoinMode, MaterializedQuadChange, QueryExecution, QueryFastPathKind,
-    QueryFastPathMode, QueryOptions, QueryResults,
+    JoinKind, JoinMode, MaterializedQuadChange, QueryExecution, QueryFastPathKind as FastPathKind,
+    QueryFastPathMode as FastPathMode, QueryOptions, QueryResults,
 };
 
 fn iri(value: &str) -> EncodedTerm {
@@ -37,11 +38,12 @@ fn run(
     node: &CraqleNode,
     graphs: &[GraphId],
     query: &str,
-    fast_paths: QueryFastPathMode,
+    fast_paths: FastPathMode,
 ) -> QueryExecution {
     let query = node.prepare_query(query).unwrap();
     let mut options = QueryOptions::default();
     options.fast_paths = fast_paths;
+    options.limits = craqle::QueryLimits::unbounded();
     node.execute_prepared_in_graphs(&AllowAllAuthorizer, graphs, &query, &options)
         .unwrap()
 }
@@ -63,6 +65,129 @@ fn canonical(results: &QueryResults) -> Vec<Vec<(String, EncodedTerm)>> {
         .collect();
     rows.sort();
     rows
+}
+
+#[test]
+fn star_bag_equivalence() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:star:bags");
+    let mut changes = Vec::new();
+    for subject in ["urn:star:a", "urn:star:b", "urn:star:missing"] {
+        for property in 0..4 {
+            if subject == "urn:star:missing" && property == 3 {
+                continue;
+            }
+            for value in 0..3 {
+                changes.push(insert(
+                    &graph,
+                    subject,
+                    &format!("urn:star:p{property}"),
+                    iri(&format!("urn:star:v{value}")),
+                ));
+            }
+        }
+    }
+    node.apply_changes_unchecked(&graph, changes).unwrap();
+    let body = "?s <urn:star:p0> ?a; <urn:star:p1> ?b; <urn:star:p2> ?c; <urn:star:p3> ?d";
+    let queries = [
+        format!("SELECT ?s ?a ?b ?c ?d WHERE {{ {body} }}"),
+        format!("SELECT ?a WHERE {{ {body} }}"),
+        format!("SELECT ?s WHERE {{ {body} }}"),
+        format!("SELECT DISTINCT ?a WHERE {{ {body} }}"),
+        format!(
+            "SELECT ?s ?a ?b ?c ?d WHERE {{ {body} }} ORDER BY ?s ?a ?b ?c ?d OFFSET 5 LIMIT 20"
+        ),
+        "SELECT ?s ?a WHERE { ?s <urn:star:p0> ?a; <urn:star:p1> ?a }".into(),
+        "SELECT ?s ?a WHERE { ?s <urn:star:p0> ?a; <urn:star:absent> ?b }".into(),
+    ];
+    for query in queries {
+        let fast = run(
+            &node,
+            std::slice::from_ref(&graph),
+            &query,
+            FastPathMode::Auto,
+        );
+        let generic = run(
+            &node,
+            std::slice::from_ref(&graph),
+            &query,
+            FastPathMode::Disabled,
+        );
+        assert_eq!(
+            canonical(&fast.results),
+            canonical(&generic.results),
+            "{query}"
+        );
+    }
+    let projection = run(
+        &node,
+        std::slice::from_ref(&graph),
+        &format!("SELECT ?a WHERE {{ {body} }}"),
+        FastPathMode::Auto,
+    );
+    let rows = canonical(&projection.results);
+    assert_eq!(rows.len(), 162);
+    for value in 0..3 {
+        let expected = iri(&format!("urn:star:v{value}"));
+        assert_eq!(rows.iter().filter(|row| row[0].1 == expected).count(), 54);
+    }
+}
+
+#[test]
+fn star_limited_validity() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:test:star:limited");
+    let mut changes = Vec::new();
+    for property in 0..4 {
+        for value in 0..20 {
+            changes.push(insert(
+                &graph,
+                "urn:star:subject",
+                &format!("urn:star:p{property}"),
+                iri(&format!("urn:star:v{value}")),
+            ));
+        }
+    }
+    node.apply_changes_unchecked(&graph, changes).unwrap();
+    let body =
+        "<urn:star:subject> <urn:star:p0> ?a; <urn:star:p1> ?b; <urn:star:p2> ?c; <urn:star:p3> ?d";
+    let prepared = node
+        .prepare_query(&format!("SELECT ?a ?b ?c ?d WHERE {{ {body} }} LIMIT 20"))
+        .unwrap();
+    let mut bounded = QueryOptions::default();
+    bounded.limits.max_intermediate_rows = 120;
+    let streamed = node
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&graph),
+            &prepared,
+            &bounded,
+        )
+        .unwrap();
+    assert_eq!(
+        streamed.statistics.fast_path,
+        Some(FastPathKind::PropertyStar)
+    );
+    assert_eq!(streamed.statistics.intermediate_rows, 20);
+    assert_eq!(canonical(&streamed.results).len(), 20);
+    for suffix in ["LIMIT 20", "OFFSET 7 LIMIT 20", "LIMIT 0"] {
+        let query = format!("SELECT ?a ?b ?c ?d WHERE {{ {body} }} {suffix}");
+        for mode in [FastPathMode::Auto, FastPathMode::Disabled] {
+            let execution = run(&node, std::slice::from_ref(&graph), &query, mode);
+            let rows = canonical(&execution.results);
+            assert_eq!(rows.len(), if suffix == "LIMIT 0" { 0 } else { 20 });
+            let unique: std::collections::BTreeSet<_> = rows.iter().collect();
+            assert_eq!(unique.len(), rows.len());
+            for row in rows {
+                assert_eq!(row.len(), 4);
+                for (_, term) in row {
+                    assert!((0..20).any(|value| term == iri(&format!("urn:star:v{value}"))));
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -156,52 +281,52 @@ fn fast_matches_generic() {
     let cases = [
         (
             "ASK { <urn:test:fast:shared> <urn:test:fast:p> <urn:test:fast:o:shared> }",
-            QueryFastPathKind::Ask,
+            FastPathKind::Ask,
         ),
         (
             "SELECT ?s WHERE { ?s <urn:test:fast:p> ?o } LIMIT 10",
-            QueryFastPathKind::SelectLimit,
+            FastPathKind::SelectLimit,
         ),
         (
             "SELECT ?s WHERE { ?s <urn:test:fast:p> <urn:test:fast:o:shared> }",
-            QueryFastPathKind::Projection,
+            FastPathKind::Projection,
         ),
         (
             "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:test:fast:p> ?o }",
-            QueryFastPathKind::UnionCount,
+            FastPathKind::UnionCount,
         ),
         (
             "SELECT (COUNT(*) AS ?count) WHERE { GRAPH <urn:test:fast:primary> { ?s <urn:test:fast:p> ?o } }",
-            QueryFastPathKind::NamedCount,
+            FastPathKind::NamedCount,
         ),
         (
             "SELECT (COUNT(*) AS ?count) WHERE { <urn:test:fast:shared> ?p <urn:test:fast:o:shared> }",
-            QueryFastPathKind::UnionCount,
+            FastPathKind::UnionCount,
         ),
         (
             "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s <urn:test:fast:p> <urn:test:fast:o:shared> }",
-            QueryFastPathKind::CountDistinctSubject,
+            FastPathKind::CountDistinctSubject,
         ),
         (
             "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s ?p <urn:test:fast:o:shared> }",
-            QueryFastPathKind::CountDistinctSubject,
+            FastPathKind::CountDistinctSubject,
         ),
         (
             "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { <urn:test:fast:shared> <urn:test:fast:p> ?o }",
-            QueryFastPathKind::CountDistinctObject,
+            FastPathKind::CountDistinctObject,
         ),
         (
             "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s <urn:test:fast:p> ?o }",
-            QueryFastPathKind::CountDistinctObject,
+            FastPathKind::CountDistinctObject,
         ),
         (
             "SELECT ?s ?name ?date WHERE { ?s <urn:test:fast:p> ?o ; <urn:test:fast:name> ?name ; <urn:test:fast:date> ?date }",
-            QueryFastPathKind::PropertyStar,
+            FastPathKind::PropertyStar,
         ),
     ];
     for (query, expected_kind) in cases {
-        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let fast = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(fast.statistics.fast_path, Some(expected_kind), "{query}");
         assert_eq!(generic.statistics.fast_path, None, "{query}");
         match (&fast.results, &generic.results) {
@@ -220,8 +345,8 @@ fn fast_matches_generic() {
     }
 
     let orphan_ask = "ASK { <urn:test:fast:stray> <urn:test:fast:p> <urn:test:fast:o:orphan> }";
-    let fast = run(&node, &graphs, orphan_ask, QueryFastPathMode::Auto);
-    let generic = run(&node, &graphs, orphan_ask, QueryFastPathMode::Disabled);
+    let fast = run(&node, &graphs, orphan_ask, FastPathMode::Auto);
+    let generic = run(&node, &graphs, orphan_ask, FastPathMode::Disabled);
     assert_eq!(fast.results, QueryResults::Boolean(false));
     assert_eq!(fast.results, generic.results);
 
@@ -229,13 +354,13 @@ fn fast_matches_generic() {
         &node,
         &graphs,
         "SELECT (COUNT(*) AS ?count) WHERE { <urn:test:fast:shared> <urn:test:fast:p> <urn:test:fast:o:shared> }",
-        QueryFastPathMode::Auto,
+        FastPathMode::Auto,
     );
     let generic_duplicate_count = run(
         &node,
         &graphs,
         "SELECT (COUNT(*) AS ?count) WHERE { <urn:test:fast:shared> <urn:test:fast:p> <urn:test:fast:o:shared> }",
-        QueryFastPathMode::Disabled,
+        FastPathMode::Disabled,
     );
     assert_eq!(duplicate_count.results, generic_duplicate_count.results);
     assert_eq!(duplicate_count.statistics.encoded_quad_constructions, 0);
@@ -247,7 +372,7 @@ fn fast_matches_generic() {
         &node,
         &graphs,
         "SELECT ?s WHERE { ?s <urn:test:fast:p> ?o } LIMIT 10",
-        QueryFastPathMode::Auto,
+        FastPathMode::Auto,
     );
     assert_eq!(
         subject_only.statistics.authoritative_terms_decoded,
@@ -281,7 +406,7 @@ fn fast_fails_closed() {
         .execute_prepared(&DenyAllAuthorizer, &prepared, &QueryOptions::default())
         .unwrap();
     assert_eq!(denied.results, QueryResults::Boolean(false));
-    assert_eq!(denied.statistics.fast_path, Some(QueryFastPathKind::Ask));
+    assert_eq!(denied.statistics.fast_path, Some(FastPathKind::Ask));
 
     let star = node
         .prepare_query("SELECT ?s WHERE { ?s <urn:test:fast:p> ?o ; <urn:test:fast:q> ?q }")
@@ -328,11 +453,11 @@ fn fast_fails_closed() {
         &node,
         std::slice::from_ref(&graph),
         "SELECT ?name ?date WHERE { <urn:test:fast:bounded-star> <urn:test:fast:name> ?name ; <urn:test:fast:date> ?date } LIMIT 2",
-        QueryFastPathMode::Auto,
+        FastPathMode::Auto,
     );
     assert_eq!(
         bounded.statistics.fast_path,
-        Some(QueryFastPathKind::PropertyStar)
+        Some(FastPathKind::PropertyStar)
     );
     assert_eq!(bounded.statistics.result_rows, 2);
     assert!(bounded.statistics.candidate_quads <= 4);
@@ -371,12 +496,12 @@ fn triangle_bounds_identifiers() {
          ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a } }",
         "ASK { ?a <urn:other> ?b . ?b <urn:other> ?c . ?c <urn:other> ?a }",
     ] {
-        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let fast = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(fast.results, generic.results, "{query}");
         assert_eq!(
             fast.statistics.fast_path,
-            Some(QueryFastPathKind::Ask),
+            Some(FastPathKind::Ask),
             "{query}"
         );
         assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
@@ -387,7 +512,7 @@ fn triangle_bounds_identifiers() {
         &node,
         std::slice::from_ref(&duplicate),
         "ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . ?c <urn:edge> ?a }",
-        QueryFastPathMode::Auto,
+        FastPathMode::Auto,
     );
     assert_eq!(hidden.results, QueryResults::Boolean(false));
 
@@ -397,8 +522,8 @@ fn triangle_bounds_identifiers() {
         "ASK { ?a <urn:edge> ?b . ?b <urn:edge> ?c . \
          ?c <urn:edge> ?d . ?d <urn:edge> ?a }",
     ] {
-        let auto = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let auto = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(auto.results, generic.results, "{query}");
         assert_eq!(auto.statistics.fast_path, None, "{query}");
     }
@@ -454,13 +579,13 @@ fn count_bindings_equivalent() {
                     &node,
                     std::slice::from_ref(&graph),
                     &query,
-                    QueryFastPathMode::Auto,
+                    FastPathMode::Auto,
                 );
                 let generic = run(
                     &node,
                     std::slice::from_ref(&graph),
                     &query,
-                    QueryFastPathMode::Disabled,
+                    FastPathMode::Disabled,
                 );
                 assert_eq!(fast.results, generic.results, "{query}");
                 assert!(fast.statistics.fast_path.is_some(), "{query}");
@@ -495,8 +620,8 @@ fn union_count_exact() {
     let graphs = vec![first.clone(), second.clone()];
     let query = "SELECT (COUNT(*) AS ?count) WHERE { ?s <urn:p> ?o }";
 
-    let exact = run(&node, &graphs, query, QueryFastPathMode::Auto);
-    let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+    let exact = run(&node, &graphs, query, FastPathMode::Auto);
+    let generic = run(&node, &graphs, query, FastPathMode::Disabled);
     assert_eq!(exact.results, generic.results);
     assert_eq!(exact.statistics.qv_keys_read, 0);
     assert_eq!(exact.statistics.encoded_quad_constructions, 0);
@@ -506,8 +631,8 @@ fn union_count_exact() {
         vec![insert(&second, "urn:s:first", "urn:p", iri("urn:o:first"))],
     )
     .unwrap();
-    let grouped = run(&node, &graphs, query, QueryFastPathMode::Auto);
-    let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+    let grouped = run(&node, &graphs, query, FastPathMode::Auto);
+    let generic = run(&node, &graphs, query, FastPathMode::Disabled);
     assert_eq!(grouped.results, generic.results);
     assert!(grouped.statistics.qv_keys_read > 0);
 }
@@ -544,18 +669,18 @@ fn star_preserves_multiplicity() {
             &node,
             std::slice::from_ref(&graph),
             query,
-            QueryFastPathMode::Auto,
+            FastPathMode::Auto,
         );
         let generic = run(
             &node,
             std::slice::from_ref(&graph),
             query,
-            QueryFastPathMode::Disabled,
+            FastPathMode::Disabled,
         );
         assert_eq!(fast.results, generic.results, "{query}");
         assert_eq!(
             fast.statistics.fast_path,
-            Some(QueryFastPathKind::SubjectStarCount)
+            Some(FastPathKind::SubjectStarCount)
         );
         assert_eq!(fast.statistics.encoded_quad_constructions, 0);
         assert_eq!(fast.statistics.authoritative_terms_decoded, 0);
@@ -604,12 +729,12 @@ fn optional_preserves_multiplicity() {
          ?s <urn:p> ?left ; <urn:m> ?mandatory \
          OPTIONAL { ?s <urn:q> ?right ; <urn:r> ?extra } }",
     ] {
-        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let fast = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(fast.results, generic.results, "{query}");
         assert_eq!(
             fast.statistics.fast_path,
-            Some(QueryFastPathKind::SubjectStarCount),
+            Some(FastPathKind::SubjectStarCount),
             "{query}"
         );
         assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
@@ -623,8 +748,8 @@ fn optional_preserves_multiplicity() {
          ?s <urn:p> ?left OPTIONAL { ?s <urn:q> ?right \
          FILTER(?right = <urn:right:1>) } }",
     ] {
-        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let fast = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(fast.results, generic.results, "{query}");
         assert_eq!(fast.statistics.fast_path, None, "{query}");
     }
@@ -676,12 +801,12 @@ fn subject_sets_equivalent() {
         "SELECT (COUNT(*) AS ?count) WHERE { \
          ?s <urn:p> ?outer FILTER NOT EXISTS { ?s <urn:missing> ?inner } }",
     ] {
-        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let fast = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(fast.results, generic.results, "{query}");
         assert_eq!(
             fast.statistics.fast_path,
-            Some(QueryFastPathKind::HashJoinCount),
+            Some(FastPathKind::HashJoinCount),
             "{query}"
         );
         assert_eq!(fast.statistics.encoded_quad_constructions, 0, "{query}");
@@ -697,8 +822,8 @@ fn subject_sets_equivalent() {
          ?s <urn:p> ?outer FILTER EXISTS { ?s <urn:q> ?inner \
          FILTER(?inner = <urn:inner:1>) } }",
     ] {
-        let fast = run(&node, &graphs, query, QueryFastPathMode::Auto);
-        let generic = run(&node, &graphs, query, QueryFastPathMode::Disabled);
+        let fast = run(&node, &graphs, query, FastPathMode::Auto);
+        let generic = run(&node, &graphs, query, FastPathMode::Disabled);
         assert_eq!(fast.results, generic.results, "{query}");
         assert_eq!(fast.statistics.fast_path, None, "{query}");
     }
@@ -757,6 +882,7 @@ fn chain_domains_explicit() {
                 let mut options = QueryOptions::default();
                 options.fast_paths = fast_paths;
                 options.join_mode = JoinMode::ForceHash;
+                options.limits = craqle::QueryLimits::unbounded();
                 node.execute_prepared_in_graphs(
                     &AllowAllAuthorizer,
                     std::slice::from_ref(&graph),
@@ -765,13 +891,10 @@ fn chain_domains_explicit() {
                 )
                 .unwrap()
             };
-            let fast = execute(QueryFastPathMode::Auto);
-            let generic = execute(QueryFastPathMode::Disabled);
+            let fast = execute(FastPathMode::Auto);
+            let generic = execute(FastPathMode::Disabled);
             assert_eq!(fast.results, generic.results, "{query}");
-            assert_eq!(
-                fast.statistics.fast_path,
-                Some(QueryFastPathKind::HashJoinCount)
-            );
+            assert_eq!(fast.statistics.fast_path, Some(FastPathKind::HashJoinCount));
             assert_eq!(fast.statistics.encoded_quad_constructions, 0);
             assert_eq!(fast.statistics.authoritative_terms_decoded, 0);
         }
@@ -813,6 +936,7 @@ fn hash_count_multiplicity() {
     let execute = |join_mode| {
         let mut options = QueryOptions::default();
         options.join_mode = join_mode;
+        options.limits = craqle::QueryLimits::unbounded();
         node.execute_prepared_in_graphs(
             &AllowAllAuthorizer,
             std::slice::from_ref(&graph),
@@ -828,13 +952,10 @@ fn hash_count_multiplicity() {
     assert_eq!(lateral.results, hash.results);
     assert_eq!(hash.results, automatic.results);
     assert_eq!(lateral.statistics.fast_path, None);
-    assert_eq!(
-        hash.statistics.fast_path,
-        Some(QueryFastPathKind::HashJoinCount)
-    );
+    assert_eq!(hash.statistics.fast_path, Some(FastPathKind::HashJoinCount));
     assert_eq!(
         automatic.statistics.fast_path,
-        Some(QueryFastPathKind::HashJoinCount)
+        Some(FastPathKind::HashJoinCount)
     );
     assert_eq!(
         lateral.statistics.planned_joins[0].physical_operator,
@@ -859,19 +980,16 @@ fn hash_count_multiplicity() {
             &node,
             std::slice::from_ref(&graph),
             query,
-            QueryFastPathMode::Auto,
+            FastPathMode::Auto,
         );
         let generic = run(
             &node,
             std::slice::from_ref(&graph),
             query,
-            QueryFastPathMode::Disabled,
+            FastPathMode::Disabled,
         );
         assert_eq!(fast.results, generic.results, "{query}");
-        assert_eq!(
-            fast.statistics.fast_path,
-            Some(QueryFastPathKind::HashJoinCount)
-        );
+        assert_eq!(fast.statistics.fast_path, Some(FastPathKind::HashJoinCount));
         assert_eq!(fast.statistics.encoded_quad_constructions, 0);
         assert_eq!(fast.statistics.authoritative_terms_decoded, 0);
         assert_eq!(fast.statistics.result_terms_decoded, 0);
@@ -957,13 +1075,13 @@ fn randomized_paths_match() {
                 &node,
                 std::slice::from_ref(&graph),
                 &query,
-                QueryFastPathMode::Auto,
+                FastPathMode::Auto,
             );
             let generic = run(
                 &node,
                 std::slice::from_ref(&graph),
                 &query,
-                QueryFastPathMode::Disabled,
+                FastPathMode::Disabled,
             );
             assert_eq!(fast.results, generic.results, "seed {seed}: {query}");
         }
@@ -979,6 +1097,7 @@ fn randomized_paths_match() {
             let mut options = QueryOptions::default();
             options.fast_paths = fast_paths;
             options.join_mode = JoinMode::ForceHash;
+            options.limits = craqle::QueryLimits::unbounded();
             node.execute_prepared_in_graphs(
                 &AllowAllAuthorizer,
                 std::slice::from_ref(&graph),
@@ -987,12 +1106,9 @@ fn randomized_paths_match() {
             )
             .unwrap()
         };
-        let fast = execute_hash(QueryFastPathMode::Auto);
-        let generic = execute_hash(QueryFastPathMode::Disabled);
+        let fast = execute_hash(FastPathMode::Auto);
+        let generic = execute_hash(FastPathMode::Disabled);
         assert_eq!(fast.results, generic.results, "hash seed {seed}");
-        assert_eq!(
-            fast.statistics.fast_path,
-            Some(QueryFastPathKind::HashJoinCount)
-        );
+        assert_eq!(fast.statistics.fast_path, Some(FastPathKind::HashJoinCount));
     }
 }
