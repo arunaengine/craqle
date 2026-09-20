@@ -9318,6 +9318,24 @@ impl GraphStore {
         Ok(())
     }
 
+    pub(crate) fn ensure_reindex(&self, graph: &GraphId) -> Result<(u64, bool)> {
+        let graph_id = self
+            .graph_id_for(graph)?
+            .ok_or_else(|| StoreError::GraphNotFound(graph.to_string()))?;
+        let _queue = self.fts_queue_guard();
+        let key = graph_reindex_key(graph_id);
+        if let Some(value) = self.graphs.get(key)? {
+            let tokens = decode_dirty_tokens(value.as_ref(), "graph reindex tokens")?;
+            return Ok((tokens.latest, false));
+        }
+        let mut batch = self.buffered_batch();
+        let token = self.stage_fts_entry(&mut batch, FtsQueueKey::Reindex(graph_id))?;
+        batch.insert(&self.search_meta, SEARCH_HEAD_KEY, token.to_be_bytes());
+        self.commit_fjall_batch(batch)?;
+        self.dirty_committed.fetch_max(token, Ordering::SeqCst);
+        Ok((token, true))
+    }
+
     #[cfg(test)]
     pub(crate) fn drain_fts_queue(&self, limit: usize) -> Result<Vec<DirtySubject>> {
         let mut result = Vec::new();

@@ -132,11 +132,12 @@ mod tests {
 
     #[test]
     fn service_returns_limit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let node = seeded_node(&tmp);
+        with_watchdog("service_returns_limit", || {
+            let tmp = tempfile::tempdir().unwrap();
+            let node = seeded_node(&tmp);
 
-        let sparql = format!(
-            r#"
+            let sparql = format!(
+                r#"
             SELECT ?s ?g
             WHERE {{
                 SERVICE <urn:craqle:fts> {{
@@ -146,23 +147,24 @@ mod tests {
                 }}
             }}
             "#
-        );
+            );
 
-        let graphs = fts_graph_rows(&node, &sparql);
-        assert_eq!(
-            graphs.len(),
-            FTS_LIMIT,
-            "FTS SERVICE under-returned authorized hits: {} of {FTS_LIMIT}",
-            graphs.len()
-        );
+            let graphs = fts_graph_rows(&node, &sparql);
+            assert_eq!(
+                graphs.len(),
+                FTS_LIMIT,
+                "FTS SERVICE under-returned authorized hits: {} of {FTS_LIMIT}",
+                graphs.len()
+            );
 
-        // Soundness is not traded for completeness.
-        assert!(
-            graphs
-                .iter()
-                .all(|graph| graph.starts_with("<urn:fts:readable:")),
-            "unreadable graph leaked into FTS results"
-        );
+            // Soundness is not traded for completeness.
+            assert!(
+                graphs
+                    .iter()
+                    .all(|graph| graph.starts_with("<urn:fts:readable:")),
+                "unreadable graph leaked into FTS results"
+            );
+        });
     }
 
     /// Oversized SERVICE limits must return a typed error before collector allocation.

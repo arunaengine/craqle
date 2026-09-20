@@ -2407,6 +2407,13 @@ impl SearchIndex {
                 continue;
             }
             if rebuild_pending && self.active_generation(entry.graph.as_str()).is_none() {
+                let (recovery, queued) = pass.store.ensure_reindex(&entry.graph)?;
+                pass.progress.recovery = Some(
+                    pass.progress
+                        .recovery
+                        .map_or(recovery, |current| current.max(recovery)),
+                );
+                pass.advanced |= queued;
                 pass.progress.remaining = true;
                 continue;
             }
@@ -3463,6 +3470,116 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(prepared, PreparedDocOp::Delete { .. }));
+    }
+
+    #[test]
+    fn rebuild_recovers_late() {
+        let dir = tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let search = SearchIndex::open_in_memory().unwrap();
+        search.bind_store(&store).unwrap();
+        let initial = store
+            .queue_search_rebuild(&RebuildScan {
+                index_id: search.index_id,
+                row_limit: 1,
+                byte_limit: search.work_bytes(),
+            })
+            .unwrap();
+        assert!(!initial.remaining);
+
+        let graph = GraphId::new("urn:test:late-rebuild-graph");
+        store.create_graph(&graph).unwrap();
+        let graph_tid = graph_term(&store, &graph);
+        let subject = graph_tid;
+        let predicate = store
+            .encode_term(&EncodedTerm::from_named_node(&crate::vocab::schema_name()))
+            .unwrap();
+        let object = store
+            .encode_term(&EncodedTerm("\"late rebuild needle\"".to_string()))
+            .unwrap();
+        let actor = crate::ActorId::from_bytes([42; 32]);
+        let mut clock = crate::VectorClock::new();
+        clock.advance(actor, 1);
+        let mut batch = store.new_batch();
+        store
+            .insert_quad(
+                &mut batch,
+                crate::store::QuadAdd {
+                    quad: crate::store::EncodedQuad {
+                        graph: graph_tid,
+                        subject,
+                        predicate,
+                        object,
+                    },
+                    dot: crate::Dot { actor, counter: 1 },
+                },
+            )
+            .unwrap();
+        store
+            .set_vector_clock(
+                &mut batch,
+                crate::store::ClockUpdate {
+                    graph_id: graph_tid,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store
+            .enqueue_fts(
+                &mut batch,
+                crate::store::FtsSubject {
+                    graph_id: graph_tid,
+                    subject,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        store
+            .set_graph_diagnostics(&graph, &crate::GraphDiagnostics::default())
+            .unwrap();
+
+        let mut target = store.current_dirty_token();
+        let mut completed = false;
+        for _ in 0..8 {
+            let progress = search
+                .drain_queues(
+                    &store,
+                    DrainRequest {
+                        bound: QueueBound {
+                            chunk: 50,
+                            max_token: Some(target),
+                        },
+                        control: DrainControl::default(),
+                    },
+                )
+                .unwrap();
+            if let Some(recovery) = progress.recovery {
+                target = target.max(recovery);
+            }
+            if store
+                .search_stage(&GenerationRequest {
+                    index_id: search.index_id,
+                    graph: graph.clone(),
+                })
+                .unwrap()
+                .is_none()
+                && search.active_generation(graph.as_str()).is_none()
+            {
+                let before = store.current_dirty_token();
+                assert_eq!((before, false), store.ensure_reindex(&graph).unwrap());
+                assert_eq!(before, store.current_dirty_token());
+            }
+            if !progress.remaining {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "late graph debt made no rebuild progress");
+        search.complete_coverage(&store, target).unwrap();
+        assert!(store.search_coverage().unwrap().unwrap().rebuild.is_none());
+        let hits = search.search("late rebuild needle", 10).unwrap();
+        assert_eq!(1, hits.len());
+        assert_eq!(graph.as_str(), hits[0].graph_id);
     }
 
     #[test]
