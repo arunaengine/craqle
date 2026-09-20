@@ -2498,7 +2498,7 @@ impl SearchIndex {
     fn apply_prepared_op(&self, writer: &mut IndexWriter, op: &PreparedDocOp) -> Result<()> {
         match op {
             PreparedDocOp::Delete { doc } => {
-                self.delete_resource_with_writer(writer, &doc.graph_iri, &doc.subject_iri);
+                self.delete_doc(writer, doc);
                 Ok(())
             }
             PreparedDocOp::Upsert { doc, all_text } => self.add_document(
@@ -2506,6 +2506,7 @@ impl SearchIndex {
                 ResourceDoc {
                     graph_id: &doc.graph_iri,
                     subject_iri: &doc.subject_iri,
+                    generation: doc.generation,
                     all_text: all_text.as_deref(),
                     delete_existing: true,
                 },
@@ -2513,87 +2514,318 @@ impl SearchIndex {
         }
     }
 
-    /// Reindex all entities in a graph from the RDF store.
-    ///
-    /// Scans the store for triples with searchable predicates, groups them by
-    /// subject, and indexes each subject as a document.
-    ///
-    /// Returns the number of entities indexed.
-    pub fn reindex_from_store(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
-        // Held across the clear, the scan and the refill, or a concurrent
-        // upsert is duplicated by the refill or overwritten by the scan.
-        let _rebuild = self.lock_graph(graph.as_str());
-        self.reindex_locked(store, graph)
-    }
+    fn stage_graph(&self, work: GraphWork<'_>, target: u64) -> Result<StageOutcome> {
+        let request = GenerationRequest {
+            index_id: self.index_id,
+            graph: work.graph.clone(),
+        };
+        let current = work.store.search_generation(&request)?;
+        let prior = work.store.search_stage(&request)?;
+        if current.active.is_some() && current.covered >= target {
+            self.set_generation(work.graph.as_str(), current.active);
+            return Ok(StageOutcome::Covered(target));
+        }
 
-    /// The caller MUST hold this graph's rebuild shard.
-    fn reindex_locked(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
-        let graph_iri = graph.as_str();
-        let graph_term = EncodedTerm::from_named_node(&graph.0);
-        let graph_tid = match store.lookup_term(&graph_term)? {
-            Some(tid) => tid,
-            None => return Ok(0),
+        let graph_term = EncodedTerm::from_named_node(&work.graph.0);
+        let Some(graph_tid) = work.store.lookup_term(&graph_term)? else {
+            let stage = work.store.search_stage(&request)?;
+            let switched =
+                work.store
+                    .delete_search_graph(&crate::search::queue::DeleteGeneration {
+                        index_id: self.index_id,
+                        graph: work.graph.clone(),
+                        covered: target,
+                    })?;
+            if let Some(stage) = stage {
+                self.stage_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&stage.generation);
+            }
+            self.apply_switch(&switched);
+            self.delete_documents_locked(work.graph.as_str())?;
+            self.commit()?;
+            return Ok(StageOutcome::Covered(target));
+        };
+        let stage_target = prior.as_ref().map_or(target, |job| job.target);
+        let mut job = work.store.begin_search_stage(&StageRequest {
+            index_id: self.index_id,
+            graph: work.graph.clone(),
+            target: stage_target,
+            session: self.session,
+        })?;
+        if let Some(prior) = prior.filter(|prior| prior.generation != job.generation) {
+            self.stage_sources
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&prior.generation);
+        }
+        if job.complete {
+            return self.switch_stage(work.store, &job);
+        }
+        if job.session != self.session {
+            return Err(SearchError::Store(
+                crate::store::StoreError::InvalidSearchState("stage-session-mismatch"),
+            ));
+        }
+        let work_limit = work.byte_limit.min(self.work_bytes());
+        let source = {
+            let sources = self
+                .stage_sources
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            sources.get(&job.generation).cloned()
+        };
+        let (source, source_bytes) = match source {
+            Some(source) => (source, 0),
+            None => {
+                let snapshot = work.store.search_snapshot();
+                let mut sources = self
+                    .stage_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let source_limit = work_limit / 2;
+                if source_limit < STAGE_SOURCE_BYTES {
+                    return Err(SearchError::ItemTooLarge {
+                        bytes: STAGE_SOURCE_BYTES,
+                        limit: source_limit,
+                    });
+                }
+                let artifact_limit = source_limit / 32;
+                let orphaned = match snapshot.orphaned_ids(graph_tid, artifact_limit) {
+                    Ok(orphaned) => orphaned,
+                    Err(crate::store::StoreError::LimitExceeded {
+                        resource: "search diagnostics rows",
+                        limit,
+                        actual,
+                    }) => {
+                        return Err(SearchError::SourceTooLarge {
+                            rows: usize::try_from(actual).unwrap_or(usize::MAX),
+                            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                        });
+                    }
+                    Err(crate::store::StoreError::LimitExceeded { limit, actual, .. }) => {
+                        return Err(SearchError::ItemTooLarge {
+                            bytes: usize::try_from(actual).unwrap_or(usize::MAX),
+                            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let bytes = STAGE_SOURCE_BYTES.saturating_add(
+                    orphaned
+                        .len()
+                        .saturating_mul(std::mem::size_of::<TermId>() * 4),
+                );
+                if bytes > source_limit {
+                    return Err(SearchError::ItemTooLarge {
+                        bytes,
+                        limit: source_limit,
+                    });
+                }
+                let source = Arc::new(StageSource {
+                    snapshot,
+                    orphaned,
+                    bytes,
+                });
+                sources.insert(job.generation, source.clone());
+                (source, bytes)
+            }
         };
 
-        let orphaned = orphaned_subjects(store, graph)?;
-        let mut count = 0usize;
-        let mut current_subject: Option<TermId> = None;
-        let mut current_subject_iri = String::new();
-        let mut current_subject_visible = false;
-        let mut current_text = String::new();
-        let mut pending_documents = Vec::new();
-        {
-            // Guards the Tantivy writer for the whole-graph clear only.
-            let writer = self.writer()?;
-            writer.delete_term(Term::from_field_text(self.f_graph_id, graph_iri));
-            self.write_epoch.fetch_add(1, Ordering::SeqCst);
+        self.check_cancel(work.control)?;
+        let page_limit = work_limit.saturating_sub(source_bytes);
+        let page = source.snapshot.scan_graph(&GraphScan {
+            graph: graph_tid,
+            after: job.cursor,
+            row_limit: 1,
+            byte_limit: page_limit / 2,
+        })?;
+        if let Some(oversized) = page.oversized {
+            return Err(SearchError::ItemTooLarge {
+                bytes: oversized.bytes,
+                limit: oversized.limit,
+            });
         }
+        let Some(quad) = page.entries.first().copied() else {
+            job.complete = true;
+            work.store.finish_search_stage(&job)?;
+            #[cfg(test)]
+            self.hooks.stage.run();
+            self.check_cancel(work.control)?;
+            return self.switch_stage(work.store, &job);
+        };
+
+        let prepared = self.prepare_stage(StageSubject {
+            store: work.store,
+            source: &source,
+            graph: work.graph,
+            graph_tid,
+            subject: quad.subject,
+            generation: job.generation,
+            control: work.control,
+            byte_limit: page_limit.saturating_sub(page.bytes),
+        })?;
+        let indexed = usize::from(matches!(&prepared.op, PreparedDocOp::Upsert { .. }));
+        {
+            let mut writer = self.writer()?;
+            self.apply_prepared_op(&mut writer, &prepared.op)?;
+        }
+        self.commit()?;
+        #[cfg(test)]
+        self.hooks.page.run();
+        self.check_cancel(work.control)?;
+        job.cursor = Some(subject_cursor(graph_tid, quad.subject));
+        job.rows = job.rows.saturating_add(
+            u64::try_from(prepared.rows.saturating_add(page.rows)).unwrap_or(u64::MAX),
+        );
+        job.bytes = job.bytes.saturating_add(
+            u64::try_from(prepared.bytes.saturating_add(page.bytes)).unwrap_or(u64::MAX),
+        );
+        work.store.advance_search_stage(&job)?;
 
         #[cfg(test)]
         self.hooks.rebuild.run();
 
-        store.for_each_quad_in_graph::<SearchError, _>(graph_tid, |quad| {
-            if current_subject != Some(quad.subject) {
-                if current_subject_visible {
-                    pending_documents.push((
-                        std::mem::take(&mut current_subject_iri),
-                        (!current_text.is_empty()).then(|| std::mem::take(&mut current_text)),
-                    ));
-                    count += 1;
-                    if pending_documents.len() >= REINDEX_FLUSH_CHUNK {
-                        self.flush_pending_documents(graph_iri, &mut pending_documents)?;
-                    }
-                }
+        Ok(StageOutcome::Pending(indexed))
+    }
 
-                let subject_term = store.decode_term_arc(quad.subject)?;
-                current_subject_iri = term_to_string(&subject_term);
-                current_subject_visible = !orphaned.contains(&current_subject_iri);
-                current_text.clear();
-                current_subject = Some(quad.subject);
-            }
+    fn switch_stage(&self, store: &GraphStore, job: &StageJob) -> Result<StageOutcome> {
+        let switched = store.switch_search_stage(job)?;
+        self.stage_sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job.generation);
+        self.apply_switch(&switched);
+        #[cfg(test)]
+        self.hooks.switch.run();
+        Ok(StageOutcome::Covered(job.target))
+    }
 
-            if current_subject_visible {
-                let predicate_term = store.decode_term_arc(quad.predicate)?;
-                if !is_searchable_predicate(&predicate_term) {
-                    return Ok(());
-                }
-                let object_term = store.decode_term_arc(quad.object)?;
-                append_searchable_text(&mut current_text, &object_term);
-            }
-            Ok(())
-        })?;
-
-        if current_subject_visible {
-            pending_documents.push((
-                current_subject_iri,
-                (!current_text.is_empty()).then_some(current_text),
-            ));
-            count += 1;
+    fn prepare_stage(&self, req: StageSubject<'_>) -> Result<PreparedStage> {
+        let subject_term = req.store.decode_term_arc(req.subject)?;
+        let doc = DocIdentity {
+            graph_iri: req.graph.as_str().to_string(),
+            subject_iri: term_to_string(&subject_term),
+            generation: req.generation,
+        };
+        let identity_bytes = doc.graph_iri.len().saturating_add(doc.subject_iri.len());
+        if identity_bytes > req.byte_limit {
+            return Err(SearchError::ItemTooLarge {
+                bytes: identity_bytes,
+                limit: req.byte_limit,
+            });
+        }
+        let remaining = req.byte_limit.saturating_sub(identity_bytes);
+        let source_limit = remaining / 2;
+        let text_limit = remaining.saturating_sub(source_limit);
+        if req.source.orphaned.contains(&req.subject) {
+            return Ok(PreparedStage {
+                op: PreparedDocOp::Delete { doc },
+                rows: 0,
+                bytes: 0,
+            });
         }
 
-        self.flush_pending_documents(graph_iri, &mut pending_documents)?;
+        let mut all_text = String::new();
+        let mut after = None;
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        let mut found = false;
+        loop {
+            self.check_cancel(req.control)?;
+            let page = req.source.snapshot.scan_subject(&SubjectScan {
+                graph: req.graph_tid,
+                subject: req.subject,
+                after,
+                row_limit: SOURCE_PAGE_ROWS,
+                byte_limit: source_limit.saturating_sub(bytes),
+            })?;
+            if let Some(oversized) = page.oversized {
+                return Err(SearchError::ItemTooLarge {
+                    bytes: oversized.bytes,
+                    limit: oversized.limit,
+                });
+            }
+            found |= !page.entries.is_empty();
+            rows = rows.saturating_add(page.rows);
+            bytes = bytes.saturating_add(page.bytes);
+            for (predicate, object) in page.entries {
+                if is_searchable_predicate(&predicate) {
+                    append_searchable_text(&mut all_text, &object, text_limit)?;
+                }
+            }
+            if !page.remaining {
+                break;
+            }
+            if rows >= SOURCE_PAGE_ROWS {
+                return Err(SearchError::SourceTooLarge {
+                    rows: rows.saturating_add(1),
+                    limit: SOURCE_PAGE_ROWS,
+                });
+            }
+            if bytes >= source_limit {
+                return Err(SearchError::ItemTooLarge {
+                    bytes: bytes.saturating_add(1),
+                    limit: source_limit,
+                });
+            }
+            after = page.next;
+            if after.is_none() {
+                return Err(SearchError::Store(
+                    crate::store::StoreError::InvalidSearchState(
+                        "stage-subject-continuation-missing",
+                    ),
+                ));
+            }
+        }
+        let op = if found {
+            PreparedDocOp::Upsert {
+                doc,
+                all_text: (!all_text.is_empty()).then_some(all_text),
+            }
+        } else {
+            PreparedDocOp::Delete { doc }
+        };
+        Ok(PreparedStage { op, rows, bytes })
+    }
 
-        Ok(count)
+    /// Reindex searchable graph subjects from RDF source and return their count.
+    pub fn reindex_from_store(&self, store: &GraphStore, graph: &GraphId) -> Result<usize> {
+        let _work = self
+            .work_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let control = DrainControl::default();
+        let mut count = 0usize;
+        let graph_term = EncodedTerm::from_named_node(&graph.0);
+        if let Some(graph_tid) = store.lookup_term(&graph_term)? {
+            let mut batch = store.new_batch();
+            store.enqueue_fts_reindex(&mut batch, graph_tid)?;
+            store.commit(batch)?;
+        }
+        let target = store.current_dirty_token();
+        loop {
+            let outcome = {
+                let _rebuild = self.lock_graph(graph.as_str());
+                self.stage_graph(
+                    GraphWork {
+                        store,
+                        graph,
+                        control: &control,
+                        byte_limit: self.work_bytes(),
+                    },
+                    target,
+                )?
+            };
+            match outcome {
+                StageOutcome::Pending(indexed) => count = count.saturating_add(indexed),
+                StageOutcome::Covered(_) => {
+                    store.clear_graph_queue(graph, target)?;
+                    return Ok(count);
+                }
+            }
+        }
     }
 
     fn doc_to_hit(&self, doc: TantivyDocument, score: f32) -> SearchHit {
