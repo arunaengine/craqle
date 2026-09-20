@@ -2158,153 +2158,325 @@ impl SearchIndex {
         }
 
         self.commit()?;
-        pass.store
-            .acknowledge_fts_queues_for_deleted_graphs(&covered)?;
-        pass.store.acknowledge_fts_delete_queue(&covered)?;
+        pass.store.acknowledge_deleted(&covered)?;
+        pass.store.acknowledge_deletes(&covered)?;
         pass.progress.covered += covered.len();
         Ok(())
     }
 
     /// Drop or re-derive one graph whose removal was queued.
-    fn settle_deleted_graph(&self, store: &GraphStore, graph: &GraphId) -> Result<()> {
+    fn settle_deleted_graph(&self, work: GraphWork<'_>, target: u64) -> Result<StageOutcome> {
         #[cfg(test)]
-        self.hooks.fail_item(graph)?;
+        self.hooks.fail_item(work.graph)?;
+        self.check_cancel(work.control)?;
         // Taken before the probe: read outside the shard, the answer can
         // already be stale by the time its branch runs.
-        let _rebuild = self.lock_graph(graph.as_str());
-        if store.contains_graph(graph)? {
-            self.reindex_locked(store, graph)?;
+        let _rebuild = self.lock_graph(work.graph.as_str());
+        if work.store.contains_graph(work.graph)? {
+            return self.stage_graph(work, target);
         } else {
-            self.delete_documents_locked(graph.as_str())?;
+            let request = GenerationRequest {
+                index_id: self.index_id,
+                graph: work.graph.clone(),
+            };
+            let stage = work.store.search_stage(&request)?;
+            let switched =
+                work.store
+                    .delete_search_graph(&crate::search::queue::DeleteGeneration {
+                        index_id: self.index_id,
+                        graph: work.graph.clone(),
+                        covered: target,
+                    })?;
+            if let Some(stage) = stage {
+                self.stage_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&stage.generation);
+            }
+            self.apply_switch(&switched);
+            self.delete_documents_locked(work.graph.as_str())?;
+            self.commit()?;
         }
-        Ok(())
+        Ok(StageOutcome::Covered(target))
     }
 
     /// Re-derive the graphs queued for a whole-graph rebuild.
     fn drain_rebuilt_graphs(&self, pass: &mut DrainPass<'_>) -> Result<()> {
-        let slice = drain_upto(&pass.bound, |chunk| {
-            pass.store.drain_fts_reindex_queue(chunk)
-        })?;
-        pass.progress.remaining |= slice.remaining;
-        if slice.entries.is_empty() {
+        let scan = self.queue_scan(QueueInput {
+            kind: QueueKind::Reindex,
+            bound: &pass.bound,
+            byte_limit: pass.byte_limit / 2,
+        });
+        let started = scan.after.is_some();
+        let page = pass.store.scan_fts_reindexes(&scan)?;
+        pass.progress.remaining |= self.save_scan(ScanSave {
+            kind: QueueKind::Reindex,
+            page: &page,
+            started,
+        });
+        pass.progress.rows_read = pass.progress.rows_read.saturating_add(page.rows);
+        pass.progress.queue_bytes = pass.progress.queue_bytes.saturating_add(page.bytes);
+        pass.progress.remaining |= page.remaining;
+        if let Some(id) = page.oversized.as_ref() {
+            pass.progress
+                .failures
+                .push(self.record_oversized(pass.store, id)?);
+        }
+        if page.entries.is_empty() {
             return Ok(());
         }
 
-        let mut covered = Vec::with_capacity(slice.entries.len());
-        for entry in &slice.entries {
-            let key = FailureKey::graph(&entry.graph);
-            match self.rebuild_queued_graph(pass.store, &entry.graph) {
-                Ok(()) => {
-                    self.clear_failure(&key);
-                    covered.push(entry.clone());
+        let mut covered = Vec::with_capacity(page.entries.len());
+        for entry in &page.entries {
+            self.check_cancel(&pass.control)?;
+            let id = graph_queue_id(QueueKind::Reindex, &entry.graph);
+            let input = FailureInput {
+                id: &id,
+                owed_from: entry.tokens.oldest,
+                target: entry.tokens.latest,
+            };
+            if let Some(failure) = self.retry_failure(pass.store, input)? {
+                pass.progress.failures.push(failure);
+                continue;
+            }
+            match self.rebuild_queued_graph(
+                GraphWork {
+                    store: pass.store,
+                    graph: &entry.graph,
+                    control: &pass.control,
+                    byte_limit: pass.byte_limit.saturating_sub(page.bytes),
+                },
+                entry.tokens.latest,
+            ) {
+                Ok(StageOutcome::Covered(target)) => {
+                    self.clear_failure(pass.store, &id)?;
+                    let mut settled = entry.clone();
+                    settled.tokens.latest = target;
+                    covered.push(settled);
                 }
-                Err(error) => pass
-                    .progress
-                    .failures
-                    .push(self.record_failure(key, &error)),
+                Ok(StageOutcome::Pending(_)) => {
+                    pass.advanced = true;
+                    pass.progress.remaining = true;
+                }
+                Err(error) if matches!(error, SearchError::Cancelled) => return Err(error),
+                Err(error) => {
+                    let input = FailureInput {
+                        id: &id,
+                        owed_from: entry.tokens.oldest,
+                        target: entry.tokens.latest,
+                    };
+                    pass.progress
+                        .failures
+                        .push(self.record_failure(pass.store, FailedItem { input, error })?);
+                }
             }
         }
         if covered.is_empty() {
             return Ok(());
         }
 
-        self.commit()?;
-        pass.store
-            .acknowledge_fts_subjects_for_reindexed_graphs(&covered)?;
-        pass.store.acknowledge_fts_reindex_queue(&covered)?;
+        pass.store.acknowledge_reindexed(&covered)?;
+        pass.store.acknowledge_reindex(&covered)?;
         pass.progress.covered += covered.len();
         Ok(())
     }
 
     /// Re-derive one queued graph, unless it has since been removed.
-    fn rebuild_queued_graph(&self, store: &GraphStore, graph: &GraphId) -> Result<()> {
+    fn rebuild_queued_graph(&self, work: GraphWork<'_>, target: u64) -> Result<StageOutcome> {
         #[cfg(test)]
-        self.hooks.fail_item(graph)?;
+        self.hooks.fail_item(work.graph)?;
+        self.check_cancel(work.control)?;
         // A graph removed after its rebuild was queued stays removed: a scan
         // that ran anyway would republish documents for a deleted graph.
-        if !store.contains_graph(graph)? {
-            let _rebuild = self.lock_graph(graph.as_str());
-            return self.delete_documents_locked(graph.as_str());
+        if !work.store.contains_graph(work.graph)? {
+            let _rebuild = self.lock_graph(work.graph.as_str());
+            let request = GenerationRequest {
+                index_id: self.index_id,
+                graph: work.graph.clone(),
+            };
+            let stage = work.store.search_stage(&request)?;
+            let switched =
+                work.store
+                    .delete_search_graph(&crate::search::queue::DeleteGeneration {
+                        index_id: self.index_id,
+                        graph: work.graph.clone(),
+                        covered: target,
+                    })?;
+            if let Some(stage) = stage {
+                self.stage_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&stage.generation);
+            }
+            self.apply_switch(&switched);
+            self.delete_documents_locked(work.graph.as_str())?;
+            self.commit()?;
+            return Ok(StageOutcome::Covered(target));
         }
-        self.reindex_from_store(store, graph)?;
-        Ok(())
+        let _rebuild = self.lock_graph(work.graph.as_str());
+        self.stage_graph(work, target)
     }
 
     /// Apply the queued per-subject updates.
     fn drain_dirty_subjects(&self, pass: &mut DrainPass<'_>) -> Result<()> {
-        let slice = drain_upto(&pass.bound, |chunk| pass.store.drain_fts_queue(chunk))?;
-        pass.progress.remaining |= slice.remaining;
-        if slice.entries.is_empty() {
+        let scan = self.queue_scan(QueueInput {
+            kind: QueueKind::Subject,
+            bound: &pass.bound,
+            byte_limit: pass.byte_limit / 2,
+        });
+        let started = scan.after.is_some();
+        let page = pass.store.scan_fts_subjects(&scan)?;
+        pass.progress.remaining |= self.save_scan(ScanSave {
+            kind: QueueKind::Subject,
+            page: &page,
+            started,
+        });
+        pass.progress.rows_read = pass.progress.rows_read.saturating_add(page.rows);
+        pass.progress.queue_bytes = pass.progress.queue_bytes.saturating_add(page.bytes);
+        pass.progress.remaining |= page.remaining;
+        if let Some(id) = page.oversized.as_ref() {
+            pass.progress
+                .failures
+                .push(self.record_oversized(pass.store, id)?);
+        }
+        if page.entries.is_empty() {
             return Ok(());
         }
 
-        // Held across both phases: a rebuild of one of these graphs must not
-        // clear and refill it from a scan that straddles the read below and
-        // the apply that follows it.
+        // Hold graph shards across read and apply so rebuild cannot straddle them.
         let rebuild_guards =
-            self.lock_graphs(slice.entries.iter().map(|entry| entry.graph.as_str()));
+            self.lock_graphs(page.entries.iter().map(|entry| entry.graph.as_str()));
 
         // Phase 1: read every update from the store with NO writer lock held,
         // stopping once the prepared text reaches the pass budget.
-        let mut seen = HashSet::with_capacity(slice.entries.len());
-        let mut caches = StoreSyncCaches::default();
+        let mut seen = HashSet::with_capacity(page.entries.len());
+        let mut caches = StoreSyncCaches::new(pass.store);
         let mut prepared: Vec<(PreparedDocOp, DirtySubject)> = Vec::new();
-        let mut duplicates = Vec::new();
         let mut prepared_bytes = 0usize;
-        for entry in &slice.entries {
-            if prepared_bytes >= PREPARED_TEXT_BUDGET {
+        let prepare_limit = pass.byte_limit.saturating_sub(page.bytes);
+        let rebuild_pending = pass.store.search_coverage()?.is_none_or(|coverage| {
+            coverage.index_id != self.index_id || coverage.rebuild.is_some()
+        });
+        for entry in &page.entries {
+            self.check_cancel(&pass.control)?;
+            if prepared_bytes.saturating_add(caches.orphan_bytes) >= prepare_limit {
                 // The rest stays queued: acknowledging entries this pass never
                 // prepared would drop their updates permanently.
                 pass.progress.remaining = true;
                 break;
             }
             if !seen.insert((entry.graph.clone(), entry.subject)) {
-                duplicates.push(entry.clone());
+                pass.progress.remaining = true;
                 continue;
             }
-            let key = FailureKey::subject(&entry.graph, entry.subject);
+            let id = subject_queue_id(&entry.graph, entry.subject);
+            let input = FailureInput {
+                id: &id,
+                owed_from: entry.tokens.oldest,
+                target: entry.tokens.latest,
+            };
+            if let Some(failure) = self.retry_failure(pass.store, input)? {
+                pass.progress.failures.push(failure);
+                continue;
+            }
+            if pass
+                .store
+                .search_stage(&GenerationRequest {
+                    index_id: self.index_id,
+                    graph: entry.graph.clone(),
+                })?
+                .is_some()
+            {
+                pass.progress.remaining = true;
+                continue;
+            }
+            if rebuild_pending && self.active_generation(entry.graph.as_str()).is_none() {
+                pass.progress.remaining = true;
+                continue;
+            }
+            let switched = pass.store.ensure_search_generation(&GenerationRequest {
+                index_id: self.index_id,
+                graph: entry.graph.clone(),
+            })?;
+            self.apply_switch(&switched);
+            let Some(generation) = switched.active else {
+                pass.progress.remaining = true;
+                continue;
+            };
+            let orphan_bytes = caches.orphan_bytes;
+            let byte_limit = prepare_limit
+                .saturating_sub(prepared_bytes)
+                .saturating_sub(orphan_bytes);
             match self.prepare_queued_entry(
                 &mut caches,
                 PrepareSubject {
                     store: pass.store,
                     graph: &entry.graph,
                     subject: entry.subject,
+                    byte_limit,
+                    generation,
                 },
             ) {
                 Ok(op) => {
-                    prepared_bytes = prepared_bytes.saturating_add(op.text_bytes());
-                    self.clear_failure(&key);
+                    prepared_bytes = prepared_bytes.saturating_add(op.held_bytes());
                     prepared.push((op, entry.clone()));
                 }
-                Err(error) => pass
-                    .progress
-                    .failures
-                    .push(self.record_failure(key, &error)),
+                Err(error) if matches!(error, SearchError::Cancelled) => return Err(error),
+                Err(error) => {
+                    let input = FailureInput {
+                        id: &id,
+                        owed_from: entry.tokens.oldest,
+                        target: entry.tokens.latest,
+                    };
+                    pass.progress
+                        .failures
+                        .push(self.record_failure(pass.store, FailedItem { input, error })?);
+                }
             }
         }
 
         // Phase 2: apply the prepared ops in queue order under the writer lock.
-        let mut covered = Vec::with_capacity(prepared.len());
+        let mut applied = Vec::with_capacity(prepared.len());
+        let mut apply_error = None;
         {
             // Guards the Tantivy writer; no store reads happen inside.
             let mut writer = self.writer()?;
             for (op, entry) in &prepared {
-                let key = FailureKey::subject(&entry.graph, entry.subject);
+                self.check_cancel(&pass.control)?;
                 match self.apply_prepared_op(&mut writer, op) {
-                    Ok(()) => covered.push(entry.clone()),
-                    Err(error) => pass
-                        .progress
-                        .failures
-                        .push(self.record_failure(key, &error)),
+                    Ok(()) => applied.push(entry.clone()),
+                    Err(error) => {
+                        apply_error = Some((entry.clone(), error));
+                        break;
+                    }
                 }
             }
         }
+        if let Some((entry, error)) = apply_error {
+            let id = subject_queue_id(&entry.graph, entry.subject);
+            pass.progress.failures.push(self.record_failure(
+                pass.store,
+                FailedItem {
+                    input: FailureInput {
+                        id: &id,
+                        owed_from: entry.tokens.oldest,
+                        target: entry.tokens.latest,
+                    },
+                    error,
+                },
+            )?);
+        }
+        let mut covered = Vec::with_capacity(applied.len());
+        for entry in applied {
+            let id = subject_queue_id(&entry.graph, entry.subject);
+            self.clear_failure(pass.store, &id)?;
+            covered.push(entry);
+        }
         drop(rebuild_guards);
 
-        if covered.is_empty() && duplicates.is_empty() {
+        if covered.is_empty() {
             return Ok(());
         }
-        covered.extend(duplicates);
 
         self.commit()?;
         pass.store.acknowledge_fts_queue(&covered)?;
