@@ -3832,6 +3832,390 @@ mod tests {
     }
 
     #[test]
+    fn cost_collection_toggles() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:query-costs");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:query-costs:s",
+            "urn:test:query-costs:p",
+            EncodedTerm::from_plain_term(&Term::Literal(Literal::new_simple_literal("value"))),
+        );
+        settle_diagnostics(&store, &graph);
+        let prepared = engine
+            .prepare_query(
+                "SELECT ?s WHERE { ?s <urn:test:query-costs:p> \"value\" . \
+                 ?s <urn:test:query-costs:p> ?other }",
+            )
+            .unwrap();
+        let run = |collect_costs| {
+            let mut options = QueryOptions::default();
+            options.collect_costs = collect_costs;
+            options.fast_paths = FastPathMode::Disabled;
+            engine
+                .execute_prepared_graphs(
+                    &crate::AllowAllAuthorizer,
+                    &prepared,
+                    std::slice::from_ref(&graph),
+                    &options,
+                )
+                .unwrap()
+                .statistics
+        };
+        let disabled = run(false);
+        assert_eq!(disabled.reverse_mapping_reads, 0);
+        assert_eq!(disabled.forward_mapping_reads, 0);
+        assert_eq!(disabled.planner_point_reads, 0);
+        assert_eq!(disabled.planner_cache_hits, 0);
+        assert_eq!(disabled.planner_cache_misses, 0);
+
+        let enabled = run(true);
+        assert!(enabled.reverse_mapping_reads > 0);
+        assert!(enabled.forward_mapping_reads > 0);
+        assert!(enabled.planner_point_reads > 0);
+        assert!(enabled.planner_cache_misses > 0);
+    }
+
+    #[test]
+    fn plan_stats_toggle() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:plan-stats");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:plan-stats:s",
+            "urn:test:plan-stats:left",
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:plan-stats:key")),
+        );
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:plan-stats:s",
+            "urn:test:plan-stats:right",
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:plan-stats:key")),
+        );
+        settle_diagnostics(&store, &graph);
+        let prepared = engine
+            .prepare_query(
+                "SELECT ?s ?key WHERE { \
+                 ?s <urn:test:plan-stats:left> ?key . \
+                 ?s <urn:test:plan-stats:right> ?key }",
+            )
+            .unwrap();
+        let run = |collect_plan_statistics| {
+            let mut options = QueryOptions::default();
+            options.fast_paths = FastPathMode::Disabled;
+            options.join_mode = JoinMode::ForceHash;
+            options.collect_plan_statistics = collect_plan_statistics;
+            engine
+                .execute_prepared_graphs(
+                    &crate::AllowAllAuthorizer,
+                    &prepared,
+                    std::slice::from_ref(&graph),
+                    &options,
+                )
+                .unwrap()
+        };
+        let enabled = run(true);
+        let disabled = run(false);
+        assert_eq!(enabled.results, disabled.results);
+        assert_eq!(
+            enabled.statistics.plan_fingerprint,
+            disabled.statistics.plan_fingerprint
+        );
+        assert_eq!(
+            enabled.statistics.planned_joins,
+            disabled.statistics.planned_joins
+        );
+        assert!(enabled.statistics.intermediate_rows_available);
+        assert!(enabled.statistics.intermediate_rows > 0);
+        assert!(!disabled.statistics.intermediate_rows_available);
+    }
+
+    #[test]
+    fn dense_mapping_work() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dense-mapping");
+        for index in 0..64 {
+            let subject = format!("urn:test:dense-mapping:{index:03}");
+            insert_quad(
+                &store,
+                &graph,
+                &subject,
+                "urn:test:dense-mapping:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    "urn:test:dense-mapping:shared",
+                )),
+            );
+            insert_quad(
+                &store,
+                &graph,
+                &subject,
+                "urn:test:dense-mapping:q",
+                EncodedTerm::from_plain_term(&Term::Literal(Literal::new_simple_literal(
+                    index.to_string(),
+                ))),
+            );
+        }
+        settle_diagnostics(&store, &graph);
+        let prepared = engine
+            .prepare_query(
+                "SELECT ?s ?value WHERE { \
+                 ?s <urn:test:dense-mapping:p> <urn:test:dense-mapping:shared> . \
+                 ?s <urn:test:dense-mapping:q> ?value }",
+            )
+            .unwrap();
+        let mut options = QueryOptions::default();
+        options.collect_costs = true;
+        options.fast_paths = FastPathMode::Disabled;
+        options.join_mode = JoinMode::ForceLateral;
+        options.read_mode = QueryReadMode::ForceQv;
+        let execution = engine
+            .execute_prepared_graphs(
+                &crate::AllowAllAuthorizer,
+                &prepared,
+                std::slice::from_ref(&graph),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(solution_rows(execution.results).len(), 64);
+        let statistics = execution.statistics;
+        assert!(statistics.candidate_quads >= 128, "{statistics:?}");
+        assert_eq!(statistics.encoded_quad_constructions, 0);
+        assert!(
+            statistics.forward_mapping_reads < statistics.candidate_quads,
+            "candidate rows must not be mapped back into dense IDs: {statistics:?}"
+        );
+        assert!(
+            statistics.reverse_mapping_reads <= statistics.candidate_quads * 2,
+            "only visibility and final decoding may resolve dense IDs: {statistics:?}"
+        );
+    }
+
+    #[test]
+    fn dense_orphan_work() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dense-orphans");
+        for index in 0..64 {
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:dense-orphans:{index:03}"),
+                "urn:test:dense-orphans:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:dense-orphans:o")),
+            );
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:dense-orphans:{index:03}"),
+                "urn:test:dense-orphans:q",
+                EncodedTerm::from_plain_term(&Term::Literal(Literal::new_simple_literal(
+                    index.to_string(),
+                ))),
+            );
+        }
+        settle_diagnostics(&store, &graph);
+        let prepared = engine
+            .prepare_query(&format!(
+                "SELECT (COUNT(*) AS ?count) WHERE {{ GRAPH <{}> {{ \
+                 ?s <urn:test:dense-orphans:p> ?o . \
+                 ?s <urn:test:dense-orphans:q> ?value }} }}",
+                graph.as_str()
+            ))
+            .unwrap();
+        let mut options = QueryOptions::default();
+        options.collect_costs = true;
+        options.fast_paths = FastPathMode::Disabled;
+        options.join_mode = JoinMode::ForceLateral;
+        options.read_mode = QueryReadMode::ForceQv;
+        let run = || {
+            engine
+                .execute_prepared_graphs(
+                    &crate::AllowAllAuthorizer,
+                    &prepared,
+                    std::slice::from_ref(&graph),
+                    &options,
+                )
+                .unwrap()
+        };
+        let clean = run();
+        assert_eq!(clean.statistics.candidate_quads, 128);
+        assert_eq!(clean.statistics.reverse_mapping_reads, 0);
+        assert_eq!(clean.statistics.encoded_quad_constructions, 0);
+
+        store
+            .set_graph_diagnostics(
+                &graph,
+                &GraphDiagnostics::from_orphaned_entities(vec![
+                    "urn:test:dense-orphans:000".to_owned(),
+                ]),
+            )
+            .unwrap();
+        let filtered = run();
+        assert_eq!(filtered.statistics.candidate_quads, 127);
+        assert_eq!(
+            filtered.statistics.reverse_mapping_reads,
+            64 + 1 + 63,
+            "orphan filtering should resolve each unique subject and object once"
+        );
+        assert!(
+            solution_rows(clean.results)[0]["count"]
+                .0
+                .starts_with("\"64\"")
+        );
+        assert!(
+            solution_rows(filtered.results)[0]["count"]
+                .0
+                .starts_with("\"63\"")
+        );
+    }
+
+    #[test]
+    fn dense_fanout_memo() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dense-fanout");
+        for index in 0..512 {
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:dense-fanout:s:{index:03}"),
+                "urn:test:dense-fanout:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked(format!(
+                    "urn:test:dense-fanout:o:{index:03}"
+                ))),
+            );
+        }
+        settle_diagnostics(&store, &graph);
+        let branch = format!("{{ GRAPH <{}> {{ ?s ?p ?o }} }}", graph.as_str());
+        let union = std::iter::repeat_n(branch, 64)
+            .collect::<Vec<_>>()
+            .join(" UNION ");
+        let prepared = engine
+            .prepare_query(&format!("SELECT ?s ?p ?o WHERE {{ {union} }}"))
+            .unwrap();
+        let mut options = QueryOptions::default();
+        options.collect_costs = true;
+        options.fast_paths = FastPathMode::Disabled;
+        options.read_mode = QueryReadMode::ForceQv;
+        let execution = engine
+            .execute_prepared_graphs(
+                &crate::AllowAllAuthorizer,
+                &prepared,
+                std::slice::from_ref(&graph),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(execution.statistics.candidate_quads, 32_768);
+        assert_eq!(execution.statistics.reverse_mapping_reads, 1_025);
+        assert_eq!(execution.statistics.encoded_quad_constructions, 0);
+        let rows = solution_rows(execution.results);
+        assert_eq!(rows.len(), 32_768);
+        let mut counts = HashMap::new();
+        for row in rows {
+            *counts.entry(row["s"].clone()).or_insert(0usize) += 1;
+        }
+        assert_eq!(counts.len(), 512);
+        assert!(counts.values().all(|count| *count == 64));
+    }
+
+    #[test]
+    fn dense_generation_refresh() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let graph = GraphId::new("urn:test:dense-generation");
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:dense-generation:s",
+            "urn:test:dense-generation:p",
+            EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:dense-generation:o")),
+        );
+        settle_diagnostics(&store, &graph);
+        let prepared = engine
+            .prepare_query("SELECT ?s ?o WHERE { ?s <urn:test:dense-generation:p> ?o }")
+            .unwrap();
+        let mut options = QueryOptions::default();
+        options.fast_paths = FastPathMode::Disabled;
+        options.read_mode = QueryReadMode::ForceQv;
+        let first = engine
+            .execute_prepared_graphs(
+                &crate::AllowAllAuthorizer,
+                &prepared,
+                std::slice::from_ref(&graph),
+                &options,
+            )
+            .unwrap();
+        store.rebuild_query_indexes().unwrap();
+        let second = engine
+            .execute_prepared_graphs(
+                &crate::AllowAllAuthorizer,
+                &prepared,
+                std::slice::from_ref(&graph),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(first.results, second.results);
+        assert_ne!(
+            first.statistics.query_id_generation,
+            second.statistics.query_id_generation
+        );
+    }
+
+    #[test]
+    fn dense_visibility_multiset() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let hidden = GraphId::new("urn:test:dense-copy:hidden");
+        let visible = GraphId::new("urn:test:dense-copy:visible");
+        for graph in [&hidden, &visible] {
+            insert_quad(
+                &store,
+                graph,
+                "urn:test:dense-copy:s",
+                "urn:test:dense-copy:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:dense-copy:o")),
+            );
+            settle_diagnostics(&store, graph);
+        }
+        let mut options = QueryOptions::default();
+        options.fast_paths = FastPathMode::Disabled;
+        let named = solution_rows(
+            engine
+                .query_with_options(
+                    QueryRun {
+                        sparql: "SELECT ?g WHERE { GRAPH ?g { ?s <urn:test:dense-copy:p> ?o } }",
+                        options: &options,
+                    },
+                    &|_, _: &GraphId| true,
+                )
+                .unwrap()
+                .results,
+        );
+        assert_eq!(
+            named.len(),
+            2,
+            "named graph copies must remain multiplicative"
+        );
+
+        let default = solution_rows(
+            engine
+                .query_with_options(
+                    QueryRun {
+                        sparql: "SELECT ?s WHERE { ?s <urn:test:dense-copy:p> ?o }",
+                        options: &options,
+                    },
+                    &|_, graph: &GraphId| graph != &hidden,
+                )
+                .unwrap()
+                .results,
+        );
+        assert_eq!(
+            default.len(),
+            1,
+            "a hidden first copy must not suppress the visible union row"
+        );
+    }
+
+    #[test]
     fn read_modes_equivalent() {
         let (_dir, store, _search, engine) = setup_engine();
         let graph = GraphId::new("urn:test:read-mode");
