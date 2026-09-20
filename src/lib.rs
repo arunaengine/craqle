@@ -650,6 +650,19 @@ pub struct SearchRequest<'a> {
     pub limit: usize,
 }
 
+/// Cancellation and a timeout for one search request.
+#[derive(Clone, Debug, Default)]
+pub struct SearchOptions {
+    pub timeout: Option<Duration>,
+    pub cancellation: QueryCancellation,
+}
+
+/// Full-text search with explicit cancellation and timeout.
+pub struct SearchRun<'a> {
+    pub request: SearchRequest<'a>,
+    pub options: &'a SearchOptions,
+}
+
 /// Full-text search restricted to an explicit set of graphs.
 pub struct GraphSearchRequest<'a> {
     pub graphs: &'a [GraphId],
@@ -3763,6 +3776,37 @@ impl CraqleNode {
 
     /// Search one pinned index view and recheck permissions before returning hits.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
+        self.search_with_options(
+            auth,
+            SearchRun {
+                request: req,
+                options: &SearchOptions::default(),
+            },
+        )
+    }
+
+    /// Search like [`CraqleNode::search`], failing on cancellation or timeout instead of
+    /// returning a shortened result.
+    pub fn search_with_options(
+        &self,
+        auth: &dyn Authorizer,
+        run: SearchRun<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let req = run.request;
+        let started = Instant::now();
+        let check = || {
+            if run.options.cancellation.is_cancelled() {
+                return Err(search::SearchError::Cancelled.into());
+            }
+            if run
+                .options
+                .timeout
+                .is_some_and(|timeout| started.elapsed() >= timeout)
+            {
+                return Err(search::SearchError::Deadline.into());
+            }
+            Ok(())
+        };
         self.search.ensure_available()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 {
@@ -3775,12 +3819,15 @@ impl CraqleNode {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .allows(graph)
         };
-        let hits = self.search.search_authorized(search::AuthorizedQuery {
-            query: req.query,
-            limit,
-            subject: None,
-            allows: &allows,
-        })?;
+        let hits = self.search.search_checked(
+            search::AuthorizedQuery {
+                query: req.query,
+                limit,
+                subject: None,
+                allows: &allows,
+            },
+            &check,
+        )?;
         drop(readable);
         self.recheck_hits(auth, hits)
     }

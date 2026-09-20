@@ -15,6 +15,10 @@ use crate::store::GraphStore;
 pub enum SearchError {
     #[error("search support is disabled; enable the `search` feature")]
     Disabled,
+    #[error("search maintenance cancelled")]
+    Cancelled,
+    #[error("search request timeout expired")]
+    Deadline,
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
 }
@@ -23,6 +27,8 @@ impl SearchError {
     pub(crate) fn kind(&self) -> crate::CraqleErrorKind {
         match self {
             Self::Disabled => crate::CraqleErrorKind::Unsupported,
+            Self::Cancelled => crate::CraqleErrorKind::Cancelled,
+            Self::Deadline => crate::CraqleErrorKind::QueryLimit,
             Self::Store(error) => error.kind(),
         }
     }
@@ -154,7 +160,15 @@ impl SearchIndex {
         &self,
         req: AuthorizedQuery<'_>,
     ) -> crate::Result<Vec<SearchHit>> {
-        let _ = (req.query, req.limit, req.subject, req.allows);
+        self.search_checked(req, &|| Ok(()))
+    }
+
+    pub(crate) fn search_checked(
+        &self,
+        req: AuthorizedQuery<'_>,
+        check: &dyn Fn() -> crate::Result<()>,
+    ) -> crate::Result<Vec<SearchHit>> {
+        let _ = (req.query, req.limit, req.subject, req.allows, check);
         Err(SearchError::Disabled.into())
     }
 

@@ -20,6 +20,8 @@ All notable changes to Craqle are documented here.
 - Query statistics, explain, and analyze report zero for store-wide counts and no
   row estimates unless the authorizer reads every graph. `Authorizer::reads_all`
   defaults to `false`; `AllowAllAuthorizer` returns `true`.
+- Search fails with `CorruptDerivedData` when a live index document has missing or
+  malformed metadata, and queues a reindex of its graph, instead of skipping it.
 
 ### Added
 
@@ -31,6 +33,8 @@ All notable changes to Craqle are documented here.
 - Authorized graph reconciliation from retained history or a verified healthy
   snapshot, with a durable backup and an audit of the replacement.
 - Explicit process and store memory reservations shared by live stores.
+- `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a
+  timeout. Either stops the search with an error instead of returning partial hits.
 
 ### Upgrading from 0.2
 

@@ -1147,4 +1147,53 @@ mod tests {
             "the re-linked entity must still be searchable after a restart"
         );
     }
+
+    #[test]
+    fn search_options_stop() {
+        let (_tmp, net) = setup_network(1);
+        let graph = GraphId::new("urn:test:search-options");
+        net.peer(0)
+            .create_crate(
+                &writer_auth(),
+                CreateCrateRequest::new(
+                    graph,
+                    "Stoppable Study",
+                    "stopneedle study",
+                    "2025-03-01",
+                    None,
+                    public_policy(),
+                ),
+            )
+            .unwrap();
+        net.flush_search_updates().unwrap();
+        let node = net.peer(0);
+        let request = || SearchRequest {
+            query: "stopneedle",
+            limit: 10,
+        };
+        let run = |options: &SearchOptions| {
+            node.search_with_options(
+                &GrantAuthorizer::default(),
+                SearchRun {
+                    request: request(),
+                    options,
+                },
+            )
+        };
+        let plain = node.search(&GrantAuthorizer::default(), request()).unwrap();
+        assert!(!plain.is_empty());
+        assert_eq!(plain.len(), run(&SearchOptions::default()).unwrap().len());
+
+        let cancelled = SearchOptions::default();
+        cancelled.cancellation.cancel();
+        let error = run(&cancelled).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::Cancelled);
+
+        let expired = SearchOptions {
+            timeout: Some(std::time::Duration::ZERO),
+            ..SearchOptions::default()
+        };
+        let error = run(&expired).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
+    }
 }

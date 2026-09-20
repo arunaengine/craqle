@@ -97,6 +97,8 @@ pub enum SearchError {
     Io(#[from] std::io::Error),
     #[error("search maintenance cancelled")]
     Cancelled,
+    #[error("search request timeout expired")]
+    Deadline,
     #[error("search index is not bound to its durable generation state")]
     Unbound,
     #[error("search item uses {bytes} bytes, limit is {limit}")]
@@ -112,7 +114,7 @@ impl SearchError {
         match self {
             Self::QueryParse(_) => crate::CraqleErrorKind::InvalidInput,
             Self::Cancelled => crate::CraqleErrorKind::Cancelled,
-            Self::ItemTooLarge { .. } | Self::SourceTooLarge { .. } => {
+            Self::ItemTooLarge { .. } | Self::SourceTooLarge { .. } | Self::Deadline => {
                 crate::CraqleErrorKind::QueryLimit
             }
             Self::Tantivy(_) | Self::Io(_) | Self::Unbound => crate::CraqleErrorKind::Storage,
@@ -1673,13 +1675,21 @@ impl SearchIndex {
         &self,
         req: AuthorizedQuery<'_>,
     ) -> crate::Result<Vec<SearchHit>> {
-        let check = || Ok::<(), crate::CraqleError>(());
+        self.search_checked(req, &|| Ok(()))
+    }
+
+    /// Full-text search that stops with `check`'s error instead of returning partial hits.
+    pub(crate) fn search_checked(
+        &self,
+        req: AuthorizedQuery<'_>,
+        check: &dyn Fn() -> crate::Result<()>,
+    ) -> crate::Result<Vec<SearchHit>> {
         self.collect_filtered(FilterQuery {
             query: req.query,
             limit: req.limit,
             subject: req.subject,
             allows: req.allows,
-            check: &check,
+            check,
         })
     }
 
@@ -3350,6 +3360,7 @@ fn failure_code(error: &SearchError) -> &'static str {
         SearchError::ItemTooLarge { .. } => "item-too-large",
         SearchError::SourceTooLarge { .. } => "item-too-large",
         SearchError::Cancelled => "cancelled",
+        SearchError::Deadline => "deadline",
         SearchError::Unbound => "index-unbound",
         SearchError::Store(error) if error.rejects_record() => "item-invalid",
         SearchError::Store(_) => "store-transient",
@@ -3382,6 +3393,7 @@ fn failure_class(error: &SearchError) -> FailureClass {
         | SearchError::QueryParse(_)
         | SearchError::Io(_)
         | SearchError::Cancelled
+        | SearchError::Deadline
         | SearchError::Unbound => FailureClass::Global,
     }
 }
