@@ -677,22 +677,37 @@ mod tests {
 
         let node = CraqleNode::open(directory.path()).unwrap();
         let digest = *blake3::hash(&postcard::to_allocvec(&snapshot).unwrap()).as_bytes();
-        assert!(
-            node.reconcile_graph(
-                &AllowAllAuthorizer,
-                ReconcileRequest {
-                    id: MutationId::new(),
-                    graph: graph.clone(),
-                    mode: RepairMode::Apply,
-                    source: ReconcileSource::HealthySnapshot {
-                        source: "stale healthy copy".to_owned(),
-                        snapshot,
-                        digest,
-                    },
-                },
-            )
-            .is_err()
-        );
+        let request = |mode| ReconcileRequest {
+            id: MutationId::new(),
+            graph: graph.clone(),
+            mode,
+            source: ReconcileSource::HealthySnapshot {
+                source: "stale healthy copy".to_owned(),
+                snapshot: snapshot.clone(),
+                digest,
+            },
+        };
+        let dry_run = node
+            .reconcile_graph(&writer_auth(), request(RepairMode::DryRun))
+            .unwrap();
+        assert_eq!(dry_run.audit.result, RepairResult::Tombstoned);
+        assert!(dry_run.audit.after_digest.is_none());
+        assert!(dry_run.audit.backup.is_none());
+
+        let denied = node
+            .reconcile_graph(&DenyAllAuthorizer, request(RepairMode::Apply))
+            .unwrap_err();
+        assert_eq!(denied.kind(), CraqleErrorKind::Unauthorized);
+
+        let error = node
+            .reconcile_graph(&writer_auth(), request(RepairMode::Apply))
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::InvalidInput);
+        assert!(matches!(
+            error,
+            CraqleError::Merge(MergeError::InputRejected(reason))
+                if reason == "live authoritative snapshot cannot replace a permanently deleted graph"
+        ));
         assert!(!node.contains_graph(&graph).unwrap());
         drop(node);
         let reopened = CraqleNode::open(directory.path()).unwrap();

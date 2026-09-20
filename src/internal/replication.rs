@@ -2981,6 +2981,13 @@ impl ReplicationEngine {
     ) -> Result<crate::sync::RepairReport, MergeError> {
         let mut report = self.preview_repair(request)?;
         if request.mode == crate::sync::RepairMode::Apply
+            && report.audit.result == crate::sync::RepairResult::Tombstoned
+        {
+            return Err(MergeError::InputRejected(
+                "live authoritative snapshot cannot replace a permanently deleted graph".to_owned(),
+            ));
+        }
+        if request.mode == crate::sync::RepairMode::Apply
             && matches!(
                 report.audit.result,
                 crate::sync::RepairResult::Differs | crate::sync::RepairResult::BackupRequired

@@ -2364,7 +2364,18 @@ impl CraqleNode {
             RepairMode::DryRun => Action::Read,
             RepairMode::Apply => Action::Write,
         };
-        self.ensure_graph_action(&request.graph, auth, action)?;
+        if self.store.graph_tombstoned(&request.graph)? {
+            let policy = self
+                .store
+                .deleted_graph_policy(&request.graph)?
+                .ok_or_else(|| AuthorizationError::PermissionDenied {
+                    action,
+                    graph: request.graph.to_string(),
+                })?;
+            auth.authorize(&request.graph, &policy, action)?;
+        } else {
+            self.ensure_graph_action(&request.graph, auth, action)?;
+        }
         let report = match request.source {
             ReconcileSource::HealthySnapshot {
                 source,
