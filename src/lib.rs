@@ -989,79 +989,198 @@ struct SearchWorkerCtx {
     stopping: Arc<AtomicBool>,
 }
 
-fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
-    loop {
-        let mut flush_replies = Vec::new();
-        let stop_message = collect_search_worker_messages(&receiver, &mut flush_replies);
-        // The flag is read alongside the channel, so a stop request queued
-        // behind a large control backlog is still seen this cycle.
-        if stop_message || ctx.stopping.load(Ordering::SeqCst) {
-            for reply in flush_replies {
-                let _ = reply.send(Err("stopped".to_string()));
-            }
-            break;
-        }
-
-        // Cleared before the drain, so a writer that enqueues after this point
-        // always gets a fresh wake through.
-        ctx.wake_pending.store(false, Ordering::SeqCst);
-
-        let result = drain_search_queues(&ctx);
-        let failed = result.is_err();
-        for reply in flush_replies {
-            let _ = reply.send(result.clone());
-        }
-        if failed {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-}
-
-fn collect_search_worker_messages(
+fn collect_search_messages(
     receiver: &mpsc::Receiver<SearchWorkerMessage>,
-    flush_replies: &mut Vec<mpsc::Sender<std::result::Result<(), String>>>,
+    pending: &mut Vec<FlushRequest>,
+    wait: Duration,
 ) -> bool {
-    match receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(SearchWorkerMessage::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Ok(SearchWorkerMessage::Flush(reply)) => flush_replies.push(reply),
-        Ok(SearchWorkerMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
-    }
-
-    // Bounded, so a caller loop cannot make one cycle collect an unbounded
-    // backlog before any indexing happens. Whatever is left stays in the
-    // channel for the next cycle, so no waiter is dropped, and a stop request
-    // behind the cap is caught by the flag the worker loop also reads.
-    for _ in 0..SEARCH_MAX_CONTROL_MESSAGES {
-        if flush_replies.len() >= SEARCH_MAX_CONTROL_MESSAGES {
+    let mut message = match receiver.recv_timeout(wait) {
+        Ok(message) => Some(message),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+    };
+    for index in 0..MAX_CONTROL_MESSAGES {
+        match message.take() {
+            Some(SearchWorkerMessage::Stop) => return true,
+            Some(SearchWorkerMessage::Flush(request)) if !request.control.is_cancelled() => {
+                pending.push(request)
+            }
+            Some(SearchWorkerMessage::Wake | SearchWorkerMessage::Flush(_)) | None => {}
+        }
+        if index + 1 == MAX_CONTROL_MESSAGES {
             break;
         }
-        match receiver.try_recv() {
-            Ok(SearchWorkerMessage::Wake) => {}
-            Ok(SearchWorkerMessage::Flush(reply)) => flush_replies.push(reply),
-            Ok(SearchWorkerMessage::Stop) => return true,
-            Err(_) => break,
+        message = receiver.try_recv().ok();
+        if message.is_none() {
+            break;
         }
     }
-
     false
 }
 
-/// Turns a maintenance-cycle panic into an error so the worker can retry.
-fn drain_search_queues(ctx: &SearchWorkerCtx) -> std::result::Result<(), String> {
-    let drain = panic::AssertUnwindSafe(|| {
-        if let Err(error) = ctx.store.repair_query_indexes() {
+fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
+    let mut pending: Vec<FlushRequest> = Vec::new();
+    let mut active = false;
+    let mut certified = None;
+    let mut cleanup_reported = false;
+    loop {
+        pending.retain(|request| !request.control.is_cancelled());
+        let wait = if active || !pending.is_empty() {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1)
+        };
+        let stop = collect_search_messages(&receiver, &mut pending, wait);
+        if stop || ctx.stopping.load(Ordering::Acquire) {
+            for request in pending.drain(..) {
+                request.control.cancel();
+                let _ = request.reply.send(Err(MaintenanceFailure::message(
+                    CraqleErrorKind::DependencyUnavailable,
+                    "maintenance worker stopped".to_owned(),
+                )));
+            }
+            break;
+        }
+        ctx.wake_pending.store(false, Ordering::Release);
+        let selected = pending
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, request)| request.target)
+            .map(|(index, _)| index);
+        let target = selected
+            .map_or_else(
+                || ctx.store.current_dirty_token(),
+                |index| pending[index].target,
+            )
+            .max(certified.unwrap_or(0));
+        // One caller abandoning its wait must not cancel shared indexing work.
+        let control = search::queue::DrainControl::with_stop(ctx.stopping.clone());
+        let progress = drain_search_slice(
+            &ctx,
+            search::queue::DrainRequest {
+                bound: search::queue::QueueBound {
+                    chunk: SEARCH_FLUSH_CHUNK,
+                    max_token: Some(target),
+                },
+                control,
+            },
+        );
+        match progress {
+            Err(error) => {
+                for request in pending.drain(..) {
+                    let _ = request.reply.send(Err(error.clone()));
+                }
+                active = false;
+            }
+            Ok(progress) => {
+                if let Some(failure) = progress
+                    .cleanup_failures
+                    .first()
+                    .filter(|_| !cleanup_reported)
+                {
+                    tracing::warn!(
+                        jobs = progress.cleanup_failures.len(),
+                        generation = ?failure.generation,
+                        bytes = failure.bytes,
+                        limit = failure.limit,
+                        "search cleanup exceeds its memory budget"
+                    );
+                    cleanup_reported = true;
+                }
+                if let Some(recovery) = progress.recovery {
+                    certified = None;
+                    for request in &mut pending {
+                        request.target = request.target.max(recovery);
+                        request.recovery = Some(request.recovery.unwrap_or(0).max(recovery));
+                    }
+                    if recovery > target {
+                        active = true;
+                        continue;
+                    }
+                }
+                if !progress.failures.is_empty() {
+                    let mut kept = Vec::new();
+                    for request in pending.drain(..) {
+                        if let Some(failure) = progress
+                            .failures
+                            .iter()
+                            .find(|failure| failure.owed_from <= request.target)
+                        {
+                            let failure = MaintenanceFailure::message(
+                                failure.error_kind,
+                                describe_search_failures(std::slice::from_ref(failure)),
+                            );
+                            let _ = request.reply.send(Err(failure));
+                        } else {
+                            kept.push(request);
+                        }
+                    }
+                    pending = kept;
+                    active = progress.covered != 0 && progress.remaining;
+                    continue;
+                }
+                active = progress.remaining;
+                if progress.remaining {
+                    continue;
+                }
+                if pending.is_empty() && progress.covered == 0 && certified == Some(target) {
+                    continue;
+                }
+                let completed = ctx
+                    .search
+                    .complete_coverage(&ctx.store, target)
+                    .map_err(MaintenanceFailure::search)
+                    .and_then(|()| ctx.store.persist().map_err(MaintenanceFailure::store));
+                if completed.is_ok() {
+                    certified = Some(target);
+                }
+                let mut kept = Vec::new();
+                for request in pending.drain(..) {
+                    if request.target > target {
+                        kept.push(request);
+                        continue;
+                    }
+                    #[cfg(feature = "search")]
+                    let result = completed.clone().map(|()| SearchReceipt {
+                        target: request.requested,
+                        covered: target,
+                        recovery: request.recovery,
+                        index_id: ctx.search.index_id(),
+                    });
+                    #[cfg(not(feature = "search"))]
+                    let result = completed
+                        .clone()
+                        .and(Err(MaintenanceFailure::search(search::SearchError::Disabled)));
+                    let _ = request.reply.send(result);
+                }
+                pending = kept;
+            }
+        }
+    }
+}
+
+fn drain_search_slice(
+    ctx: &SearchWorkerCtx,
+    request: search::queue::DrainRequest,
+) -> std::result::Result<search::queue::DrainProgress, MaintenanceFailure> {
+    let operation = panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if ctx.search.take_drain_panic() {
+            panic!("injected drain panic");
+        }
+        if let Err(error) = ctx.store.repair_query_with(&ctx.stopping) {
             tracing::warn!(%error, "query index repair remains pending");
         }
-        flush_search_queue(&ctx.store, &ctx.search)
+        ctx.search
+            .drain_queues(&ctx.store, request)
+            .map_err(MaintenanceFailure::search)
     });
-    match panic::catch_unwind(drain) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(payload) => Err(format!(
-            "search worker panicked: {}",
-            panic_message(&*payload)
-        )),
-    }
+    panic::catch_unwind(operation).unwrap_or_else(|payload| {
+        Err(MaintenanceFailure::message(
+            CraqleErrorKind::Storage,
+            format!("maintenance worker panicked: {}", panic_message(&*payload)),
+        ))
+    })
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -1074,76 +1193,64 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-/// Drains the FTS queues until everything enqueued *before this call* is indexed.
-///
-/// The target is captured once, here, at the accepted submission boundary.
-/// Without it a writer that keeps enqueueing holds the loop open and
-/// `flush_search_updates()` never returns. A recovery discovered while
-/// draining raises that target once, and it is never lowered again: rebuilding
-/// the original cutoff on every pass dropped the rebuild work whose tokens
-/// landed above it, so the flush reported success with part of its own
-/// recovery still queued. Recomputing the target from the newest source token
-/// instead would put the moving target back.
-///
-/// Returning `Ok` means every entry at or below that target was committed to
-/// the index and the reader reloaded before those entries were acknowledged.
-/// Entries that failed, and a scan that spent its row budget before reaching
-/// eligible work, are reported as errors rather than counted as an empty
-/// queue.
+// Tests synchronously drain the same fixed coverage boundary as the worker.
+#[cfg(test)]
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
     #[cfg(test)]
-    if search.take_armed_drain_panic() {
+    if search.take_drain_panic() {
         panic!("injected drain panic");
     }
-
     let mut target = store.current_dirty_token();
-    let mut processed_any = false;
-    let (incomplete, failures) = loop {
+    let control = search::queue::DrainControl::default();
+    let started = Instant::now();
+    loop {
         let progress = search.drain_queues(
             store,
-            search::QueueBound {
-                chunk: SEARCH_QUEUE_FLUSH_CHUNK,
-                max_token: Some(target),
+            search::queue::DrainRequest {
+                bound: search::queue::QueueBound {
+                    chunk: SEARCH_FLUSH_CHUNK,
+                    max_token: Some(target),
+                },
+                control: control.clone(),
             },
         )?;
-        if let Some(raised) = progress.recovery {
-            target = target.max(raised);
+        if started.elapsed() > Duration::from_secs(180) {
+            return Err(CraqleError::SearchWorker(
+                "search test flush exceeded its deadlock cap".to_owned(),
+            ));
         }
-        if progress.covered == 0 {
-            // Nothing moved this pass. Either no eligible work is left, or a
-            // budget stopped the scan short of it; only the second still owes
-            // the caller a continuation. Entries that failed an earlier pass
-            // are retried, so the pass that ends the loop is the one that
-            // knows what is still owed.
-            break (progress.remaining, progress.failures);
+        if let Some(recovery) = progress.recovery {
+            if recovery > target {
+                target = recovery;
+                continue;
+            }
         }
-        processed_any = true;
-    };
-
-    if processed_any {
-        store.persist()?;
+        if !progress.failures.is_empty() {
+            return Err(CraqleError::SearchWorker(describe_search_failures(
+                &progress.failures,
+            )));
+        }
+        if !progress.remaining {
+            break;
+        }
     }
-    if !failures.is_empty() {
-        return Err(CraqleError::SearchWorker(describe_search_failures(
-            &failures,
-        )));
-    }
-    if incomplete {
-        return Err(CraqleError::SearchWorker(
-            "search queue scan spent its row budget with work still owed".to_string(),
-        ));
-    }
+    search.complete_coverage(store, target)?;
+    store.persist()?;
     Ok(())
 }
 
 /// Name what a flush could not cover, with the first entry's diagnostic.
-fn describe_search_failures(failures: &[search::DrainFailure]) -> String {
+fn describe_search_failures(failures: &[search::queue::DrainFailure]) -> String {
     let mut message = format!("{} search queue entries still owed", failures.len());
     if let Some(first) = failures.first() {
         message.push_str(&format!(
-            "; {} failed {} times: {}",
+            "; {} {:?} target {} failed {} times ({}; retry at {}): {}",
             first.graph.as_str(),
+            first.kind,
+            first.target,
             first.attempts,
+            first.code,
+            first.retry_at_ms,
             first.diagnostic
         ));
     }
@@ -1181,6 +1288,26 @@ pub struct CraqleNode {
     reindex_gate: std::sync::Mutex<Option<ReindexGate>>,
 }
 
+struct PolicyWrite<'a> {
+    graph: &'a GraphId,
+    policy: GraphPolicy,
+    durability: CraqleRequestDurability,
+}
+
+struct BatchFinish<'a> {
+    graph: &'a GraphId,
+    batch: Batch,
+    durability: CraqleRequestDurability,
+}
+
+struct CrateBuild<'a> {
+    auth: &'a dyn Authorizer,
+    request: CreateCrateRequest,
+    durability: CraqleRequestDurability,
+    actor: Option<ActorId>,
+    version: RoCrateVersion,
+}
+
 /// Reports that a reindex reached the point between a scan and its clear, then
 /// waits to be released. Test-only.
 #[cfg(test)]
@@ -1195,7 +1322,8 @@ pub struct CraqleOptions {
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
     remote_policy_authorizer: Arc<dyn RemotePolicyAuthorizer>,
     search_storage: SearchStorage,
-    graph_store_persist_mode: CraqleFjallPersistMode,
+    store_mode: CraqleFjallPersistMode,
+    memory_budget: MemoryBudget,
     #[cfg(feature = "shacl-core")]
     pending_replay_policy: PendingReplayPolicy,
 }
@@ -1215,7 +1343,8 @@ impl Default for CraqleOptions {
             sync: None,
             remote_policy_authorizer: Arc::new(DenyRemotePolicyChanges),
             search_storage: SearchStorage::default(),
-            graph_store_persist_mode: CraqleFjallPersistMode::default(),
+            store_mode: CraqleFjallPersistMode::default(),
+            memory_budget: MemoryBudget::default(),
             #[cfg(feature = "shacl-core")]
             pending_replay_policy: PendingReplayPolicy::default(),
         }
@@ -1237,13 +1366,18 @@ impl CraqleOptions {
         self
     }
 
+    pub fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
     pub fn with_graph_store_persist_mode(mut self, mode: CraqleFjallPersistMode) -> Self {
-        self.graph_store_persist_mode = mode;
+        self.store_mode = mode;
         self
     }
 
     pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
-        self.graph_store_persist_mode
+        self.store_mode
     }
 
     #[cfg(feature = "shacl-core")]
@@ -1325,51 +1459,58 @@ impl CraqleNode {
 
     /// Open a node rooted at `path` with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: CraqleOptions) -> Result<Self> {
+        options
+            .memory_budget
+            .validate()
+            .map_err(store::StoreError::from)?;
         let root = path.as_ref();
         std::fs::create_dir_all(root)?;
         let search_storage = options.search_storage;
-        let graph_store_persist_mode = options.graph_store_persist_mode;
+        let store_mode = options.store_mode;
         #[cfg(feature = "shacl-core")]
         let pending_replay_policy = options.pending_replay_policy;
 
-        let store = Arc::new(GraphStore::open_with_persist_mode(
+        let store = Arc::new(GraphStore::open_with_budget(
             root.join("store"),
-            graph_store_persist_mode.into_store_mode(),
+            store_mode.into_store_mode(),
+            options.memory_budget,
         )?);
         let search = Arc::new(match search_storage {
-            SearchStorage::Disk => SearchIndex::open(root.join("search"))?,
-            SearchStorage::Memory => SearchIndex::open_in_memory()?,
+            SearchStorage::Disk => {
+                SearchIndex::open_with_budget(root.join("search"), options.memory_budget)?
+            }
+            SearchStorage::Memory => SearchIndex::memory_with_budget(options.memory_budget)?,
         });
-        let search_needs_rebuild =
-            search.needs_rebuild() || search_storage == SearchStorage::Memory;
+        let search_needs_rebuild = search.bind_store(&store)?.is_some();
+        if search_needs_rebuild {
+            store.persist()?;
+        }
         #[allow(unused_mut)]
-        let mut node = Self::from_store_and_search(store, search.clone(), options);
+        let mut node = Self::assemble_store(store, search.clone(), options);
         reconcile_at_open(&node)?;
         #[cfg(feature = "shacl-core")]
         {
             let startup_started = Instant::now();
             let mut outcome = PendingReplayOutcome::default();
-            if node.store.pending_shacl_queue_repair_required()? {
+            if node.store.shacl_repair_needed()? {
                 let repair = {
                     let _binding_guard = node.store.binding_guard();
-                    node.store.repair_pending_shacl_queue()?
+                    node.store.repair_shacl_queue()?
                 };
                 node.persist_fjall()?;
                 outcome.statistics.binding_records_scanned = repair.binding_records_scanned;
-                outcome.statistics.pending_queue_entries_scanned =
-                    repair.pending_queue_entries_scanned;
+                outcome.statistics.pending_queue_entries_scanned = repair.pending_entries_scanned;
             }
             let replay = match pending_replay_policy {
-                PendingReplayPolicy::ReplayAllBeforeOpen => Some(
-                    node.replication
-                        .replay_pending_bindings_bounded(usize::MAX, None)?,
-                ),
+                PendingReplayPolicy::ReplayAllBeforeOpen => {
+                    Some(node.replication.replay_bindings_bounded(usize::MAX, None)?)
+                }
                 PendingReplayPolicy::ReplayBounded {
                     max_graphs,
                     max_elapsed,
                 } => Some(
                     node.replication
-                        .replay_pending_bindings_bounded(max_graphs, Some(max_elapsed))?,
+                        .replay_bindings_bounded(max_graphs, Some(max_elapsed))?,
                 ),
                 PendingReplayPolicy::Defer => None,
             };
@@ -1385,12 +1526,32 @@ impl CraqleNode {
             node.startup_pending_replay = outcome;
         }
         if search_needs_rebuild {
-            node.schedule_full_search_reindex()?;
+            node.schedule_search_update();
         }
         Ok(node)
     }
 
     pub fn from_store_and_search(
+        store: Arc<GraphStore>,
+        search: Arc<SearchIndex>,
+        options: CraqleOptions,
+    ) -> Self {
+        let repair = search
+            .bind_store(&store)
+            .map_err(CraqleError::from)
+            .and_then(|target| {
+                if target.is_some() {
+                    store.persist()?;
+                }
+                Ok(())
+            });
+        if let Err(error) = repair {
+            tracing::warn!(%error, "search initialization remains pending");
+        }
+        Self::assemble_store(store, search, options)
+    }
+
+    fn assemble_store(
         store: Arc<GraphStore>,
         search: Arc<SearchIndex>,
         options: CraqleOptions,
@@ -1531,8 +1692,8 @@ impl CraqleNode {
             }
             .into());
         }
-        self.ensure_prepared_document_current(document)?;
-        self.ensure_rocrate_policy_current(policy)?;
+        self.ensure_prepared_current(document)?;
+        self.ensure_policy_current(policy)?;
 
         let shacl = self.shacl.validate_delta(
             &document.graph,
@@ -1541,14 +1702,14 @@ impl CraqleNode {
             &options.validation,
         )?;
 
-        self.ensure_prepared_document_current(document)?;
-        self.ensure_rocrate_policy_current(policy)?;
+        self.ensure_prepared_current(document)?;
+        self.ensure_policy_current(policy)?;
         let conforms = document.structural_findings.is_empty() && shacl.conforms;
-        let accepted_by_write_policy =
+        let accepted_write_policy =
             document.structural_findings.is_empty() && shacl.accepted_by_write_policy;
         Ok(RoCratePolicyReport {
             conforms,
-            accepted_by_write_policy,
+            accepted_by_write_policy: accepted_write_policy,
             detected_version: document.detected_version,
             document_digest: document.document_digest,
             rocrate_violations: document.structural_findings.clone(),
@@ -1853,7 +2014,7 @@ impl CraqleNode {
     ) -> Result<PendingReplayOutcome> {
         Ok(self
             .replication
-            .replay_pending_bindings_bounded(max_graphs, Some(max_elapsed))?)
+            .replay_bindings_bounded(max_graphs, Some(max_elapsed))?)
     }
 
     #[cfg(feature = "shacl-core")]
@@ -1861,12 +2022,12 @@ impl CraqleNode {
         let started = Instant::now();
         let repair = {
             let _binding_guard = self.store.binding_guard();
-            self.store.repair_pending_shacl_queue()?
+            self.store.repair_shacl_queue()?
         };
         self.persist_fjall()?;
         Ok(PendingReplayStatistics {
             binding_records_scanned: repair.binding_records_scanned,
-            pending_queue_entries_scanned: repair.pending_queue_entries_scanned,
+            pending_queue_entries_scanned: repair.pending_entries_scanned,
             elapsed: started.elapsed(),
             ..PendingReplayStatistics::default()
         })
@@ -1956,7 +2117,7 @@ impl CraqleNode {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn ensure_prepared_document_current(&self, document: &PreparedRoCrateDocument) -> Result<()> {
+    fn ensure_prepared_current(&self, document: &PreparedRoCrateDocument) -> Result<()> {
         let current = match &document.base {
             PreparedGraphBase::New => !self.store.contains_graph(&document.graph)?,
             PreparedGraphBase::Existing { data_version } => {
@@ -1975,7 +2136,7 @@ impl CraqleNode {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn ensure_rocrate_policy_current(&self, policy: &CompiledRoCratePolicy) -> Result<()> {
+    fn ensure_policy_current(&self, policy: &CompiledRoCratePolicy) -> Result<()> {
         let shape_versions = policy.shacl.shape_versions();
         if policy.compiler_model_version != SHACL_COMPILER_MODEL_VERSION
             || policy.shacl.model_version() != SHACL_COMPILER_MODEL_VERSION
@@ -2076,12 +2237,10 @@ impl CraqleNode {
         Ok(topic_id)
     }
 
-    /// Deterministic graph topic id, binding it locally only if its genesis is
-    /// already present. Never mints, so concurrent callers on different nodes
-    /// cannot fork rival geneses for the same graph.
+    /// Bind a deterministic topic only when its genesis is already present.
     pub fn bind_or_derive_irokle_topic(&self, graph: &GraphId) -> Result<irokle::TopicId> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        if let Some(topic_id) = sync.bind_graph_topic_if_present(&self.store, graph)? {
+        if let Some(topic_id) = sync.bind_existing_topic(&self.store, graph)? {
             self.persist_fjall()?;
             return Ok(topic_id);
         }
@@ -2091,16 +2250,14 @@ impl CraqleNode {
     /// Binds the graph's topic id if its genesis is present locally, else `None`.
     pub fn bind_irokle_topic(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        let bound = sync.bind_graph_topic_if_present(&self.store, graph)?;
+        let bound = sync.bind_existing_topic(&self.store, graph)?;
         if bound.is_some() {
             self.persist_fjall()?;
         }
         Ok(bound)
     }
 
-    /// Mints the graph's topic genesis with an explicit member set (or binds an
-    /// existing one). The only path that creates a graph genesis; callers own
-    /// the single-minter discipline.
+    /// Mint or bind a topic genesis; callers enforce single-minter discipline.
     pub fn mint_irokle_topic(
         &self,
         graph: &GraphId,
