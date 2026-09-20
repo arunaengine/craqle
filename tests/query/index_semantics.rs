@@ -1,17 +1,14 @@
 //! Black-box query contracts for graph routing and duplicate handling.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! CONSTRUCT/DESCRIBE coverage remains in the internal SPARQL tests: the
-//! public graph result contains triples but no graph provenance, so it cannot
-//! express the cross-graph multiplicity contract this suite targets.
-
+//! Public triples lack graph provenance; internal tests cover CONSTRUCT and DESCRIBE.
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
 use craqle::{
-    AllowAllAuthorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
-    MaterializedQuadChange, QueryResults,
+    AllowAllAuthorizer, Authorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
+    MaterializedQuadChange, QueryLimits, QueryOptions, QueryResults,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -163,6 +160,18 @@ fn canonical_rows(results: QueryResults) -> Vec<Vec<(String, EncodedTerm)>> {
     rows
 }
 
+fn query_unbounded(
+    node: &CraqleNode,
+    auth: &dyn Authorizer,
+    sparql: &str,
+) -> craqle::Result<QueryResults> {
+    let prepared = node.prepare_query(sparql)?;
+    let mut options = QueryOptions::default();
+    options.limits = QueryLimits::unbounded();
+    node.execute_prepared(auth, &prepared, &options)
+        .map(|execution| execution.results)
+}
+
 fn expected_shared_rows() -> Vec<Vec<(String, EncodedTerm)>> {
     vec![vec![("s".to_string(), iri(SHARED_SUBJECT))]]
 }
@@ -232,7 +241,7 @@ fn mixed_patterns_preserve() {
         "SELECT ?g ?s WHERE {{ ?s <{TEST_PREDICATE}> \"{SHARED_VALUE}\" . \
          GRAPH ?g {{ ?s <{TEST_PREDICATE}> \"{SHARED_VALUE}\" }} }}"
     );
-    let rows = canonical_rows(fixture.node.query(&fixture.reader, &query).unwrap());
+    let rows = canonical_rows(query_unbounded(&fixture.node, &fixture.reader, &query).unwrap());
 
     assert_eq!(rows, expected_named_rows(&fixture.visible));
     assert!(rows.iter().all(|row| {
@@ -319,14 +328,14 @@ fn bounded_queries_deduplicate() {
     let limited = format!("SELECT ?s ?o WHERE {{ ?s <{TEST_PREDICATE}> ?o }} ORDER BY ?o LIMIT 1");
     let ten = format!("SELECT ?s ?o WHERE {{ ?s <{TEST_PREDICATE}> ?o }} ORDER BY ?o LIMIT 10");
     assert_eq!(
-        canonical_rows(fixture.node.query(&fixture.reader, &limited).unwrap()),
+        canonical_rows(query_unbounded(&fixture.node, &fixture.reader, &limited).unwrap()),
         canonical_expected(vec![vec![
             ("s".to_string(), iri(UNIQUE_SUBJECT)),
             ("o".to_string(), literal(UNIQUE_VALUE)),
         ]])
     );
     assert_eq!(
-        canonical_rows(fixture.node.query(&fixture.reader, &ten).unwrap()),
+        canonical_rows(query_unbounded(&fixture.node, &fixture.reader, &ten).unwrap()),
         expected_all_rows()
     );
 }

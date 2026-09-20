@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
@@ -80,9 +81,9 @@ fn prepared_reads_fresh() {
     assert_eq!(first.results, old);
     assert_eq!(first.statistics.parse_time, std::time::Duration::ZERO);
 
-    let first_query_id_generation = first.statistics.query_id_generation.unwrap();
+    let first_generation = first.statistics.query_id_generation.unwrap();
     let rebuilt = node.rebuild_query_indexes().unwrap();
-    assert!(rebuilt.query_id_generation > first_query_id_generation);
+    assert!(rebuilt.query_id_generation > first_generation);
     let after_rebuild = node
         .execute_prepared_in_graphs(
             &AllowAllAuthorizer,
@@ -288,6 +289,7 @@ fn forced_join_results() {
         .unwrap();
     let mut lateral_options = QueryOptions::default();
     lateral_options.join_mode = JoinMode::ForceLateral;
+    lateral_options.limits = craqle::QueryLimits::unbounded();
     let lateral = node
         .execute_prepared_in_graphs(
             &AllowAllAuthorizer,
@@ -298,6 +300,7 @@ fn forced_join_results() {
         .unwrap();
     let mut hash_options = QueryOptions::default();
     hash_options.join_mode = JoinMode::ForceHash;
+    hash_options.limits = craqle::QueryLimits::unbounded();
     let hash = node
         .execute_prepared_in_graphs(
             &AllowAllAuthorizer,

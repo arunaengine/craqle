@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 use std::time::Duration;
@@ -9,7 +10,8 @@ use std::time::Duration;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleErrorKind, CraqleNode, EncodedTerm, GraphId, MaterializedQuadChange,
-    QueryFastPathMode, QueryLimits, QueryOptions, QueryResults, UpdateLimits, UpdateOptions,
+    QueryFastPathMode as FastPathMode, QueryLimits, QueryOptions, QueryResults, UpdateLimits,
+    UpdateOptions,
 };
 
 fn insert(graph: &GraphId, subject: &str, predicate: &str, object: &str) -> MaterializedQuadChange {
@@ -83,7 +85,7 @@ fn query_limits() {
         &graph,
         "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
         |options| {
-            options.fast_paths = QueryFastPathMode::Disabled;
+            options.fast_paths = FastPathMode::Disabled;
             options.limits.max_result_cells = 1;
         },
     );
@@ -107,7 +109,7 @@ fn query_limits() {
         &graph,
         "SELECT DISTINCT ?s WHERE { ?s <urn:p> ?o }",
         |options| {
-            options.fast_paths = QueryFastPathMode::Disabled;
+            options.fast_paths = FastPathMode::Disabled;
             options.limits.max_hash_entries = 1;
         },
     );
@@ -140,7 +142,7 @@ fn query_limits() {
         &graph,
         "SELECT ?o WHERE { <urn:a> <urn:next>+ ?o }",
         |options| {
-            options.fast_paths = QueryFastPathMode::Disabled;
+            options.fast_paths = FastPathMode::Disabled;
             options.limits.max_property_path_edges = 1;
         },
     );

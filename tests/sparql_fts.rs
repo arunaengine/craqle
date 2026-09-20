@@ -4,16 +4,7 @@
 
 mod support;
 
-/// Completeness of the `SERVICE <urn:craqle:fts>` clause (charter G8, finding K2).
-///
-/// Graph visibility is decided *after* tantivy has ranked its hits, so asking
-/// the index for exactly `fts:limit` documents silently returns fewer
-/// authorized rows than the caller requested whenever the top-ranked hits sit
-/// in graphs the caller cannot read. Authorized results must never be omitted.
-///
-/// Every case here needs a real tantivy index: the `search`-off stub answers
-/// every query with an empty result set, which satisfies "no unauthorized graph
-/// leaked" vacuously.
+/// Authorized SERVICE matches must fill the requested page under a real search index.
 #[cfg(all(test, feature = "search"))]
 mod tests {
     use std::collections::BTreeSet;
@@ -83,9 +74,7 @@ mod tests {
         )
         .unwrap();
 
-        // Interleave the two populations so relevance ranking cannot separate
-        // them: with equal scores the index is free to return any mix, and a
-        // no-over-fetch reader keeps only the readable minority of the top N.
+        // Equal-scoring readable and hidden documents exercise authorization before ranking.
         for idx in 0..UNREADABLE.max(READABLE) {
             if idx < UNREADABLE {
                 seed_matching_crate(&node, &unreadable_graph(idx));
@@ -108,7 +97,34 @@ mod tests {
     where
         F: Fn(&GraphId) -> bool + Send + Sync,
     {
-        solution_rows(query_with_test_visibility(node, visible, sparql).unwrap())
+        let auth = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+            if visible(graph) {
+                Ok(())
+            } else {
+                Err(AuthorizationError::PermissionDenied {
+                    action,
+                    graph: graph.as_str().to_owned(),
+                })
+            }
+        };
+        let query = node.prepare_query(sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.limits = QueryLimits::unbounded();
+        solution_rows(
+            node.execute_prepared(&auth, &query, &options)
+                .unwrap()
+                .results,
+        )
+        .into_iter()
+        .map(|row| row.get("g").expect("?g must be bound").0.clone())
+        .collect()
+    }
+
+    fn bounded_graph_rows<F>(node: &CraqleNode, visible: F, sparql: &str) -> BTreeSet<String>
+    where
+        F: Fn(&GraphId) -> bool + Send + Sync,
+    {
+        solution_rows(query_with_visibility(node, visible, sparql).unwrap())
             .into_iter()
             .map(|row| row.get("g").expect("?g must be bound").0.clone())
             .collect()
@@ -149,9 +165,7 @@ mod tests {
         );
     }
 
-    /// `fts:limit` is remote input. Tantivy's collector pre-allocates
-    /// `limit * 2` and the over-fetch multiplies it first, so an unbounded
-    /// limit let one query abort the process instead of returning a page.
+    /// Oversized SERVICE limits must return a typed error before collector allocation.
     #[test]
     fn service_clamps_limit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -171,7 +185,7 @@ mod tests {
             usize::MAX
         );
 
-        let graphs = fts_graph_rows(&node, &sparql);
+        let graphs = bounded_graph_rows(&node, visible, &sparql);
         assert_eq!(
             READABLE,
             graphs.len(),
@@ -209,21 +223,10 @@ mod tests {
         }
     }
 
-    /// The escalation loop has to terminate on an exhausted index *and* keep
-    /// escalating while authorized hits are still out of reach.
-    ///
-    /// `rows.is_empty()` alone was the one FTS assertion that also held with the
-    /// loop deleted, and with the `search` feature off. Two things pin it now:
-    /// the query runs under a watchdog, so "it terminated" is asserted rather
-    /// than delegated to the harness not hanging; and every readable graph is
-    /// authorized alone in turn, which the reader can only satisfy by fetching
-    /// past `fts:limit` — one authorized document among 250 equal-scoring ones
-    /// is not in the top `limit` for all but one of them.
+    /// An exhausted hidden corpus must finish, while sparse authorized matches remain reachable.
     #[test]
     fn service_terminates_unauthorized() {
-        // The watchdog is the termination assertion: an escalation loop that
-        // never notices an exhausted index hangs the harness rather than
-        // failing, and `rows.is_empty()` below would never be reached.
+        // The watchdog turns lost progress into an assertion rather than a hung suite.
         with_watchdog("service_terminates_unauthorized", || {
             let tmp = tempfile::tempdir().unwrap();
             let node = seeded_node(&tmp);
@@ -242,7 +245,7 @@ mod tests {
                 )
             };
 
-            let rows = graph_rows_for(&node, |_: &GraphId| false, &sparql(FTS_LIMIT));
+            let rows = bounded_graph_rows(&node, |_: &GraphId| false, &sparql(FTS_LIMIT));
             assert!(
                 rows.is_empty(),
                 "an unauthorized reader must see nothing: {rows:?}"
@@ -282,7 +285,24 @@ mod tests {
             "#,
             readable.as_str()
         );
-        let rows = solution_rows(query_with_test_visibility(&node, visible, &sparql).unwrap());
+        let auth = |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+            if visible(graph) {
+                Ok(())
+            } else {
+                Err(AuthorizationError::PermissionDenied {
+                    action,
+                    graph: graph.as_str().to_owned(),
+                })
+            }
+        };
+        let mut options = QueryOptions::default();
+        options.limits = QueryLimits::unbounded();
+        let query = node.prepare_query(&sparql).unwrap();
+        let rows = solution_rows(
+            node.execute_prepared(&auth, &query, &options)
+                .unwrap()
+                .results,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get("s").unwrap().0,
@@ -303,8 +323,12 @@ mod tests {
             "#,
             hidden.as_str()
         );
-        let hidden_rows =
-            solution_rows(query_with_test_visibility(&node, visible, &hidden_sparql).unwrap());
+        let hidden_query = node.prepare_query(&hidden_sparql).unwrap();
+        let hidden_rows = solution_rows(
+            node.execute_prepared(&auth, &hidden_query, &options)
+                .unwrap()
+                .results,
+        );
         assert!(hidden_rows.is_empty());
     }
 }

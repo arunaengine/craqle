@@ -1,11 +1,8 @@
 //! Small, deterministic semantic baseline for the public SPARQL API.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! This deliberately checks results, not query timings.  Each baseline query
-//! runs with the craqle optimizer both enabled and disabled; solution rows are
-//! compared as multisets because SPARQL does not prescribe an order here.
-
+//! Compare optimizer-on/off solutions as multisets, independent of execution timing.
+#[path = "../support.rs"]
 mod support;
 
 use crate::support::TestWriteExt as _;
@@ -13,10 +10,11 @@ use crate::support::TestWriteExt as _;
 use oxrdf::Term;
 
 use craqle::{
-    AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange,
-    QueryResults, SearchStorage,
+    Action, AllowAllAuthorizer, AuthorizationError, CraqleNode, CraqleOptions, EncodedTerm,
+    GraphId, GraphPolicy, MaterializedQuadChange, QueryLimits, QueryOptions, QueryResults,
+    SearchStorage,
 };
-use support::{query_with_test_planner, query_with_test_visibility};
+use support::query_with_visibility;
 
 const PRIMARY_GRAPH: &str = "urn:baseline:primary";
 const DUPLICATE_GRAPH: &str = "urn:baseline:duplicate";
@@ -181,15 +179,36 @@ fn canonicalize(results: QueryResults) -> CanonicalResults {
     }
 }
 
-fn planner_result<F>(node: &CraqleNode, label: &str, visible: F, sparql: &str) -> CanonicalResults
+fn planner_result<F>(node: &CraqleNode, visible: F, sparql: &str) -> CanonicalResults
 where
     F: Fn(&GraphId) -> bool + Sync,
 {
-    let optimized = canonicalize(query_with_test_planner(node, &visible, sparql, true).unwrap());
-    let unoptimized = canonicalize(query_with_test_planner(node, &visible, sparql, false).unwrap());
+    let prepared = node.prepare_query(sparql).unwrap();
+    let auth = |graph: &GraphId, _: &GraphPolicy, action: Action| {
+        if visible(graph) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_owned(),
+            })
+        }
+    };
+    let execute = |optimize| {
+        let mut options = QueryOptions::default();
+        options.optimize = optimize;
+        options.limits = QueryLimits::unbounded();
+        canonicalize(
+            node.execute_prepared(&auth, &prepared, &options)
+                .unwrap()
+                .results,
+        )
+    };
+    let optimized = execute(true);
+    let unoptimized = execute(false);
     assert_eq!(
         optimized, unoptimized,
-        "{label}: optimizer changed SPARQL semantics\nquery: {sparql}"
+        "optimizer changed SPARQL semantics\nquery: {sparql}"
     );
     optimized
 }
@@ -228,23 +247,18 @@ fn baseline_plans_equivalent() {
 
     let ask_hit = format!("ASK WHERE {{ <{NEEDLE_SUBJECT}> <{KNOWN}> <{KNOWN_OBJECT}> }}");
     assert_eq!(
-        planner_result(&fixture.node, "bound ASK hit", |_| true, &ask_hit),
+        planner_result(&fixture.node, |_| true, &ask_hit),
         CanonicalResults::Boolean(true)
     );
 
     let ask_miss = format!("ASK WHERE {{ <urn:baseline:missing> <{KNOWN}> <{KNOWN_OBJECT}> }}");
     assert_eq!(
-        planner_result(&fixture.node, "bound ASK miss", |_| true, &ask_miss),
+        planner_result(&fixture.node, |_| true, &ask_miss),
         CanonicalResults::Boolean(false)
     );
 
     let limit = format!("SELECT ?s WHERE {{ ?s <{KNOWN}> <{KNOWN_OBJECT}> }} LIMIT 10");
-    let limit_rows = solution_rows(planner_result(
-        &fixture.node,
-        "SELECT LIMIT 10",
-        |_| true,
-        &limit,
-    ));
+    let limit_rows = solution_rows(planner_result(&fixture.node, |_| true, &limit));
     assert_eq!(limit_rows.len(), 10);
     let allowed_limit_rows = expected_rows(
         (0..10)
@@ -265,12 +279,7 @@ fn baseline_plans_equivalent() {
     assert_eq!(distinct_limit_rows.len(), 10);
 
     let count = format!("SELECT (COUNT(*) AS ?count) WHERE {{ ?s <{COMMON}> ?value }}");
-    let count_rows = solution_rows(planner_result(
-        &fixture.node,
-        "exact COUNT(*)",
-        |_| true,
-        &count,
-    ));
+    let count_rows = solution_rows(planner_result(&fixture.node, |_| true, &count));
     assert_eq!(count_rows.len(), 1);
     assert_eq!(literal_value(binding(&count_rows[0], "count")), "11");
 
@@ -278,12 +287,7 @@ fn baseline_plans_equivalent() {
         "SELECT ?s ?name ?rare WHERE {{ ?s <{NAME}> ?name ; <{RARE}> ?rare ; <{COMMON}> ?value }}"
     );
     assert_eq!(
-        solution_rows(planner_result(
-            &fixture.node,
-            "same-subject property star",
-            |_| true,
-            &property_star,
-        )),
+        solution_rows(planner_result(&fixture.node, |_| true, &property_star,)),
         expected_rows(vec![vec![
             ("s".to_string(), iri(NEEDLE_SUBJECT)),
             ("name".to_string(), literal("Needle")),
@@ -300,21 +304,11 @@ fn baseline_plans_equivalent() {
         ("value".to_string(), literal("common-needle")),
     ]]);
     assert_eq!(
-        solution_rows(planner_result(
-            &fixture.node,
-            "rare-to-common join",
-            |_| true,
-            &rare_to_common,
-        )),
+        solution_rows(planner_result(&fixture.node, |_| true, &rare_to_common,)),
         expected_join
     );
     assert_eq!(
-        solution_rows(planner_result(
-            &fixture.node,
-            "common-to-rare join",
-            |_| true,
-            &common_to_rare,
-        )),
+        solution_rows(planner_result(&fixture.node, |_| true, &common_to_rare,)),
         expected_join
     );
 }
@@ -335,19 +329,9 @@ fn plans_preserve_multiplicity() {
         ],
     ]);
 
-    let _ = planner_result(
-        &fixture.node,
-        "union default duplicate behavior",
-        |_| true,
-        &default_query,
-    );
+    let _ = planner_result(&fixture.node, |_| true, &default_query);
     assert_eq!(
-        solution_rows(planner_result(
-            &fixture.node,
-            "named graph duplicate multiplicity",
-            |_| true,
-            &named_query,
-        )),
+        solution_rows(planner_result(&fixture.node, |_| true, &named_query,)),
         named_rows,
         "non-DISTINCT SELECT must preserve one row from each named graph"
     );
@@ -361,7 +345,7 @@ fn union_deduplicates_triples() {
 
     assert_eq!(
         solution_rows(canonicalize(
-            query_with_test_visibility(&fixture.node, |_| true, &query).unwrap(),
+            query_with_visibility(&fixture.node, |_| true, &query).unwrap(),
         )),
         expected,
         "the union default graph must contain one copy of an identical triple"
@@ -373,12 +357,7 @@ fn queries_hide_orphans() {
     let fixture = fixture();
     let hidden_query = format!("SELECT ?s WHERE {{ ?s <{HIDDEN}> \"hidden\" }}");
     assert_eq!(
-        solution_rows(planner_result(
-            &fixture.node,
-            "visible graph baseline",
-            |_| true,
-            &hidden_query,
-        )),
+        solution_rows(planner_result(&fixture.node, |_| true, &hidden_query,)),
         expected_rows(vec![vec![(
             "s".to_string(),
             iri("urn:baseline:hidden-subject"),
@@ -388,7 +367,6 @@ fn queries_hide_orphans() {
     assert_eq!(
         solution_rows(planner_result(
             &fixture.node,
-            "hidden graph visibility",
             move |graph| graph != &hidden,
             &hidden_query,
         )),
@@ -422,7 +400,6 @@ fn queries_hide_orphans() {
     assert_eq!(
         solution_rows(planner_result(
             &fixture.node,
-            "orphan filtering",
             |graph| graph == &fixture.orphan,
             &orphan_query,
         )),

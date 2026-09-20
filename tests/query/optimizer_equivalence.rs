@@ -2,12 +2,10 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
-/// Result-equivalence harness for the craqle query-plan optimizer: every
-/// shape in the perf matrix (plus OPTIONAL-unbound and typed-literal edge
-/// cases) must produce identical result sets with the optimizer on and off,
-/// with the lazy visibility predicate active.
+/// Compare optimizer results with lazy visibility, including unbound and typed terms.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -18,10 +16,7 @@ mod tests {
 
     const GRAPH_COUNT: usize = 400;
     const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-    /// Above `sparql::EXPLICIT_DATASET_GRAPH_LIMIT`, so an explicit visible
-    /// list runs through the union view with a `Set` graph filter — the path
-    /// where a bound object used to enumerate every corpus graph holding
-    /// `(p, o)` no matter how few graphs the caller could actually see.
+    /// Above the explicit-dataset threshold, this uses union-view filtering.
     const UNION_VISIBLE_GRAPHS: usize = 40;
 
     fn term_iri(iri: &str) -> EncodedTerm {
@@ -141,10 +136,67 @@ mod tests {
         }
     }
 
+    fn planner_rows(node: &CraqleNode, sparql: &str, optimize: bool) -> QueryResults {
+        let auth = |graph: &GraphId, _: &GraphPolicy, action: Action| {
+            if visible(graph) {
+                Ok(())
+            } else {
+                Err(AuthorizationError::PermissionDenied {
+                    action,
+                    graph: graph.as_str().to_owned(),
+                })
+            }
+        };
+        let prepared = node.prepare_query(sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.optimize = optimize;
+        options.limits = QueryLimits::unbounded();
+        node.execute_prepared(&auth, &prepared, &options)
+            .unwrap()
+            .results
+    }
+
+    fn all_rows(node: &CraqleNode, sparql: &str, optimize: bool) -> QueryResults {
+        let prepared = node.prepare_query(sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.optimize = optimize;
+        options.limits = QueryLimits::unbounded();
+        node.execute_prepared(&AllowAllAuthorizer, &prepared, &options)
+            .unwrap()
+            .results
+    }
+
+    fn visible_rows(node: &CraqleNode, sparql: &str, allowed: &BTreeSet<String>) -> QueryResults {
+        let auth = |graph: &GraphId, _: &GraphPolicy, action: Action| {
+            if allowed.contains(graph.as_str()) {
+                Ok(())
+            } else {
+                Err(AuthorizationError::PermissionDenied {
+                    action,
+                    graph: graph.as_str().to_owned(),
+                })
+            }
+        };
+        let prepared = node.prepare_query(sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.limits = QueryLimits::unbounded();
+        node.execute_prepared(&auth, &prepared, &options)
+            .unwrap()
+            .results
+    }
+
+    fn listed_rows(node: &CraqleNode, graphs: &[GraphId], sparql: &str) -> QueryResults {
+        let prepared = node.prepare_query(sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.limits = QueryLimits::unbounded();
+        node.execute_prepared_in_graphs(&AllowAllAuthorizer, graphs, &prepared, &options)
+            .unwrap()
+            .results
+    }
+
     fn assert_equivalent(node: &CraqleNode, label: &str, sparql: &str) -> usize {
-        let optimized =
-            canonical_rows(query_with_test_planner(node, visible, sparql, true).unwrap());
-        let raw = canonical_rows(query_with_test_planner(node, visible, sparql, false).unwrap());
+        let optimized = canonical_rows(planner_rows(node, sparql, true));
+        let raw = canonical_rows(planner_rows(node, sparql, false));
         assert_eq!(
             optimized, raw,
             "{label}: optimizer changed the result set\nquery: {sparql}"
@@ -349,8 +401,7 @@ mod tests {
         let sparql = "SELECT ?d ?n WHERE { ?d a <http://schema.org/Dataset> ; \
                       <http://schema.org/name> ?n }";
         for optimize in [true, false] {
-            let rows =
-                solution_rows(query_with_test_planner(&node, visible, sparql, optimize).unwrap());
+            let rows = solution_rows(planner_rows(&node, sparql, optimize));
             assert!(!rows.is_empty());
             for row in &rows {
                 let name = &row.get("n").unwrap().0;
@@ -382,9 +433,8 @@ mod tests {
         // `?v = 1` is value equality: it must match both "1"^^xsd:integer and
         // the non-canonical "01"^^xsd:integer spellings.
         let sparql = "SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }";
-        let optimized =
-            solution_rows(query_with_test_planner(&node, visible, sparql, true).unwrap());
-        let raw = solution_rows(query_with_test_planner(&node, visible, sparql, false).unwrap());
+        let optimized = solution_rows(planner_rows(&node, sparql, true));
+        let raw = solution_rows(planner_rows(&node, sparql, false));
         assert_eq!(optimized.len(), raw.len());
         // Every visible dataset has a version quad; idx % 5 == 0 graphs use
         // the "01" spelling and must still match.
@@ -392,7 +442,7 @@ mod tests {
         assert_eq!(optimized.len(), visible_count);
     }
 
-    // ── Bound-object patterns under a small visible set (finding R5) ─────────
+    // Bound-object patterns under a small visible set.
 
     fn bound_object_shapes() -> Vec<(&'static str, String)> {
         vec![
@@ -433,11 +483,7 @@ mod tests {
         ]
     }
 
-    /// A caller seeing 40 of 400 graphs must get exactly the same answer
-    /// whether the visible set is handed over as an explicit list (which now
-    /// walks the visible members for bound objects) or as a lazy predicate
-    /// (which enumerates index candidates). Both still gate every graph
-    /// through `graph_is_visible` and every quad through `quad_is_visible`.
+    /// Explicit lists and lazy predicates must agree for bound objects.
     #[test]
     fn patterns_respect_visibility() {
         let tmp = tempfile::tempdir().unwrap();
@@ -453,15 +499,9 @@ mod tests {
             .iter()
             .map(|graph| graph.as_str().to_string())
             .collect();
-        let by_predicate = |graph: &GraphId| allowed.contains(graph.as_str());
-
         for (label, sparql) in bound_object_shapes() {
-            let from_list = canonical_rows(
-                node.query_in_graphs(&AllowAllAuthorizer, &listed, &sparql)
-                    .unwrap(),
-            );
-            let from_predicate =
-                canonical_rows(query_with_test_visibility(&node, by_predicate, &sparql).unwrap());
+            let from_list = canonical_rows(listed_rows(&node, &listed, &sparql));
+            let from_predicate = canonical_rows(visible_rows(&node, &sparql, &allowed));
             assert_eq!(
                 from_list, from_predicate,
                 "{label}: explicit visible list diverged from the visibility predicate\n\
@@ -489,11 +529,9 @@ mod tests {
         }
     }
 
-    // ── FILTER / effective-boolean-value matrix (finding R6) ─────────────────
+    // FILTER effective-boolean-value matrix.
 
-    /// Expected SPARQL effective boolean value. `Error` means "not an EBV
-    /// type", which a FILTER turns into an eliminated solution — distinct from
-    /// `False`, which `!` flips back to a kept row.
+    /// `Error` is an invalid EBV removed by FILTER, unlike negatable `False`.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Ebv {
         True,
@@ -504,9 +542,7 @@ mod tests {
     const EBV_VALUE: &str = "urn:eq:ebv:value";
     const XSD: &str = "http://www.w3.org/2001/XMLSchema";
 
-    /// One row per term shape the expression evaluator has to classify. The
-    /// expectations are spareval's EBV table, which craqle must not perturb by
-    /// routing term externalization through its own cache.
+    /// Cached term decoding must preserve spareval's effective boolean value semantics.
     fn ebv_matrix() -> Vec<(&'static str, String, Ebv)> {
         let typed = |value: &str, datatype: &str| format!("\"{value}\"^^<{XSD}#{datatype}>");
         vec![
@@ -562,12 +598,10 @@ mod tests {
     fn ebv_entities(node: &CraqleNode, expression: &str) -> BTreeSet<String> {
         let sparql = format!("SELECT ?e WHERE {{ ?e <{EBV_VALUE}> ?v . FILTER({expression}) }}");
         let entities = |optimize: bool| -> BTreeSet<String> {
-            solution_rows(
-                query_with_test_planner(node, |_: &GraphId| true, &sparql, optimize).unwrap(),
-            )
-            .into_iter()
-            .map(|row| row.get("e").expect("?e must be bound").0.clone())
-            .collect()
+            solution_rows(all_rows(node, &sparql, optimize))
+                .into_iter()
+                .map(|row| row.get("e").expect("?e must be bound").0.clone())
+                .collect()
         };
         let optimized = entities(true);
         assert_eq!(
