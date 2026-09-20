@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -26,35 +27,35 @@ mod tests {
 
         let node_dir = root.path().join("craqle-node");
         let node = CraqleNode::open(&node_dir).unwrap();
-        probe_craqle_metadata_ops("craqle-node-central-syncdata", &node, samples);
+        probe_metadata_ops("craqle-node-central-syncdata", &node, samples);
 
-        probe_low_level_fjall(
-            "low-level-syncall-per-subwrite",
-            &root.path().join("low-level-syncall"),
+        probe_fjall(LowProbe {
+            label: "low-level-syncall-per-subwrite",
+            path: &root.path().join("low-level-syncall"),
             samples,
             subwrites,
-            PersistMode::SyncAll,
-            None,
-        );
-        probe_low_level_fjall(
-            "low-level-buffer-no-central-persist",
-            &root.path().join("low-level-buffer-no-persist"),
+            subwrite_persist: PersistMode::SyncAll,
+            central_persist: None,
+        });
+        probe_fjall(LowProbe {
+            label: "low-level-buffer-no-central-persist",
+            path: &root.path().join("low-level-buffer-no-persist"),
             samples,
             subwrites,
-            PersistMode::Buffer,
-            None,
-        );
-        probe_low_level_fjall(
-            "low-level-buffer-central-syncdata",
-            &root.path().join("low-level-buffer-syncdata"),
+            subwrite_persist: PersistMode::Buffer,
+            central_persist: None,
+        });
+        probe_fjall(LowProbe {
+            label: "low-level-buffer-central-syncdata",
+            path: &root.path().join("low-level-buffer-syncdata"),
             samples,
             subwrites,
-            PersistMode::Buffer,
-            Some(PersistMode::SyncData),
-        );
+            subwrite_persist: PersistMode::Buffer,
+            central_persist: Some(PersistMode::SyncData),
+        });
     }
 
-    fn probe_craqle_metadata_ops(label: &str, node: &CraqleNode, samples: usize) {
+    fn probe_metadata_ops(label: &str, node: &CraqleNode, samples: usize) {
         let writer = writer_auth();
         let mut create_latencies = Vec::with_capacity(samples);
         let mut policy_latencies = Vec::with_capacity(samples);
@@ -93,14 +94,24 @@ mod tests {
         );
     }
 
-    fn probe_low_level_fjall(
-        label: &str,
-        path: &Path,
+    struct LowProbe<'a> {
+        label: &'a str,
+        path: &'a Path,
         samples: usize,
         subwrites: usize,
         subwrite_persist: PersistMode,
         central_persist: Option<PersistMode>,
-    ) {
+    }
+
+    fn probe_fjall(req: LowProbe<'_>) {
+        let LowProbe {
+            label,
+            path,
+            samples,
+            subwrites,
+            subwrite_persist,
+            central_persist,
+        } = req;
         let db = Database::builder(path).open().unwrap();
         let graphs = db
             .keyspace("graphs", KeyspaceCreateOptions::default)

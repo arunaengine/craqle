@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -15,8 +16,8 @@ mod tests {
     use crate::support::*;
 
     const DEFAULT_GRAPH_COUNT: usize = 128;
-    const DEFAULT_ENTITIES_PER_GRAPH: usize = 512;
-    const DEFAULT_CONTEXTUALS_PER_GRAPH: usize = 4;
+    const DEFAULT_GRAPH_ENTITIES: usize = 512;
+    const DEFAULT_GRAPH_CONTEXTUALS: usize = 4;
     const DEFAULT_BATCH_SIZE: usize = 256;
     const DEFAULT_QUERY_SAMPLES: usize = 12;
 
@@ -35,11 +36,11 @@ mod tests {
                 graph_count: env_usize("CRAQLE_CROSS_GRAPH_COUNT", DEFAULT_GRAPH_COUNT),
                 entities_per_graph: env_usize(
                     "CRAQLE_CROSS_GRAPH_ENTITIES_PER_GRAPH",
-                    DEFAULT_ENTITIES_PER_GRAPH,
+                    DEFAULT_GRAPH_ENTITIES,
                 ),
                 contextuals_per_graph: env_usize(
                     "CRAQLE_CROSS_GRAPH_CONTEXTUALS_PER_GRAPH",
-                    DEFAULT_CONTEXTUALS_PER_GRAPH,
+                    DEFAULT_GRAPH_CONTEXTUALS,
                 ),
                 batch_size: env_usize("CRAQLE_CROSS_GRAPH_BATCH_SIZE", DEFAULT_BATCH_SIZE),
                 query_samples: env_usize("CRAQLE_CROSS_GRAPH_QUERY_SAMPLES", DEFAULT_QUERY_SAMPLES),
@@ -108,21 +109,23 @@ mod tests {
 
             for start in (0..config.entities_per_graph).step_by(config.batch_size) {
                 let batch_count = usize::min(config.batch_size, config.entities_per_graph - start);
-                append_benchmark_media_objects(
+                append_benchmark_entities(
                     node,
                     &writer_auth(),
-                    &graph,
-                    start,
-                    batch_count,
-                    shared_keyword,
+                    AppendBatch {
+                        graph: &graph,
+                        start,
+                        count: batch_count,
+                        keyword: shared_keyword,
+                    },
                 );
             }
         }
         let load_elapsed = load_start.elapsed();
 
         let mut subject_led_latencies = Vec::with_capacity(config.query_samples);
-        let mut predicate_object_count_latencies = Vec::with_capacity(config.query_samples);
-        let mut predicate_object_point_latencies = Vec::with_capacity(config.query_samples);
+        let mut object_count_times = Vec::with_capacity(config.query_samples);
+        let mut object_point_times = Vec::with_capacity(config.query_samples);
 
         let subject_led_query = r#"
         SELECT ?g ?name ?pos
@@ -135,7 +138,7 @@ mod tests {
         ORDER BY ?g
         "#;
 
-        let predicate_object_count_query = format!(
+        let object_count_query = format!(
             r#"
         SELECT (COUNT(?s) AS ?count)
         WHERE {{
@@ -148,7 +151,7 @@ mod tests {
         );
 
         let _ = solution_rows(node.query(&reader, subject_led_query).unwrap());
-        let _ = solution_rows(node.query(&reader, &predicate_object_count_query).unwrap());
+        let _ = solution_rows(node.query(&reader, &object_count_query).unwrap());
         let warm_entity_idx = sample_entity_index(0, config.entities_per_graph);
         let warm_point_query = format!(
             r#"
@@ -184,9 +187,8 @@ mod tests {
             assert_eq!(seen_positions.len(), config.graph_count);
 
             let count_start = Instant::now();
-            let count_rows =
-                solution_rows(node.query(&reader, &predicate_object_count_query).unwrap());
-            predicate_object_count_latencies.push(count_start.elapsed());
+            let count_rows = solution_rows(node.query(&reader, &object_count_query).unwrap());
+            object_count_times.push(count_start.elapsed());
             assert_eq!(
                 binding_i64(count_rows[0].get("count").unwrap()),
                 config.total_entities() as i64
@@ -207,7 +209,7 @@ mod tests {
             );
             let point_start = Instant::now();
             let point_rows = solution_rows(node.query(&reader, &point_query).unwrap());
-            predicate_object_point_latencies.push(point_start.elapsed());
+            object_point_times.push(point_start.elapsed());
             assert_eq!(point_rows.len(), config.graph_count);
             let mut point_graphs = BTreeSet::new();
             for row in &point_rows {
@@ -241,14 +243,14 @@ mod tests {
             "{}",
             format_stats(
                 "graph-unbound predicate/object mediaobject count",
-                &predicate_object_count_latencies,
+                &object_count_times,
             )
         );
         println!(
             "{}",
             format_stats(
                 "graph-unbound predicate/object identifier lookup",
-                &predicate_object_point_latencies,
+                &object_point_times,
             )
         );
     }

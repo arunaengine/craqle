@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -14,8 +15,8 @@ mod tests {
     use crate::support::*;
 
     const DEFAULT_GRAPH_COUNT: usize = 6;
-    const DEFAULT_ENTITIES_PER_GRAPH: usize = 8_000;
-    const DEFAULT_CONTEXTUALS_PER_GRAPH: usize = 6;
+    const DEFAULT_GRAPH_ENTITIES: usize = 8_000;
+    const DEFAULT_GRAPH_CONTEXTUALS: usize = 6;
     const DEFAULT_BATCH_SIZE: usize = 2_000;
 
     #[derive(Debug, Clone, Copy)]
@@ -32,11 +33,11 @@ mod tests {
                 graph_count: env_usize("CRAQLE_COLD_START_GRAPH_COUNT", DEFAULT_GRAPH_COUNT),
                 entities_per_graph: env_usize(
                     "CRAQLE_COLD_START_ENTITIES_PER_GRAPH",
-                    DEFAULT_ENTITIES_PER_GRAPH,
+                    DEFAULT_GRAPH_ENTITIES,
                 ),
                 contextuals_per_graph: env_usize(
                     "CRAQLE_COLD_START_CONTEXTUALS_PER_GRAPH",
-                    DEFAULT_CONTEXTUALS_PER_GRAPH,
+                    DEFAULT_GRAPH_CONTEXTUALS,
                 ),
                 batch_size: env_usize("CRAQLE_COLD_START_BATCH_SIZE", DEFAULT_BATCH_SIZE),
             }
@@ -96,13 +97,15 @@ mod tests {
                 for start in (0..config.entities_per_graph).step_by(config.batch_size) {
                     let batch_count =
                         usize::min(config.batch_size, config.entities_per_graph - start);
-                    append_benchmark_media_objects(
+                    append_benchmark_entities(
                         &node,
                         &writer_auth(),
-                        &graph,
-                        start,
-                        batch_count,
-                        &keyword,
+                        AppendBatch {
+                            graph: &graph,
+                            start,
+                            count: batch_count,
+                            keyword: &keyword,
+                        },
                     );
                 }
             }

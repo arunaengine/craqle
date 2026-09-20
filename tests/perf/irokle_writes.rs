@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -55,7 +56,7 @@ mod tests {
     #[cfg(feature = "iroh")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "diagnostic probe for Aruna-like net-backed Irokle write latency"]
-    async fn aruna_like_net_backed_write_latency_probe() {
+    async fn net_write_latency() {
         let samples = env_usize("CRAQLE_IROKLE_NET_WRITE_PROBE_SAMPLES", 10);
         let peer_count = env_usize("CRAQLE_IROKLE_NET_WRITE_PROBE_PEERS", 2);
         let entity_count = env_usize("CRAQLE_IROKLE_NET_WRITE_PROBE_ENTITIES", 1);
@@ -93,22 +94,22 @@ mod tests {
         )
         .await;
 
-        probe_aruna_service_node(
-            "aruna-service-style-syncall",
-            fjall::PersistMode::SyncAll,
+        probe_aruna(ArunaProbe {
+            label: "aruna-service-style-syncall",
+            persist_mode: fjall::PersistMode::SyncAll,
             samples,
             peer_count,
             entity_count,
-        )
+        })
         .await;
 
-        probe_aruna_service_node(
-            "aruna-service-style-buffer",
-            fjall::PersistMode::Buffer,
+        probe_aruna(ArunaProbe {
+            label: "aruna-service-style-buffer",
+            persist_mode: fjall::PersistMode::Buffer,
             samples,
             peer_count,
             entity_count,
-        )
+        })
         .await;
     }
 
@@ -175,7 +176,7 @@ mod tests {
         let mut peer_nodes = Vec::with_capacity(peer_count);
         let mut peers = Vec::with_capacity(peer_count);
         for peer_idx in 0..peer_count {
-            let peer_node = net_backed_irokle_node(
+            let peer_node = net_irokle_node(
                 root.path().join(format!("irokle-peer-{peer_idx}")),
                 Some(irokle::WriteConcern::Local),
             )
@@ -185,7 +186,7 @@ mod tests {
         }
 
         let irokle_node =
-            net_backed_irokle_node(root.path().join("irokle-main"), node_write_concern).await;
+            net_irokle_node(root.path().join("irokle-main"), node_write_concern).await;
         let node = CraqleNode::open_with_options(
             root.path().join("craqle"),
             CraqleOptions::new().with_irokle(
@@ -195,7 +196,13 @@ mod tests {
         )
         .unwrap();
 
-        probe_node_with_peers(label, &node, &peers, samples, entity_count);
+        probe_peer_node(PeerProbe {
+            label,
+            node: &node,
+            peers: &peers,
+            samples,
+            entity_count,
+        });
 
         irokle_node.shutdown_iroh().await;
         for peer_node in peer_nodes {
@@ -204,7 +211,7 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
-    async fn net_backed_irokle_node(
+    async fn net_irokle_node(
         path: impl AsRef<std::path::Path>,
         write_concern: Option<irokle::WriteConcern>,
     ) -> irokle::Irokle<irokle::FjallStorage> {
@@ -231,14 +238,24 @@ mod tests {
         builder.build().unwrap()
     }
 
-    #[allow(dead_code)]
-    fn probe_node_with_peers(
-        label: &str,
-        node: &CraqleNode,
-        peers: &[irokle::PeerId],
+    #[cfg(feature = "iroh")]
+    struct PeerProbe<'a> {
+        label: &'a str,
+        node: &'a CraqleNode,
+        peers: &'a [irokle::PeerId],
         samples: usize,
         entity_count: usize,
-    ) {
+    }
+
+    #[cfg(feature = "iroh")]
+    fn probe_peer_node(req: PeerProbe<'_>) {
+        let PeerProbe {
+            label,
+            node,
+            peers,
+            samples,
+            entity_count,
+        } = req;
         let writer = writer_auth();
         let mut create_latencies = Vec::with_capacity(samples);
         let mut apply_latencies = Vec::with_capacity(samples);
@@ -291,33 +308,49 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
-    async fn probe_aruna_service_node(
-        label: &str,
+    struct ArunaProbe<'a> {
+        label: &'a str,
         persist_mode: fjall::PersistMode,
         samples: usize,
         peer_count: usize,
         entity_count: usize,
-    ) {
+    }
+
+    #[cfg(feature = "iroh")]
+    async fn probe_aruna(req: ArunaProbe<'_>) {
+        let ArunaProbe {
+            label,
+            persist_mode,
+            samples,
+            peer_count,
+            entity_count,
+        } = req;
         let root = probe_tempdir("craqle-aruna-service-write-probe");
         let mut peer_nodes = Vec::with_capacity(peer_count);
         let mut peers = Vec::with_capacity(peer_count);
         for peer_idx in 0..peer_count {
             let peer_node =
-                aruna_style_irokle_node(root.path().join(format!("irokle-peer-{peer_idx}")), None)
-                    .await;
+                aruna_irokle_node(root.path().join(format!("irokle-peer-{peer_idx}")), None).await;
             peers.push(peer_node.peer_id());
             peer_nodes.push(peer_node);
         }
 
         let (irokle_node, net) =
-            aruna_style_irokle_service(root.path().join("irokle-main"), persist_mode).await;
+            aruna_irokle_service(root.path().join("irokle-main"), persist_mode).await;
         let node = CraqleNode::open_with_options(
             root.path().join("craqle"),
             CraqleOptions::new().with_irokle(irokle_node.clone(), CraqleIrokleOptions::new()),
         )
         .unwrap();
 
-        probe_node_with_peers_and_recheck(label, &node, &net, &peers, samples, entity_count);
+        probe_recheck(RecheckProbe {
+            label,
+            node: &node,
+            net: &net,
+            peers: &peers,
+            samples,
+            entity_count,
+        });
 
         net.shutdown().await;
         for peer_node in peer_nodes {
@@ -326,7 +359,7 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
-    async fn aruna_style_irokle_service(
+    async fn aruna_irokle_service(
         path: impl AsRef<std::path::Path>,
         persist_mode: fjall::PersistMode,
     ) -> (
@@ -352,7 +385,7 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
-    async fn aruna_style_irokle_node(
+    async fn aruna_irokle_node(
         path: impl AsRef<std::path::Path>,
         write_concern: Option<irokle::WriteConcern>,
     ) -> irokle::Irokle<irokle::FjallStorage> {
@@ -374,14 +407,25 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
-    fn probe_node_with_peers_and_recheck(
-        label: &str,
-        node: &CraqleNode,
-        net: &irokle::net::IrohNet<irokle::FjallStorage>,
-        peers: &[irokle::PeerId],
+    struct RecheckProbe<'a> {
+        label: &'a str,
+        node: &'a CraqleNode,
+        net: &'a irokle::net::IrohNet<irokle::FjallStorage>,
+        peers: &'a [irokle::PeerId],
         samples: usize,
         entity_count: usize,
-    ) {
+    }
+
+    #[cfg(feature = "iroh")]
+    fn probe_recheck(req: RecheckProbe<'_>) {
+        let RecheckProbe {
+            label,
+            node,
+            net,
+            peers,
+            samples,
+            entity_count,
+        } = req;
         let writer = writer_auth();
         let mut create_latencies = Vec::with_capacity(samples);
         let mut apply_latencies = Vec::with_capacity(samples);

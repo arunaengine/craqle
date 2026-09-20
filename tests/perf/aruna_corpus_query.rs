@@ -2,14 +2,11 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
-/// Faithful reproduction of the aruna production cluster query workload:
-/// aruna-shaped graphs (50/50 scaffold / RO-Crate, bench.py payload shapes),
-/// `https://w3id.org/aruna/<ULID>` graph IRIs, applied through the normal
-/// checked apply path with sprinkled deletes, then reopened cold. Runs the
-/// exact cluster bench queries through `query_graphs_with` with a predicate
-/// mirroring aruna's registry lookup (IRI tail parse + binary search).
+/// Reproduces the Aruna query workload with mixed crate shapes, deletes, and a
+/// cold reopen, using registry-like IRI lookup for the cluster queries.
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -206,19 +203,18 @@ mod tests {
         let visible = |graph: &GraphId| registry_visible(registry, graph);
 
         let ask = || {
-            let result = query_with_test_visibility(node, visible, ASK_QUERY).unwrap();
+            let result = query_with_visibility(node, visible, ASK_QUERY).unwrap();
             assert_eq!(result, QueryResults::Boolean(true));
             1
         };
         let select_datasets = || {
             let rows =
-                solution_rows(query_with_test_visibility(node, visible, SELECT_DATASETS).unwrap());
+                solution_rows(query_with_visibility(node, visible, SELECT_DATASETS).unwrap());
             assert_eq!(rows.len(), 25);
             rows.len()
         };
         let select_files = || {
-            let rows =
-                solution_rows(query_with_test_visibility(node, visible, SELECT_FILES).unwrap());
+            let rows = solution_rows(query_with_visibility(node, visible, SELECT_FILES).unwrap());
             assert_eq!(rows.len(), 100);
             rows.len()
         };
@@ -233,7 +229,7 @@ mod tests {
         );
         let filter_scan = || {
             let rows =
-                solution_rows(query_with_test_visibility(node, visible, &filter_contains).unwrap());
+                solution_rows(query_with_visibility(node, visible, &filter_contains).unwrap());
             assert!(
                 rows.iter()
                     .any(|row| row.get("name").is_some_and(|name| name.0.contains(&needle))),
@@ -287,19 +283,19 @@ mod tests {
         let count_type_q = "SELECT (COUNT(*) AS ?c) WHERE { ?d a <http://schema.org/Dataset> }";
 
         measure("COUNT names (predicate registry)", samples, || {
-            solution_rows(query_with_test_visibility(&node, visible, count_q).unwrap()).len()
+            solution_rows(query_with_visibility(&node, visible, count_q).unwrap()).len()
         });
         measure("COUNT names (predicate all)", samples, || {
-            solution_rows(query_with_test_visibility(&node, all, count_q).unwrap()).len()
+            solution_rows(query_with_visibility(&node, all, count_q).unwrap()).len()
         });
         measure("COUNT type quads (predicate registry)", samples, || {
-            solution_rows(query_with_test_visibility(&node, visible, count_type_q).unwrap()).len()
+            solution_rows(query_with_visibility(&node, visible, count_type_q).unwrap()).len()
         });
         measure("CONTAINS scan (predicate registry)", samples, || {
-            solution_rows(query_with_test_visibility(&node, visible, contains_q).unwrap()).len()
+            solution_rows(query_with_visibility(&node, visible, contains_q).unwrap()).len()
         });
         measure("CONTAINS scan (predicate all)", samples, || {
-            solution_rows(query_with_test_visibility(&node, all, contains_q).unwrap()).len()
+            solution_rows(query_with_visibility(&node, all, contains_q).unwrap()).len()
         });
     }
 

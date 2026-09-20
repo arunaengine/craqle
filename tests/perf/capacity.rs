@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+#[path = "../support.rs"]
 mod support;
 
 #[cfg(test)]
@@ -12,17 +13,16 @@ mod tests {
 
     use crate::support::*;
 
-    const DEFAULT_SINGLE_GRAPH_COUNT: usize = 1;
-    const DEFAULT_SINGLE_GRAPH_ENTITIES: usize = 2_500_000;
-    const DEFAULT_SINGLE_GRAPH_RAMP_ENTITIES: &[usize] =
-        &[100_000, 250_000, 500_000, 1_000_000, 2_500_000];
-    const DEFAULT_SINGLE_SUMMARY_SAMPLES: usize = 25;
+    const DEFAULT_SINGLE_GRAPHS: usize = 1;
+    const DEFAULT_SINGLE_ENTITIES: usize = 2_500_000;
+    const DEFAULT_SINGLE_RAMP: &[usize] = &[100_000, 250_000, 500_000, 1_000_000, 2_500_000];
+    const DEFAULT_SINGLE_SAMPLES: usize = 25;
 
-    const DEFAULT_MANY_GRAPH_COUNT: usize = 1_000;
-    const DEFAULT_MANY_GRAPH_ENTITIES: usize = 10_000;
-    const DEFAULT_MANY_SUMMARY_SAMPLES: usize = 1_000;
+    const DEFAULT_MANY_GRAPHS: usize = 1_000;
+    const DEFAULT_MANY_ENTITIES: usize = 10_000;
+    const DEFAULT_MANY_SAMPLES: usize = 1_000;
 
-    const DEFAULT_CONTEXTUALS_PER_GRAPH: usize = 6;
+    const DEFAULT_GRAPH_CONTEXTUALS: usize = 6;
     const DEFAULT_BATCH_SIZE: usize = 10_000;
     const DEFAULT_BREAKDOWN_ENTITIES: usize = 100_000;
 
@@ -51,7 +51,7 @@ mod tests {
                 ),
                 contextuals_per_graph: env_usize(
                     "CRAQLE_CAPACITY_BREAKDOWN_CONTEXTUALS",
-                    DEFAULT_CONTEXTUALS_PER_GRAPH,
+                    DEFAULT_GRAPH_CONTEXTUALS,
                 ),
                 batch_size: env_usize("CRAQLE_CAPACITY_BREAKDOWN_BATCH_SIZE", DEFAULT_BATCH_SIZE),
             }
@@ -80,7 +80,7 @@ mod tests {
                 ),
                 contextuals_per_graph: env_usize(
                     &format!("{prefix}_CONTEXTUALS_PER_GRAPH"),
-                    DEFAULT_CONTEXTUALS_PER_GRAPH,
+                    DEFAULT_GRAPH_CONTEXTUALS,
                 ),
                 batch_size: env_usize(&format!("{prefix}_BATCH_SIZE"), DEFAULT_BATCH_SIZE),
                 summary_samples: env_usize(&format!("{prefix}_SUMMARY_SAMPLES"), summary_samples),
@@ -106,11 +106,11 @@ mod tests {
     fn large_graph_profile() {
         let config = CapacityConfig::from_env(
             "CRAQLE_CAPACITY_SINGLE",
-            DEFAULT_SINGLE_GRAPH_COUNT,
-            DEFAULT_SINGLE_GRAPH_ENTITIES,
-            DEFAULT_SINGLE_SUMMARY_SAMPLES,
+            DEFAULT_SINGLE_GRAPHS,
+            DEFAULT_SINGLE_ENTITIES,
+            DEFAULT_SINGLE_SAMPLES,
         );
-        run_summary_and_disk_profile("single_graph_2_5m", config);
+        run_capacity_profile("single_graph_2_5m", config);
     }
 
     #[test]
@@ -118,22 +118,16 @@ mod tests {
     fn capacity_ramp_profile() {
         let base = CapacityConfig::from_env(
             "CRAQLE_CAPACITY_SINGLE",
-            DEFAULT_SINGLE_GRAPH_COUNT,
-            DEFAULT_SINGLE_GRAPH_ENTITIES,
+            DEFAULT_SINGLE_GRAPHS,
+            DEFAULT_SINGLE_ENTITIES,
             1,
         );
-        let counts = env_usize_list(
-            "CRAQLE_CAPACITY_SINGLE_ENTITY_STEPS",
-            DEFAULT_SINGLE_GRAPH_RAMP_ENTITIES,
-        );
+        let counts = env_usize_list("CRAQLE_CAPACITY_SINGLE_ENTITY_STEPS", DEFAULT_SINGLE_RAMP);
 
         for entities_per_graph in counts {
             let mut config = base;
             config.entities_per_graph = entities_per_graph;
-            run_summary_and_disk_profile(
-                &format!("single_graph_ramp_{entities_per_graph}"),
-                config,
-            );
+            run_capacity_profile(&format!("single_graph_ramp_{entities_per_graph}"), config);
         }
     }
 
@@ -166,13 +160,13 @@ mod tests {
         let pair_sync_ops = net.sync_pair(0, 1).unwrap();
         let pair_sync_elapsed = pair_sync_start.elapsed();
 
-        let peer0_reindex_start = Instant::now();
+        let source_reindex_start = Instant::now();
         net.peer(0).reindex_search().unwrap();
-        let peer0_reindex_elapsed = peer0_reindex_start.elapsed();
+        let source_reindex_elapsed = source_reindex_start.elapsed();
 
-        let peer1_reindex_start = Instant::now();
+        let replica_reindex_start = Instant::now();
         net.peer(1).reindex_search().unwrap();
-        let peer1_reindex_elapsed = peer1_reindex_start.elapsed();
+        let replica_reindex_elapsed = replica_reindex_start.elapsed();
 
         let (_tmp_sync, net_sync) = setup_network(2);
         let sync_graph = GraphId::new("urn:capacity:breakdown:sync-graph-0000");
@@ -207,8 +201,8 @@ mod tests {
             fingerprint.0,
             pair_sync_elapsed,
             pair_sync_ops,
-            peer0_reindex_elapsed,
-            peer1_reindex_elapsed,
+            source_reindex_elapsed,
+            replica_reindex_elapsed,
         );
         println!(
             "sync path: build {}, apply {}, sync {:?}",
@@ -223,14 +217,14 @@ mod tests {
     fn small_graphs_profile() {
         let config = CapacityConfig::from_env(
             "CRAQLE_CAPACITY_MANY",
-            DEFAULT_MANY_GRAPH_COUNT,
-            DEFAULT_MANY_GRAPH_ENTITIES,
-            DEFAULT_MANY_SUMMARY_SAMPLES,
+            DEFAULT_MANY_GRAPHS,
+            DEFAULT_MANY_ENTITIES,
+            DEFAULT_MANY_SAMPLES,
         );
-        run_summary_and_disk_profile("many_graphs", config);
+        run_capacity_profile("many_graphs", config);
     }
 
-    fn run_summary_and_disk_profile(label: &str, config: CapacityConfig) {
+    fn run_capacity_profile(label: &str, config: CapacityConfig) {
         let tmp = tempfile::tempdir().unwrap();
         let cluster = CraqleCluster::new(1, tmp.path()).unwrap();
         let node = cluster.peer(0);
@@ -267,13 +261,15 @@ mod tests {
             let graph_keyword = format!("capacity-keyword-{graph_idx:04}");
             for start in (0..config.entities_per_graph).step_by(config.batch_size) {
                 let batch_count = usize::min(config.batch_size, config.entities_per_graph - start);
-                append_benchmark_media_objects(
+                append_benchmark_entities(
                     node,
                     &writer_auth(),
-                    &graph,
-                    start,
-                    batch_count,
-                    &graph_keyword,
+                    AppendBatch {
+                        graph: &graph,
+                        start,
+                        count: batch_count,
+                        keyword: &graph_keyword,
+                    },
                 );
             }
 
@@ -360,14 +356,14 @@ mod tests {
             let batch_count = usize::min(batch_size, entities_per_graph - start);
 
             let build_start = Instant::now();
-            let entities = benchmark_media_object_entities(
+            let entities = benchmark_entities(EntityBatch {
                 start,
-                batch_count,
+                count: batch_count,
                 keyword,
-                "Proteomics sample",
-                "benchmark record",
-                "BENCH",
-            );
+                name_prefix: "Proteomics sample",
+                description_label: "benchmark record",
+                identifier_prefix: "BENCH",
+            });
             breakdown.change_build_latencies.push(build_start.elapsed());
 
             let apply_start = Instant::now();
