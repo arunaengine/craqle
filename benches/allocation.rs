@@ -67,7 +67,7 @@ fn record_live_growth(size: usize) {
 pub struct AllocationSample {
     pub allocations: u64,
     pub allocated_bytes: u64,
-    pub peak_live_delta_bytes: usize,
+    pub peak_delta_bytes: usize,
 }
 
 pub struct AllocationInterval {
@@ -96,7 +96,7 @@ impl AllocationInterval {
             allocated_bytes: ALLOCATED_BYTES
                 .load(Ordering::SeqCst)
                 .saturating_sub(self.allocated_bytes),
-            peak_live_delta_bytes: INTERVAL_PEAK_BYTES
+            peak_delta_bytes: INTERVAL_PEAK_BYTES
                 .load(Ordering::SeqCst)
                 .saturating_sub(self.live_bytes),
         }

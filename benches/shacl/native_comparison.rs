@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::hint::black_box;
 use std::time::Instant;
 
-#[path = "support/allocation.rs"]
+#[path = "../allocation.rs"]
 mod allocation;
-#[path = "support/mod.rs"]
+#[path = "../support.rs"]
 mod support;
 
 use support::BenchWriteExt as _;
@@ -149,7 +149,7 @@ fn shacl_native_comparison(c: &mut Criterion) {
         external_validation_duration.as_nanos(),
         external_allocations.allocations,
         external_allocations.allocated_bytes,
-        external_allocations.peak_live_delta_bytes,
+        external_allocations.peak_delta_bytes,
         external_copy_bytes,
     );
     print_native(
@@ -247,7 +247,7 @@ fn prepare_paired_data(fixture: &Fixture, graph: &GraphId) -> CopiedData {
         .collect();
     fixture
         .node()
-        .apply_changes_bulk_unchecked(graph, changes)
+        .apply_bulk_unchecked(graph, changes)
         .expect("insert paired native data graph");
     fixture
         .node()
@@ -395,7 +395,7 @@ fn print_native(
         read.terms_decoded,
         allocations.allocations,
         allocations.allocated_bytes,
-        allocations.peak_live_delta_bytes,
+        allocations.peak_delta_bytes,
     );
 }
 

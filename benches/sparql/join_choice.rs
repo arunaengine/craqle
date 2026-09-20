@@ -5,9 +5,9 @@
 use std::env;
 use std::hint::black_box;
 
-#[path = "support/allocation.rs"]
+#[path = "../allocation.rs"]
 mod allocation;
-#[path = "support/mod.rs"]
+#[path = "../support.rs"]
 mod support;
 
 use support::BenchWriteExt as _;
@@ -15,7 +15,8 @@ use support::BenchWriteExt as _;
 use allocation::AllocationInterval;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleNode, CraqleOptions, EncodedTerm, GraphId, JoinKind,
-    JoinMode, MaterializedQuadChange, QueryExecution, QueryFastPathKind, QueryOptions,
+    JoinMode, MaterializedQuadChange, QueryExecution, QueryFastPathKind as FastPathKind,
+    QueryOptions,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::{binary_blake3, env_duration, repository_commit};
@@ -132,13 +133,10 @@ fn sparql_join_choice(c: &mut Criterion) {
         automatic.statistics.planned_joins[0].physical_operator,
         JoinKind::Hash
     );
-    assert_eq!(
-        hash.statistics.fast_path,
-        Some(QueryFastPathKind::HashJoinCount)
-    );
+    assert_eq!(hash.statistics.fast_path, Some(FastPathKind::HashJoinCount));
     assert_eq!(
         automatic.statistics.fast_path,
-        Some(QueryFastPathKind::HashJoinCount)
+        Some(FastPathKind::HashJoinCount)
     );
     for (mode, execution, allocations) in [
         ("ForceLateral", &lateral, lateral_allocations),
@@ -200,7 +198,7 @@ fn sparql_join_choice(c: &mut Criterion) {
                 .map(|duration| duration.as_nanos()),
             allocations.allocations,
             allocations.allocated_bytes,
-            allocations.peak_live_delta_bytes,
+            allocations.peak_delta_bytes,
         );
     }
 

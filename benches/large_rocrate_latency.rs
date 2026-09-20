@@ -5,22 +5,23 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-#[path = "../tests/support/perf.rs"]
+#[path = "../tests/perf_support.rs"]
 mod perf;
-#[path = "../tests/support/sim.rs"]
+#[path = "../tests/sim_support.rs"]
 mod sim;
 
 use craqle::{CreateCrateRequest, GrantAuthorizer, GraphId};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use perf::{
-    append_benchmark_media_objects, attach_contextual_entities, bench_auth, bench_policy, env_usize,
+    AppendBatch, append_benchmark_entities as append_media, attach_contextual_entities, bench_auth,
+    bench_policy, env_usize,
 };
 use sim::CraqleCluster;
 
 const PAGE_SIZE: usize = 1_000;
 const DEFAULT_CRATE_COUNT: usize = 24;
-const DEFAULT_ENTITIES_PER_CRATE: usize = 50_000;
-const DEFAULT_CONTEXTUALS_PER_CRATE: usize = 6;
+const DEFAULT_CRATE_ENTITIES: usize = 50_000;
+const DEFAULT_CRATE_CONTEXTS: usize = 6;
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 #[derive(Debug, Clone, Copy)]
 struct BenchConfig {
@@ -36,11 +37,11 @@ impl BenchConfig {
             crate_count: env_usize("CRAQLE_LARGE_BENCH_CRATE_COUNT", DEFAULT_CRATE_COUNT),
             entities_per_crate: env_usize(
                 "CRAQLE_LARGE_BENCH_ENTITIES_PER_CRATE",
-                DEFAULT_ENTITIES_PER_CRATE,
+                DEFAULT_CRATE_ENTITIES,
             ),
             contextuals_per_crate: env_usize(
                 "CRAQLE_LARGE_BENCH_CONTEXTUALS_PER_CRATE",
-                DEFAULT_CONTEXTUALS_PER_CRATE,
+                DEFAULT_CRATE_CONTEXTS,
             ),
             batch_size: env_usize("CRAQLE_LARGE_BENCH_BATCH_SIZE", DEFAULT_BATCH_SIZE),
         }
@@ -95,13 +96,15 @@ fn build_fixture(config: BenchConfig) -> Fixture {
         let crate_keyword = format!("crate-keyword-{crate_idx:02}");
         for start in (0..config.entities_per_crate).step_by(config.batch_size) {
             let batch_count = usize::min(config.batch_size, config.entities_per_crate - start);
-            append_benchmark_media_objects(
+            append_media(
                 node,
                 &bench_auth(),
-                &graph,
-                start,
-                batch_count,
-                &crate_keyword,
+                AppendBatch {
+                    graph: &graph,
+                    start,
+                    count: batch_count,
+                    keyword: &crate_keyword,
+                },
             );
         }
 
@@ -142,7 +145,7 @@ fn build_fixture(config: BenchConfig) -> Fixture {
     }
 }
 
-fn large_rocrate_latency_benchmarks(c: &mut Criterion) {
+fn rocrate_latency_benches(c: &mut Criterion) {
     let config = BenchConfig::from_env();
     let fixture = build_fixture(config);
     let node = fixture.cluster.peer(0);
@@ -212,5 +215,5 @@ fn large_rocrate_latency_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, large_rocrate_latency_benchmarks);
+criterion_group!(benches, rocrate_latency_benches);
 criterion_main!(benches);

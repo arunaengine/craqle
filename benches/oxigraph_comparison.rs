@@ -1,16 +1,7 @@
-//! Focused same-corpus Craqle versus Oxigraph SPARQL comparison.
+//! Compares warm consumed Craqle and Oxigraph queries on the same corpus.
+//! Persistent mode explicitly uses RocksDB and Craqle `SyncAll`.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! The default mode runs Oxigraph 0.5.9 in memory. The explicit persistent mode
-//! below uses RocksDB and Craqle `SyncAll`. Both modes cover warm, fully
-//! consumed query execution only; they do not claim database-size or
-//! durable-load parity. Ten million quads are deliberately rejected by this
-//! executable.
-//!
-//! Persistent comparison mode is explicit and benchmark-only:
-//! `RUSTFLAGS="--cfg oxigraph_persistent" cargo bench --bench
-//! oxigraph_comparison --features oxigraph/rocksdb`.
 
 #![allow(unexpected_cfgs)]
 
@@ -20,8 +11,8 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use craqle::{CraqleFjallPersistMode, QueryOptions, QueryResults as CraqleResults};
-use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use craqle::{CraqleFjallPersistMode as PersistMode, QueryOptions, QueryResults as CraqleResults};
+use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode as GraphNode, Quad, Term};
 use oxigraph::sparql::{PreparedSparqlQuery, QueryResults as OxigraphResults, SparqlEvaluator};
 use oxigraph::store::Store;
 
@@ -79,9 +70,9 @@ fn main() {
         sample_size: samples,
         load_batch: support::fixture::LOAD_BATCH_SIZE,
         persist_mode: if cfg!(oxigraph_persistent) {
-            CraqleFjallPersistMode::SyncAll
+            PersistMode::SyncAll
         } else {
-            CraqleFjallPersistMode::Buffer
+            PersistMode::Buffer
         },
     };
 
@@ -231,7 +222,7 @@ fn compare_case(fixture: &Fixture, oxigraph: &Store, index: usize, samples: usiz
         oxigraph,
         label,
         query,
-        fixture.hot_path_is_unordered_limit(index),
+        fixture.hot_path_unordered(index),
         samples,
     );
 }
@@ -321,12 +312,9 @@ fn prepare_oxigraph(query: &str, fixture: &Fixture) -> PreparedSparqlQuery {
     prepared
         .dataset_mut()
         .set_default_graph(visible.iter().cloned().map(GraphName::NamedNode).collect());
-    prepared.dataset_mut().set_available_named_graphs(
-        visible
-            .into_iter()
-            .map(NamedOrBlankNode::NamedNode)
-            .collect(),
-    );
+    prepared
+        .dataset_mut()
+        .set_available_named_graphs(visible.into_iter().map(GraphNode::NamedNode).collect());
     prepared
 }
 

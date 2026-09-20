@@ -7,9 +7,9 @@ use std::hint::black_box;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-#[path = "support/allocation.rs"]
+#[path = "../allocation.rs"]
 mod allocation;
-#[path = "support/mod.rs"]
+#[path = "../support.rs"]
 mod support;
 
 use support::BenchWriteExt as _;
@@ -691,7 +691,7 @@ fn policy_bench(c: &mut Criterion, data: &BenchData) {
             sample.constraints,
             sample.allocation.allocations,
             sample.allocation.allocated_bytes,
-            sample.allocation.peak_live_delta_bytes,
+            sample.allocation.peak_delta_bytes,
         );
     }
 }
@@ -1334,7 +1334,7 @@ fn print_case(
         duration.as_nanos(),
         allocations.allocations,
         allocations.allocated_bytes,
-        allocations.peak_live_delta_bytes,
+        allocations.peak_delta_bytes,
     );
 }
 

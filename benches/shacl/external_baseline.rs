@@ -1,11 +1,7 @@
-//! External-copy SHACL baseline for the later Craqle-native validator.
+//! Measures an external-copy SHACL baseline against native validation.
+//! Completed Rudof reports cannot measure time to the first violation.
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
-//!
-//! This deliberately exports the visible Craqle graph into Rudof's in-memory
-//! Oxigraph graph. It is comparison-only: production validation must not take
-//! this path. Rudof's Native API returns a completed report, so it cannot
-//! expose a true time-to-first-violation measurement.
 
 use std::collections::HashSet;
 use std::hint::black_box;
@@ -25,7 +21,7 @@ use shacl::validator::report::ValidationReport;
 use shacl::validator::store::Graph;
 use shacl::validator::{ShaclConfig, ShaclValidationMode};
 
-#[path = "support/mod.rs"]
+#[path = "../support.rs"]
 mod support;
 
 use support::QUADS_10M;

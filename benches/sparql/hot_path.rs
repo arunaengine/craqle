@@ -4,13 +4,13 @@
 
 use std::hint::black_box;
 
-#[path = "support/allocation.rs"]
+#[path = "../allocation.rs"]
 mod allocation;
-#[path = "support/mod.rs"]
+#[path = "../support.rs"]
 mod support;
 
 use allocation::AllocationInterval;
-use craqle::{QueryFastPathMode, QueryOptions};
+use craqle::{QueryFastPathMode as FastPathMode, QueryOptions};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::fixture::Fixture;
 
@@ -25,12 +25,12 @@ fn print_alloc(fixture: &Fixture, index: usize, mode: craqle::QueryReadMode) {
         fixture.hot_path_label(index),
         sample.allocations,
         sample.allocated_bytes,
-        sample.peak_live_delta_bytes,
+        sample.peak_delta_bytes,
     );
     std::hint::black_box(results);
 }
 
-fn sparql_hot_path_benchmarks(c: &mut Criterion) {
+fn hot_path_benches(c: &mut Criterion) {
     let fixture = Fixture::from_environment();
     fixture.print_provenance("sparql_hot_path");
     // This untimed sweep checks every result and deterministically warms the
@@ -112,9 +112,9 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     group.finish();
 
     let mut fast_options = QueryOptions::default();
-    fast_options.fast_paths = QueryFastPathMode::Auto;
+    fast_options.fast_paths = FastPathMode::Auto;
     let mut generic_options = QueryOptions::default();
-    generic_options.fast_paths = QueryFastPathMode::Disabled;
+    generic_options.fast_paths = FastPathMode::Disabled;
     let mut group = c.benchmark_group("sparql_fast_path_comparison");
     group.sample_size(config.sample_size);
     group.warm_up_time(config.warm_up);
@@ -221,5 +221,5 @@ fn sparql_hot_path_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, sparql_hot_path_benchmarks);
+criterion_group!(benches, hot_path_benches);
 criterion_main!(benches);

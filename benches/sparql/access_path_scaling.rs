@@ -4,9 +4,9 @@
 
 use std::hint::black_box;
 
-#[path = "support/allocation.rs"]
+#[path = "../allocation.rs"]
 mod allocation;
-#[path = "support/mod.rs"]
+#[path = "../support.rs"]
 mod support;
 
 use allocation::{AllocationInterval, AllocationSample};
@@ -96,7 +96,7 @@ fn print_work(
             .map(|duration| duration.as_nanos()),
         sample.allocations,
         sample.allocated_bytes,
-        sample.peak_live_delta_bytes,
+        sample.peak_delta_bytes,
     );
 }
 
