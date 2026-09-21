@@ -848,6 +848,8 @@ fn estimate_pattern(
 
 const INDEXED_LOOKUP_COST: u64 = 8;
 const HASH_OUTER_MIN: u64 = 256;
+/// First visit to a graph reads its visibility and orphan records, about 16 scanned rows.
+const GRAPH_VISIT_COST: u64 = 16;
 
 fn pattern_variables(pattern: &TriplePattern) -> Option<Vec<oxrdf::Variable>> {
     let mut variables = HashMap::new();
@@ -1054,6 +1056,20 @@ fn physical_chain(
             && let Some(demand) = cx.row_demand.get()
         {
             apply_demand(&mut estimate, right_key_count, demand);
+        }
+        // A hash side on the graph variable may visit graphs the left side never reached.
+        if let Some(graph) = cx.graph_var.borrow().as_ref()
+            && join_keys.contains(graph)
+        {
+            let visited = left_distinct.get(graph).copied().unwrap_or(left_rows);
+            let reached = estimate_variable_distinct(&pattern, graph, right_rows, cx);
+            let unvisited = reached.saturating_sub(visited);
+            estimate.estimated_hash_cost = estimate
+                .estimated_hash_cost
+                .saturating_add(unvisited.saturating_mul(GRAPH_VISIT_COST));
+            if estimate.estimated_hash_cost >= estimate.estimated_lateral_cost {
+                estimate.physical_operator = JoinKind::IndexedLateral;
+            }
         }
         let hash_eligible =
             !join_keys.is_empty() && left_variables.is_some() && right_variables.is_some();
@@ -1540,6 +1556,42 @@ mod tests {
             JoinKind::IndexedLateral
         );
         assert!(first_lateral_leaf(select_pattern(&lateral)).is_some());
+    }
+
+    /// Inside `GRAPH ?g`, a hash side that reaches unvisited graphs loses to lateral probes.
+    #[test]
+    fn graph_visits_priced() {
+        let (_dir, store) = setup_store();
+        for idx in 0..600 {
+            let graph = format!("urn:g:{idx}");
+            let root = format!("<{graph}>");
+            insert(
+                &store,
+                &graph,
+                &format!("<urn:d:{idx}>"),
+                "<urn:about>",
+                &root,
+            );
+            insert(&store, &graph, &root, "<urn:name>", "\"n\"");
+            if idx % 2 == 0 {
+                insert(&store, &graph, &root, "<urn:author>", "<urn:person>");
+            }
+        }
+        let plan = |text: &str| {
+            let mut query = parse(text);
+            let trace = optimize_with_mode(&mut query, &store, JoinMode::Auto).unwrap();
+            trace.joins[0].physical_operator
+        };
+        assert_eq!(
+            plan(
+                "SELECT ?g WHERE { GRAPH ?g { ?d <urn:about> ?g . ?g <urn:author> <urn:person> } }"
+            ),
+            JoinKind::IndexedLateral
+        );
+        assert_eq!(
+            plan("SELECT ?g WHERE { GRAPH ?g { ?d <urn:about> ?g . ?g <urn:name> ?n } }"),
+            JoinKind::Hash
+        );
     }
 
     #[test]
