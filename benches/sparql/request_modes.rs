@@ -296,6 +296,40 @@ fn measure(fixture: &Fixture, scenario: serde_json::Value, auth: &dyn Authorizer
     }
 }
 
+/// Storage work of one explicit single-graph run, outside any timed interval.
+fn scoped_work(fixture: &Fixture, denied: usize) {
+    let mut options = QueryOptions::default();
+    options.collect_costs = true;
+    options.collect_plan_statistics = false;
+    let run = fixture
+        .node
+        .execute_prepared_in_graphs(
+            &AllowAllAuthorizer,
+            std::slice::from_ref(&fixture.readable),
+            &fixture.prepared,
+            &options,
+        )
+        .expect("scoped counter run");
+    let stats = run.statistics;
+    println!(
+        "{}",
+        json!({
+            "record": "scoped_work",
+            "denied_rows": denied,
+            "result_rows": stats.result_rows,
+            "candidate_quads": stats.candidate_quads,
+            "qv_keys_read": stats.qv_keys_read,
+            "qv_bytes_read": stats.qv_bytes_read,
+            "source_keys_read": stats.source_keys_read,
+            "forward_mapping_reads": stats.forward_mapping_reads,
+            "reverse_mapping_reads": stats.reverse_mapping_reads,
+            "planner_point_reads": stats.planner_point_reads,
+            "planning_ns": nanos(stats.planning_time),
+            "access_paths": format!("{:?}", stats.selected_access_paths),
+        })
+    );
+}
+
 fn main() {
     let readable = env_list("CRAQLE_MODES_READABLE", &[2_000])[0];
     let denied = env_list("CRAQLE_MODES_DENIED", &[0, 2_000, 20_000]);
@@ -316,6 +350,7 @@ fn main() {
         let fixture = Fixture::new(readable, denied);
         let scenario = |reader: &str| json!({ "denied_rows": denied, "reader": reader });
         measure(&fixture, scenario("restricted"), &reader);
+        scoped_work(&fixture, denied);
         if denied == 0 {
             measure(&fixture, scenario("allow_all"), &AllowAllAuthorizer);
         }
