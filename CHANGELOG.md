@@ -47,6 +47,8 @@ All notable changes to Craqle are documented here.
 - Authorized graph reconciliation from retained history or a verified healthy
   snapshot, with a durable backup and an audit of the replacement.
 - Explicit process and store memory reservations shared by live stores.
+- `QueryOptions::results_only()` runs a query without per-operator statistics.
+  `QueryOptions::default()` still collects them for compatibility.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a
   timeout. Either stops the search with an error instead of returning partial hits.
   `search_graphs_with` and `search_resources_with` apply the same options to

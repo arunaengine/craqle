@@ -495,6 +495,18 @@ pub struct QueryOptions {
     pub limits: QueryLimits,
 }
 
+impl QueryOptions {
+    /// Default limits and planning without per-operator statistics, the cheap choice
+    /// for callers that need rows but not an analyzed plan.
+    #[must_use]
+    pub fn results_only() -> Self {
+        Self {
+            collect_plan_statistics: false,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for QueryOptions {
     fn default() -> Self {
         Self {

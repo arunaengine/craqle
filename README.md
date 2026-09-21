@@ -120,8 +120,12 @@ let prepared = node.prepare_query(
     "SELECT ?name WHERE { ?entity <http://schema.org/name> ?name }",
 )?;
 let execution =
-    node.execute_prepared(&auth, &prepared, &QueryOptions::default())?;
+    node.execute_prepared(&auth, &prepared, &QueryOptions::results_only())?;
 ```
+
+`QueryOptions::default()` also collects per-operator statistics for analysis,
+which costs several times more than the query itself on join-heavy queries. Use
+`QueryOptions::results_only()` when only the rows are needed.
 
 Queries enforce limits on input, storage reads, native execution, and collected
 results by default. Generic sorting, grouping, joins, and property paths remain
