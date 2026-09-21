@@ -37,6 +37,9 @@ All notable changes to Craqle are documented here.
   and policy-based default unions still use the union scan with visibility checks.
 - Join planning for one explicit graph estimates predicate and total rows from that
   graph's own counters, so unrelated graphs no longer change the chosen join.
+- Join planning inside `GRAPH ?g` treats an unbound `?g` as a shared join variable
+  bound by the first match, instead of as already bound. Patterns connected only
+  through `?g` now form one join chain, which roughly halves typical dataset searches.
 - Default-union queries, statistics, prepared execution, explain, and analyze fail
   with the store error when a graph policy cannot be read. Earlier versions hid
   that graph and could return fewer rows, a smaller count, or a false `ASK`.

@@ -77,6 +77,7 @@ struct PlanCtx<'a> {
     stats: RefCell<HashMap<PlannerStat, PlannerEstimate>>,
     row_demand: Cell<Option<u64>>,
     graph: Option<TermId>,
+    graph_var: RefCell<Option<String>>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -92,6 +93,7 @@ impl<'a> PlanCtx<'a> {
             stats: RefCell::new(HashMap::new()),
             row_demand: Cell::new(None),
             graph: mode.graph,
+            graph_var: RefCell::new(None),
         }
     }
 
@@ -204,6 +206,13 @@ fn predicate_var_key(predicate: &NamedNodePattern) -> Option<String> {
         NamedNodePattern::Variable(v) => Some(v.as_str().to_string()),
         NamedNodePattern::NamedNode(_) => None,
     }
+}
+
+/// Triple variables plus the enclosing unbound graph variable, which every pattern binds.
+fn pattern_var_keys(pattern: &TriplePattern, cx: &PlanCtx<'_>) -> Vec<String> {
+    let mut keys = triple_var_keys(pattern);
+    keys.extend(cx.graph_var.borrow().clone());
+    keys
 }
 
 fn triple_var_keys(pattern: &TriplePattern) -> Vec<String> {
@@ -355,11 +364,14 @@ fn optimize_pattern(
             right: Box::new(optimize_pattern(*right, bound, cx)),
         },
         GraphPattern::Graph { name, inner } => {
-            let mut inner_bound = bound.clone();
-            inner_bound.extend(predicate_var_key(&name));
+            // An unbound graph variable joins every inner pattern and is bound by the first match.
+            let free = predicate_var_key(&name).filter(|key| !bound.contains(key));
+            let outer = cx.graph_var.replace(free);
+            let inner = optimize_pattern(*inner, bound, cx);
+            cx.graph_var.replace(outer);
             GraphPattern::Graph {
                 name,
-                inner: Box::new(optimize_pattern(*inner, &inner_bound, cx)),
+                inner: Box::new(inner),
             }
         }
         GraphPattern::Extend {
@@ -990,7 +1002,9 @@ fn physical_chain(
     let first = patterns.next().expect("non-empty pattern chain");
     let mut left_rows = estimate_pattern(&first, bound, cx).unwrap_or(u64::MAX);
     let mut left_distinct = HashMap::new();
-    for key in triple_var_keys(&first) {
+    let mut projected = bound.clone();
+    projected.extend(cx.graph_var.borrow().clone());
+    for key in pattern_var_keys(&first, cx) {
         let estimate = if matches!(cx.join_mode, JoinMode::ForceHash) || left_rows >= HASH_OUTER_MIN
         {
             estimate_variable_distinct(&first, &key, left_rows, cx)
@@ -1000,7 +1014,7 @@ fn physical_chain(
         left_distinct.insert(key, estimate);
     }
     let mut left_variables = pattern_variables(&first).map(|mut variables| {
-        include_bound_variables(&mut variables, bound);
+        include_bound_variables(&mut variables, &projected);
         variables
     });
     let mut node = GraphPattern::Bgp {
@@ -1010,10 +1024,10 @@ fn physical_chain(
     for pattern in patterns {
         let right_rows = estimate_pattern(&pattern, bound, cx).unwrap_or(u64::MAX);
         let right_variables = pattern_variables(&pattern).map(|mut variables| {
-            include_bound_variables(&mut variables, bound);
+            include_bound_variables(&mut variables, &projected);
             variables
         });
-        let right_keys: HashSet<_> = triple_var_keys(&pattern).into_iter().collect();
+        let right_keys: HashSet<_> = pattern_var_keys(&pattern, cx).into_iter().collect();
         let join_keys: Vec<_> = right_keys
             .iter()
             .filter(|key| left_distinct.contains_key(*key))
@@ -1127,7 +1141,7 @@ fn reorder_bgp(
     let free_vars: Vec<HashSet<String>> = patterns
         .iter()
         .map(|pattern| {
-            triple_var_keys(pattern)
+            pattern_var_keys(pattern, cx)
                 .into_iter()
                 .filter(|key| !bound.contains(key))
                 .collect()

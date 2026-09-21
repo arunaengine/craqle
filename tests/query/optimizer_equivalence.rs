@@ -279,6 +279,18 @@ mod tests {
                     .to_string(),
             ),
             (
+                "graph_only_join",
+                "SELECT ?g ?d ?f WHERE { GRAPH ?g { ?d <http://schema.org/version> ?v . \
+                 ?f a <http://schema.org/File> } }"
+                    .to_string(),
+            ),
+            (
+                "graph_subject_chain",
+                "SELECT ?g ?n WHERE { GRAPH ?g { ?g <http://schema.org/name> ?n ; \
+                 <http://schema.org/hasPart> ?f . ?f a <http://schema.org/File> } }"
+                    .to_string(),
+            ),
+            (
                 "fixed_graph_pattern",
                 "SELECT ?d ?n WHERE { GRAPH <urn:eq:crate:0123> { ?d a <http://schema.org/Dataset> ; \
                  <http://schema.org/name> ?n } }"
@@ -384,6 +396,35 @@ mod tests {
             }
         }
         assert!(nonempty >= 18, "most shapes must return rows: {nonempty}");
+    }
+
+    /// Patterns that share only the graph variable must still join within one graph.
+    #[test]
+    fn graph_joins_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(tmp.path()).unwrap();
+        seeded_corpus(&node);
+        for (label, sparql) in matrix_shapes()
+            .into_iter()
+            .filter(|(label, _)| label.starts_with("graph_"))
+        {
+            let raw = canonical_rows(all_rows(&node, &sparql, false));
+            assert!(!raw.is_empty(), "{label}: shape must return rows");
+            for mode in [JoinMode::ForceHash, JoinMode::ForceLateral] {
+                let prepared = node.prepare_query(&sparql).unwrap();
+                let mut options = QueryOptions::default();
+                options.join_mode = mode;
+                options.limits = QueryLimits::unbounded();
+                let run = node
+                    .execute_prepared(&AllowAllAuthorizer, &prepared, &options)
+                    .unwrap();
+                assert!(
+                    !run.statistics.planned_joins.is_empty(),
+                    "{label}: {mode:?}"
+                );
+                assert_eq!(canonical_rows(run.results), raw, "{label}: {mode:?}");
+            }
+        }
     }
 
     #[test]
