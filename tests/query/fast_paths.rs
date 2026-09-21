@@ -384,6 +384,27 @@ fn fast_matches_generic() {
     );
 }
 
+/// Denies every read while requesting full diagnostics, to observe the executed path.
+struct DeniedReader;
+
+impl craqle::Authorizer for DeniedReader {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &craqle::GraphPolicy,
+        action: craqle::Action,
+    ) -> Result<(), craqle::AuthorizationError> {
+        Err(craqle::AuthorizationError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_owned(),
+        })
+    }
+
+    fn reads_all(&self) -> bool {
+        true
+    }
+}
+
 #[test]
 fn fast_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
@@ -404,6 +425,13 @@ fn fast_fails_closed() {
         .unwrap();
     let denied = node
         .execute_prepared(&DenyAllAuthorizer, &prepared, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(denied.results, QueryResults::Boolean(false));
+    assert!(denied.statistics.details_withheld());
+    assert_eq!(denied.statistics.fast_path, None);
+    // Full diagnostics show the fast path itself hid the denied graph.
+    let denied = node
+        .execute_prepared(&DeniedReader, &prepared, &QueryOptions::default())
         .unwrap();
     assert_eq!(denied.results, QueryResults::Boolean(false));
     assert_eq!(denied.statistics.fast_path, Some(FastPathKind::Ask));

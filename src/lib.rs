@@ -3608,8 +3608,8 @@ impl CraqleNode {
             },
             &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
         );
-        let execution = policy.finish(execution.map_err(CraqleError::from))?;
-        Ok(scoped_execution(auth, execution))
+        let (prepared, execution) = policy.finish(execution.map_err(CraqleError::from))?;
+        Ok(scoped_execution(auth, &prepared, execution))
     }
 
     /// Execute a SPARQL query and return its complete result with diagnostics.
@@ -3618,14 +3618,13 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         sparql: &str,
     ) -> Result<QueryExecution> {
-        let policy = PolicyVisibility::new(&self.store, auth);
-        let execution = self
-            .sparql
-            .query_snapshot_stats(sparql, &|snapshot, graph: &GraphId| {
-                policy.visible(snapshot, graph)
-            });
-        let execution = policy.finish(execution.map_err(CraqleError::from))?;
-        Ok(scoped_execution(auth, execution))
+        self.query_with_options(
+            auth,
+            QueryRequest {
+                sparql,
+                options: &QueryOptions::default(),
+            },
+        )
     }
 
     /// Execute a prepared query against a fresh authorized store snapshot.
@@ -3644,7 +3643,7 @@ impl CraqleNode {
             true,
         );
         let execution = policy.finish(execution.map_err(CraqleError::from))?;
-        Ok(scoped_execution(auth, execution))
+        Ok(scoped_execution(auth, query, execution))
     }
 
     /// Inspect the current logical and physical plan without executing it.
@@ -3661,7 +3660,7 @@ impl CraqleNode {
             options,
         );
         let plan = policy.finish(plan.map_err(CraqleError::from))?;
-        Ok(scoped_plan(auth, plan))
+        Ok(scoped_plan(auth, query, plan))
     }
 
     /// Execute a prepared query completely and return its measured plan.
@@ -3698,13 +3697,13 @@ impl CraqleNode {
         sparql: &str,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        let execution = self.sparql.query_graphs_options(sparql::GraphQuery {
+        let (prepared, execution) = self.sparql.query_graphs_options(sparql::GraphQuery {
             auth,
             graphs,
             sparql,
             options,
         })?;
-        Ok(scoped_execution(auth, execution))
+        Ok(scoped_execution(auth, &prepared, execution))
     }
 
     /// Execute a prepared query over an explicit, wholly authorized graph set.
@@ -3718,7 +3717,7 @@ impl CraqleNode {
         let execution = self
             .sparql
             .execute_prepared_graphs(auth, query, graphs, options)?;
-        Ok(scoped_execution(auth, execution))
+        Ok(scoped_execution(auth, query, execution))
     }
 
     /// Inspect a prepared plan for an explicit, wholly authorized graph set.
@@ -3732,7 +3731,7 @@ impl CraqleNode {
         let plan = self
             .sparql
             .explain_prepared_graphs(auth, query, graphs, options)?;
-        Ok(scoped_plan(auth, plan))
+        Ok(scoped_plan(auth, query, plan))
     }
 
     /// Execute over explicit authorized graphs and return the measured plan.
@@ -4578,16 +4577,21 @@ impl<'a> PolicyVisibility<'a> {
     }
 }
 
-fn scoped_execution(auth: &dyn Authorizer, mut execution: QueryExecution) -> QueryExecution {
+/// Withholds diagnostics that could reflect graphs this caller may not read.
+fn scoped_execution(
+    auth: &dyn Authorizer,
+    prepared: &PreparedQuery,
+    mut execution: QueryExecution,
+) -> QueryExecution {
     if !auth.reads_all() {
-        execution.statistics.withhold_counts();
+        execution.statistics.withhold_details(prepared);
     }
     execution
 }
 
-fn scoped_plan(auth: &dyn Authorizer, mut plan: QueryPlan) -> QueryPlan {
+fn scoped_plan(auth: &dyn Authorizer, prepared: &PreparedQuery, mut plan: QueryPlan) -> QueryPlan {
     if !auth.reads_all() {
-        plan.withhold_counts();
+        plan.withhold_details(prepared);
     }
     plan
 }

@@ -66,7 +66,7 @@ pub trait Authorizer: Send + Sync {
     ) -> Result<(), AuthorizationError>;
 
     /// Whether `Read` is granted on every graph.
-    /// Only such callers receive store-wide counts in query diagnostics.
+    /// Only such callers receive physical plans and store-wide counts in query diagnostics.
     fn reads_all(&self) -> bool {
         false
     }

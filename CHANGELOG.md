@@ -17,9 +17,13 @@ All notable changes to Craqle are documented here.
   before a short publication fence.
 - Dropping a node joins its maintenance worker; an active storage or search call
   must finish before shutdown completes.
-- Query statistics, explain, and analyze report zero for store-wide counts and no
-  row estimates unless the authorizer reads every graph. `Authorizer::reads_all`
-  defaults to `false`; `AllowAllAuthorizer` returns `true`.
+- Query statistics, explain, and analyze keep only timings, result counts, the
+  query form, and a fingerprint of the query text unless the authorizer reads every
+  graph. The physical plan, join choices, fast-path kind, access paths, estimates,
+  and store counters can depend on unreadable graphs, so they are withheld and the
+  plan root reports `QueryPhysicalOperator::Withheld`. `details_withheld` on
+  `QueryPlan` and `QueryExecutionStatistics` tells a withheld zero from a measured
+  one. `Authorizer::reads_all` defaults to `false`; `AllowAllAuthorizer` returns `true`.
 - Search fails with `CorruptDerivedData` when a live index document has missing or
   malformed metadata, and queues a reindex of its graph, instead of skipping it.
   Damage without a readable graph scope, or beyond 64 pending graphs, queues a

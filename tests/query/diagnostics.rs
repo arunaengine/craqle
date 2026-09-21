@@ -11,11 +11,13 @@ use crate::support::TestWriteExt as _;
 use craqle::{
     Action, AllowAllAuthorizer, AuthorizationError, CraqleNode, EncodedTerm, GraphId, GraphPolicy,
     JoinMode, MaterializedQuadChange, QueryExecution, QueryExecutionStatistics, QueryOptions,
-    QueryPlan, QueryPlanNode, QueryRequest,
+    QueryPhysicalOperator, QueryPlan, QueryPlanNode, QueryRequest,
 };
 
 const QUERY: &str = "SELECT ?left ?right ?key WHERE { \
      ?left <urn:test:diag:left> ?key . ?right <urn:test:diag:right> ?key }";
+/// A single-pattern count that ordinary options may admit to a fast path.
+const COUNT: &str = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:test:diag:right> ?key }";
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -44,6 +46,11 @@ fn rows(graph: &GraphId, count: usize) -> Vec<MaterializedQuadChange> {
 
 /// Identical readable data next to a denied graph of the given size.
 fn fixture(denied_rows: usize) -> Fixture {
+    skewed_fixture(denied_rows, 0)
+}
+
+/// Like [`fixture`], with `right_only` extra denied rows that skew one join side.
+fn skewed_fixture(denied_rows: usize, right_only: usize) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(directory.path()).unwrap();
     let readable = GraphId::new("urn:test:diag:readable");
@@ -54,6 +61,15 @@ fn fixture(denied_rows: usize) -> Fixture {
         node.apply_changes_unchecked(graph, rows(graph, count))
             .unwrap();
     }
+    let skew = (0..right_only)
+        .map(|index| MaterializedQuadChange::Insert {
+            graph: denied.clone(),
+            subject: iri(format!("urn:test:diag:skew:{index}")),
+            predicate: iri("urn:test:diag:right".to_owned()),
+            object: iri(format!("urn:test:diag:key:{}", index % 4)),
+        })
+        .collect();
+    node.apply_changes_unchecked(&denied, skew).unwrap();
     Fixture {
         _directory: directory,
         node,
@@ -111,12 +127,19 @@ fn untimed_stats(mut stats: QueryExecutionStatistics) -> QueryExecutionStatistic
     stats
 }
 
+/// Automatic join selection and fast-path admission, as ordinary callers run them.
+fn automatic_options() -> QueryOptions {
+    let mut options = QueryOptions::default();
+    options.collect_costs = true;
+    options
+}
+
 /// Every caller-visible output of one fixture, in a comparable form.
-fn observe(fixture: &Fixture) -> Vec<(String, String)> {
+fn observe(fixture: &Fixture, options: &QueryOptions, query: &str) -> Vec<(String, String)> {
     let node = &fixture.node;
     let graphs = std::slice::from_ref(&fixture.readable);
-    let options = planner_options();
-    let prepared = node.prepare_query(QUERY).unwrap();
+    let options = options.clone();
+    let prepared = node.prepare_query(query).unwrap();
     let execution = |label: &str, run: craqle::Result<QueryExecution>| {
         let run = run.unwrap();
         let mut rows = support::solution_rows(run.results)
@@ -145,14 +168,15 @@ fn observe(fixture: &Fixture) -> Vec<(String, String)> {
         )]
     };
     let request = QueryRequest {
-        sparql: QUERY,
+        sparql: query,
         options: &options,
     };
     [
         execution("options", node.query_with_options(&reader, request)),
+        execution("statistics", node.query_with_statistics(&reader, query)),
         execution(
             "graphs",
-            node.query_in_graphs_with_options(&reader, graphs, QUERY, &options),
+            node.query_in_graphs_with_options(&reader, graphs, query, &options),
         ),
         execution(
             "prepared",
@@ -184,13 +208,10 @@ fn observe(fixture: &Fixture) -> Vec<(String, String)> {
     .collect()
 }
 
-#[test]
-fn denied_sizes_hidden() {
-    let small = observe(&fixture(2));
-    let large = observe(&fixture(3_000));
+fn assert_same(small: &[(String, String)], large: &[(String, String)]) {
     assert_eq!(small.len(), large.len());
     let mut differences = Vec::new();
-    for ((label, small), (_, large)) in small.iter().zip(&large) {
+    for ((label, small), (_, large)) in small.iter().zip(large) {
         if small != large {
             differences.push(format!("{label}\n  small: {small}\n  large: {large}"));
         }
@@ -200,6 +221,25 @@ fn denied_sizes_hidden() {
         "denied data changed caller-visible output:\n{}",
         differences.join("\n")
     );
+}
+
+#[test]
+fn denied_sizes_hidden() {
+    let options = planner_options();
+    assert_same(
+        &observe(&fixture(2), &options, QUERY),
+        &observe(&fixture(3_000), &options, QUERY),
+    );
+}
+
+#[test]
+fn automatic_plan_hidden() {
+    let options = automatic_options();
+    for query in [QUERY, COUNT] {
+        let small = observe(&skewed_fixture(2, 0), &options, query);
+        assert_same(&small, &observe(&skewed_fixture(3_000, 0), &options, query));
+        assert_same(&small, &observe(&skewed_fixture(2, 6_000), &options, query));
+    }
 }
 
 #[test]
@@ -220,18 +260,27 @@ fn default_counts_withheld() {
         )
         .unwrap()
         .statistics;
+    assert!(restricted.details_withheld());
     assert_eq!(restricted.result_rows, 16);
-    assert!(!restricted.planned_joins.is_empty());
-    for join in &restricted.planned_joins {
-        assert_eq!(join.estimated_left_rows, 0);
-        assert_eq!(join.estimated_output_rows, 0);
-        assert_eq!(join.estimated_hash_cost, 0);
-    }
+    assert!(restricted.planned_joins.is_empty());
+    assert!(restricted.selected_access_paths.is_empty());
+    assert!(!restricted.intermediate_rows_available);
     assert_eq!(restricted.plan.root.estimated_rows, None);
     assert_eq!(restricted.candidate_quads, 0);
-    assert_eq!(restricted.plan.root.candidate_rows, 0);
+    assert!(restricted.plan.root.children.is_empty());
+    assert_eq!(restricted.plan.root.output_rows, 16);
+    assert_eq!(
+        restricted.plan.root.physical_operator,
+        QueryPhysicalOperator::Withheld
+    );
+    assert_eq!(restricted.plan_fingerprint, restricted.plan.fingerprint);
+
+    // A caller that reads every graph keeps the complete physical diagnostics.
+    assert!(!full.details_withheld());
     assert_eq!(full.result_rows, 16);
     assert!(full.planned_joins[0].estimated_left_rows > 3_000);
     assert!(full.plan.root.estimated_rows.is_some());
     assert!(full.candidate_quads > 3_000);
+    assert!(!full.plan.root.children.is_empty());
+    assert_ne!(full.plan_fingerprint, restricted.plan_fingerprint);
 }

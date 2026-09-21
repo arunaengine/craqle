@@ -98,6 +98,8 @@ pub enum QueryResults {
 pub struct PreparedQuery {
     query: Arc<Query>,
     query_bytes: usize,
+    /// Hash of the caller's query text; parsed aggregates get fresh variable names.
+    source_fingerprint: Arc<str>,
 }
 
 #[derive(Clone, Copy)]
@@ -609,10 +611,13 @@ pub enum QueryPhysicalOperator {
     FastPath(FastPathKind),
     PlannedJoin(JoinKind),
     Evaluator(String),
+    /// The caller may not read every graph, so the physical plan is not reported.
+    Withheld,
 }
 
 /// Work and stage timings for one complete query execution.
-/// Store-wide counts and estimates are zero unless the authorizer reads every graph.
+/// Unless the authorizer reads every graph, only timings, result counts, and the query
+/// fingerprint are reported; see [`QueryExecutionStatistics::details_withheld`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryExecutionStatistics {
     pub parse_time: Duration,
@@ -666,62 +671,53 @@ pub struct QueryExecutionStatistics {
 }
 
 impl QueryExecutionStatistics {
-    /// Clears counts that scans and planner statistics gather across unreadable graphs.
-    pub(crate) fn withhold_counts(&mut self) {
-        for join in &mut self.planned_joins {
-            *join = PlannedJoin {
-                physical_operator: join.physical_operator,
-                estimated_left_rows: 0,
-                estimated_right_rows: 0,
-                estimated_distinct_join_keys: 0,
-                estimated_output_rows: 0,
-                estimated_lateral_cost: 0,
-                estimated_hash_cost: 0,
-            };
-        }
-        for count in [
-            &mut self.index_seeks,
-            &mut self.source_keys_read,
-            &mut self.source_bytes_read,
-            &mut self.qv_keys_read,
-            &mut self.qv_bytes_read,
-            &mut self.reverse_mapping_reads,
-            &mut self.reverse_mapping_bytes,
-            &mut self.forward_mapping_reads,
-            &mut self.forward_mapping_bytes,
-            &mut self.planner_index_entries,
-            &mut self.planner_point_reads,
-            &mut self.planner_cache_hits,
-            &mut self.planner_cache_misses,
-            &mut self.planner_memo_hits,
-            &mut self.planner_memo_misses,
-            &mut self.candidate_quads,
-            &mut self.graphs_considered,
-            &mut self.orphan_checks,
-            &mut self.duplicate_groups,
-            &mut self.duplicate_copies_skipped,
-            &mut self.key_fields_extracted,
-            &mut self.authoritative_terms_decoded,
-            &mut self.result_terms_decoded,
-            &mut self.encoded_quad_constructions,
-            &mut self.terms_decoded,
-        ] {
-            *count = 0;
-        }
-        self.plan.withhold_counts();
+    /// Keeps only timings, the caller's own result counts, and the query-derived plan.
+    /// Every other field may reflect unreadable graphs and returns to its default.
+    pub(crate) fn withhold_details(&mut self, prepared: &PreparedQuery) {
+        let full = std::mem::take(self);
+        let mut plan = full.plan;
+        plan.withhold_details(prepared);
+        *self = Self {
+            parse_time: full.parse_time,
+            rewrite_time: full.rewrite_time,
+            planning_time: full.planning_time,
+            execution_time: full.execution_time,
+            result_collection_time: full.result_collection_time,
+            time_to_first_internal_result: full.time_to_first_internal_result,
+            plan_fingerprint: plan.fingerprint.clone(),
+            result_rows: full.result_rows,
+            result_cells: full.result_cells,
+            plan,
+            ..Self::default()
+        };
+    }
+
+    /// Whether details that could reflect unreadable graphs were withheld from the caller.
+    pub fn details_withheld(&self) -> bool {
+        self.plan.details_withheld()
     }
 }
 
 impl QueryPlan {
-    /// Clears row estimates and scan counts from every plan node.
-    pub(crate) fn withhold_counts(&mut self) {
-        let mut pending = vec![&mut self.root];
-        while let Some(node) = pending.pop() {
-            node.estimated_rows = None;
-            node.index_seeks = 0;
-            node.candidate_rows = 0;
-            pending.extend(node.children.iter_mut());
-        }
+    /// Replaces the physical plan with its query form, result rows, and query text fingerprint.
+    pub(crate) fn withhold_details(&mut self, prepared: &PreparedQuery) {
+        let root = std::mem::take(&mut self.root);
+        *self = Self {
+            fingerprint: prepared.source_fingerprint.to_string(),
+            root: QueryPlanNode {
+                logical_operator: root.logical_operator,
+                physical_operator: QueryPhysicalOperator::Withheld,
+                actual_rows: root.actual_rows,
+                output_rows: root.output_rows,
+                elapsed_time: root.elapsed_time,
+                ..QueryPlanNode::default()
+            },
+        };
+    }
+
+    /// Whether the physical plan and its estimates were withheld from the caller.
+    pub fn details_withheld(&self) -> bool {
+        self.root.physical_operator == QueryPhysicalOperator::Withheld
     }
 }
 
@@ -935,36 +931,37 @@ impl SparqlEngine {
             .map(|execution| execution.results)
     }
 
+    /// Parses and executes one query, returning the parsed query for diagnostic scoping.
     pub(crate) fn query_with_options(
         &self,
         request: QueryRun<'_>,
         policy_visible: &SnapshotVisibleFn<'_>,
-    ) -> Result<QueryExecution> {
+    ) -> Result<(PreparedQuery, QueryExecution)> {
         let (prepared, parse_time) = parse_prepared_query(request.sparql, &request.options.limits)?;
-        self.execute_prepared_snapshot(&prepared, policy_visible, request.options, parse_time, true)
+        let execution = self.execute_prepared_snapshot(
+            &prepared,
+            policy_visible,
+            request.options,
+            parse_time,
+            true,
+        )?;
+        Ok((prepared, execution))
     }
 
-    pub(crate) fn query_graphs_options(&self, request: GraphQuery<'_>) -> Result<QueryExecution> {
+    pub(crate) fn query_graphs_options(
+        &self,
+        request: GraphQuery<'_>,
+    ) -> Result<(PreparedQuery, QueryExecution)> {
         let (prepared, parse_time) = parse_prepared_query(request.sparql, &request.options.limits)?;
-        self.execute_prepared_scope(
+        let (execution, _) = self.execute_prepared_scope(
             &prepared,
             GraphScope::List(request.graphs),
             request.options,
             parse_time,
             true,
             Some(request.auth),
-        )
-        .map(|(execution, _)| execution)
-    }
-
-    pub(crate) fn query_snapshot_stats(
-        &self,
-        sparql: &str,
-        policy_visible: &SnapshotVisibleFn<'_>,
-    ) -> Result<QueryExecution> {
-        let options = QueryOptions::default();
-        let (prepared, parse_time) = parse_prepared_query(sparql, &options.limits)?;
-        self.execute_prepared_snapshot(&prepared, policy_visible, &options, parse_time, true)
+        )?;
+        Ok((prepared, execution))
     }
 
     pub(crate) fn execute_prepared_snapshot(
@@ -1866,6 +1863,7 @@ fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQ
         PreparedQuery {
             query: Arc::new(query),
             query_bytes: sparql.len(),
+            source_fingerprint: blake3::hash(sparql.as_bytes()).to_hex().as_str().into(),
         },
         started.elapsed(),
     ))
@@ -4271,6 +4269,7 @@ mod tests {
                     &|_, _: &GraphId| true,
                 )
                 .unwrap()
+                .1
                 .results,
         );
         assert_eq!(
@@ -4289,6 +4288,7 @@ mod tests {
                     &|_, graph: &GraphId| graph != &hidden,
                 )
                 .unwrap()
+                .1
                 .results,
         );
         assert_eq!(
