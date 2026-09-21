@@ -704,10 +704,11 @@ impl<'store, 'context, 'visibility> DenseCursor<'store, 'context, 'visibility> {
             .source(DenseTerm::new(query, self.resolver.space().scope))
     }
 
-    fn account(&mut self, bytes: u64, fields: u64) -> Result<()> {
+    /// Keys arrive inside the narrowed range; the four key fields are read
+    /// directly, so they are not counted as separately extracted fields.
+    fn account(&mut self, bytes: u64) -> Result<()> {
         self.context.increment_candidate_quads();
         self.context.record_qv_read(bytes);
-        self.context.record_key_fields(fields);
         self.candidates_since_check += 1;
         if self.candidates_since_check == CANCELLATION_CHECK_INTERVAL {
             self.candidates_since_check = 0;
@@ -732,9 +733,8 @@ impl Iterator for DenseCursor<'_, '_, '_> {
                 Ok(key) => key,
                 Err(error) => return self.fail(error),
             };
-            let (matches, _) = self.raw.matches(key);
             let query = [key.graph(), key.subject(), key.predicate(), key.object()];
-            if let Err(error) = self.account(key.bytes_read, 4) {
+            if let Err(error) = self.account(key.bytes_read) {
                 return self.fail(error);
             }
             if query.iter().any(|term| term.0 >= self.raw.query_id_limit) {
@@ -742,9 +742,6 @@ impl Iterator for DenseCursor<'_, '_, '_> {
                     context: "qv2 query index key",
                     message: "query ID exceeds the admitted generation bound".to_owned(),
                 });
-            }
-            if !matches {
-                continue;
             }
             let graph_source = match self.graph_source(query[0]) {
                 Ok(source) => source,
