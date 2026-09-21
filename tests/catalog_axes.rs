@@ -2,6 +2,8 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+// The shared benchmark module carries axis helpers this test does not call.
+#[allow(dead_code)]
 #[path = "../benches/catalog/case.rs"]
 mod catalog_case;
 

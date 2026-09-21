@@ -4161,16 +4161,17 @@ mod tests {
     /// Deterministic text with common, rare, and tied terms of varied frequency.
     fn prune_text(index: usize, round: usize) -> String {
         let mut state = (index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ round as u64;
-        let mut words = Vec::new();
-        for _ in 0..(index % 5) + 1 {
-            words.push("common");
-        }
+        let mut words = vec!["common"; index % 5 + 1];
         state ^= state >> 29;
-        if state % 17 == 0 {
+        if state.is_multiple_of(17) {
             words.push("rare");
         }
-        words.push(if state % 2 == 0 { "alpha" } else { "beta" });
-        if index % 7 == 0 {
+        words.push(if state.is_multiple_of(2) {
+            "alpha"
+        } else {
+            "beta"
+        });
+        if index.is_multiple_of(7) {
             return "tie filler".to_owned();
         }
         words.join(" ")

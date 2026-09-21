@@ -280,11 +280,11 @@ fn prune_text(index: usize) -> String {
         state ^= state >> 31;
         state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         let repeats = (state % 4) as usize;
-        if state % (1 << (rank * 2)) as u64 == 0 {
+        if state.is_multiple_of(1u64 << (rank * 2)) {
             words.extend(std::iter::repeat_n(*word, repeats + 1));
         }
     }
-    if index % 11 == 0 {
+    if index.is_multiple_of(11) {
         return "tie filler".to_owned();
     }
     words.join(" ")
@@ -329,7 +329,7 @@ fn prune_search(index: &SearchIndex, run: &PruneRun<'_>) -> (u64, Vec<SearchHit>
         .store(run.exhaustive, Ordering::SeqCst);
     let allows = |graph: &str| {
         let slot: usize = graph.rsplit(':').next().unwrap().parse().unwrap();
-        Ok::<bool, SearchError>(!run.sparse || slot % 3 == 0)
+        Ok::<bool, SearchError>(!run.sparse || slot.is_multiple_of(3))
     };
     let check = || Ok::<(), SearchError>(());
     let started = Instant::now();

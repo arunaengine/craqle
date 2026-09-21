@@ -1179,6 +1179,7 @@ mod tests {
                     options,
                 },
             )
+            .map_err(|error| error.kind())
         };
         let plain = node.search(&GrantAuthorizer::default(), request()).unwrap();
         assert!(!plain.is_empty());
@@ -1186,14 +1187,12 @@ mod tests {
 
         let cancelled = SearchOptions::default();
         cancelled.cancellation.cancel();
-        let error = run(&cancelled).unwrap_err();
-        assert_eq!(error.kind(), CraqleErrorKind::Cancelled);
+        assert_eq!(run(&cancelled).unwrap_err(), CraqleErrorKind::Cancelled);
 
         let expired = SearchOptions {
             timeout: Some(std::time::Duration::ZERO),
             ..SearchOptions::default()
         };
-        let error = run(&expired).unwrap_err();
-        assert_eq!(error.kind(), CraqleErrorKind::QueryLimit);
+        assert_eq!(run(&expired).unwrap_err(), CraqleErrorKind::QueryLimit);
     }
 }
