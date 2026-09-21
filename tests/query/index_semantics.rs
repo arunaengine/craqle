@@ -381,3 +381,37 @@ fn probes_follow_deletes() {
     let kept = [fixture.visible[0].clone(), fixture.visible[2].clone()];
     assert_eq!(probe(&fixture.node), graph_rows(&kept));
 }
+
+/// Negated paths scan with subject and object bound, which the key prefix may not cover.
+#[test]
+fn residual_terms_filtered() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graph = GraphId::new("urn:pr3:query-semantics:residual");
+    let root = iri(graph.as_str());
+    node.apply_changes_unchecked(
+        &graph,
+        vec![
+            insert(&graph, root.clone(), RDF_TYPE, iri(SCHEMA_DATASET)),
+            insert(&graph, root, TEST_PREDICATE, literal(SHARED_VALUE)),
+        ],
+    )
+    .unwrap();
+    node.ensure_query_indexes();
+    let ask = |sparql: String| match node.query(&AllowAllAuthorizer, &sparql).unwrap() {
+        QueryResults::Boolean(answer) => answer,
+        other => panic!("expected a boolean, got {other:?}"),
+    };
+    let target = format!("<{}>", graph.as_str());
+    for scope in [format!("GRAPH {target}"), String::new()] {
+        let excluded =
+            format!("ASK {{ {scope} {{ {target} !(<{TEST_PREDICATE}>) \"{SHARED_VALUE}\" }} }}");
+        let included =
+            format!("ASK {{ {scope} {{ {target} !(<{RDF_TYPE}>) \"{SHARED_VALUE}\" }} }}");
+        assert!(
+            !ask(excluded),
+            "{scope}: only the negated predicate links the pair"
+        );
+        assert!(ask(included), "{scope}: another predicate links the pair");
+    }
+}
