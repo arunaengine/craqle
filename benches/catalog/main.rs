@@ -266,15 +266,13 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
     let rate = case.usize("rate", 0);
     let offered = usize::max(1, rows.saturating_mul(rate) / 100) * usize::from(rate > 0);
     let barrier = Arc::new(std::sync::Barrier::new(1 + usize::from(offered > 0)));
-    // Completion time and size of each applied chunk, classified against the timer later.
-    let completed = Arc::new(std::sync::Mutex::new(Vec::<(Instant, usize)>::new()));
-    let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Each attempted chunk with its completion time or error kind, classified later.
+    let attempts = Arc::new(std::sync::Mutex::new(Vec::<WriteAttempt>::new()));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = (offered > 0).then(|| {
         let node = Arc::clone(&node);
         let barrier = Arc::clone(&barrier);
-        let completed = Arc::clone(&completed);
-        let rejected = Arc::clone(&rejected);
+        let attempts = Arc::clone(&attempts);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             barrier.wait();
@@ -286,15 +284,14 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
                 let changes = (start..end)
                     .map(|index| change(&graph_id(0), rows + index, 0x5a))
                     .collect();
-                match node.apply_changes(&AllowAllAuthorizer, &graph_id(0), changes) {
-                    Ok(_) => completed
-                        .lock()
-                        .unwrap()
-                        .push((Instant::now(), end - start)),
-                    Err(_) => {
-                        rejected.fetch_add(end - start, std::sync::atomic::Ordering::AcqRel);
-                    }
-                }
+                let outcome = node
+                    .apply_changes(&AllowAllAuthorizer, &graph_id(0), changes)
+                    .map(|_| Instant::now())
+                    .map_err(|error| format!("{:?}", error.kind()));
+                attempts.lock().unwrap().push(WriteAttempt {
+                    rows: rows + start..rows + end,
+                    outcome,
+                });
             }
         })
     });
@@ -309,20 +306,57 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
     if let Some(writer) = writer {
         writer.join().unwrap();
     }
-    let (mut before, mut during, mut after) = (0, 0, 0);
-    for (at, rows) in completed.lock().unwrap().iter() {
-        let slot = if *at < started {
-            &mut before
-        } else if *at <= ended {
-            &mut during
-        } else {
-            &mut after
-        };
-        *slot += rows;
-    }
-    let rejected = rejected.load(std::sync::atomic::Ordering::Acquire);
     let drain_started = Instant::now();
     node.persist_fjall().unwrap();
+    let drain_ns = drain_started.elapsed().as_nanos();
+    // An error does not prove nothing committed, so every attempt is checked against source.
+    let present: std::collections::HashSet<String> = node
+        .graph_snapshot(&graph_id(0))
+        .unwrap()
+        .quads
+        .into_iter()
+        .filter(|quad| !quad.dots.is_empty())
+        .map(|quad| quad.subject.0)
+        .collect();
+    let (mut before, mut during, mut after) = (0, 0, 0);
+    let mut errors = std::collections::BTreeMap::<String, [usize; 3]>::new();
+    let attempts = std::mem::take(&mut *attempts.lock().unwrap());
+    let attempted: usize = attempts.iter().map(|attempt| attempt.rows.len()).sum();
+    for attempt in attempts {
+        let stored = attempt
+            .rows
+            .clone()
+            .filter(|index| present.contains(&format!("<urn:catalog:s:{}:{index}>", 0x5a)))
+            .count();
+        match attempt.outcome {
+            Ok(at) => {
+                assert_eq!(attempt.rows.len(), stored, "an accepted write is missing");
+                let slot = if at < started {
+                    &mut before
+                } else if at <= ended {
+                    &mut during
+                } else {
+                    &mut after
+                };
+                *slot += stored;
+            }
+            Err(kind) => {
+                let counts = errors.entry(kind).or_default();
+                let slot = match stored {
+                    0 => 0,
+                    stored if stored == attempt.rows.len() => 1,
+                    _ => 2,
+                };
+                counts[slot] += attempt.rows.len();
+            }
+        }
+    }
+    let authoritative = present.len();
+    let derived = graph_count(&node);
+    assert_eq!(
+        authoritative, derived,
+        "query index disagrees with source after rebuild"
+    );
     json!({
         "completed": rows,
         "effective": {
@@ -330,17 +364,45 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
             "applied_before_rebuild": before,
             "applied_during_rebuild": during,
             "applied_after_rebuild": after,
-            "rejected_rows": rejected,
-            "not_attempted_rows": offered - before - during - after - rejected,
+            // Per error kind: rows absent from source, fully stored, and partly stored.
+            "errors": errors
+                .iter()
+                .map(|(kind, [absent, stored, partial])| {
+                    (kind.clone(), json!({"absent": absent, "stored": stored, "partial": partial}))
+                })
+                .collect::<serde_json::Map<_, _>>(),
+            "not_attempted_rows": offered - attempted,
             "concurrent": during > 0,
         },
+        "authoritative_rows": authoritative,
+        "derived_rows": derived,
         "work_ns": rebuild_ns,
         "rebuild_ns": rebuild_ns,
-        "drain_ns": drain_started.elapsed().as_nanos(),
+        "drain_ns": drain_ns,
         "source_rows": status.source_live_quads,
         "indexed_rows": status.indexed_quads,
         "fingerprint": format!("{:?}", node.graph_fingerprint(&graph_id(0)).unwrap()),
     })
+}
+
+/// One write chunk of the rebuild workload and how its call returned.
+struct WriteAttempt {
+    rows: std::ops::Range<usize>,
+    outcome: Result<Instant, String>,
+}
+
+/// Rows the query index reports for the first graph, after writes have settled.
+fn graph_count(node: &CraqleNode) -> usize {
+    let query = format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{}> {{ ?s <urn:catalog:p> ?o }} }}",
+        graph_id(0).as_str()
+    );
+    let craqle::QueryResults::Solutions(rows) = node.query(&AllowAllAuthorizer, &query).unwrap()
+    else {
+        panic!("COUNT returned no solutions");
+    };
+    let count = &rows[0]["n"].0;
+    count[1..count.find("\"^^").unwrap()].parse().unwrap()
 }
 
 fn run_merge(path: &Path, case: &Case) -> Value {
