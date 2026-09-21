@@ -25,7 +25,7 @@ use crate::search::SearchIndex;
 use crate::sparql_fast_path::{
     FastPathPlan, QueryFastPathKind as FastPathKind, QueryFastPathMode as FastPathMode,
 };
-use crate::store::{GraphStore, StoreError, StoreReadSnapshot, TermId};
+use crate::store::{GraphStore, QueryTermId, StoreError, StoreReadSnapshot, TermId};
 use oxrdf::{
     BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode as GraphNode, Term, Triple, Variable,
 };
@@ -1186,6 +1186,7 @@ impl SparqlEngine {
             options.limits,
             stages.clock.clone(),
         )?);
+        let mut known_terms = HashMap::new();
         if let Some(plan) = stages.graph_distinct.take()
             && context.validation_graph().is_none()
             && let Some(relation) = crate::graph_distinct::execute(
@@ -1202,6 +1203,7 @@ impl SparqlEngine {
             let work = &relation.stats;
             tracing::debug!(target: "craqle::graph_distinct", ?work, "native graph-level relation");
             crate::graph_distinct::substitute(&plan, &mut query, relation.values);
+            known_terms = relation.known;
         }
         if let Some(plan) = stages.fast_path.take() {
             let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &budget)?;
@@ -1277,12 +1279,15 @@ impl SparqlEngine {
                 .set_available_named_graphs(named_graphs);
         }
         let execution_started = Instant::now();
-        let (results, explanation) = prepared.explain(StoreDataset::with_query_budget(
-            view,
-            &context,
-            default_union_marker,
-            Arc::clone(&budget),
-        ));
+        let (results, explanation) = prepared.explain(
+            StoreDataset::with_query_budget(
+                view,
+                &context,
+                default_union_marker,
+                Arc::clone(&budget),
+            )
+            .with_known_terms(known_terms),
+        );
         let initial_execution_time = execution_started.elapsed();
         let results = results.map_err(|error| map_eval_error(error, &stages.clock))?;
         let (results, collection) = collect_query_results(
@@ -2964,6 +2969,8 @@ struct StoreDataset<'store, 'context, 'visibility> {
     dense_scope: Option<u64>,
     /// The single selected graph and its dense ID, resolved once per dataset.
     scoped_graph: Cell<Option<(TermId, Option<DenseTerm>)>>,
+    /// Stored identities a native operator already resolved for this query.
+    known_terms: HashMap<String, (TermId, QueryTermId)>,
 }
 
 static NEXT_DENSE_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -2991,6 +2998,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
             scoped_graph: Cell::new(None),
+            known_terms: HashMap::new(),
         }
     }
 
@@ -3009,6 +3017,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
             scoped_graph: Cell::new(None),
+            known_terms: HashMap::new(),
         }
     }
 
@@ -3027,7 +3036,13 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
             scoped_graph: Cell::new(None),
+            known_terms: HashMap::new(),
         }
+    }
+
+    fn with_known_terms(mut self, known_terms: HashMap<String, (TermId, QueryTermId)>) -> Self {
+        self.known_terms = known_terms;
+        self
     }
 
     /// The one graph an explicit scope selects, with its dense ID when query IDs apply.
@@ -3511,6 +3526,15 @@ where
             return Ok(StoreTerm::DefaultUnion);
         }
         let encoded = EncodedTerm::from_term(&term)?;
+        if let Some((source, dense)) = self.known_terms.get(&encoded.0) {
+            return Ok(match self.dense_scope {
+                Some(scope) => StoreTerm::Mapped {
+                    source: *source,
+                    dense: DenseTerm::new(*dense, scope),
+                },
+                None => StoreTerm::Source(*source),
+            });
+        }
         Ok(match self.view.lookup_term(self.context, &encoded)? {
             Some(id) => self.stored_term(id, false)?,
             None => StoreTerm::Missing(encoded),

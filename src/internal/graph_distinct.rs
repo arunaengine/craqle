@@ -20,7 +20,7 @@ use crate::graph_join::{
 };
 use crate::rdf_read::{GraphSelector, RdfReadView};
 use crate::sparql::Result;
-use crate::store::QueryTermId;
+use crate::store::{QueryTermId, TermId};
 
 /// Bounds planning work, which grows with the square of the pattern count.
 const MAX_PATTERNS: usize = 32;
@@ -307,9 +307,11 @@ pub(crate) struct GraphDistinctStats {
     pub(crate) steps: Vec<(usize, Method, bool, usize, usize)>,
 }
 
-/// The computed replacement relation.
+/// The computed replacement relation with the stored identities of its terms.
 pub(crate) struct GraphDistinctRelation {
     pub(crate) values: GraphPattern,
+    /// Term text with source and dense IDs, so the evaluator needs no dictionary reads.
+    pub(crate) known: HashMap<String, (TermId, QueryTermId)>,
     pub(crate) stats: GraphDistinctStats,
 }
 
@@ -687,6 +689,7 @@ impl Run<'_, '_, '_> {
         };
         variables.extend(counts.iter().cloned());
         let mut decoded: HashMap<QueryTermId, GroundTerm> = HashMap::new();
+        let mut known = HashMap::new();
         let mut bindings = Vec::with_capacity(tuples.len());
         for (key, count) in &tuples {
             let mut row = Vec::with_capacity(variables.len());
@@ -699,6 +702,7 @@ impl Run<'_, '_, '_> {
                         let Some(ground) = ground_term(&encoded) else {
                             return Ok(None);
                         };
+                        known.insert(encoded.0, (source, *term));
                         decoded.insert(*term, ground.clone());
                         ground
                     }
@@ -721,6 +725,7 @@ impl Run<'_, '_, '_> {
                 variables,
                 bindings,
             },
+            known,
             stats,
         }))
     }
