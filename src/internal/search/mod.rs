@@ -4285,10 +4285,7 @@ mod tests {
         assert_eq!(0, index.pending_repairs());
         assert!(queued_reindex(&store));
         drain_all(&index, &store);
-        assert_ne!(
-            Some(DIRECT_GENERATION),
-            index.active_generation(RAW_GRAPH)
-        );
+        assert_ne!(Some(DIRECT_GENERATION), index.active_generation(RAW_GRAPH));
         assert!(raw_search(&index).unwrap().is_empty());
     }
 
