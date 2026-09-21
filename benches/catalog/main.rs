@@ -264,12 +264,15 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
     let rate = case.usize("rate", 0);
     let offered = usize::max(1, rows.saturating_mul(rate) / 100) * usize::from(rate > 0);
     let barrier = Arc::new(std::sync::Barrier::new(1 + usize::from(offered > 0)));
-    let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Completion time and size of each applied chunk, classified against the timer later.
+    let completed = Arc::new(std::sync::Mutex::new(Vec::<(Instant, usize)>::new()));
+    let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = (offered > 0).then(|| {
         let node = Arc::clone(&node);
         let barrier = Arc::clone(&barrier);
-        let applied = Arc::clone(&applied);
+        let completed = Arc::clone(&completed);
+        let rejected = Arc::clone(&rejected);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             barrier.wait();
@@ -281,9 +284,15 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
                 let changes = (start..end)
                     .map(|index| change(&graph_id(0), rows + index, 0x5a))
                     .collect();
-                node.apply_changes(&AllowAllAuthorizer, &graph_id(0), changes)
-                    .unwrap();
-                applied.fetch_add(end - start, std::sync::atomic::Ordering::Release);
+                match node.apply_changes(&AllowAllAuthorizer, &graph_id(0), changes) {
+                    Ok(_) => completed
+                        .lock()
+                        .unwrap()
+                        .push((Instant::now(), end - start)),
+                    Err(_) => {
+                        rejected.fetch_add(end - start, std::sync::atomic::Ordering::AcqRel);
+                    }
+                }
             }
         })
     });
@@ -292,20 +301,36 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
     }
     let started = Instant::now();
     let status = node.rebuild_query_indexes().unwrap();
-    let rebuild_ns = started.elapsed().as_nanos();
-    let during = applied.load(std::sync::atomic::Ordering::Acquire);
+    let ended = Instant::now();
+    let rebuild_ns = ended.duration_since(started).as_nanos();
     stop.store(true, std::sync::atomic::Ordering::Release);
     if let Some(writer) = writer {
         writer.join().unwrap();
     }
+    let (mut before, mut during, mut after) = (0, 0, 0);
+    for (at, rows) in completed.lock().unwrap().iter() {
+        let slot = if *at < started {
+            &mut before
+        } else if *at <= ended {
+            &mut during
+        } else {
+            &mut after
+        };
+        *slot += rows;
+    }
+    let rejected = rejected.load(std::sync::atomic::Ordering::Acquire);
     let drain_started = Instant::now();
     node.persist_fjall().unwrap();
     json!({
         "completed": rows,
         "effective": {
             "offered_rows": offered,
+            "applied_before_rebuild": before,
             "applied_during_rebuild": during,
-            "concurrent": offered > 0,
+            "applied_after_rebuild": after,
+            "rejected_rows": rejected,
+            "not_attempted_rows": offered - before - during - after - rejected,
+            "concurrent": during > 0,
         },
         "work_ns": rebuild_ns,
         "rebuild_ns": rebuild_ns,
