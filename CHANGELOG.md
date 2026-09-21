@@ -22,6 +22,8 @@ All notable changes to Craqle are documented here.
   defaults to `false`; `AllowAllAuthorizer` returns `true`.
 - Search fails with `CorruptDerivedData` when a live index document has missing or
   malformed metadata, and queues a reindex of its graph, instead of skipping it.
+  Damage without a readable graph scope, or beyond 64 pending graphs, queues a
+  whole search rebuild. A repair stays pending until the store accepts it.
 
 ### Added
 
