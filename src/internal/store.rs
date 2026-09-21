@@ -3565,7 +3565,7 @@ impl GraphStore {
         #[cfg(test)]
         self.index_admission_probes.fetch_add(1, Ordering::Relaxed);
         let (trusted, fallback_reason) =
-            match self.snapshot_counter(&snapshot, IndexCounterKey::Total)? {
+            match self.snapshot_counter(snapshot, IndexCounterKey::Total)? {
                 IndexCounterRead::Value(total) if total == header.indexed_quads => (true, None),
                 IndexCounterRead::Value(_) => (false, Some("total-counter-mismatch")),
                 IndexCounterRead::Missing => (false, Some("total-counter-missing")),
@@ -6716,7 +6716,7 @@ impl GraphStore {
             return None;
         }
         costs.planner_points(1);
-        let IndexHeaderRead::Valid(header) = self.snapshot_index_header(&snapshot).ok()? else {
+        let IndexHeaderRead::Valid(header) = self.snapshot_index_header(snapshot).ok()? else {
             return None;
         };
         let slot = IndexSlot::decode(header.active_slot)?;
