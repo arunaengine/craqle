@@ -6134,6 +6134,9 @@ mod tests {
             .unwrap();
         write_keyword(&origin, &graph, "after");
 
+        // Idle search maintenance cannot consume the one armed commit failure.
+        #[cfg(feature = "search")]
+        replica.flush_search_updates().unwrap();
         replica.store.arm_commit_failure();
         assert!(replica.reconcile_irokle().is_err());
         assert_eq!(baseline_cursor, topic_cursor(&replica, topic));
