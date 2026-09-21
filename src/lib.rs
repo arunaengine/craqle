@@ -13,6 +13,8 @@ mod core;
 mod count_exec;
 #[path = "internal/count_plan.rs"]
 mod count_plan;
+#[path = "internal/graph_join.rs"]
+mod graph_join;
 #[path = "internal/memory.rs"]
 mod memory;
 #[path = "internal/planner.rs"]
