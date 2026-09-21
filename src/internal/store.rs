@@ -2,7 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Included};
 use std::path::Path;
@@ -2420,6 +2420,8 @@ pub(crate) struct StoreReadSnapshot {
     active_slot: OnceCell<Option<IndexSlot>>,
     /// Graph metadata, clock and diagnostics records by key, read at most once per snapshot.
     graph_records: RefCell<HashMap<[u8; 17], Option<fjall::Slice>>>,
+    /// Set once `graph_records` holds every graph record, so a missing key means absent.
+    graph_records_complete: Cell<bool>,
     /// Graph names decoded for this snapshot, so policy reads skip a dictionary read.
     graph_names: RefCell<HashMap<String, TermId>>,
 }
@@ -2430,6 +2432,7 @@ impl From<&Snapshot> for StoreReadSnapshot {
             snapshot: snapshot.clone(),
             active_slot: OnceCell::new(),
             graph_records: RefCell::default(),
+            graph_records_complete: Cell::new(false),
             graph_names: RefCell::default(),
         }
     }
@@ -2972,9 +2975,45 @@ impl StoreReadSnapshot {
         if let Some(record) = self.graph_records.borrow().get(&key) {
             return Ok(record.clone());
         }
+        if self.graph_records_complete.get() {
+            return Ok(None);
+        }
         let record = self.snapshot.get(&store.graphs, key)?;
         self.graph_records.borrow_mut().insert(key, record.clone());
         Ok(record)
+    }
+
+    /// Reads all graph metadata, clock and diagnostics records with three range scans. Keeps
+    /// nothing and returns `false` when more than `limit` graphs exist, bounding the work.
+    pub(crate) fn prefetch_graph_records(&self, store: &GraphStore, limit: usize) -> Result<bool> {
+        if self.graph_records_complete.get() {
+            return Ok(true);
+        }
+        let mut records = Vec::new();
+        for prefix in [
+            GRAPH_META_PREFIX,
+            GRAPH_CLOCK_PREFIX,
+            GRAPH_DIAGNOSTICS_PREFIX,
+        ] {
+            let mut graphs = 0_usize;
+            for guard in self.snapshot.prefix(&store.graphs, [prefix]) {
+                let (key, value) = guard.into_inner()?;
+                let Ok(key) = <[u8; 17]>::try_from(key.as_ref()) else {
+                    continue;
+                };
+                graphs += 1;
+                if graphs > limit {
+                    return Ok(false);
+                }
+                records.push((key, value));
+            }
+        }
+        let mut memo = self.graph_records.borrow_mut();
+        for (key, value) in records {
+            memo.insert(key, Some(value));
+        }
+        self.graph_records_complete.set(true);
+        Ok(true)
     }
 
     fn vector_clock(&self, store: &GraphStore, graph: TermId) -> Result<VectorClock> {
@@ -11903,6 +11942,58 @@ mod tests {
         let after = store.read_snapshot();
         assert_eq!(after.graph_policy(&store, &kept).unwrap(), Some(changed));
         assert!(!after.contains_graph_id(&store, id(&deleted)).unwrap());
+    }
+
+    /// Range-read graph records answer exactly like point reads; a refused prefetch keeps
+    /// nothing, and later graphs stay invisible to the older snapshot.
+    #[test]
+    fn prefetched_records_exact() {
+        let (_dir, store) = setup_store();
+        let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let media = "http://schema.org/MediaObject";
+        let graphs: Vec<GraphId> = (0..3)
+            .map(|index| GraphId::new(&format!("urn:test:prefetch-{index}")))
+            .collect();
+        for graph in &graphs {
+            store.create_graph(graph).unwrap();
+        }
+        for graph in &graphs[..2] {
+            let quad = encode_quad(&store, graph, ("urn:e:loose", rdf_type, media));
+            commit_add(&store, graph, quad);
+        }
+        let diagnostics = store.compute_graph_diagnostics(&graphs[0]).unwrap();
+        store
+            .set_graph_diagnostics(&graphs[0], &diagnostics)
+            .unwrap();
+        let point = store.read_snapshot();
+        let ranged = store.read_snapshot();
+        assert!(!ranged.prefetch_graph_records(&store, 2).unwrap());
+        assert!(ranged.prefetch_graph_records(&store, 3).unwrap());
+        let late = GraphId::new("urn:test:prefetch-late");
+        store.create_graph(&late).unwrap();
+
+        let context = ReadContext::new(crate::query::context::QueryCancellation::new());
+        for graph in graphs.iter().chain([&late]) {
+            let id = store
+                .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                point.contains_graph_id(&store, id).unwrap(),
+                ranged.contains_graph_id(&store, id).unwrap()
+            );
+            assert_eq!(
+                point.graph_policy(&store, graph).unwrap(),
+                ranged.graph_policy(&store, graph).unwrap()
+            );
+            let orphans = point.orphaned_entity_ids(&store, &context, id).unwrap();
+            assert_eq!(
+                orphans,
+                ranged.orphaned_entity_ids(&store, &context, id).unwrap()
+            );
+            assert_eq!(orphans.is_empty(), !graphs[..2].contains(graph));
+        }
+        assert!(!ranged.contains_graph_id(&store, TermId(u128::MAX)).unwrap());
     }
 
     fn seed_graph_record(path: &Path, key: &[u8], value: &[u8]) {

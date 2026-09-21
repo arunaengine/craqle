@@ -284,6 +284,8 @@ impl Names {
 const SEEK_COST: u64 = 10;
 /// Relative cost of one key in a whole-store range, where the graph changes on most keys.
 const SCAN_KEY_COST: u64 = 2;
+/// Expected graph visits from which graph records are read by range instead of point reads.
+const PREFETCH_GRAPHS: u64 = 256;
 /// Row counts from which the planner probes a few real rows instead of trusting counters.
 const OBSERVE_ROWS: usize = 64;
 const OBSERVE_SAMPLES: usize = 4;
@@ -303,6 +305,7 @@ pub(crate) struct GraphDistinctStats {
     pub(crate) reads: ReadCounts,
     pub(crate) peak_rows: u64,
     pub(crate) retained: u64,
+    pub(crate) prefetched: bool,
     /// Pattern, access method, filter step, and row counts before and after each step.
     pub(crate) steps: Vec<(usize, Method, bool, usize, usize)>,
 }
@@ -397,6 +400,19 @@ impl Run<'_, '_, '_> {
     /// Evaluates every pattern; `None` means dense reads became unavailable.
     fn evaluate(&self) -> Result<Option<Rows>> {
         let mut pending: Vec<usize> = (0..self.plan.patterns.len()).collect();
+        let mut first = u64::MAX;
+        for pattern in &pending {
+            first = first.min(self.scan_estimate(*pattern)?);
+        }
+        // Each first graph visit costs several point reads; ranges are cheaper for many graphs.
+        if (PREFETCH_GRAPHS..u64::MAX / 4).contains(&first) {
+            let limit = usize::try_from(first.saturating_mul(4)).unwrap_or(usize::MAX);
+            let view = self.reader.input.view;
+            let prefetched = view
+                .snapshot()
+                .prefetch_graph_records(view.store(), limit)?;
+            self.record(|stats| stats.prefetched = prefetched);
+        }
         let mut rows = Rows::unit();
         while !pending.is_empty() && !rows.data.is_empty() {
             self.reader.input.context.check_cancelled()?;
