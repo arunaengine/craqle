@@ -350,9 +350,8 @@ fn prune_search(index: &SearchIndex, run: &PruneRun<'_>) -> (u64, Vec<SearchHit>
     (started.elapsed().as_nanos() as u64, hits)
 }
 
-/// Checks pruned hits against the exhaustive oracle by identity, eligibility, and score.
-/// Scores may differ by the tolerance; hits tied within it may reorder, and only the
-/// tie group at the cutoff may hold different members.
+/// Checks pruned hits against the exhaustive oracle by identity, eligibility, and score;
+/// hits tied within the tolerance may reorder, and only the cutoff tie group may differ.
 fn assert_same_hits(oracle: &[SearchHit], pruned: &[SearchHit], sparse: bool) {
     let tolerance = |score: f32| score.abs() * 1e-5 + 1e-6;
     assert_eq!(oracle.len(), pruned.len(), "result sizes differ");

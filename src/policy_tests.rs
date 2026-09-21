@@ -127,7 +127,7 @@ fn assert_failed(label: &str, result: Result<QueryResults>) {
 }
 
 #[test]
-fn denied_graphs_stay_hidden() {
+fn denied_stays_hidden() {
     let (_directory, node) = fixture();
     for (label, result) in run_all(&node, ROWS) {
         let results = result.unwrap_or_else(|error| panic!("{label}: {error}"));
@@ -143,7 +143,7 @@ fn denied_graphs_stay_hidden() {
 }
 
 #[test]
-fn policy_failure_fails_rows() {
+fn policy_failure_fails() {
     let (_directory, node) = fixture();
     node.store.fail_policy_reads(Some(GraphId::new(FAILING)));
     for (label, result) in run_all(&node, ROWS) {
@@ -164,7 +164,7 @@ fn policy_failure_fails_rows() {
 }
 
 #[test]
-fn early_limit_stays_complete() {
+fn early_limit_completes() {
     let (_directory, node) = fixture();
     node.store.fail_policy_reads(Some(GraphId::new(FAILING)));
     let limited = format!("{ROWS} LIMIT 1");

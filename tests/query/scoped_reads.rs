@@ -173,7 +173,7 @@ fn oracle(node: &CraqleNode, query: &str) -> QueryResults {
 }
 
 #[test]
-fn single_scope_matches_graph() {
+fn single_scope_matches() {
     let (_directory, node) = fixture(40);
     for (label, query) in QUERIES {
         let ordered = label == "ordered";
@@ -191,7 +191,7 @@ fn single_scope_matches_graph() {
 }
 
 #[test]
-fn small_union_stays_distinct() {
+fn union_stays_distinct() {
     let (_directory, node) = fixture(40);
     let shared = QUERIES[5].1;
     let union = canonical(scoped(&node, &[TARGET, SHARED], shared).results, false);

@@ -627,9 +627,8 @@ pub enum QueryPhysicalOperator {
     Withheld,
 }
 
-/// Work and stage timings for one complete query execution.
-/// Unless the authorizer reads every graph, only timings, result counts, and the query
-/// fingerprint are reported; see [`QueryExecutionStatistics::details_withheld`].
+/// Work and stage timings for one complete query execution. A caller that cannot read every
+/// graph gets a reduced view; see [`QueryExecutionStatistics::details_withheld`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryExecutionStatistics {
     pub parse_time: Duration,
