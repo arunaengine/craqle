@@ -6684,6 +6684,9 @@ mod tests {
             .unwrap();
 
         pair.origin.delete_authorized(&shapes).unwrap();
+        // Idle search maintenance cannot consume the one armed commit failure.
+        #[cfg(feature = "search")]
+        pair.replica.flush_search_updates().unwrap();
         pair.replica.store.set_graph_tombstone(&shapes).unwrap();
         pair.replica.store.arm_commit_failure();
         assert!(pair.replica.reconcile_irokle().is_err());
