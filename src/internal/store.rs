@@ -1310,6 +1310,9 @@ pub struct GraphStore {
     /// Global term-id → term cache. Term ids are content hashes, so entries do
     /// not need invalidation; capacity and bytes are bounded independently.
     term_decode_cache: RwLock<BoundedCache<TermId, Arc<EncodedTerm>>>,
+    /// Counts for the shared-lock term hit path, which cannot update the cache.
+    term_cache_hits: AtomicU64,
+    term_cache_misses: AtomicU64,
     /// Set by a test to stall between the durable commit and the index apply,
     /// widening a window that is otherwise microseconds wide.
     #[cfg(test)]
@@ -6257,11 +6260,17 @@ impl GraphStore {
         let quad = indexes.quad_subjects.statistics();
         let object = indexes.object_order.statistics();
         drop(indexes);
-        let terms = self
+        let mut terms = self
             .term_decode_cache
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .statistics();
+        terms.hits = terms
+            .hits
+            .saturating_add(self.term_cache_hits.load(Ordering::Relaxed));
+        terms.misses = terms
+            .misses
+            .saturating_add(self.term_cache_misses.load(Ordering::Relaxed));
         [quad, object, terms]
     }
 
@@ -7194,6 +7203,8 @@ impl GraphStore {
             validation_max_active: std::sync::atomic::AtomicUsize::new(0),
             indexes: RwLock::new(IndexState::with_budget(&budget)),
             term_decode_cache: RwLock::new(BoundedCache::new(TERM_CACHE_CAP, budget.terms)),
+            term_cache_hits: AtomicU64::new(0),
+            term_cache_misses: AtomicU64::new(0),
             #[cfg(test)]
             commit_stall: Mutex::new(None),
             #[cfg(test)]
@@ -7623,12 +7634,15 @@ impl GraphStore {
     pub(crate) fn decode_term_arc(&self, id: TermId) -> Result<Arc<EncodedTerm>> {
         if let Some(term) = self
             .term_decode_cache
-            .write()
+            .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .get_cloned(&id)
+            .peek(&id)
+            .cloned()
         {
+            self.term_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(term);
         }
+        self.term_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let term = Arc::new(self.read_term(id)?);
         let mut cache = self

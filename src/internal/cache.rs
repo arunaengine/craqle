@@ -80,6 +80,16 @@ where
         Some(entry.value.clone())
     }
 
+    /// Reads under a shared borrow. The caller counts the hit, because this
+    /// path never reorders entries and takes no exclusive lock.
+    pub(crate) fn peek<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
     pub(crate) fn insert(&mut self, key: K, value: V, bytes: usize) {
         if self.max_entries == 0 || bytes.saturating_add(Self::entry_reserve()) > self.max_bytes {
             self.remove(&key);
