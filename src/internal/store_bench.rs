@@ -271,3 +271,122 @@ fn catalog_b17() {
         })
     );
 }
+
+/// Hit path compared by the decode contention benchmark.
+#[derive(Clone, Copy, Debug)]
+enum HitPath {
+    /// The earlier path: an exclusive lock on every hit, to update its counters.
+    Counted,
+    /// The current production path, which reads hits under a shared lock.
+    Shared,
+}
+
+fn decode_hit(store: &GraphStore, id: TermId, path: HitPath) -> Arc<EncodedTerm> {
+    if let HitPath::Counted = path
+        && let Some(term) = store
+            .term_decode_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_cloned(&id)
+    {
+        return term;
+    }
+    store.decode_term_arc(id).unwrap()
+}
+
+struct DecodeRun<'a> {
+    store: &'a GraphStore,
+    ids: &'a [TermId],
+    path: HitPath,
+}
+
+/// Runs barrier-aligned readers and returns wall time and sampled call latencies.
+fn decode_readers(run: &DecodeRun<'_>, threads: usize) -> (u128, Vec<u64>) {
+    const OPS: usize = 200_000;
+    let barrier = std::sync::Barrier::new(threads + 1);
+    let started = std::sync::Mutex::new(None);
+    let samples = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|thread| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut sampled = Vec::with_capacity(OPS / 64);
+                    barrier.wait();
+                    for op in 0..OPS {
+                        let id = run.ids[(op * 7 + thread * 13) % run.ids.len()];
+                        if op % 64 == 0 {
+                            let call = Instant::now();
+                            std::hint::black_box(decode_hit(run.store, id, run.path));
+                            sampled.push(call.elapsed().as_nanos() as u64);
+                        } else {
+                            std::hint::black_box(decode_hit(run.store, id, run.path));
+                        }
+                    }
+                    sampled
+                })
+            })
+            .collect();
+        *started.lock().unwrap() = Some(Instant::now());
+        barrier.wait();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let wall = started.lock().unwrap().unwrap().elapsed().as_nanos();
+    (wall, samples)
+}
+
+#[test]
+#[ignore = "release-only concurrent term decode cache workload"]
+fn decode_contention() {
+    let root = tempfile::tempdir().unwrap();
+    let store = GraphStore::open(root.path().join("store")).unwrap();
+    let ids: Vec<TermId> = (0..16_384)
+        .map(|index| {
+            store
+                .resolve_term(&EncodedTerm(format!("<urn:bench:decode:{index:05}>")))
+                .unwrap()
+        })
+        .collect();
+    for (workload, keys, entries) in [("hot", 64, 1_000_000), ("churn", 16_384, 4_096)] {
+        *store
+            .term_decode_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = BoundedCache::new(entries, 128 << 20);
+        for path in [HitPath::Counted, HitPath::Shared] {
+            for threads in [1, 2, 4, 8] {
+                let run = DecodeRun {
+                    store: &store,
+                    ids: &ids[..keys],
+                    path,
+                };
+                decode_readers(&run, threads);
+                let (wall, mut samples) = decode_readers(&run, threads);
+                samples.sort_unstable();
+                let quantile = |part: usize| samples[(samples.len() - 1) * part / 1000];
+                let statistics = store
+                    .term_decode_cache
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .statistics();
+                println!(
+                    "{}",
+                    json!({
+                        "benchmark_id": "decode_contention",
+                        "workload": workload,
+                        "path": format!("{path:?}"),
+                        "threads": threads,
+                        "ops": 200_000 * threads,
+                        "wall_ns": wall,
+                        "ops_per_second": (200_000 * threads) as f64 / (wall as f64 / 1e9),
+                        "p50_ns": quantile(500),
+                        "p99_ns": quantile(990),
+                        "p999_ns": quantile(999),
+                        "cache": format!("{statistics:?}"),
+                    })
+                );
+            }
+        }
+    }
+}

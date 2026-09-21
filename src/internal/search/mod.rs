@@ -454,6 +454,8 @@ struct TestHooks {
     exhaustive: AtomicBool,
     /// Segments collected with score pruning.
     pruned: std::sync::atomic::AtomicUsize,
+    /// Time spent loading stored identities for final hits.
+    hydrate_ns: AtomicU64,
 }
 
 #[cfg(test)]
@@ -1826,6 +1828,8 @@ impl SearchIndex {
         }
         let mut retained = rank_bytes;
         let mut hits = Vec::with_capacity(ranked.len());
+        #[cfg(test)]
+        let hydration = std::time::Instant::now();
         for ranked in ranked {
             (req.check)()?;
             let doc: TantivyDocument = view
@@ -1853,6 +1857,10 @@ impl SearchIndex {
             }
             hits.push(hit);
         }
+        #[cfg(test)]
+        self.hooks
+            .hydrate_ns
+            .fetch_add(hydration.elapsed().as_nanos() as u64, Ordering::SeqCst);
         hits.sort_by(|left, right| {
             right
                 .score

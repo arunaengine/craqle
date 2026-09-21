@@ -267,3 +267,194 @@ fn catalog_b10() {
         })
     );
 }
+
+const PRUNE_VOCABULARY: [&str; 8] = [
+    "common", "frequent", "usual", "middle", "sparse", "scarce", "rare", "unique",
+];
+
+/// Deterministic text whose term frequencies fall off across the vocabulary.
+fn prune_text(index: usize) -> String {
+    let mut state = (index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut words = Vec::new();
+    for (rank, word) in PRUNE_VOCABULARY.iter().enumerate() {
+        state ^= state >> 31;
+        state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let repeats = (state % 4) as usize;
+        if state % (1 << (rank * 2)) as u64 == 0 {
+            words.extend(std::iter::repeat_n(*word, repeats + 1));
+        }
+    }
+    if index % 11 == 0 {
+        return "tie filler".to_owned();
+    }
+    words.join(" ")
+}
+
+fn prune_index(docs: usize, segments: usize) -> SearchIndex {
+    let index = SearchIndex::open_in_memory().unwrap();
+    let chunk = docs.div_ceil(segments.max(1));
+    for position in 0..docs {
+        let graph = format!("urn:bench:prune:graph:{}", position % 64);
+        let subject = format!("urn:bench:prune:subject:{position}");
+        index
+            .index_resource(&graph, &subject, Some(&prune_text(position)))
+            .unwrap();
+        if (position + 1) % chunk == 0 {
+            index.commit().unwrap();
+        }
+    }
+    index.commit().unwrap();
+    if segments == 1 {
+        let ids = index.index.searchable_segment_ids().unwrap();
+        if ids.len() > 1 {
+            index.writer().unwrap().merge(&ids).wait().unwrap();
+        }
+        index.reader.reload().unwrap();
+        index.publish_searcher();
+    }
+    index
+}
+
+struct PruneRun<'a> {
+    query: &'a str,
+    limit: usize,
+    sparse: bool,
+    exhaustive: bool,
+}
+
+fn prune_search(index: &SearchIndex, run: &PruneRun<'_>) -> (u64, Vec<SearchHit>) {
+    index
+        .hooks
+        .exhaustive
+        .store(run.exhaustive, Ordering::SeqCst);
+    let allows = |graph: &str| {
+        let slot: usize = graph.rsplit(':').next().unwrap().parse().unwrap();
+        Ok::<bool, SearchError>(!run.sparse || slot % 3 == 0)
+    };
+    let check = || Ok::<(), SearchError>(());
+    let started = Instant::now();
+    let hits = index
+        .collect_filtered(FilterQuery {
+            query: run.query,
+            limit: run.limit,
+            subject: None,
+            allows: &allows,
+            check: &check,
+        })
+        .unwrap();
+    (started.elapsed().as_nanos() as u64, hits)
+}
+
+fn median(samples: &mut [u64]) -> u64 {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+#[test]
+#[ignore = "release-only exhaustive and pruned text collection comparison"]
+fn text_pruning() {
+    let docs = std::env::var("CRAQLE_PRUNE_DOCS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let rounds = 15;
+    for segments in [1, 8] {
+        let index = prune_index(docs, segments);
+        let layout = index.pin_view().searcher.segment_readers().len();
+        for query in ["common", "common frequent", "rare", "unique", "tie"] {
+            for (limit, sparse) in [(10, false), (100, false), (10, true), (100, true)] {
+                let mut timings = [Vec::new(), Vec::new()];
+                let mut hydrate = [0u64, 0u64];
+                let mut pruned_segments = 0;
+                for round in 0..=rounds {
+                    let mut results = Vec::new();
+                    for step in 0..2 {
+                        let exhaustive = (round + step) % 2 == 0;
+                        let before = index.hooks.pruned.load(Ordering::SeqCst);
+                        let hydrated = index.hooks.hydrate_ns.load(Ordering::SeqCst);
+                        let (elapsed, hits) = prune_search(
+                            &index,
+                            &PruneRun {
+                                query,
+                                limit,
+                                sparse,
+                                exhaustive,
+                            },
+                        );
+                        if round > 0 {
+                            let slot = usize::from(!exhaustive);
+                            timings[slot].push(elapsed);
+                            hydrate[slot] +=
+                                index.hooks.hydrate_ns.load(Ordering::SeqCst) - hydrated;
+                            pruned_segments += index.hooks.pruned.load(Ordering::SeqCst) - before;
+                        }
+                        results.push(hits);
+                    }
+                    let tolerance = |score: f32| score.abs() * 1e-5 + 1e-6;
+                    assert_eq!(results[0].len(), results[1].len());
+                    for (left, right) in results[0].iter().zip(&results[1]) {
+                        assert!((left.score - right.score).abs() <= tolerance(left.score));
+                    }
+                }
+                println!(
+                    "{}",
+                    json!({
+                        "benchmark_id": "text_pruning",
+                        "docs": docs,
+                        "segments": layout,
+                        "query": query,
+                        "limit": limit,
+                        "sparse": sparse,
+                        "rounds": rounds,
+                        "exhaustive_median_ns": median(&mut timings[0]),
+                        "pruned_median_ns": median(&mut timings[1]),
+                        "exhaustive_hydrate_ns": hydrate[0] / rounds as u64,
+                        "pruned_hydrate_ns": hydrate[1] / rounds as u64,
+                        "pruned_segments": pruned_segments,
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-only generation publication cost by graph count"]
+fn generation_publication() {
+    for graphs in [1_000usize, 10_000, 50_000] {
+        let index = SearchIndex::open_in_memory().unwrap();
+        let rows = (0..graphs)
+            .map(|slot| GraphGeneration {
+                graph: GraphId::new(&format!("urn:bench:publish:{slot:06}")),
+                active: Some(DIRECT_GENERATION),
+                covered: 0,
+            })
+            .collect();
+        index.publish_generations(GenerationView::from_rows(index.index_id, rows));
+        let switches = 200;
+        let mut lock_ns = Vec::with_capacity(switches);
+        let started = Instant::now();
+        for switch in 0..switches {
+            let graph = format!("urn:bench:publish:{:06}", switch * 7 % graphs);
+            let call = Instant::now();
+            index.set_generation(&graph, Some(GenerationId(2 + switch as u64)));
+            lock_ns.push(call.elapsed().as_nanos() as u64);
+        }
+        let total = started.elapsed().as_nanos();
+        lock_ns.sort_unstable();
+        let per_switch = total / switches as u128;
+        println!(
+            "{}",
+            json!({
+                "benchmark_id": "generation_publication",
+                "graphs": graphs,
+                "switches": switches,
+                "copied_entries_per_switch": graphs,
+                "median_switch_ns": lock_ns[switches / 2],
+                "p99_switch_ns": lock_ns[(switches - 1) * 99 / 100],
+                "mean_switch_ns": per_switch,
+                "projected_rebuild_ns": per_switch * graphs as u128,
+            })
+        );
+    }
+}
