@@ -274,7 +274,7 @@ pub(crate) struct RawIndexCursor {
     snapshot: Snapshot,
     keyspace: Keyspace,
     query_to_term: Keyspace,
-    iterator: fjall::Iter,
+    iterator: KeyRead,
     order: IndexCursorOrder,
     prefix: Vec<u8>,
     pattern: RawIndexPattern,
@@ -283,13 +283,16 @@ pub(crate) struct RawIndexCursor {
     costs: QueryCost,
 }
 
+/// Index keys opened on first read; a fully bound prefix is one point read.
+enum KeyRead {
+    Unopened,
+    Range(fjall::Iter),
+    Done,
+}
+
 impl RawIndexCursor {
     pub(crate) fn new(snapshot: Snapshot, scan: RawIndexScan<'_>) -> Self {
-        let iterator = if scan.prefix.is_empty() {
-            snapshot.iter(scan.keyspace)
-        } else {
-            snapshot.prefix(scan.keyspace, &scan.prefix)
-        };
+        let iterator = KeyRead::Unopened;
         let prefix_terms = scan.prefix.len() / 8;
         let count_grouping = grouping_for_order(scan.order, |column| {
             let column_position = match scan.order {
@@ -378,7 +381,8 @@ impl RawIndexCursor {
                 lower.extend_from_slice(&start.to_be_bytes());
                 let mut upper = prefix.clone();
                 upper.extend_from_slice(&end.to_be_bytes());
-                let iterator = snapshot.range(&keyspace, (Included(lower), Excluded(upper)));
+                let iterator =
+                    KeyRead::Range(snapshot.range(&keyspace, (Included(lower), Excluded(upper))));
                 Some(Self {
                     snapshot: snapshot.clone(),
                     keyspace: keyspace.clone(),
@@ -396,31 +400,52 @@ impl RawIndexCursor {
     }
 
     pub(crate) fn next_key(&mut self) -> Option<Result<RawIndexKey>> {
-        let guard = self.iterator.next()?;
-        let (key, value) = match guard.into_inner() {
+        if matches!(self.iterator, KeyRead::Unopened) {
+            if self.prefix.len() == 32 {
+                self.iterator = KeyRead::Done;
+                return match self.snapshot.get(&self.keyspace, &self.prefix) {
+                    Ok(Some(value)) => Some(self.index_key(&self.prefix, &value)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error.into())),
+                };
+            }
+            self.iterator = KeyRead::Range(if self.prefix.is_empty() {
+                self.snapshot.iter(&self.keyspace)
+            } else {
+                self.snapshot.prefix(&self.keyspace, &self.prefix)
+            });
+        }
+        let KeyRead::Range(iterator) = &mut self.iterator else {
+            return None;
+        };
+        let (key, value) = match iterator.next()?.into_inner() {
             Ok(entry) => entry,
             Err(error) => return Some(Err(error.into())),
         };
-        if !value.as_ref().is_empty() {
-            return Some(Err(crate::store::StoreError::InvalidIndexEncoding {
+        Some(self.index_key(&key, &value))
+    }
+
+    fn index_key(&self, key: &[u8], value: &[u8]) -> Result<RawIndexKey> {
+        if !value.is_empty() {
+            return Err(crate::store::StoreError::InvalidIndexEncoding {
                 context: "qv2 query index value",
                 message: format!("expected empty value, found {} bytes", value.len()),
-            }));
+            });
         }
-        let bytes = match <[u8; 32]>::try_from(key.as_ref()) {
+        let bytes = match <[u8; 32]>::try_from(key) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Some(Err(crate::store::StoreError::InvalidIndexEncoding {
+                return Err(crate::store::StoreError::InvalidIndexEncoding {
                     context: "qv2 query index key",
                     message: format!("expected 32 bytes, found {}", key.len()),
-                }));
+                });
             }
         };
-        Some(Ok(RawIndexKey {
+        Ok(RawIndexKey {
             bytes,
             order: self.order,
             bytes_read: (key.len() + value.len()) as u64,
-        }))
+        })
     }
 
     pub(crate) fn track_costs(mut self, costs: QueryCost) -> Self {
@@ -471,11 +496,7 @@ impl RawIndexCursor {
         for term in terms.into_iter().map_while(|term| term) {
             prefix.extend_from_slice(&term.0.to_be_bytes());
         }
-        self.iterator = if prefix.is_empty() {
-            self.snapshot.iter(&self.keyspace)
-        } else {
-            self.snapshot.prefix(&self.keyspace, &prefix)
-        };
+        self.iterator = KeyRead::Unopened;
         self.prefix = prefix;
         self.pattern = pattern.without_prefix(self.order, self.prefix.len() / 8);
         self

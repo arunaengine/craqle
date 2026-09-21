@@ -8,7 +8,7 @@ mod support;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, Authorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
-    MaterializedQuadChange, QueryLimits, QueryOptions, QueryResults,
+    JoinMode, MaterializedQuadChange, QueryLimits, QueryOptions, QueryResults,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -339,4 +339,45 @@ fn bounded_queries_deduplicate() {
         canonical_rows(query_unbounded(&fixture.node, &fixture.reader, &ten).unwrap()),
         expected_all_rows()
     );
+}
+
+/// Fully bound probes read one index key and still follow deletes and visibility.
+#[test]
+fn probes_follow_deletes() {
+    let fixture = fixture(3);
+    let sparql = format!(
+        "SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{SCHEMA_HAS_PART}> ?s . ?s <{TEST_PREDICATE}> \"{SHARED_VALUE}\" }} }}"
+    );
+    let probe = |node: &CraqleNode| {
+        let prepared = node.prepare_query(&sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.join_mode = JoinMode::ForceLateral;
+        let run = node
+            .execute_prepared(&fixture.reader, &prepared, &options)
+            .unwrap();
+        canonical_rows(run.results)
+    };
+    let graph_rows = |graphs: &[GraphId]| {
+        let mut rows: Vec<_> = graphs
+            .iter()
+            .map(|graph| vec![("g".to_string(), iri(graph.as_str()))])
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(probe(&fixture.node), graph_rows(&fixture.visible));
+
+    let removed = &fixture.visible[1];
+    let delete = MaterializedQuadChange::Delete {
+        graph: removed.clone(),
+        subject: iri(SHARED_SUBJECT),
+        predicate: iri(TEST_PREDICATE),
+        object: literal(SHARED_VALUE),
+    };
+    fixture
+        .node
+        .apply_changes_unchecked(removed, vec![delete])
+        .unwrap();
+    let kept = [fixture.visible[0].clone(), fixture.visible[2].clone()];
+    assert_eq!(probe(&fixture.node), graph_rows(&kept));
 }
