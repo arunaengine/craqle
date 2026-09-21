@@ -371,13 +371,14 @@ fn run_merge(path: &Path, case: &Case) -> Value {
         right.install_graph_snapshot(snapshot).unwrap();
     }
     right.persist_fjall().unwrap();
-    let observed_actors = right.vector_clock(&graph).unwrap().0.len();
+    // Includes the baseline and merging stores next to the requested actors.
+    let clock_entries = right.vector_clock(&graph).unwrap().0.len();
     json!({
         "completed": rows,
         "overlap": overlap,
         "effective": {
             "requested_actors": actors,
-            "observed_actors": observed_actors,
+            "clock_entries": clock_entries,
             "suffix_rows_per_actor": suffix.max(1),
         },
         "suffix": suffix,
