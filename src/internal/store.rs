@@ -1327,6 +1327,9 @@ pub struct GraphStore {
     /// Makes the next durable batch fail immediately before fjall commits.
     #[cfg(test)]
     commit_failure: std::sync::atomic::AtomicBool,
+    /// Makes every snapshot policy read of this graph fail with an I/O error.
+    #[cfg(test)]
+    policy_failure: Mutex<Option<GraphId>>,
     /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
     /// between an acknowledgement's token read and its commit.
     #[cfg(test)]
@@ -2984,6 +2987,18 @@ impl StoreReadSnapshot {
         store: &GraphStore,
         graph: &GraphId,
     ) -> Result<Option<GraphPolicy>> {
+        #[cfg(test)]
+        if store
+            .policy_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(graph)
+        {
+            return Err(StoreError::Fjall(fjall::Error::Io(std::io::Error::other(
+                "injected policy read failure",
+            ))));
+        }
         let Some(graph) = self.lookup_term(store, &EncodedTerm::from_named_node(&graph.0))? else {
             return Ok(None);
         };
@@ -5454,6 +5469,15 @@ impl GraphStore {
         self.commit_failure.store(true, Ordering::SeqCst);
     }
 
+    /// Make snapshot policy reads of one graph fail until cleared. Test-only.
+    #[cfg(test)]
+    pub(crate) fn fail_policy_reads(&self, graph: Option<GraphId>) {
+        *self
+            .policy_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = graph;
+    }
+
     #[cfg(test)]
     fn take_commit_failure(&self) -> bool {
         self.commit_failure.swap(false, Ordering::SeqCst)
@@ -7215,6 +7239,8 @@ impl GraphStore {
             peak_commit_stalls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             commit_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            policy_failure: Mutex::new(None),
             #[cfg(test)]
             fts_ack_stall: Mutex::new(None),
             #[cfg(test)]

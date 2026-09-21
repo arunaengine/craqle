@@ -17,6 +17,9 @@ mod count_plan;
 mod memory;
 #[path = "internal/planner.rs"]
 mod planner;
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod policy_tests;
 #[path = "internal/query/mod.rs"]
 mod query;
 #[path = "internal/qv_gate.rs"]
@@ -3566,17 +3569,15 @@ impl CraqleNode {
     }
 
     /// Query with lazy graph visibility from the same snapshot as policy.
-    /// Missing policy and policy read errors deny visibility.
+    /// Missing or denying policy hides a graph; a policy read error fails the query.
     pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
-        Ok(self
+        let policy = PolicyVisibility::new(&self.store, auth);
+        let results = self
             .sparql
             .query_snapshot(sparql, &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            })?)
+                policy.visible(snapshot, graph)
+            });
+        policy.finish(results.map_err(CraqleError::from))
     }
 
     /// Parse a reusable query without snapshot or authorization state.
@@ -3593,19 +3594,15 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         request: QueryRequest<'_>,
     ) -> Result<QueryExecution> {
+        let policy = PolicyVisibility::new(&self.store, auth);
         let execution = self.sparql.query_with_options(
             sparql::QueryRun {
                 sparql: request.sparql,
                 options: request.options,
             },
-            &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            },
-        )?;
+            &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
+        );
+        let execution = policy.finish(execution.map_err(CraqleError::from))?;
         Ok(scoped_execution(auth, execution))
     }
 
@@ -3615,15 +3612,13 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         sparql: &str,
     ) -> Result<QueryExecution> {
-        let execution =
-            self.sparql
-                .query_snapshot_stats(sparql, &|snapshot, graph: &GraphId| {
-                    snapshot
-                        .graph_policy(&self.store, graph)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-                })?;
+        let policy = PolicyVisibility::new(&self.store, auth);
+        let execution = self
+            .sparql
+            .query_snapshot_stats(sparql, &|snapshot, graph: &GraphId| {
+                policy.visible(snapshot, graph)
+            });
+        let execution = policy.finish(execution.map_err(CraqleError::from))?;
         Ok(scoped_execution(auth, execution))
     }
 
@@ -3634,19 +3629,15 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
+        let policy = PolicyVisibility::new(&self.store, auth);
         let execution = self.sparql.execute_prepared_snapshot(
             query,
-            &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            },
+            &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
             options,
             Duration::ZERO,
             true,
-        )?;
+        );
+        let execution = policy.finish(execution.map_err(CraqleError::from))?;
         Ok(scoped_execution(auth, execution))
     }
 
@@ -3657,17 +3648,13 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryPlan> {
+        let policy = PolicyVisibility::new(&self.store, auth);
         let plan = self.sparql.explain_prepared_snapshot(
             query,
-            &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            },
+            &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
             options,
-        )?;
+        );
+        let plan = policy.finish(plan.map_err(CraqleError::from))?;
         Ok(scoped_plan(auth, plan))
     }
 
@@ -4487,6 +4474,50 @@ impl CraqleNode {
 }
 
 /// Keeps store-wide counts only for callers that may read every graph.
+/// Snapshot policy visibility that keeps the first policy read failure of one request.
+struct PolicyVisibility<'a> {
+    store: &'a GraphStore,
+    auth: &'a dyn Authorizer,
+    failure: Mutex<Option<store::StoreError>>,
+}
+
+impl<'a> PolicyVisibility<'a> {
+    fn new(store: &'a GraphStore, auth: &'a dyn Authorizer) -> Self {
+        Self {
+            store,
+            auth,
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// Hides a graph without readable permission; a failed read also hides it until `finish`.
+    fn visible(&self, snapshot: &store::StoreReadSnapshot, graph: &GraphId) -> bool {
+        match snapshot.graph_policy(self.store, graph) {
+            Ok(policy) => policy
+                .is_some_and(|policy| self.auth.authorize(graph, &policy, Action::Read).is_ok()),
+            Err(error) => {
+                self.failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert(error);
+                false
+            }
+        }
+    }
+
+    /// Turns any request that could not read required policy into that error.
+    fn finish<T>(self, result: Result<T>) -> Result<T> {
+        match self
+            .failure
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(error) => Err(error.into()),
+            None => result,
+        }
+    }
+}
+
 fn scoped_execution(auth: &dyn Authorizer, mut execution: QueryExecution) -> QueryExecution {
     if !auth.reads_all() {
         execution.statistics.withhold_counts();
