@@ -19,8 +19,8 @@ use craqle::{
 use serde_json::{Value, json};
 
 use catalog_case::{
-    CAP_ENV, CASE_ENV, Case, ID_ENV, case_seed, check_values, estimate_bytes, supported_axes,
-    work_rows,
+    CAP_ENV, CASE_ENV, Case, ID_ENV, case_seed, check_values, estimate_bytes, merge_actor,
+    supported_axes, work_rows,
 };
 use catalog_reads::{run_cache, run_reads};
 
@@ -105,14 +105,14 @@ fn persist_mode(case: &Case) -> PersistMode {
 }
 
 fn open_node(path: &Path, case: &Case) -> CraqleNode {
-    open_actor(path, case, 0x43)
+    open_actor(path, case, [0x43; 32])
 }
 
-fn open_actor(path: &Path, case: &Case, actor: u8) -> CraqleNode {
+fn open_actor(path: &Path, case: &Case, actor: [u8; 32]) -> CraqleNode {
     CraqleNode::open_with_options(
         path,
         CraqleOptions::new()
-            .with_actor(ActorId::from_bytes([actor; 32]))
+            .with_actor(ActorId::from_bytes(actor))
             .with_graph_store_persist_mode(persist_mode(case)),
     )
     .unwrap()
@@ -318,8 +318,8 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
 
 fn run_merge(path: &Path, case: &Case) -> Value {
     let left = open_node(&path.join("left"), case);
-    let actors = case.usize("actors", 1).clamp(1, 255);
-    let right = open_actor(&path.join("right"), case, 0x44);
+    let actors = case.usize("actors", 1);
+    let right = open_actor(&path.join("right"), case, [0x44; 32]);
     let rows = prepare_node(&left, case);
     let graph = graph_id(0);
     right
@@ -352,7 +352,7 @@ fn run_merge(path: &Path, case: &Case) -> Value {
         let peer = open_actor(
             &path.join(format!("actor-{actor}")),
             case,
-            0x80 + actor as u8,
+            merge_actor(actor),
         );
         peer.set_graph_policy(&AllowAllAuthorizer, &graph, graph_policy())
             .unwrap();

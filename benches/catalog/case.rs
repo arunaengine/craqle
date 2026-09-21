@@ -7,6 +7,11 @@ use serde_json::Value;
 pub const CASE_ENV: &str = "CRAQLE_BENCH_CASE";
 pub const ID_ENV: &str = "CRAQLE_BENCH_ID";
 pub const CAP_ENV: &str = "CRAQLE_BENCH_BYTE_CAP";
+/// Most extra merge actors B05 and B06 open; each actor opens its own store.
+pub const MAX_ACTORS: usize = 1_024;
+/// Axes read as text or as booleans; every other axis is a whole number.
+const TEXT_AXES: [&str; 5] = ["query", "selectivity", "cache", "input", "persist"];
+const BOOL_AXES: [&str; 5] = ["replicated", "search", "related", "deleted", "restart"];
 
 pub struct Case(pub Value);
 
@@ -83,23 +88,68 @@ pub fn supported_axes(id: &str) -> &'static [&'static str] {
 /// Rejects text axis values the selected workload would otherwise replace with a default.
 pub fn check_values(id: &str, case: &Case) -> Result<(), String> {
     case.choice("persist", &["sync-all", "buffer", "sync-data"])?;
+    check_numbers(case)?;
     match id {
-        "B12" => case
+        "B02" | "B12" | "B13" => case
             .choice(
                 "query",
                 &[
                     "default", "values", "join", "sort", "distinct", "group", "string", "path",
-                    "fts",
+                    "fts", "absent",
                 ],
             )
-            .map(drop),
-        "B13" => case
-            .choice("selectivity", &["low", "high"])
+            .and(case.choice("selectivity", &["low", "high"]))
             .and(case.choice("cache", &["cold", "warm"]))
             .map(drop),
         "B18" => case.choice("input", &["valid", "invalid"]).map(drop),
         _ => Ok(()),
     }
+}
+
+/// Rejects malformed values and counts a workload would otherwise wrap, clamp, or raise.
+fn check_numbers(case: &Case) -> Result<(), String> {
+    let axes = case.0.as_object().ok_or("a case must be a JSON object")?;
+    for (name, value) in axes {
+        let kind_ok = if TEXT_AXES.contains(&name.as_str()) {
+            value.is_string()
+        } else if BOOL_AXES.contains(&name.as_str()) {
+            value.is_boolean()
+        } else {
+            let number = value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or_else(|| format!("{name}={value} is not a whole number"))?;
+            let (low, high) = match name.as_str() {
+                "hit_percent" | "overlap" => (0, 100),
+                "readable_per_mille" => (0, 1_000),
+                "actors" => (1, MAX_ACTORS),
+                "rows" => (1_000, usize::MAX),
+                "readers" | "writers" | "graphs" | "stores" | "samples" => (1, usize::MAX),
+                _ => (0, usize::MAX),
+            };
+            if !(low..=high).contains(&number) {
+                return Err(format!("{name}={number} is outside {low}..={high}"));
+            }
+            true
+        };
+        if !kind_ok {
+            return Err(format!("{name}={value} has the wrong type"));
+        }
+    }
+    if case.usize("samples", usize::MAX) < case.usize("readers", 1) {
+        return Err("samples must be at least readers".to_owned());
+    }
+    if case.usize("changed", usize::MAX) < case.usize("writers", 1) {
+        return Err("changed must be at least writers".to_owned());
+    }
+    Ok(())
+}
+
+/// Full actor ID for one extra merge actor, disjoint from the fixture's repeated-byte IDs.
+pub fn merge_actor(index: usize) -> [u8; 32] {
+    let mut bytes = [0xa5; 32];
+    bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+    bytes
 }
 
 pub fn estimate_bytes(case: &Case) -> usize {
