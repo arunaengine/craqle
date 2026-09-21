@@ -1259,8 +1259,13 @@ impl SparqlEngine {
         ));
         let initial_execution_time = execution_started.elapsed();
         let results = results.map_err(|error| map_eval_error(error, &stages.clock))?;
-        let (results, collection) =
-            collect_query_results(results, execution_started, &context, &budget)?;
+        let (results, collection) = collect_query_results(
+            results,
+            execution_started,
+            &context,
+            &budget,
+            collect_plan_statistics || options.collect_costs,
+        )?;
         let read_statistics = context.snapshot();
         let explanation_metrics = if collect_plan_statistics {
             read_explanation_metrics(&explanation)?
@@ -3493,6 +3498,7 @@ fn collect_query_results(
     execution_started: Instant,
     context: &ReadContext<'_>,
     budget: &QueryBudget,
+    collect_metrics: bool,
 ) -> Result<(QueryResults, CollectionMetrics)> {
     match results {
         spareval::QueryResults::Solutions(mut solutions) => {
@@ -3502,17 +3508,20 @@ fn collect_query_results(
             let mut metrics = CollectionMetrics::default();
             loop {
                 budget.check()?;
-                let execution = Instant::now();
+                let execution = collect_metrics.then(Instant::now);
                 let solution = solutions.next();
-                metrics.execution_time = metrics.execution_time.saturating_add(execution.elapsed());
+                if let Some(execution) = execution {
+                    metrics.execution_time =
+                        metrics.execution_time.saturating_add(execution.elapsed());
+                }
                 let Some(solution) = solution else {
                     break;
                 };
-                if metrics.first_result_time.is_none() {
+                if collect_metrics && metrics.first_result_time.is_none() {
                     metrics.first_result_time = Some(execution_started.elapsed());
                 }
                 let solution = solution.map_err(|error| map_eval_error(error, budget.clock()))?;
-                let collecting = Instant::now();
+                let collecting = collect_metrics.then(Instant::now);
                 let mut row = HashMap::with_capacity(solution.len());
                 for (variable, term) in solution.iter() {
                     row.insert(variable.as_str().to_string(), EncodedTerm::from_term(term)?);
@@ -3529,8 +3538,10 @@ fn collect_query_results(
                     previous_capacity,
                     rows.capacity(),
                 )?;
-                metrics.collection_time =
-                    metrics.collection_time.saturating_add(collecting.elapsed());
+                if let Some(collecting) = collecting {
+                    metrics.collection_time =
+                        metrics.collection_time.saturating_add(collecting.elapsed());
+                }
             }
             Ok((QueryResults::Solutions(rows), metrics))
         }
@@ -3551,13 +3562,16 @@ fn collect_query_results(
             let mut metrics = CollectionMetrics::default();
             loop {
                 budget.check()?;
-                let execution = Instant::now();
+                let execution = collect_metrics.then(Instant::now);
                 let triple = triples.next();
-                metrics.execution_time = metrics.execution_time.saturating_add(execution.elapsed());
+                if let Some(execution) = execution {
+                    metrics.execution_time =
+                        metrics.execution_time.saturating_add(execution.elapsed());
+                }
                 let Some(triple) = triple else {
                     break;
                 };
-                if metrics.first_result_time.is_none() {
+                if collect_metrics && metrics.first_result_time.is_none() {
                     metrics.first_result_time = Some(execution_started.elapsed());
                 }
                 let Triple {
@@ -3565,7 +3579,7 @@ fn collect_query_results(
                     predicate,
                     object,
                 } = triple.map_err(|error| map_eval_error(error, budget.clock()))?;
-                let collecting = Instant::now();
+                let collecting = collect_metrics.then(Instant::now);
                 let triple = (
                     EncodedTerm::from(&subject),
                     EncodedTerm::from_named_node(&predicate),
@@ -3583,8 +3597,10 @@ fn collect_query_results(
                 }
                 metrics.result_rows = metrics.result_rows.saturating_add(1);
                 metrics.result_cells = metrics.result_cells.saturating_add(3);
-                metrics.collection_time =
-                    metrics.collection_time.saturating_add(collecting.elapsed());
+                if let Some(collecting) = collecting {
+                    metrics.collection_time =
+                        metrics.collection_time.saturating_add(collecting.elapsed());
+                }
             }
             Ok((QueryResults::Graph(graph), metrics))
         }
@@ -5056,6 +5072,7 @@ mod tests {
             Instant::now(),
             &context,
             &budget,
+            true,
         )
         .unwrap()
         .0;

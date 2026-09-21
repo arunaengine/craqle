@@ -175,15 +175,7 @@ impl RequestState {
     }
 
     pub(crate) fn mark_deadline(&self) {
-        let mut cause = self
-            .cause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *cause == RequestOutcome::Active {
-            *cause = RequestOutcome::Deadline;
-        }
-        drop(cause);
-        self.evaluator.cancel();
+        self.mark(RequestOutcome::Deadline);
     }
 
     pub(crate) fn mark_capacity(&self) {
