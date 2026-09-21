@@ -5576,6 +5576,16 @@ impl GraphStore {
         self.peak_commit_stalls.load(Ordering::SeqCst)
     }
 
+    /// Writes every memtable to tables, for read-layout experiments. Test-only.
+    #[cfg(test)]
+    pub(crate) fn flush_memtables(&self) -> Result<()> {
+        for name in self.db.list_keyspace_names() {
+            let keyspace = self.db.keyspace(&name, KeyspaceCreateOptions::default)?;
+            keyspace.rotate_memtable_and_wait()?;
+        }
+        Ok(())
+    }
+
     /// Make exactly the next durable batch commit fail. Test-only.
     #[cfg(test)]
     pub(crate) fn arm_commit_failure(&self) {

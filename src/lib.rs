@@ -31,6 +31,9 @@ mod qv_gate;
 #[path = "internal/rdf_read.rs"]
 mod rdf_read;
 #[cfg(test)]
+#[path = "internal/read_ladder.rs"]
+mod read_ladder;
+#[cfg(test)]
 #[path = "receipt_tests.rs"]
 mod receipt_tests;
 #[path = "internal/replication.rs"]
