@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Bound::{Excluded, Included};
 use std::rc::Rc;
@@ -624,6 +625,8 @@ pub(crate) struct DenseCursor<'store, 'context, 'visibility> {
     raw: RawIndexCursor,
     resolver: DenseResolver,
     last_graph: Option<(QueryTermId, TermId)>,
+    /// The last graph's visibility and orphans; both are fixed within one request.
+    last_orphans: Option<(QueryTermId, Option<Rc<HashSet<TermId>>>)>,
     current_group: Option<(QueryTermId, QueryTermId, QueryTermId)>,
     group_emitted: bool,
     default_union: bool,
@@ -657,6 +660,7 @@ impl<'store, 'context, 'visibility> DenseCursor<'store, 'context, 'visibility> {
             raw: input.raw,
             resolver,
             last_graph: None,
+            last_orphans: None,
             current_group: None,
             group_emitted: false,
             default_union: input.default_union,
@@ -750,16 +754,24 @@ impl Iterator for DenseCursor<'_, '_, '_> {
                 Ok(source) => source,
                 Err(error) => return self.fail(error),
             };
-            let orphaned = graph_orphans(GraphVisibilityInput {
-                store: self.store,
-                snapshot: self.snapshot,
-                context: self.context,
-                graph: graph_source,
-            });
-            let orphaned = match orphaned {
-                Ok(Some(orphaned)) => orphaned,
-                Ok(None) => continue,
-                Err(error) => return self.fail(error),
+            let orphaned = match &self.last_orphans {
+                Some((graph, orphaned)) if *graph == query[0] => orphaned.clone(),
+                _ => {
+                    let orphaned = match graph_orphans(GraphVisibilityInput {
+                        store: self.store,
+                        snapshot: self.snapshot,
+                        context: self.context,
+                        graph: graph_source,
+                    }) {
+                        Ok(orphaned) => orphaned,
+                        Err(error) => return self.fail(error),
+                    };
+                    self.last_orphans = Some((query[0], orphaned.clone()));
+                    orphaned
+                }
+            };
+            let Some(orphaned) = orphaned else {
+                continue;
             };
             let mut subject_source = self.source_hint(1, query[1]);
             let mut object_source = self.source_hint(3, query[3]);
