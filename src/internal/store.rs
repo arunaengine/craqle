@@ -3675,7 +3675,9 @@ impl GraphStore {
         let mut query_terms = Vec::with_capacity(terms.len());
         for term in terms {
             scan.costs.planner_points(1);
-            let value = view.snapshot.get(spaces.term_to_query, term.to_be_bytes())?;
+            let value = view
+                .snapshot
+                .get(spaces.term_to_query, term.to_be_bytes())?;
             scan.costs
                 .forward_mapping(16 + value.as_ref().map_or(0, |value| value.len() as u64));
             let Some(value) = value else {
@@ -12544,7 +12546,9 @@ mod tests {
 
         let reopened = Arc::new(GraphStore::open(directory.path()).unwrap());
         let captured = reopened.read_snapshot();
-        let admission = reopened.snapshot_admission(captured.snapshot_ref()).unwrap();
+        let admission = reopened
+            .snapshot_admission(captured.snapshot_ref())
+            .unwrap();
         assert!(
             !admission.trusted,
             "an uncovered query view must not be admitted after reopen"
