@@ -435,6 +435,11 @@ path = "benches/sparql/request_modes.rs"
 harness = false
 
 [[bench]]
+name = "rocrate_craqle"
+path = "benches/rocrate.rs"
+harness = false
+
+[[bench]]
 name = "plan_quality"
 path = "benches/sparql/plan_quality.rs"
 harness = false
