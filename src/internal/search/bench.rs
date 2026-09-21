@@ -292,6 +292,11 @@ fn prune_text(index: usize) -> String {
 
 fn prune_index(docs: usize, segments: usize) -> SearchIndex {
     let index = SearchIndex::open_in_memory().unwrap();
+    // Background merges would race the explicit merge and change the measured layout.
+    index
+        .writer()
+        .unwrap()
+        .set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
     let chunk = docs.div_ceil(segments.max(1));
     for position in 0..docs {
         let graph = format!("urn:bench:prune:graph:{}", position % 64);
@@ -345,6 +350,60 @@ fn prune_search(index: &SearchIndex, run: &PruneRun<'_>) -> (u64, Vec<SearchHit>
     (started.elapsed().as_nanos() as u64, hits)
 }
 
+/// Checks pruned hits against the exhaustive oracle by identity, eligibility, and score.
+/// Scores may differ by the tolerance; hits tied within it may reorder, and only the
+/// tie group at the cutoff may hold different members.
+fn assert_same_hits(oracle: &[SearchHit], pruned: &[SearchHit], sparse: bool) {
+    let tolerance = |score: f32| score.abs() * 1e-5 + 1e-6;
+    assert_eq!(oracle.len(), pruned.len(), "result sizes differ");
+    for hits in [oracle, pruned] {
+        let mut seen = HashSet::new();
+        for hit in hits {
+            let position: usize = hit
+                .subject_iri
+                .strip_prefix("urn:bench:prune:subject:")
+                .and_then(|position| position.parse().ok())
+                .unwrap_or_else(|| panic!("{} is not a fixture subject", hit.subject_iri));
+            let graph = format!("urn:bench:prune:graph:{}", position % 64);
+            assert_eq!(graph, hit.graph_id, "wrong graph for {}", hit.subject_iri);
+            assert!(
+                !sparse || (position % 64).is_multiple_of(3),
+                "ineligible {graph}"
+            );
+            assert!(
+                seen.insert(&hit.subject_iri),
+                "duplicate {}",
+                hit.subject_iri
+            );
+        }
+    }
+    let mut group = 0;
+    while group < oracle.len() {
+        let score = oracle[group].score;
+        let end = oracle[group..]
+            .iter()
+            .position(|hit| (hit.score - score).abs() > tolerance(score))
+            .map_or(oracle.len(), |offset| group + offset);
+        for hit in &pruned[group..end] {
+            assert!((hit.score - score).abs() <= tolerance(score), "score moved");
+        }
+        if end < oracle.len() {
+            let mut expected: Vec<_> = oracle[group..end]
+                .iter()
+                .map(|hit| &hit.subject_iri)
+                .collect();
+            let mut actual: Vec<_> = pruned[group..end]
+                .iter()
+                .map(|hit| &hit.subject_iri)
+                .collect();
+            expected.sort();
+            actual.sort();
+            assert_eq!(expected, actual, "tie group members differ");
+        }
+        group = end;
+    }
+}
+
 fn median(samples: &mut [u64]) -> u64 {
     samples.sort_unstable();
     samples[samples.len() / 2]
@@ -390,11 +449,8 @@ fn text_pruning() {
                         }
                         results.push(hits);
                     }
-                    let tolerance = |score: f32| score.abs() * 1e-5 + 1e-6;
-                    assert_eq!(results[0].len(), results[1].len());
-                    for (left, right) in results[0].iter().zip(&results[1]) {
-                        assert!((left.score - right.score).abs() <= tolerance(left.score));
-                    }
+                    let exhaustive = usize::from(round % 2 != 0);
+                    assert_same_hits(&results[exhaustive], &results[1 - exhaustive], sparse);
                 }
                 println!(
                     "{}",
@@ -402,6 +458,7 @@ fn text_pruning() {
                         "benchmark_id": "text_pruning",
                         "docs": docs,
                         "segments": layout,
+                        "requested_segments": segments,
                         "query": query,
                         "limit": limit,
                         "sparse": sparse,
@@ -453,7 +510,9 @@ fn generation_publication() {
                 "median_switch_ns": lock_ns[switches / 2],
                 "p99_switch_ns": lock_ns[(switches - 1) * 99 / 100],
                 "mean_switch_ns": per_switch,
+                // A projection from per-switch timings, not a measured rebuild.
                 "projected_rebuild_ns": per_switch * graphs as u128,
+                "projection_only": true,
             })
         );
     }
