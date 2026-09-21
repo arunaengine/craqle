@@ -35,6 +35,7 @@ pub(crate) struct DenseScan {
     pub(crate) resolver: Option<DenseResolver>,
     pub(crate) cache_entries: usize,
     pub(crate) cache_bytes: usize,
+    pub(crate) graphs: Option<Rc<HashSet<crate::store::QueryTermId>>>,
 }
 
 pub(crate) struct VisibilityTerms {
@@ -389,6 +390,7 @@ impl<'store> StoreReadView<'store> {
             resolver: scan.resolver,
             cache_entries: scan.cache_entries,
             cache_bytes: scan.cache_bytes,
+            graphs: scan.graphs,
         })))
     }
 

@@ -3311,6 +3311,7 @@ where
                 resolver: self.dense_resolver.borrow().clone(),
                 cache_entries,
                 cache_bytes,
+                graphs: None,
             };
             match self.view.dense_keys(self.context, scan) {
                 Ok(Some(cursor)) => {

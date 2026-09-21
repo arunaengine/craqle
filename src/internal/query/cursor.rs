@@ -616,6 +616,8 @@ pub(crate) struct DenseInput<'store, 'context, 'visibility> {
     pub(crate) cache_bytes: usize,
     pub(crate) default_union: bool,
     pub(crate) source_hints: [Option<(QueryTermId, TermId)>; 4],
+    /// Keys outside these graphs are skipped before any visibility work.
+    pub(crate) graphs: Option<Rc<HashSet<QueryTermId>>>,
 }
 
 pub(crate) struct DenseCursor<'store, 'context, 'visibility> {
@@ -631,6 +633,7 @@ pub(crate) struct DenseCursor<'store, 'context, 'visibility> {
     group_emitted: bool,
     default_union: bool,
     source_hints: [Option<(QueryTermId, TermId)>; 4],
+    graphs: Option<Rc<HashSet<QueryTermId>>>,
     candidates_since_check: usize,
     finished: bool,
 }
@@ -665,6 +668,7 @@ impl<'store, 'context, 'visibility> DenseCursor<'store, 'context, 'visibility> {
             group_emitted: false,
             default_union: input.default_union,
             source_hints: input.source_hints,
+            graphs: input.graphs,
             candidates_since_check: 0,
             finished: false,
         }
@@ -747,7 +751,12 @@ impl Iterator for DenseCursor<'_, '_, '_> {
                     message: "query ID exceeds the admitted generation bound".to_owned(),
                 });
             }
-            if !matches {
+            if !matches
+                || self
+                    .graphs
+                    .as_ref()
+                    .is_some_and(|graphs| !graphs.contains(&query[0]))
+            {
                 continue;
             }
             let graph_source = match self.graph_source(query[0]) {
