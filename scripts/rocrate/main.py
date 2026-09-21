@@ -24,6 +24,8 @@ import fixture
 import virtuoso
 
 REPO = Path(__file__).resolve().parent.parent.parent
+# Craqle's MAX_SEARCH_LIMIT; one search cannot return a larger complete set.
+SEARCH_LIMIT = 10_000
 
 
 def main():
@@ -45,6 +47,8 @@ def main():
     (fixture_dir / "crates.json").write_text(json.dumps(crates))
     cases = catalog.build(model)
     (fixture_dir / "cases.json").write_text(json.dumps(cases, ensure_ascii=False))
+    # Build before hashing, so the recorded source is the source the binary came from.
+    binary = build_craqle() if "craqle" in args.engines else None
     identity = {k: v for k, v in checks.identity(REPO).items() if k != "fixtures_sha256"}
     context = REPO / "src" / "rocrate" / "1_2.jsonld"
     environment = {
@@ -64,7 +68,7 @@ def main():
     environment["engine_order"] = engines
     for engine in engines:
         if engine == "craqle":
-            environment["craqle"], records = run_craqle(fixture_dir, args)
+            environment["craqle"], records = run_craqle(fixture_dir, binary, args)
         else:
             environment["virtuoso"], records = run_virtuoso(fixture_dir, cases, args)
         for record in records:
@@ -81,20 +85,25 @@ def main():
     summary = summarize(cases, results)
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     invalid = [row for row in summary if any(v not in ("valid", "normalized", None)
+                                             and not v.startswith("limit:")
                                              for v in row["validity"].values())]
     print(json.dumps({"out": str(out), "cases": len(cases), "invalid": invalid}, indent=1))
     return 1 if invalid else 0
 
 
-def run_craqle(fixture_dir, args):
-    """Build the in-process adapter once, hash it, and run it on the declared CPUs."""
+def build_craqle():
+    """Build the in-process adapter and return its executable path."""
     build = subprocess.run(
         ["nice", "-n", "19", "cargo", "build", "--release", "--locked", "--all-features",
          "--bench", "rocrate_craqle", "--message-format=json"],
         cwd=REPO, capture_output=True, text=True, check=True,
         env={**os.environ, "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "2")})
-    binary = next(json.loads(line)["executable"] for line in build.stdout.splitlines()
-                  if '"executable":"' in line and "rocrate_craqle" in line)
+    return next(json.loads(line)["executable"] for line in build.stdout.splitlines()
+                if '"executable":"' in line and "rocrate_craqle" in line)
+
+
+def run_craqle(fixture_dir, binary, args):
+    """Run the adapter on the declared CPUs and keep its records and identity."""
     started = time.monotonic()
     run = subprocess.run(["taskset", "-c", args.cpus, binary], capture_output=True, text=True,
                          env={**os.environ, "CRAQLE_ROCRATE_FIXTURE": str(fixture_dir),
@@ -215,8 +224,11 @@ def validate(case, record):
         if len(set(hits)) != len(hits):
             return "duplicate hits"
         if case["mode"] == "controlled":
-            return "valid" if sorted(hits) == sorted(map(tuple, case["expected"])) else (
-                f"matched {len(hits)} resources, expected {len(case['expected'])}")
+            if sorted(hits) == sorted(map(tuple, case["expected"])):
+                return "valid"
+            if record["engine"] == "craqle" and len(hits) == SEARCH_LIMIT < len(case["expected"]):
+                return f"limit: one search returns at most {SEARCH_LIMIT} hits"
+            return f"matched {len(hits)} resources, expected {len(case['expected'])}"
         pool = set(map(tuple, case["pool"]))
         if len(hits) != case["size"]:
             return f"{len(hits)} hits, expected {case['size']}"
