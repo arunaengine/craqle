@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use craqle::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, CraqleNode, GraphId, GraphPolicy,
-    QueryOptions, QueryResults, SearchFlushOptions, SearchRequest,
+    QueryFastPathMode as FastPathMode, QueryOptions, QueryResults, SearchFlushOptions,
+    SearchRequest,
 };
 use serde_json::{Value, json};
 
@@ -22,8 +23,29 @@ fn main() {
         value.parse().expect("CRAQLE_ROCRATE_SAMPLES is a count")
     });
     let directory = tempfile::tempdir().expect("store directory");
-    let node = CraqleNode::open(directory.path()).expect("open node");
+    // A kept store is loaded once and then only read, so repeated profiles skip ingestion.
+    let kept = env::var("CRAQLE_ROCRATE_STORE").ok().map(PathBuf::from);
+    let path = kept.clone().unwrap_or_else(|| directory.path().to_owned());
+    let loaded = path.join("rocrate-loaded");
+    let reuse = kept.is_some() && loaded.exists();
+    let node = CraqleNode::open(&path).expect("open node");
     let crates: Vec<Value> = read_json(&fixture.join("crates.json"));
+    let cases: Vec<Value> = read_json(&fixture.join("cases.json"));
+    let selected: Option<Vec<String>> = env::var("CRAQLE_ROCRATE_CASES")
+        .ok()
+        .map(|ids| ids.split(',').map(str::to_owned).collect());
+    if reuse {
+        for case in &cases {
+            let id = case["id"].as_str().unwrap();
+            if selected
+                .as_ref()
+                .is_none_or(|ids| ids.iter().any(|wanted| wanted == id))
+            {
+                emit(run_case(&node, case, samples));
+            }
+        }
+        return;
+    }
 
     let started = Instant::now();
     for entry in &crates {
@@ -49,8 +71,10 @@ fn main() {
         "durability": "SyncAll acknowledgement per crate",
     }));
     emit(equivalence(&node, &fixture, &crates));
+    if kept.is_some() {
+        fs::write(&loaded, b"").expect("mark kept store");
+    }
 
-    let cases: Vec<Value> = read_json(&fixture.join("cases.json"));
     for case in &cases {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_case(&node, case, samples)
@@ -60,7 +84,10 @@ fn main() {
             Err(_) => emit(json!({"record": "case", "case": case["id"], "status": "failed"})),
         }
     }
-    emit(update_case(&node, &crates));
+    // The update case changes data, so a kept store stays unchanged.
+    if kept.is_none() {
+        emit(update_case(&node, &crates));
+    }
     emit(json!({"record": "footprint", "bytes": directory_bytes(directory.path())}));
 }
 
@@ -208,7 +235,10 @@ fn run_case(node: &CraqleNode, case: &Value, samples: usize) -> Value {
                     .map(|graph| GraphId::new(graph.as_str().unwrap()))
                     .collect()
             });
-            let options = QueryOptions::results_only();
+            let mut options = QueryOptions::results_only();
+            if env::var("CRAQLE_ROCRATE_FAST_PATHS").as_deref() == Ok("off") {
+                options.fast_paths = FastPathMode::Disabled;
+            }
             let execute = || {
                 let run = match &graphs {
                     Some(graphs) => {
@@ -219,6 +249,21 @@ fn run_case(node: &CraqleNode, case: &Value, samples: usize) -> Value {
                 run.expect("query").results
             };
             let rows = canonical(&execute(), &variables);
+            if env::var("CRAQLE_ROCRATE_COSTS").is_ok() {
+                let mut costs = options.clone();
+                costs.collect_costs = true;
+                let run = match &graphs {
+                    Some(graphs) => {
+                        node.execute_prepared_in_graphs(auth, graphs, &prepared, &costs)
+                    }
+                    None => node.execute_prepared(auth, &prepared, &costs),
+                };
+                emit(json!({
+                    "record": "costs",
+                    "case": id,
+                    "statistics": format!("{:?}", run.expect("query").statistics),
+                }));
+            }
             (rows, timed(samples, || solution_count(&execute())))
         }
     };

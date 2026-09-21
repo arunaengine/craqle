@@ -17,6 +17,12 @@ count across different crate counts. `--tuned` applies a modest Virtuoso buffer 
 from its RDF performance guide; `--engines` runs one engine only. The run exits non-zero
 when any answer is wrong, except for the documented Craqle search result limit.
 
+The Craqle adapter also runs alone for repeated profiles. `CRAQLE_ROCRATE_STORE` keeps the
+loaded store in a directory and later runs only read it; `CRAQLE_ROCRATE_CASES` selects case IDs;
+`CRAQLE_ROCRATE_FAST_PATHS=off` runs the generic evaluator for comparison; and
+`CRAQLE_ROCRATE_COSTS` adds one cost-counting run per case. `CRAQLE_ROCRATE_FIXTURE` and
+`CRAQLE_ROCRATE_SAMPLES` are set as the runner sets them.
+
 ## What is compared
 
 - Fixtures are RO-Crate 1.2 metadata documents with a descriptor, a root dataset, a nested
