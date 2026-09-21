@@ -628,7 +628,10 @@ impl TriplePlan {
         context: &ReadContext<'_>,
     ) -> Result<Option<ResolvedTriple<'a>>> {
         let selector = match &self.graph {
-            PatternGraph::DefaultUnion => GraphSelector::DefaultUnion,
+            // One selected graph holds each triple once, so its range is the distinct union.
+            PatternGraph::DefaultUnion => context
+                .single_graph()
+                .map_or(GraphSelector::DefaultUnion, GraphSelector::Named),
             PatternGraph::Named(graph) => {
                 let Some(graph) = view.lookup_term(context, graph)? else {
                     return Ok(None);

@@ -554,6 +554,18 @@ impl<'a> ReadContext<'a> {
         }
     }
 
+    /// The only graph an exact scope admits, so default-union reads may use its range.
+    pub(crate) fn single_graph(&self) -> Option<TermId> {
+        match &self.visibility {
+            GraphVisibility::Exact(graphs)
+                if graphs.len() == 1 && self.validation_graph.is_none() =>
+            {
+                graphs.iter().next().copied()
+            }
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub(crate) fn with_graph_visibility(
         cancellation: QueryCancellation,

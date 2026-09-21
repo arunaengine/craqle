@@ -276,6 +276,10 @@ name = "query_prepared"
 path = "tests/query/prepared.rs"
 
 [[test]]
+name = "query_scoped_reads"
+path = "tests/query/scoped_reads.rs"
+
+[[test]]
 name = "shacl_binding"
 path = "tests/shacl/binding.rs"
 

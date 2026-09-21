@@ -28,6 +28,10 @@ All notable changes to Craqle are documented here.
   malformed metadata, and queues a reindex of its graph, instead of skipping it.
   Damage without a readable graph scope, or beyond 64 pending graphs, queues a
   whole search rebuild. A repair stays pending until the store accepts it.
+- A query over exactly one explicit graph reads that graph's own index range,
+  including counts from its per-graph counters, instead of scanning the union of all
+  graphs and discarding rows from others. Results are unchanged. Larger graph lists
+  and policy-based default unions still use the union scan with visibility checks.
 - Default-union queries, statistics, prepared execution, explain, and analyze fail
   with the store error when a graph policy cannot be read. Earlier versions hid
   that graph and could return fewer rows, a smaller count, or a false `ASK`.

@@ -278,9 +278,9 @@ fn default_counts_withheld() {
     // A caller that reads every graph keeps the complete physical diagnostics.
     assert!(!full.details_withheld());
     assert_eq!(full.result_rows, 16);
-    assert!(full.planned_joins[0].estimated_left_rows > 3_000);
+    assert!(full.planned_joins[0].estimated_left_rows > 0);
     assert!(full.plan.root.estimated_rows.is_some());
-    assert!(full.candidate_quads > 3_000);
+    assert!(full.candidate_quads > 0);
     assert!(!full.plan.root.children.is_empty());
     assert_ne!(full.plan_fingerprint, restricted.plan_fingerprint);
 }

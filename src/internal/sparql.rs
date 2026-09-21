@@ -2857,6 +2857,8 @@ struct StoreDataset<'store, 'context, 'visibility> {
     query_budget: Option<Arc<QueryBudget>>,
     dense_resolver: RefCell<Option<DenseResolver>>,
     dense_scope: Option<u64>,
+    /// The single selected graph and its dense ID, resolved once per dataset.
+    scoped_graph: Cell<Option<(TermId, Option<DenseTerm>)>>,
 }
 
 static NEXT_DENSE_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -2883,6 +2885,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             query_budget: None,
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
+            scoped_graph: Cell::new(None),
         }
     }
 
@@ -2900,6 +2903,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             query_budget: None,
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
+            scoped_graph: Cell::new(None),
         }
     }
 
@@ -2917,7 +2921,27 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             query_budget: Some(query_budget),
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
+            scoped_graph: Cell::new(None),
         }
+    }
+
+    /// The one graph an explicit scope selects, with its dense ID when query IDs apply.
+    fn scoped_graph(&self) -> crate::store::Result<Option<(TermId, Option<DenseTerm>)>> {
+        let Some(graph) = self.context.single_graph() else {
+            return Ok(None);
+        };
+        if let Some(scoped) = self.scoped_graph.get() {
+            return Ok(Some(scoped));
+        }
+        let dense = match self.dense_scope {
+            Some(scope) if self.view.query_ids_trusted(self.context)? => self
+                .view
+                .query_term_id(self.context, graph)?
+                .map(|query| DenseTerm::new(query, scope)),
+            _ => None,
+        };
+        self.scoped_graph.set(Some((graph, dense)));
+        Ok(Some((graph, dense)))
     }
 
     fn resolve_pattern_term(&self, term: Option<&StoreTerm>) -> ResolvedPatternTerm {
@@ -3166,10 +3190,14 @@ where
                 )
             }
             Some(Some(StoreTerm::Missing(_))) => return Box::new(std::iter::empty()),
-            Some(Some(StoreTerm::DefaultUnion)) => (GraphSelector::DefaultUnion, None, None),
             // Compatibility callers use `Some(None)` for the distinct union
             // default; the cursor owns its constant-state semantics.
-            Some(None) => (GraphSelector::DefaultUnion, None, None),
+            Some(Some(StoreTerm::DefaultUnion)) | Some(None) => match self.scoped_graph() {
+                // One graph holds each triple once, so its range is the distinct union.
+                Ok(Some((graph, dense))) => (GraphSelector::Named(graph), dense, Some(graph)),
+                Ok(None) => (GraphSelector::DefaultUnion, None, None),
+                Err(error) => return Box::new(std::iter::once(Err(error.into()))),
+            },
             None => (GraphSelector::Union, None, None),
         };
         let dense_terms = [
