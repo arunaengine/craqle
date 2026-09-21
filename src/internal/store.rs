@@ -10104,6 +10104,25 @@ impl GraphStore {
         })
     }
 
+    /// Graph generations of every in-flight search stage of one index.
+    pub(crate) fn staged_search_generations(
+        &self,
+        index_id: [u8; 16],
+    ) -> Result<Vec<(GraphId, GenerationId)>> {
+        let mut staged = Vec::new();
+        for guard in self.search_meta.prefix([SEARCH_STAGE_PREFIX]) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 17 {
+                continue;
+            }
+            let stored = decode_search_stage(value.as_ref())?;
+            if stored.format == SEARCH_META_FORMAT && stored.index_id == index_id {
+                staged.push((stored.job.graph, stored.job.generation));
+            }
+        }
+        Ok(staged)
+    }
+
     pub(crate) fn search_stage(&self, req: &GenerationRequest) -> Result<Option<StageJob>> {
         Ok(self
             .stored_search_stage(&req.graph)?

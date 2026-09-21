@@ -27,7 +27,10 @@ All notable changes to Craqle are documented here.
 - Search fails with `CorruptDerivedData` when a live index document has missing or
   malformed metadata, and queues a reindex of its graph, instead of skipping it.
   Damage without a readable graph scope, or beyond 64 pending graphs, queues a
-  whole search rebuild. A repair stays pending until the store accepts it.
+  whole search rebuild. A repair stays pending until the store accepts it, and a
+  late report from an older search view cannot replace a current one. A whole
+  rebuild ends by deleting every document outside the published and staged
+  generations, so damaged records with no usable scope or key are removed.
 - A query over exactly one explicit graph reads that graph's own index range,
   including counts from its per-graph counters, instead of scanning the union of all
   graphs and discarding rows from others. Results are unchanged. Larger graph lists

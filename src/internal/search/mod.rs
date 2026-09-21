@@ -18,7 +18,8 @@ use tantivy::TERMINATED;
 #[cfg(test)]
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::{
-    Bm25StatisticsProvider as _, BooleanQuery, EnableScoring, Occur, Query, QueryParser, TermQuery,
+    AllQuery, Bm25StatisticsProvider as _, BooleanQuery, EnableScoring, Occur, Query, QueryParser,
+    TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
@@ -182,6 +183,29 @@ enum FailureClass {
     Rebuild,
 }
 
+/// Whole-rebuild requests; an acceptance forgets only the requests it saw.
+#[derive(Default)]
+struct RebuildIntent {
+    requested: AtomicU64,
+    accepted: AtomicU64,
+}
+
+impl RebuildIntent {
+    fn request(&self) {
+        self.requested.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The newest request the store has not durably accepted yet.
+    fn pending(&self) -> Option<u64> {
+        let requested = self.requested.load(Ordering::SeqCst);
+        (requested != self.accepted.load(Ordering::SeqCst)).then_some(requested)
+    }
+
+    fn accept(&self, seen: u64) {
+        self.accepted.fetch_max(seen, Ordering::SeqCst);
+    }
+}
+
 /// Damage found by readers, kept until the store durably accepts its repair.
 #[derive(Default)]
 struct RepairIntents {
@@ -223,6 +247,8 @@ struct SearchView {
     searcher: Searcher,
     generations: Arc<GenerationView>,
     bound: bool,
+    /// Whole-index sweeps completed before this view was published.
+    sweep: u64,
 }
 
 struct ManifestState {
@@ -407,9 +433,10 @@ pub struct SearchIndex {
     commit_lock: Mutex<()>,
     /// Graph mutation shards precede commit and writer locks in ascending order.
     rebuild_shards: [Mutex<()>; REBUILD_SHARDS],
-    /// Set when a poisoned writer was rolled back or damage has no trusted graph,
-    /// so the index owes a full re-derivation. Cleared once that reindex is queued.
-    rebuild_owed: AtomicBool,
+    /// Owed full re-derivation after writer poison or damage without a trusted graph.
+    rebuild_owed: RebuildIntent,
+    /// Whole-index sweeps completed, so old views cannot re-request swept damage.
+    sweeps: AtomicU64,
     scan_cursors: Mutex<QueueCursors>,
     retry_now: AtomicU64,
     fair_cursor: AtomicU64,
@@ -459,6 +486,10 @@ struct TestHooks {
     fail_graph: Mutex<Option<String>>,
     /// Fails the next required metadata read, modelling an index I/O error.
     metadata_io: AtomicBool,
+    /// Fails the next index revision read before a whole rebuild is bound.
+    revision_io: AtomicBool,
+    /// Fails the next metadata column opening with this error.
+    column_failure: Mutex<Option<tantivy::TantivyError>>,
     /// Forces the exhaustive collector, the oracle for pruned collection.
     exhaustive: AtomicBool,
     /// Segments collected with score pruning.
@@ -848,6 +879,7 @@ impl SearchIndex {
             searcher: reader.searcher(),
             generations,
             bound: false,
+            sweep: 0,
         });
         let writer_bytes = usize::try_from(budget.search_writer_bytes()).map_err(|_| {
             SearchError::ItemTooLarge {
@@ -867,7 +899,8 @@ impl SearchIndex {
             committed_epoch: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
             rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
-            rebuild_owed: AtomicBool::new(false),
+            rebuild_owed: RebuildIntent::default(),
+            sweeps: AtomicU64::new(0),
             scan_cursors: Mutex::new(QueueCursors::default()),
             retry_now: AtomicU64::new(0),
             fair_cursor: AtomicU64::new(0),
@@ -917,6 +950,7 @@ impl SearchIndex {
             searcher: reader.searcher(),
             generations,
             bound: true,
+            sweep: 0,
         });
         let writer_bytes = usize::try_from(budget.search_writer_bytes()).map_err(|_| {
             SearchError::ItemTooLarge {
@@ -936,7 +970,8 @@ impl SearchIndex {
             committed_epoch: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
             rebuild_shards: std::array::from_fn(|_| Mutex::new(())),
-            rebuild_owed: AtomicBool::new(false),
+            rebuild_owed: RebuildIntent::default(),
+            sweeps: AtomicU64::new(0),
             scan_cursors: Mutex::new(QueueCursors::default()),
             retry_now: AtomicU64::new(0),
             fair_cursor: AtomicU64::new(0),
@@ -996,6 +1031,7 @@ impl SearchIndex {
             searcher: self.reader.searcher(),
             generations,
             bound,
+            sweep: self.sweeps.load(Ordering::SeqCst),
         });
     }
 
@@ -1010,6 +1046,7 @@ impl SearchIndex {
             searcher: self.reader.searcher(),
             generations: Arc::new(generations),
             bound: true,
+            sweep: self.sweeps.load(Ordering::SeqCst),
         });
     }
 
@@ -1033,6 +1070,7 @@ impl SearchIndex {
             searcher: self.reader.searcher(),
             generations: Arc::new(generations),
             bound: true,
+            sweep: self.sweeps.load(Ordering::SeqCst),
         });
     }
 
@@ -1258,6 +1296,9 @@ impl SearchIndex {
                     ),
                 ));
             }
+            if let Some(generations) = &generations {
+                self.sweep_unaddressed(store, generations)?;
+            }
             store.finish_search_rebuild(&crate::search::queue::SearchCoverage {
                 format: crate::search::queue::SEARCH_META_FORMAT,
                 index_id: self.index_id,
@@ -1284,6 +1325,40 @@ impl SearchIndex {
             self.publish_generations(generations);
         }
         self.needs_rebuild.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Deletes every document outside published and staged generations after a whole
+    /// rebuild, including damage with no usable scope or key that cleanup cannot address.
+    fn sweep_unaddressed(&self, store: &GraphStore, active: &GenerationView) -> Result<()> {
+        let _work = self
+            .work_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let key = |graph: &str, generation| {
+            Term::from_field_text(
+                self.f_generation_key,
+                &generation_key(self.index_id, graph, generation),
+            )
+        };
+        let mut keep: Vec<Term> = active
+            .by_graph
+            .iter()
+            .map(|(graph, generation)| key(graph, *generation))
+            .collect();
+        for (graph, generation) in store.staged_search_generations(self.index_id)? {
+            keep.push(key(graph.as_str(), generation));
+        }
+        let unaddressed = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
+            (Occur::MustNot, Box::new(TermSetQuery::new(keep))),
+        ]);
+        self.writer()?.delete_query(Box::new(unaddressed))?;
+        self.write_epoch.fetch_add(1, Ordering::SeqCst);
+        // Views published from here on show the swept index.
+        self.sweeps.fetch_add(1, Ordering::SeqCst);
+        self.commit()?;
+        self.publish_searcher();
         Ok(())
     }
 
@@ -1405,7 +1480,7 @@ impl SearchIndex {
         &'a self,
         mut guard: MutexGuard<'a, IndexWriter>,
     ) -> Result<MutexGuard<'a, IndexWriter>> {
-        self.rebuild_owed.store(true, Ordering::SeqCst);
+        self.rebuild_owed.request();
         guard.rollback()?;
         self.writer.clear_poison();
         Ok(guard)
@@ -1420,21 +1495,17 @@ impl SearchIndex {
         if self.writer.is_poisoned() {
             drop(self.writer()?);
         }
-        if !self.rebuild_owed.swap(false, Ordering::SeqCst) {
+        let Some(seen) = self.rebuild_owed.pending() else {
             return Ok((bound, None));
-        }
-
-        let revision = self.index.load_metas()?.opstamp;
-        let raised = match store.bind_search_rebuild(&RebuildRequest {
+        };
+        // Any failure before the durable bind leaves the request pending for the next pass.
+        let revision = self.index_revision()?;
+        let target = store.bind_search_rebuild(&RebuildRequest {
             index_id: self.index_id,
             index_revision: revision,
-        }) {
-            Ok(target) => bound.max_token.map(|_| target),
-            Err(error) => {
-                self.rebuild_owed.store(true, Ordering::SeqCst);
-                return Err(error.into());
-            }
-        };
+        })?;
+        self.rebuild_owed.accept(seen);
+        let raised = bound.max_token.map(|_| target);
         Ok((
             QueueBound {
                 max_token: raised.or(bound.max_token),
@@ -1442,6 +1513,16 @@ impl SearchIndex {
             },
             raised,
         ))
+    }
+
+    fn index_revision(&self) -> Result<u64> {
+        #[cfg(test)]
+        if self.hooks.revision_io.swap(false, Ordering::SeqCst) {
+            return Err(SearchError::Io(std::io::Error::other(
+                "injected index metadata failure",
+            )));
+        }
+        Ok(self.index.load_metas()?.opstamp)
     }
 
     fn now_ms(&self) -> u64 {
@@ -1559,7 +1640,7 @@ impl SearchIndex {
     }
 
     fn reset_writer(&self) -> Result<()> {
-        self.rebuild_owed.store(true, Ordering::SeqCst);
+        self.rebuild_owed.request();
         let mut writer = self.writer()?;
         writer.rollback()?;
         let committed = self.committed_epoch.load(Ordering::SeqCst);
@@ -1760,16 +1841,7 @@ impl SearchIndex {
         let pruning = self.pruning_safe(&view.searcher, query.as_ref());
         for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
             (req.check)()?;
-            let scopes = reader
-                .fast_fields()
-                .bytes(GENERATION_SCOPE_FIELD)
-                .map_err(SearchError::from)
-                .map_err(E::from)?;
-            let stable = reader
-                .fast_fields()
-                .bytes(STABLE_KEY_FIELD)
-                .map_err(SearchError::from)
-                .map_err(E::from)?;
+            let (scopes, stable) = self.metadata_columns(&view, reader).map_err(E::from)?;
             let initial = top.threshold();
             // Ineligible documents return the current threshold, so they never raise it.
             let mut offer = |doc: DocId, score: &mut dyn FnMut() -> Score| {
@@ -1859,7 +1931,9 @@ impl SearchIndex {
                 });
             // The trusted scope names the graph; a stored identity is never authority.
             let hit = hit
-                .inspect_err(|_| self.mark_damaged(scope_at(&view, ranked.address).as_deref()))
+                .inspect_err(|_| {
+                    self.mark_damaged(&view, scope_at(&view, ranked.address).as_deref());
+                })
                 .map_err(E::from)?;
             retained = retained
                 .saturating_add(hit.graph_id.len())
@@ -3043,9 +3117,9 @@ impl SearchIndex {
     where
         E: From<SearchError>,
     {
-        let scope = self.read_scope(req.scopes, req.doc).map_err(E::from)?;
+        let scope = self.read_scope(&req).map_err(E::from)?;
         let Some(graph) = scope_graph(&scope) else {
-            self.mark_damaged(None);
+            self.mark_damaged(req.view, None);
             return Err(E::from(SearchError::Damaged {
                 detail: "generation scope",
             }));
@@ -3059,47 +3133,88 @@ impl SearchIndex {
             })
         });
         stable.map(Some).map_err(|error| {
-            self.mark_damaged(Some(&scope));
+            self.mark_damaged(req.view, Some(&scope));
             E::from(error)
         })
     }
 
     /// Reads one document's generation scope, owing a whole rebuild when it cannot.
-    fn read_scope(
-        &self,
-        scopes: Option<&tantivy::columnar::BytesColumn>,
-        doc: DocId,
-    ) -> Result<Vec<u8>> {
+    fn read_scope<E>(&self, req: &ActiveDoc<'_, E>) -> Result<Vec<u8>> {
         #[cfg(test)]
         let scope = if self.hooks.metadata_io.swap(false, Ordering::SeqCst) {
             Err(SearchError::Io(std::io::Error::other(
                 "injected metadata read failure",
             )))
         } else {
-            column_bytes(scopes, doc)
+            column_bytes(req.scopes, req.doc)
         };
         #[cfg(not(test))]
-        let scope = column_bytes(scopes, doc);
-        scope.inspect_err(|_| self.mark_damaged(None))
+        let scope = column_bytes(req.scopes, req.doc);
+        scope.inspect_err(|_| self.mark_damaged(req.view, None))
     }
 
-    /// Retains repair for the graph of a trusted scope, or a whole rebuild without one.
-    fn mark_damaged(&self, scope: Option<&[u8]>) {
+    /// Opens the required metadata columns of one segment. Corruption owes a whole
+    /// rebuild; an I/O failure is only reported, since a retry may succeed.
+    fn metadata_columns(
+        &self,
+        view: &SearchView,
+        reader: &tantivy::SegmentReader,
+    ) -> Result<(
+        Option<tantivy::columnar::BytesColumn>,
+        Option<tantivy::columnar::BytesColumn>,
+    )> {
+        let open = |field| {
+            #[cfg(test)]
+            if let Some(error) = self
+                .hooks
+                .column_failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                return Err(error);
+            }
+            reader.fast_fields().bytes(field)
+        };
+        open(GENERATION_SCOPE_FIELD)
+            .and_then(|scopes| Ok((scopes, open(STABLE_KEY_FIELD)?)))
+            .map_err(|error| match error {
+                tantivy::TantivyError::IoError(error) => SearchError::Io(std::io::Error::new(
+                    error.kind(),
+                    "search metadata could not be read",
+                )),
+                _ => {
+                    self.mark_damaged(view, None);
+                    SearchError::Damaged {
+                        detail: "metadata column",
+                    }
+                }
+            })
+    }
+
+    /// Retains repair for damage the current publication still shows; a report from an
+    /// older view can neither replace current intent nor re-request swept damage.
+    fn mark_damaged(&self, view: &SearchView, scope: Option<&[u8]>) {
         let Some((graph, generation)) = scope.and_then(scope_parts) else {
-            self.rebuild_owed.store(true, Ordering::SeqCst);
+            if view.sweep == self.sweeps.load(Ordering::SeqCst) {
+                self.rebuild_owed.request();
+            }
             return;
         };
+        if self.active_generation(graph) != Some(generation) {
+            return;
+        }
         let mut intents = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
         if intents.graphs.len() < DAMAGED_GRAPHS || intents.graphs.contains_key(graph) {
             intents.graphs.insert(graph.to_owned(), generation);
         } else {
-            self.rebuild_owed.store(true, Ordering::SeqCst);
+            self.rebuild_owed.request();
         }
     }
 
     /// Durably queues retained graph repairs and reports whether repair work is owed.
     pub(crate) fn queue_repairs(&self, store: &GraphStore) -> bool {
-        let owed = self.rebuild_owed.load(Ordering::SeqCst);
+        let owed = self.rebuild_owed.pending().is_some();
         let pending: Vec<(String, GenerationId)> = {
             let intents = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
             if intents.graphs.is_empty() || intents.retry_at_ms > self.now_ms() {
@@ -4055,17 +4170,19 @@ mod tests {
     }
 
     /// Field values for a hand-built document whose metadata may be missing or malformed.
-    struct RawDoc<'a> {
-        scope: Option<Vec<u8>>,
-        stable: Option<Vec<u8>>,
-        identity: Option<(&'a str, &'a str)>,
+    pub(super) struct RawDoc<'a> {
+        pub(super) scope: Option<Vec<u8>>,
+        pub(super) stable: Option<Vec<u8>>,
+        pub(super) identity: Option<(&'a str, &'a str)>,
+        /// Indexed generation key that ordinary cleanup deletes by.
+        pub(super) key: Option<String>,
     }
 
-    const RAW_GRAPH: &str = "urn:test:raw-graph";
-    const RAW_SUBJECT: &str = "urn:test:raw-subject";
+    pub(super) const RAW_GRAPH: &str = "urn:test:raw-graph";
+    pub(super) const RAW_SUBJECT: &str = "urn:test:raw-subject";
 
     impl RawDoc<'_> {
-        fn valid(index: &SearchIndex) -> Self {
+        pub(super) fn valid(index: &SearchIndex) -> Self {
             Self {
                 scope: Some(generation_scope(
                     index.index_id,
@@ -4074,13 +4191,17 @@ mod tests {
                 )),
                 stable: Some(stable_hit_key(RAW_GRAPH, RAW_SUBJECT).to_vec()),
                 identity: Some((RAW_GRAPH, RAW_SUBJECT)),
+                key: Some(generation_key(index.index_id, RAW_GRAPH, DIRECT_GENERATION)),
             }
         }
     }
 
-    fn write_raw(index: &SearchIndex, raw: RawDoc<'_>) {
+    pub(super) fn write_raw(index: &SearchIndex, raw: RawDoc<'_>) {
         let mut document = TantivyDocument::default();
         document.add_text(index.f_doc_key, "unsplittable");
+        if let Some(key) = raw.key {
+            document.add_text(index.f_generation_key, &key);
+        }
         if let Some((graph, subject)) = raw.identity {
             document.add_text(index.f_graph_id, graph);
             document.add_text(index.f_subject_iri, subject);
@@ -4097,7 +4218,7 @@ mod tests {
         index.commit().unwrap();
     }
 
-    fn raw_search(index: &SearchIndex) -> Result<Vec<SearchHit>> {
+    pub(super) fn raw_search(index: &SearchIndex) -> Result<Vec<SearchHit>> {
         index.search_in_graphs(GraphSetQuery {
             graphs: &[GraphId::new(RAW_GRAPH)],
             query: "rawneedle",
@@ -4168,7 +4289,7 @@ mod tests {
         let intents = index.damaged.lock().unwrap();
         (
             intents.graphs.get(RAW_GRAPH) == Some(&DIRECT_GENERATION),
-            index.rebuild_owed.load(Ordering::SeqCst),
+            index.rebuild_owed.pending().is_some(),
         )
     }
 
@@ -4209,15 +4330,16 @@ mod tests {
         let index = SearchIndex::open_in_memory().unwrap();
         for graph in 0..=DAMAGED_GRAPHS {
             let graph = format!("urn:test:overflow:{graph}");
+            index.set_generation(&graph, Some(DIRECT_GENERATION));
             let scope = generation_scope(index.index_id, &graph, DIRECT_GENERATION);
-            index.mark_damaged(Some(&scope));
+            index.mark_damaged(&index.pin_view(), Some(&scope));
         }
         assert_eq!(DAMAGED_GRAPHS, index.pending_repairs());
-        assert!(index.rebuild_owed.load(Ordering::SeqCst));
+        assert!(index.rebuild_owed.pending().is_some());
     }
 
     /// Opens a bound store and index whose raw graph has one document with no stable key.
-    fn damaged_store(dir: &Path) -> (GraphStore, SearchIndex) {
+    pub(super) fn damaged_store(dir: &Path) -> (GraphStore, SearchIndex) {
         let store = GraphStore::open(dir).unwrap();
         let index = SearchIndex::open_in_memory().unwrap();
         index.bind_store(&store).unwrap();
@@ -4235,7 +4357,8 @@ mod tests {
         (store, index)
     }
 
-    fn drain_all(index: &SearchIndex, store: &GraphStore) {
+    /// Drains every queue up to the current target and returns the covered target.
+    pub(super) fn drain_all(index: &SearchIndex, store: &GraphStore) -> u64 {
         let mut target = store.current_dirty_token();
         for _ in 0..64 {
             let progress = index
@@ -4254,13 +4377,13 @@ mod tests {
             let raised = progress.recovery.is_some_and(|recovery| recovery > target);
             target = target.max(progress.recovery.unwrap_or(0));
             if !progress.remaining && !raised {
-                return;
+                return target;
             }
         }
         panic!("search queue made no bounded progress");
     }
 
-    fn queued_reindex(store: &GraphStore) -> bool {
+    pub(super) fn queued_reindex(store: &GraphStore) -> bool {
         store
             .drain_reindex_queue(8)
             .unwrap()
@@ -4305,7 +4428,7 @@ mod tests {
 
         // A reader still holding the replaced generation reports it again.
         let stale = generation_scope(index.index_id, RAW_GRAPH, DIRECT_GENERATION);
-        index.mark_damaged(Some(&stale));
+        index.mark_damaged(&index.pin_view(), Some(&stale));
         assert!(!index.queue_repairs(&store));
         assert_eq!(0, index.pending_repairs());
         assert!(!queued_reindex(&store));
@@ -5175,7 +5298,7 @@ mod tests {
         );
         assert_eq!(1, index.search("afterpoison", 10)?.len());
         assert!(
-            index.rebuild_owed.load(Ordering::SeqCst),
+            index.rebuild_owed.pending().is_some(),
             "the rollback discarded uncommitted work, so a rebuild is owed"
         );
 
@@ -5277,7 +5400,7 @@ mod tests {
         )])
     }
 
-    fn crate_request(
+    pub(super) fn crate_request(
         graph: &GraphId,
         description: &str,
         public: bool,
