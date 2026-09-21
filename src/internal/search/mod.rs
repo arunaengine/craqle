@@ -4267,6 +4267,11 @@ mod tests {
     #[test]
     fn pruned_matches_exhaustive() {
         let index = SearchIndex::open_in_memory().unwrap();
+        // Background merges would race the explicit merges this test controls.
+        index
+            .writer()
+            .unwrap()
+            .set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
         write_prune(&index, (0, 200), 0);
         write_prune(&index, (200, 400), 0);
         assert!(index.pin_view().searcher.segment_readers().len() > 1);
