@@ -879,9 +879,11 @@ pub(crate) fn graph_is_visible(
             GraphVisibility::Exact(graphs) => graphs.contains(&graph),
             GraphVisibility::Predicate(visible) => {
                 let term = decode_term(store, context, graph)?;
-                term.to_named_node()
-                    .map(|named| visible(&GraphId(named)))
-                    .unwrap_or(false)
+                term.to_named_node().is_some_and(|named| {
+                    let named = GraphId(named);
+                    snapshot.remember_graph_name(&named, graph);
+                    visible(&named)
+                })
             }
         }
     };

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Included};
 use std::path::Path;
@@ -2418,6 +2418,10 @@ pub(crate) struct StoreReadSnapshot {
     /// The active index slot is fixed for this snapshot's sequence, so the
     /// header is decoded at most once per snapshot.
     active_slot: OnceCell<Option<IndexSlot>>,
+    /// Graph metadata, clock and diagnostics records by key, read at most once per snapshot.
+    graph_records: RefCell<HashMap<[u8; 17], Option<fjall::Slice>>>,
+    /// Graph names decoded for this snapshot, so policy reads skip a dictionary read.
+    graph_names: RefCell<HashMap<String, TermId>>,
 }
 
 impl From<&Snapshot> for StoreReadSnapshot {
@@ -2425,6 +2429,8 @@ impl From<&Snapshot> for StoreReadSnapshot {
         Self {
             snapshot: snapshot.clone(),
             active_slot: OnceCell::new(),
+            graph_records: RefCell::default(),
+            graph_names: RefCell::default(),
         }
     }
 }
@@ -2955,10 +2961,39 @@ impl StoreReadSnapshot {
     }
 
     pub(crate) fn contains_graph_id(&self, store: &GraphStore, graph: TermId) -> Result<bool> {
+        Ok(self.graph_meta(store, graph)?.is_some())
+    }
+
+    fn graph_meta(&self, store: &GraphStore, graph: TermId) -> Result<Option<fjall::Slice>> {
+        self.graph_record(store, graph_meta_key(graph))
+    }
+
+    fn graph_record(&self, store: &GraphStore, key: [u8; 17]) -> Result<Option<fjall::Slice>> {
+        if let Some(record) = self.graph_records.borrow().get(&key) {
+            return Ok(record.clone());
+        }
+        let record = self.snapshot.get(&store.graphs, key)?;
+        self.graph_records.borrow_mut().insert(key, record.clone());
+        Ok(record)
+    }
+
+    fn vector_clock(&self, store: &GraphStore, graph: TermId) -> Result<VectorClock> {
+        if let Some(bytes) = self.graph_record(store, graph_clock_key(graph))? {
+            return Ok(postcard::from_bytes(bytes.as_ref())?);
+        }
         Ok(self
-            .snapshot
-            .get(&store.graphs, graph_meta_key(graph))?
-            .is_some())
+            .graph_meta(store, graph)?
+            .map(|bytes| postcard::from_bytes::<StoredGraphMeta>(bytes.as_ref()))
+            .transpose()?
+            .unwrap_or_default()
+            .clock)
+    }
+
+    /// Records a graph name decoded from this snapshot's dictionary.
+    pub(crate) fn remember_graph_name(&self, graph: &GraphId, term: TermId) {
+        self.graph_names
+            .borrow_mut()
+            .insert(graph.as_str().to_owned(), term);
     }
 
     pub(crate) fn graph_version(&self, store: &GraphStore, graph: TermId) -> Result<[u8; 32]> {
@@ -3016,10 +3051,15 @@ impl StoreReadSnapshot {
                 "injected policy read failure",
             ))));
         }
-        let Some(graph) = self.lookup_term(store, &EncodedTerm::from_named_node(&graph.0))? else {
-            return Ok(None);
+        let known = self.graph_names.borrow().get(graph.as_str()).copied();
+        let graph = match known {
+            Some(graph) => graph,
+            None => match self.lookup_term(store, &EncodedTerm::from_named_node(&graph.0))? {
+                Some(graph) => graph,
+                None => return Ok(None),
+            },
         };
-        let Some(bytes) = self.snapshot.get(&store.graphs, graph_meta_key(graph))? else {
+        let Some(bytes) = self.graph_meta(store, graph)? else {
             return Ok(None);
         };
         Ok(Some(
@@ -3037,8 +3077,12 @@ impl StoreReadSnapshot {
         if !self.contains_graph_id(store, graph)? {
             return Ok(HashSet::new());
         }
-        let clock = store.snapshot_vector_clock(&self.snapshot, graph)?;
-        if let Some(record) = store.snapshot_stored_diagnostics(&self.snapshot, graph)?
+        let clock = self.vector_clock(store, graph)?;
+        let stored = self
+            .graph_record(store, graph_diagnostics_key(graph))?
+            .map(|bytes| postcard::from_bytes::<StoredDiagnostics>(bytes.as_ref()))
+            .transpose()?;
+        if let Some(record) = stored
             && record.at_clock == clock
         {
             let mut orphaned = HashSet::with_capacity(record.diagnostics.orphaned_entities.len());
@@ -3451,10 +3495,7 @@ impl GraphStore {
     /// Captures the durable source/qv authority. Cache publication may follow
     /// it; generation checks keep stale cache entries off this read path.
     pub(crate) fn read_snapshot(&self) -> StoreReadSnapshot {
-        StoreReadSnapshot {
-            snapshot: self.db.snapshot(),
-            active_slot: OnceCell::new(),
-        }
+        StoreReadSnapshot::from(&self.db.snapshot())
     }
 
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
@@ -11831,6 +11872,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// Remembered graph records belong to one snapshot; later writes stay invisible to it.
+    #[test]
+    fn snapshot_records_isolated() {
+        let (_dir, store) = setup_store();
+        let kept = GraphId::new("urn:test:memo-kept");
+        let deleted = GraphId::new("urn:test:memo-deleted");
+        store.create_graph(&kept).unwrap();
+        store.create_graph(&deleted).unwrap();
+        let before = store.read_snapshot();
+        let id = |graph: &GraphId| {
+            before
+                .lookup_term(&store, &EncodedTerm::from_named_node(&graph.0))
+                .unwrap()
+                .unwrap()
+        };
+        let original = before.graph_policy(&store, &kept).unwrap().unwrap();
+        assert!(before.contains_graph_id(&store, id(&deleted)).unwrap());
+        let changed = GraphPolicy {
+            public: !original.public,
+            ..original.clone()
+        };
+        store.set_graph_policy(&kept, &changed).unwrap();
+        store.delete_graph(&deleted).unwrap();
+
+        assert_eq!(before.graph_policy(&store, &kept).unwrap(), Some(original));
+        assert!(before.contains_graph_id(&store, id(&deleted)).unwrap());
+        let after = store.read_snapshot();
+        assert_eq!(after.graph_policy(&store, &kept).unwrap(), Some(changed));
+        assert!(!after.contains_graph_id(&store, id(&deleted)).unwrap());
     }
 
     fn seed_graph_record(path: &Path, key: &[u8], value: &[u8]) {
