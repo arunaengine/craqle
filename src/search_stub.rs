@@ -123,8 +123,8 @@ impl SearchIndex {
         Err(SearchError::Disabled.into())
     }
 
-    pub(crate) fn take_damaged(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::new()
+    pub(crate) fn queue_repairs(&self, _store: &GraphStore) -> bool {
+        false
     }
 
     pub(crate) fn retry_wait(&self, _retry_at_ms: u64) -> std::time::Duration {

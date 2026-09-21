@@ -6,7 +6,7 @@ pub(crate) mod queue;
 
 use std::borrow::Cow;
 use std::collections::BinaryHeap;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 #[cfg(test)]
@@ -51,7 +51,7 @@ const STAGE_SOURCE_BYTES: usize = 256;
 /// Rebuild-lock shards. Comfortably above the indexer's concurrency while
 /// staying a fixed, tiny allocation.
 const REBUILD_SHARDS: usize = 64;
-/// Damaged graphs awaiting a reindex; later detections repeat once these are repaired.
+/// Damaged graphs retained for targeted reindex; overflow escalates to a whole rebuild.
 const DAMAGED_GRAPHS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v5";
@@ -180,6 +180,15 @@ enum FailureClass {
     ItemRetryable,
     Global,
     Rebuild,
+}
+
+/// Damage found by readers, kept until the store durably accepts its repair.
+#[derive(Default)]
+struct RepairIntents {
+    /// Damaged graphs with the generation each reader observed.
+    graphs: BTreeMap<String, GenerationId>,
+    failures: u32,
+    retry_at_ms: u64,
 }
 
 #[derive(Clone, Default)]
@@ -398,8 +407,8 @@ pub struct SearchIndex {
     commit_lock: Mutex<()>,
     /// Graph mutation shards precede commit and writer locks in ascending order.
     rebuild_shards: [Mutex<()>; REBUILD_SHARDS],
-    /// Set when a poisoned writer was rolled back and the index therefore owes
-    /// the store a full re-derivation. Cleared once that reindex is queued.
+    /// Set when a poisoned writer was rolled back or damage has no trusted graph,
+    /// so the index owes a full re-derivation. Cleared once that reindex is queued.
     rebuild_owed: AtomicBool,
     scan_cursors: Mutex<QueueCursors>,
     retry_now: AtomicU64,
@@ -407,7 +416,7 @@ pub struct SearchIndex {
     prepared_bytes: usize,
     work_lock: Mutex<()>,
     stage_sources: Mutex<HashMap<GenerationId, Arc<StageSource>>>,
-    damaged: Mutex<BTreeSet<String>>,
+    damaged: Mutex<RepairIntents>,
     session: [u8; 16],
     #[cfg(test)]
     hooks: TestHooks,
@@ -865,7 +874,7 @@ impl SearchIndex {
             prepared_bytes,
             work_lock: Mutex::new(()),
             stage_sources: Mutex::new(HashMap::new()),
-            damaged: Mutex::new(BTreeSet::new()),
+            damaged: Mutex::new(RepairIntents::default()),
             session: *uuid::Uuid::new_v4().as_bytes(),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -934,7 +943,7 @@ impl SearchIndex {
             prepared_bytes,
             work_lock: Mutex::new(()),
             stage_sources: Mutex::new(HashMap::new()),
-            damaged: Mutex::new(BTreeSet::new()),
+            damaged: Mutex::new(RepairIntents::default()),
             session: *uuid::Uuid::new_v4().as_bytes(),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -1832,20 +1841,22 @@ impl SearchIndex {
         let hydration = std::time::Instant::now();
         for ranked in ranked {
             (req.check)()?;
-            let doc: TantivyDocument = view
+            let hit = view
                 .searcher
                 .doc(ranked.address)
                 .map_err(SearchError::from)
+                .and_then(|doc| self.doc_to_hit(doc, ranked.score))
+                .and_then(|hit| {
+                    (stable_hit_key(&hit.graph_id, &hit.subject_iri) == ranked.stable)
+                        .then_some(hit)
+                        .ok_or(SearchError::Damaged {
+                            detail: "stored identity",
+                        })
+                });
+            // The trusted scope names the graph; a stored identity is never authority.
+            let hit = hit
+                .inspect_err(|_| self.mark_damaged(scope_at(&view, ranked.address).as_deref()))
                 .map_err(E::from)?;
-            let hit = self.doc_to_hit(doc, ranked.score).map_err(E::from)?;
-            if stable_hit_key(&hit.graph_id, &hit.subject_iri) != ranked.stable {
-                if let Some(graph) = scope_graph_at(&view, ranked.address) {
-                    self.mark_damaged(&graph);
-                }
-                return Err(E::from(SearchError::Damaged {
-                    detail: "stored identity",
-                }));
-            }
             retained = retained
                 .saturating_add(hit.graph_id.len())
                 .saturating_add(hit.subject_iri.len());
@@ -3028,42 +3039,123 @@ impl SearchIndex {
     where
         E: From<SearchError>,
     {
-        #[cfg(test)]
-        if self.hooks.metadata_io.swap(false, Ordering::SeqCst) {
-            return Err(E::from(SearchError::Io(std::io::Error::other(
-                "injected metadata read failure",
-            ))));
-        }
-        let scope = column_bytes(req.scopes, req.doc).map_err(E::from)?;
-        let graph = scope_graph(&scope).ok_or(E::from(SearchError::Damaged {
-            detail: "generation scope",
-        }))?;
+        let scope = self.read_scope(req.scopes, req.doc).map_err(E::from)?;
+        let Some(graph) = scope_graph(&scope) else {
+            self.mark_damaged(None);
+            return Err(E::from(SearchError::Damaged {
+                detail: "generation scope",
+            }));
+        };
         if !req.view.generations.active.contains(scope.as_slice()) || !(req.allows)(graph)? {
             return Ok(None);
         }
-        let stable = column_bytes(req.stable, req.doc).map_err(E::from)?;
-        match <[u8; 32]>::try_from(stable.as_slice()) {
-            Ok(stable) => Ok(Some(stable)),
-            Err(_) => {
-                self.mark_damaged(graph);
-                Err(E::from(SearchError::Damaged {
-                    detail: "stable key",
-                }))
+        let stable = column_bytes(req.stable, req.doc).and_then(|stable| {
+            <[u8; 32]>::try_from(stable.as_slice()).map_err(|_| SearchError::Damaged {
+                detail: "stable key",
+            })
+        });
+        stable.map(Some).map_err(|error| {
+            self.mark_damaged(Some(&scope));
+            E::from(error)
+        })
+    }
+
+    /// Reads one document's generation scope, owing a whole rebuild when it cannot.
+    fn read_scope(
+        &self,
+        scopes: Option<&tantivy::columnar::BytesColumn>,
+        doc: DocId,
+    ) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        let scope = if self.hooks.metadata_io.swap(false, Ordering::SeqCst) {
+            Err(SearchError::Io(std::io::Error::other(
+                "injected metadata read failure",
+            )))
+        } else {
+            column_bytes(scopes, doc)
+        };
+        #[cfg(not(test))]
+        let scope = column_bytes(scopes, doc);
+        scope.inspect_err(|_| self.mark_damaged(None))
+    }
+
+    /// Retains repair for the graph of a trusted scope, or a whole rebuild without one.
+    fn mark_damaged(&self, scope: Option<&[u8]>) {
+        let Some((graph, generation)) = scope.and_then(scope_parts) else {
+            self.rebuild_owed.store(true, Ordering::SeqCst);
+            return;
+        };
+        let mut intents = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
+        if intents.graphs.len() < DAMAGED_GRAPHS || intents.graphs.contains_key(graph) {
+            intents.graphs.insert(graph.to_owned(), generation);
+        } else {
+            self.rebuild_owed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Durably queues retained graph repairs and reports whether repair work is owed.
+    pub(crate) fn queue_repairs(&self, store: &GraphStore) -> bool {
+        let owed = self.rebuild_owed.load(Ordering::SeqCst);
+        let pending: Vec<(String, GenerationId)> = {
+            let intents = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
+            if intents.graphs.is_empty() || intents.retry_at_ms > self.now_ms() {
+                return owed;
+            }
+            intents
+                .graphs
+                .iter()
+                .map(|(graph, generation)| (graph.clone(), *generation))
+                .collect()
+        };
+        let mut queued = owed;
+        let mut failed = false;
+        for (graph, generation) in pending {
+            // A later generation or deletion already replaced what the reader saw.
+            let accepted = if self.active_generation(&graph) != Some(generation) {
+                Ok(false)
+            } else {
+                match store.ensure_reindex(&GraphId::new(&graph)) {
+                    Ok((_, created)) => Ok(created),
+                    Err(crate::store::StoreError::GraphNotFound(_)) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            };
+            let mut intents = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
+            match accepted {
+                Ok(created) => {
+                    queued |= created;
+                    if intents.graphs.get(&graph) == Some(&generation) {
+                        intents.graphs.remove(&graph);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "damaged search graph could not be queued");
+                    failed = true;
+                }
             }
         }
-    }
-
-    /// Records a readable damaged graph for the maintenance worker to reindex.
-    fn mark_damaged(&self, graph: &str) {
-        let mut damaged = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
-        if damaged.len() < DAMAGED_GRAPHS {
-            damaged.insert(graph.to_owned());
+        let mut intents = self.damaged.lock().unwrap_or_else(PoisonError::into_inner);
+        if failed {
+            let shift = intents.failures.min(16);
+            intents.failures = intents.failures.saturating_add(1);
+            let delay = RETRY_BASE_MS
+                .saturating_mul(1u64 << shift)
+                .min(RETRY_MAX_MS);
+            intents.retry_at_ms = self.now_ms().saturating_add(delay);
+        } else {
+            intents.failures = 0;
+            intents.retry_at_ms = 0;
         }
+        queued
     }
 
-    /// Takes the damaged graphs recorded since the previous call.
-    pub(crate) fn take_damaged(&self) -> BTreeSet<String> {
-        std::mem::take(&mut *self.damaged.lock().unwrap_or_else(PoisonError::into_inner))
+    #[cfg(test)]
+    fn pending_repairs(&self) -> usize {
+        self.damaged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .graphs
+            .len()
     }
 
     fn delete_doc(&self, writer: &mut IndexWriter, doc: &DocIdentity) {
@@ -3236,6 +3328,12 @@ fn scope_graph(scope: &[u8]) -> Option<&str> {
     std::str::from_utf8(&scope[16..scope.len() - 8]).ok()
 }
 
+fn scope_parts(scope: &[u8]) -> Option<(&str, GenerationId)> {
+    let graph = scope_graph(scope)?;
+    let generation = scope[scope.len() - 8..].try_into().ok()?;
+    Some((graph, GenerationId(u64::from_be_bytes(generation))))
+}
+
 /// Terms of a single term query or of a union whose clauses are all optional terms.
 fn pruning_terms(query: &dyn Query) -> Option<Vec<&Term>> {
     if let Some(term) = query.downcast_ref::<TermQuery>() {
@@ -3253,12 +3351,11 @@ fn pruning_terms(query: &dyn Query) -> Option<Vec<&Term>> {
         .collect()
 }
 
-/// Reads the graph named by one document's generation scope.
-fn scope_graph_at(view: &SearchView, address: DocAddress) -> Option<String> {
+/// Reads one document's generation scope.
+fn scope_at(view: &SearchView, address: DocAddress) -> Option<Vec<u8>> {
     let reader = view.searcher.segment_reader(address.segment_ord);
     let scopes = reader.fast_fields().bytes(GENERATION_SCOPE_FIELD).ok()?;
-    let scope = column_bytes(scopes.as_ref(), address.doc_id).ok()?;
-    scope_graph(&scope).map(str::to_owned)
+    column_bytes(scopes.as_ref(), address.doc_id).ok()
 }
 
 /// Reads a required single-value bytes field that every current document carries.
@@ -3446,6 +3543,7 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -4006,42 +4104,43 @@ mod tests {
     #[test]
     fn damaged_metadata_errors() {
         type Damage = fn(&mut RawDoc<'static>);
-        let cases: [(&str, Damage, &str, bool); 6] = [
+        // Attributable damage owes a graph reindex; damage without a trusted scope, a rebuild.
+        let cases: [(&str, Damage, &str, (bool, bool)); 6] = [
             (
                 "missing scope",
                 |raw| raw.scope = None,
                 "metadata column",
-                false,
+                (false, true),
             ),
             (
                 "missing stable",
                 |raw| raw.stable = None,
                 "metadata column",
-                false,
+                (true, false),
             ),
             (
                 "short scope",
                 |raw| raw.scope = Some(vec![0; 8]),
                 "generation scope",
-                false,
+                (false, true),
             ),
             (
                 "short stable",
                 |raw| raw.stable = Some(vec![0; 16]),
                 "stable key",
-                true,
+                (true, false),
             ),
             (
                 "no identity",
                 |raw| raw.identity = None,
                 "stored identity",
-                false,
+                (true, false),
             ),
             (
                 "foreign identity",
                 |raw| raw.identity = Some(("urn:test:elsewhere", RAW_SUBJECT)),
                 "stored identity",
-                true,
+                (true, false),
             ),
         ];
         for (label, damage, expected, repairs) in cases {
@@ -4056,9 +4155,17 @@ mod tests {
                 "{label}: {error:?}"
             );
             assert_eq!(error.kind(), crate::CraqleErrorKind::CorruptDerivedData);
-            let damaged = index.take_damaged();
-            assert_eq!(damaged.contains(RAW_GRAPH), repairs, "{label}");
+            assert_eq!(repairs, owed_repairs(&index), "{label}");
         }
+    }
+
+    /// Whether the raw graph owes a targeted reindex and whether a whole rebuild is owed.
+    fn owed_repairs(index: &SearchIndex) -> (bool, bool) {
+        let intents = index.damaged.lock().unwrap();
+        (
+            intents.graphs.get(RAW_GRAPH) == Some(&DIRECT_GENERATION),
+            index.rebuild_owed.load(Ordering::SeqCst),
+        )
     }
 
     #[test]
@@ -4077,7 +4184,8 @@ mod tests {
         let hits = raw_search(&index).unwrap();
         assert_eq!(1, hits.len());
         assert_eq!(RAW_SUBJECT, hits[0].subject_iri);
-        assert!(index.take_damaged().is_empty());
+        assert_eq!((false, false), owed_repairs(&index));
+        assert_eq!(0, index.pending_repairs());
     }
 
     #[test]
@@ -4088,36 +4196,137 @@ mod tests {
         index.hooks.metadata_io.store(true, Ordering::SeqCst);
         let error = raw_search(&index).unwrap_err();
         assert!(matches!(error, SearchError::Io(_)), "{error:?}");
+        assert_eq!((false, true), owed_repairs(&index));
         assert_eq!(1, raw_search(&index).unwrap().len());
     }
 
     #[test]
-    fn damaged_graph_repaired() {
-        let dir = tempdir().unwrap();
-        let graph = GraphId::new("urn:test:damaged-repair");
-        let node = crate::CraqleNode::open(dir.path()).unwrap();
-        let auth = crate::AllowAllAuthorizer;
-        node.create_crate(&auth, crate_request(&graph, "repairneedle", true))
+    fn repair_overflow_escalates() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        for graph in 0..=DAMAGED_GRAPHS {
+            let graph = format!("urn:test:overflow:{graph}");
+            let scope = generation_scope(index.index_id, &graph, DIRECT_GENERATION);
+            index.mark_damaged(Some(&scope));
+        }
+        assert_eq!(DAMAGED_GRAPHS, index.pending_repairs());
+        assert!(index.rebuild_owed.load(Ordering::SeqCst));
+    }
+
+    /// Opens a bound store and index whose raw graph has one document with no stable key.
+    fn damaged_store(dir: &Path) -> (GraphStore, SearchIndex) {
+        let store = GraphStore::open(dir).unwrap();
+        let index = SearchIndex::open_in_memory().unwrap();
+        index.bind_store(&store).unwrap();
+        let graph = GraphId::new(RAW_GRAPH);
+        store.create_graph(&graph).unwrap();
+        store
+            .set_graph_diagnostics(&graph, &crate::GraphDiagnostics::default())
             .unwrap();
+        drain_all(&index, &store);
+        assert!(!queued_reindex(&store));
+        index.set_generation(RAW_GRAPH, Some(DIRECT_GENERATION));
+        let mut raw = RawDoc::valid(&index);
+        raw.stable = None;
+        write_raw(&index, raw);
+        (store, index)
+    }
+
+    fn drain_all(index: &SearchIndex, store: &GraphStore) {
+        let mut target = store.current_dirty_token();
+        for _ in 0..64 {
+            let progress = index
+                .drain_queues(
+                    store,
+                    DrainRequest {
+                        bound: QueueBound {
+                            chunk: 50,
+                            max_token: Some(target),
+                        },
+                        control: DrainControl::default(),
+                    },
+                )
+                .unwrap();
+            assert!(progress.failures.is_empty(), "{:?}", progress.failures);
+            let raised = progress.recovery.is_some_and(|recovery| recovery > target);
+            target = target.max(progress.recovery.unwrap_or(0));
+            if !progress.remaining && !raised {
+                return;
+            }
+        }
+        panic!("search queue made no bounded progress");
+    }
+
+    fn queued_reindex(store: &GraphStore) -> bool {
+        store
+            .drain_reindex_queue(8)
+            .unwrap()
+            .iter()
+            .any(|dirty| dirty.graph.as_str() == RAW_GRAPH)
+    }
+
+    #[test]
+    fn failed_enqueue_retained() {
+        let dir = tempdir().unwrap();
+        let (store, index) = damaged_store(dir.path());
+        index.set_retry_now(1_000);
+        let error = raw_search(&index).unwrap_err();
+        assert!(matches!(error, SearchError::Damaged { .. }), "{error:?}");
+
+        store.arm_commit_failure();
+        assert!(!index.queue_repairs(&store));
+        assert_eq!(1, index.pending_repairs());
+        assert!(!queued_reindex(&store));
+        // Backoff defers the retry instead of spinning on the failing store.
+        assert!(!index.queue_repairs(&store));
+        assert!(!queued_reindex(&store));
+
+        index.set_retry_now(1_000 + RETRY_MAX_MS);
+        assert!(index.queue_repairs(&store));
+        assert_eq!(0, index.pending_repairs());
+        assert!(queued_reindex(&store));
+        drain_all(&index, &store);
+        assert_ne!(
+            Some(DIRECT_GENERATION),
+            index.active_generation(RAW_GRAPH)
+        );
+        assert!(raw_search(&index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_report_ignored() {
+        let dir = tempdir().unwrap();
+        let (store, index) = damaged_store(dir.path());
+        raw_search(&index).unwrap_err();
+        assert!(index.queue_repairs(&store));
+        drain_all(&index, &store);
+        let repaired = index.active_generation(RAW_GRAPH);
+        assert_ne!(Some(DIRECT_GENERATION), repaired);
+
+        // A reader still holding the replaced generation reports it again.
+        let stale = generation_scope(index.index_id, RAW_GRAPH, DIRECT_GENERATION);
+        index.mark_damaged(Some(&stale));
+        assert!(!index.queue_repairs(&store));
+        assert_eq!(0, index.pending_repairs());
+        assert!(!queued_reindex(&store));
+        assert_eq!(repaired, index.active_generation(RAW_GRAPH));
+    }
+
+    /// Indexes one crate, then adds a document without a stable key to its generation.
+    fn damage_node(dir: &Path, graph: &GraphId) -> crate::CraqleNode {
+        let node = crate::CraqleNode::open(dir).unwrap();
+        node.create_crate(
+            &crate::AllowAllAuthorizer,
+            crate_request(graph, "repairneedle", true),
+        )
+        .unwrap();
         node.flush_search_updates().unwrap();
-        let search = |node: &crate::CraqleNode| {
-            node.search(
-                &auth,
-                crate::SearchRequest {
-                    query: "repairneedle",
-                    limit: 10,
-                },
-            )
-        };
-        let expected = search(&node).unwrap();
-        assert!(!expected.is_empty());
         let generation = node.search.active_generation(graph.as_str()).unwrap();
         let mut document = TantivyDocument::default();
         document.add_text(node.search.f_graph_id, graph.as_str());
         document.add_text(node.search.f_subject_iri, "urn:test:damaged");
         let scope = generation_scope(node.search.index_id, graph.as_str(), generation);
+        // No stable key: attributable damage that readers used to drop.
         document.add_bytes(node.search.f_generation_scope, &scope);
-        document.add_bytes(node.search.f_stable_key, &[0; 16]);
         document.add_text(node.search.f_all_text, "repairneedle");
         node.search
             .writer()
@@ -4126,30 +4335,70 @@ mod tests {
             .unwrap();
         node.search.write_epoch.fetch_add(1, Ordering::SeqCst);
         node.search.commit().unwrap();
-        let pinned = node.search.pin_view();
+        node
+    }
 
-        let error = search(&node).unwrap_err();
-        assert_eq!(error.kind(), crate::CraqleErrorKind::CorruptDerivedData);
-        // The worker queues the reindex on its next pass; a flush then drains it.
+    fn repair_search(node: &crate::CraqleNode) -> crate::Result<Vec<SearchHit>> {
+        node.search(
+            &crate::AllowAllAuthorizer,
+            crate::SearchRequest {
+                query: "repairneedle",
+                limit: 10,
+            },
+        )
+    }
+
+    /// Waits for the worker to hand every retained repair to the durable queue.
+    fn await_accepted(node: &crate::CraqleNode) {
         let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        let repaired = loop {
-            node.flush_search_updates().unwrap();
-            if let Ok(hits) = search(&node) {
-                break hits;
-            }
+        while node.search.pending_repairs() != 0 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "damage was never repaired"
+                "repair was never queued"
             );
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let identities = |hits: &[SearchHit]| {
-            hits.iter()
-                .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(identities(&expected), identities(&repaired));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn damaged_graph_repaired() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:damaged-repair");
+        let node = damage_node(dir.path(), &graph);
+        let generation = node.search.active_generation(graph.as_str()).unwrap();
+        let pinned = node.search.pin_view();
+
+        // Exactly one reader sees the damage; nothing searches again until it is repaired.
+        let error = repair_search(&node).unwrap_err();
+        assert_eq!(error.kind(), crate::CraqleErrorKind::CorruptDerivedData);
+        await_accepted(&node);
+        // A flush requested after durable acceptance targets the repair token.
+        node.flush_search_updates().unwrap();
+        assert_ne!(
+            Some(generation),
+            node.search.active_generation(graph.as_str())
+        );
+        let repaired = repair_search(&node).unwrap();
+        assert_eq!(1, repaired.len());
+        assert_eq!(graph.as_str(), repaired[0].graph_id);
+        let scope = generation_scope(node.search.index_id, graph.as_str(), generation);
         assert!(pinned.generations.active.contains(scope.as_slice()));
+    }
+
+    #[test]
+    fn accepted_repair_reopens() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:damaged-reopen");
+        let node = damage_node(dir.path(), &graph);
+        repair_search(&node).unwrap_err();
+        await_accepted(&node);
+        drop(node);
+
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        node.flush_search_updates().unwrap();
+        let repaired = repair_search(&node).unwrap();
+        assert_eq!(1, repaired.len());
+        assert_eq!(graph.as_str(), repaired[0].graph_id);
     }
 
     const PRUNE_GRAPHS: usize = 12;

@@ -1090,7 +1090,7 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
             break;
         }
         ctx.wake_pending.store(false, Ordering::Release);
-        let repairing = queue_repairs(&ctx);
+        let repairing = ctx.search.queue_repairs(&ctx.store);
         if let Some(due) = retry_at
             && !woke
             && !repairing
@@ -1198,18 +1198,6 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
             }
         }
     }
-}
-
-/// Queues a durable reindex for graphs whose search documents were found damaged.
-fn queue_repairs(ctx: &SearchWorkerCtx) -> bool {
-    let mut queued = false;
-    for graph in ctx.search.take_damaged() {
-        match ctx.store.ensure_reindex(&GraphId::new(&graph)) {
-            Ok((_, created)) => queued |= created,
-            Err(error) => tracing::warn!(%error, "damaged search graph could not be queued"),
-        }
-    }
-    queued
 }
 
 fn drain_search_slice(
