@@ -280,7 +280,7 @@ fn join_fixture(skew: usize) -> (tempfile::TempDir, CraqleNode) {
 }
 
 #[test]
-fn scoped_plan_ignores_unrelated() {
+fn plan_ignores_unrelated() {
     const JOIN: &str =
         "SELECT ?l ?r WHERE { ?l <urn:test:scope:left> ?k . ?r <urn:test:scope:right> ?k }";
     let plan = |skew| {
