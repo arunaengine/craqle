@@ -755,6 +755,8 @@ enum GraphScope<'a> {
 thread_local! {
     /// Evaluations on this thread that collected per-operator statistics.
     static DETAILED_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Native graph-level evaluations on this thread.
+    pub(crate) static GRAPH_DISTINCT_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Small graph sets populate spareval's named graph list. Larger sets use the
@@ -872,6 +874,7 @@ impl SparqlEngine {
                 options,
                 fast_path: fast_path.as_ref(),
                 graph: single_graph(scope),
+                graph_distinct: false,
             },
         )?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
@@ -1012,6 +1015,7 @@ impl SparqlEngine {
         let rewrite_time = rewrite_started.elapsed();
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
+        let graph_distinct = graph_distinct_plan(&query, options, fast_path.as_ref());
         let features = query_features(&query);
         QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planning_started = Instant::now();
@@ -1022,6 +1026,7 @@ impl SparqlEngine {
                 options,
                 fast_path: fast_path.as_ref(),
                 graph: single_graph(scope),
+                graph_distinct: graph_distinct.is_some(),
             },
         )?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
@@ -1045,6 +1050,7 @@ impl SparqlEngine {
                 plan_fingerprint,
                 planner_trace,
                 fast_path,
+                graph_distinct,
                 logical_operator,
             },
             collect_plan_statistics,
@@ -1116,6 +1122,7 @@ impl SparqlEngine {
         let rewrite_time = rewrite_started.elapsed();
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
+        let graph_distinct = graph_distinct_plan(&query, options, fast_path.as_ref());
         let features = query_features(&query);
         QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planning_started = Instant::now();
@@ -1126,6 +1133,7 @@ impl SparqlEngine {
                 options,
                 fast_path: fast_path.as_ref(),
                 graph: single_graph(scope),
+                graph_distinct: graph_distinct.is_some(),
             },
         )?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
@@ -1149,6 +1157,7 @@ impl SparqlEngine {
                 plan_fingerprint,
                 planner_trace,
                 fast_path,
+                graph_distinct,
                 logical_operator,
             },
             collect_plan_statistics,
@@ -1157,7 +1166,7 @@ impl SparqlEngine {
 
     fn execute_query(
         &self,
-        query: Query,
+        mut query: Query,
         scope: GraphScope<'_>,
         view: &StoreReadView<'_>,
         options: &QueryOptions,
@@ -1177,6 +1186,23 @@ impl SparqlEngine {
             options.limits,
             stages.clock.clone(),
         )?);
+        if let Some(plan) = stages.graph_distinct.take()
+            && context.validation_graph().is_none()
+            && let Some(relation) = crate::graph_distinct::execute(
+                &plan,
+                crate::graph_join::JoinInput {
+                    view,
+                    context: &context,
+                    budget: &budget,
+                },
+            )?
+        {
+            #[cfg(test)]
+            GRAPH_DISTINCT_RUNS.with(|runs| runs.set(runs.get() + 1));
+            let work = &relation.stats;
+            tracing::debug!(target: "craqle::graph_distinct", ?work, "native graph-level relation");
+            crate::graph_distinct::substitute(&plan, &mut query, relation.values);
+        }
         if let Some(plan) = stages.fast_path.take() {
             let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &budget)?;
             let read_statistics = context.snapshot();
@@ -1861,6 +1887,7 @@ struct QueryStageStatistics {
     plan_fingerprint: String,
     planner_trace: PlannerTrace,
     fast_path: Option<FastPathPlan>,
+    graph_distinct: Option<crate::graph_distinct::GraphDistinctPlan>,
     logical_operator: QueryLogicalOperator,
 }
 
@@ -1997,6 +2024,8 @@ struct PlanRequest<'a> {
     fast_path: Option<&'a FastPathPlan>,
     /// The one explicitly selected graph, whose own counters replace store-wide ones.
     graph: Option<TermId>,
+    /// A native graph-level plan replaces the subtree the planner would reorder.
+    graph_distinct: bool,
 }
 
 /// The only graph an explicit scope selects, after removing duplicate names.
@@ -2015,8 +2044,9 @@ fn plan_query(query: &mut Query, request: PlanRequest<'_>) -> Result<PlannerTrac
         options,
         fast_path,
         graph,
+        graph_distinct,
     } = request;
-    if fast_path.is_some_and(|plan| !plan.is_hash_join())
+    if (graph_distinct || fast_path.is_some_and(|plan| !plan.is_hash_join()))
         && matches!(options.join_mode, JoinMode::Auto)
     {
         return Ok(PlannerTrace::default());
@@ -2063,6 +2093,20 @@ fn fast_path_plan(query: &Query, options: &QueryOptions) -> Option<FastPathPlan>
         JoinMode::ForcePropertyStar if plan.is_property_star() => Some(plan),
         JoinMode::ForceLateral | JoinMode::ForceHash | JoinMode::ForcePropertyStar => None,
     }
+}
+
+fn graph_distinct_plan(
+    query: &Query,
+    options: &QueryOptions,
+    fast_path: Option<&FastPathPlan>,
+) -> Option<crate::graph_distinct::GraphDistinctPlan> {
+    if fast_path.is_some()
+        || matches!(options.fast_paths, FastPathMode::Disabled)
+        || !matches!(options.join_mode, JoinMode::Auto)
+    {
+        return None;
+    }
+    crate::graph_distinct::analyze(query)
 }
 
 fn select_fast_path(

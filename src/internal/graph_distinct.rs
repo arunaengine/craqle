@@ -725,3 +725,425 @@ impl Run<'_, '_, '_> {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use oxrdf::NamedNode;
+
+    use super::*;
+    use crate::core::{ActorId, Dot, GraphDiagnostics, GraphId};
+    use crate::query::budget::BudgetShape;
+    use crate::query::context::QueryCancellation;
+    use crate::query::context::ReadContext;
+    use crate::query::deadline::RequestClock;
+    use crate::rdf_read::StoreReadView;
+    use crate::search::SearchIndex;
+    use crate::sparql::{
+        GRAPH_DISTINCT_RUNS, QueryBudget, QueryLimits, QueryOptions, QueryResults, QueryRun,
+        SparqlEngine,
+    };
+    use crate::sparql_fast_path::QueryFastPathMode as FastPathMode;
+    use crate::store::{EncodedQuad, GraphStore, QuadAdd};
+
+    const ABOUT: &str = "urn:t:about";
+    const PART: &str = "urn:t:part";
+    const KEYWORD: &str = "urn:t:keyword";
+    const LICENSE: &str = "urn:t:license";
+    const FORMAT: &str = "urn:t:format";
+    const OPEN: &str = "urn:t:open";
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        store: Arc<GraphStore>,
+        engine: SparqlEngine,
+        counter: std::cell::Cell<u64>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(GraphStore::open(dir.path()).unwrap());
+            let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+            let engine = SparqlEngine::new(store.clone(), search);
+            Self {
+                _dir: dir,
+                store,
+                engine,
+                counter: std::cell::Cell::new(0),
+            }
+        }
+
+        fn add(&self, graph: &str, triple: [&str; 3]) {
+            let graph_id = GraphId::new(graph);
+            if !self.store.contains_graph(&graph_id).unwrap() {
+                self.store.create_graph(&graph_id).unwrap();
+            }
+            let term = |text: &str| {
+                let term = match text.strip_prefix('"') {
+                    Some(literal) => EncodedTerm::from_literal(&Literal::new_simple_literal(
+                        literal.trim_end_matches('"'),
+                    )),
+                    None => EncodedTerm::from_named_node(&NamedNode::new_unchecked(text)),
+                };
+                self.store.resolve_term(&term).unwrap()
+            };
+            self.counter.set(self.counter.get() + 1);
+            let mut batch = self.store.new_batch();
+            self.store
+                .insert_quad(
+                    &mut batch,
+                    QuadAdd {
+                        quad: EncodedQuad {
+                            graph: term(graph),
+                            subject: term(triple[0]),
+                            predicate: term(triple[1]),
+                            object: term(triple[2]),
+                        },
+                        dot: Dot {
+                            actor: ActorId::random(),
+                            counter: self.counter.get(),
+                        },
+                    },
+                )
+                .unwrap();
+            self.store.commit(batch).unwrap();
+        }
+
+        fn run(&self, sparql: &str, fast_paths: FastPathMode) -> Vec<Vec<(String, String)>> {
+            let options = QueryOptions {
+                fast_paths,
+                ..QueryOptions::default()
+            };
+            let hidden = |_: &crate::store::StoreReadSnapshot, graph: &GraphId| {
+                !graph.as_str().ends_with("hidden")
+            };
+            let (_, execution) = self
+                .engine
+                .query_with_options(
+                    QueryRun {
+                        sparql,
+                        options: &options,
+                    },
+                    &hidden,
+                )
+                .unwrap();
+            let QueryResults::Solutions(rows) = execution.results else {
+                panic!("expected solutions");
+            };
+            rows.into_iter()
+                .map(|row: HashMap<String, EncodedTerm>| {
+                    let mut row: Vec<(String, String)> =
+                        row.into_iter().map(|(name, term)| (name, term.0)).collect();
+                    row.sort();
+                    row
+                })
+                .collect()
+        }
+
+        /// Asserts agreement for each forced access method and the automatic choice.
+        fn compare(&self, sparql: &str, native: bool) -> Vec<Vec<(String, String)>> {
+            let mut first = None;
+            for method in [
+                Some(Method::Scan),
+                Some(Method::Probe),
+                Some(Method::GraphScan),
+                None,
+            ] {
+                FORCED_METHOD.with(|forced| forced.set(method));
+                let rows = self.compare_once(sparql, native);
+                FORCED_METHOD.with(|forced| forced.set(None));
+                first.get_or_insert(rows);
+            }
+            first.expect("one method ran")
+        }
+
+        fn compare_once(&self, sparql: &str, native: bool) -> Vec<Vec<(String, String)>> {
+            let runs = || GRAPH_DISTINCT_RUNS.with(std::cell::Cell::get);
+            let before = runs();
+            let fast = self.run(sparql, FastPathMode::Auto);
+            assert_eq!(
+                runs() - before,
+                usize::from(native),
+                "admission of {sparql}"
+            );
+            let slow = self.run(sparql, FastPathMode::Disabled);
+            assert_eq!(runs() - before, usize::from(native));
+            let ordered = sparql.contains("ORDER BY");
+            let (mut left, mut right) = (fast.clone(), slow);
+            if !ordered {
+                left.sort();
+                right.sort();
+            }
+            assert_eq!(left, right, "{sparql}");
+            fast
+        }
+    }
+
+    /// Crates with adversarial near-misses around one root-level match shape.
+    fn crates() -> Fixture {
+        let fixture = Fixture::new();
+        for index in 0..6 {
+            let graph = format!("urn:t:g{index}");
+            let file = format!("{graph}/file");
+            fixture.add(&graph, ["urn:t:descriptor", ABOUT, &graph]);
+            fixture.add(&graph, [&graph, KEYWORD, "\"soil\""]);
+            fixture.add(&graph, [&graph, LICENSE, OPEN]);
+            fixture.add(&graph, [&graph, PART, &file]);
+            fixture.add(&graph, [&file, FORMAT, "\"text/csv\""]);
+            fixture.add(&graph, [&file, FORMAT, "\"text/plain\""]);
+        }
+        // The format belongs to a nested file that is not a direct child.
+        fixture.add("urn:t:g1", ["urn:t:g1/file", FORMAT, "\"x\""]);
+        fixture.add("urn:t:g6", ["urn:t:descriptor", ABOUT, "urn:t:g6"]);
+        fixture.add("urn:t:g6", ["urn:t:g6", KEYWORD, "\"soil\""]);
+        fixture.add("urn:t:g6", ["urn:t:g6", LICENSE, OPEN]);
+        fixture.add("urn:t:g6", ["urn:t:g6", PART, "urn:t:g6/a"]);
+        fixture.add("urn:t:g6", ["urn:t:g6/a", PART, "urn:t:g6/b"]);
+        fixture.add("urn:t:g6", ["urn:t:g6/b", FORMAT, "\"text/csv\""]);
+        // A non-root entity carries the keyword and license.
+        fixture.add("urn:t:g7", ["urn:t:descriptor", ABOUT, "urn:t:g7"]);
+        fixture.add("urn:t:g7", ["urn:t:g7/other", KEYWORD, "\"soil\""]);
+        fixture.add("urn:t:g7", ["urn:t:g7/other", LICENSE, OPEN]);
+        fixture.add("urn:t:g7", ["urn:t:g7", PART, "urn:t:g7/file"]);
+        fixture.add("urn:t:g7", ["urn:t:g7/file", FORMAT, "\"text/csv\""]);
+        // Only the wrong file has the format.
+        fixture.add("urn:t:g8", ["urn:t:descriptor", ABOUT, "urn:t:g8"]);
+        fixture.add("urn:t:g8", ["urn:t:g8", KEYWORD, "\"soil\""]);
+        fixture.add("urn:t:g8", ["urn:t:g8", LICENSE, OPEN]);
+        fixture.add("urn:t:g8", ["urn:t:g8", PART, "urn:t:g8/a"]);
+        fixture.add("urn:t:g8", ["urn:t:g8/b", FORMAT, "\"text/csv\""]);
+        // Hidden graphs and orphaned witnesses must not contribute.
+        let hidden = "urn:t:hidden";
+        fixture.add(hidden, ["urn:t:descriptor", ABOUT, hidden]);
+        fixture.add(hidden, [hidden, KEYWORD, "\"soil\""]);
+        fixture.add(hidden, [hidden, LICENSE, OPEN]);
+        fixture.add(hidden, [hidden, PART, "urn:t:hidden/file"]);
+        fixture.add(hidden, ["urn:t:hidden/file", FORMAT, "\"text/csv\""]);
+        fixture.add("urn:t:g9", ["urn:t:descriptor", ABOUT, "urn:t:g9"]);
+        fixture.add("urn:t:g9", ["urn:t:g9", KEYWORD, "\"soil\""]);
+        fixture.add("urn:t:g9", ["urn:t:g9", LICENSE, OPEN]);
+        fixture.add("urn:t:g9", ["urn:t:g9", PART, "urn:t:g9/orphan"]);
+        fixture.add("urn:t:g9", ["urn:t:g9/orphan", FORMAT, "\"text/csv\""]);
+        fixture
+            .store
+            .set_graph_diagnostics(
+                &GraphId::new("urn:t:g9"),
+                &GraphDiagnostics::from_orphaned_entities(vec!["urn:t:g9/orphan".to_owned()]),
+            )
+            .unwrap();
+        // Several descriptors and duplicate witnesses in one graph.
+        fixture.add("urn:t:g2", ["urn:t:descriptor2", ABOUT, "urn:t:g2"]);
+        for file in 0..5 {
+            let file = format!("urn:t:g2/extra{file}");
+            fixture.add("urn:t:g2", ["urn:t:g2", PART, &file]);
+            fixture.add("urn:t:g2", [&file, FORMAT, "\"text/csv\""]);
+        }
+        fixture
+    }
+
+    #[test]
+    fn root_match_equivalent() {
+        let fixture = crates();
+        let rows = fixture.compare(
+            &format!(
+                "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?d <{ABOUT}> ?g . \
+                 ?g <{KEYWORD}> \"soil\" ; <{LICENSE}> <{OPEN}> ; <{PART}> ?f . \
+                 ?f <{FORMAT}> \"text/csv\" }} }} ORDER BY ?g"
+            ),
+            true,
+        );
+        let graphs: Vec<&str> = rows.iter().map(|row| row[0].1.as_str()).collect();
+        assert_eq!(
+            graphs,
+            [
+                "<urn:t:g0>",
+                "<urn:t:g1>",
+                "<urn:t:g2>",
+                "<urn:t:g3>",
+                "<urn:t:g4>",
+                "<urn:t:g5>"
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_counts_equivalent() {
+        let fixture = crates();
+        for pattern in [
+            format!("?g <{LICENSE}> ?value"),
+            format!("?g <{PART}> ?f . ?f <{FORMAT}> ?value"),
+            format!("?g <{KEYWORD}> ?value"),
+        ] {
+            fixture.compare(
+                &format!(
+                    "SELECT ?value (COUNT(DISTINCT ?g) AS ?crates) WHERE {{ GRAPH ?g {{ \
+                     ?d <{ABOUT}> ?g . {pattern} }} }} GROUP BY ?value ORDER BY ?value"
+                ),
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn related_shapes_equivalent() {
+        let fixture = crates();
+        let native = [
+            format!("SELECT DISTINCT ?g ?f WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+            format!("SELECT REDUCED ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+            format!(
+                "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }} \
+                 ORDER BY DESC(?g) LIMIT 3 OFFSET 1"
+            ),
+            format!("SELECT DISTINCT ?f WHERE {{ GRAPH ?g {{ ?x <{PART}> ?f . ?f ?p ?f2 }} }}"),
+            format!("SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ _:root <{PART}> ?f }} }}"),
+            format!("SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?x <{PART}> ?x }} }}"),
+            "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?g <urn:t:absent> ?x } }".to_owned(),
+            format!("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+            "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?g <urn:t:absent> ?x } }"
+                .to_owned(),
+            "SELECT ?value (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { \
+                 ?g <urn:t:absent> ?value } } GROUP BY ?value"
+                .to_owned(),
+            format!(
+                "SELECT ?g (COUNT(DISTINCT ?g) AS ?n) WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }} \
+                 GROUP BY ?g HAVING (COUNT(DISTINCT ?g) > 0)"
+            ),
+            "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }".to_owned(),
+        ];
+        for query in native {
+            fixture.compare(&query, true);
+        }
+        let fallback = [
+            format!("SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+            format!("SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }} ORDER BY ?f"),
+            format!(
+                "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f \
+                 OPTIONAL {{ ?f <{FORMAT}> ?x }} }} }}"
+            ),
+            format!(
+                "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f \
+                 FILTER(?f != ?g) }} }}"
+            ),
+            format!(
+                "SELECT ?value (COUNT(?g) AS ?n) WHERE {{ GRAPH ?g {{ ?g <{LICENSE}> ?value }} }} \
+                 GROUP BY ?value"
+            ),
+            format!(
+                "SELECT ?value (COUNT(DISTINCT ?f) AS ?n) WHERE {{ GRAPH ?g {{ \
+                 ?g <{PART}> ?f . ?f <{FORMAT}> ?value }} }} GROUP BY ?value"
+            ),
+            format!("SELECT DISTINCT ?g WHERE {{ GRAPH <urn:t:g0> {{ ?g <{PART}> ?f }} }}"),
+            format!("SELECT DISTINCT ?x WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+        ];
+        for query in fallback {
+            fixture.compare(&query, false);
+        }
+    }
+
+    /// Deterministic small random graphs keep repeated terms, copies and near misses likely.
+    #[test]
+    fn random_graphs_equivalent() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for _ in 0..4 {
+            let fixture = Fixture::new();
+            for _ in 0..60 {
+                let graph = format!("urn:t:r{}", next(4));
+                let node = |value: u64| match value {
+                    0 => graph.clone(),
+                    value => format!("urn:t:n{value}"),
+                };
+                let subject = node(next(5));
+                let predicate = format!("urn:t:p{}", next(3));
+                let object = if next(4) == 0 {
+                    format!("\"v{}\"", next(3))
+                } else {
+                    node(next(5))
+                };
+                fixture.add(&graph, [&subject, &predicate, &object]);
+            }
+            for query in [
+                "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?g <urn:t:p0> ?x . ?x <urn:t:p1> ?y } }",
+                "SELECT DISTINCT ?g ?y WHERE { GRAPH ?g { ?a <urn:t:p0> ?x . ?x <urn:t:p1> ?y } }",
+                "SELECT ?y (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?x <urn:t:p2> ?y . \
+                 ?x <urn:t:p0> ?z } } GROUP BY ?y",
+                "SELECT ?p (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?g ?p ?x } } GROUP BY ?p",
+                "SELECT DISTINCT ?x WHERE { GRAPH ?g { ?x <urn:t:p1> ?x } }",
+            ] {
+                fixture.compare(query, true);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_witnesses_bounded() {
+        let fixture = crates();
+        let query = format!(
+            "SELECT ?value (COUNT(DISTINCT ?g) AS ?n) WHERE {{ GRAPH ?g {{ \
+             ?g <{PART}> ?f . ?f <{FORMAT}> ?value }} }} GROUP BY ?value"
+        );
+        let work = |fixture: &Fixture| work(fixture, &query);
+        let before = work(&fixture);
+        for file in 0..50 {
+            let file = format!("urn:t:g3/copy{file}");
+            fixture.add("urn:t:g3", ["urn:t:g3", PART, &file]);
+            fixture.add("urn:t:g3", [&file, FORMAT, "\"text/csv\""]);
+        }
+        let after = work(&fixture);
+        assert!(after.reads.scanned > before.reads.scanned);
+        assert_eq!(after.retained, before.retained);
+    }
+
+    #[test]
+    fn budget_errors_explicit() {
+        let fixture = crates();
+        let mut options = QueryOptions::default();
+        options.limits.max_hash_entries = 2;
+        let result = fixture.engine.query_with_options(
+            QueryRun {
+                sparql: &format!("SELECT DISTINCT ?g ?f WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+                options: &options,
+            },
+            &|_, _| true,
+        );
+        assert!(result.is_err());
+
+        let options = QueryOptions::default();
+        options.cancellation.cancel();
+        let result = fixture.engine.query_with_options(
+            QueryRun {
+                sparql: &format!("SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{PART}> ?f }} }}"),
+                options: &options,
+            },
+            &|_, _| true,
+        );
+        assert!(result.is_err());
+    }
+
+    fn work(fixture: &Fixture, sparql: &str) -> GraphDistinctStats {
+        let query = spargebra::SparqlParser::new().parse_query(sparql).unwrap();
+        let plan = analyze(&query).unwrap();
+        let view = StoreReadView::new(&fixture.store);
+        let context = ReadContext::new(QueryCancellation::new());
+        let budget = QueryBudget::new(
+            BudgetShape::default(),
+            QueryLimits::default(),
+            RequestClock::start(None, QueryCancellation::new(), std::time::Instant::now()),
+        )
+        .unwrap();
+        let input = JoinInput {
+            view: &view,
+            context: &context,
+            budget: &budget,
+        };
+        execute(&plan, input).unwrap().unwrap().stats
+    }
+}
