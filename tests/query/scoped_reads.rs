@@ -49,11 +49,10 @@ fn iri(value: &str) -> EncodedTerm {
     EncodedTerm(format!("<{value}>"))
 }
 
+/// Inserts one `(subject, predicate, object)` triple into a graph.
 fn quad(
     graph: &GraphId,
-    subject: &str,
-    predicate: &str,
-    object: EncodedTerm,
+    (subject, predicate, object): (&str, &str, EncodedTerm),
 ) -> MaterializedQuadChange {
     MaterializedQuadChange::Insert {
         graph: graph.clone(),
@@ -77,16 +76,18 @@ fn fixture(unrelated: usize) -> (tempfile::TempDir, CraqleNode) {
         let subject = format!("urn:test:scope:s:{index}");
         for value in ["alpha", "beta"] {
             let name = EncodedTerm(format!("\"{value} {index}\""));
-            changes.push(quad(&target, &subject, NAME, name));
+            changes.push(quad(&target, (&subject, NAME, name)));
         }
         let next = format!("urn:test:scope:s:{}", (index + 1) % 6);
-        changes.push(quad(&target, &subject, KNOWS, iri(&next)));
+        changes.push(quad(&target, (&subject, KNOWS, iri(&next))));
     }
     changes.push(quad(
         &target,
-        "urn:test:scope:s:gone",
-        NAME,
-        EncodedTerm("\"gone\"".into()),
+        (
+            "urn:test:scope:s:gone",
+            NAME,
+            EncodedTerm("\"gone\"".into()),
+        ),
     ));
     node.apply_changes_unchecked(&target, changes).unwrap();
     node.apply_changes_unchecked(
@@ -103,15 +104,15 @@ fn fixture(unrelated: usize) -> (tempfile::TempDir, CraqleNode) {
     let copies = vec![
         quad(
             &shared,
-            "urn:test:scope:s:0",
-            KNOWS,
-            iri("urn:test:scope:s:1"),
+            ("urn:test:scope:s:0", KNOWS, iri("urn:test:scope:s:1")),
         ),
         quad(
             &shared,
-            "urn:test:scope:s:gone",
-            NAME,
-            EncodedTerm("\"gone\"".into()),
+            (
+                "urn:test:scope:s:gone",
+                NAME,
+                EncodedTerm("\"gone\"".into()),
+            ),
         ),
     ];
     node.apply_changes_unchecked(&shared, copies).unwrap();
@@ -120,8 +121,8 @@ fn fixture(unrelated: usize) -> (tempfile::TempDir, CraqleNode) {
             let subject = format!("urn:test:scope:noise:{index}");
             let name = EncodedTerm(format!("\"noise {index}\""));
             [
-                quad(&other, &subject, NAME, name),
-                quad(&other, &subject, KNOWS, iri("urn:test:scope:s:1")),
+                quad(&other, (&subject, NAME, name)),
+                quad(&other, (&subject, KNOWS, iri("urn:test:scope:s:1"))),
             ]
         })
         .collect();
