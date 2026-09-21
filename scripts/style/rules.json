@@ -38,9 +38,10 @@
       "members": [
         "case.rs",
         "main.rs",
+        "oracle.rs",
         "reads.rs"
       ],
-      "reason": "The three files form the consistency benchmark catalog domain.",
+      "reason": "The four files form the consistency benchmark catalog domain.",
       "source": "Aruna STYLE.md shared-prefix rule"
     },
     {

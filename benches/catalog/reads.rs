@@ -13,29 +13,8 @@ use craqle::{
 };
 use serde_json::{Value, json};
 
+use super::catalog_oracle::{Expected, Fixture, canonical_rows, check_hits, check_rows, expected};
 use super::{Case, case_seed, graph_id, open_node, prepare_node, settle};
-
-/// How a read's answer is compared across readers and against its expected size.
-#[derive(Clone, Copy)]
-enum RowCheck {
-    /// Complete solutions compared as a multiset in a fixed variable order.
-    Multiset,
-    /// Rows whose order is part of the answer.
-    Ordered,
-    /// A limit without ordering: any subset of fixture subjects of the expected size.
-    Limited,
-}
-
-/// One read case with the exact row count every correct answer has.
-#[derive(Clone)]
-struct ReadQuery {
-    text: String,
-    expected: usize,
-    check: RowCheck,
-    /// Fixture seed and subject count that every limited answer must come from.
-    seed: usize,
-    rows: usize,
-}
 
 /// Results of one measured read, validated after its timer stops.
 enum ReadOutput {
@@ -51,7 +30,13 @@ pub(super) fn run_reads(path: &Path, case: &Case) -> Value {
     let prepare_ns = prepare_started.elapsed().as_nanos();
     let readers = case.usize("readers", 1).max(1);
     let warm = case.text("cache", "cold") == "warm";
-    let query = read_query(case, preloaded);
+    let fixture = Fixture {
+        seed: case_seed(case),
+        rows: preloaded,
+        graphs: case.usize("graphs", 1).max(1),
+    };
+    let name = case.text("query", case.text("selectivity", "default"));
+    let query = expected(name, &fixture).unwrap_or_else(|reason| panic!("{reason}"));
     let prepared = (!query.text.starts_with("fts:"))
         .then(|| Arc::new(node.prepare_query(&query.text).unwrap()));
     let barrier = Arc::new(Barrier::new(readers));
@@ -86,7 +71,8 @@ pub(super) fn run_reads(path: &Path, case: &Case) -> Value {
         let end_offset = start_offset + elapsed;
         first_end = Some(first_end.map_or(end_offset, |value| value.min(end_offset)));
         latency_ns.push(elapsed);
-        digests.push(validate(&query, output));
+        let accepted = validate(&query, &output);
+        digests.push(accepted.unwrap_or_else(|reason| panic!("{}: {reason}", query.text)));
     }
     assert!(
         digests.windows(2).all(|pair| pair[0] == pair[1]),
@@ -116,7 +102,7 @@ pub(super) fn run_reads(path: &Path, case: &Case) -> Value {
         "prepare_ns": prepare_ns,
         "work_ns": latency_ns.iter().sum::<u128>(),
         "latency_ns": latency_ns,
-        "result_rows": query.expected,
+        "result_rows": query.rows(),
         "counter_run": counters.map(read_counters),
         "output_digest": digests.first().cloned().unwrap_or_default(),
     })
@@ -164,121 +150,11 @@ fn run_query(node: &CraqleNode, query: &str, prepared: Option<&PreparedQuery>) -
     )
 }
 
-/// Checks the exact row count and returns a digest that is equal for every correct answer.
-fn validate(query: &ReadQuery, output: ReadOutput) -> String {
-    let lines: Vec<String> = match output {
-        ReadOutput::Hits(hits) => hits
-            .into_iter()
-            .map(|(graph, subject)| format!("{graph}\u{1f}{subject}"))
-            .collect(),
-        ReadOutput::Rows(QueryResults::Solutions(solutions)) => solutions
-            .into_iter()
-            .map(|row| {
-                let mut cells: Vec<String> = row
-                    .into_iter()
-                    .map(|(name, term)| format!("{name}={}", term.0))
-                    .collect();
-                cells.sort();
-                cells.join("\u{1f}")
-            })
-            .collect(),
-        ReadOutput::Rows(other) => vec![format!("{other:?}")],
-    };
-    assert_eq!(
-        query.expected,
-        lines.len(),
-        "{} returned the wrong number of rows",
-        query.text
-    );
-    let mut lines = lines;
-    match query.check {
-        RowCheck::Ordered => {}
-        RowCheck::Multiset => lines.sort(),
-        RowCheck::Limited => {
-            let prefix = format!("s=<urn:catalog:s:{}:", query.seed);
-            for line in &lines {
-                let index = line
-                    .strip_prefix(&prefix)
-                    .and_then(|rest| rest.strip_suffix('>'))
-                    .and_then(|index| index.parse::<usize>().ok());
-                assert!(
-                    index.is_some_and(|index| index < query.rows),
-                    "{line} is not a fixture subject"
-                );
-            }
-            return format!("limited:{}", lines.len());
-        }
-    }
-    blake3::hash(lines.join("\n").as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-/// Builds each read from the fixture's own seed, with its exact expected row count.
-fn read_query(case: &Case, rows: usize) -> ReadQuery {
-    let seed = case_seed(case);
-    let page = rows.min(100);
-    let (text, expected, check) = match case.text("query", case.text("selectivity", "default")) {
-        "fts" => ("fts:catalog".to_owned(), page, RowCheck::Ordered),
-        "values" => (
-            format!("SELECT ?s WHERE {{ VALUES ?s {{ <urn:catalog:s:{seed}:0> }} ?s ?p ?o }}"),
-            1,
-            RowCheck::Multiset,
-        ),
-        "join" => (
-            "SELECT ?s WHERE { ?s <urn:catalog:p> ?o . ?s <urn:catalog:p> ?x }".to_owned(),
-            rows,
-            RowCheck::Multiset,
-        ),
-        "sort" => (
-            "SELECT ?s WHERE { ?s <urn:catalog:p> ?o } ORDER BY ?o LIMIT 100".to_owned(),
-            page,
-            RowCheck::Ordered,
-        ),
-        "distinct" => (
-            "SELECT DISTINCT ?o WHERE { ?s <urn:catalog:p> ?o }".to_owned(),
-            rows,
-            RowCheck::Multiset,
-        ),
-        "group" => (
-            "SELECT (COUNT(?s) AS ?count) WHERE { ?s <urn:catalog:p> ?o }".to_owned(),
-            1,
-            RowCheck::Multiset,
-        ),
-        "string" => (
-            "SELECT ?s WHERE { ?s <urn:catalog:p> ?o FILTER(CONTAINS(STR(?o), \"token\")) }"
-                .to_owned(),
-            rows,
-            RowCheck::Multiset,
-        ),
-        "path" => (
-            "SELECT ?s WHERE { ?s <urn:catalog:p>+ ?o } LIMIT 100".to_owned(),
-            page,
-            RowCheck::Limited,
-        ),
-        "high" => (
-            format!("SELECT ?s WHERE {{ ?s <urn:catalog:p> \"catalog token {seed} 0\" }}"),
-            1,
-            RowCheck::Multiset,
-        ),
-        // A lookup that must find nothing, kept apart from the positive cases.
-        "absent" => (
-            "SELECT ?s WHERE { ?s <urn:catalog:p> \"catalog token absent\" }".to_owned(),
-            0,
-            RowCheck::Multiset,
-        ),
-        _ => (
-            "SELECT ?s WHERE { ?s <urn:catalog:p> ?o } LIMIT 100".to_owned(),
-            page,
-            RowCheck::Limited,
-        ),
-    };
-    ReadQuery {
-        text,
-        expected,
-        check,
-        seed,
-        rows,
+/// Checks one output against the fixture's independent answer, after its timer stopped.
+fn validate(query: &Expected, output: &ReadOutput) -> Result<String, String> {
+    match output {
+        ReadOutput::Hits(hits) => check_hits(query, hits),
+        ReadOutput::Rows(results) => check_rows(query, canonical_rows(results, query.variables)?),
     }
 }
 

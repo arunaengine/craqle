@@ -8,6 +8,8 @@ use std::time::Instant;
 
 #[path = "case.rs"]
 mod catalog_case;
+#[path = "oracle.rs"]
+mod catalog_oracle;
 #[path = "reads.rs"]
 mod catalog_reads;
 
