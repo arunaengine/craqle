@@ -233,3 +233,67 @@ fn unrelated_rows_unread() {
         );
     }
 }
+
+/// Left and right join rows in the target, plus `skew` right rows elsewhere on three keys.
+fn join_fixture(skew: usize) -> (tempfile::TempDir, CraqleNode) {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let [target, other] = [TARGET, UNRELATED].map(GraphId::new);
+    let key = |index: usize| iri(&format!("urn:test:scope:key:{index}"));
+    let mut rows = Vec::new();
+    for index in 0..400 {
+        rows.push(quad(
+            &target,
+            (
+                &format!("urn:test:scope:l:{index}"),
+                "urn:test:scope:left",
+                key(index % 100),
+            ),
+        ));
+        rows.push(quad(
+            &target,
+            (
+                &format!("urn:test:scope:r:{index}"),
+                "urn:test:scope:right",
+                key(index % 100),
+            ),
+        ));
+    }
+    node.apply_changes_unchecked(&target, rows).unwrap();
+    let skewed: Vec<_> = (0..skew)
+        .map(|index| {
+            quad(
+                &other,
+                (
+                    &format!("urn:test:scope:x:{index}"),
+                    "urn:test:scope:right",
+                    key(index % 3),
+                ),
+            )
+        })
+        .collect();
+    for chunk in skewed.chunks(10_000) {
+        node.apply_changes_unchecked(&other, chunk.to_vec())
+            .unwrap();
+    }
+    (directory, node)
+}
+
+#[test]
+fn scoped_plan_ignores_unrelated() {
+    const JOIN: &str =
+        "SELECT ?l ?r WHERE { ?l <urn:test:scope:left> ?k . ?r <urn:test:scope:right> ?k }";
+    let plan = |skew| {
+        let (_directory, node) = join_fixture(skew);
+        let run = scoped(&node, &[TARGET], JOIN);
+        let joins: Vec<_> = run
+            .statistics
+            .planned_joins
+            .iter()
+            .map(|join| join.physical_operator)
+            .collect();
+        (joins, canonical(run.results, false))
+    };
+    // Store-wide counts once chose a lateral join here because of rows the query never reads.
+    assert_eq!(plan(0), plan(10_000));
+}

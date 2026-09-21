@@ -865,7 +865,15 @@ impl SparqlEngine {
         let fast_path = fast_path_plan(&query, options);
         let features = query_features(&query);
         QueryBudget::new(features.budget, options.limits, clock.clone())?;
-        let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
+        let planner_trace = plan_query(
+            &mut query,
+            PlanRequest {
+                store: &self.store,
+                options,
+                fast_path: fast_path.as_ref(),
+                graph: single_graph(scope),
+            },
+        )?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
         clock.check_stage()?;
         let features = query_features(&query);
@@ -1007,7 +1015,15 @@ impl SparqlEngine {
         let features = query_features(&query);
         QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planning_started = Instant::now();
-        let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
+        let planner_trace = plan_query(
+            &mut query,
+            PlanRequest {
+                store: &self.store,
+                options,
+                fast_path: fast_path.as_ref(),
+                graph: single_graph(scope),
+            },
+        )?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
         if options.optimize {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
@@ -1103,7 +1119,15 @@ impl SparqlEngine {
         let features = query_features(&query);
         QueryBudget::new(features.budget, options.limits, clock.clone())?;
         let planning_started = Instant::now();
-        let planner_trace = plan_query(&mut query, &self.store, options, fast_path.as_ref())?;
+        let planner_trace = plan_query(
+            &mut query,
+            PlanRequest {
+                store: &self.store,
+                options,
+                fast_path: fast_path.as_ref(),
+                graph: single_graph(scope),
+            },
+        )?;
         let fast_path = select_fast_path(fast_path, &planner_trace);
         if options.optimize {
             tracing::trace!(target: "craqle::planner", plan = %query, "craqle-optimized query");
@@ -1961,12 +1985,32 @@ fn query_fingerprint(query: &Query) -> String {
         .to_string()
 }
 
-fn plan_query(
-    query: &mut Query,
-    store: &GraphStore,
-    options: &QueryOptions,
-    fast_path: Option<&FastPathPlan>,
-) -> Result<PlannerTrace> {
+/// What one planning pass may read: statistics, options, the admitted fast path, and scope.
+struct PlanRequest<'a> {
+    store: &'a GraphStore,
+    options: &'a QueryOptions,
+    fast_path: Option<&'a FastPathPlan>,
+    /// The one explicitly selected graph, whose own counters replace store-wide ones.
+    graph: Option<TermId>,
+}
+
+/// The only graph an explicit scope selects, after removing duplicate names.
+fn single_graph(scope: GraphScope<'_>) -> Option<TermId> {
+    let GraphScope::List([first, rest @ ..]) = scope else {
+        return None;
+    };
+    rest.iter()
+        .all(|graph| graph == first)
+        .then(|| crate::store::hash_term(&EncodedTerm::from_named_node(&first.0)))
+}
+
+fn plan_query(query: &mut Query, request: PlanRequest<'_>) -> Result<PlannerTrace> {
+    let PlanRequest {
+        store,
+        options,
+        fast_path,
+        graph,
+    } = request;
     if fast_path.is_some_and(|plan| !plan.is_hash_join())
         && matches!(options.join_mode, JoinMode::Auto)
     {
@@ -1997,6 +2041,7 @@ fn plan_query(
         crate::planner::PlanMode {
             join: options.join_mode,
             collect_costs: options.collect_costs,
+            graph,
         },
     )
     .map_err(|error| SparqlError::Planning(error.to_string()))

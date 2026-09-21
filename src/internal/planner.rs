@@ -13,7 +13,7 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
 use crate::query::context::{CostStatistics, QueryCost};
-use crate::store::{GraphStore, PlannerEstimate, PlannerStat};
+use crate::store::{GraphStore, PlannerEstimate, PlannerStat, TermId};
 
 /// Test and benchmark control for connected BGP join selection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -61,6 +61,8 @@ pub(crate) struct PlannerTrace {
 pub(crate) struct PlanMode {
     pub(crate) join: JoinMode,
     pub(crate) collect_costs: bool,
+    /// The one graph a query reads, whose own counters replace store-wide estimates.
+    pub(crate) graph: Option<TermId>,
 }
 
 /// Per-pass planner state that memoizes constant term ids but never transient errors.
@@ -74,6 +76,7 @@ struct PlanCtx<'a> {
     costs: QueryCost,
     stats: RefCell<HashMap<PlannerStat, PlannerEstimate>>,
     row_demand: Cell<Option<u64>>,
+    graph: Option<TermId>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -88,10 +91,22 @@ impl<'a> PlanCtx<'a> {
             costs: QueryCost::planner(mode.collect_costs),
             stats: RefCell::new(HashMap::new()),
             row_demand: Cell::new(None),
+            graph: mode.graph,
         }
     }
 
     fn stat(&self, stat: PlannerStat) -> PlannerEstimate {
+        // Exact per-graph counters exist for these; other estimates stay store-wide bounds.
+        let stat = match (self.graph, stat) {
+            (Some(graph), PlannerStat::Predicate(predicate)) => {
+                PlannerStat::GraphPredicate(graph, predicate)
+            }
+            (Some(graph), PlannerStat::PredicateObject(predicate, object)) => {
+                PlannerStat::GraphPredicateObject(graph, predicate, object)
+            }
+            (Some(graph), PlannerStat::Total) => PlannerStat::Graph(graph),
+            (_, stat) => stat,
+        };
         if let Some(value) = self.stats.borrow().get(&stat).copied() {
             self.costs.planner_memo(true);
             return value;
@@ -137,6 +152,7 @@ pub(crate) fn optimize_with_mode(
         PlanMode {
             join: join_mode,
             collect_costs: false,
+            graph: None,
         },
     )
 }
@@ -1468,6 +1484,7 @@ mod tests {
             PlanMode {
                 join: JoinMode::Auto,
                 collect_costs: true,
+                graph: None,
             },
         );
         let first = cx.stat(PlannerStat::Total);

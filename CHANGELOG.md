@@ -35,6 +35,8 @@ All notable changes to Craqle are documented here.
   including counts from its per-graph counters, instead of scanning the union of all
   graphs and discarding rows from others. Results are unchanged. Larger graph lists
   and policy-based default unions still use the union scan with visibility checks.
+- Join planning for one explicit graph estimates predicate and total rows from that
+  graph's own counters, so unrelated graphs no longer change the chosen join.
 - Default-union queries, statistics, prepared execution, explain, and analyze fail
   with the store error when a graph policy cannot be read. Earlier versions hid
   that graph and could return fewer rows, a smaller count, or a false `ASK`.

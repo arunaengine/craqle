@@ -1077,6 +1077,9 @@ type PlannerCacheKey = (u64, StatRevision, Option<QueryTermId>, DistinctDomain);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum PlannerStat {
+    Graph(TermId),
+    GraphPredicate(TermId, TermId),
+    GraphPredicateObject(TermId, TermId, TermId),
     PredicateObject(TermId, TermId),
     Predicate(TermId),
     PredicateSubjects(TermId),
@@ -6821,7 +6824,37 @@ impl GraphStore {
             object,
             ..crate::rdf_read::QuadPattern::default()
         };
+        let counter = |stat: QvStat, pattern: crate::rdf_read::QuadPattern| {
+            self.read_snapshot()
+                .qv_stat(self, &QvRead { stat, costs })
+                .ok()
+                .flatten()
+                .and_then(|count| usize::try_from(count).ok())
+                .map(PlannerEstimate::Exact)
+                .unwrap_or_else(|| self.source_pattern_count(pattern, costs))
+        };
         match stat {
+            PlannerStat::Graph(graph) => counter(
+                QvStat::Graph(graph),
+                crate::rdf_read::QuadPattern {
+                    graph: Some(graph),
+                    ..pattern(None, None, None)
+                },
+            ),
+            PlannerStat::GraphPredicate(graph, predicate) => counter(
+                QvStat::GraphPredicate(graph, predicate),
+                crate::rdf_read::QuadPattern {
+                    graph: Some(graph),
+                    ..pattern(None, Some(predicate), None)
+                },
+            ),
+            PlannerStat::GraphPredicateObject(graph, predicate, object) => counter(
+                QvStat::GraphPredicateObject(graph, predicate, object),
+                crate::rdf_read::QuadPattern {
+                    graph: Some(graph),
+                    ..pattern(None, Some(predicate), Some(object))
+                },
+            ),
             PlannerStat::PredicateObject(predicate, object) => {
                 let snapshot = self.read_snapshot();
                 snapshot
