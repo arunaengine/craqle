@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Included};
 use std::path::Path;
@@ -2414,6 +2415,18 @@ pub(crate) struct QueryIndexAdmission {
 #[derive(Clone)]
 pub(crate) struct StoreReadSnapshot {
     snapshot: Snapshot,
+    /// The active index slot is fixed for this snapshot's sequence, so the
+    /// header is decoded at most once per snapshot.
+    active_slot: OnceCell<Option<IndexSlot>>,
+}
+
+impl From<&Snapshot> for StoreReadSnapshot {
+    fn from(snapshot: &Snapshot) -> Self {
+        Self {
+            snapshot: snapshot.clone(),
+            active_slot: OnceCell::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2720,6 +2733,11 @@ impl StoreReadSnapshot {
         self.snapshot.seqno()
     }
 
+    #[must_use]
+    pub(crate) fn snapshot_ref(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
     pub(crate) fn raw_quad_cursor(
         &self,
         store: &GraphStore,
@@ -2757,9 +2775,7 @@ impl StoreReadSnapshot {
         store: &GraphStore,
         scan: &crate::query::cursor::IndexScan<'_>,
     ) -> Result<crate::query::cursor::RawQuadCursor> {
-        let Some((keyspace, query_to_term, prefix)) =
-            store.query_index_range(&self.snapshot, scan)?
-        else {
+        let Some((keyspace, query_to_term, prefix)) = store.query_index_range(self, scan)? else {
             return Ok(crate::query::cursor::RawQuadCursor::empty());
         };
         Ok(crate::query::cursor::RawQuadCursor::query_index(
@@ -2781,7 +2797,7 @@ impl StoreReadSnapshot {
         let resolve = |term: Option<TermId>| -> Result<Option<Option<QueryTermId>>> {
             match term {
                 Some(term) => {
-                    let term = store.snapshot_query_id(&self.snapshot, term)?;
+                    let term = store.snapshot_query_id(self, term)?;
                     scan.costs.forward_mapping(
                         16 + term.map_or(0, |_| std::mem::size_of::<u64>() as u64),
                     );
@@ -2802,9 +2818,7 @@ impl StoreReadSnapshot {
         let Some(object) = resolve(scan.pattern.object)? else {
             return Ok(None);
         };
-        let Some((keyspace, query_to_term, prefix)) =
-            store.query_index_range(&self.snapshot, scan)?
-        else {
+        let Some((keyspace, query_to_term, prefix)) = store.query_index_range(self, scan)? else {
             return Ok(None);
         };
         let filter = crate::query::cursor::RawIndexPattern::new(graph, subject, predicate, object)
@@ -2828,7 +2842,7 @@ impl StoreReadSnapshot {
     }
 
     pub(crate) fn query_index_admission(&self, store: &GraphStore) -> Result<QueryIndexAdmission> {
-        store.snapshot_admission(&self.snapshot)
+        store.snapshot_admission(self.snapshot_ref())
     }
 
     pub(crate) fn query_term_id(
@@ -2836,7 +2850,7 @@ impl StoreReadSnapshot {
         store: &GraphStore,
         term: TermId,
     ) -> Result<(Option<QueryTermId>, Option<u64>)> {
-        let Some(spaces) = store.active_query_spaces(&self.snapshot)? else {
+        let Some(spaces) = store.active_query_spaces(self)? else {
             return Ok((None, None));
         };
         let value = self
@@ -2857,7 +2871,7 @@ impl StoreReadSnapshot {
     pub(crate) fn qv_stat(&self, store: &GraphStore, read: &QvRead<'_>) -> Result<Option<u64>> {
         let map = |term: TermId| -> Result<Option<QueryTermId>> {
             read.costs.planner_points(1);
-            let Some(spaces) = store.active_query_spaces(&self.snapshot)? else {
+            let Some(spaces) = store.active_query_spaces(self)? else {
                 return Ok(None);
             };
             let value = self
@@ -2919,7 +2933,7 @@ impl StoreReadSnapshot {
             }
         };
         read.costs.planner_points(2);
-        match store.snapshot_counter(&self.snapshot, key)? {
+        match store.snapshot_counter(self.snapshot_ref(), key)? {
             IndexCounterRead::Value(count) => Ok(Some(count)),
             IndexCounterRead::Missing if zero_missing => Ok(Some(0)),
             IndexCounterRead::Missing | IndexCounterRead::Malformed => Ok(None),
@@ -2933,7 +2947,7 @@ impl StoreReadSnapshot {
         key: IndexCounterKey,
         zero_missing: bool,
     ) -> Result<Option<u64>> {
-        match store.snapshot_counter(&self.snapshot, key)? {
+        match store.snapshot_counter(self.snapshot_ref(), key)? {
             IndexCounterRead::Value(count) => Ok(Some(count)),
             IndexCounterRead::Missing if zero_missing => Ok(Some(0)),
             IndexCounterRead::Missing | IndexCounterRead::Malformed => Ok(None),
@@ -3086,11 +3100,17 @@ impl GraphStore {
         }
     }
 
-    fn active_query_spaces(&self, snapshot: &Snapshot) -> Result<Option<IndexSpaces<'_>>> {
-        let slot = match self.snapshot_index_header(snapshot)? {
-            IndexHeaderRead::Valid(header) => IndexSlot::decode(header.active_slot),
-            IndexHeaderRead::Legacy(_) => Some(IndexSlot::Primary),
-            IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
+    fn active_query_spaces(&self, view: &StoreReadSnapshot) -> Result<Option<IndexSpaces<'_>>> {
+        let slot = match view.active_slot.get() {
+            Some(slot) => *slot,
+            None => {
+                let slot = match self.snapshot_index_header(&view.snapshot)? {
+                    IndexHeaderRead::Valid(header) => IndexSlot::decode(header.active_slot),
+                    IndexHeaderRead::Legacy(_) => Some(IndexSlot::Primary),
+                    IndexHeaderRead::Absent | IndexHeaderRead::Malformed => None,
+                };
+                *view.active_slot.get_or_init(|| slot)
+            }
         };
         Ok(slot.map(|slot| self.query_spaces(slot)))
     }
@@ -3285,11 +3305,15 @@ impl GraphStore {
         self.stage_index_header(batch, &IndexHeader::failed_from(previous, reason));
     }
 
-    fn snapshot_query_id(&self, snapshot: &Snapshot, term: TermId) -> Result<Option<QueryTermId>> {
-        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+    fn snapshot_query_id(
+        &self,
+        view: &StoreReadSnapshot,
+        term: TermId,
+    ) -> Result<Option<QueryTermId>> {
+        let Some(spaces) = self.active_query_spaces(view)? else {
             return Ok(None);
         };
-        snapshot
+        view.snapshot
             .get(spaces.term_to_query, term.to_be_bytes())?
             .map(|value| decode_query_id(value.as_ref(), "term-to-query mapping"))
             .transpose()
@@ -3298,13 +3322,13 @@ impl GraphStore {
     #[cfg(test)]
     fn snapshot_query_quad(
         &self,
-        snapshot: &Snapshot,
+        view: &StoreReadSnapshot,
         quad: EncodedQuad,
     ) -> Result<Option<QueryQuad>> {
-        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+        let Some(spaces) = self.active_query_spaces(view)? else {
             return Ok(None);
         };
-        self.spaces_query_quad(snapshot, spaces, quad)
+        self.spaces_query_quad(&view.snapshot, spaces, quad)
     }
 
     fn spaces_query_quad(
@@ -3429,6 +3453,7 @@ impl GraphStore {
     pub(crate) fn read_snapshot(&self) -> StoreReadSnapshot {
         StoreReadSnapshot {
             snapshot: self.db.snapshot(),
+            active_slot: OnceCell::new(),
         }
     }
 
@@ -3540,7 +3565,7 @@ impl GraphStore {
         #[cfg(test)]
         self.index_admission_probes.fetch_add(1, Ordering::Relaxed);
         let (trusted, fallback_reason) =
-            match self.snapshot_counter(snapshot, IndexCounterKey::Total)? {
+            match self.snapshot_counter(&snapshot, IndexCounterKey::Total)? {
                 IndexCounterRead::Value(total) if total == header.indexed_quads => (true, None),
                 IndexCounterRead::Value(_) => (false, Some("total-counter-mismatch")),
                 IndexCounterRead::Missing => (false, Some("total-counter-missing")),
@@ -3559,11 +3584,11 @@ impl GraphStore {
 
     fn query_index_range(
         &self,
-        snapshot: &Snapshot,
+        view: &StoreReadSnapshot,
         scan: &crate::query::cursor::IndexScan<'_>,
     ) -> Result<Option<(&Keyspace, &Keyspace, Vec<u8>)>> {
         scan.costs.planner_points(1);
-        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+        let Some(spaces) = self.active_query_spaces(view)? else {
             return Ok(None);
         };
         let terms = match scan.order {
@@ -3650,10 +3675,7 @@ impl GraphStore {
         let mut query_terms = Vec::with_capacity(terms.len());
         for term in terms {
             scan.costs.planner_points(1);
-            let Some(spaces) = self.active_query_spaces(snapshot)? else {
-                return Ok(None);
-            };
-            let value = snapshot.get(spaces.term_to_query, term.to_be_bytes())?;
+            let value = view.snapshot.get(spaces.term_to_query, term.to_be_bytes())?;
             scan.costs
                 .forward_mapping(16 + value.as_ref().map_or(0, |value| value.len() as u64));
             let Some(value) = value else {
@@ -3829,17 +3851,18 @@ impl GraphStore {
     }
 
     fn initialize_indexes(&self) -> Result<()> {
-        let snapshot = self.db.snapshot();
-        if self.fail_unrepaired_debt(&snapshot)? {
+        let view = self.read_snapshot();
+        let snapshot = view.snapshot_ref();
+        if self.fail_unrepaired_debt(snapshot)? {
             return Ok(());
         }
-        match self.snapshot_index_header(&snapshot)? {
+        match self.snapshot_index_header(snapshot)? {
             IndexHeaderRead::Absent => {
-                let source_live_quads = self.count_live_rows(&snapshot)?;
+                let source_live_quads = self.count_live_rows(snapshot)?;
                 if source_live_quads != 0 {
                     return Ok(());
                 }
-                if !self.index_spaces_empty(&snapshot)? {
+                if !self.index_spaces_empty(snapshot)? {
                     let mut batch = self.buffered_batch();
                     self.stage_index_failure(
                         &mut batch,
@@ -3863,12 +3886,12 @@ impl GraphStore {
                 self.stage_index_failure(&mut batch, None, "metadata-malformed");
                 self.commit_fjall_batch(batch)
             }
-            IndexHeaderRead::Legacy(header) => self.certify_legacy_header(&snapshot, header),
+            IndexHeaderRead::Legacy(header) => self.certify_legacy_header(snapshot, header),
             IndexHeaderRead::Valid(header) => {
                 if !matches!(header.state, StoredIndexState::Ready) {
                     return Ok(());
                 }
-                let admission = self.snapshot_admission(&snapshot)?;
+                let admission = self.snapshot_admission(snapshot)?;
                 if admission.trusted {
                     return Ok(());
                 }
@@ -5144,7 +5167,10 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         self.recover_query_build(Some(stop))?;
-        if self.snapshot_admission(&self.db.snapshot())?.trusted {
+        if self
+            .snapshot_admission(self.read_snapshot().snapshot_ref())?
+            .trusted
+        {
             return Ok(());
         }
         match self.rebuild_query_inner(stop) {
@@ -5268,7 +5294,9 @@ impl GraphStore {
             let mut build = current;
             build.control_digest = self.query_header_digest(&capture)?;
             build.trusted_active = matches!(header_read, IndexHeaderRead::Valid(_))
-                && self.snapshot_admission(&capture)?.trusted;
+                && self
+                    .snapshot_admission(self.read_snapshot().snapshot_ref())?
+                    .trusted;
             build.phase = QueryBuildPhase::Scan;
             let mut batch = self.buffered_batch();
             batch.insert(&self.qv2_meta, QV_BUILD_KEY, postcard::to_allocvec(&build)?);
@@ -5612,7 +5640,7 @@ impl GraphStore {
         snapshot: &Snapshot,
         key: IndexCounterKey,
     ) -> Result<IndexCounterRead> {
-        let Some(spaces) = self.active_query_spaces(snapshot)? else {
+        let Some(spaces) = self.active_query_spaces(&snapshot.into())? else {
             return Ok(IndexCounterRead::Missing);
         };
         Self::query_index_counter(snapshot, spaces, key)
@@ -6673,8 +6701,9 @@ impl GraphStore {
         stat: DistinctStat,
         costs: &crate::query::context::QueryCost,
     ) -> Option<PlannerEstimate> {
-        let snapshot = self.db.snapshot();
-        let admission = self.snapshot_admission(&snapshot).ok()?;
+        let view = self.read_snapshot();
+        let snapshot = view.snapshot_ref();
+        let admission = self.snapshot_admission(snapshot).ok()?;
         costs.planner_points(
             admission
                 .debt_reads
@@ -6709,7 +6738,7 @@ impl GraphStore {
         let revision = match predicate {
             Some(predicate) => {
                 costs.planner_points(1);
-                match Self::query_revision(&snapshot, spaces, predicate).ok()? {
+                match Self::query_revision(snapshot, spaces, predicate).ok()? {
                     IndexCounterRead::Value(version) => StatRevision::Predicate(version),
                     IndexCounterRead::Missing => StatRevision::Epoch(header.source_epoch),
                     IndexCounterRead::Malformed => return None,
@@ -11290,8 +11319,9 @@ impl GraphStore {
         ) {
             return Ok(false);
         }
-        let snapshot = self.db.snapshot();
-        Ok(self.snapshot_admission(&snapshot)?.trusted)
+        Ok(self
+            .snapshot_admission(self.read_snapshot().snapshot_ref())?
+            .trusted)
     }
 
     pub(crate) fn search_covered(&self, receipt: &MutationReceipt) -> Result<bool> {
@@ -12467,7 +12497,7 @@ mod tests {
 
         // The gap: source holds two rows, the query view holds one.
         let captured = store.read_snapshot();
-        let admission = store.snapshot_admission(&captured.snapshot).unwrap();
+        let admission = store.snapshot_admission(captured.snapshot_ref()).unwrap();
         assert!(!admission.trusted);
         assert_eq!(
             admission.fallback_reason,
@@ -12477,7 +12507,7 @@ mod tests {
         held.finish();
         store.repair_projection_debt(&publish, debt).unwrap();
 
-        let admission = store.snapshot_admission(&captured.snapshot).unwrap();
+        let admission = store.snapshot_admission(captured.snapshot_ref()).unwrap();
         assert!(
             !admission.trusted,
             "an old view must keep its own answer after the repair"
@@ -12514,7 +12544,7 @@ mod tests {
 
         let reopened = Arc::new(GraphStore::open(directory.path()).unwrap());
         let captured = reopened.read_snapshot();
-        let admission = reopened.snapshot_admission(&captured.snapshot).unwrap();
+        let admission = reopened.snapshot_admission(captured.snapshot_ref()).unwrap();
         assert!(
             !admission.trusted,
             "an uncovered query view must not be admitted after reopen"
@@ -12527,7 +12557,7 @@ mod tests {
         assert_index_ready(&reopened, 2);
         assert!(
             !reopened
-                .snapshot_admission(&captured.snapshot)
+                .snapshot_admission(captured.snapshot_ref())
                 .unwrap()
                 .trusted
         );
@@ -12561,7 +12591,7 @@ mod tests {
         let captured = store.read_snapshot();
         assert!(
             !store
-                .snapshot_admission(&captured.snapshot)
+                .snapshot_admission(captured.snapshot_ref())
                 .unwrap()
                 .trusted
         );
@@ -12572,7 +12602,7 @@ mod tests {
         assert_index_ready(&store, 1);
         assert!(
             !store
-                .snapshot_admission(&captured.snapshot)
+                .snapshot_admission(captured.snapshot_ref())
                 .unwrap()
                 .trusted
         );
@@ -13039,19 +13069,20 @@ mod tests {
     }
 
     fn test_index_counter(store: &GraphStore, key: IndexCounterKey) -> Option<u64> {
-        let snapshot = store.db.snapshot();
+        let snapshot = store.read_snapshot();
         let spaces = store
             .active_query_spaces(&snapshot)
             .unwrap()
             .expect("query-index header must select an active slot");
         snapshot
+            .snapshot_ref()
             .get(spaces.meta, key.bytes())
             .unwrap()
             .map(|value| decode_index_count(value.as_ref()).unwrap())
     }
 
     fn test_query_id(store: &GraphStore, term: TermId) -> QueryTermId {
-        let snapshot = store.db.snapshot();
+        let snapshot = store.read_snapshot();
         store
             .snapshot_query_id(&snapshot, term)
             .unwrap()
@@ -13059,7 +13090,7 @@ mod tests {
     }
 
     fn test_query_quad(store: &GraphStore, quad: EncodedQuad) -> QueryQuad {
-        let snapshot = store.db.snapshot();
+        let snapshot = store.read_snapshot();
         store
             .snapshot_query_quad(&snapshot, quad)
             .unwrap()

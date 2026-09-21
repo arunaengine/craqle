@@ -202,7 +202,7 @@ fn assert_exact(store: &GraphStore, graph: &GraphId, suffixes: &[&str]) {
     assert_eq!(expected.len() as u64, report.indexed_quads);
     assert!(
         store
-            .snapshot_admission(&store.db.snapshot())
+            .snapshot_admission(store.read_snapshot().snapshot_ref())
             .unwrap()
             .trusted
     );
