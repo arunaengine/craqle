@@ -1195,4 +1195,179 @@ mod tests {
         };
         assert_eq!(run(&expired).unwrap_err(), CraqleErrorKind::QueryLimit);
     }
+
+    /// Creates one searchable crate per flush, so each lands in its own index segment.
+    fn budget_node(graphs: &[(&str, bool)]) -> (tempfile::TempDir, CraqleNode) {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(directory.path()).unwrap();
+        for (graph, public) in graphs {
+            let policy = if *public {
+                public_policy()
+            } else {
+                GraphPolicy {
+                    public: false,
+                    permission_paths: Vec::new(),
+                }
+            };
+            node.create_crate(
+                &AllowAllAuthorizer,
+                CreateCrateRequest::new(
+                    GraphId::new(graph),
+                    "Budget Study",
+                    "budgetneedle",
+                    "2025-03-01",
+                    None,
+                    policy,
+                ),
+            )
+            .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+        (directory, node)
+    }
+
+    const ENTRIES: [&str; 3] = ["search", "graphs", "resources"];
+
+    /// A labelled fixture of `(graph, public)` crates with one query and limit.
+    type BudgetCase<'a> = (&'a str, &'a [(&'a str, bool)], &'a str, usize);
+
+    /// One search call: its entry point, request, and options.
+    struct BudgetCall<'a> {
+        entry: &'static str,
+        query: &'a str,
+        limit: usize,
+        options: &'a SearchOptions,
+    }
+
+    /// Runs one plain, graph-scoped, or hydrated search and counts its hits.
+    fn budget_run(
+        node: &CraqleNode,
+        auth: &dyn Authorizer,
+        call: BudgetCall<'_>,
+    ) -> std::result::Result<usize, CraqleErrorKind> {
+        let graphs: Vec<GraphId> = ["urn:test:budget:a", "urn:test:budget:b"]
+            .into_iter()
+            .map(GraphId::new)
+            .collect();
+        let request = SearchRequest {
+            query: call.query,
+            limit: call.limit,
+        };
+        let options = call.options;
+        let hits = match call.entry {
+            "search" => node
+                .search_with_options(auth, SearchRun { request, options })
+                .map(|hits| hits.len()),
+            "graphs" => node
+                .search_graphs_with(
+                    auth,
+                    GraphSearchRun {
+                        request: GraphSearchRequest {
+                            graphs: &graphs,
+                            query: call.query,
+                            limit: call.limit,
+                        },
+                        options,
+                    },
+                )
+                .map(|hits| hits.len()),
+            "resources" => node
+                .search_resources_with(auth, SearchRun { request, options })
+                .map(|hits| hits.len()),
+            other => panic!("unknown search entry {other}"),
+        };
+        hits.map_err(|error| error.kind())
+    }
+
+    #[test]
+    fn ended_budget_fails() {
+        let cancelled = SearchOptions::default();
+        cancelled.cancellation.cancel();
+        let expired = SearchOptions {
+            timeout: Some(std::time::Duration::ZERO),
+            ..SearchOptions::default()
+        };
+        let cases: [BudgetCase<'_>; 5] = [
+            ("empty index", &[], "budgetneedle", 10),
+            (
+                "no match",
+                &[("urn:test:budget:a", true)],
+                "absentneedle",
+                10,
+            ),
+            (
+                "all denied",
+                &[("urn:test:budget:a", false)],
+                "budgetneedle",
+                10,
+            ),
+            (
+                "matches",
+                &[("urn:test:budget:a", true), ("urn:test:budget:b", true)],
+                "budgetneedle",
+                10,
+            ),
+            (
+                "zero limit",
+                &[("urn:test:budget:a", true)],
+                "budgetneedle",
+                0,
+            ),
+        ];
+        let auth = GrantAuthorizer::default();
+        for (label, graphs, query, limit) in cases {
+            let (_directory, node) = budget_node(graphs);
+            let open = SearchOptions::default();
+            let expected = if label == "matches" { 2 } else { 0 };
+            for (options, expected) in [
+                (&open, Ok(expected)),
+                (&cancelled, Err(CraqleErrorKind::Cancelled)),
+                (&expired, Err(CraqleErrorKind::QueryLimit)),
+            ] {
+                for entry in ENTRIES {
+                    let call = BudgetCall {
+                        entry,
+                        query,
+                        limit,
+                        options,
+                    };
+                    let result = budget_run(&node, &auth, call);
+                    assert_eq!(expected, result, "{label} {entry}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_cancel_fails() {
+        let (_directory, node) = budget_node(&[("urn:test:budget:a", true)]);
+        // Call 1 is candidate authorization, call 2 the final recheck, call 3 hydration.
+        for (entry, cancel_on) in [
+            ("search", 2),
+            ("graphs", 2),
+            ("resources", 2),
+            ("resources", 3),
+        ] {
+            let options = SearchOptions::default();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let auth = |graph: &GraphId, policy: &GraphPolicy, action: Action| {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == cancel_on {
+                    options.cancellation.cancel();
+                }
+                GrantAuthorizer::default().authorize(graph, policy, action)
+            };
+            let call = BudgetCall {
+                entry,
+                query: "budgetneedle",
+                limit: 10,
+                options: &options,
+            };
+            let result = budget_run(&node, &auth, call);
+            assert_eq!(
+                CraqleErrorKind::Cancelled,
+                result.unwrap_err(),
+                "{entry} cancelled on call {cancel_on}"
+            );
+        }
+    }
 }

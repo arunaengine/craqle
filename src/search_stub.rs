@@ -156,13 +156,6 @@ impl SearchIndex {
         Err(SearchError::Disabled)
     }
 
-    pub(crate) fn search_authorized(
-        &self,
-        req: AuthorizedQuery<'_>,
-    ) -> crate::Result<Vec<SearchHit>> {
-        self.search_checked(req, &|| Ok(()))
-    }
-
     pub(crate) fn search_checked(
         &self,
         req: AuthorizedQuery<'_>,

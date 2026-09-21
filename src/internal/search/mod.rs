@@ -1682,6 +1682,7 @@ impl SearchIndex {
     }
 
     /// Full-text search across all graphs.
+    #[cfg(test)]
     pub(crate) fn search_authorized(
         &self,
         req: AuthorizedQuery<'_>,
@@ -1711,6 +1712,7 @@ impl SearchIndex {
     where
         E: From<SearchError>,
     {
+        (req.check)()?;
         if req.limit == 0 {
             return Ok(Vec::new());
         }
@@ -1757,6 +1759,7 @@ impl SearchIndex {
         let mut top = TopRanked::new(req.limit);
         let pruning = self.pruning_safe(&view.searcher, query.as_ref());
         for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
+            (req.check)()?;
             let scopes = reader
                 .fast_fields()
                 .bytes(GENERATION_SCOPE_FIELD)
@@ -1828,6 +1831,7 @@ impl SearchIndex {
                 let _ = scorer.advance();
             }
         }
+        (req.check)()?;
         let mut ranked = top.ranked.into_vec();
         ranked.sort();
         #[cfg(test)]

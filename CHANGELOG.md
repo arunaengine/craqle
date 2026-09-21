@@ -41,6 +41,10 @@ All notable changes to Craqle are documented here.
 - Explicit process and store memory reservations shared by live stores.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a
   timeout. Either stops the search with an error instead of returning partial hits.
+  `search_graphs_with` and `search_resources_with` apply the same options to
+  graph-scoped and hydrated search. One budget covers setup, scoring, the final
+  permission recheck, and hydration, and an ended budget fails even when nothing
+  matches. Checks are cooperative, so this is not a strict wall-clock bound.
 
 ### Upgrading from 0.2
 

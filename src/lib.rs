@@ -673,6 +673,12 @@ pub struct GraphSearchRequest<'a> {
     pub limit: usize,
 }
 
+/// Graph-scoped full-text search with explicit cancellation and timeout.
+pub struct GraphSearchRun<'a> {
+    pub request: GraphSearchRequest<'a>,
+    pub options: &'a SearchOptions,
+}
+
 /// One subject to resolve into its visible `(predicate, object)` pairs.
 pub struct DescribeRequest<'a> {
     pub graph: &'a GraphId,
@@ -3762,32 +3768,32 @@ impl CraqleNode {
 
     /// Search like [`CraqleNode::search`], failing on cancellation or timeout instead of
     /// returning a shortened result.
+    ///
+    /// One budget covers index setup, scoring, candidate authorization, stored-hit
+    /// loading, and the final permission recheck. It is checked cooperatively between
+    /// work units, so a single long index call can finish before the error is observed.
+    /// A search-disabled build reports `Unsupported` first; an ended budget then fails
+    /// even a zero limit.
     pub fn search_with_options(
         &self,
         auth: &dyn Authorizer,
         run: SearchRun<'_>,
     ) -> Result<Vec<SearchHit>> {
-        let req = run.request;
-        let started = Instant::now();
-        let check = || {
-            if run.options.cancellation.is_cancelled() {
-                return Err(search::SearchError::Cancelled.into());
-            }
-            if run
-                .options
-                .timeout
-                .is_some_and(|timeout| started.elapsed() >= timeout)
-            {
-                return Err(search::SearchError::Deadline.into());
-            }
-            Ok(())
-        };
+        self.collect_hits(&SearchScope::new(auth, run.options), run.request)
+    }
+
+    fn collect_hits(
+        &self,
+        scope: &SearchScope<'_>,
+        req: SearchRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
         self.search.ensure_available()?;
+        scope.check()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let readable = Mutex::new(ReadableGraphs::new(self, auth));
+        let readable = Mutex::new(ReadableGraphs::new(self, scope.auth));
         let allows = |graph: &str| {
             readable
                 .lock()
@@ -3801,10 +3807,10 @@ impl CraqleNode {
                 subject: None,
                 allows: &allows,
             },
-            &check,
+            &|| scope.check(),
         )?;
         drop(readable);
-        self.recheck_hits(auth, hits)
+        self.recheck_hits(scope, hits)
     }
 
     /// Search a graph set with one parse, one index view, and final authorization.
@@ -3813,7 +3819,26 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         req: GraphSearchRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
+        self.search_graphs_with(
+            auth,
+            GraphSearchRun {
+                request: req,
+                options: &SearchOptions::default(),
+            },
+        )
+    }
+
+    /// Search a graph set like [`CraqleNode::search_graphs`] under the cancellation and
+    /// timeout rules of [`CraqleNode::search_with_options`].
+    pub fn search_graphs_with(
+        &self,
+        auth: &dyn Authorizer,
+        run: GraphSearchRun<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let scope = SearchScope::new(auth, run.options);
         self.search.ensure_available()?;
+        scope.check()?;
+        let req = run.request;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 || req.graphs.is_empty() {
             return Ok(Vec::new());
@@ -3851,28 +3876,37 @@ impl CraqleNode {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .allows(graph)
         };
-        let hits = self.search.search_authorized(search::AuthorizedQuery {
-            query: req.query,
-            limit,
-            subject: None,
-            allows: &allows,
-        })?;
+        let hits = self.search.search_checked(
+            search::AuthorizedQuery {
+                query: req.query,
+                limit,
+                subject: None,
+                allows: &allows,
+            },
+            &|| scope.check(),
+        )?;
         drop(readable);
         drop(selected);
-        self.recheck_hits(auth, hits)
+        self.recheck_hits(&scope, hits)
     }
 
-    fn recheck_hits(&self, auth: &dyn Authorizer, hits: Vec<SearchHit>) -> Result<Vec<SearchHit>> {
-        let mut readable = ReadableGraphs::new(self, auth);
+    fn recheck_hits(
+        &self,
+        scope: &SearchScope<'_>,
+        hits: Vec<SearchHit>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut readable = ReadableGraphs::new(self, scope.auth);
         let keep = {
             let mut seen = HashSet::new();
             hits.iter()
                 .map(|hit| {
+                    scope.check()?;
                     Ok(readable.allows(&hit.graph_id)?
                         && seen.insert((hit.graph_id.as_str(), hit.subject_iri.as_str())))
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        scope.check()?;
         Ok(hits
             .into_iter()
             .zip(keep)
@@ -3897,15 +3931,24 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         hits: &[SearchHit],
     ) -> Result<Vec<HydratedSearchHit>> {
+        self.hydrate_hits(&SearchScope::new(auth, &SearchOptions::default()), hits)
+    }
+
+    fn hydrate_hits(
+        &self,
+        scope: &SearchScope<'_>,
+        hits: &[SearchHit],
+    ) -> Result<Vec<HydratedSearchHit>> {
         let mut contexts: HashMap<String, Option<DescribeCtx>> = HashMap::new();
         let mut hydrated = Vec::with_capacity(hits.len());
 
         for hit in hits {
+            scope.check()?;
             let ctx = match contexts.entry(hit.graph_id.clone()) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let graph = GraphId::new(&hit.graph_id);
-                    let ctx = match self.ensure_graph_action(&graph, auth, Action::Read) {
+                    let ctx = match self.ensure_graph_action(&graph, scope.auth, Action::Read) {
                         Ok(()) => Some(self.describe_ctx(&graph)?),
                         Err(CraqleError::Authorization(_)) => None,
                         Err(error) => return Err(error),
@@ -3922,7 +3965,7 @@ impl CraqleNode {
                 properties: self.describe_in_ctx(ctx, &hit.subject_iri)?,
             });
         }
-
+        scope.check()?;
         Ok(hydrated)
     }
 
@@ -3932,8 +3975,25 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         req: SearchRequest<'_>,
     ) -> Result<Vec<HydratedSearchHit>> {
-        let hits = self.search(auth, req)?;
-        self.hydrate_search_hits(auth, &hits)
+        self.search_resources_with(
+            auth,
+            SearchRun {
+                request: req,
+                options: &SearchOptions::default(),
+            },
+        )
+    }
+
+    /// Search and hydrate like [`CraqleNode::search_resources`]; one budget from
+    /// [`CraqleNode::search_with_options`] also covers hydration.
+    pub fn search_resources_with(
+        &self,
+        auth: &dyn Authorizer,
+        run: SearchRun<'_>,
+    ) -> Result<Vec<HydratedSearchHit>> {
+        let scope = SearchScope::new(auth, run.options);
+        let hits = self.collect_hits(&scope, run.request)?;
+        self.hydrate_hits(&scope, &hits)
     }
 
     /// Wait for queued search work; search-disabled builds keep it owed.
@@ -4574,6 +4634,37 @@ struct DescribeCtx {
 }
 
 /// Memo of graph readability for one call and one policy view.
+/// The caller and cooperative budget shared by every phase of one search request.
+struct SearchScope<'a> {
+    auth: &'a dyn Authorizer,
+    started: Instant,
+    options: &'a SearchOptions,
+}
+
+impl<'a> SearchScope<'a> {
+    fn new(auth: &'a dyn Authorizer, options: &'a SearchOptions) -> Self {
+        Self {
+            auth,
+            started: Instant::now(),
+            options,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.options.cancellation.is_cancelled() {
+            return Err(search::SearchError::Cancelled.into());
+        }
+        if self
+            .options
+            .timeout
+            .is_some_and(|timeout| self.started.elapsed() >= timeout)
+        {
+            return Err(search::SearchError::Deadline.into());
+        }
+        Ok(())
+    }
+}
+
 struct ReadableGraphs<'a> {
     node: &'a CraqleNode,
     auth: &'a dyn Authorizer,
