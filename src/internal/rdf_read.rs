@@ -17,6 +17,9 @@ use crate::store::{
     StoreError, StoreReadSnapshot, TermId,
 };
 
+/// Largest exact scope mapped to dense graph IDs for key filtering.
+const EXACT_FILTER_GRAPHS: usize = 1_024;
+
 /// A quad pattern represented entirely by internally interned term ids.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct QuadPattern {
@@ -365,6 +368,10 @@ impl<'store> StoreReadView<'store> {
                 ))?;
         context.record_access_path(path);
         context.increment_index_seeks();
+        let graphs = match scan.graphs {
+            Some(graphs) => Some(graphs),
+            None => self.exact_dense_graphs(context)?,
+        };
         let costs = context.costs();
         let Some(raw) = self.snapshot.index_key_cursor(
             self.store,
@@ -390,8 +397,33 @@ impl<'store> StoreReadView<'store> {
             resolver: scan.resolver,
             cache_entries: scan.cache_entries,
             cache_bytes: scan.cache_bytes,
-            graphs: scan.graphs,
+            graphs,
         })))
+    }
+
+    /// An exact scope's graphs as dense IDs, so cursors skip other graphs before visibility.
+    fn exact_dense_graphs(
+        &self,
+        context: &ReadContext<'_>,
+    ) -> Result<Option<Rc<HashSet<crate::store::QueryTermId>>>> {
+        if let Some(graphs) = context.dense_graphs() {
+            return Ok(graphs);
+        }
+        let dense = match context.exact_graphs() {
+            // Larger scopes cost more mapping reads than the skipped graphs usually save.
+            Some(graphs) if graphs.len() <= EXACT_FILTER_GRAPHS => {
+                let mut dense = HashSet::with_capacity(graphs.len());
+                for graph in graphs {
+                    if let Some(graph) = self.query_term_id(context, *graph)? {
+                        dense.insert(graph);
+                    }
+                }
+                Some(Rc::new(dense))
+            }
+            _ => None,
+        };
+        context.remember_dense_graphs(dense.clone());
+        Ok(dense)
     }
 
     pub(crate) fn orphaned_ids(

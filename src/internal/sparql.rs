@@ -5243,6 +5243,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_scopes_skip() {
+        let (_dir, store, _search, engine) = setup_engine();
+        let mut graphs = Vec::new();
+        for index in 0..10 {
+            let graph = GraphId::new(&format!("urn:test:exact-skip:{index}"));
+            for predicate in ["urn:test:exact-skip:p", "urn:test:exact-skip:q"] {
+                insert_quad(
+                    &store,
+                    &graph,
+                    &format!("urn:test:exact-skip:s{index}"),
+                    predicate,
+                    EncodedTerm::from_plain_term(&Term::Literal(Literal::new_simple_literal(
+                        "same",
+                    ))),
+                );
+            }
+            graphs.push(graph);
+        }
+        let selected = [graphs[2].clone(), graphs[7].clone()];
+        let (results, statistics) = engine
+            .query_graph_mode(
+                "SELECT ?s WHERE { ?s <urn:test:exact-skip:p> ?o ; <urn:test:exact-skip:q> ?o }",
+                &selected,
+                QueryReadMode::Auto,
+            )
+            .unwrap();
+        let mut subjects: Vec<String> = solution_rows(results)
+            .into_iter()
+            .map(|row| row["s"].0.clone())
+            .collect();
+        subjects.sort();
+        assert_eq!(
+            subjects,
+            ["<urn:test:exact-skip:s2>", "<urn:test:exact-skip:s7>"]
+        );
+        // Keys of unlisted graphs are skipped before any visibility decision.
+        assert_eq!(statistics.graphs_considered, 2);
+    }
+
+    #[test]
     fn explicit_scopes_preserved() {
         let (_dir, store, _search, engine) = setup_engine();
         let mut graphs = Vec::new();

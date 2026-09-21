@@ -2,14 +2,14 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::{EncodedTerm, GraphId};
-use crate::store::{Result, StoreError, TermId, hash_term};
+use crate::store::{QueryTermId, Result, StoreError, TermId, hash_term};
 
 /// Cancellation shared by Craqle reads without exposing evaluator or storage
 /// cancellation primitives through the public API.
@@ -520,6 +520,8 @@ pub(crate) struct ReadContext<'a> {
     counters: ReadCounters,
     graph_visibility: RefCell<HashMap<TermId, bool>>,
     orphaned: RefCell<HashMap<TermId, Rc<HashSet<TermId>>>>,
+    /// The exact scope's graphs as dense IDs, mapped at most once per request.
+    dense_graphs: OnceCell<Option<Rc<HashSet<QueryTermId>>>>,
 }
 
 impl<'a> Default for ReadContext<'a> {
@@ -538,6 +540,7 @@ impl<'a> ReadContext<'a> {
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
+            dense_graphs: OnceCell::new(),
         }
     }
 
@@ -557,7 +560,24 @@ impl<'a> ReadContext<'a> {
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
+            dense_graphs: OnceCell::new(),
         }
+    }
+
+    /// The graphs an exact scope admits, outside validation.
+    pub(crate) fn exact_graphs(&self) -> Option<&HashSet<TermId>> {
+        match &self.visibility {
+            GraphVisibility::Exact(graphs) if self.validation_graph.is_none() => Some(graphs),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn dense_graphs(&self) -> Option<Option<Rc<HashSet<QueryTermId>>>> {
+        self.dense_graphs.get().cloned()
+    }
+
+    pub(crate) fn remember_dense_graphs(&self, graphs: Option<Rc<HashSet<QueryTermId>>>) {
+        let _ = self.dense_graphs.set(graphs);
     }
 
     /// The only graph an exact scope admits, so default-union reads may use its range.
@@ -584,6 +604,7 @@ impl<'a> ReadContext<'a> {
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
+            dense_graphs: OnceCell::new(),
         }
     }
 
@@ -599,6 +620,7 @@ impl<'a> ReadContext<'a> {
             counters: ReadCounters::default(),
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
+            dense_graphs: OnceCell::new(),
         }
     }
 
