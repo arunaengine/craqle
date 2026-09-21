@@ -30,6 +30,9 @@ struct CancellationRegistry {
 }
 
 pub(crate) struct RequestState {
+    /// Set once the outcome leaves [`RequestOutcome::Active`], which never
+    /// reverses. The hot path reads this before taking `cause`.
+    closed: AtomicBool,
     cause: Mutex<RequestOutcome>,
     evaluator: spareval::CancellationToken,
 }
@@ -165,6 +168,7 @@ impl Drop for CancelRegistration {
 impl RequestState {
     pub(crate) fn new() -> Self {
         Self {
+            closed: AtomicBool::new(false),
             cause: Mutex::new(RequestOutcome::Active),
             evaluator: spareval::CancellationToken::new(),
         }
@@ -202,13 +206,23 @@ impl RequestState {
         if outcome == RequestOutcome::Explicit || *cause == RequestOutcome::Active {
             *cause = outcome;
         }
+        let published = *cause;
+        if published != RequestOutcome::Active {
+            // Published before the flag: a relaxed reader that observes the
+            // flag and then locks `cause` sees this value or the one after it.
+            self.closed.store(true, Ordering::Relaxed);
+        }
         drop(cause);
         if outcome != RequestOutcome::Active {
             self.evaluator.cancel();
         }
     }
 
+    /// Reads the outcome without locking while the request stays active.
     pub(crate) fn outcome(&self) -> RequestOutcome {
+        if !self.closed.load(Ordering::Relaxed) {
+            return RequestOutcome::Active;
+        }
         *self
             .cause
             .lock()
