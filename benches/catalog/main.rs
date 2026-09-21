@@ -12,12 +12,16 @@ mod catalog_case;
 mod catalog_reads;
 
 use craqle::{
-    ActorId, AllowAllAuthorizer, CraqleFjallPersistMode as PersistMode, CraqleNode, CraqleOptions,
-    EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange, SearchRequest,
+    Action, ActorId, AllowAllAuthorizer, AuthorizationError, CraqleFjallPersistMode as PersistMode,
+    CraqleNode, CraqleOptions, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
+    SearchRequest,
 };
 use serde_json::{Value, json};
 
-use catalog_case::{CAP_ENV, CASE_ENV, Case, ID_ENV, case_seed, estimate_bytes, work_rows};
+use catalog_case::{
+    CAP_ENV, CASE_ENV, Case, ID_ENV, case_seed, check_values, estimate_bytes, supported_axes,
+    work_rows,
+};
 use catalog_reads::{run_cache, run_reads};
 
 fn main() {
@@ -27,6 +31,23 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(128 * 1024 * 1024usize);
+    let unsupported = case.unsupported(supported_axes(&id));
+    if let Err(reason) = check_values(&id, &case).and(if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("axes not implemented: {}", unsupported.join(", ")))
+    }) {
+        println!(
+            "{}",
+            json!({
+                "benchmark_id": id,
+                "status": "unsupported",
+                "reason": reason,
+                "case": case.0,
+            })
+        );
+        return;
+    }
     let estimate = estimate_bytes(&case);
     if estimate > byte_cap {
         println!(
@@ -238,23 +259,57 @@ fn run_writes(path: &Path, case: &Case) -> Value {
 }
 
 fn run_rebuild(path: &Path, case: &Case) -> Value {
-    let node = open_node(path, case);
+    let node = Arc::new(open_node(path, case));
     let rows = prepare_node(&node, case);
     let rate = case.usize("rate", 0);
-    if rate > 0 {
-        let count = usize::max(1, rows.saturating_mul(rate) / 100);
-        let changes = (0..count)
-            .map(|index| change(&graph_id(0), rows + index, rate))
-            .collect();
-        node.apply_changes(&AllowAllAuthorizer, &graph_id(0), changes)
-            .unwrap();
+    let offered = usize::max(1, rows.saturating_mul(rate) / 100) * usize::from(rate > 0);
+    let barrier = Arc::new(std::sync::Barrier::new(1 + usize::from(offered > 0)));
+    let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = (offered > 0).then(|| {
+        let node = Arc::clone(&node);
+        let barrier = Arc::clone(&barrier);
+        let applied = Arc::clone(&applied);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            barrier.wait();
+            for start in (0..offered).step_by(100) {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let end = usize::min(start + 100, offered);
+                let changes = (start..end)
+                    .map(|index| change(&graph_id(0), rows + index, 0x5a))
+                    .collect();
+                node.apply_changes(&AllowAllAuthorizer, &graph_id(0), changes)
+                    .unwrap();
+                applied.fetch_add(end - start, std::sync::atomic::Ordering::Release);
+            }
+        })
+    });
+    if offered > 0 {
+        barrier.wait();
     }
     let started = Instant::now();
     let status = node.rebuild_query_indexes().unwrap();
+    let rebuild_ns = started.elapsed().as_nanos();
+    let during = applied.load(std::sync::atomic::Ordering::Acquire);
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(writer) = writer {
+        writer.join().unwrap();
+    }
+    let drain_started = Instant::now();
     node.persist_fjall().unwrap();
     json!({
         "completed": rows,
-        "work_ns": started.elapsed().as_nanos(),
+        "effective": {
+            "offered_rows": offered,
+            "applied_during_rebuild": during,
+            "concurrent": offered > 0,
+        },
+        "work_ns": rebuild_ns,
+        "rebuild_ns": rebuild_ns,
+        "drain_ns": drain_started.elapsed().as_nanos(),
         "source_rows": status.source_live_quads,
         "indexed_rows": status.indexed_quads,
         "fingerprint": format!("{:?}", node.graph_fingerprint(&graph_id(0)).unwrap()),
@@ -263,8 +318,8 @@ fn run_rebuild(path: &Path, case: &Case) -> Value {
 
 fn run_merge(path: &Path, case: &Case) -> Value {
     let left = open_node(&path.join("left"), case);
-    let actor = case.usize("actors", 1).min(255) as u8;
-    let right = open_actor(&path.join("right"), case, actor);
+    let actors = case.usize("actors", 1).clamp(1, 255);
+    let right = open_actor(&path.join("right"), case, 0x44);
     let rows = prepare_node(&left, case);
     let graph = graph_id(0);
     right
@@ -289,24 +344,42 @@ fn run_merge(path: &Path, case: &Case) -> Value {
             .apply_changes(&AllowAllAuthorizer, &graph, changes)
             .unwrap();
     }
+    // Each actor writes its own suffix rows in its own store, so the merged
+    // graph really carries that many independent clock entries.
     let suffix = case.usize("suffix", 0);
-    if suffix > 0 {
-        let changes = (0..suffix)
-            .map(|index| change(&graph, rows + index, actor as usize))
-            .collect();
-        right
-            .apply_changes(&AllowAllAuthorizer, &graph, changes)
+    let mut actor_snapshots = Vec::with_capacity(actors);
+    for actor in 0..actors {
+        let peer = open_actor(
+            &path.join(format!("actor-{actor}")),
+            case,
+            0x80 + actor as u8,
+        );
+        peer.set_graph_policy(&AllowAllAuthorizer, &graph, graph_policy())
             .unwrap();
+        let changes = (0..suffix.max(1))
+            .map(|index| change(&graph, rows + actor * suffix.max(1) + index, actor))
+            .collect();
+        peer.apply_changes(&AllowAllAuthorizer, &graph, changes)
+            .unwrap();
+        actor_snapshots.push(peer.graph_snapshot(&graph).unwrap());
     }
     let snapshot = left.graph_snapshot(&graph).unwrap();
     let started = Instant::now();
     let first = right.install_graph_snapshot(&snapshot).unwrap();
     let second = right.install_graph_snapshot(&snapshot).unwrap();
+    for snapshot in &actor_snapshots {
+        right.install_graph_snapshot(snapshot).unwrap();
+    }
     right.persist_fjall().unwrap();
+    let observed_actors = right.vector_clock(&graph).unwrap().0.len();
     json!({
         "completed": rows,
         "overlap": overlap,
-        "actors": actor,
+        "effective": {
+            "requested_actors": actors,
+            "observed_actors": observed_actors,
+            "suffix_rows_per_actor": suffix.max(1),
+        },
         "suffix": suffix,
         "work_ns": started.elapsed().as_nanos(),
         "first": format!("{first:?}"),
@@ -318,6 +391,7 @@ fn run_merge(path: &Path, case: &Case) -> Value {
 fn run_search(path: &Path, case: &Case) -> Value {
     let node = open_node(path, case);
     let rows = prepare_node(&node, case);
+    let graphs = case.usize("graphs", 1).max(1);
     let subject_bytes = case.usize("subject_bytes", 0);
     if subject_bytes > 0 {
         node.apply_changes(
@@ -327,28 +401,56 @@ fn run_search(path: &Path, case: &Case) -> Value {
         )
         .unwrap();
     }
-    let started = Instant::now();
+    let readable = graphs.saturating_mul(case.usize("readable_per_mille", 1_000)) / 1_000;
+    let allowed: Vec<String> = (0..readable)
+        .map(|index| graph_id(index).to_string())
+        .collect();
+    let auth = move |graph: &GraphId, _policy: &GraphPolicy, action: Action| {
+        if action == Action::Read && allowed.iter().any(|name| name == graph.as_str()) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                action,
+                graph: graph.as_str().to_owned(),
+            })
+        }
+    };
+    let reindex_started = Instant::now();
     node.reindex_search().unwrap();
+    let reindex_ns = reindex_started.elapsed().as_nanos();
+    let drain_started = Instant::now();
     node.flush_search_updates().unwrap();
+    let drain_ns = drain_started.elapsed().as_nanos();
     let limit = case.usize("page", 10);
+    let query_started = Instant::now();
     let hits = node
         .search(
-            &AllowAllAuthorizer,
+            &auth,
             SearchRequest {
                 query: "catalog",
                 limit,
             },
         )
         .unwrap();
+    let query_ns = query_started.elapsed().as_nanos();
     let hit_digest = blake3::hash(format!("{hits:?}").as_bytes())
         .to_hex()
         .to_string();
     json!({
         "completed": rows,
         "hits": hits.len(),
+        "effective": {
+            "graphs": graphs,
+            "readable_graphs": readable,
+            "readable_per_mille": readable.saturating_mul(1_000) / graphs,
+            "page": limit,
+        },
         "output_digest": hit_digest,
         "fingerprint": format!("{:?}", node.graph_fingerprint(&graph_id(0)).unwrap()),
-        "work_ns": started.elapsed().as_nanos(),
+        "reindex_ns": reindex_ns,
+        "drain_ns": drain_ns,
+        "query_ns": query_ns,
+        "work_ns": reindex_ns + drain_ns + query_ns,
     })
 }
 

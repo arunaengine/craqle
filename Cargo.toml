@@ -240,6 +240,10 @@ name = "perf_smoke"
 path = "tests/perf/smoke.rs"
 
 [[test]]
+name = "catalog_axes"
+path = "tests/catalog_axes.rs"
+
+[[test]]
 name = "query_budgets"
 path = "tests/query/budgets.rs"
 

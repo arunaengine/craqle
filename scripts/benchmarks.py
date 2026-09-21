@@ -279,7 +279,7 @@ def run(repo, output, catalog, axes, args):
                     index += 1
                     native_status = result["native"].get("status")
                     failed |= result["status"] != "passed"
-                    if native_status == "capacity_blocked" and args.profile == "release":
+                    if native_status in ("capacity_blocked", "unsupported") and args.profile == "release":
                         failed = True
                     row = {field: "" for field in RESULT_FIELDS}
                     row.update({
