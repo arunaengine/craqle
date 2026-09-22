@@ -5283,6 +5283,14 @@ impl GraphStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         self.recover_query_build(Some(stop))?;
+        {
+            // Commits hold this lock until their debt is settled, so debt seen here is stranded.
+            let _projection = self
+                .projection_lock
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.fail_unrepaired_debt(&self.db.snapshot())?;
+        }
         if self
             .snapshot_admission(self.read_snapshot().snapshot_ref())?
             .trusted
@@ -12651,6 +12659,32 @@ mod tests {
                 .unwrap()
                 .trusted
         );
+    }
+
+    /// Debt left by a failed catch-up is turned into a rebuild by runtime maintenance.
+    #[test]
+    fn stranded_debt_heals() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv-stranded-debt");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o"));
+        commit_add(&store, &graph, quad);
+        let mut batch = store.buffered_batch();
+        store.stage_projection_debt(&mut batch);
+        store.commit_fjall_batch(batch).unwrap();
+        assert!(
+            !store
+                .snapshot_admission(&store.db.snapshot())
+                .unwrap()
+                .trusted
+        );
+
+        store.repair_query_indexes().unwrap();
+
+        let snapshot = store.db.snapshot();
+        assert!(!store.projection_debt_present(&snapshot).unwrap());
+        assert!(store.snapshot_admission(&snapshot).unwrap().trusted);
+        assert!(store.index_contains(quad));
     }
 
     /// A full build delta log abandons the build instead of failing the source commit.
