@@ -758,7 +758,7 @@ mod tests {
         SparqlEngine,
     };
     use crate::sparql_fast_path::QueryFastPathMode as FastPathMode;
-    use crate::store::{EncodedQuad, GraphStore, QuadAdd};
+    use crate::store::{ClockUpdate, CounterKey, EncodedQuad, GraphStore, QuadAdd, QuadRemove};
 
     const ABOUT: &str = "urn:t:about";
     const PART: &str = "urn:t:part";
@@ -771,7 +771,6 @@ mod tests {
         _dir: tempfile::TempDir,
         store: Arc<GraphStore>,
         engine: SparqlEngine,
-        counter: std::cell::Cell<u64>,
     }
 
     impl Fixture {
@@ -784,15 +783,10 @@ mod tests {
                 _dir: dir,
                 store,
                 engine,
-                counter: std::cell::Cell::new(0),
             }
         }
 
-        fn add(&self, graph: &str, triple: [&str; 3]) {
-            let graph_id = GraphId::new(graph);
-            if !self.store.contains_graph(&graph_id).unwrap() {
-                self.store.create_graph(&graph_id).unwrap();
-            }
+        fn quad(&self, graph: &str, triple: [&str; 3]) -> EncodedQuad {
             let term = |text: &str| {
                 let term = match text.strip_prefix('"') {
                     Some(literal) => EncodedTerm::from_literal(&Literal::new_simple_literal(
@@ -802,25 +796,72 @@ mod tests {
                 };
                 self.store.resolve_term(&term).unwrap()
             };
-            self.counter.set(self.counter.get() + 1);
+            EncodedQuad {
+                graph: term(graph),
+                subject: term(triple[0]),
+                predicate: term(triple[1]),
+                object: term(triple[2]),
+            }
+        }
+
+        fn add(&self, graph: &str, triple: [&str; 3]) {
+            let graph_id = GraphId::new(graph);
+            if !self.store.contains_graph(&graph_id).unwrap() {
+                self.store.create_graph(&graph_id).unwrap();
+            }
+            let quad = self.quad(graph, triple);
+            let _guard = self.store.graph_commit_guard(&graph_id);
+            let actor = ActorId::random();
             let mut batch = self.store.new_batch();
+            let counter = self
+                .store
+                .next_counter(
+                    &mut batch,
+                    CounterKey {
+                        graph_id: quad.graph,
+                        actor,
+                    },
+                )
+                .unwrap();
             self.store
                 .insert_quad(
                     &mut batch,
                     QuadAdd {
-                        quad: EncodedQuad {
-                            graph: term(graph),
-                            subject: term(triple[0]),
-                            predicate: term(triple[1]),
-                            object: term(triple[2]),
-                        },
-                        dot: Dot {
-                            actor: ActorId::random(),
-                            counter: self.counter.get(),
-                        },
+                        quad,
+                        dot: Dot { actor, counter },
                     },
                 )
                 .unwrap();
+            let mut clock = self.store.vector_clock_id(quad.graph).unwrap();
+            clock.advance(actor, counter);
+            self.store
+                .set_vector_clock(
+                    &mut batch,
+                    ClockUpdate {
+                        graph_id: quad.graph,
+                        clock: &clock,
+                    },
+                )
+                .unwrap();
+            self.store.commit(batch).unwrap();
+        }
+
+        fn remove(&self, graph: &str, triple: [&str; 3]) {
+            let quad = self.quad(graph, triple);
+            let witnessed = self.store.vector_clock_id(quad.graph).unwrap();
+            let _guard = self.store.graph_commit_guard(&GraphId::new(graph));
+            let mut batch = self.store.new_batch();
+            assert!(
+                self.store
+                    .remove_quad(
+                        &mut batch,
+                        QuadRemove {
+                            quad,
+                            witnessed: &witnessed,
+                        },
+                    )
+                    .unwrap()
+            );
             self.store.commit(batch).unwrap();
         }
 
@@ -1093,6 +1134,38 @@ mod tests {
                 fixture.compare(query, true);
             }
         }
+    }
+
+    /// Removing containment orphans an untouched file; reattaching makes it visible again.
+    #[test]
+    fn orphan_transitions_equivalent() {
+        const SCHEMA_PART: &str = "http://schema.org/hasPart";
+        const SCHEMA_FORMAT: &str = "http://schema.org/encodingFormat";
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const MEDIA: &str = "http://schema.org/MediaObject";
+        let fixture = Fixture::new();
+        for graph in ["urn:t:o1", "urn:t:o2"] {
+            let file = format!("{graph}/file");
+            fixture.add(graph, [graph, SCHEMA_PART, &file]);
+            fixture.add(graph, [&file, RDF_TYPE, MEDIA]);
+            fixture.add(graph, [&file, SCHEMA_FORMAT, "\"text/csv\""]);
+        }
+        let query = format!(
+            "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?f <{SCHEMA_FORMAT}> \"text/csv\" }} }} \
+             ORDER BY ?g"
+        );
+        let graphs = |fixture: &Fixture| -> Vec<String> {
+            fixture
+                .compare(&query, true)
+                .into_iter()
+                .map(|row| row[0].1.clone())
+                .collect()
+        };
+        assert_eq!(graphs(&fixture), ["<urn:t:o1>", "<urn:t:o2>"]);
+        fixture.remove("urn:t:o1", ["urn:t:o1", SCHEMA_PART, "urn:t:o1/file"]);
+        assert_eq!(graphs(&fixture), ["<urn:t:o2>"]);
+        fixture.add("urn:t:o1", ["urn:t:o1", SCHEMA_PART, "urn:t:o1/file"]);
+        assert_eq!(graphs(&fixture), ["<urn:t:o1>", "<urn:t:o2>"]);
     }
 
     #[test]
