@@ -10,6 +10,11 @@ All notable changes to Craqle are documented here.
 
 ### Changed
 
+- Source fallback for an explicit graph union deduplicates visible triples under
+  query hash limits, preserving bag multiplicity in later joins and aggregates.
+- Queries honor a single `FROM` graph and authorized `FROM NAMED` graphs. Repeated
+  dataset names are deduplicated; multiple distinct default graphs in `FROM` or
+  update `USING` are rejected explicitly because RDF-merge semantics are unsupported.
 - Integrates Irokle 0.3.0 at revision `fd29484e9281524efa692f59025ac6cca2443da8`.
 - Requires Rust 1.97.1 or newer. Craqle's authoritative RDF disk format remains `1.0`.
 - Background maintenance retries failed search entries and rebuilds uncovered query

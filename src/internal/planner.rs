@@ -49,6 +49,8 @@ pub struct PlannedJoin {
 pub(crate) enum PlannerError {
     #[error("forced join mode {0:?} cannot represent this query")]
     ForcedModeUnavailable(JoinMode),
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
 }
 
 #[derive(Default)]
@@ -604,7 +606,13 @@ fn has_noncanonical_spelling(cx: &PlanCtx<'_>, literal: &Literal) -> bool {
         "{}^^<http://www.w3.org/2001/XMLSchema#string>",
         literal
     ));
-    matches!(cx.store.lookup_term(&alternate), Ok(Some(_)))
+    match cx.store.lookup_term(&alternate) {
+        Ok(found) => found.is_some(),
+        Err(error) => {
+            *cx.error.borrow_mut() = Some(PlannerError::Store(error));
+            true
+        }
+    }
 }
 
 fn fold_variable_patterns(

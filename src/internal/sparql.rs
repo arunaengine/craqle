@@ -1245,37 +1245,26 @@ impl SparqlEngine {
         }
         let mut prepared = evaluator.prepare(&query);
         let default_union_marker = BlankNode::default();
-        let source_default_graphs = if matches!(options.read_mode, QueryReadMode::ForceSource)
-            || !view.query_ids_trusted(&context)?
-        {
-            match scope {
-                GraphScope::List(graphs) => {
-                    let mut default_graphs = Vec::with_capacity(graphs.len());
-                    let mut seen = HashSet::with_capacity(graphs.len());
-                    for graph in graphs {
-                        if seen.insert(graph.as_str()) && view.contains_graph(graph)? {
-                            default_graphs.push(GraphName::NamedNode(graph.0.clone()));
-                        }
-                    }
-                    Some(default_graphs)
-                }
-                #[cfg(test)]
-                GraphScope::All => None,
-                GraphScope::Predicate(_) => None,
-            }
-        } else {
-            None
-        };
-        if let Some(source_default_graphs) = source_default_graphs {
-            prepared
-                .dataset_mut()
-                .set_default_graph(source_default_graphs);
-        } else {
+        let source_union = matches!(scope, GraphScope::List(_))
+            && (matches!(options.read_mode, QueryReadMode::ForceSource)
+                || !view.query_ids_trusted(&context)?);
+        if query.dataset().is_none() {
             prepared
                 .dataset_mut()
                 .set_default_graph(vec![GraphName::BlankNode(default_union_marker.clone())]);
         }
-        if let Some(named_graphs) = named_graphs {
+        if let Some(declared) = query.dataset().and_then(|dataset| dataset.named.as_ref()) {
+            let mut visible = Vec::with_capacity(declared.len());
+            for graph in declared {
+                if let Some(term) =
+                    view.lookup_term(&context, &EncodedTerm::from_named_node(graph))?
+                    && view.graph_is_visible(&context, term)?
+                {
+                    visible.push(GraphNode::NamedNode(graph.clone()));
+                }
+            }
+            prepared.dataset_mut().set_available_named_graphs(visible);
+        } else if let Some(named_graphs) = named_graphs {
             prepared
                 .dataset_mut()
                 .set_available_named_graphs(named_graphs);
@@ -1288,6 +1277,7 @@ impl SparqlEngine {
                 default_union_marker,
                 Arc::clone(&budget),
             )
+            .with_source_union(source_union)
             .with_known_terms(known_terms),
         );
         let initial_execution_time = execution_started.elapsed();
@@ -1383,6 +1373,10 @@ impl SparqlEngine {
                     pattern,
                 } => {
                     authorize_update_dataset(&view, auth, using.as_ref())?;
+                    let mut using = using.clone();
+                    if let Some(dataset) = using.as_mut() {
+                        normalize_dataset(dataset)?;
+                    }
                     authorize_update_pattern(&view, auth, pattern)?;
                     for quad in delete {
                         authorize_template_graph(&view, auth, &quad.graph_name)?;
@@ -1930,9 +1924,12 @@ fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQ
     check_query_shape(sparql)?;
     let started = Instant::now();
     let full = format!("{COMMON_PREFIXES}{sparql}");
-    let query = SparqlParser::new()
+    let mut query = SparqlParser::new()
         .parse_query(&full)
         .map_err(|error| SparqlError::Parse(error.to_string()))?;
+    if let Some(dataset) = query.dataset_mut() {
+        normalize_dataset(dataset)?;
+    }
     Ok((
         PreparedQuery {
             query: Arc::new(query),
@@ -1941,6 +1938,21 @@ fn parse_prepared_query(sparql: &str, limits: &QueryLimits) -> Result<(PreparedQ
         },
         started.elapsed(),
     ))
+}
+
+fn normalize_dataset(dataset: &mut spargebra::algebra::QueryDataset) -> Result<()> {
+    dataset.default.sort();
+    dataset.default.dedup();
+    if let Some(named) = dataset.named.as_mut() {
+        named.sort();
+        named.dedup();
+    }
+    if dataset.default.len() > 1 {
+        return Err(SparqlError::Unsupported(
+            "merging multiple default dataset graphs is not supported".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Nesting the parser is allowed to build. Mid-parse cancellation does not
@@ -2086,7 +2098,12 @@ fn plan_query(query: &mut Query, request: PlanRequest<'_>) -> Result<PlannerTrac
             graph,
         },
     )
-    .map_err(|error| SparqlError::Planning(error.to_string()))
+    .map_err(|error| match error {
+        crate::planner::PlannerError::Store(error) => SparqlError::Store(error),
+        crate::planner::PlannerError::ForcedModeUnavailable(_) => {
+            SparqlError::Planning(error.to_string())
+        }
+    })
 }
 
 fn fast_path_plan(query: &Query, options: &QueryOptions) -> Option<FastPathPlan> {
@@ -3018,6 +3035,7 @@ struct StoreDataset<'store, 'context, 'visibility> {
     graph_visits_prepared: Cell<bool>,
     /// Stored identities a native operator already resolved for this query.
     known_terms: HashMap<String, (TermId, QueryTermId)>,
+    source_union: bool,
 }
 
 static NEXT_DENSE_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -3047,6 +3065,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             scoped_graph: Cell::new(None),
             graph_visits_prepared: Cell::new(false),
             known_terms: HashMap::new(),
+            source_union: false,
         }
     }
 
@@ -3067,6 +3086,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             scoped_graph: Cell::new(None),
             graph_visits_prepared: Cell::new(false),
             known_terms: HashMap::new(),
+            source_union: false,
         }
     }
 
@@ -3087,11 +3107,17 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             scoped_graph: Cell::new(None),
             graph_visits_prepared: Cell::new(false),
             known_terms: HashMap::new(),
+            source_union: false,
         }
     }
 
     fn with_known_terms(mut self, known_terms: HashMap<String, (TermId, QueryTermId)>) -> Self {
         self.known_terms = known_terms;
+        self
+    }
+
+    fn with_source_union(mut self, enabled: bool) -> Self {
+        self.source_union = enabled;
         self
     }
 
@@ -3324,6 +3350,13 @@ where
         {
             return Box::new(std::iter::once(Err(error.into())));
         }
+        if self
+            .context
+            .exact_graphs()
+            .is_some_and(|graphs| graphs.is_empty())
+        {
+            return Box::new(std::iter::empty());
+        }
         let subject = self.resolve_pattern_term(subject);
         let predicate = self.resolve_pattern_term(predicate);
         let object = self.resolve_pattern_term(object);
@@ -3414,6 +3447,7 @@ where
             (dense(subject), dense(predicate), dense(object))
             && (graph_dense.is_some() || !matches!(selector, GraphSelector::Named(_)))
             && let Some(scope) = self.dense_scope
+            && !self.source_union
         {
             if subject_id.is_none()
                 && object_id.is_none()
@@ -3496,6 +3530,12 @@ where
             },
             ..QuadPattern::default()
         };
+        let source_union = self.source_union && matches!(selector, GraphSelector::DefaultUnion);
+        let selector = if source_union {
+            GraphSelector::Union
+        } else {
+            selector
+        };
         let quads = match self.view.scan(self.context, selector, pattern) {
             Ok(quads) => quads,
             Err(error) => return Box::new(std::iter::once(Err(error.into()))),
@@ -3506,6 +3546,33 @@ where
                 query_budget.observe_intermediate(1)?;
             }
             quad.map_err(StoreDatasetError::from)
+        });
+        let union_budget = self.query_budget.clone();
+        let context = self.context;
+        let mut seen = HashSet::new();
+        let quads = quads.filter_map(move |quad| {
+            let quad = match quad {
+                Ok(quad) => quad,
+                Err(error) => return Some(Err(error)),
+            };
+            if source_union {
+                let key = [quad.subject, quad.predicate, quad.object];
+                if seen.contains(&key) {
+                    context.record_skipped_copies(1);
+                    return None;
+                }
+                let entries = seen.len().saturating_add(1);
+                // Reserve bucket growth and control bytes before inserting source triple identities.
+                let bytes = entries.saturating_mul(4 * std::mem::size_of_val(&key));
+                if let Some(budget) = &union_budget
+                    && let Err(error) = budget.check_hash(entries, bytes)
+                {
+                    return Some(Err(error.into()));
+                }
+                seen.insert(key);
+                context.increment_duplicate_groups();
+            }
+            Some(Ok(quad))
         });
         let writer = self.term_writer();
 
@@ -4591,6 +4658,73 @@ mod tests {
         assert_eq!(vec![ReadAccessPath::QvGpos], qv.selected_access_paths);
         assert_eq!(1, source.source_keys_read);
         assert_eq!(1, qv.qv_keys_read);
+    }
+
+    #[test]
+    fn failed_lookup_preserves() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = fjall::Database::builder(directory.path()).open().unwrap();
+        let store = Arc::new(GraphStore::from_database(database.clone()).unwrap());
+        let terms = database
+            .keyspace("terms", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let engine = SparqlEngine::new(store.clone(), search);
+        let graph = GraphId::new("urn:test:lookup:graph");
+        let alternate = EncodedTerm("\"same\"^^<http://www.w3.org/2001/XMLSchema#string>".into());
+        insert_quad(
+            &store,
+            &graph,
+            "urn:test:lookup:subject",
+            "urn:test:lookup:p",
+            alternate.clone(),
+        );
+        let text = "SELECT ?s WHERE { ?s <urn:test:lookup:p> ?v FILTER(?v = \"same\") }";
+        let key = crate::store::hash_term(&alternate).to_be_bytes();
+        terms.insert(key, b"<urn:test:lookup:collision>").unwrap();
+        let result = engine.query_with_graphs(text, std::slice::from_ref(&graph));
+        assert!(matches!(
+            result,
+            Err(SparqlError::Store(StoreError::TermCollision { .. }))
+        ));
+        terms.insert(key, alternate.0.as_bytes()).unwrap();
+        let rows = solution_rows(engine.query_with_graphs(text, &[graph]).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"].0, "<urn:test:lookup:subject>");
+    }
+
+    #[test]
+    fn degraded_union_matches() {
+        for state in [
+            crate::QueryIndexState::Missing,
+            crate::QueryIndexState::Building,
+            crate::QueryIndexState::Failed("unavailable".to_owned()),
+        ] {
+            let (_directory, store, _search, engine) = setup_engine();
+            let graphs = ["urn:test:union:a", "urn:test:union:b"].map(GraphId::new);
+            for graph in &graphs {
+                insert_quad(
+                    &store,
+                    graph,
+                    "urn:test:union:shared",
+                    "urn:test:union:p",
+                    EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:test:union:o")),
+                );
+                settle_diagnostics(&store, graph);
+            }
+            store.set_test_index(state);
+            let (result, reads) = engine
+                .query_graph_mode(
+                    "SELECT ?s WHERE { ?s <urn:test:union:p> ?o } ORDER BY ?s",
+                    &graphs,
+                    QueryReadMode::Auto,
+                )
+                .unwrap();
+            let rows = solution_rows(result);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["s"].0, "<urn:test:union:shared>");
+            assert!(reads.source_keys_read > 0);
+        }
     }
 
     #[test]

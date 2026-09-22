@@ -295,6 +295,124 @@ fn union_crosses_graphs() {
     }
 }
 
+#[test]
+fn source_union_matches() {
+    let (_directory, node) = fixture(4);
+    let graphs = [TARGET, SHARED].map(GraphId::new);
+    for query in [
+        "SELECT ?s WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> }",
+        "SELECT ?s ?name WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> ; \
+         <urn:test:scope:name> ?name } ORDER BY ?name",
+        "SELECT ?g ?s WHERE { GRAPH ?g { ?s <urn:test:scope:knows> <urn:test:scope:s:1> } }",
+    ] {
+        let expected = canonical(scoped(&node, &[TARGET, SHARED], query).results, false);
+        let mut options = QueryOptions::default();
+        options.read_mode = QueryReadMode::ForceSource;
+        options.fast_paths = craqle::QueryFastPathMode::Disabled;
+        let actual = node
+            .query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .unwrap();
+        assert_eq!(canonical(actual.results, false), expected, "{query}");
+    }
+}
+
+#[test]
+fn source_union_bounds() {
+    let (_directory, node) = fixture(4);
+    let graphs = [TARGET, SHARED].map(GraphId::new);
+    let mut options = QueryOptions::default();
+    options.read_mode = QueryReadMode::ForceSource;
+    options.fast_paths = craqle::QueryFastPathMode::Disabled;
+    options.limits.max_hash_entries = 1;
+    let query = "SELECT ?s ?name WHERE { ?s <urn:test:scope:name> ?name }";
+    assert!(
+        node.query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .is_err()
+    );
+    options.limits.max_hash_entries = 1_000_000;
+    options.limits.max_hash_bytes = 64;
+    assert!(
+        node.query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .is_err()
+    );
+    options.collect_costs = true;
+    let empty = node
+        .query_in_graphs_with_options(&AllowAllAuthorizer, &[], query, &options)
+        .unwrap();
+    assert!(canonical(empty.results, false).is_empty());
+    assert_eq!(empty.statistics.source_keys_read, 0);
+}
+
+#[test]
+fn declared_datasets_match() {
+    let (_directory, node) = fixture(4);
+    let plain = "SELECT ?s ?name WHERE { ?s <urn:test:scope:name> ?name } ORDER BY ?s ?name";
+    let expected = canonical(scoped(&node, &[TARGET], plain).results, true);
+    let query = plain.replace(" WHERE ", &format!(" FROM <{TARGET}> WHERE "));
+    for mode in [QueryReadMode::Auto, QueryReadMode::ForceSource] {
+        let mut options = QueryOptions::default();
+        options.read_mode = mode;
+        let actual = node
+            .query_with_options(
+                &AllowAllAuthorizer,
+                craqle::QueryRequest {
+                    sparql: &query,
+                    options: &options,
+                },
+            )
+            .unwrap();
+        assert_eq!(canonical(actual.results, true), expected);
+        let graphs = [TARGET, SHARED, UNRELATED].map(GraphId::new);
+        let actual = node
+            .query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, &query, &options)
+            .unwrap();
+        assert_eq!(canonical(actual.results, true), expected);
+    }
+    let query = format!("SELECT ?s FROM NAMED <{TARGET}> WHERE {{ ?s ?p ?o }}");
+    assert!(canonical(node.query(&AllowAllAuthorizer, &query).unwrap(), false).is_empty());
+    let query =
+        format!("SELECT ?g FROM NAMED <{TARGET}> FROM NAMED <{TARGET}> WHERE {{ GRAPH ?g {{}} }}");
+    assert_eq!(
+        canonical(node.query(&AllowAllAuthorizer, &query).unwrap(), false),
+        [format!("g=<{TARGET}>")]
+    );
+    let deny = |graph: &GraphId, _: &GraphPolicy, action: craqle::Action| {
+        Err(craqle::AuthorizationError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_owned(),
+        })
+    };
+    assert!(canonical(node.query(&deny, &query).unwrap(), false).is_empty());
+    let query = plain.replace(
+        " WHERE ",
+        &format!(" FROM <{TARGET}> FROM <{SHARED}> WHERE "),
+    );
+    assert_eq!(
+        node.prepare_query(&query).unwrap_err().kind(),
+        craqle::CraqleErrorKind::Unsupported
+    );
+}
+
+#[test]
+fn unsupported_update_atomic() {
+    let (_directory, node) = fixture(4);
+    let graph = GraphId::new(TARGET);
+    let before = node.graph_snapshot(&graph).unwrap();
+    let query = format!(
+        "INSERT DATA {{ GRAPH <{TARGET}> {{ <urn:test:new> <urn:test:p> <urn:test:o> }} }}; \
+         INSERT {{ GRAPH <{TARGET}> {{ ?s <urn:test:copied> ?o }} }} \
+         USING <{TARGET}> USING <{SHARED}> WHERE {{ ?s <{KNOWS}> ?o }}"
+    );
+    assert_eq!(
+        node.apply_sparql_update(&AllowAllAuthorizer, &query)
+            .unwrap_err()
+            .kind(),
+        craqle::CraqleErrorKind::Unsupported
+    );
+    assert_eq!(node.graph_snapshot(&graph).unwrap(), before);
+}
+
 /// Left and right join rows in the target, plus `skew` right rows elsewhere on three keys.
 fn join_fixture(skew: usize) -> (tempfile::TempDir, CraqleNode) {
     let directory = tempfile::tempdir().unwrap();

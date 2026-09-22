@@ -315,12 +315,20 @@ fn scoped_orphans_refresh() {
     let fixture = fixture(2);
     let query = format!("{} ORDER BY ?s", shared_query());
     let read = || {
-        canonical_rows(
+        let expected = canonical_rows(
             fixture
                 .node
                 .query_in_graphs(&fixture.reader, &fixture.visible, &query)
                 .unwrap(),
-        )
+        );
+        let mut options = QueryOptions::default();
+        options.read_mode = craqle::QueryReadMode::ForceSource;
+        let source = fixture
+            .node
+            .query_in_graphs_with_options(&fixture.reader, &fixture.visible, &query, &options)
+            .unwrap();
+        assert_eq!(canonical_rows(source.results), expected);
+        expected
     };
     for (index, graph) in fixture.visible.iter().enumerate() {
         assert_eq!(read(), expected_shared_rows());
