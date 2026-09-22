@@ -38,6 +38,9 @@ loaded store in a directory and later runs only read it; `CRAQLE_ROCRATE_CASES` 
 - Controlled text matching compares exact resource sets for whole words in `name`,
   `description`, `keywords`, and `identifier`. Ranked text checks each engine's own top-k
   for eligibility and duplicates; the two rankings are not expected to agree.
+- RC12 joins text with structure twice: bounded top-k search then the join, run on Craqle
+  only and checked for correct, unrepeated rows; and complete matching with
+  `fts:complete`, compared with Virtuoso on the exact answer.
 - Readable-graph cases restrict Craqle through an authorizer and Virtuoso through a
   `VALUES ?g` list. The Virtuoso form is an application-enforced simulation, not the same
   access control.

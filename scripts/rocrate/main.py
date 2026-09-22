@@ -132,7 +132,8 @@ def run_virtuoso(fixture_dir, cases, args):
         order = list(cases)
         random.Random(len(cases)).shuffle(order)
         for case in order:
-            records.append(virtuoso_case(server, case, args.samples))
+            if "virtuoso" in case.get("engines", ["virtuoso"]):
+                records.append(virtuoso_case(server, case, args.samples))
         records.append(virtuoso_update(server, cases))
         records.append({"record": "footprint", "bytes": server.footprint()})
     finally:
@@ -235,6 +236,10 @@ def validate(case, record):
         return "valid" if all(hit in pool for hit in hits) else "ineligible hit"
     rows = normalize(case, rows)
     expected = case["expected"]
+    if case["compare"] == "subset":
+        # A bounded answer may omit matches, but every row must be one and appear once.
+        valid = len(set(rows)) == len(rows) and set(rows) <= set(expected)
+        return "valid" if valid else "row outside the expected answer or repeated"
     ordered = case["compare"] == "ordered"
     if (rows if ordered else sorted(rows)) == (expected if ordered else sorted(expected)):
         return "valid"

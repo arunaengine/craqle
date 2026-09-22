@@ -267,14 +267,22 @@ def text_cases(model):
                     if (crate.base, crate.base) in documents
                     and common in documents[(crate.base, crate.base)]
                     and person in [model.people[author] for author in crate.authors])
-    cases.append({"id": "RC12-text-author", "kind": "structured", "terms": common,
-                  "person": person, "variables": ["g"],
-                  "expected": rows(*[[("g", iri(base))] for base in wanted]),
-                  "craqle_sparql": " ".join(f"""SELECT DISTINCT ?g WHERE {{
-                      SERVICE <urn:craqle:fts> {{ ?s <urn:craqle:fts:query> "{common}" .
-                      ?s <urn:craqle:fts:graph> ?g . ?s <urn:craqle:fts:limit> 10000 }}
-                      GRAPH ?g {{ ?d {S}about> ?s . ?s {S}author> <{person}> }} }}
-                      ORDER BY ?g""".split()),
+    expected = rows(*[[("g", iri(base))] for base in wanted])
+    text_author = """SELECT DISTINCT ?g WHERE {{ SERVICE <urn:craqle:fts> {{
+        ?s <urn:craqle:fts:query> "{common}" . ?s <urn:craqle:fts:graph> ?g . ?s {mode} }}
+        GRAPH ?g {{ ?d {S}about> ?s . ?s {S}author> <{person}> }} }} ORDER BY ?g"""
+    # Bounded top-k search joined with structure is a different operation from exhaustive
+    # matching; only the latter is compared with Virtuoso.
+    cases.append({"id": "RC12-topk-author", "kind": "structured", "engines": ["craqle"],
+                  "variables": ["g"], "expected": expected, "compare": "subset",
+                  "craqle_sparql": " ".join(text_author.format(
+                      common=common, S=S, person=person,
+                      mode="<urn:craqle:fts:limit> 10000").split())})
+    cases.append({"id": "RC12-complete-author", "kind": "structured", "terms": common,
+                  "person": person, "variables": ["g"], "expected": expected,
+                  "craqle_sparql": " ".join(text_author.format(
+                      common=common, S=S, person=person,
+                      mode="<urn:craqle:fts:complete> true").split()),
                   "virtuoso_sparql": " ".join(f"""SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{
                       ?d {S}about> ?g . ?g {S}author> <{person}> . ?g ?p ?o .
                       FILTER(?p IN ({", ".join(f"{S}{name}>" for name in TEXT_PREDICATES)}))
