@@ -4,7 +4,7 @@
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::ops::Bound::{Excluded, Included};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
@@ -2550,12 +2550,20 @@ impl SearchSnapshot {
         let mut bytes = 0usize;
         let mut remaining = false;
         let mut oversized = None;
-        let candidates = predicates.iter().flat_map(|predicate| {
-            let mut scoped = [0u8; 48];
-            scoped[..32].copy_from_slice(&prefix);
-            scoped[32..].copy_from_slice(&predicate.to_be_bytes());
-            self.snapshot.prefix(&self.quads, scoped)
-        });
+        let candidates = predicates
+            .iter()
+            .filter(|predicate| scan.after.is_none_or(|(after, _)| **predicate >= after))
+            .flat_map(|predicate| {
+                let mut scoped = [0u8; 48];
+                scoped[..32].copy_from_slice(&prefix);
+                scoped[32..].copy_from_slice(&predicate.to_be_bytes());
+                let after = scan
+                    .after
+                    .filter(|(after, _)| after == predicate)
+                    .map(|(_, object)| [&scoped[..], &object.to_be_bytes()].concat());
+                let range = resume_range(&scoped, after.as_deref());
+                self.snapshot.range(&self.quads, range)
+            });
         for guard in candidates {
             let (key, value) = guard.into_inner()?;
             if dots_empty(value.as_ref()) {
@@ -2563,9 +2571,6 @@ impl SearchSnapshot {
             }
             let quad = GraphStore::decode_quad_key(key.as_ref())?;
             let cursor = (quad.predicate, quad.object);
-            if scan.after.is_some_and(|after| cursor <= after) {
-                continue;
-            }
             if rows == scan.row_limit {
                 remaining = true;
                 break;
@@ -2670,6 +2675,19 @@ fn snapshot_term(snapshot: &Snapshot, terms: &Keyspace, id: TermId) -> Result<En
     Ok(EncodedTerm(decode_term_text(value.as_ref())?))
 }
 
+/// Keys under `prefix`, starting strictly after `after` when resuming a page.
+fn resume_range(prefix: &[u8], after: Option<&[u8]>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let lower = after.map_or_else(|| Included(prefix.to_vec()), |key| Excluded(key.to_vec()));
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            return (lower, Excluded(end));
+        }
+    }
+    (lower, Unbounded)
+}
+
 fn scan_graph_snapshot(
     snapshot: &Snapshot,
     quads: &Keyspace,
@@ -2679,13 +2697,14 @@ fn scan_graph_snapshot(
     let mut rows = 0usize;
     let mut bytes = 0usize;
     let mut oversized = None;
-    for guard in snapshot.prefix(quads, scan.graph.to_be_bytes()) {
+    let after = scan.after.as_ref().map(|after| &after[..]);
+    for guard in snapshot.range(quads, resume_range(&scan.graph.to_be_bytes(), after)) {
         let (key, value) = guard.into_inner()?;
         let raw: [u8; 64] = key
             .as_ref()
             .try_into()
             .map_err(|_| StoreError::InvalidSearchState("graph-scan-key-invalid"))?;
-        if scan.after.is_some_and(|after| raw <= after) || dots_empty(value.as_ref()) {
+        if dots_empty(value.as_ref()) {
             continue;
         }
         if rows == scan.row_limit {
@@ -7657,11 +7676,9 @@ impl GraphStore {
             let mut last = None;
             match migration.stage {
                 SearchOrderStage::Clear => {
-                    for guard in self.search_queue.iter() {
+                    let after = (!migration.after.is_empty()).then_some(&migration.after[..]);
+                    for guard in self.search_queue.range(resume_range(&[], after)) {
                         let (key, _) = guard.into_inner()?;
-                        if key.as_ref() <= migration.after.as_slice() {
-                            continue;
-                        }
                         last = Some(key.to_vec());
                         batch.remove(&self.search_queue, key);
                         visited += 1;
@@ -7679,11 +7696,9 @@ impl GraphStore {
                         SearchOrderStage::Subject => (QueueKind::Subject, graph_dirty_prefix()),
                         SearchOrderStage::Clear | SearchOrderStage::Done => unreachable!(),
                     };
-                    for guard in self.graphs.prefix(prefix) {
+                    let after = (!migration.after.is_empty()).then_some(&migration.after[..]);
+                    for guard in self.graphs.range(resume_range(&prefix, after)) {
                         let (key, value) = guard.into_inner()?;
-                        if key.as_ref() <= migration.after.as_slice() {
-                            continue;
-                        }
                         let cursor = self.queue_cursor(kind, key.as_ref(), value.as_ref())?;
                         batch.insert(&self.search_queue, search_order_key(cursor), key.as_ref());
                         last = Some(key.to_vec());
@@ -9668,14 +9683,9 @@ impl GraphStore {
             bytes: 0,
             oversized: None,
         };
-        for guard in self.search_queue.prefix([SEARCH_ORDER_PREFIX]) {
+        let range = resume_range(&[SEARCH_ORDER_PREFIX], after.as_ref().map(|key| &key[..]));
+        for guard in self.search_queue.range(range) {
             let (key, identity) = guard.into_inner()?;
-            if after
-                .as_ref()
-                .is_some_and(|after| key.as_ref() <= after.as_slice())
-            {
-                continue;
-            }
             let cursor = decode_search_order(key.as_ref())?;
             if scan.max_token.is_some_and(|bound| cursor.token > bound) {
                 break;
@@ -10567,16 +10577,17 @@ impl GraphStore {
         let mut rows = 0usize;
         let mut bytes = 0usize;
         let mut oversized = None;
-        for guard in self.search_meta.prefix([SEARCH_CLEANUP_PREFIX]) {
+        let after = scan
+            .after
+            .map(|after| [&[SEARCH_CLEANUP_PREFIX][..], &after.0.to_be_bytes()].concat());
+        let range = resume_range(&[SEARCH_CLEANUP_PREFIX], after.as_deref());
+        for guard in self.search_meta.range(range) {
             let (key, value) = guard.into_inner()?;
             if key.len() != 9 {
                 return Err(StoreError::InvalidSearchState("search-cleanup-key-invalid"));
             }
             let generation =
                 GenerationId(u64::from_be_bytes(key.as_ref()[1..].try_into().unwrap()));
-            if scan.after.is_some_and(|after| generation <= after) {
-                continue;
-            }
             if rows == scan.row_limit {
                 remaining = true;
                 break;
@@ -11963,6 +11974,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// Resumed pages seek past the cursor and stop at the prefix end, even for 0xff bytes.
+    #[test]
+    fn resume_range_bounds() {
+        assert_eq!(
+            resume_range(&[3, 0xff], Some(&[3, 0xff, 7])),
+            (Excluded(vec![3, 0xff, 7]), Excluded(vec![4]))
+        );
+        assert_eq!(
+            resume_range(&[0xff], None),
+            (Included(vec![0xff]), Unbounded)
+        );
+        assert_eq!(resume_range(&[], None), (Included(Vec::new()), Unbounded));
     }
 
     /// Remembered graph records belong to one snapshot; later writes stay invisible to it.
