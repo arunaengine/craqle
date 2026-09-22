@@ -296,6 +296,10 @@ name = "shacl_compile"
 path = "tests/shacl/compile.rs"
 
 [[test]]
+name = "shacl_delta"
+path = "tests/shacl/incremental.rs"
+
+[[test]]
 name = "shacl_native"
 path = "tests/shacl/native.rs"
 
