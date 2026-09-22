@@ -317,6 +317,24 @@ impl EncodedTerm {
         }
     }
 
+    /// The oxrdf spelling of a literal alias, so equal RDF terms share one stored identity.
+    pub(crate) fn canonical(&self) -> Option<Self> {
+        let Some(oxrdf::Term::Literal(literal)) = self.to_term() else {
+            return None;
+        };
+        let text = match literal.language() {
+            Some(language) if language.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                oxrdf::Literal::new_language_tagged_literal_unchecked(
+                    literal.value(),
+                    language.to_ascii_lowercase(),
+                )
+                .to_string()
+            }
+            _ => literal.to_string(),
+        };
+        (text != self.0).then_some(Self(text))
+    }
+
     pub fn to_named_node(&self) -> Option<NamedNode> {
         if self.0.starts_with('<') && self.0.ends_with('>') {
             Some(NamedNode::new_unchecked(&self.0[1..self.0.len() - 1]))

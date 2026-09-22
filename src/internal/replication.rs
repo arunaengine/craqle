@@ -97,6 +97,53 @@ fn mutation_digest(
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+/// Writes literal aliases in canonical form; deletes also remove an alias stored before canonicalization.
+fn canonical_changes(changes: Vec<MaterializedQuadChange>) -> Vec<MaterializedQuadChange> {
+    let mut canonical = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (MaterializedQuadChange::Insert {
+            graph,
+            subject,
+            predicate,
+            object,
+        }
+        | MaterializedQuadChange::Delete {
+            graph,
+            subject,
+            predicate,
+            object,
+        }) = &change;
+        let raw = [subject, predicate, object];
+        let terms = raw.map(|term| term.canonical().unwrap_or_else(|| term.clone()));
+        if terms.iter().zip(raw).all(|(term, raw)| term == raw) {
+            canonical.push(change);
+            continue;
+        }
+        let graph = graph.clone();
+        let [subject, predicate, object] = terms;
+        match change {
+            MaterializedQuadChange::Insert { .. } => {
+                canonical.push(MaterializedQuadChange::Insert {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+            }
+            MaterializedQuadChange::Delete { .. } => {
+                canonical.push(MaterializedQuadChange::Delete {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+                canonical.push(change);
+            }
+        }
+    }
+    canonical
+}
+
 fn new_mutation() -> crate::sync::MutationId {
     crate::sync::MutationId::new()
 }
@@ -717,6 +764,7 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
@@ -728,8 +776,9 @@ impl ReplicationEngine {
 
     pub(crate) fn apply_mutation(
         &self,
-        request: crate::sync::MutationRequest,
+        mut request: crate::sync::MutationRequest,
     ) -> Result<crate::sync::MutationReceipt, UpdateError> {
+        request.changes = canonical_changes(request.changes);
         self.ensure_change_targets(&request.graph, &request.changes)?;
         if request.changes.is_empty() {
             return Err(UpdateError::InvalidChangeSet(
@@ -1129,6 +1178,7 @@ impl ReplicationEngine {
         changes: Vec<MaterializedQuadChange>,
         render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
         self.commit_with_plan(LocalCommit {
             id: None,
@@ -1147,6 +1197,7 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
@@ -1172,6 +1223,7 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
@@ -1196,6 +1248,7 @@ impl ReplicationEngine {
         changes: Vec<MaterializedQuadChange>,
         render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
         self.commit_with_plan(LocalCommit {
             id: None,
@@ -1213,6 +1266,7 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
         if changes.is_empty() {
             return self.empty_batch(graph);
@@ -1236,6 +1290,7 @@ impl ReplicationEngine {
         shape_versions: &[(GraphId, [u8; 32])],
         render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(changes);
         self.ensure_change_targets(graph, &changes)?;
         let fence = PreparedCommitFence {
             data_version,
@@ -1278,8 +1333,9 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
     ) -> Result<(), UpdateError> {
-        self.ensure_change_targets(graph, changes)?;
-        self.validate(graph, changes)
+        let changes = canonical_changes(changes.to_vec());
+        self.ensure_change_targets(graph, &changes)?;
+        self.validate(graph, &changes)
     }
 
     fn validate(

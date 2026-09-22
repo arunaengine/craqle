@@ -15,6 +15,10 @@ All notable changes to Craqle are documented here.
 - Queries honor a single `FROM` graph and authorized `FROM NAMED` graphs. Repeated
   dataset names are deduplicated; multiple distinct default graphs in `FROM` or
   update `USING` are rejected explicitly because RDF-merge semantics are unsupported.
+- Local writes store literal aliases such as `"x"^^xsd:string`, escaped characters
+  and upper-case language tags in their canonical N-Triples form, so equal RDF
+  literals match in patterns, joins, DISTINCT and GROUP BY. Deletes also remove the
+  raw spelling written by earlier versions. Replicated events keep their spelling.
 - Integrates Irokle 0.3.0 at revision `fd29484e9281524efa692f59025ac6cca2443da8`.
 - Requires Rust 1.97.1 or newer. Craqle's authoritative RDF disk format remains `1.0`.
 - Background maintenance retries failed search entries and rebuilds uncovered query

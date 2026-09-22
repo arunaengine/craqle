@@ -8,7 +8,7 @@ mod support;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, Authorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
-    JoinMode, MaterializedQuadChange, QueryLimits, QueryOptions, QueryResults,
+    JoinMode, MaterializedQuadChange, QueryFastPathMode, QueryLimits, QueryOptions, QueryResults,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -479,4 +479,110 @@ fn residual_terms_filtered() {
         );
         assert!(ask(included), "{scope}: another predicate links the pair");
     }
+}
+
+/// Equal RDF literals written with different spellings are one term in every query form.
+#[test]
+fn literal_aliases_merge() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let graphs: Vec<_> = (0..4)
+        .map(|index| GraphId::new(&format!("urn:test:alias:{index}")))
+        .collect();
+    let spellings = [
+        "\"same\"",
+        "\"same\"^^<http://www.w3.org/2001/XMLSchema#string>",
+        "\"\\u0073ame\"",
+        "\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+    ];
+    for (graph, spelling) in graphs.iter().zip(spellings) {
+        node.import_graph_policy(graph, public_policy()).unwrap();
+        let object = EncodedTerm(spelling.to_owned());
+        let quads = vec![(iri(graph.as_str()), iri(TEST_PREDICATE), object)];
+        node.insert_quads(&AllowAllAuthorizer, graph, quads)
+            .unwrap();
+    }
+    let tagged = &graphs[3];
+    let quads = vec![(
+        iri("urn:test:alias:tagged"),
+        iri(TEST_PREDICATE),
+        literal("x"),
+    )];
+    node.insert_quads(&AllowAllAuthorizer, tagged, quads)
+        .unwrap();
+    let quads = vec![(
+        iri("urn:test:alias:tagged"),
+        iri(TEST_PREDICATE),
+        EncodedTerm("\"x\"@EN".to_owned()),
+    )];
+    node.insert_quads(&AllowAllAuthorizer, tagged, quads)
+        .unwrap();
+    node.ensure_query_indexes();
+
+    let graph_rows = |graphs: &[GraphId]| {
+        let mut rows: Vec<_> = graphs
+            .iter()
+            .map(|graph| vec![("g".to_string(), iri(graph.as_str()))])
+            .collect();
+        rows.sort();
+        rows
+    };
+    let run = |sparql: &str, fast_paths: QueryFastPathMode| {
+        let prepared = node.prepare_query(sparql).unwrap();
+        let mut options = QueryOptions::default();
+        options.fast_paths = fast_paths;
+        canonical_rows(
+            node.execute_prepared(&AllowAllAuthorizer, &prepared, &options)
+                .unwrap()
+                .results,
+        )
+    };
+    let count = |value: u64| {
+        EncodedTerm(format!(
+            "\"{value}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        ))
+    };
+    for mode in [QueryFastPathMode::Auto, QueryFastPathMode::Disabled] {
+        let bound = format!("SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{TEST_PREDICATE}> \"same\" }} }}");
+        assert_eq!(run(&bound, mode), graph_rows(&graphs[..3]), "{mode:?}");
+        let grouped = format!(
+            "SELECT ?v (COUNT(DISTINCT ?g) AS ?n) WHERE {{ GRAPH ?g {{ ?g <{TEST_PREDICATE}> ?v }} }} GROUP BY ?v"
+        );
+        let mut expected = vec![
+            vec![
+                ("n".to_string(), count(1)),
+                ("v".to_string(), EncodedTerm(spellings[3].to_owned())),
+            ],
+            vec![
+                ("n".to_string(), count(3)),
+                ("v".to_string(), literal("same")),
+            ],
+        ];
+        expected.sort();
+        assert_eq!(run(&grouped, mode), expected, "{mode:?}");
+        let tags = format!(
+            "SELECT DISTINCT ?v WHERE {{ <urn:test:alias:tagged> <{TEST_PREDICATE}> ?v FILTER(lang(?v) != \"\") }}"
+        );
+        let rows = run(&tags, mode);
+        assert_eq!(
+            rows,
+            vec![vec![("v".to_string(), EncodedTerm("\"x\"@en".to_owned()))]],
+            "{mode:?}"
+        );
+    }
+
+    let removed = &graphs[0];
+    let delete = MaterializedQuadChange::Delete {
+        graph: removed.clone(),
+        subject: iri(removed.as_str()),
+        predicate: iri(TEST_PREDICATE),
+        object: EncodedTerm(spellings[1].to_owned()),
+    };
+    node.apply_changes(&AllowAllAuthorizer, removed, vec![delete])
+        .unwrap();
+    let bound = format!("SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{TEST_PREDICATE}> \"same\" }} }}");
+    assert_eq!(
+        run(&bound, QueryFastPathMode::Auto),
+        graph_rows(&graphs[1..3])
+    );
 }
