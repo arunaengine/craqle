@@ -2851,6 +2851,12 @@ fn rewrite_fts_service(
     if spec.complete {
         spec.limit = cx.limits.max_intermediate_rows;
     }
+    if spec.limit == 0 && spec.complete {
+        return Err(SparqlError::QueryLimit {
+            resource: "intermediate rows",
+            limit: 0,
+        });
+    }
     if spec.limit == 0 {
         return Ok(GraphPattern::Values {
             variables: requested_fts_variables(&spec),
@@ -6818,6 +6824,14 @@ mod tests {
         assert!(matches!(
             run(&service("fts:complete true"), limits),
             Err(SparqlError::QueryLimit { .. })
+        ));
+        let none = QueryLimits {
+            max_intermediate_rows: 0,
+            ..QueryLimits::default()
+        };
+        assert!(matches!(
+            run(&service("fts:complete true"), none),
+            Err(SparqlError::QueryLimit { limit: 0, .. })
         ));
         assert!(matches!(
             run(
