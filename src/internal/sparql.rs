@@ -2603,6 +2603,7 @@ fn search_visible_hits(
         subject: request.filter.subject,
         allows: &allows,
         check: &check,
+        candidates: None,
     };
     let raw = if request.complete {
         search.collect_complete(query)?

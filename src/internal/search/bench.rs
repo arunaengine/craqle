@@ -340,6 +340,7 @@ fn prune_search(index: &SearchIndex, run: &PruneRun<'_>) -> (u64, Vec<SearchHit>
     let started = Instant::now();
     let hits = index
         .collect_filtered(FilterQuery {
+            candidates: None,
             query: run.query,
             limit: run.limit,
             subject: None,

@@ -280,7 +280,12 @@ pub(crate) struct FilterQuery<'a, E> {
     pub subject: Option<&'a str>,
     pub allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
+    /// Optional semijoin hint; the caller retains the original RDF join when it is declined.
+    pub candidates: Option<&'a CandidateSource<'a, E>>,
 }
+
+pub(crate) type CandidateSource<'a, E> =
+    dyn Fn() -> std::result::Result<Option<Vec<String>>, E> + 'a;
 
 /// One unranked collection: the pinned view and query, the document ceiling, the retained
 /// bytes per document and in total, and the caller's graph filter and progress check.
@@ -1790,6 +1795,7 @@ impl SearchIndex {
         check: &dyn Fn() -> crate::Result<()>,
     ) -> crate::Result<Vec<SearchHit>> {
         self.collect_filtered(FilterQuery {
+            candidates: None,
             query: req.query,
             limit: req.limit,
             subject: req.subject,
@@ -1845,7 +1851,7 @@ impl SearchIndex {
             .parse_query(&sanitize_query(req.query))
             .map_err(SearchError::from)
             .map_err(E::from)?;
-        let query: Box<dyn Query> = if let Some(subject) = req.subject {
+        let mut query: Box<dyn Query> = if let Some(subject) = req.subject {
             Box::new(BooleanQuery::new(vec![
                 (Occur::Must, parsed),
                 (
@@ -1859,6 +1865,62 @@ impl SearchIndex {
         } else {
             parsed
         };
+        if complete
+            && let Some(prepare) = req.candidates
+            && let Some(term) = query.downcast_ref::<TermQuery>()
+            && view
+                .searcher
+                .doc_freq(term.term())
+                .map_err(SearchError::from)
+                .map_err(E::from)?
+                > crate::MAX_SEARCH_LIMIT as u64
+            && let Some(subjects) = prepare()?
+        {
+            (req.check)()?;
+            let bitset = view
+                .searcher
+                .segment_readers()
+                .iter()
+                .map(|reader| {
+                    (reader.max_doc() as usize)
+                        .div_ceil(64)
+                        .saturating_mul(8)
+                        .saturating_add(64)
+                })
+                .max()
+                .unwrap_or(0);
+            let bytes = candidate_bytes(&subjects).saturating_add(bitset);
+            let limit = req.limit.min(crate::MAX_SEARCH_LIMIT);
+            let mut admitted = bytes <= self.query_bytes() / 4 && subjects.len() <= limit;
+            if admitted {
+                let mut postings = 0_u64;
+                for subject in &subjects {
+                    (req.check)()?;
+                    let term = Term::from_field_text(self.f_subject_iri, subject);
+                    postings = postings.saturating_add(
+                        view.searcher
+                            .doc_freq(&term)
+                            .map_err(SearchError::from)
+                            .map_err(E::from)?,
+                    );
+                    if postings > limit as u64 {
+                        admitted = false;
+                        break;
+                    }
+                }
+            }
+            if admitted {
+                query = Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, query),
+                    (
+                        Occur::Must,
+                        Box::new(TermSetQuery::new(subjects.iter().map(|subject| {
+                            Term::from_field_text(self.f_subject_iri, subject)
+                        }))),
+                    ),
+                ]));
+            }
+        }
         let native_limit = self.query_bytes() / 2;
         let per_rank = std::mem::size_of::<RankedDoc>().saturating_add(64);
         let (mut ranked, rank_bytes) = if complete {
@@ -2068,6 +2130,7 @@ impl SearchIndex {
         let allows = |_: &str| Ok::<bool, SearchError>(true);
         let check = || Ok::<(), SearchError>(());
         self.collect_filtered(FilterQuery {
+            candidates: None,
             query,
             limit,
             subject: None,
@@ -2086,6 +2149,7 @@ impl SearchIndex {
         let allows = |candidate: &str| Ok::<bool, SearchError>(candidate == graph_id);
         let check = || Ok::<(), SearchError>(());
         self.collect_filtered(FilterQuery {
+            candidates: None,
             query,
             limit,
             subject: None,
@@ -2104,6 +2168,7 @@ impl SearchIndex {
         };
         let check = || Ok::<(), SearchError>(());
         self.collect_filtered(FilterQuery {
+            candidates: None,
             query: req.query,
             limit: req.limit,
             subject: None,
@@ -3590,6 +3655,19 @@ fn column_bytes(column: Option<&tantivy::columnar::BytesColumn>, doc: DocId) -> 
         .ok_or_else(damaged)
 }
 
+pub(crate) fn candidate_bytes(subjects: &[String]) -> usize {
+    if subjects.is_empty() {
+        return 0;
+    }
+    // Include the locked FST builder's registry, retained transitions and longest-key stack.
+    let longest = subjects.iter().map(String::len).max().unwrap_or(0);
+    let scratch = (1_usize << 20).saturating_add(longest.saturating_mul(256));
+    subjects.iter().fold(
+        scratch.saturating_add(subjects.len().saturating_mul(256)),
+        |bytes, subject| bytes.saturating_add(subject.len().saturating_mul(192)),
+    )
+}
+
 pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(graph_id.len() as u64).to_be_bytes());
@@ -4413,6 +4491,127 @@ mod tests {
     }
 
     #[test]
+    fn candidates_pin_view() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let mut index = SearchIndex::memory_with_budget(budget).unwrap();
+        for subject in 0..10_001 {
+            index
+                .index_resource(
+                    "urn:test:candidates",
+                    &format!("urn:test:old:{subject}"),
+                    Some("needle"),
+                )
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let allows = |_: &str| Ok::<_, SearchError>(true);
+        let check = || Ok::<_, SearchError>(());
+        let prepared = std::cell::Cell::new(false);
+        let prepare = || {
+            prepared.set(true);
+            index
+                .index_resource("urn:test:candidates", "urn:test:new", Some("needle"))
+                .unwrap();
+            index.commit().unwrap();
+            Ok(Some(vec!["urn:test:new".to_owned()]))
+        };
+        let hits = index
+            .collect_complete(FilterQuery {
+                query: "needle",
+                limit: 10,
+                subject: None,
+                allows: &allows,
+                check: &check,
+                candidates: Some(&prepare),
+            })
+            .unwrap();
+        assert!(prepared.get());
+        assert!(hits.is_empty());
+        let subjects = || Ok::<_, SearchError>(Some(vec!["urn:test:new".to_owned()]));
+        let hits = index
+            .collect_complete(FilterQuery {
+                query: "needle",
+                limit: 10,
+                subject: None,
+                allows: &allows,
+                check: &check,
+                candidates: Some(&subjects),
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject_iri, "urn:test:new");
+        for graph in 0..11 {
+            index
+                .index_resource(
+                    &format!("urn:test:expansion:{graph}"),
+                    "urn:test:repeated",
+                    Some("other"),
+                )
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let repeated = || Ok::<_, SearchError>(Some(vec!["urn:test:repeated".to_owned()]));
+        let fallback = index
+            .collect_complete(FilterQuery {
+                query: "needle",
+                limit: 1,
+                subject: None,
+                allows: &allows,
+                check: &check,
+                candidates: Some(&repeated),
+            })
+            .unwrap();
+        assert_eq!(fallback.len(), 2);
+        let cancelled = std::cell::Cell::new(false);
+        let prepare = || {
+            cancelled.set(true);
+            Ok::<_, SearchError>(Some(Vec::new()))
+        };
+        let check = || {
+            if cancelled.get() {
+                Err(SearchError::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            index.collect_complete(FilterQuery {
+                query: "needle",
+                limit: 10,
+                subject: None,
+                allows: &allows,
+                check: &check,
+                candidates: Some(&prepare),
+            }),
+            Err(SearchError::Cancelled)
+        ));
+        index.prepared_bytes = 20_480;
+        let fallback = index
+            .collect_complete(FilterQuery {
+                query: "needle",
+                limit: 10,
+                subject: None,
+                allows: &allows,
+                check: &|| Ok(()),
+                candidates: Some(&subjects),
+            })
+            .unwrap();
+        assert_eq!(fallback.len(), 11);
+        index.prepared_bytes = 128;
+        assert!(matches!(
+            index.collect_complete(FilterQuery {
+                query: "needle",
+                limit: 10,
+                subject: None,
+                allows: &allows,
+                check: &|| Ok(()),
+                candidates: Some(&subjects),
+            }),
+            Err(SearchError::ItemTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn metadata_io_fails() {
         let index = SearchIndex::open_in_memory().unwrap();
         index.set_generation(RAW_GRAPH, Some(DIRECT_GENERATION));
@@ -4680,6 +4879,7 @@ mod tests {
         let check = || Ok::<(), SearchError>(());
         index
             .collect_filtered(FilterQuery {
+                candidates: None,
                 query,
                 limit,
                 subject: None,

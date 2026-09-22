@@ -63,7 +63,11 @@ pub(crate) struct FilterQuery<'a, E> {
     pub subject: Option<&'a str>,
     pub allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
+    pub candidates: Option<&'a CandidateSource<'a, E>>,
 }
+
+pub(crate) type CandidateSource<'a, E> =
+    dyn Fn() -> std::result::Result<Option<Vec<String>>, E> + 'a;
 
 pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
