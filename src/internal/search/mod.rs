@@ -1282,6 +1282,11 @@ impl SearchIndex {
     }
 
     pub(crate) fn complete_coverage(&self, store: &GraphStore, target: u64) -> Result<()> {
+        // A generation switch between manifest load and publish would reinstall the old one.
+        let _work = self
+            .work_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let current = store.search_coverage()?;
         let full_scan = self.needs_rebuild.load(Ordering::SeqCst)
             || current.is_none_or(|coverage| coverage.rebuild.is_some());
@@ -1358,11 +1363,8 @@ impl SearchIndex {
 
     /// Deletes every document outside published and staged generations after a whole
     /// rebuild, including damage with no usable scope or key that cleanup cannot address.
+    /// The caller holds `work_lock`.
     fn sweep_unaddressed(&self, store: &GraphStore, active: &GenerationView) -> Result<()> {
-        let _work = self
-            .work_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let key = |graph: &str, generation| {
             Term::from_field_text(
                 self.f_generation_key,
