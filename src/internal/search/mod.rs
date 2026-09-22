@@ -18,8 +18,8 @@ use tantivy::TERMINATED;
 #[cfg(test)]
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::{
-    AllQuery, Bm25StatisticsProvider as _, BooleanQuery, EnableScoring, Occur, Query, QueryParser,
-    TermQuery, TermSetQuery,
+    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, EnableScoring, Occur, Query,
+    QueryParser, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
@@ -301,6 +301,12 @@ struct MatchAll<'a, E> {
 
 /// Last small scope decoded within one immutable segment.
 type ScopeCache = Option<(u64, Arc<Vec<u8>>)>;
+
+struct PruneSegment<'a> {
+    searcher: &'a Searcher,
+    reader: &'a tantivy::SegmentReader,
+    query: &'a dyn Query,
+}
 
 /// One scored document whose required metadata the collector decodes.
 struct ActiveDoc<'a, E> {
@@ -1951,11 +1957,15 @@ impl SearchIndex {
                 .map_err(SearchError::from)
                 .map_err(E::from)?;
             let mut top = TopRanked::new(req.limit);
-            let pruning = self.pruning_safe(&view.searcher, query.as_ref());
             for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
                 (req.check)()?;
                 let (scopes, stable) = self.metadata_columns(&view, reader).map_err(E::from)?;
                 let mut scope_cache = None;
+                let scale = self.pruning_scale(PruneSegment {
+                    searcher: &view.searcher,
+                    reader,
+                    query: query.as_ref(),
+                });
                 let initial = top.threshold();
                 // Ineligible documents return the current threshold, so they never raise it.
                 let mut offer = |doc: DocId, score: &mut dyn FnMut() -> Score| {
@@ -1988,31 +1998,56 @@ impl SearchIndex {
                     }
                     Ok(top.threshold())
                 };
-                if pruning {
-                    #[cfg(test)]
-                    self.hooks.pruned.fetch_add(1, Ordering::SeqCst);
-                    let mut failed = None;
-                    weight
-                        .for_each_pruning(initial, reader, &mut |doc, score| {
-                            if failed.is_some() {
-                                return Score::INFINITY;
-                            }
-                            offer(doc, &mut || score).unwrap_or_else(|error| {
-                                failed = Some(error);
-                                Score::INFINITY
-                            })
-                        })
-                        .map_err(SearchError::from)
-                        .map_err(E::from)?;
-                    if let Some(error) = failed {
-                        return Err(error);
-                    }
-                    continue;
-                }
                 let mut scorer = weight
                     .scorer(reader, 1.0)
                     .map_err(SearchError::from)
                     .map_err(E::from)?;
+                if let Some(scale) = scale
+                    && let Some(term) = query.downcast_ref::<TermQuery>().map(TermQuery::term)
+                {
+                    let inverted = reader
+                        .inverted_index(term.field())
+                        .map_err(SearchError::from)
+                        .map_err(E::from)?;
+                    let Some(mut blocks) = inverted
+                        .read_block_postings(term, IndexRecordOption::WithFreqs)
+                        .map_err(SearchError::from)
+                        .map_err(E::from)?
+                    else {
+                        continue;
+                    };
+                    let norms = reader
+                        .get_fieldnorms_reader(term.field())
+                        .map_err(SearchError::from)
+                        .map_err(E::from)?;
+                    let bm25 = Bm25Weight::for_terms(&view.searcher, std::slice::from_ref(term))
+                        .map_err(SearchError::from)
+                        .map_err(E::from)?;
+                    #[cfg(test)]
+                    self.hooks.pruned.fetch_add(1, Ordering::SeqCst);
+                    let mut threshold = initial;
+                    while blocks.block_len() != 0 {
+                        (req.check)()?;
+                        let bound = blocks.block_max_score(&norms, &bm25);
+                        if !bound.is_finite() || bound >= scaled_threshold(threshold, scale) {
+                            for &doc in blocks.docs() {
+                                if scorer.seek(doc) != doc {
+                                    self.mark_damaged(&view, None);
+                                    return Err(E::from(SearchError::Damaged {
+                                        detail: "postings identity",
+                                    }));
+                                }
+                                let score = scorer.score();
+                                if !score.is_finite() || score > threshold {
+                                    threshold = offer(doc, &mut || score)?;
+                                }
+                            }
+                        }
+                        // Public advance loads the next block, including its partial tail.
+                        blocks.advance();
+                    }
+                    continue;
+                }
                 while scorer.doc() != TERMINATED {
                     offer(scorer.doc(), &mut || scorer.score())?;
                     let _ = scorer.advance();
@@ -3249,40 +3284,25 @@ impl SearchIndex {
         })
     }
 
-    /// Whether block-max pruning bounds hold: one segment, one field, and a term union
-    /// scored with that segment's own statistics.
-    fn pruning_safe(&self, searcher: &Searcher, query: &dyn Query) -> bool {
+    fn pruning_scale(&self, request: PruneSegment<'_>) -> Option<Score> {
         #[cfg(test)]
         if self.hooks.exhaustive.load(Ordering::SeqCst) {
-            return false;
+            return None;
         }
-        let [reader] = searcher.segment_readers() else {
-            return false;
-        };
-        let Some(terms) = pruning_terms(query) else {
-            return false;
-        };
-        let Some(field) = terms.first().map(|term| term.field()) else {
-            return false;
-        };
-        let statistics = || -> tantivy::Result<bool> {
-            if terms.iter().any(|term| term.field() != field)
-                || searcher.total_num_docs()? != u64::from(reader.max_doc())
-                || searcher.total_num_tokens(field)?
-                    != reader.inverted_index(field)?.total_num_tokens()
-            {
-                return Ok(false);
-            }
-            for term in &terms {
-                if searcher.doc_freq(term)?
-                    != u64::from(reader.inverted_index(field)?.doc_freq(term)?)
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        };
-        statistics().unwrap_or(false)
+        let term = request.query.downcast_ref::<TermQuery>()?.term();
+        if term.field() != self.f_all_text {
+            return None;
+        }
+        request.reader.get_fieldnorms_reader(term.field()).ok()?;
+        let local = request
+            .reader
+            .inverted_index(term.field())
+            .ok()?
+            .total_num_tokens() as Score
+            / request.reader.max_doc() as Score;
+        let global = request.searcher.total_num_tokens(term.field()).ok()? as Score
+            / request.searcher.total_num_docs().ok()? as Score;
+        segment_scale(local, global)
     }
 
     /// Returns the stable key of an active, allowed document, or `None` for skipped ones.
@@ -3645,23 +3665,6 @@ fn scope_parts(scope: &[u8]) -> Option<(&str, GenerationId)> {
     Some((graph, GenerationId(u64::from_be_bytes(generation))))
 }
 
-/// Terms of a single term query or of a union whose clauses are all optional terms.
-fn pruning_terms(query: &dyn Query) -> Option<Vec<&Term>> {
-    if let Some(term) = query.downcast_ref::<TermQuery>() {
-        return Some(vec![term.term()]);
-    }
-    let boolean = query.downcast_ref::<BooleanQuery>()?;
-    boolean
-        .clauses()
-        .iter()
-        .map(|(occur, query)| {
-            (*occur == Occur::Should)
-                .then(|| query.downcast_ref::<TermQuery>().map(TermQuery::term))
-                .flatten()
-        })
-        .collect()
-}
-
 /// Reads one document's generation scope.
 fn scope_at(view: &SearchView, address: DocAddress) -> Option<Vec<u8>> {
     let reader = view.searcher.segment_reader(address.segment_ord);
@@ -3694,6 +3697,27 @@ pub(crate) fn candidate_bytes(subjects: &[String]) -> usize {
         scratch.saturating_add(subjects.len().saturating_mul(256)),
         |bytes, subject| bytes.saturating_add(subject.len().saturating_mul(192)),
     )
+}
+
+fn segment_scale(local: Score, global: Score) -> Option<Score> {
+    if ![local, global]
+        .iter()
+        .all(|mean| (2_f32.powi(-32)..=2_f32.powi(32)).contains(mean))
+    {
+        return None;
+    }
+    let ratio = f64::from(global) / f64::from(local);
+    // Enclose rounded local maximization and global BM25 scoring within normal arithmetic.
+    let margin = 1.0 + 64.0 * f64::from(f32::EPSILON);
+    Some(((ratio.max(1.0 / ratio) * margin) as Score).next_up())
+}
+
+fn scaled_threshold(threshold: Score, scale: Score) -> Score {
+    if scale == 1.0 {
+        threshold
+    } else {
+        (threshold / scale).next_down()
+    }
 }
 
 pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
@@ -4995,6 +5019,11 @@ mod tests {
                 let case = format!("{label} {query:?} {request:?}");
                 assert_eq!(oracle.len(), pruned.len(), "{case}");
                 let identity = |hit: &SearchHit| (hit.graph_id.clone(), hit.subject_iri.clone());
+                if !query.contains(' ') {
+                    for (left, right) in oracle.iter().zip(&pruned) {
+                        assert_eq!(left.score.to_bits(), right.score.to_bits(), "{case}");
+                    }
+                }
                 if oracle
                     .iter()
                     .zip(&pruned)
@@ -5025,6 +5054,111 @@ mod tests {
     }
 
     #[test]
+    fn segment_bounds_hold() {
+        let terms: Vec<_> = [0, 1, 16, 63, 128, 255]
+            .into_iter()
+            .flat_map(|norm| [1, 2, 47, 95, 1_000, u32::MAX].map(|frequency| (norm, frequency)))
+            .collect();
+        let means = [2_f32.powi(-32), 0.25, 1.0, 16.0, 4_096.0, 2_f32.powi(32)];
+        for local in means {
+            for global in means {
+                let scale = segment_scale(local, global).unwrap();
+                let local = tantivy::query::Bm25Weight::for_one_term_without_explain(7, 100, local);
+                let global =
+                    tantivy::query::Bm25Weight::for_one_term_without_explain(7, 100, global);
+                for &(left_norm, left_freq) in &terms {
+                    for &(right_norm, right_freq) in &terms {
+                        if local.score(left_norm, left_freq) >= local.score(right_norm, right_freq)
+                        {
+                            let bound = global.score(left_norm, left_freq);
+                            let threshold = global.score(right_norm, right_freq).next_down();
+                            assert!(bound >= scaled_threshold(threshold, scale));
+                        }
+                    }
+                }
+            }
+        }
+        for invalid in [
+            0.0,
+            -1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+        ] {
+            assert!(segment_scale(invalid, 1.0).is_none());
+            assert!(segment_scale(1.0, invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn skewed_pruning_matches() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        index
+            .writer()
+            .unwrap()
+            .set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+        for (segment, count, padding) in [(0, 257, 500), (1, 2_048, 0), (2, 129, 50)] {
+            for position in 0..count {
+                let text = format!(
+                    "{}{}",
+                    "common ".repeat(position % 7 + 1),
+                    "filler ".repeat(padding)
+                );
+                index
+                    .index_resource(
+                        &prune_graph(position),
+                        &format!("urn:test:skew:{segment}:{position}"),
+                        Some(&text),
+                    )
+                    .unwrap();
+            }
+            index.commit().unwrap();
+        }
+        assert_eq!(index.pin_view().searcher.segment_readers().len(), 3);
+        assert!(assert_same_top(&index, "skewed") > 0);
+    }
+
+    #[test]
+    fn tail_winner_preserved() {
+        // One writer preserves the final posting's position in the partial block.
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        let graph = "urn:test:tail";
+        index.set_generation(graph, Some(DIRECT_GENERATION));
+        for position in 0..269 {
+            let repeats = match position {
+                0 => 47,
+                128 => 95,
+                1..=127 => 1,
+                _ => 0,
+            };
+            let subject = format!("urn:test:tail:{position}");
+            let mut document = TantivyDocument::default();
+            document.add_text(index.f_graph_id, graph);
+            document.add_text(index.f_subject_iri, &subject);
+            document.add_text(index.f_all_text, "needle ".repeat(repeats));
+            document.add_bytes(
+                index.f_generation_scope,
+                &generation_scope(index.index_id, graph, DIRECT_GENERATION),
+            );
+            document.add_bytes(index.f_stable_key, &stable_hit_key(graph, &subject));
+            index.writer().unwrap().add_document(document).unwrap();
+        }
+        index.write_epoch.fetch_add(1, Ordering::SeqCst);
+        index.commit().unwrap();
+        assert_eq!(index.pin_view().searcher.segment_readers().len(), 1);
+        index.hooks.exhaustive.store(true, Ordering::SeqCst);
+        let expected = index.search("needle", 1).unwrap();
+        assert_eq!(expected[0].subject_iri, "urn:test:tail:128");
+        index.hooks.exhaustive.store(false, Ordering::SeqCst);
+        let actual = index.search("needle", 1).unwrap();
+        assert_eq!(actual[0].subject_iri, expected[0].subject_iri);
+        assert_eq!(actual[0].score.to_bits(), expected[0].score.to_bits());
+    }
+
+    #[test]
     fn pruned_matches_exhaustive() {
         let index = SearchIndex::open_in_memory().unwrap();
         // Background merges would race the explicit merges this test controls.
@@ -5035,11 +5169,7 @@ mod tests {
         write_prune(&index, (0, 200), 0);
         write_prune(&index, (200, 400), 0);
         assert!(index.pin_view().searcher.segment_readers().len() > 1);
-        assert_eq!(
-            0,
-            assert_same_top(&index, "segments"),
-            "several segments must not prune"
-        );
+        assert!(assert_same_top(&index, "segments") > 0);
 
         merge_all(&index);
         assert!(
