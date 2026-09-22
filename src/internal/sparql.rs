@@ -5084,6 +5084,8 @@ mod tests {
         };
         let mut options = QueryOptions::results_only();
         options.limits.max_intermediate_rows = crate::MAX_SEARCH_LIMIT + 1;
+        // Slow debug hosts must not turn this budget contract into a deadline failure.
+        options.limits.deadline = None;
         options.fast_paths = FastPathMode::Disabled;
         assert_eq!(execute(&options).unwrap(), 6_000);
         options.fast_paths = FastPathMode::Auto;
