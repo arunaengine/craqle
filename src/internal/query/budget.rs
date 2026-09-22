@@ -106,7 +106,10 @@ impl QueryBudget {
     }
 
     /// Applies the final query shape while keeping work already charged.
-    pub(crate) fn resume(&self, shape: BudgetShape) -> std::result::Result<Self, QueryLimitExceeded> {
+    pub(crate) fn resume(
+        &self,
+        shape: BudgetShape,
+    ) -> std::result::Result<Self, QueryLimitExceeded> {
         let budget = Self::new(shape, self.limits, self.clock.clone())?;
         for (target, source) in [
             (&budget.intermediate_rows, &self.intermediate_rows),
