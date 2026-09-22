@@ -1027,7 +1027,6 @@ impl SparqlEngine {
         .then_some(FtsCandidates {
             view: &view,
             context: &context,
-            budget: &budget,
         });
         let rewrite_started = Instant::now();
         rewrite_fts_query(
@@ -1158,7 +1157,6 @@ impl SparqlEngine {
         .then_some(FtsCandidates {
             view: &view,
             context: &context,
-            budget: &budget,
         });
         let rewrite_started = Instant::now();
         rewrite_fts_query(
@@ -2461,7 +2459,6 @@ struct FtsRewriteCtx<'a> {
 struct FtsCandidates<'a> {
     view: &'a StoreReadView<'a>,
     context: &'a ReadContext<'a>,
-    budget: &'a QueryBudget,
 }
 
 fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
@@ -2663,15 +2660,32 @@ fn candidate_subjects(
     let Some(plan) = crate::graph_distinct::analyze(&query) else {
         return Ok(None);
     };
-    let Some(relation) = crate::graph_distinct::execute(
+    // Optional work gets its own budget; exceeding it declines instead of failing the query.
+    let decline = |error: SparqlError| {
+        cx.clock.check_stage()?;
+        match error {
+            SparqlError::QueryLimit { .. } => Ok(None),
+            error => Err(error),
+        }
+    };
+    let mut shape = query_features(&query).budget;
+    shape.estimated_rows = 0;
+    let budget = match QueryBudget::new(shape, *cx.limits, cx.clock.clone()) {
+        Ok(budget) => budget,
+        Err(error) => return decline(error.into()),
+    };
+    let relation = crate::graph_distinct::execute(
         &plan,
         crate::graph_join::JoinInput {
             view: input.view,
             context: input.context,
-            budget: input.budget,
+            budget: &budget,
         },
-    )?
-    else {
+    );
+    let Some(relation) = (match relation {
+        Ok(relation) => relation,
+        Err(error) => return decline(error),
+    }) else {
         return Ok(None);
     };
     drop(relation.known);
@@ -5003,10 +5017,7 @@ mod tests {
             })
             .unwrap();
         options.limits.max_intermediate_rows = minimum;
-        assert!(matches!(
-            execute(&text, &options),
-            Err(SparqlError::QueryLimit { .. })
-        ));
+        assert_eq!(execute(&text, &options).unwrap(), expected);
 
         options.limits = QueryLimits::production();
         options.read_mode = QueryReadMode::ForceSource;
@@ -5014,6 +5025,69 @@ mod tests {
         options.read_mode = QueryReadMode::Auto;
         store.set_test_index(crate::QueryIndexState::Failed("unavailable".into()));
         assert_eq!(execute(&text, &options).unwrap(), expected);
+    }
+
+    /// Candidate preparation must not spend the budget of a query that fits without it.
+    #[test]
+    #[cfg(feature = "search")]
+    fn candidates_keep_budget() {
+        let (_directory, store, search, engine) = setup_engine();
+        let graph = GraphId::new("urn:big");
+        store.create_graph(&graph).unwrap();
+        let resolve = |term: &str| {
+            store
+                .resolve_term(&EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                    term,
+                )))
+                .unwrap()
+        };
+        let (graph_id, predicate, object) = (
+            resolve(graph.as_str()),
+            resolve("urn:kind"),
+            resolve("urn:wanted"),
+        );
+        let mut batch = store.new_batch();
+        for index in 0..6_000 {
+            let quad = EncodedQuad {
+                graph: graph_id,
+                subject: resolve(&format!("urn:s:{index}")),
+                predicate,
+                object,
+            };
+            let dot = Dot {
+                actor: ActorId::random(),
+                counter: 1,
+            };
+            store
+                .insert_quad(&mut batch, QuadAdd { quad, dot })
+                .unwrap();
+        }
+        store.commit(batch).unwrap();
+        settle_diagnostics(&store, &graph);
+        for index in 0..=crate::MAX_SEARCH_LIMIT {
+            search
+                .index_resource(graph.as_str(), &format!("urn:s:{index}"), Some("needle"))
+                .unwrap();
+        }
+        search.commit().unwrap();
+        let text = "SELECT ?g ?s WHERE { SERVICE <urn:craqle:fts> { ?s <urn:craqle:fts:query> \"needle\" ; <urn:craqle:fts:graph> ?g ; <urn:craqle:fts:complete> true } GRAPH ?g { ?s <urn:kind> <urn:wanted> } }";
+        let execute = |options: &QueryOptions| {
+            engine
+                .query_with_options(
+                    QueryRun {
+                        sparql: text,
+                        options,
+                    },
+                    &|_, _| true,
+                )
+                .map(|(_, result)| solution_rows(result.results).len())
+        };
+        let mut options = QueryOptions::results_only();
+        options.limits.max_intermediate_rows = crate::MAX_SEARCH_LIMIT + 1;
+        options.fast_paths = FastPathMode::Disabled;
+        assert_eq!(execute(&options).unwrap(), 6_000);
+        options.fast_paths = FastPathMode::Auto;
+        assert_eq!(execute(&options).unwrap(), 6_000);
     }
 
     #[test]
