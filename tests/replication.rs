@@ -510,6 +510,44 @@ mod tests {
         ));
     }
 
+    /// A peer's undecodable event after the prepare frontier must not block the retry.
+    #[test]
+    fn peer_poison_retries() {
+        let (_tmp, net) = setup_network(2);
+        let graph = GraphId::new("urn:test:mutation-peer-poison");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+        let request = |admission_sequence| MutationRequest {
+            id: MutationId::new(),
+            admission_sequence,
+            graph: graph.clone(),
+            changes: vec![MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: EncodedTerm::from_named_node(&graph.0),
+                predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                object: literal_term("after poison"),
+            }],
+        };
+        let mut retry = request(None);
+        let prepared = net
+            .peer(0)
+            .apply_mutation(&writer_auth(), retry.clone())
+            .unwrap();
+        assert_eq!(prepared.source, SourceOutcome::Prepared);
+
+        let topic = net.peer(0).irokle_topic_id(&graph).unwrap().unwrap();
+        net.irokle(1)
+            .open_topic::<PoisonEvent>(topic)
+            .unwrap()
+            .publish(PoisonEvent { junk: vec![7; 7] })
+            .unwrap();
+        net.sync_until_converged(10).unwrap();
+
+        retry.admission_sequence = Some(prepared.admission_sequence);
+        let applied = net.peer(0).apply_mutation(&writer_auth(), retry).unwrap();
+        assert_eq!(applied.source, SourceOutcome::Applied);
+    }
+
     #[test]
     fn outbound_hides_repairs() {
         let graph = GraphId::new("urn:test:receipt-visible");

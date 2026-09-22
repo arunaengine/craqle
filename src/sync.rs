@@ -1661,6 +1661,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             target: Some(view.clock),
         };
         let mut cursor = Some(encode_topic_cursor(&initial)?);
+        let local = irokle::actor_id_for(topic, self.node.peer_id());
         loop {
             let catchup = self.topic_records_since(topic, cursor.as_deref())?;
             let TopicCatchup {
@@ -1678,7 +1679,8 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                     {
                         return Ok(Some(record.clone()));
                     }
-                    TopicRecord::Rejected(record) => {
+                    // Only this node publishes its prepared mutation, so peer rejections cannot hide it.
+                    TopicRecord::Rejected(record) if record.meta.actor_id == local => {
                         return Err(CraqleSyncError::InvalidEvent(format!(
                             "prepared mutation search reached rejected record {}",
                             record.meta.op_id
