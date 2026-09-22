@@ -80,6 +80,8 @@ struct PlanCtx<'a> {
     row_demand: Cell<Option<u64>>,
     graph: Option<TermId>,
     graph_var: RefCell<Option<String>>,
+    /// Every enclosing graph variable, bound or not; folding one would drop its graph constraint.
+    graph_names: RefCell<Vec<String>>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -96,6 +98,7 @@ impl<'a> PlanCtx<'a> {
             row_demand: Cell::new(None),
             graph: mode.graph,
             graph_var: RefCell::new(None),
+            graph_names: RefCell::new(Vec::new()),
         }
     }
 
@@ -369,7 +372,12 @@ fn optimize_pattern(
             // An unbound graph variable joins every inner pattern and is bound by the first match.
             let free = predicate_var_key(&name).filter(|key| !bound.contains(key));
             let outer = cx.graph_var.replace(free);
+            let named = predicate_var_key(&name);
+            cx.graph_names.borrow_mut().extend(named.clone());
             let inner = optimize_pattern(*inner, bound, cx);
+            if named.is_some() {
+                cx.graph_names.borrow_mut().pop();
+            }
             cx.graph_var.replace(outer);
             GraphPattern::Graph {
                 name,
@@ -686,6 +694,14 @@ fn rewrite_bgp_filter(
     let mut remaining = Vec::with_capacity(conjuncts.len());
     for conjunct in conjuncts {
         let folded = foldable_equality(&conjunct).and_then(|(variable, constant)| {
+            if cx
+                .graph_names
+                .borrow()
+                .iter()
+                .any(|name| name == variable.as_str())
+            {
+                return None;
+            }
             match &constant {
                 FoldableConstant::StringLiteral(literal)
                     if has_noncanonical_spelling(cx, literal) =>

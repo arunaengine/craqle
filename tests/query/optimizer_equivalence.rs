@@ -852,4 +852,34 @@ mod tests {
             .collect();
         assert_eq!(ebv_entities(&node, "STRLEN(STR(?v)) >= 0"), stringable);
     }
+
+    /// A filter on the enclosing graph variable must keep constraining the graph.
+    #[test]
+    fn graph_filter_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(tmp.path()).unwrap();
+        for (graph, object) in [("urn:g:a", "urn:o1"), ("urn:g:b", "urn:o3")] {
+            let graph = GraphId::new(graph);
+            let change = MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: term_iri("urn:g:a"),
+                predicate: term_iri("urn:p"),
+                object: term_iri(object),
+            };
+            node.apply_changes_unchecked(&graph, vec![change]).unwrap();
+        }
+        node.ensure_query_indexes();
+        let expected = vec!["g=<urn:g:a>|o=<urn:o1>".to_string()];
+        for filter in ["?g = <urn:g:a>", "sameTerm(?g, <urn:g:a>)"] {
+            let sparql =
+                format!("SELECT ?g ?o WHERE {{ GRAPH ?g {{ ?g <urn:p> ?o FILTER({filter}) }} }}");
+            let raw = canonical_rows(all_rows(&node, &sparql, false));
+            assert_eq!(raw, expected, "{filter}");
+            assert_eq!(
+                canonical_rows(all_rows(&node, &sparql, true)),
+                raw,
+                "{filter}"
+            );
+        }
+    }
 }
