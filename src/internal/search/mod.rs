@@ -3275,9 +3275,12 @@ impl SearchIndex {
             };
             match outcome {
                 StageOutcome::Pending(indexed) => count = count.saturating_add(indexed),
-                StageOutcome::Covered(_) => {
-                    store.clear_graph_queue(graph, target)?;
-                    return Ok(count);
+                StageOutcome::Covered(covered) => {
+                    store.clear_graph_queue(graph, covered.min(target))?;
+                    // A resumed stage may cover only its older target; rebuild again.
+                    if covered >= target {
+                        return Ok(count);
+                    }
                 }
             }
         }
@@ -6207,6 +6210,62 @@ mod tests {
         second.join().unwrap().unwrap();
         assert!(node.store.drain_reindex_queue(8).unwrap().is_empty());
         assert_eq!(1, node.search.search("sharedneedle", 10).unwrap().len());
+    }
+
+    #[test]
+    fn resumed_stage_rescans() {
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:resumed-stage");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(&writer_auth(), crate_request(&graph, "oldneedle", true))
+                .unwrap();
+            node.flush_search_updates().unwrap();
+        }
+        let search = SearchIndex::open_in_memory().unwrap();
+        let store = reopen_store(dir.path());
+        {
+            let mut batch = store.new_batch();
+            store
+                .enqueue_fts_reindex(&mut batch, graph_term(&store, &graph))
+                .unwrap();
+            store.commit(batch).unwrap();
+            let _guard = search.lock_graph(graph.as_str());
+            let outcome = search
+                .stage_graph(
+                    GraphWork {
+                        store: &store,
+                        graph: &graph,
+                        control: &DrainControl::default(),
+                        byte_limit: search.work_bytes(),
+                    },
+                    store.current_dirty_token(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, StageOutcome::Pending(_)));
+        }
+        {
+            // A later write the cached stage snapshot cannot contain.
+            let other = Arc::new(SearchIndex::open_in_memory().unwrap());
+            let sparql = Arc::new(crate::sparql::SparqlEngine::new(store.clone(), other));
+            let engine = crate::replication::ReplicationEngine::new(
+                store.clone(),
+                sparql,
+                crate::core::ActorId::random(),
+            );
+            crate::rocrate::RoCrateManager::new(Arc::new(engine))
+                .add_data_entity(
+                    &graph,
+                    "data/fresh.txt",
+                    "http://schema.org/MediaObject",
+                    "freshneedle",
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+
+        search.reindex_from_store(&store, &graph).unwrap();
+        assert_eq!(1, search.search("freshneedle", 10).unwrap().len());
     }
 
     #[test]
