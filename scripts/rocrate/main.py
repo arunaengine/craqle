@@ -228,6 +228,8 @@ def validate(case, record):
             if sorted(hits) == sorted(map(tuple, case["expected"])):
                 return "valid"
             if record["engine"] == "craqle" and len(hits) == SEARCH_LIMIT < len(case["expected"]):
+                if not set(hits).issubset(set(map(tuple, case["expected"]))):
+                    return "ineligible hit"
                 return f"limit: one search returns at most {SEARCH_LIMIT} hits"
             return f"matched {len(hits)} resources, expected {len(case['expected'])}"
         pool = set(map(tuple, case["pool"]))

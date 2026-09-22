@@ -35,8 +35,8 @@
     },
     {
       "path": "scripts/rocrate",
-      "members": ["catalog.py", "fixture.py", "main.py", "virtuoso.py"],
-      "reason": "The four files form the RO-Crate and Virtuoso comparison benchmark.",
+      "members": ["catalog.py", "fixture.py", "main.py", "tests.py", "virtuoso.py"],
+      "reason": "The five files form the RO-Crate and Virtuoso comparison benchmark and its tests.",
       "source": "Aruna STYLE.md shared-prefix rule"
     },
     {

@@ -157,7 +157,7 @@ fn fixture() -> Fixture {
     }
 }
 
-fn canonicalize(results: QueryResults) -> CanonicalResults {
+fn canonicalize(results: QueryResults, ordered: bool) -> CanonicalResults {
     match results {
         QueryResults::Boolean(value) => CanonicalResults::Boolean(value),
         QueryResults::Solutions(rows) => {
@@ -169,7 +169,9 @@ fn canonicalize(results: QueryResults) -> CanonicalResults {
                     row
                 })
                 .collect();
-            rows.sort();
+            if !ordered {
+                rows.sort();
+            }
             CanonicalResults::Solutions(rows)
         }
         QueryResults::Graph(mut triples) => {
@@ -197,11 +199,15 @@ where
     let execute = |optimize| {
         let mut options = QueryOptions::default();
         options.optimize = optimize;
+        if !optimize {
+            options.fast_paths = craqle::QueryFastPathMode::Disabled;
+        }
         options.limits = QueryLimits::unbounded();
         canonicalize(
             node.execute_prepared(&auth, &prepared, &options)
                 .unwrap()
                 .results,
+            false,
         )
     };
     let optimized = execute(true);
@@ -346,6 +352,7 @@ fn union_deduplicates_triples() {
     assert_eq!(
         solution_rows(canonicalize(
             query_with_visibility(&fixture.node, |_| true, &query).unwrap(),
+            false,
         )),
         expected,
         "the union default graph must contain one copy of an identical triple"
@@ -393,6 +400,7 @@ fn queries_hide_orphans() {
                     &orphan_query,
                 )
                 .unwrap(),
+            false,
         )),
         Vec::<Vec<(String, EncodedTerm)>>::new(),
         "an explicit graph list must not expose a recorded orphan"
@@ -405,4 +413,151 @@ fn queries_hide_orphans() {
         )),
         Vec::<Vec<(String, EncodedTerm)>>::new()
     );
+}
+
+fn external_result(store: &oxigraph::store::Store, query: &str) -> CanonicalResults {
+    use oxigraph::sparql::{QueryResults as ExternalResults, SparqlEvaluator};
+    let result = SparqlEvaluator::new()
+        .parse_query(query)
+        .unwrap()
+        .on_store(store)
+        .execute()
+        .unwrap();
+    match result {
+        ExternalResults::Boolean(value) => CanonicalResults::Boolean(value),
+        ExternalResults::Solutions(solutions) => {
+            let mut rows: Vec<Vec<(String, EncodedTerm)>> = solutions
+                .map(|row| {
+                    let row = row.unwrap();
+                    let mut cells: Vec<_> = row
+                        .iter()
+                        .map(|(name, term)| {
+                            (name.as_str().to_owned(), EncodedTerm(term.to_string()))
+                        })
+                        .collect();
+                    cells.sort();
+                    cells
+                })
+                .collect();
+            if !query.contains("ORDER BY") {
+                rows.sort();
+            }
+            CanonicalResults::Solutions(rows)
+        }
+        ExternalResults::Graph(triples) => {
+            let mut triples: Vec<_> = triples
+                .map(|triple| {
+                    let triple = triple.unwrap();
+                    (
+                        EncodedTerm(triple.subject.to_string()),
+                        EncodedTerm(triple.predicate.to_string()),
+                        EncodedTerm(triple.object.to_string()),
+                    )
+                })
+                .collect();
+            triples.sort();
+            CanonicalResults::Graph(triples)
+        }
+    }
+}
+
+#[test]
+fn independent_queries_match() {
+    use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
+    let named = |value: String| NamedNode::new(value).unwrap();
+    for seed in 0..6 {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            directory.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let reference = oxigraph::store::Store::new().unwrap();
+        for graph_index in 0..3 {
+            let graph = GraphId::new(&format!("urn:oracle:g{graph_index}"));
+            let mut changes = Vec::new();
+            for index in 0..12 {
+                let subject = named(format!("urn:oracle:s{}", index % 8));
+                let mut triples = vec![
+                    (
+                        "urn:oracle:p",
+                        Term::Literal(Literal::from((index + seed + graph_index) % 5)),
+                    ),
+                    (
+                        "urn:oracle:r",
+                        Term::NamedNode(named(format!("urn:oracle:s{}", (index + 1) % 8))),
+                    ),
+                ];
+                if (index + seed + graph_index) % 3 == 0 {
+                    triples.push((
+                        "urn:oracle:q",
+                        Term::Literal(Literal::new_simple_literal("shared")),
+                    ));
+                }
+                for (predicate, object) in triples {
+                    let predicate = named(predicate.to_owned());
+                    changes.push(MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: EncodedTerm(subject.to_string()),
+                        predicate: EncodedTerm(predicate.to_string()),
+                        object: EncodedTerm(object.to_string()),
+                    });
+                    // Materialize a set-valued default graph independently of the query adapter.
+                    for scope in [
+                        GraphName::DefaultGraph,
+                        GraphName::NamedNode(named(graph.as_str().to_owned())),
+                    ] {
+                        reference
+                            .insert(&Quad::new(
+                                subject.clone(),
+                                predicate.clone(),
+                                object.clone(),
+                                scope,
+                            ))
+                            .unwrap();
+                    }
+                }
+            }
+            node.apply_changes_unchecked(&graph, changes).unwrap();
+        }
+        for query in [
+            "SELECT ?s ?v WHERE { ?s <urn:oracle:p> ?v }",
+            "SELECT ?s WHERE { ?s <urn:oracle:p> ?v }",
+            "SELECT DISTINCT ?s WHERE { ?s <urn:oracle:p> ?v }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:oracle:p> ?v }",
+            "SELECT ?g ?s WHERE { GRAPH ?g { ?s <urn:oracle:p> ?v } }",
+            "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s <urn:oracle:p> 2 ; <urn:oracle:q> ?q } }",
+            "SELECT ?v (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s <urn:oracle:p> ?v } } GROUP BY ?v ORDER BY ?v",
+            "SELECT ?s ?v ?q WHERE { ?s <urn:oracle:p> ?v OPTIONAL { ?s <urn:oracle:q> ?q } }",
+            "SELECT ?s ?v WHERE { ?s <urn:oracle:p> ?v FILTER(?v >= 2) }",
+            "SELECT ?s WHERE { ?s <urn:oracle:p> ?v FILTER EXISTS { ?s <urn:oracle:q> ?q } }",
+            "SELECT ?s WHERE { ?s <urn:oracle:p> ?v FILTER NOT EXISTS { ?s <urn:oracle:q> ?q } }",
+            "SELECT ?s WHERE { { ?s <urn:oracle:p> 1 } UNION { ?s <urn:oracle:p> 2 } }",
+            "SELECT ?s WHERE { ?s <urn:oracle:p> ?v MINUS { ?s <urn:oracle:q> ?q } }",
+            "SELECT ?s ?v WHERE { VALUES ?v { 1 2 } ?s <urn:oracle:p> ?v }",
+            "SELECT ?s ?next WHERE { ?s <urn:oracle:p> ?v BIND((?v + 1) AS ?next) }",
+            "SELECT ?s ?o WHERE { ?s <urn:oracle:r>+ ?o } ORDER BY ?s ?o LIMIT 20",
+            "SELECT ?s ?v WHERE { ?s <urn:oracle:p> ?v } ORDER BY ?s ?v LIMIT 5 OFFSET 2",
+            "ASK { ?s <urn:oracle:p> 2 }",
+            "ASK { ?s <urn:oracle:missing> ?o }",
+        ] {
+            let expected = external_result(&reference, query);
+            let prepared = node.prepare_query(query).unwrap();
+            for fast in [
+                craqle::QueryFastPathMode::Auto,
+                craqle::QueryFastPathMode::Disabled,
+            ] {
+                let mut options = QueryOptions::results_only();
+                options.fast_paths = fast;
+                let actual = node
+                    .execute_prepared(&AllowAllAuthorizer, &prepared, &options)
+                    .unwrap();
+                assert_eq!(
+                    canonicalize(actual.results, query.contains("ORDER BY")),
+                    expected,
+                    "seed {seed}, {fast:?}: {query}"
+                );
+            }
+        }
+    }
 }

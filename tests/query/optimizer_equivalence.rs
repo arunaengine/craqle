@@ -115,8 +115,8 @@ mod tests {
             .is_none_or(|idx| idx % 7 != 0)
     }
 
-    fn canonical_rows(results: QueryResults) -> BTreeSet<String> {
-        match results {
+    fn canonical_rows(results: QueryResults) -> Vec<String> {
+        let mut rows: Vec<String> = match results {
             QueryResults::Solutions(rows) => rows
                 .into_iter()
                 .map(|row| {
@@ -128,12 +128,14 @@ mod tests {
                     entries.join("|")
                 })
                 .collect(),
-            QueryResults::Boolean(value) => BTreeSet::from([format!("bool={value}")]),
+            QueryResults::Boolean(value) => vec![format!("bool={value}")],
             QueryResults::Graph(triples) => triples
                 .into_iter()
                 .map(|(s, p, o)| format!("{} {} {}", s.0, p.0, o.0))
                 .collect(),
-        }
+        };
+        rows.sort();
+        rows
     }
 
     fn planner_rows(node: &CraqleNode, sparql: &str, optimize: bool) -> QueryResults {
@@ -150,6 +152,9 @@ mod tests {
         let prepared = node.prepare_query(sparql).unwrap();
         let mut options = QueryOptions::default();
         options.optimize = optimize;
+        if !optimize {
+            options.fast_paths = QueryFastPathMode::Disabled;
+        }
         options.limits = QueryLimits::unbounded();
         node.execute_prepared(&auth, &prepared, &options)
             .unwrap()
@@ -160,6 +165,9 @@ mod tests {
         let prepared = node.prepare_query(sparql).unwrap();
         let mut options = QueryOptions::default();
         options.optimize = optimize;
+        if !optimize {
+            options.fast_paths = QueryFastPathMode::Disabled;
+        }
         options.limits = QueryLimits::unbounded();
         node.execute_prepared(&AllowAllAuthorizer, &prepared, &options)
             .unwrap()
@@ -498,7 +506,10 @@ mod tests {
         };
         let full = run("", JoinMode::Auto);
         assert_eq!(full.statistics.result_rows as usize, expected.len());
-        assert_eq!(canonical_rows(full.results.clone()), expected);
+        assert_eq!(
+            canonical_rows(full.results.clone()),
+            expected.iter().cloned().collect::<Vec<_>>()
+        );
         assert_eq!(
             full.statistics.planned_joins[0].physical_operator,
             JoinKind::Hash
@@ -510,7 +521,7 @@ mod tests {
             let actual = canonical_rows(results.clone());
             assert_eq!(rows.len(), 20);
             assert_eq!(actual.len(), 20);
-            assert!(actual.is_subset(&expected));
+            assert!(actual.iter().all(|row| expected.contains(row)));
         };
         let limited = run("LIMIT 20", JoinMode::Auto);
         assert_limited(&limited.results);
