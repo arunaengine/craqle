@@ -105,6 +105,22 @@ impl QueryBudget {
         })
     }
 
+    /// Applies the final query shape while keeping work already charged.
+    pub(crate) fn resume(&self, shape: BudgetShape) -> std::result::Result<Self, QueryLimitExceeded> {
+        let budget = Self::new(shape, self.limits, self.clock.clone())?;
+        for (target, source) in [
+            (&budget.intermediate_rows, &self.intermediate_rows),
+            (&budget.property_path_edges, &self.property_path_edges),
+            (&budget.result_rows, &self.result_rows),
+            (&budget.result_cells, &self.result_cells),
+            (&budget.result_bytes, &self.result_bytes),
+            (&budget.graph_triples, &self.graph_triples),
+        ] {
+            target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        Ok(budget)
+    }
+
     pub(crate) fn check(&self) -> std::result::Result<(), QueryLimitExceeded> {
         if let Some(error) = clock_error(&self.clock) {
             return Err(error);

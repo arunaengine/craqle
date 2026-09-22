@@ -862,6 +862,7 @@ impl SparqlEngine {
                 post_raw_visibility,
                 clock: &clock,
                 limits: &options.limits,
+                candidates: None,
             },
         )?;
         clock.check_stage()?;
@@ -1002,6 +1003,23 @@ impl SparqlEngine {
         let visible = |graph: &GraphId| policy_visible(view.snapshot(), graph);
         let scope = GraphScope::Predicate(&visible);
 
+        let (mut context, named_graphs) =
+            scope_read_context(scope, &view, options.cancellation.clone())?;
+        if options.collect_costs {
+            context.enable_costs();
+        }
+        let mut shape = query_features(&query).budget;
+        shape.estimated_rows = 0;
+        let budget = Arc::new(QueryBudget::new(shape, options.limits, clock.clone())?);
+        let candidates = (options.optimize
+            && matches!(options.fast_paths, FastPathMode::Auto)
+            && matches!(options.join_mode, JoinMode::Auto)
+            && query.dataset().is_none())
+        .then_some(FtsCandidates {
+            view: &view,
+            context: &context,
+            budget: &budget,
+        });
         let rewrite_started = Instant::now();
         rewrite_fts_query(
             &mut query,
@@ -1011,6 +1029,7 @@ impl SparqlEngine {
                 post_raw_visibility: Some((self.store.as_ref(), policy_visible)),
                 clock: &clock,
                 limits: &options.limits,
+                candidates,
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
@@ -1044,6 +1063,9 @@ impl SparqlEngine {
             &view,
             options,
             QueryStageStatistics {
+                context,
+                named_graphs,
+                budget,
                 clock,
                 parse_time,
                 rewrite_time,
@@ -1109,6 +1131,23 @@ impl SparqlEngine {
         let view = StoreReadView::with_read_mode(&self.store, options.read_mode);
         authorize_graph_scope(&view, scope, explicit_auth)?;
         let mut query = prepared.query.as_ref().clone();
+        let (mut context, named_graphs) =
+            scope_read_context(scope, &view, options.cancellation.clone())?;
+        if options.collect_costs {
+            context.enable_costs();
+        }
+        let mut shape = query_features(&query).budget;
+        shape.estimated_rows = 0;
+        let budget = Arc::new(QueryBudget::new(shape, options.limits, clock.clone())?);
+        let candidates = (options.optimize
+            && matches!(options.fast_paths, FastPathMode::Auto)
+            && matches!(options.join_mode, JoinMode::Auto)
+            && query.dataset().is_none())
+        .then_some(FtsCandidates {
+            view: &view,
+            context: &context,
+            budget: &budget,
+        });
         let rewrite_started = Instant::now();
         rewrite_fts_query(
             &mut query,
@@ -1118,6 +1157,7 @@ impl SparqlEngine {
                 post_raw_visibility: None,
                 clock: &clock,
                 limits: &options.limits,
+                candidates,
             },
         )?;
         let rewrite_time = rewrite_started.elapsed();
@@ -1151,6 +1191,9 @@ impl SparqlEngine {
             &view,
             options,
             QueryStageStatistics {
+                context,
+                named_graphs,
+                budget,
                 clock,
                 parse_time,
                 rewrite_time,
@@ -1171,22 +1214,15 @@ impl SparqlEngine {
         scope: GraphScope<'_>,
         view: &StoreReadView<'_>,
         options: &QueryOptions,
-        mut stages: QueryStageStatistics,
+        mut stages: QueryStageStatistics<'_>,
         collect_plan_statistics: bool,
     ) -> Result<(QueryExecution, ReadStatistics)> {
         let collect_plan_statistics = collect_plan_statistics && options.collect_plan_statistics;
-        let (mut context, named_graphs) =
-            scope_read_context(scope, view, options.cancellation.clone())?;
-        if options.collect_costs {
-            context.enable_costs();
-        }
+        let context = &stages.context;
+        let named_graphs = stages.named_graphs.take();
         context.check_cancelled()?;
         let features = query_features(&query);
-        let budget = Arc::new(QueryBudget::new(
-            features.budget,
-            options.limits,
-            stages.clock.clone(),
-        )?);
+        let budget = Arc::new(stages.budget.resume(features.budget)?);
         let mut known_terms = HashMap::new();
         if let Some(plan) = stages.graph_distinct.take()
             && context.validation_graph().is_none()
@@ -1194,7 +1230,7 @@ impl SparqlEngine {
                 &plan,
                 crate::graph_join::JoinInput {
                     view,
-                    context: &context,
+                    context,
                     budget: &budget,
                 },
             )?
@@ -1207,7 +1243,7 @@ impl SparqlEngine {
             known_terms = relation.known;
         }
         if let Some(plan) = stages.fast_path.take() {
-            let outcome = crate::sparql_fast_path::execute(&plan, view, &context, &budget)?;
+            let outcome = crate::sparql_fast_path::execute(&plan, view, context, &budget)?;
             let read_statistics = context.snapshot();
             let mut statistics = build_execution_statistics(
                 stages,
@@ -1257,8 +1293,8 @@ impl SparqlEngine {
             let mut visible = Vec::with_capacity(declared.len());
             for graph in declared {
                 if let Some(term) =
-                    view.lookup_term(&context, &EncodedTerm::from_named_node(graph))?
-                    && view.graph_is_visible(&context, term)?
+                    view.lookup_term(context, &EncodedTerm::from_named_node(graph))?
+                    && view.graph_is_visible(context, term)?
                 {
                     visible.push(GraphNode::NamedNode(graph.clone()));
                 }
@@ -1273,7 +1309,7 @@ impl SparqlEngine {
         let (results, explanation) = prepared.explain(
             StoreDataset::with_query_budget(
                 view,
-                &context,
+                context,
                 default_union_marker,
                 Arc::clone(&budget),
             )
@@ -1285,7 +1321,7 @@ impl SparqlEngine {
         let (results, collection) = collect_query_results(
             results,
             execution_started,
-            &context,
+            context,
             &budget,
             collect_plan_statistics || options.collect_costs,
         )?;
@@ -1880,7 +1916,10 @@ fn authorize_graph_scope(
     Ok(())
 }
 
-struct QueryStageStatistics {
+struct QueryStageStatistics<'a> {
+    context: ReadContext<'a>,
+    named_graphs: Option<Vec<GraphNode>>,
+    budget: Arc<QueryBudget>,
     clock: RequestClock,
     parse_time: Duration,
     rewrite_time: Duration,
@@ -2224,7 +2263,7 @@ fn explanation_descendant_rows(node: &serde_json::Value, root: bool) -> u64 {
 }
 
 fn build_execution_statistics(
-    stages: QueryStageStatistics,
+    stages: QueryStageStatistics<'_>,
     reads: ReadStatistics,
     initial_execution_time: Duration,
     collection: CollectionMetrics,
@@ -2400,6 +2439,14 @@ struct FtsRewriteCtx<'a> {
     post_raw_visibility: Option<(&'a GraphStore, &'a SnapshotVisibleFn<'a>)>,
     clock: &'a RequestClock,
     limits: &'a QueryLimits,
+    candidates: Option<FtsCandidates<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct FtsCandidates<'a> {
+    view: &'a StoreReadView<'a>,
+    context: &'a ReadContext<'a>,
+    budget: &'a QueryBudget,
 }
 
 fn rewrite_fts_query(query: &mut Query, cx: FtsRewriteCtx<'_>) -> Result<()> {
@@ -2420,10 +2467,24 @@ fn rewrite_graph_pattern(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
             pattern
         }
-        GraphPattern::Join { left, right } => GraphPattern::Join {
-            left: Box::new(rewrite_graph_pattern(*left, cx)?),
-            right: Box::new(rewrite_graph_pattern(*right, cx)?),
-        },
+        GraphPattern::Join { left, right } => {
+            if let Some(service) = candidate_join(&left, &right, cx)? {
+                GraphPattern::Join {
+                    left: Box::new(service),
+                    right,
+                }
+            } else if let Some(service) = candidate_join(&right, &left, cx)? {
+                GraphPattern::Join {
+                    left,
+                    right: Box::new(service),
+                }
+            } else {
+                GraphPattern::Join {
+                    left: Box::new(rewrite_graph_pattern(*left, cx)?),
+                    right: Box::new(rewrite_graph_pattern(*right, cx)?),
+                }
+            }
+        }
         GraphPattern::LeftJoin {
             left,
             right,
@@ -2500,7 +2561,7 @@ fn rewrite_graph_pattern(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result
             silent,
         } => match name {
             NamedNodePattern::NamedNode(node) if node.as_str() == FTS_SERVICE_IRI => {
-                rewrite_fts_service(*inner, cx)?
+                rewrite_fts_service(*inner, cx, None)?
             }
             other => GraphPattern::Service {
                 name: other,
@@ -2509,6 +2570,116 @@ fn rewrite_graph_pattern(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result
             },
         },
     })
+}
+
+fn candidate_join(
+    service: &GraphPattern,
+    rdf: &GraphPattern,
+    cx: FtsRewriteCtx<'_>,
+) -> Result<Option<GraphPattern>> {
+    if cx.candidates.is_none() || cx.limits.max_intermediate_rows == 0 {
+        return Ok(None);
+    }
+    let GraphPattern::Service {
+        name: NamedNodePattern::NamedNode(name),
+        inner,
+        silent: false,
+    } = service
+    else {
+        return Ok(None);
+    };
+    if name.as_str() != FTS_SERVICE_IRI {
+        return Ok(None);
+    }
+    let spec = parse_fts_spec(*inner.clone())?;
+    let (Some(FtsSubjectPattern::Variable(subject)), Some(FtsGraphBinding::Variable(graph))) =
+        (&spec.subject, &spec.graph)
+    else {
+        return Ok(None);
+    };
+    if !spec.complete || subject == graph {
+        return Ok(None);
+    }
+    let GraphPattern::Graph {
+        name: NamedNodePattern::Variable(selected),
+        inner: pattern,
+    } = rdf
+    else {
+        return Ok(None);
+    };
+    let GraphPattern::Bgp { patterns } = pattern.as_ref() else {
+        return Ok(None);
+    };
+    if selected != graph
+        || !patterns.iter().any(|pattern| {
+            matches!(
+                pattern.object,
+                TermPattern::NamedNode(_) | TermPattern::Literal(_)
+            )
+        })
+    {
+        return Ok(None);
+    }
+    let prepare = || candidate_subjects(rdf, subject, cx);
+    rewrite_fts_service(*inner.clone(), cx, Some(&prepare)).map(Some)
+}
+
+fn candidate_subjects(
+    rdf: &GraphPattern,
+    subject: &Variable,
+    cx: FtsRewriteCtx<'_>,
+) -> Result<Option<Vec<String>>> {
+    let Some(input) = cx.candidates else {
+        return Ok(None);
+    };
+    if input.context.validation_graph().is_some() {
+        return Ok(None);
+    }
+    let query = Query::Select {
+        dataset: None,
+        base_iri: None,
+        pattern: GraphPattern::Distinct {
+            inner: Box::new(GraphPattern::Project {
+                inner: Box::new(rdf.clone()),
+                variables: vec![subject.clone()],
+            }),
+        },
+    };
+    let Some(plan) = crate::graph_distinct::analyze(&query) else {
+        return Ok(None);
+    };
+    let Some(relation) = crate::graph_distinct::execute(
+        &plan,
+        crate::graph_join::JoinInput {
+            view: input.view,
+            context: input.context,
+            budget: input.budget,
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    drop(relation.known);
+    let GraphPattern::Values { bindings, .. } = relation.values else {
+        return Ok(None);
+    };
+    let mut bytes = bindings.len().saturating_mul(128);
+    for row in &bindings {
+        let [Some(GroundTerm::NamedNode(subject))] = row.as_slice() else {
+            return Ok(None);
+        };
+        bytes = bytes.saturating_add(subject.as_str().len().saturating_mul(32));
+    }
+    if bytes > cx.search.query_bytes() / 4 || bytes > cx.limits.max_hash_bytes {
+        return Ok(None);
+    }
+    let mut subjects = Vec::with_capacity(bindings.len());
+    for row in bindings {
+        if let Some(Some(GroundTerm::NamedNode(subject))) = row.into_iter().next() {
+            subjects.push(subject.into_string());
+        }
+    }
+    Ok(Some(subjects))
 }
 
 /// Bounds graph-policy memoization for one pinned SERVICE request.
@@ -2583,6 +2754,7 @@ struct FtsSearchRequest<'a> {
     /// `Some` restricts the index query to a single, already-visible graph.
     graph: Option<&'a str>,
     filter: FtsHitFilter<'a>,
+    candidates: Option<&'a crate::search::CandidateSource<'a, SparqlError>>,
 }
 
 /// Authorizes before ranking and checks current raw policies before returning rows.
@@ -2603,7 +2775,7 @@ fn search_visible_hits(
         subject: request.filter.subject,
         allows: &allows,
         check: &check,
-        candidates: None,
+        candidates: request.candidates,
     };
     let raw = if request.complete {
         search.collect_complete(query)?
@@ -2655,7 +2827,11 @@ fn search_visible_hits(
 
 /// Rewrites FTS against the last committed index state into `VALUES`.
 /// Callers needing read-your-writes must flush search first.
-fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
+fn rewrite_fts_service(
+    pattern: GraphPattern,
+    cx: FtsRewriteCtx<'_>,
+    candidates: Option<&crate::search::CandidateSource<'_, SparqlError>>,
+) -> Result<GraphPattern> {
     let mut spec = parse_fts_spec(pattern)?;
     if spec.complete {
         spec.limit = cx.limits.max_intermediate_rows;
@@ -2703,6 +2879,7 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
             clamped: spec.limit_clamped,
             complete: spec.complete,
             graph,
+            candidates,
             filter: FtsHitFilter {
                 visibility: &visibility,
                 post_raw_visibility: cx.post_raw_visibility,
@@ -4659,6 +4836,142 @@ mod tests {
         assert_eq!(vec![ReadAccessPath::QvGpos], qv.selected_access_paths);
         assert_eq!(1, source.source_keys_read);
         assert_eq!(1, qv.qv_keys_read);
+    }
+
+    #[test]
+    #[cfg(feature = "search")]
+    fn service_union_budget() {
+        let (_directory, store, search, engine) = setup_engine();
+        let graph = GraphId::new("urn:union");
+        for subject in ["urn:first", "urn:second"] {
+            insert_quad(
+                &store,
+                &graph,
+                subject,
+                "urn:p",
+                EncodedTerm::from_named_node(&NamedNode::new_unchecked("urn:value")),
+            );
+        }
+        settle_diagnostics(&store, &graph);
+        search
+            .index_resource(graph.as_str(), "urn:first", Some("needle"))
+            .unwrap();
+        search.commit().unwrap();
+        let mut options = QueryOptions::results_only();
+        options.fast_paths = FastPathMode::Disabled;
+        options.limits.max_hash_entries = 1;
+        let (_, execution) = engine.query_with_options(
+            QueryRun {
+                sparql: "SELECT ?s WHERE { { SERVICE <urn:craqle:fts> { ?s <urn:craqle:fts:query> \"needle\" ; <urn:craqle:fts:complete> true } } UNION { ?s <urn:p> ?o } }",
+                options: &options,
+            },
+            &|_, _| true,
+        ).unwrap();
+        assert_eq!(solution_rows(execution.results).len(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "search")]
+    fn candidates_preserve_bags() {
+        let (_directory, store, search, engine) = setup_engine();
+        let iri = |value: &str| EncodedTerm::from_named_node(&NamedNode::new_unchecked(value));
+        for (graph, subject, kind, witnesses) in [
+            ("urn:joined:a", "urn:shared", "urn:wanted", 2),
+            ("urn:joined:b", "urn:shared", "urn:other", 1),
+            ("urn:joined:c", "urn:second", "urn:wanted", 1),
+        ] {
+            let graph = GraphId::new(graph);
+            insert_quad(&store, &graph, subject, "urn:kind", iri(kind));
+            for witness in 0..witnesses {
+                insert_quad(
+                    &store,
+                    &graph,
+                    &format!("{}:d:{witness}", graph.as_str()),
+                    "urn:about",
+                    iri(subject),
+                );
+            }
+            settle_diagnostics(&store, &graph);
+        }
+        for (graph, subject) in [
+            ("urn:joined:a", "urn:shared"),
+            ("urn:joined:a", "urn:second"),
+            ("urn:joined:b", "urn:shared"),
+            ("urn:joined:c", "urn:shared"),
+            ("urn:joined:c", "urn:second"),
+        ] {
+            search
+                .index_resource(graph, subject, Some("needle"))
+                .unwrap();
+        }
+        for index in 0..10_001 {
+            search
+                .index_resource(
+                    "urn:joined:b",
+                    &format!("urn:irrelevant:{index}"),
+                    Some("needle"),
+                )
+                .unwrap();
+        }
+        search.commit().unwrap();
+        let rdf = "GRAPH ?g { ?d <urn:about> ?s . ?s <urn:kind> <urn:wanted> }";
+        let service = "SERVICE <urn:craqle:fts> { ?s <urn:craqle:fts:query> \"needle\" ; <urn:craqle:fts:graph> ?g ; <urn:craqle:fts:complete> true }";
+        let text = format!("SELECT ?g ?s WHERE {{ {service} {rdf} }} ORDER BY ?g ?s");
+        let execute = |text: &str, options: &QueryOptions| {
+            engine
+                .query_with_options(
+                    QueryRun {
+                        sparql: text,
+                        options,
+                    },
+                    &|_, _| true,
+                )
+                .map(|(_, result)| result.results)
+        };
+        let mut options = QueryOptions::results_only();
+        options.fast_paths = FastPathMode::Disabled;
+        let expected = execute(&text, &options).unwrap();
+        assert_eq!(solution_rows(expected.clone()).len(), 3);
+        options.fast_paths = FastPathMode::Auto;
+        options.limits.max_intermediate_rows = 100;
+        assert_eq!(execute(&text, &options).unwrap(), expected);
+        let reversed = format!("SELECT ?g ?s WHERE {{ {rdf} {service} }} ORDER BY ?g ?s");
+        assert_eq!(execute(&reversed, &options).unwrap(), expected);
+        let blank = text.replace("?d <urn:about>", "[] <urn:about>");
+        assert_eq!(execute(&blank, &options).unwrap(), expected);
+        let alias = text.replace("<urn:craqle:fts:graph> ?g", "<urn:craqle:fts:graph> ?s");
+        assert!(matches!(
+            execute(&alias, &options),
+            Err(SparqlError::QueryLimit { .. })
+        ));
+        let bounded = text.replace("<urn:craqle:fts:complete> true", "<urn:craqle:fts:limit> 1");
+        let limited = execute(&bounded, &options).unwrap();
+        options.fast_paths = FastPathMode::Disabled;
+        assert_eq!(execute(&bounded, &options).unwrap(), limited);
+        options.fast_paths = FastPathMode::Auto;
+        let empty = text.replace("<urn:wanted>", "<urn:missing>");
+        assert!(solution_rows(execute(&empty, &options).unwrap()).is_empty());
+
+        let values = "VALUES (?s ?g) { (<urn:shared> <urn:joined:a>) (<urn:second> <urn:joined:a>) (<urn:shared> <urn:joined:b>) (<urn:shared> <urn:joined:c>) (<urn:second> <urn:joined:c>) }";
+        let materialized = format!("SELECT ?g ?s WHERE {{ {values} {rdf} }} ORDER BY ?g ?s");
+        let minimum = (5..100)
+            .find(|limit| {
+                options.limits.max_intermediate_rows = *limit;
+                execute(&materialized, &options).is_ok()
+            })
+            .unwrap();
+        options.limits.max_intermediate_rows = minimum;
+        assert!(matches!(
+            execute(&text, &options),
+            Err(SparqlError::QueryLimit { .. })
+        ));
+
+        options.limits = QueryLimits::production();
+        options.read_mode = QueryReadMode::ForceSource;
+        assert_eq!(execute(&text, &options).unwrap(), expected);
+        options.read_mode = QueryReadMode::Auto;
+        store.set_test_index(crate::QueryIndexState::Failed("unavailable".into()));
+        assert_eq!(execute(&text, &options).unwrap(), expected);
     }
 
     #[test]
