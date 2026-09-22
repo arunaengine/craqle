@@ -194,3 +194,31 @@ fn explicit_scope_fails() {
         .unwrap();
     assert_eq!(vec![ALLOWED], subjects(&allowed));
 }
+
+/// Graph-level native plans hide denied graphs and fail on unreadable policy.
+#[test]
+fn graph_level_policy() {
+    let (_directory, node) = fixture();
+    let distinct =
+        "SELECT DISTINCT ?s WHERE { GRAPH ?g { ?s <http://schema.org/keywords> \"race\" } }";
+    let counted = "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { \
+                   ?s <http://schema.org/keywords> \"race\" } }";
+    for (label, result) in run_all(&node, distinct) {
+        let results = result.unwrap_or_else(|error| panic!("{label}: {error}"));
+        if label != "analyze" {
+            assert_eq!(vec![ALLOWED, FAILING], subjects(&results), "{label}");
+        }
+    }
+    let runs = || crate::sparql::GRAPH_DISTINCT_RUNS.with(std::cell::Cell::get);
+    let before = runs();
+    let visible = node.query(&public_only, counted).unwrap();
+    assert!(count(&visible).starts_with("\"2\""), "{visible:?}");
+    assert_eq!(runs(), before + 1, "the count must use the native plan");
+
+    node.store.fail_policy_reads(Some(GraphId::new(FAILING)));
+    for sparql in [distinct, counted] {
+        for (label, result) in run_all(&node, sparql) {
+            assert_failed(label, result);
+        }
+    }
+}
