@@ -10,7 +10,8 @@ mod support;
 use crate::support::TestWriteExt as _;
 use craqle::{
     ActorId, CraqleError, CraqleNode, CraqleOptions, EncodedTerm, GraphId, MaterializedQuadChange,
-    QueryCancellation, SearchStorage, ShaclCompileOptions, ShaclError, ShaclValidationOptions,
+    QueryCancellation, SearchStorage, ShaclCompileOptions, ShaclError, ShaclEvaluationMode,
+    ShaclValidationOptions,
 };
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_core::SHACLPath;
@@ -1269,6 +1270,68 @@ fn native_target_forms() {
         literal("value")
     );
     native_matches_rudof(&shape_text, &data_text);
+}
+
+/// A delta must judge literal aliases as the canonical terms a commit stores.
+#[test]
+fn alias_delta_canonical() {
+    let (_database, node) = node();
+    let auth = craqle::AllowAllAuthorizer;
+    let shapes = GraphId::new("urn:test:alias:shapes");
+    let data = GraphId::new("urn:test:alias:data");
+    let (root, property) = (iri("urn:test:alias:shape"), iri("urn:test:alias:property"));
+    let (focus, left, right) = (
+        iri("urn:test:alias:focus"),
+        iri("urn:test:alias:left"),
+        iri("urn:test:alias:right"),
+    );
+    insert(
+        &node,
+        &shapes,
+        &[
+            (&root, RDF_TYPE, &sh("NodeShape")),
+            (&root, &sh("targetNode"), &focus),
+            (&root, &sh("property"), &property),
+            (&property, &sh("path"), &left),
+            (&property, &sh("disjoint"), &right),
+        ],
+    );
+    insert(&node, &data, &[(&focus, &right, &literal("a"))]);
+    let schema = node
+        .compile_shacl(&auth, &shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    let alias = "\"a\"^^<http://www.w3.org/2001/XMLSchema#string>";
+    let changes = [MaterializedQuadChange::Insert {
+        graph: data.clone(),
+        subject: EncodedTerm(focus.clone()),
+        predicate: EncodedTerm(left.clone()),
+        object: EncodedTerm(alias.to_owned()),
+    }];
+    let mut reports = Vec::new();
+    for execution_mode in [
+        ShaclEvaluationMode::Auto,
+        ShaclEvaluationMode::Full,
+        ShaclEvaluationMode::Delta,
+    ] {
+        let options = ShaclValidationOptions {
+            execution_mode,
+            ..ShaclValidationOptions::default()
+        };
+        let report = node
+            .validate_shacl_delta(&auth, &data, &schema, &changes, &options)
+            .unwrap();
+        assert!(!report.conforms, "{execution_mode:?}");
+        reports.push(report.results);
+    }
+    node.apply_changes_unchecked(&data, changes.to_vec())
+        .unwrap();
+    let committed = node
+        .validate_shacl(&auth, &data, &schema, &ShaclValidationOptions::default())
+        .unwrap();
+    assert!(!committed.conforms);
+    for results in reports {
+        assert_eq!(results, committed.results);
+    }
 }
 
 #[test]

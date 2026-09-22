@@ -383,6 +383,8 @@ impl ShaclCompiler {
             return Err(ShaclError::ValidationCancelled.into());
         }
         self.ensure_schema_current(schema)?;
+        // Commits store canonical literal spellings, so the verdict must judge the same terms.
+        let changes = &crate::replication::canonical_changes(changes.to_vec());
         let (resolved, cache_hit, resolve_time) = self.resolve(schema)?;
         if let Some(graph) = changed_schema(schema, changes) {
             let error = if options.execution_mode == ShaclEvaluationMode::Delta {

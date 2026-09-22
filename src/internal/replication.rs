@@ -98,7 +98,9 @@ fn mutation_digest(
 }
 
 /// Writes literal aliases in canonical form; deletes also remove an alias stored before canonicalization.
-fn canonical_changes(changes: Vec<MaterializedQuadChange>) -> Vec<MaterializedQuadChange> {
+pub(crate) fn canonical_changes(
+    changes: Vec<MaterializedQuadChange>,
+) -> Vec<MaterializedQuadChange> {
     let mut canonical = Vec::with_capacity(changes.len());
     for change in changes {
         let (MaterializedQuadChange::Insert {
