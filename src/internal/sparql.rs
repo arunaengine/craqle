@@ -2969,6 +2969,8 @@ struct StoreDataset<'store, 'context, 'visibility> {
     dense_scope: Option<u64>,
     /// The single selected graph and its dense ID, resolved once per dataset.
     scoped_graph: Cell<Option<(TermId, Option<DenseTerm>)>>,
+    /// Set once a broad cross-graph scan has considered reading graph records by range.
+    graph_visits_prepared: Cell<bool>,
     /// Stored identities a native operator already resolved for this query.
     known_terms: HashMap<String, (TermId, QueryTermId)>,
 }
@@ -2998,6 +3000,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
             scoped_graph: Cell::new(None),
+            graph_visits_prepared: Cell::new(false),
             known_terms: HashMap::new(),
         }
     }
@@ -3017,6 +3020,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
             scoped_graph: Cell::new(None),
+            graph_visits_prepared: Cell::new(false),
             known_terms: HashMap::new(),
         }
     }
@@ -3036,6 +3040,7 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
             dense_resolver: RefCell::new(None),
             dense_scope: next_dense_scope(),
             scoped_graph: Cell::new(None),
+            graph_visits_prepared: Cell::new(false),
             known_terms: HashMap::new(),
         }
     }
@@ -3043,6 +3048,24 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
     fn with_known_terms(mut self, known_terms: HashMap<String, (TermId, QueryTermId)>) -> Self {
         self.known_terms = known_terms;
         self
+    }
+
+    /// Reads graph records by range once when a predicate scan crosses many graphs.
+    fn prepare_graph_visits(
+        &self,
+        predicate: ResolvedPatternTerm,
+    ) -> std::result::Result<(), StoreDatasetError> {
+        let ResolvedPatternTerm::Existing { source, dense } = predicate else {
+            return Ok(());
+        };
+        if self.graph_visits_prepared.replace(true) {
+            return Ok(());
+        }
+        let predicate = self.source_term(source, dense)?;
+        if let Some(expected) = self.view.qv_p_count(self.context, predicate)? {
+            self.view.prepare_graph_visits(expected)?;
+        }
+        Ok(())
     }
 
     /// The one graph an explicit scope selects, with its dense ID when query IDs apply.
@@ -3340,6 +3363,13 @@ where
             && (graph_dense.is_some() || !matches!(selector, GraphSelector::Named(_)))
             && let Some(scope) = self.dense_scope
         {
+            if subject_id.is_none()
+                && object_id.is_none()
+                && !matches!(selector, GraphSelector::Named(_))
+                && let Err(error) = self.prepare_graph_visits(predicate)
+            {
+                return Box::new(std::iter::once(Err(error)));
+            }
             let (cache_entries, cache_bytes) = self
                 .query_budget
                 .as_ref()

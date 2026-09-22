@@ -19,6 +19,8 @@ use crate::store::{
 
 /// Largest exact scope mapped to dense graph IDs for key filtering.
 const EXACT_FILTER_GRAPHS: usize = 1_024;
+/// Expected graph visits from which graph records are read by range instead of point reads.
+const PREFETCH_GRAPHS: u64 = 256;
 
 /// A quad pattern represented entirely by internally interned term ids.
 #[derive(Clone, Copy, Debug, Default)]
@@ -424,6 +426,16 @@ impl<'store> StoreReadView<'store> {
         };
         context.remember_dense_graphs(dense.clone());
         Ok(dense)
+    }
+
+    /// Reads graph records by range when a read expects to visit at least about a third of
+    /// all graphs; point reads are cheaper for fewer. Returns whether records were read.
+    pub(crate) fn prepare_graph_visits(&self, expected: u64) -> Result<bool> {
+        if !(PREFETCH_GRAPHS..u64::MAX / 4).contains(&expected) {
+            return Ok(false);
+        }
+        let limit = usize::try_from(expected.saturating_mul(3)).unwrap_or(usize::MAX);
+        self.snapshot.prefetch_graph_records(self.store, limit)
     }
 
     pub(crate) fn orphaned_ids(

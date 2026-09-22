@@ -284,8 +284,6 @@ impl Names {
 const SEEK_COST: u64 = 10;
 /// Relative cost of one key in a whole-store range, where the graph changes on most keys.
 const SCAN_KEY_COST: u64 = 2;
-/// Expected graph visits from which graph records are read by range instead of point reads.
-const PREFETCH_GRAPHS: u64 = 256;
 /// Row counts from which the planner probes a few real rows instead of trusting counters.
 const OBSERVE_ROWS: usize = 64;
 const OBSERVE_SAMPLES: usize = 4;
@@ -404,15 +402,8 @@ impl Run<'_, '_, '_> {
         for pattern in &pending {
             first = first.min(self.scan_estimate(*pattern)?);
         }
-        // Each first graph visit costs several point reads; ranges are cheaper for many graphs.
-        if (PREFETCH_GRAPHS..u64::MAX / 4).contains(&first) {
-            let limit = usize::try_from(first.saturating_mul(4)).unwrap_or(usize::MAX);
-            let view = self.reader.input.view;
-            let prefetched = view
-                .snapshot()
-                .prefetch_graph_records(view.store(), limit)?;
-            self.record(|stats| stats.prefetched = prefetched);
-        }
+        let prefetched = self.reader.input.view.prepare_graph_visits(first)?;
+        self.record(|stats| stats.prefetched = prefetched);
         let mut rows = Rows::unit();
         while !pending.is_empty() && !rows.data.is_empty() {
             self.reader.input.context.check_cancelled()?;
