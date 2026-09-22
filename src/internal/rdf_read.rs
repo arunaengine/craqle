@@ -1543,6 +1543,29 @@ mod tests {
         assert!(cursor.next().is_none());
     }
 
+    /// A closed request clock stops scans that skip only hidden graphs.
+    #[test]
+    fn deadline_stops_scans() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:deadline");
+        add_many(&store, &graph, 1_025);
+        settle_diagnostics(&store, &graph);
+        let view = StoreReadView::new(&store);
+        let cancellation = QueryCancellation::new();
+        let clock = crate::query::deadline::RequestClock::start(
+            Some(Duration::ZERO),
+            cancellation.clone(),
+            std::time::Instant::now(),
+        );
+        let hidden = |_: &GraphId| false;
+        let mut context = ReadContext::with_graph_visibility(cancellation.clone(), &hidden);
+        assert!(context.check_cancelled().is_ok());
+        context.watch_clock(&clock);
+        let scan = view.scan(&context, GraphSelector::Union, QuadPattern::default());
+        assert!(matches!(scan, Err(StoreError::Cancelled)));
+        assert!(!cancellation.is_cancelled());
+    }
+
     #[test]
     fn duplicates_observe_cancellation() {
         let (_directory, store) = setup_store();

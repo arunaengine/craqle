@@ -228,6 +228,14 @@ impl RequestClock {
         }
     }
 
+    /// Reports a read stopped by a closed clock with the clock's own cause.
+    fn store_error(&self, error: SparqlError) -> SparqlError {
+        match error {
+            SparqlError::Store(StoreError::Cancelled) => self.cancel_error(),
+            error => error,
+        }
+    }
+
     fn cancel_error(&self) -> SparqlError {
         match self.outcome() {
             RequestOutcome::Explicit | RequestOutcome::Active => SparqlError::Cancelled,
@@ -1005,6 +1013,7 @@ impl SparqlEngine {
 
         let (mut context, named_graphs) =
             scope_read_context(scope, &view, options.cancellation.clone())?;
+        context.watch_clock(&clock);
         if options.collect_costs {
             context.enable_costs();
         }
@@ -1031,7 +1040,8 @@ impl SparqlEngine {
                 limits: &options.limits,
                 candidates,
             },
-        )?;
+        )
+        .map_err(|error| clock.store_error(error))?;
         let rewrite_time = rewrite_started.elapsed();
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
@@ -1066,7 +1076,7 @@ impl SparqlEngine {
                 context,
                 named_graphs,
                 budget,
-                clock,
+                clock: clock.clone(),
                 parse_time,
                 rewrite_time,
                 craqle_planning_time,
@@ -1079,6 +1089,7 @@ impl SparqlEngine {
             collect_plan_statistics,
         )
         .map(|(execution, _)| execution)
+        .map_err(|error| clock.store_error(error))
     }
 
     #[cfg(test)]
@@ -1133,6 +1144,7 @@ impl SparqlEngine {
         let mut query = prepared.query.as_ref().clone();
         let (mut context, named_graphs) =
             scope_read_context(scope, &view, options.cancellation.clone())?;
+        context.watch_clock(&clock);
         if options.collect_costs {
             context.enable_costs();
         }
@@ -1159,7 +1171,8 @@ impl SparqlEngine {
                 limits: &options.limits,
                 candidates,
             },
-        )?;
+        )
+        .map_err(|error| clock.store_error(error))?;
         let rewrite_time = rewrite_started.elapsed();
         clock.check_stage()?;
         let fast_path = fast_path_plan(&query, options);
@@ -1194,7 +1207,7 @@ impl SparqlEngine {
                 context,
                 named_graphs,
                 budget,
-                clock,
+                clock: clock.clone(),
                 parse_time,
                 rewrite_time,
                 craqle_planning_time,
@@ -1206,6 +1219,7 @@ impl SparqlEngine {
             },
             collect_plan_statistics,
         )
+        .map_err(|error| clock.store_error(error))
     }
 
     fn execute_query(
@@ -1456,10 +1470,11 @@ impl SparqlEngine {
                                 default_union_marker.clone(),
                             )]);
                     }
-                    let context = ReadContext::with_visible_graphs(
+                    let mut context = ReadContext::with_visible_graphs(
                         cancellation.clone(),
                         readable_graphs.iter().cloned(),
                     );
+                    context.watch_clock(&clock);
                     let iter = prepared
                         .execute(StoreDataset::with_query_budget(
                             &view,
@@ -4026,7 +4041,7 @@ fn map_eval_error(error: QueryEvaluationError, clock: &RequestClock) -> SparqlEr
                     matches!(error, StoreDatasetError::Store(StoreError::Cancelled))
                 }) =>
         {
-            SparqlError::Cancelled
+            clock.cancel_error()
         }
         QueryEvaluationError::Dataset(error)
             if error
@@ -4170,6 +4185,27 @@ mod tests {
         let search = Arc::new(SearchIndex::open_in_memory().unwrap());
         let engine = SparqlEngine::new(store.clone(), search.clone());
         (dir, store, search, engine)
+    }
+
+    /// Reads stopped by the request deadline report the deadline, not cancellation.
+    #[test]
+    fn deadline_read_errors() {
+        let live = RequestClock::start(None, QueryCancellation::new(), Instant::now());
+        let error = live.store_error(SparqlError::Store(StoreError::Cancelled));
+        assert!(matches!(error, SparqlError::Cancelled));
+        let expired = RequestClock::start(
+            Some(Duration::ZERO),
+            QueryCancellation::new(),
+            Instant::now(),
+        );
+        let error = expired.store_error(SparqlError::Store(StoreError::Cancelled));
+        assert!(matches!(
+            error,
+            SparqlError::QueryLimit {
+                resource: "query deadline",
+                ..
+            }
+        ));
     }
 
     #[test]

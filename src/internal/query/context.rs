@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::deadline::RequestClock;
 use crate::core::{EncodedTerm, GraphId};
 use crate::store::{QueryTermId, Result, StoreError, TermId, hash_term};
 
@@ -522,6 +523,8 @@ pub(crate) struct ReadContext<'a> {
     orphaned: RefCell<HashMap<TermId, Rc<HashSet<TermId>>>>,
     /// The exact scope's graphs as dense IDs, mapped at most once per request.
     dense_graphs: OnceCell<Option<Rc<HashSet<QueryTermId>>>>,
+    /// Closed with the request clock, so read loops also stop at the deadline.
+    request: Option<spareval::CancellationToken>,
 }
 
 impl<'a> Default for ReadContext<'a> {
@@ -541,6 +544,7 @@ impl<'a> ReadContext<'a> {
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
             dense_graphs: OnceCell::new(),
+            request: None,
         }
     }
 
@@ -561,6 +565,7 @@ impl<'a> ReadContext<'a> {
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
             dense_graphs: OnceCell::new(),
+            request: None,
         }
     }
 
@@ -605,6 +610,7 @@ impl<'a> ReadContext<'a> {
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
             dense_graphs: OnceCell::new(),
+            request: None,
         }
     }
 
@@ -621,6 +627,7 @@ impl<'a> ReadContext<'a> {
             graph_visibility: RefCell::new(HashMap::new()),
             orphaned: RefCell::new(HashMap::new()),
             dense_graphs: OnceCell::new(),
+            request: None,
         }
     }
 
@@ -638,8 +645,17 @@ impl<'a> ReadContext<'a> {
         self.counters.costs.clone()
     }
 
+    pub(crate) fn watch_clock(&mut self, clock: &RequestClock) {
+        self.request = Some(clock.evaluator());
+    }
+
     pub(crate) fn check_cancelled(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled()
+            || self
+                .request
+                .as_ref()
+                .is_some_and(spareval::CancellationToken::is_cancelled)
+        {
             return Err(StoreError::Cancelled);
         }
         Ok(())
