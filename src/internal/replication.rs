@@ -3054,6 +3054,9 @@ impl ReplicationEngine {
             report.audit.after_digest = Some(snapshot_digest(&request.authoritative)?);
             self.store
                 .replace_snapshot(&request.authoritative, &report.audit)?;
+            let _write = self.store.graph_write_guard(&report.audit.graph);
+            let _commit = self.store.graph_commit_guard(&report.audit.graph);
+            self.recompute_graph_diagnostics(&report.audit.graph)?;
             return Ok(report);
         }
         self.record_repair(&report.audit)?;

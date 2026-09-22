@@ -651,6 +651,81 @@ mod tests {
         assert_eq!(reopened.graph_snapshot(&graph).unwrap(), healthy);
     }
 
+    /// A repair that keeps the clock must not leave diagnostics from the replaced quads.
+    #[test]
+    fn repair_refreshes_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open(directory.path()).unwrap();
+        let graph = GraphId::new("urn:test:repair-diagnostics");
+        node.create_crate(
+            &writer_auth(),
+            CreateCrateRequest::new(
+                graph.clone(),
+                "Linked source",
+                "Repair fixture",
+                "2026-09-20",
+                None,
+                public_policy(),
+            ),
+        )
+        .unwrap();
+        let part =
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:repair-part"));
+        let link = EncodedTerm::from_named_node(&vocab::schema_has_part());
+        node.apply_changes_unchecked(
+            &graph,
+            vec![
+                MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: EncodedTerm::from_named_node(&graph.0),
+                    predicate: link.clone(),
+                    object: part.clone(),
+                },
+                MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: part.clone(),
+                    predicate: EncodedTerm::from_named_node(&vocab::rdf_type()),
+                    object: EncodedTerm::from_named_node(&vocab::schema_dataset()),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(
+            node.graph_diagnostics(&graph)
+                .unwrap()
+                .orphaned_entities
+                .is_empty()
+        );
+        let mut healthy = node.graph_snapshot(&graph).unwrap();
+        healthy
+            .quads
+            .retain(|quad| !(quad.predicate == link && quad.object == part));
+        let digest = *blake3::hash(&postcard::to_allocvec(&healthy).unwrap()).as_bytes();
+
+        let report = node
+            .reconcile_graph(
+                &writer_auth(),
+                ReconcileRequest {
+                    id: MutationId::new(),
+                    graph: graph.clone(),
+                    mode: RepairMode::Apply,
+                    source: ReconcileSource::HealthySnapshot {
+                        source: "same clock fixture".to_owned(),
+                        snapshot: healthy.clone(),
+                        digest,
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(report.audit.result, RepairResult::Applied);
+        assert_eq!(node.graph_snapshot(&graph).unwrap().clock, healthy.clock);
+        assert_eq!(
+            node.graph_diagnostics(&graph).unwrap().orphaned_entities,
+            vec!["urn:test:repair-part".to_owned()]
+        );
+    }
+
     #[test]
     fn repair_keeps_tombstone() {
         let directory = tempfile::tempdir().unwrap();

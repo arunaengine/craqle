@@ -9290,6 +9290,14 @@ impl GraphStore {
                 clock: &snapshot.clock,
             },
         )?;
+        // An unchanged clock would keep trusting results derived from the replaced quads.
+        batch.remove(&self.graphs, graph_diagnostics_key(graph_id));
+        #[cfg(feature = "shacl-core")]
+        self.stage_pending_bindings(
+            &mut batch,
+            &snapshot.graph,
+            *blake3::hash(&postcard::to_allocvec(&snapshot.clock)?).as_bytes(),
+        )?;
         self.enqueue_fts_subjects(
             &mut batch,
             FtsEnqueue {
