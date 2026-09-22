@@ -1283,7 +1283,7 @@ impl SparqlEngine {
         let default_union_marker = BlankNode::default();
         let source_union = matches!(scope, GraphScope::List(_))
             && (matches!(options.read_mode, QueryReadMode::ForceSource)
-                || !view.query_ids_trusted(&context)?);
+                || !view.query_ids_trusted(context)?);
         if query.dataset().is_none() {
             prepared
                 .dataset_mut()
