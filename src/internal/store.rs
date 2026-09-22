@@ -255,6 +255,7 @@ const INDEX_EPOCH_SHARDS: usize = 256;
 /// Maximum wait for query-view maintenance ownership before reporting busy.
 const QV_COMMIT_WAIT: Duration = Duration::from_secs(120);
 const TERM_CACHE_CAP: usize = 1_000_000;
+const SOURCE_CACHE_CAP: usize = 1_000_000;
 const TERM_CACHE_BYTES: usize = 128 * 1_048_576;
 const SUBJECT_CACHE_CAP: usize = 65_536;
 const SUBJECT_CACHE_BYTES: usize = 64 * 1_048_576;
@@ -309,6 +310,9 @@ fn decode_disk_format(bytes: &[u8]) -> Result<DiskFormatVersion> {
         minor: u16::from_be_bytes(bytes[2..].try_into().unwrap()),
     })
 }
+
+/// Source terms of dense IDs by query-ID generation, shared by all readers of one store.
+pub(crate) type SourceCache = Arc<RwLock<BoundedCache<(u64, QueryTermId), TermId>>>;
 
 /// Per-store cache ceilings derived from the admitted process memory budget.
 #[derive(Clone, Copy)]
@@ -1314,6 +1318,10 @@ pub struct GraphStore {
     /// Global term-id → term cache. Term ids are content hashes, so entries do
     /// not need invalidation; capacity and bytes are bounded independently.
     term_decode_cache: RwLock<BoundedCache<TermId, Arc<EncodedTerm>>>,
+    /// Source terms of dense IDs; a mapping never changes within one query-ID generation.
+    source_cache: SourceCache,
+    /// Highest query-ID generation seen by this process, so a rebuild never reuses one.
+    generation_floor: AtomicU64,
     /// Counts for the shared-lock term hit path, which cannot update the cache.
     term_cache_hits: AtomicU64,
     term_cache_misses: AtomicU64,
@@ -3358,7 +3366,32 @@ impl GraphStore {
                 });
             }
         }
-        Ok(decode_index_header(bytes.as_ref()))
+        let header = decode_index_header(bytes.as_ref());
+        if let IndexHeaderRead::Valid(header) | IndexHeaderRead::Legacy(header) = &header {
+            self.generation_floor
+                .fetch_max(header.query_id_generation, Ordering::SeqCst);
+        }
+        Ok(header)
+    }
+
+    /// Shared source mappings for dense cursors, keyed by query-ID generation.
+    pub(crate) fn source_cache(&self) -> SourceCache {
+        Arc::clone(&self.source_cache)
+    }
+
+    /// A generation above `previous` and every generation this process has seen. Shared
+    /// source mappings stay exact even when a lost header restarts the stored count.
+    fn next_generation(&self, previous: u64) -> u64 {
+        let mut generation = previous.checked_add(1).unwrap_or(1);
+        loop {
+            let seen = self
+                .generation_floor
+                .fetch_max(generation, Ordering::SeqCst);
+            if seen < generation {
+                return generation;
+            }
+            generation = seen.checked_add(1).unwrap_or(1);
+        }
     }
 
     fn query_header_digest(&self, snapshot: &Snapshot) -> Result<[u8; 32]> {
@@ -5407,7 +5440,7 @@ impl GraphStore {
                     stop,
                 })?;
                 let union_duplicate_free = self.index_union_unique(&self.db.snapshot(), spaces)?;
-                let query_id_generation = previous.query_id_generation.checked_add(1).unwrap_or(1);
+                let query_id_generation = self.next_generation(previous.query_id_generation);
                 let mut candidate = IndexHeader {
                     active_slot: inactive.encode(),
                     state: StoredIndexState::Building,
@@ -7381,6 +7414,11 @@ impl GraphStore {
             validation_max_active: std::sync::atomic::AtomicUsize::new(0),
             indexes: RwLock::new(IndexState::with_budget(&budget)),
             term_decode_cache: RwLock::new(BoundedCache::new(TERM_CACHE_CAP, budget.terms)),
+            source_cache: Arc::new(RwLock::new(BoundedCache::new(
+                SOURCE_CACHE_CAP,
+                budget.terms / 8,
+            ))),
+            generation_floor: AtomicU64::new(0),
             term_cache_hits: AtomicU64::new(0),
             term_cache_misses: AtomicU64::new(0),
             #[cfg(test)]
@@ -14405,6 +14443,27 @@ mod tests {
         assert!(sampled.valid);
         assert!(!sampled.full);
         assert_eq!(1, reopened.index_verify_count());
+    }
+
+    #[test]
+    fn generations_never_reused() {
+        let (_dir, store) = setup_store();
+        let graph = GraphId::new("urn:test:qv:generation-floor");
+        store.create_graph(&graph).unwrap();
+        let quad = encode_quad(&store, &graph, ("urn:test:s", "urn:test:p", "urn:test:o"));
+        commit_add(&store, &graph, quad);
+        store.rebuild_query_indexes().unwrap();
+        store.rebuild_query_indexes().unwrap();
+        let used = test_index_header(&store).query_id_generation;
+        assert!(
+            used > 2,
+            "the stored count must exceed a fresh header's first rebuild"
+        );
+
+        remove_test_key(&store, &store.qv2_meta, QV_HEADER_KEY);
+        store.rebuild_query_indexes().unwrap();
+        assert!(test_index_header(&store).query_id_generation > used);
+        assert_index_ready(&store, 1);
     }
 
     #[test]

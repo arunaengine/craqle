@@ -7,13 +7,15 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Bound::{Excluded, Included};
 use std::rc::Rc;
+use std::sync::PoisonError;
 
 use fjall::{Keyspace, Readable, Snapshot};
 
 use crate::query::context::{QueryCost, ReadContext};
 use crate::rdf_read::{GraphVisibilityInput, QuadPattern, graph_orphans};
 use crate::store::{
-    EncodedQuad, GraphStore, IndexCursorOrder, QueryTermId, Result, StoreReadSnapshot, TermId,
+    EncodedQuad, GraphStore, IndexCursorOrder, QueryTermId, Result, SourceCache, StoreReadSnapshot,
+    TermId,
 };
 use crate::validation_delta::DeltaQuadCursor;
 
@@ -133,6 +135,7 @@ struct DenseResolverInner {
     costs: QueryCost,
     space: DenseSpace,
     sources: RefCell<crate::cache::BoundedCache<QueryTermId, TermId>>,
+    shared: Option<SourceCache>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -518,6 +521,7 @@ impl RawIndexCursor {
                     request.cache_entries,
                     request.cache_bytes,
                 )),
+                shared: request.shared,
             }),
         }
     }
@@ -583,12 +587,33 @@ impl DenseResolver {
         if let Some(source) = self.inner.sources.borrow_mut().get_cloned(&term.query) {
             return Ok(source);
         }
+        let key = (self.inner.space.generation, term.query);
+        let shared = self.inner.shared.as_ref().and_then(|shared| {
+            shared
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .peek(&key)
+                .copied()
+        });
+        if let Some(source) = shared {
+            self.inner
+                .sources
+                .borrow_mut()
+                .insert(term.query, source, 0);
+            return Ok(source);
+        }
         let (source, bytes) = GraphStore::decode_query_term(
             &self.inner.snapshot,
             &self.inner.query_to_term,
             term.query,
         )?;
         self.inner.costs.reverse_mapping(bytes);
+        if let Some(shared) = &self.inner.shared {
+            shared
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, source, 0);
+        }
         self.inner
             .sources
             .borrow_mut()
@@ -597,11 +622,12 @@ impl DenseResolver {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct DenseRequest {
     pub(crate) scope: u64,
     pub(crate) cache_entries: usize,
     pub(crate) cache_bytes: usize,
+    pub(crate) shared: Option<SourceCache>,
 }
 
 pub(crate) struct DenseInput<'store, 'context, 'visibility> {
@@ -653,6 +679,7 @@ impl<'store, 'context, 'visibility> DenseCursor<'store, 'context, 'visibility> {
                     scope: input.scope,
                     cache_entries: input.cache_entries,
                     cache_bytes: input.cache_bytes,
+                    shared: Some(input.store.source_cache()),
                 },
             ),
         };

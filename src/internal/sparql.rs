@@ -4131,18 +4131,19 @@ mod tests {
                 .unwrap()
                 .statistics
         };
+        // Counting runs first, before shared source mappings are cached.
+        let enabled = run(true);
+        assert!(enabled.reverse_mapping_reads > 0);
+        assert!(enabled.forward_mapping_reads > 0);
+        assert!(enabled.planner_point_reads > 0);
+        assert!(enabled.planner_cache_misses > 0);
+
         let disabled = run(false);
         assert_eq!(disabled.reverse_mapping_reads, 0);
         assert_eq!(disabled.forward_mapping_reads, 0);
         assert_eq!(disabled.planner_point_reads, 0);
         assert_eq!(disabled.planner_cache_hits, 0);
         assert_eq!(disabled.planner_cache_misses, 0);
-
-        let enabled = run(true);
-        assert!(enabled.reverse_mapping_reads > 0);
-        assert!(enabled.forward_mapping_reads > 0);
-        assert!(enabled.planner_point_reads > 0);
-        assert!(enabled.planner_cache_misses > 0);
     }
 
     #[test]
