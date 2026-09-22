@@ -2093,22 +2093,24 @@ impl SearchIndex {
         let hydration = std::time::Instant::now();
         for ranked in ranked {
             (req.check)()?;
+            let scope = scope_at(&view, ranked.address);
             let hit = view
                 .searcher
                 .doc(ranked.address)
                 .map_err(SearchError::from)
                 .and_then(|doc| self.doc_to_hit(doc, ranked.score))
                 .and_then(|hit| {
-                    (stable_hit_key(&hit.graph_id, &hit.subject_iri) == ranked.stable)
-                        .then_some(hit)
-                        .ok_or(SearchError::Damaged {
-                            detail: "stored identity",
-                        })
+                    (stable_hit_key(&hit.graph_id, &hit.subject_iri) == ranked.stable
+                        && scope.as_deref().and_then(scope_graph) == Some(hit.graph_id.as_str()))
+                    .then_some(hit)
+                    .ok_or(SearchError::Damaged {
+                        detail: "stored identity",
+                    })
                 });
             // The trusted scope names the graph; a stored identity is never authority.
             let hit = hit
                 .inspect_err(|_| {
-                    self.mark_damaged(&view, scope_at(&view, ranked.address).as_deref());
+                    self.mark_damaged(&view, scope.as_deref());
                 })
                 .map_err(E::from)?;
             retained = retained
@@ -4540,7 +4542,7 @@ mod tests {
     fn damaged_metadata_errors() {
         type Damage = fn(&mut RawDoc<'static>);
         // Attributable damage owes a graph reindex; damage without a trusted scope, a rebuild.
-        let cases: [(&str, Damage, &str, (bool, bool)); 6] = [
+        let cases: [(&str, Damage, &str, (bool, bool)); 7] = [
             (
                 "missing scope",
                 |raw| raw.scope = None,
@@ -4574,6 +4576,15 @@ mod tests {
             (
                 "foreign identity",
                 |raw| raw.identity = Some(("urn:test:elsewhere", RAW_SUBJECT)),
+                "stored identity",
+                (true, false),
+            ),
+            (
+                "foreign graph",
+                |raw| {
+                    raw.identity = Some(("urn:test:elsewhere", RAW_SUBJECT));
+                    raw.stable = Some(stable_hit_key("urn:test:elsewhere", RAW_SUBJECT).to_vec());
+                },
                 "stored identity",
                 (true, false),
             ),
