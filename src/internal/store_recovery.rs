@@ -331,7 +331,7 @@ fn cleanup_overlaps_rebuild() {
 }
 
 #[test]
-fn cap_drains_recovery() {
+fn cap_abandons_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let store = setup_store(dir.path());
     let graph = GraphId::new(TEST_GRAPH);
@@ -345,15 +345,12 @@ fn cap_drains_recovery() {
     gate.wait();
     commit_quad(&store, &graph, "delta-one");
     commit_quad(&store, &graph, "delta-two");
-    let rejected = encode_quad(&store, &graph, "delta-three");
-    assert!(matches!(
-        try_commit(&store, &graph, rejected),
-        Err(StoreError::QueryIndexCapacity)
-    ));
-    gate.release();
-    rebuild.join().unwrap().unwrap();
-
     commit_quad(&store, &graph, "delta-three");
+    gate.release();
+    assert!(rebuild.join().unwrap().is_err());
+
+    store.repair_query_indexes().unwrap();
+    store.rebuild_query_indexes().unwrap();
     assert_exact(
         &store,
         &graph,

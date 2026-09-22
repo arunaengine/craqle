@@ -6296,7 +6296,18 @@ impl GraphStore {
         let next_bytes = build.delta_bytes.saturating_add(bytes);
         let (row_limit, byte_limit) = self.delta_limits();
         if next_rows > row_limit || next_bytes > byte_limit {
-            return Err(StoreError::QueryIndexCapacity);
+            // A disposable build must not block source writes; maintenance clears it and rebuilds.
+            let cleanup = QueryCleanupRecord {
+                format: QV_SCHEMA_VERSION,
+                slot: build.slot,
+            };
+            batch.remove(&self.qv2_meta, QV_BUILD_KEY);
+            batch.insert(
+                &self.qv2_meta,
+                QV_CLEANUP_KEY,
+                postcard::to_allocvec(&cleanup)?,
+            );
+            return Ok(());
         }
         let delta_id = build.next_delta;
         build.next_delta = build
@@ -12642,8 +12653,9 @@ mod tests {
         );
     }
 
+    /// A full build delta log abandons the build instead of failing the source commit.
     #[test]
-    fn delta_cap_rejects() {
+    fn delta_cap_abandons() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:qv-delta-cap");
         store.create_graph(&graph).unwrap();
@@ -12691,11 +12703,22 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            store.commit(batch),
-            Err(StoreError::QueryIndexCapacity)
-        ));
-        assert!(!store.contains_quad(quad).unwrap());
+        store.commit(batch).unwrap();
+        assert!(store.contains_quad(quad).unwrap());
+        assert!(store.query_build(&store.db.snapshot()).unwrap().is_none());
+        assert!(store.qv2_meta.contains_key(QV_CLEANUP_KEY).unwrap());
+
+        store.repair_query_indexes().unwrap();
+        assert!(!store.qv2_meta.contains_key(QV_CLEANUP_KEY).unwrap());
+        store.rebuild_query_indexes().unwrap();
+        assert!(store.query_build(&store.db.snapshot()).unwrap().is_none());
+        assert!(
+            store
+                .snapshot_admission(&store.db.snapshot())
+                .unwrap()
+                .trusted
+        );
+        assert!(store.index_contains(quad));
     }
 
     #[test]
