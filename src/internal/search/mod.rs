@@ -1957,6 +1957,8 @@ impl SearchIndex {
                 .map_err(SearchError::from)
                 .map_err(E::from)?;
             let mut top = TopRanked::new(req.limit);
+            let union = query.downcast_ref::<TermQuery>().is_none()
+                && self.pruning_safe(&view.searcher, query.as_ref());
             for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
                 (req.check)()?;
                 let (scopes, stable) = self.metadata_columns(&view, reader).map_err(E::from)?;
@@ -2045,6 +2047,27 @@ impl SearchIndex {
                         }
                         // Public advance loads the next block, including its partial tail.
                         blocks.advance();
+                    }
+                    continue;
+                }
+                if union {
+                    #[cfg(test)]
+                    self.hooks.pruned.fetch_add(1, Ordering::SeqCst);
+                    let mut failed = None;
+                    weight
+                        .for_each_pruning(initial, reader, &mut |doc, score| {
+                            if failed.is_some() {
+                                return Score::INFINITY;
+                            }
+                            offer(doc, &mut || score).unwrap_or_else(|error| {
+                                failed = Some(error);
+                                Score::INFINITY
+                            })
+                        })
+                        .map_err(SearchError::from)
+                        .map_err(E::from)?;
+                    if let Some(error) = failed {
+                        return Err(error);
                     }
                     continue;
                 }
@@ -3284,6 +3307,42 @@ impl SearchIndex {
         })
     }
 
+    /// Whether block-max pruning bounds hold: one segment, one field, and a term union
+    /// scored with that segment's own statistics.
+    fn pruning_safe(&self, searcher: &Searcher, query: &dyn Query) -> bool {
+        #[cfg(test)]
+        if self.hooks.exhaustive.load(Ordering::SeqCst) {
+            return false;
+        }
+        let [reader] = searcher.segment_readers() else {
+            return false;
+        };
+        let Some(terms) = pruning_terms(query) else {
+            return false;
+        };
+        let Some(field) = terms.first().map(|term| term.field()) else {
+            return false;
+        };
+        let statistics = || -> tantivy::Result<bool> {
+            if terms.iter().any(|term| term.field() != field)
+                || searcher.total_num_docs()? != u64::from(reader.max_doc())
+                || searcher.total_num_tokens(field)?
+                    != reader.inverted_index(field)?.total_num_tokens()
+            {
+                return Ok(false);
+            }
+            for term in &terms {
+                if searcher.doc_freq(term)?
+                    != u64::from(reader.inverted_index(field)?.doc_freq(term)?)
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        statistics().unwrap_or(false)
+    }
+
     fn pruning_scale(&self, request: PruneSegment<'_>) -> Option<Score> {
         #[cfg(test)]
         if self.hooks.exhaustive.load(Ordering::SeqCst) {
@@ -3663,6 +3722,23 @@ fn scope_parts(scope: &[u8]) -> Option<(&str, GenerationId)> {
     let graph = scope_graph(scope)?;
     let generation = scope[scope.len() - 8..].try_into().ok()?;
     Some((graph, GenerationId(u64::from_be_bytes(generation))))
+}
+
+/// Terms of a single term query or of a union whose clauses are all optional terms.
+fn pruning_terms(query: &dyn Query) -> Option<Vec<&Term>> {
+    if let Some(term) = query.downcast_ref::<TermQuery>() {
+        return Some(vec![term.term()]);
+    }
+    let boolean = query.downcast_ref::<BooleanQuery>()?;
+    boolean
+        .clauses()
+        .iter()
+        .map(|(occur, query)| {
+            (*occur == Occur::Should)
+                .then(|| query.downcast_ref::<TermQuery>().map(TermQuery::term))
+                .flatten()
+        })
+        .collect()
 }
 
 /// Reads one document's generation scope.
@@ -5176,6 +5252,9 @@ mod tests {
             assert_same_top(&index, "merged") > 0,
             "one segment must prune"
         );
+        let before = index.hooks.pruned.load(Ordering::SeqCst);
+        prune_hits(&index, "alpha beta", (10, false));
+        assert_eq!(index.hooks.pruned.load(Ordering::SeqCst), before + 1);
 
         // Replacements and deletions leave dead documents inside the merged segment.
         write_prune(&index, (0, 120), 1);
