@@ -19,6 +19,8 @@ use crate::store::{
 
 /// Largest exact scope mapped to dense graph IDs for key filtering.
 const EXACT_FILTER_GRAPHS: usize = 1_024;
+/// Bounds the live graph-prefixed ranges of a small default union.
+pub(crate) const GRAPH_RANGE_LIMIT: usize = 32;
 /// Expected graph visits from which graph records are read by range instead of point reads.
 const PREFETCH_GRAPHS: u64 = 256;
 
@@ -368,12 +370,33 @@ impl<'store> StoreReadView<'store> {
                 .ok_or(StoreError::IndexVerificationFailed(
                     "query-generation-missing",
                 ))?;
-        context.record_access_path(path);
-        context.increment_index_seeks();
         let graphs = match scan.graphs {
             Some(graphs) => Some(graphs),
             None => self.exact_dense_graphs(context)?,
         };
+        let merge_graphs = matches!(scan.selector, GraphSelector::DefaultUnion)
+            && graphs
+                .as_ref()
+                .is_some_and(|graphs| graphs.len() <= GRAPH_RANGE_LIMIT);
+        let path = if merge_graphs {
+            match path {
+                ReadAccessPath::QvSpog => ReadAccessPath::QvGspo,
+                ReadAccessPath::QvPosg => ReadAccessPath::QvGpos,
+                ReadAccessPath::QvOspg => ReadAccessPath::QvGosp,
+                _ => path,
+            }
+        } else {
+            path
+        };
+        context.record_access_path(path);
+        let seeks = if merge_graphs {
+            graphs.as_ref().map_or(0, |graphs| graphs.len())
+        } else {
+            1
+        };
+        for _ in 0..seeks {
+            context.increment_index_seeks();
+        }
         let costs = context.costs();
         let Some(raw) = self.snapshot.index_key_cursor(
             self.store,
@@ -387,11 +410,15 @@ impl<'store> StoreReadView<'store> {
         else {
             return Ok(None);
         };
+        let raw = match graphs.as_ref() {
+            Some(graphs) if merge_graphs => raw.merge_graphs(scan.pattern, graphs),
+            _ => raw.narrow(scan.pattern),
+        };
         Ok(Some(DenseCursor::new(DenseInput {
             store: self.store,
             snapshot: &self.snapshot,
             context,
-            raw: raw.narrow(scan.pattern).track_costs(costs),
+            raw: raw.track_costs(costs),
             generation,
             scope: scan.scope,
             default_union: matches!(scan.selector, GraphSelector::DefaultUnion),

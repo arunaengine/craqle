@@ -282,7 +282,7 @@ fn scans_filter_visibility() {
 #[test]
 fn scope_boundary_stable() {
     let fixture = fixture(33);
-    let default_query = shared_query();
+    let default_query = format!("{} ORDER BY ?s", shared_query());
     let named_query = named_shared_query();
 
     for count in [1, 2, 32, 33] {
@@ -308,6 +308,63 @@ fn scope_boundary_stable() {
             "named graph scope of {count} graphs"
         );
     }
+}
+
+#[test]
+fn scoped_orphans_refresh() {
+    let fixture = fixture(2);
+    let query = format!("{} ORDER BY ?s", shared_query());
+    let read = || {
+        canonical_rows(
+            fixture
+                .node
+                .query_in_graphs(&fixture.reader, &fixture.visible, &query)
+                .unwrap(),
+        )
+    };
+    for (index, graph) in fixture.visible.iter().enumerate() {
+        assert_eq!(read(), expected_shared_rows());
+        fixture
+            .node
+            .apply_changes_unchecked(
+                graph,
+                vec![MaterializedQuadChange::Delete {
+                    graph: graph.clone(),
+                    subject: iri(graph.as_str()),
+                    predicate: iri(SCHEMA_HAS_PART),
+                    object: iri(SHARED_SUBJECT),
+                }],
+            )
+            .unwrap();
+        if index == 0 {
+            assert_eq!(read(), expected_shared_rows());
+        }
+    }
+    assert!(read().is_empty());
+    let graph = &fixture.visible[0];
+    fixture
+        .node
+        .apply_changes_unchecked(
+            graph,
+            vec![insert(
+                graph,
+                iri(graph.as_str()),
+                SCHEMA_HAS_PART,
+                iri(SHARED_SUBJECT),
+            )],
+        )
+        .unwrap();
+    assert_eq!(read(), expected_shared_rows());
+    assert!(
+        fixture
+            .node
+            .query_in_graphs(
+                &fixture.reader,
+                &[graph.clone(), fixture.hidden.clone()],
+                &query
+            )
+            .is_err()
+    );
 }
 
 #[test]

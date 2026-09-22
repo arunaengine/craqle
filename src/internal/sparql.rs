@@ -3100,6 +3100,13 @@ impl<'store, 'context, 'visibility> StoreDataset<'store, 'context, 'visibility> 
         &self,
         predicate: ResolvedPatternTerm,
     ) -> std::result::Result<(), StoreDatasetError> {
+        if self
+            .context
+            .exact_graphs()
+            .is_some_and(|graphs| graphs.len() <= crate::rdf_read::GRAPH_RANGE_LIMIT)
+        {
+            return Ok(());
+        }
         let ResolvedPatternTerm::Existing { source, dense } = predicate else {
             return Ok(());
         };

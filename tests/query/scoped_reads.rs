@@ -235,6 +235,31 @@ fn unrelated_rows_unread() {
 }
 
 #[test]
+fn unions_ignore_noise() {
+    let (_small_directory, small) = fixture(4);
+    let (_large_directory, large) = fixture(4_000);
+    for query in [
+        "SELECT DISTINCT ?s ?o WHERE { ?s <urn:test:scope:name> ?o }",
+        "SELECT DISTINCT ?s ?p WHERE { ?s ?p <urn:test:scope:s:1> }",
+        "SELECT DISTINCT ?p ?o WHERE { <urn:test:scope:s:0> ?p ?o }",
+        "SELECT DISTINCT ?s ?p ?o WHERE { ?s ?p ?o }",
+    ] {
+        let small_run = scoped(&small, &[TARGET, SHARED], query);
+        let large_run = scoped(&large, &[TARGET, SHARED], query);
+        assert_eq!(
+            canonical(small_run.results, false),
+            canonical(large_run.results, false),
+            "{query}"
+        );
+        assert_eq!(
+            small_run.statistics.qv_keys_read, large_run.statistics.qv_keys_read,
+            "unrelated graphs changed union index work: {query}"
+        );
+        assert!(large_run.statistics.qv_keys_read <= 20, "{query}");
+    }
+}
+
+#[test]
 fn union_crosses_graphs() {
     let (_directory, node) = fixture(4);
     let shared = GraphId::new(SHARED);

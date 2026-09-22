@@ -291,6 +291,7 @@ pub(crate) struct RawIndexCursor {
 enum KeyRead {
     Unopened,
     Range(fjall::Iter),
+    Merged(Vec<(RawIndexCursor, Option<RawIndexKey>)>),
     Done,
 }
 
@@ -404,6 +405,25 @@ impl RawIndexCursor {
     }
 
     pub(crate) fn next_key(&mut self) -> Option<Result<RawIndexKey>> {
+        if let KeyRead::Merged(ranges) = &mut self.iterator {
+            for (cursor, head) in ranges.iter_mut() {
+                if head.is_none() {
+                    match cursor.next_key() {
+                        Some(Ok(key)) => *head = Some(key),
+                        Some(Err(error)) => return Some(Err(error)),
+                        None => {}
+                    }
+                }
+            }
+            // Graph-prefixed ranges share their remaining column order, keeping copies adjacent.
+            let next = ranges
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, head))| head.map(|key| (index, key)))
+                .min_by(|(_, left), (_, right)| left.bytes[8..].cmp(&right.bytes[8..]))?
+                .0;
+            return ranges[next].1.take().map(Ok);
+        }
         if matches!(self.iterator, KeyRead::Unopened) {
             if self.prefix.len() == 32 {
                 self.iterator = KeyRead::Done;
@@ -454,6 +474,38 @@ impl RawIndexCursor {
 
     pub(crate) fn track_costs(mut self, costs: QueryCost) -> Self {
         self.costs = costs;
+        self
+    }
+
+    pub(crate) fn merge_graphs(
+        mut self,
+        pattern: RawIndexPattern,
+        graphs: &HashSet<QueryTermId>,
+    ) -> Self {
+        self.iterator = KeyRead::Merged(
+            graphs
+                .iter()
+                .map(|graph| {
+                    let cursor = Self::new(
+                        self.snapshot.clone(),
+                        RawIndexScan {
+                            keyspace: &self.keyspace,
+                            query_to_term: &self.query_to_term,
+                            order: self.order,
+                            prefix: Vec::new(),
+                            pattern,
+                            query_id_limit: self.query_id_limit,
+                        },
+                    )
+                    .narrow(RawIndexPattern {
+                        graph: Some(*graph),
+                        ..pattern
+                    });
+                    (cursor, None)
+                })
+                .collect(),
+        );
+        self.pattern = pattern;
         self
     }
 
