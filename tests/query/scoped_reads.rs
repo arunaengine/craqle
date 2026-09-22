@@ -8,7 +8,7 @@ mod support;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, CraqleNode, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
-    QueryExecution, QueryOptions, QueryResults,
+    QueryExecution, QueryOptions, QueryReadMode, QueryResults,
 };
 
 const TARGET: &str = "urn:test:scope:target";
@@ -230,6 +230,42 @@ fn unrelated_rows_unread() {
             work(&small_run),
             work(&large_run),
             "{label}: unrelated rows changed the scoped read work"
+        );
+    }
+}
+
+#[test]
+fn union_crosses_graphs() {
+    let (_directory, node) = fixture(4);
+    let shared = GraphId::new(SHARED);
+    node.apply_changes_unchecked(
+        &shared,
+        vec![quad(
+            &shared,
+            ("urn:test:scope:cross", KNOWS, iri("urn:test:scope:s:0")),
+        )],
+    )
+    .unwrap();
+    let query = "SELECT ?name WHERE { <urn:test:scope:cross> <urn:test:scope:knows> ?o . \
+                 ?o <urn:test:scope:name> ?name } ORDER BY ?name";
+    for graph in [TARGET, SHARED] {
+        assert!(canonical(scoped(&node, &[graph], query).results, true).is_empty());
+    }
+    let graphs = [TARGET, SHARED, TARGET].map(GraphId::new);
+    for read_mode in [
+        QueryReadMode::Auto,
+        QueryReadMode::ForceQv,
+        QueryReadMode::ForceSource,
+    ] {
+        let mut options = QueryOptions::default();
+        options.read_mode = read_mode;
+        let actual = node
+            .query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .unwrap();
+        assert_eq!(
+            canonical(actual.results, true),
+            ["name=\"alpha 0\"", "name=\"beta 0\""],
+            "{read_mode:?}"
         );
     }
 }

@@ -1251,8 +1251,9 @@ impl SparqlEngine {
             match scope {
                 GraphScope::List(graphs) => {
                     let mut default_graphs = Vec::with_capacity(graphs.len());
+                    let mut seen = HashSet::with_capacity(graphs.len());
                     for graph in graphs {
-                        if view.contains_graph(graph)? {
+                        if seen.insert(graph.as_str()) && view.contains_graph(graph)? {
                             default_graphs.push(GraphName::NamedNode(graph.0.clone()));
                         }
                     }
