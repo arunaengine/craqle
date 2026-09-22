@@ -40,6 +40,15 @@ All notable changes to Craqle are documented here.
 - Join planning inside `GRAPH ?g` treats an unbound `?g` as a shared join variable
   bound by the first match, instead of as already bound. Patterns connected only
   through `?g` now form one join chain, which roughly halves typical dataset searches.
+- `SELECT DISTINCT` over `GRAPH ?g { ... }` and `COUNT(DISTINCT ?g)` grouped by
+  pattern variables run a native graph-level plan over the query index. It joins index
+  ranges in memory, keeps only the variables the result needs, and stops at the first
+  match when a graph only has to exist. Results are unchanged. Disabling fast paths in
+  `QueryOptions` keeps the general evaluator; explain still shows the general plan.
+- A query reads each graph's metadata, clock, and diagnostics at most once, and by range
+  when it visits many graphs. Mappings from query index IDs to terms are shared between
+  queries of one index generation. Explicit graph lists skip unlisted graphs before any
+  visibility check.
 - Default-union queries, statistics, prepared execution, explain, and analyze fail
   with the store error when a graph policy cannot be read. Earlier versions hid
   that graph and could return fewer rows, a smaller count, or a false `ASK`.
