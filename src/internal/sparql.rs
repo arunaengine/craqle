@@ -2799,7 +2799,7 @@ fn search_visible_hits(
         .filter
         .post_raw_visibility
         .map(|(store, _)| store.read_snapshot());
-    let mut memo = crate::cache::BoundedCache::new(1_024, search.query_bytes() / 4);
+    let mut memo = crate::cache::BoundedCache::new(raw.len(), search.query_bytes() / 4);
     let mut kept = Vec::with_capacity(raw.len());
     for hit in raw {
         if let (Some((_, visible)), Some(current)) =
@@ -4972,6 +4972,52 @@ mod tests {
         options.read_mode = QueryReadMode::Auto;
         store.set_test_index(crate::QueryIndexState::Failed("unavailable".into()));
         assert_eq!(execute(&text, &options).unwrap(), expected);
+    }
+
+    #[test]
+    #[cfg(feature = "search")]
+    fn recheck_budget_caches() {
+        let (_directory, store, _search, _engine) = setup_engine();
+        let search =
+            SearchIndex::memory_with_budget(crate::MemoryBudget::new(2 << 30, 256 << 20)).unwrap();
+        for index in 0..1_100 {
+            let graph = format!("urn:test:recheck:{index}");
+            for subject in 0..4 {
+                search
+                    .index_resource(&graph, &format!("{graph}:{subject}"), Some("needle"))
+                    .unwrap();
+            }
+        }
+        search.commit().unwrap();
+        let checks = Cell::new(0);
+        let allowed = Cell::new(true);
+        let visible = |_: &crate::store::StoreReadSnapshot, _: &GraphId| {
+            checks.set(checks.get() + 1);
+            allowed.get()
+        };
+        let visibility =
+            FtsGraphVisibility::new(GraphScope::All, search.query_bytes() / 4).unwrap();
+        let clock = RequestClock::start(None, QueryCancellation::new(), Instant::now());
+        let request = FtsSearchRequest {
+            candidates: None,
+            query: "needle",
+            limit: 4_400,
+            clock: &clock,
+            clamped: false,
+            complete: true,
+            graph: None,
+            filter: FtsHitFilter {
+                visibility: &visibility,
+                post_raw_visibility: Some((&store, &visible)),
+                subject: None,
+            },
+        };
+        assert_eq!(search_visible_hits(&search, &request).unwrap().len(), 4_400);
+        assert_eq!(checks.get(), 1_100);
+        checks.set(0);
+        allowed.set(false);
+        assert!(search_visible_hits(&search, &request).unwrap().is_empty());
+        assert_eq!(checks.get(), 1_100);
     }
 
     #[test]
