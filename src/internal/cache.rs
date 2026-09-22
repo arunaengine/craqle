@@ -23,6 +23,8 @@ pub(crate) struct CacheStatistics {
     pub(crate) inspections: u64,
     /// Times the recency order was rebuilt and sorted.
     pub(crate) compactions: u64,
+    /// Times the storage was shrunk to fit, each a full table rebuild.
+    pub(crate) shrinks: u64,
 }
 
 struct CacheEntry<V> {
@@ -43,6 +45,8 @@ pub(crate) struct BoundedCache<K, V> {
     inspections: u64,
     #[cfg(test)]
     compactions: u64,
+    #[cfg(test)]
+    shrinks: u64,
 }
 
 impl<K, V> BoundedCache<K, V>
@@ -63,6 +67,8 @@ where
             inspections: 0,
             #[cfg(test)]
             compactions: 0,
+            #[cfg(test)]
+            shrinks: 0,
         }
     }
 
@@ -171,6 +177,7 @@ where
             evictions: self.evictions,
             inspections: self.inspections,
             compactions: self.compactions,
+            shrinks: self.shrinks,
         }
     }
 
@@ -188,6 +195,12 @@ where
             self.evict_oldest();
         }
         if self.retained_bytes() > self.max_bytes {
+            // Evicting an eighth first leaves the rebuilt table room for later inserts, so it
+            // is not regrown and shrunk again on every insert.
+            let keep = self.entries.len() - self.entries.len() / 8;
+            while self.entries.len() > keep {
+                self.evict_oldest();
+            }
             self.shrink_storage();
         }
         while self.retained_bytes() > self.max_bytes && !self.entries.is_empty() {
@@ -235,6 +248,10 @@ where
     }
 
     fn shrink_storage(&mut self) {
+        #[cfg(test)]
+        {
+            self.shrinks = self.shrinks.saturating_add(1);
+        }
         self.entries.shrink_to_fit();
         self.order.shrink_to_fit();
     }
@@ -281,6 +298,25 @@ mod tests {
         cache.insert(1u64, 2u64, 8);
         assert!(cache.statistics().bytes > 8);
         assert!(cache.statistics().bytes <= 1_024);
+    }
+
+    /// A byte-bounded cache at its limit must not rebuild its table on every insert.
+    #[test]
+    fn full_cache_amortized() {
+        let max_bytes = 1_000_000;
+        let mut cache = BoundedCache::new(usize::MAX, max_bytes);
+        let inserts = 20_000u64;
+        for key in 0..inserts {
+            cache.insert(u128::from(key), std::sync::Arc::new(()), 60);
+            assert!(cache.retained_bytes() <= max_bytes, "insert {key}");
+        }
+        let statistics = cache.statistics();
+        assert!(statistics.entries > 0);
+        assert!(
+            statistics.shrinks < inserts / 100,
+            "{} table rebuilds for {inserts} inserts",
+            statistics.shrinks
+        );
     }
 
     #[test]
