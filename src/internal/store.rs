@@ -255,6 +255,8 @@ const INDEX_EPOCH_SHARDS: usize = 256;
 /// Maximum wait for query-view maintenance ownership before reporting busy.
 const QV_COMMIT_WAIT: Duration = Duration::from_secs(120);
 const TERM_CACHE_CAP: usize = 1_000_000;
+/// Graph records one read snapshot may hold after a range prefetch.
+const PREFETCH_RECORD_BYTES: usize = 16 * 1_048_576;
 const SOURCE_CACHE_CAP: usize = 1_000_000;
 const TERM_CACHE_BYTES: usize = 128 * 1_048_576;
 const SUBJECT_CACHE_CAP: usize = 65_536;
@@ -2992,11 +2994,12 @@ impl StoreReadSnapshot {
     }
 
     /// Reads all graph metadata, clock and diagnostics records with three range scans. Keeps
-    /// nothing and returns `false` when more than `limit` graphs exist, bounding the work.
+    /// nothing and returns `false` past `limit` graphs or the byte cap, bounding the work.
     pub(crate) fn prefetch_graph_records(&self, store: &GraphStore, limit: usize) -> Result<bool> {
         if self.graph_records_complete.get() {
             return Ok(true);
         }
+        let mut bytes = 0_usize;
         let mut records = Vec::new();
         for prefix in [
             GRAPH_META_PREFIX,
@@ -3010,7 +3013,8 @@ impl StoreReadSnapshot {
                     continue;
                 };
                 graphs += 1;
-                if graphs > limit {
+                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+                if graphs > limit || bytes > PREFETCH_RECORD_BYTES {
                     return Ok(false);
                 }
                 records.push((key, value));
