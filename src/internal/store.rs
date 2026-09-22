@@ -1714,28 +1714,6 @@ fn batch_order_key(sequence: u64) -> [u8; 10] {
     key
 }
 
-fn receipt_is_terminal(receipt: &MutationReceipt) -> bool {
-    use crate::sync::PersistenceOutcome;
-    matches!(
-        receipt.persistence,
-        PersistenceOutcome::Buffered
-            | PersistenceOutcome::DataSynced
-            | PersistenceOutcome::FullySynced
-    ) && [
-        receipt.repairs.diagnostics,
-        receipt.repairs.shacl,
-        receipt.repairs.search,
-        receipt.repairs.query_view,
-    ]
-    .into_iter()
-    .all(|outcome| {
-        matches!(
-            outcome,
-            RepairOutcome::NotRequired | RepairOutcome::Complete
-        )
-    })
-}
-
 fn encode_dots(dots: &[Dot]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(1 + dots.len() * 40);
     bytes.push(DOT_ENCODING_TAG);
@@ -7635,12 +7613,15 @@ impl GraphStore {
         }
     }
 
+    /// Restores the admission counter and orders receipts that older versions left untracked.
     fn restore_receipt_next(&self) -> Result<()> {
         let mut highest = self
             .receipt_order
             .get(RECEIPT_EXPIRED_KEY)?
             .and_then(|value| decode_index_count(value.as_ref()))
             .unwrap_or(0);
+        let mut batch = self.buffered_batch();
+        let mut staged = 0usize;
         for guard in self.receipts.iter() {
             let (key, value) = guard.into_inner()?;
             if key.len() != 32 {
@@ -7648,6 +7629,18 @@ impl GraphStore {
             }
             let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
             highest = highest.max(receipt.admission_sequence);
+            let order = receipt_order_key(&receipt);
+            if !self.receipt_order.contains_key(order)? {
+                batch.insert(&self.receipt_order, order, receipt.id.0);
+                staged += 1;
+            }
+            if staged == QV_BUILD_ROWS {
+                self.commit_fjall_batch(std::mem::replace(&mut batch, self.buffered_batch()))?;
+                staged = 0;
+            }
+        }
+        if staged > 0 {
+            self.commit_fjall_batch(batch)?;
         }
         self.receipt_next
             .store(highest.saturating_add(1).max(1), Ordering::SeqCst);
@@ -11222,44 +11215,46 @@ impl GraphStore {
         Ok(())
     }
 
-    fn trim_receipts(&self, batch: &mut fjall::OwnedWriteBatch, adding: bool) -> Result<()> {
-        if !adding {
-            return Ok(());
-        }
-        let mut oldest = None;
-        let mut count = 0usize;
-        for guard in self.receipt_order.iter() {
-            let (key, value) = guard.into_inner()?;
+    /// Makes room for one more receipt, sparing receipts staged in this batch.
+    fn trim_receipts(&self, batch: &mut WriteBatch) -> Result<()> {
+        let mut expired = None;
+        let mut kept = 0usize;
+        let mut removed = 0usize;
+        for guard in self.receipt_order.iter().rev() {
+            let (key, id) = guard.into_inner()?;
             if key.len() != 40 {
                 continue;
             }
-            if oldest.is_none() {
-                oldest = Some((key.to_vec(), value.to_vec()));
+            let staged = batch
+                .pending_receipts
+                .iter()
+                .any(|receipt| receipt.id.0[..] == id[..]);
+            if kept + 1 < RECEIPT_RETENTION || staged {
+                kept += 1;
+                continue;
             }
-            count += 1;
-            if count == RECEIPT_RETENTION {
+            if removed == QV_BUILD_ROWS {
                 break;
             }
-        }
-        if count == RECEIPT_RETENTION
-            && let Some((order, id)) = oldest
-        {
             if let Some(value) = self.receipts.get(&id)? {
                 let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
-                let expired = self
-                    .receipt_order
-                    .get(RECEIPT_EXPIRED_KEY)?
-                    .and_then(|value| decode_index_count(value.as_ref()))
-                    .unwrap_or(0)
-                    .max(receipt.admission_sequence);
-                batch.insert(
-                    &self.receipt_order,
-                    RECEIPT_EXPIRED_KEY,
-                    expired.to_be_bytes(),
-                );
+                expired = expired.max(Some(receipt.admission_sequence));
             }
-            batch.remove(&self.receipt_order, order);
-            batch.remove(&self.receipts, id);
+            batch.inner.remove(&self.receipt_order, key);
+            batch.inner.remove(&self.receipts, id);
+            removed += 1;
+        }
+        if let Some(expired) = expired {
+            let stored = self
+                .receipt_order
+                .get(RECEIPT_EXPIRED_KEY)?
+                .and_then(|value| decode_index_count(value.as_ref()))
+                .unwrap_or(0);
+            batch.inner.insert(
+                &self.receipt_order,
+                RECEIPT_EXPIRED_KEY,
+                stored.max(expired).to_be_bytes(),
+            );
         }
         Ok(())
     }
@@ -11290,17 +11285,14 @@ impl GraphStore {
         }
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
-        let terminal = receipt_is_terminal(&stored);
-        self.trim_receipts(&mut batch.inner, terminal)?;
+        self.trim_receipts(batch)?;
         batch
             .inner
             .insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
-        batch.pending_receipts.push(stored.clone());
-        if terminal {
-            batch
-                .inner
-                .insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
-        }
+        batch
+            .inner
+            .insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
+        batch.pending_receipts.push(stored);
         Ok(None)
     }
 
@@ -11508,9 +11500,17 @@ impl GraphStore {
         }
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
+        if receipt_order_key(&previous) != receipt_order_key(&stored) {
+            batch
+                .inner
+                .remove(&self.receipt_order, receipt_order_key(&previous));
+        }
         batch
             .inner
             .insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
+        batch
+            .inner
+            .insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
         batch.pending_receipts.push(stored);
         Ok(())
     }
@@ -11538,17 +11538,12 @@ impl GraphStore {
         {
             return Err(StoreError::ReceiptConflict);
         }
-        let was_terminal = receipt_is_terminal(&previous);
-        let terminal = receipt_is_terminal(&stored);
         let mut batch = self.buffered_batch();
-        if was_terminal {
+        if receipt_order_key(&previous) != receipt_order_key(&stored) {
             batch.remove(&self.receipt_order, receipt_order_key(&previous));
         }
-        self.trim_receipts(&mut batch, terminal && !was_terminal)?;
         batch.insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
-        if terminal {
-            batch.insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
-        }
+        batch.insert(&self.receipt_order, receipt_order_key(&stored), stored.id.0);
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
         self.commit_fjall_batch(batch)?;
@@ -11988,6 +11983,68 @@ mod tests {
             (Included(vec![0xff]), Unbounded)
         );
         assert_eq!(resume_range(&[], None), (Included(Vec::new()), Unbounded));
+    }
+
+    /// Receipts that never settle still leave retention; reopen orders untracked ones again.
+    #[test]
+    fn pending_receipts_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:receipt-retention");
+        let stage = |nanos: usize| {
+            let receipt = MutationReceipt {
+                id: MutationId::new(),
+                admission_sequence: 0,
+                graph: graph.clone(),
+                request_digest: [7; 32],
+                event_id: None,
+                topic: None,
+                publish_after: None,
+                topic_epoch: None,
+                topic_genesis: None,
+                search_token: None,
+                repair_graphs: Vec::new(),
+                source: SourceOutcome::Prepared,
+                persistence: crate::sync::PersistenceOutcome::Pending,
+                repairs: crate::sync::RepairState {
+                    diagnostics: RepairOutcome::Pending,
+                    shacl: RepairOutcome::Pending,
+                    search: RepairOutcome::Pending,
+                    query_view: RepairOutcome::Pending,
+                },
+                source_version: [0; 32],
+                updated_unix_nanos: i64::try_from(nanos).unwrap(),
+            };
+            let mut batch = store.new_batch();
+            assert!(store.stage_receipt(&mut batch, &receipt).unwrap().is_none());
+            store.commit(batch).unwrap();
+            store.mutation_receipt(&receipt.id).unwrap().unwrap()
+        };
+        let first = stage(0);
+        let second = stage(1);
+        for nanos in 2..=RECEIPT_RETENTION {
+            stage(nanos);
+        }
+        let lookup = |receipt: &MutationReceipt| MutationLookup {
+            graph: graph.clone(),
+            id: receipt.id,
+            admission_sequence: Some(receipt.admission_sequence),
+        };
+        assert!(store.mutation_receipt(&first.id).unwrap().is_none());
+        assert!(matches!(
+            store.receipt_status(&lookup(&first)).unwrap(),
+            MutationStatus::Expired
+        ));
+        assert!(matches!(
+            store.receipt_status(&lookup(&second)).unwrap(),
+            MutationStatus::Known(_)
+        ));
+
+        let order = receipt_order_key(&second);
+        store.receipt_order.remove(order).unwrap();
+        drop(store);
+        let reopened = GraphStore::open(dir.path()).unwrap();
+        assert!(reopened.receipt_order.contains_key(order).unwrap());
     }
 
     /// Remembered graph records belong to one snapshot; later writes stay invisible to it.
