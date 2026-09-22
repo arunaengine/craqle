@@ -334,12 +334,20 @@ impl<'a, 'view, 'context> GraphReader<'a, 'view, 'context> {
     fn groups(&self, rows: &Rows, join: &[usize]) -> Result<RowGroups> {
         let mut groups = RowGroups::default();
         for (index, row) in rows.data.iter().enumerate() {
-            groups.entry(join_key(row, join)).or_default().push(index);
+            let key = join_key(row, join);
+            let entries = groups
+                .len()
+                .saturating_add(usize::from(!groups.contains_key(&key)));
+            let bytes = entries
+                .saturating_mul(KEY_ENTRY_BYTES.saturating_mul(2))
+                .saturating_add(
+                    index
+                        .saturating_add(1)
+                        .saturating_mul(std::mem::size_of::<usize>() * 2),
+                );
+            self.input.budget.check_hash(entries, bytes)?;
+            groups.entry(key).or_default().push(index);
         }
-        let entries = groups.len();
-        self.input
-            .budget
-            .check_hash(entries, entries.saturating_mul(KEY_ENTRY_BYTES))?;
         Ok(groups)
     }
 

@@ -678,15 +678,28 @@ impl Run<'_, '_, '_> {
     }
 
     fn values(&self, rows: &Rows) -> Result<Option<GraphDistinctRelation>> {
-        let JoinInput { view, context, .. } = self.reader.input;
+        let JoinInput {
+            view,
+            context,
+            budget,
+        } = self.reader.input;
         let plan = self.plan;
+        let mut bytes = rows
+            .data
+            .len()
+            .saturating_mul(std::mem::size_of::<crate::graph_join::Row>());
         let mut tuples: HashMap<Vec<QueryTermId>, u64> = HashMap::new();
         for row in &rows.data {
+            budget.check()?;
             let key: Vec<QueryTermId> = plan
                 .keys
                 .iter()
                 .map(|(_, index)| rows.value(row, *index).expect("keys are kept columns"))
                 .collect();
+            if !tuples.contains_key(&key) {
+                bytes = bytes.saturating_add(64_usize.saturating_mul(key.len().saturating_add(2)));
+                budget.check_hash(tuples.len().saturating_add(1), bytes)?;
+            }
             *tuples.entry(key).or_insert(0) += 1;
         }
         let mut variables: Vec<Variable> = plan.keys.iter().map(|(key, _)| key.clone()).collect();
@@ -695,22 +708,32 @@ impl Run<'_, '_, '_> {
             Output::Count(outputs) => outputs.as_slice(),
         };
         variables.extend(counts.iter().cloned());
-        let mut decoded: HashMap<QueryTermId, GroundTerm> = HashMap::new();
+        let mut decoded: HashMap<QueryTermId, (GroundTerm, usize)> = HashMap::new();
         let mut known = HashMap::new();
         let mut bindings = Vec::with_capacity(tuples.len());
         for (key, count) in &tuples {
+            bytes = bytes.saturating_add(128_usize.saturating_mul(counts.len()));
+            budget.check_hash(tuples.len(), bytes)?;
             let mut row = Vec::with_capacity(variables.len());
             for term in key {
                 let ground = match decoded.get(term) {
-                    Some(ground) => ground.clone(),
+                    Some((ground, size)) => {
+                        bytes = bytes.saturating_add(*size);
+                        budget.check_hash(tuples.len(), bytes)?;
+                        ground.clone()
+                    }
                     None => {
                         let source = self.reader.source(*term)?;
                         let encoded = view.decode_result_term(context, source)?;
+                        let size = encoded.0.len();
+                        // Account for both cached spellings and the binding's owned term copy.
+                        bytes = bytes.saturating_add(size.saturating_mul(3).saturating_add(256));
+                        budget.check_hash(tuples.len(), bytes)?;
                         let Some(ground) = ground_term(&encoded) else {
                             return Ok(None);
                         };
                         known.insert(encoded.0, (source, *term));
-                        decoded.insert(*term, ground.clone());
+                        decoded.insert(*term, (ground.clone(), size));
                         ground
                     }
                 };
@@ -1185,6 +1208,30 @@ mod tests {
         let after = work(&fixture);
         assert!(after.reads.scanned > before.reads.scanned);
         assert_eq!(after.retained, before.retained);
+    }
+
+    #[test]
+    fn literal_bytes_bounded() {
+        let fixture = Fixture::new();
+        let literal = format!("\"{}\"", "a".repeat(65_536));
+        fixture.add("urn:t:g", ["urn:t:s", FORMAT, &literal]);
+        let query =
+            format!("SELECT DISTINCT ?value WHERE {{ GRAPH ?g {{ ?s <{FORMAT}> ?value }} }}");
+        let mut options = QueryOptions::default();
+        options.limits.max_hash_bytes = 1_024;
+        options.limits.max_result_bytes = 1_048_576;
+        let result = fixture.engine.query_with_options(
+            QueryRun {
+                sparql: &query,
+                options: &options,
+            },
+            &|_, _| true,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::sparql::SparqlError::QueryLimit { .. })
+        ));
+        assert_eq!(fixture.compare(&query, true).len(), 1);
     }
 
     #[test]
