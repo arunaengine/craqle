@@ -63,6 +63,10 @@ All notable changes to Craqle are documented here.
   graph-scoped and hydrated search. One budget covers setup, scoring, the final
   permission recheck, and hydration, and an ended budget fails even when nothing
   matches. Checks are cooperative, so this is not a strict wall-clock bound.
+- `?s fts:complete true` in the FTS `SERVICE` returns every matching resource instead
+  of the top-ranked page. It cannot be combined with `fts:limit` or `fts:score`. More
+  matches than the query's intermediate-row limit or the search memory share fail with
+  an error instead of returning a partial answer.
 
 ### Upgrading from 0.2
 

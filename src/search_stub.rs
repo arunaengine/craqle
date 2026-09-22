@@ -176,6 +176,16 @@ impl SearchIndex {
         Err(E::from(SearchError::Disabled))
     }
 
+    pub(crate) fn collect_complete<E>(
+        &self,
+        req: FilterQuery<'_, E>,
+    ) -> std::result::Result<Vec<SearchHit>, E>
+    where
+        E: From<SearchError>,
+    {
+        self.collect_filtered(req)
+    }
+
     pub fn search_in_graph(
         &self,
         _graph_id: &str,

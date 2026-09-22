@@ -784,6 +784,7 @@ const FTS_QUERY_IRI: &str = "urn:craqle:fts:query";
 const FTS_LIMIT_IRI: &str = "urn:craqle:fts:limit";
 const FTS_SCORE_IRI: &str = "urn:craqle:fts:score";
 const FTS_GRAPH_IRI: &str = "urn:craqle:fts:graph";
+const FTS_COMPLETE_IRI: &str = "urn:craqle:fts:complete";
 
 impl SparqlEngine {
     pub(crate) fn new(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
@@ -2367,6 +2368,9 @@ struct FtsServiceSpec {
     limit_clamped: bool,
     score_var: Option<Variable>,
     graph: Option<FtsGraphBinding>,
+    /// Every match within the intermediate-row budget, unranked, instead of the top hits.
+    complete: bool,
+    limit_set: bool,
 }
 
 /// Everything the FTS SERVICE rewrite needs: the index it reads and the
@@ -2556,6 +2560,8 @@ struct FtsSearchRequest<'a> {
     clock: &'a RequestClock,
     /// A filled page under a clamped limit is an incomplete answer.
     clamped: bool,
+    /// Every match up to `limit`; more matches are an error, never a truncated answer.
+    complete: bool,
     /// `Some` restricts the index query to a single, already-visible graph.
     graph: Option<&'a str>,
     filter: FtsHitFilter<'a>,
@@ -2573,14 +2579,25 @@ fn search_visible_hits(
             && request.filter.visibility.allows(graph))
     };
     let check = || request.clock.check_stage();
-    let raw = search.collect_filtered(crate::search::FilterQuery::<SparqlError> {
+    let query = crate::search::FilterQuery::<SparqlError> {
         query: request.query,
         limit: request.limit,
         subject: request.filter.subject,
         allows: &allows,
         check: &check,
-    })?;
+    };
+    let raw = if request.complete {
+        search.collect_complete(query)?
+    } else {
+        search.collect_filtered(query)?
+    };
     request.clock.check_stage()?;
+    if request.complete && raw.len() > request.limit {
+        return Err(SparqlError::QueryLimit {
+            resource: "fts matches",
+            limit: request.limit,
+        });
+    }
     if request.clamped && raw.len() == request.limit {
         return Err(SparqlError::QueryLimit {
             resource: "fts hits",
@@ -2620,7 +2637,10 @@ fn search_visible_hits(
 /// Rewrites FTS against the last committed index state into `VALUES`.
 /// Callers needing read-your-writes must flush search first.
 fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<GraphPattern> {
-    let spec = parse_fts_spec(pattern)?;
+    let mut spec = parse_fts_spec(pattern)?;
+    if spec.complete {
+        spec.limit = cx.limits.max_intermediate_rows;
+    }
     if spec.limit == 0 {
         return Ok(GraphPattern::Values {
             variables: requested_fts_variables(&spec),
@@ -2662,6 +2682,7 @@ fn rewrite_fts_service(pattern: GraphPattern, cx: FtsRewriteCtx<'_>) -> Result<G
             limit: spec.limit,
             clock: cx.clock,
             clamped: spec.limit_clamped,
+            complete: spec.complete,
             graph,
             filter: FtsHitFilter {
                 visibility: &visibility,
@@ -2733,6 +2754,23 @@ fn parse_fts_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
                 })?;
                 spec.limit = requested.min(crate::MAX_SEARCH_LIMIT);
                 spec.limit_clamped = requested > spec.limit;
+                spec.limit_set = true;
+            }
+            FTS_COMPLETE_IRI => {
+                let TermPattern::Literal(literal) = pattern.object else {
+                    return Err(SparqlError::Unsupported(
+                        "fts:complete must be bound to a boolean literal".into(),
+                    ));
+                };
+                spec.complete = match (literal.datatype(), literal.value()) {
+                    (oxrdf::vocab::xsd::BOOLEAN, "true" | "1") => true,
+                    (oxrdf::vocab::xsd::BOOLEAN, "false" | "0") => false,
+                    _ => {
+                        return Err(SparqlError::Unsupported(
+                            "fts:complete must be bound to a boolean literal".into(),
+                        ));
+                    }
+                };
             }
             FTS_SCORE_IRI => {
                 let TermPattern::Variable(variable) = pattern.object else {
@@ -2769,6 +2807,12 @@ fn parse_fts_spec(pattern: GraphPattern) -> Result<FtsServiceSpec> {
     if spec.query.is_none() {
         return Err(SparqlError::Unsupported(
             "FTS SERVICE requires an fts:query literal".into(),
+        ));
+    }
+    // A complete match has no ranking, so a page size or score would be meaningless.
+    if spec.complete && (spec.limit_set || spec.score_var.is_some()) {
+        return Err(SparqlError::Unsupported(
+            "fts:complete cannot be combined with fts:limit or fts:score".into(),
         ));
     }
 
@@ -6181,6 +6225,69 @@ mod tests {
                 .0
                 .contains("http://www.w3.org/2001/XMLSchema#double")
         );
+    }
+
+    /// Complete matching returns every match beyond a ranked page, and a match count over
+    /// the query budget fails instead of truncating.
+    #[cfg(feature = "search")]
+    #[test]
+    fn complete_matches_bounded() {
+        let (_dir, store, search, engine) = setup_engine();
+        for index in 0..30 {
+            let graph = GraphId::new(&format!("urn:test:fts-complete:g{index}"));
+            insert_quad(
+                &store,
+                &graph,
+                &format!("urn:test:fts-complete:e{index}"),
+                "http://schema.org/name",
+                EncodedTerm::from_plain_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "Zephyr survey {index}"
+                )))),
+            );
+            settle_diagnostics(&store, &graph);
+        }
+        crate::flush_search_queue(&store, &search).unwrap();
+        let service = |arguments: &str| {
+            format!(
+                "SELECT ?s WHERE {{ SERVICE <urn:craqle:fts> {{ \
+                 ?s fts:query \"zephyr\" ; {arguments} }} }}"
+            )
+        };
+        let run = |sparql: &str, limits: QueryLimits| {
+            let options = QueryOptions {
+                limits,
+                ..QueryOptions::default()
+            };
+            engine
+                .query_with_options(
+                    QueryRun {
+                        sparql,
+                        options: &options,
+                    },
+                    &|_, _| true,
+                )
+                .map(|(_, execution)| solution_rows(execution.results).len())
+        };
+
+        let ranked = run(&service("fts:limit 5"), QueryLimits::default()).unwrap();
+        assert_eq!(ranked, 5);
+        let complete = run(&service("fts:complete true"), QueryLimits::default()).unwrap();
+        assert_eq!(complete, 30);
+        let limits = QueryLimits {
+            max_intermediate_rows: 10,
+            ..QueryLimits::default()
+        };
+        assert!(matches!(
+            run(&service("fts:complete true"), limits),
+            Err(SparqlError::QueryLimit { .. })
+        ));
+        assert!(matches!(
+            run(
+                &service("fts:complete true ; fts:limit 5"),
+                QueryLimits::default()
+            ),
+            Err(SparqlError::Unsupported(_))
+        ));
     }
 
     /// Needs a real tantivy index: the `search`-off stub returns no hits,

@@ -282,6 +282,18 @@ pub(crate) struct FilterQuery<'a, E> {
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
 }
 
+/// One unranked collection: the pinned view and query, the document ceiling, the retained
+/// bytes per document and in total, and the caller's graph filter and progress check.
+struct MatchAll<'a, E> {
+    view: &'a SearchView,
+    query: &'a dyn Query,
+    limit: usize,
+    per_rank: usize,
+    native_limit: usize,
+    allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
+    check: &'a dyn Fn() -> std::result::Result<(), E>,
+}
+
 /// One scored document whose required metadata the collector decodes.
 struct ActiveDoc<'a, E> {
     view: &'a SearchView,
@@ -1793,6 +1805,29 @@ impl SearchIndex {
     where
         E: From<SearchError>,
     {
+        self.collect_with(req, false)
+    }
+
+    /// Every eligible match without ranking, at most `limit + 1` so callers can detect
+    /// more matches than they accept. Hits carry a zero score.
+    pub(crate) fn collect_complete<E>(
+        &self,
+        req: FilterQuery<'_, E>,
+    ) -> std::result::Result<Vec<SearchHit>, E>
+    where
+        E: From<SearchError>,
+    {
+        self.collect_with(req, true)
+    }
+
+    fn collect_with<E>(
+        &self,
+        req: FilterQuery<'_, E>,
+        complete: bool,
+    ) -> std::result::Result<Vec<SearchHit>, E>
+    where
+        E: From<SearchError>,
+    {
         (req.check)()?;
         if req.limit == 0 {
             return Ok(Vec::new());
@@ -1826,85 +1861,97 @@ impl SearchIndex {
         };
         let native_limit = self.query_bytes() / 2;
         let per_rank = std::mem::size_of::<RankedDoc>().saturating_add(64);
-        let rank_bytes = req.limit.saturating_mul(per_rank);
-        if rank_bytes > native_limit {
-            return Err(E::from(SearchError::ItemTooLarge {
-                bytes: rank_bytes,
-                limit: native_limit,
-            }));
-        }
-        let weight = query
-            .weight(EnableScoring::enabled_from_searcher(&view.searcher))
-            .map_err(SearchError::from)
-            .map_err(E::from)?;
-        let mut top = TopRanked::new(req.limit);
-        let pruning = self.pruning_safe(&view.searcher, query.as_ref());
-        for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
-            (req.check)()?;
-            let (scopes, stable) = self.metadata_columns(&view, reader).map_err(E::from)?;
-            let initial = top.threshold();
-            // Ineligible documents return the current threshold, so they never raise it.
-            let mut offer = |doc: DocId, score: &mut dyn FnMut() -> Score| {
-                (req.check)()?;
-                if reader
-                    .alive_bitset()
-                    .is_none_or(|alive| alive.is_alive(doc))
-                    && let Some(stable) = self.active_key(ActiveDoc {
-                        view: &view,
-                        scopes: scopes.as_ref(),
-                        stable: stable.as_ref(),
-                        doc,
-                        allows: req.allows,
-                    })?
-                {
-                    let score = score();
-                    if !score.is_finite() {
-                        return Err(E::from(SearchError::Tantivy(
-                            tantivy::TantivyError::SystemError(
-                                "search produced a non-finite score".to_string(),
-                            ),
-                        )));
-                    }
-                    top.retain(RankedDoc {
-                        score,
-                        stable,
-                        address: DocAddress::new(segment as u32, doc),
-                    });
-                }
-                Ok(top.threshold())
-            };
-            if pruning {
-                #[cfg(test)]
-                self.hooks.pruned.fetch_add(1, Ordering::SeqCst);
-                let mut failed = None;
-                weight
-                    .for_each_pruning(initial, reader, &mut |doc, score| {
-                        if failed.is_some() {
-                            return Score::INFINITY;
-                        }
-                        offer(doc, &mut || score).unwrap_or_else(|error| {
-                            failed = Some(error);
-                            Score::INFINITY
-                        })
-                    })
-                    .map_err(SearchError::from)
-                    .map_err(E::from)?;
-                if let Some(error) = failed {
-                    return Err(error);
-                }
-                continue;
+        let (mut ranked, rank_bytes) = if complete {
+            self.match_all(MatchAll {
+                view: &view,
+                query: query.as_ref(),
+                limit: req.limit.saturating_add(1),
+                per_rank,
+                native_limit,
+                allows: req.allows,
+                check: req.check,
+            })?
+        } else {
+            let rank_bytes = req.limit.saturating_mul(per_rank);
+            if rank_bytes > native_limit {
+                return Err(E::from(SearchError::ItemTooLarge {
+                    bytes: rank_bytes,
+                    limit: native_limit,
+                }));
             }
-            let mut scorer = weight
-                .scorer(reader, 1.0)
+            let weight = query
+                .weight(EnableScoring::enabled_from_searcher(&view.searcher))
                 .map_err(SearchError::from)
                 .map_err(E::from)?;
-            while scorer.doc() != TERMINATED {
-                offer(scorer.doc(), &mut || scorer.score())?;
-                let _ = scorer.advance();
+            let mut top = TopRanked::new(req.limit);
+            let pruning = self.pruning_safe(&view.searcher, query.as_ref());
+            for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
+                (req.check)()?;
+                let (scopes, stable) = self.metadata_columns(&view, reader).map_err(E::from)?;
+                let initial = top.threshold();
+                // Ineligible documents return the current threshold, so they never raise it.
+                let mut offer = |doc: DocId, score: &mut dyn FnMut() -> Score| {
+                    (req.check)()?;
+                    if reader
+                        .alive_bitset()
+                        .is_none_or(|alive| alive.is_alive(doc))
+                        && let Some(stable) = self.active_key(ActiveDoc {
+                            view: &view,
+                            scopes: scopes.as_ref(),
+                            stable: stable.as_ref(),
+                            doc,
+                            allows: req.allows,
+                        })?
+                    {
+                        let score = score();
+                        if !score.is_finite() {
+                            return Err(E::from(SearchError::Tantivy(
+                                tantivy::TantivyError::SystemError(
+                                    "search produced a non-finite score".to_string(),
+                                ),
+                            )));
+                        }
+                        top.retain(RankedDoc {
+                            score,
+                            stable,
+                            address: DocAddress::new(segment as u32, doc),
+                        });
+                    }
+                    Ok(top.threshold())
+                };
+                if pruning {
+                    #[cfg(test)]
+                    self.hooks.pruned.fetch_add(1, Ordering::SeqCst);
+                    let mut failed = None;
+                    weight
+                        .for_each_pruning(initial, reader, &mut |doc, score| {
+                            if failed.is_some() {
+                                return Score::INFINITY;
+                            }
+                            offer(doc, &mut || score).unwrap_or_else(|error| {
+                                failed = Some(error);
+                                Score::INFINITY
+                            })
+                        })
+                        .map_err(SearchError::from)
+                        .map_err(E::from)?;
+                    if let Some(error) = failed {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                let mut scorer = weight
+                    .scorer(reader, 1.0)
+                    .map_err(SearchError::from)
+                    .map_err(E::from)?;
+                while scorer.doc() != TERMINATED {
+                    offer(scorer.doc(), &mut || scorer.score())?;
+                    let _ = scorer.advance();
+                }
             }
-        }
+            (top.ranked.into_vec(), rank_bytes)
+        };
         (req.check)()?;
-        let mut ranked = top.ranked.into_vec();
         ranked.sort();
         #[cfg(test)]
         {
@@ -1962,6 +2009,58 @@ impl SearchIndex {
                 .then_with(|| left.subject_iri.cmp(&right.subject_iri))
         });
         Ok(hits)
+    }
+
+    /// Collects eligible documents without scoring, failing once they outgrow the budget.
+    fn match_all<E>(&self, req: MatchAll<'_, E>) -> std::result::Result<(Vec<RankedDoc>, usize), E>
+    where
+        E: From<SearchError>,
+    {
+        let weight = req
+            .query
+            .weight(EnableScoring::disabled_from_searcher(&req.view.searcher))
+            .map_err(SearchError::from)
+            .map_err(E::from)?;
+        let mut matched = Vec::new();
+        for (segment, reader) in req.view.searcher.segment_readers().iter().enumerate() {
+            (req.check)()?;
+            let (scopes, stable) = self.metadata_columns(req.view, reader).map_err(E::from)?;
+            let mut scorer = weight
+                .scorer(reader, 1.0)
+                .map_err(SearchError::from)
+                .map_err(E::from)?;
+            while scorer.doc() != TERMINATED && matched.len() < req.limit {
+                (req.check)()?;
+                let doc = scorer.doc();
+                if reader
+                    .alive_bitset()
+                    .is_none_or(|alive| alive.is_alive(doc))
+                    && let Some(stable) = self.active_key(ActiveDoc {
+                        view: req.view,
+                        scopes: scopes.as_ref(),
+                        stable: stable.as_ref(),
+                        doc,
+                        allows: req.allows,
+                    })?
+                {
+                    let bytes = matched.len().saturating_add(1).saturating_mul(req.per_rank);
+                    if bytes > req.native_limit {
+                        return Err(E::from(SearchError::ItemTooLarge {
+                            bytes,
+                            limit: req.native_limit,
+                        }));
+                    }
+                    matched.push(RankedDoc {
+                        score: 0.0,
+                        stable,
+                        address: DocAddress::new(segment as u32, doc),
+                    });
+                }
+                let _ = scorer.advance();
+            }
+        }
+        let bytes = matched.len().saturating_mul(req.per_rank);
+        Ok((matched, bytes))
     }
 
     /// Full-text search across all graphs.
