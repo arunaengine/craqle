@@ -299,6 +299,9 @@ struct MatchAll<'a, E> {
     check: &'a dyn Fn() -> std::result::Result<(), E>,
 }
 
+/// Last small scope decoded within one immutable segment.
+type ScopeCache = Option<(u64, Arc<Vec<u8>>)>;
+
 /// One scored document whose required metadata the collector decodes.
 struct ActiveDoc<'a, E> {
     view: &'a SearchView,
@@ -306,6 +309,7 @@ struct ActiveDoc<'a, E> {
     stable: Option<&'a tantivy::columnar::BytesColumn>,
     doc: DocId,
     allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
+    scope_cache: &'a mut ScopeCache,
 }
 
 #[derive(Clone, Debug)]
@@ -513,6 +517,7 @@ struct TestHooks {
     pruned: std::sync::atomic::AtomicUsize,
     /// Time spent loading stored identities for final hits.
     hydrate_ns: AtomicU64,
+    scope_decodes: AtomicU64,
 }
 
 #[cfg(test)]
@@ -1950,6 +1955,7 @@ impl SearchIndex {
             for (segment, reader) in view.searcher.segment_readers().iter().enumerate() {
                 (req.check)()?;
                 let (scopes, stable) = self.metadata_columns(&view, reader).map_err(E::from)?;
+                let mut scope_cache = None;
                 let initial = top.threshold();
                 // Ineligible documents return the current threshold, so they never raise it.
                 let mut offer = |doc: DocId, score: &mut dyn FnMut() -> Score| {
@@ -1963,6 +1969,7 @@ impl SearchIndex {
                             stable: stable.as_ref(),
                             doc,
                             allows: req.allows,
+                            scope_cache: &mut scope_cache,
                         })?
                     {
                         let score = score();
@@ -2087,6 +2094,7 @@ impl SearchIndex {
         for (segment, reader) in req.view.searcher.segment_readers().iter().enumerate() {
             (req.check)()?;
             let (scopes, stable) = self.metadata_columns(req.view, reader).map_err(E::from)?;
+            let mut scope_cache = None;
             let mut scorer = weight
                 .scorer(reader, 1.0)
                 .map_err(SearchError::from)
@@ -2103,6 +2111,7 @@ impl SearchIndex {
                         stable: stable.as_ref(),
                         doc,
                         allows: req.allows,
+                        scope_cache: &mut scope_cache,
                     })?
                 {
                     let bytes = matched.len().saturating_add(1).saturating_mul(req.per_rank);
@@ -3277,11 +3286,11 @@ impl SearchIndex {
     }
 
     /// Returns the stable key of an active, allowed document, or `None` for skipped ones.
-    fn active_key<E>(&self, req: ActiveDoc<'_, E>) -> std::result::Result<Option<[u8; 32]>, E>
+    fn active_key<E>(&self, mut req: ActiveDoc<'_, E>) -> std::result::Result<Option<[u8; 32]>, E>
     where
         E: From<SearchError>,
     {
-        let scope = self.read_scope(&req).map_err(E::from)?;
+        let scope = self.read_scope(&mut req).map_err(E::from)?;
         let Some(graph) = scope_graph(&scope) else {
             self.mark_damaged(req.view, None);
             return Err(E::from(SearchError::Damaged {
@@ -3303,17 +3312,36 @@ impl SearchIndex {
     }
 
     /// Reads one document's generation scope, owing a whole rebuild when it cannot.
-    fn read_scope<E>(&self, req: &ActiveDoc<'_, E>) -> Result<Vec<u8>> {
+    fn read_scope<E>(&self, req: &mut ActiveDoc<'_, E>) -> Result<Arc<Vec<u8>>> {
+        let mut read = || {
+            let ordinal = req
+                .scopes
+                .and_then(|column| column.term_ords(req.doc).next());
+            if let Some((cached, bytes)) = req.scope_cache.as_ref()
+                && Some(*cached) == ordinal
+            {
+                return Ok(Arc::clone(bytes));
+            }
+            #[cfg(test)]
+            self.hooks.scope_decodes.fetch_add(1, Ordering::SeqCst);
+            let bytes = Arc::new(column_bytes(req.scopes, req.doc)?);
+            if let Some(ordinal) = ordinal
+                && bytes.capacity().saturating_add(64) <= (self.query_bytes() / 8).min(65_536)
+            {
+                *req.scope_cache = Some((ordinal, Arc::clone(&bytes)));
+            }
+            Ok(bytes)
+        };
         #[cfg(test)]
         let scope = if self.hooks.metadata_io.swap(false, Ordering::SeqCst) {
             Err(SearchError::Io(std::io::Error::other(
                 "injected metadata read failure",
             )))
         } else {
-            column_bytes(req.scopes, req.doc)
+            read()
         };
         #[cfg(not(test))]
-        let scope = column_bytes(req.scopes, req.doc);
+        let scope = read();
         scope.inspect_err(|_| self.mark_damaged(req.view, None))
     }
 
@@ -4609,6 +4637,66 @@ mod tests {
             }),
             Err(SearchError::ItemTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn scope_cache_isolated() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+        index
+            .writer()
+            .unwrap()
+            .set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+        index.hooks.exhaustive.store(true, Ordering::SeqCst);
+        for subject in ["urn:test:a", "urn:test:b", "urn:test:c"] {
+            index
+                .index_resource("urn:test:scope:a", subject, Some("needle"))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        merge_all(&index);
+        assert_eq!(index.search("needle", 3).unwrap().len(), 3);
+        assert_eq!(index.hooks.scope_decodes.load(Ordering::SeqCst), 1);
+        index
+            .index_resource("urn:test:scope:b", "urn:test:d", Some("needle"))
+            .unwrap();
+        index.commit().unwrap();
+        let allows = |graph: &str| Ok::<_, SearchError>(graph == "urn:test:scope:b");
+        let hits = index
+            .collect_complete(FilterQuery {
+                candidates: None,
+                query: "needle",
+                limit: 4,
+                subject: None,
+                allows: &allows,
+                check: &|| Ok(()),
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].graph_id, "urn:test:scope:b");
+        assert_eq!(index.hooks.scope_decodes.load(Ordering::SeqCst), 3);
+        let view = index.pin_view();
+        let reader = &view.searcher.segment_readers()[0];
+        let (scopes, stable) = index.metadata_columns(&view, reader).unwrap();
+        let mut cache = None;
+        let mut request = ActiveDoc {
+            view: &view,
+            scopes: scopes.as_ref(),
+            stable: stable.as_ref(),
+            doc: 0,
+            allows: &allows,
+            scope_cache: &mut cache,
+        };
+        index.read_scope(&mut request).unwrap();
+        index.hooks.metadata_io.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            index.read_scope(&mut request),
+            Err(SearchError::Io(_))
+        ));
+        index.prepared_bytes = 32;
+        let mut cache = None;
+        request.scope_cache = &mut cache;
+        index.read_scope(&mut request).unwrap();
+        assert!(cache.is_none());
     }
 
     #[test]
