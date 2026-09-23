@@ -879,12 +879,89 @@ fn preserves_concurrent_heads() {
     }
     cluster.sync_until_converged(10).unwrap();
     let live = cluster.peer(0).graph_snapshot(&graph).unwrap();
-    for (request, expected) in requests.iter().zip(states) {
+    for (request, expected) in requests.iter().zip(&states) {
         let view = cluster
             .peer(0)
             .project_history(&AllowAllAuthorizer, request)
             .unwrap();
-        assert_eq!(view.node.graph_snapshot(&graph).unwrap(), expected);
+        assert_eq!(&view.node.graph_snapshot(&graph).unwrap(), expected);
         assert_eq!(cluster.peer(0).graph_snapshot(&graph).unwrap(), live);
     }
+    let node = cluster.peer(0);
+    let heads = node.graph_heads(&AllowAllAuthorizer, &graph).unwrap();
+    assert_eq!(heads.len(), 2);
+    let mut log = HistoryLog {
+        graph: graph.clone(),
+        heads: heads.clone(),
+        limit: 1,
+        max_bytes: 1024 * 1024,
+    };
+    let narrow = node.history_log(&AllowAllAuthorizer, &log).unwrap_err();
+    assert_eq!(narrow.kind(), CraqleErrorKind::ResourceLimit);
+    log.limit = 2;
+    let mut walked = BTreeSet::new();
+    while !log.heads.is_empty() {
+        let page = node.history_log(&AllowAllAuthorizer, &log).unwrap();
+        assert!(page.operations.into_iter().all(|op| walked.insert(op.id)));
+        log.heads = page.next;
+    }
+    let all = cluster
+        .irokle(0)
+        .raw_topic(topic)
+        .unwrap()
+        .history()
+        .unwrap();
+    assert_eq!(walked, all.iter().map(|op| op.id).collect());
+    let diff = node
+        .compare_history(
+            &AllowAllAuthorizer,
+            &HistoryCompare {
+                graph: graph.clone(),
+                from: requests[0].heads.clone(),
+                to: heads.clone(),
+                max_operations: 100,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+    let (added, removed) = names(&diff.changes);
+    assert!(added.contains(&"\"Branch 1\"".to_owned()));
+    assert!(removed.is_empty());
+    let restored = node
+        .restore_history(
+            &AllowAllAuthorizer,
+            &HistoryRestore {
+                graph: graph.clone(),
+                heads: requests[0].heads.clone(),
+                expected: Some(heads.clone()),
+                id: None,
+                max_operations: 100,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(restored.extends(&heads));
+    let quads = |snapshot: &craqle::GraphReplicaSnapshot| {
+        snapshot
+            .quads
+            .iter()
+            .map(|quad| {
+                (
+                    quad.subject.clone(),
+                    quad.predicate.clone(),
+                    quad.object.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        quads(&node.graph_snapshot(&graph).unwrap()),
+        quads(&states[0])
+    );
+    cluster.sync_until_converged(10).unwrap();
+    assert_eq!(
+        cluster.peer(1).graph_snapshot(&graph).unwrap(),
+        node.graph_snapshot(&graph).unwrap()
+    );
 }
