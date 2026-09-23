@@ -83,7 +83,7 @@ shacl-core = [
 blake3 = { workspace = true }
 chrono = { workspace = true }
 fjall = { workspace = true }
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "fd29484e9281524efa692f59025ac6cca2443da8", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "d9d6688bc3b6bca9d321cf5bd668ecd438dbbfe3", features = [
     "fjall",
 ] }
 oxrdf = { workspace = true }
