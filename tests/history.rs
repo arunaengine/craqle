@@ -3,10 +3,11 @@ mod support;
 use std::collections::BTreeSet;
 
 use craqle::{
-    Action, AllowAllAuthorizer, AuthorizationError, CraqleErrorKind, CraqleGraphEvent,
-    CraqleIrokleOptions, CraqleNode, CraqleOptions, CreateCrateRequest, DenyAllAuthorizer,
-    EncodedTerm, GraphHistory, GraphId, GraphPolicy, HistoryCompare, HistoryLog, HistoryRestore,
-    MaterializedQuadChange, SearchStorage,
+    Action, AllowAllAuthorizer, AuthorizationError, CommitInfo, CraqleErrorKind, CraqleGraphEvent,
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
+    DenyAllAuthorizer, EncodedTerm, GraphHistory, GraphId, GraphPolicy, HistoryCompare, HistoryLog,
+    HistoryPoint, HistoryRestore, MaterializedQuadChange, MutationCommit, MutationId,
+    MutationRequest, RoCrateWrite, SearchStorage,
 };
 use irokle::{Irokle, MemoryStorage, OpId};
 
@@ -83,6 +84,17 @@ impl Fixture {
 impl Fixture {
     fn rename(&self, name: &str) {
         let policy = self.node.graph_policy(&self.graph).unwrap();
+        self.node
+            .apply_rocrate_document_checked_with_policy(
+                &AllowAllAuthorizer,
+                self.graph.clone(),
+                &self.renamed(name),
+                policy,
+            )
+            .unwrap();
+    }
+
+    fn renamed(&self, name: &str) -> String {
         let text = self
             .node
             .export_rocrate(&AllowAllAuthorizer, &self.graph)
@@ -95,14 +107,27 @@ impl Fixture {
             .find(|value| value["@type"] == "Dataset")
             .unwrap();
         root["name"] = serde_json::json!(name);
-        self.node
-            .apply_rocrate_document_checked_with_policy(
-                &AllowAllAuthorizer,
-                self.graph.clone(),
-                &doc.to_string(),
-                policy,
-            )
-            .unwrap();
+        doc.to_string()
+    }
+
+    fn rocrate_write<'a>(&self, jsonld: &'a str, commit: CommitInfo) -> RoCrateWrite<'a> {
+        RoCrateWrite {
+            graph: self.graph.clone(),
+            jsonld,
+            policy: self.node.graph_policy(&self.graph).unwrap(),
+            durability: CraqleRequestDurability::Durable,
+            actor: None,
+            commit: Some(commit),
+        }
+    }
+
+    fn insert(&self, object: &str) -> MaterializedQuadChange {
+        MaterializedQuadChange::Insert {
+            graph: self.graph.clone(),
+            subject: EncodedTerm("<urn:commit>".into()),
+            predicate: EncodedTerm("<urn:p>".into()),
+            object: EncodedTerm(format!("\"{object}\"")),
+        }
     }
 
     fn heads(&self) -> Vec<OpId> {
@@ -131,6 +156,75 @@ impl Fixture {
             commit: None,
         }
     }
+}
+
+fn commit(message: &str) -> CommitInfo {
+    CommitInfo {
+        message: message.to_owned(),
+        author_name: "Ada Lovelace".to_owned(),
+        author_email: "ada@example.org".to_owned(),
+        author_time_ms: 1_790_000_000_000,
+        author_tz_offset_minutes: 120,
+        sources: Vec::new(),
+    }
+}
+
+fn point(graph: &str, heads: usize) -> HistoryPoint {
+    HistoryPoint {
+        graph: GraphId::new(graph),
+        heads: (0..heads)
+            .map(|head| OpId::from_bytes([head as u8; 32]))
+            .collect(),
+    }
+}
+
+/// Commit infos that break exactly one bound each, for commits to `graph`.
+fn invalid_commits(graph: &GraphId) -> Vec<CommitInfo> {
+    let base = commit("invalid");
+    let mut long = base.clone();
+    long.message = "m".repeat(CommitInfo::MAX_MESSAGE_BYTES + 1);
+    let mut wide = base.clone();
+    wide.author_email = "e".repeat(CommitInfo::MAX_AUTHOR_BYTES + 1);
+    let mut broken = base.clone();
+    broken.author_name = "Ada\nCommitter: Eve".to_owned();
+    let mut zone = base.clone();
+    zone.author_tz_offset_minutes = -1081;
+    let with_sources = |sources: Vec<HistoryPoint>| CommitInfo {
+        sources,
+        ..base.clone()
+    };
+    let many = (0..=CommitInfo::MAX_SOURCES)
+        .map(|index| point(&format!("urn:source:{index}"), 1))
+        .collect();
+    vec![
+        long,
+        wide,
+        broken,
+        zone,
+        with_sources(many),
+        with_sources(vec![point("urn:source:empty", 0)]),
+        with_sources(vec![point(
+            "urn:source:wide",
+            CommitInfo::MAX_SOURCE_HEADS + 1,
+        )]),
+        with_sources(vec![
+            point("urn:source:twice", 1),
+            point("urn:source:twice", 2),
+        ]),
+        with_sources(vec![point(graph.as_str(), 1)]),
+    ]
+}
+
+/// The newest operation of a graph with a single head.
+fn newest(node: &CraqleNode, graph: &GraphId) -> craqle::HistoryOperation {
+    let log = HistoryLog {
+        graph: graph.clone(),
+        heads: node.graph_heads(&AllowAllAuthorizer, graph).unwrap(),
+        limit: 1,
+        max_bytes: 1024 * 1024,
+    };
+    let mut page = node.history_log(&AllowAllAuthorizer, &log).unwrap();
+    page.operations.remove(0)
 }
 
 fn read_only(
@@ -966,4 +1060,322 @@ fn preserves_concurrent_heads() {
         cluster.peer(1).graph_snapshot(&graph).unwrap(),
         node.graph_snapshot(&graph).unwrap()
     );
+}
+
+#[test]
+fn syncs_commit_messages() {
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = support::CraqleCluster::new(2, directory.path()).unwrap();
+    let graph = GraphId::new("urn:history:commits");
+    support::create_test_crate(&cluster, 0, &graph);
+    cluster.sync_until_converged(10).unwrap();
+    let node = cluster.peer(0);
+    let change = MaterializedQuadChange::Insert {
+        graph: graph.clone(),
+        subject: EncodedTerm::from_named_node(&graph.0),
+        predicate: EncodedTerm::from_named_node(&craqle::vocab::schema_keywords()),
+        object: EncodedTerm("\"synced\"".into()),
+    };
+    let id = MutationId::new();
+    let request = |admission_sequence| MutationCommit {
+        request: MutationRequest {
+            id,
+            admission_sequence,
+            graph: graph.clone(),
+            changes: vec![change.clone()],
+        },
+        commit: CommitInfo {
+            author_tz_offset_minutes: -330,
+            sources: vec![point("urn:history:fork", 2), point("urn:history:merged", 1)],
+            ..commit("Add a synced keyword")
+        },
+    };
+    let ticket = node
+        .apply_mutation_with(&AllowAllAuthorizer, request(None))
+        .unwrap();
+    node.apply_mutation_with(
+        &AllowAllAuthorizer,
+        request(Some(ticket.admission_sequence)),
+    )
+    .unwrap();
+    cluster.sync_until_converged(10).unwrap();
+    let remote = newest(cluster.peer(1), &graph);
+    assert_eq!(remote.commit(), Some(&request(None).commit));
+    assert!(!remote.rejected);
+    assert_eq!(remote.changes(), std::slice::from_ref(&change));
+    assert_eq!(remote, newest(node, &graph));
+    let content = cluster.peer(1).graph_snapshot(&graph).unwrap();
+    assert_eq!(content, node.graph_snapshot(&graph).unwrap());
+    let topic = node.irokle_topic_id(&graph).unwrap().unwrap();
+    let rejections = cluster.peer(1).replication_rejection_count();
+    cluster
+        .irokle(0)
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::CommittedMutation {
+            id: MutationId::new(),
+            graph: graph.clone(),
+            changes: vec![change],
+            render_hints: None,
+            commit: Box::new(invalid_commits(&graph).pop().unwrap()),
+        })
+        .unwrap();
+    cluster.sync_until_converged(10).unwrap();
+    let replica = cluster.peer(1);
+    assert_eq!(replica.replication_rejection_count(), rejections + 1);
+    let rejected = newest(replica, &graph);
+    assert!(rejected.rejected && rejected.event.is_none());
+    assert_eq!(replica.graph_snapshot(&graph).unwrap(), content);
+}
+
+#[test]
+fn records_rocrate_commits() {
+    let fixture = Fixture::new();
+    let document = fixture.renamed("Committed");
+    fixture
+        .node
+        .apply_rocrate_with(
+            &AllowAllAuthorizer,
+            fixture.rocrate_write(&document, commit("Rename the crate")),
+        )
+        .unwrap();
+    let operation = newest(&fixture.node, &fixture.graph);
+    assert_eq!(operation.commit(), Some(&commit("Rename the crate")));
+    assert!(matches!(
+        operation.event,
+        Some(CraqleGraphEvent::CommittedMutation {
+            render_hints: Some(_),
+            ..
+        })
+    ));
+    assert!(
+        fixture
+            .node
+            .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+            .unwrap()
+            .contains("Committed")
+    );
+    fixture.rename("Plain");
+    let plain = newest(&fixture.node, &fixture.graph);
+    assert!(matches!(
+        plain.event,
+        Some(CraqleGraphEvent::Mutation { .. })
+    ));
+    assert_eq!(plain.commit(), None);
+}
+
+#[test]
+fn records_restore_commits() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let content = fixture.content();
+    fixture.rename("Changed");
+    let request = HistoryRestore {
+        commit: Some(commit("Revert the rename")),
+        ..fixture.restore(&original, None)
+    };
+    let restored = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap()
+        .unwrap();
+    let operation = newest(&fixture.node, &fixture.graph);
+    assert_eq!(operation.id, restored.operation);
+    assert_eq!(operation.commit(), Some(&commit("Revert the rename")));
+    assert_eq!(fixture.content(), content);
+}
+
+#[test]
+fn rejects_invalid_commits() {
+    let fixture = Fixture::new();
+    let heads = fixture.heads();
+    let content = fixture.content();
+    let document = fixture.renamed("Rejected");
+    for invalid in invalid_commits(&fixture.graph) {
+        let error = fixture
+            .node
+            .apply_rocrate_with(
+                &AllowAllAuthorizer,
+                fixture.rocrate_write(&document, invalid.clone()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::InvalidInput);
+        let mutation = MutationCommit {
+            request: MutationRequest {
+                id: MutationId::new(),
+                admission_sequence: None,
+                graph: fixture.graph.clone(),
+                changes: vec![fixture.insert("rejected")],
+            },
+            commit: invalid.clone(),
+        };
+        let error = fixture
+            .node
+            .apply_mutation_with(&AllowAllAuthorizer, mutation)
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::InvalidInput);
+        let restore = HistoryRestore {
+            commit: Some(invalid),
+            ..fixture.restore(&heads, None)
+        };
+        let error = fixture
+            .node
+            .restore_history(&AllowAllAuthorizer, &restore)
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::InvalidInput);
+    }
+    // A write that publishes no event has nowhere to keep the commit.
+    let local = RoCrateWrite {
+        durability: CraqleRequestDurability::WalAlreadyDurable,
+        ..fixture.rocrate_write(&document, commit("Local"))
+    };
+    let error = fixture
+        .node
+        .apply_rocrate_with(&AllowAllAuthorizer, local)
+        .unwrap_err();
+    assert_eq!(error.kind(), CraqleErrorKind::InvalidInput);
+    assert_eq!(fixture.heads(), heads);
+    assert_eq!(fixture.content(), content);
+}
+
+#[test]
+fn rejects_peer_commits() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let content = fixture.content();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let native = fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap();
+    let invalid = invalid_commits(&fixture.graph);
+    let rejections = fixture.node.replication_rejection_count();
+    for commit in &invalid {
+        native
+            .publish(CraqleGraphEvent::CommittedMutation {
+                id: MutationId::new(),
+                graph: fixture.graph.clone(),
+                changes: vec![fixture.insert("invalid")],
+                render_hints: None,
+                commit: Box::new(commit.clone()),
+            })
+            .unwrap();
+        let unapplied = newest(&fixture.node, &fixture.graph);
+        assert!(unapplied.rejected && unapplied.event.is_none());
+    }
+    fixture.node.reconcile_irokle().unwrap();
+    assert_eq!(
+        fixture.node.replication_rejection_count(),
+        rejections + invalid.len() as u64
+    );
+    assert_eq!(fixture.content(), content);
+    let heads = fixture.heads();
+    let compare = HistoryCompare {
+        graph: fixture.graph.clone(),
+        from: original,
+        to: heads.clone(),
+        max_operations: 100,
+        max_bytes: 1024 * 1024,
+    };
+    let diff = fixture
+        .node
+        .compare_history(&AllowAllAuthorizer, &compare)
+        .unwrap();
+    assert!(diff.changes.is_empty());
+    native
+        .publish(CraqleGraphEvent::CommittedMutation {
+            id: MutationId::new(),
+            graph: fixture.graph.clone(),
+            changes: vec![fixture.insert("valid")],
+            render_hints: None,
+            commit: Box::new(commit("Peer change")),
+        })
+        .unwrap();
+    fixture.node.reconcile_irokle().unwrap();
+    let valid = newest(&fixture.node, &fixture.graph);
+    assert_eq!(valid.commit(), Some(&commit("Peer change")));
+    assert_eq!(valid.parents, heads);
+    assert!(fixture.content().contains(&(
+        EncodedTerm("<urn:commit>".into()),
+        EncodedTerm("<urn:p>".into()),
+        EncodedTerm("\"valid\"".into()),
+    )));
+    let view = fixture
+        .node
+        .project_history(&AllowAllAuthorizer, &fixture.request("committed"))
+        .unwrap();
+    assert_eq!(
+        view.node.graph_snapshot(&fixture.graph).unwrap(),
+        fixture.node.graph_snapshot(&fixture.graph).unwrap()
+    );
+}
+
+#[test]
+fn replays_plain_mutations() {
+    let id = [1; 32];
+    // Encoding of a `Mutation` event before `CommittedMutation` was appended.
+    let mut stored = vec![4];
+    stored.extend(id);
+    stored.push(5);
+    stored.extend(b"urn:g");
+    stored.extend([0, 0]);
+    let decoded = postcard::from_bytes::<CraqleGraphEvent>(&stored).unwrap();
+    assert_eq!(
+        decoded,
+        CraqleGraphEvent::Mutation {
+            id: MutationId(id),
+            graph: GraphId::new("urn:g"),
+            changes: Vec::new(),
+            render_hints: None,
+        }
+    );
+    let committed = CraqleGraphEvent::CommittedMutation {
+        id: MutationId(id),
+        graph: GraphId::new("urn:g"),
+        changes: Vec::new(),
+        render_hints: None,
+        commit: Box::new(commit("New")),
+    };
+    let encoded = postcard::to_allocvec(&committed).unwrap();
+    assert_eq!((encoded[0], &encoded[1..stored.len()]), (5, &stored[1..]));
+
+    let fixture = Fixture::new();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let before = fixture.heads();
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::Mutation {
+            id: MutationId::new(),
+            graph: fixture.graph.clone(),
+            changes: vec![fixture.insert("plain")],
+            render_hints: None,
+        })
+        .unwrap();
+    fixture.node.reconcile_irokle().unwrap();
+    let plain = newest(&fixture.node, &fixture.graph);
+    assert!(!plain.rejected);
+    assert_eq!(plain.commit(), None);
+    assert_eq!(plain.changes(), [fixture.insert("plain")]);
+    let compare = HistoryCompare {
+        graph: fixture.graph.clone(),
+        from: before,
+        to: fixture.heads(),
+        max_operations: 100,
+        max_bytes: 1024 * 1024,
+    };
+    let diff = fixture
+        .node
+        .compare_history(&AllowAllAuthorizer, &compare)
+        .unwrap();
+    assert_eq!(diff.changes, [fixture.insert("plain")]);
 }
