@@ -1389,7 +1389,25 @@ pub struct GraphStore {
 /// Serializes one graph's read-write cycle before term shard locks.
 pub(crate) struct GraphCommitGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
 
-pub(crate) struct GraphWriteGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+/// Reentrant on its thread, so an entry point can hold the lock across authorization and commit.
+pub(crate) struct GraphWriteGuard<'a> {
+    guard: Option<MutexGuard<'a, ()>>,
+    lock: usize,
+}
+
+thread_local! {
+    /// The write lock shards this thread holds, by address.
+    static HELD_WRITE_LOCKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+impl Drop for GraphWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            HELD_WRITE_LOCKS.with(|held| held.borrow_mut().retain(|lock| *lock != self.lock));
+            drop(guard);
+        }
+    }
+}
 
 pub(crate) struct ReceiptGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
 
@@ -3238,10 +3256,17 @@ impl GraphStore {
     pub(crate) fn graph_write_guard(&self, graph: &GraphId) -> GraphWriteGuard<'_> {
         let hash = blake3::hash(graph.as_str().as_bytes());
         let shard = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap()) as usize;
-        let guard = self.write_locks[shard % self.write_locks.len()]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        GraphWriteGuard(guard)
+        let mutex = &self.write_locks[shard % self.write_locks.len()];
+        let lock = std::ptr::from_ref(mutex) as usize;
+        if HELD_WRITE_LOCKS.with(|held| held.borrow().contains(&lock)) {
+            return GraphWriteGuard { guard: None, lock };
+        }
+        let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        HELD_WRITE_LOCKS.with(|held| held.borrow_mut().push(lock));
+        GraphWriteGuard {
+            guard: Some(guard),
+            lock,
+        }
     }
 
     /// Hold through receipt staging and source commit for one stable identity.
