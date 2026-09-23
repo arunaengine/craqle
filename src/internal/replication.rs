@@ -1,9 +1,19 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+//! Publishes graph events and merges observed-remove replica state.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 #[cfg(feature = "shacl-core")]
 use std::time::{Duration, Instant};
 
-use crate::core::*;
+use crate::core::{
+    ActorId, Batch, ContextTag, CrateRenderHints, CrateViolation, Dot, EncodedTerm, EventId,
+    GraphDiagnostics, GraphId, GraphReplicaSnapshot, GraphTombstone, MaterializedQuadChange,
+    QuadOp, SnapshotQuadState, TaggedGraphPolicy, TaggedRenderHints,
+    UnsupportedRdfStarTerm as RdfStarError, VectorClock,
+};
 #[cfg(feature = "shacl-core")]
 use crate::rdf_read::StoreReadView;
 use crate::rules::{ChangeSet, DeltaSummary, Rule};
@@ -11,9 +21,10 @@ use crate::sparql::SparqlEngine;
 #[cfg(feature = "shacl-core")]
 use crate::store::BindingGuard;
 use crate::store::{
-    BatchTermCtx, ClockUpdate, CounterKey, EncodedQuad, FtsEnqueue, FtsSubject, GraphStore,
-    QuadAdd, QuadRemove, TermId,
+    BatchReceiptLink, BatchTermCtx, ClockUpdate, CounterKey, EncodedQuad, FtsEnqueue, FtsSubject,
+    GraphStore, PolicyReceipt, QuadAdd, QuadRemove, SnapshotLimits, TermId,
 };
+use crate::sync::CraqleGraphEvent;
 use chrono::Utc;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +42,7 @@ pub enum UpdateError {
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
     #[error(transparent)]
-    UnsupportedRdfStarTerm(#[from] UnsupportedRdfStarTerm),
+    UnsupportedRdfStarTerm(#[from] RdfStarError),
     #[error("prepared state is stale: {fence}")]
     StalePreparedState { fence: String },
     #[error("store: {0}")]
@@ -40,6 +51,16 @@ pub enum UpdateError {
     Sync(#[from] crate::sync::CraqleSyncError),
     #[error("graph `{}` was permanently deleted by event {}", .tombstone.graph, .tombstone.delete_event)]
     GraphDeleted { tombstone: GraphTombstone },
+    #[error("mutation {:?} has a durable outcome but did not finish: {reason}", .receipt.id)]
+    Accepted {
+        receipt: Box<crate::sync::MutationReceipt>,
+        error_kind: crate::CraqleErrorKind,
+        reason: String,
+    },
+    #[error("mutation receipt expired")]
+    ReceiptExpired,
+    #[error("mutation admission ticket is unknown")]
+    ReceiptUnknown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +69,166 @@ pub enum MergeError {
     Store(#[from] crate::store::StoreError),
     #[error("input rejected: {0}")]
     InputRejected(String),
+    /// Events the batch declares as its causal base that this replica has not
+    /// applied. The transport must fetch them and retry.
+    #[error("missing causal dependencies: {}", render_dots(.0))]
+    MissingDependencies(Vec<Dot>),
+    #[error("mutation {:?} was accepted but follow-up work failed: {reason}", .receipt.id)]
+    Accepted {
+        receipt: Box<crate::sync::MutationReceipt>,
+        error_kind: crate::CraqleErrorKind,
+        reason: String,
+    },
+}
+
+fn render_dots(dots: &[Dot]) -> String {
+    dots.iter()
+        .map(|dot| format!("{}:{}", dot.actor, dot.counter))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn mutation_digest(
+    graph: &GraphId,
+    changes: &[MaterializedQuadChange],
+    hints: Option<&TaggedRenderHints>,
+) -> Result<[u8; 32], UpdateError> {
+    let bytes =
+        postcard::to_allocvec(&(graph, changes, hints)).map_err(crate::store::StoreError::from)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// A retryable failure: this node's own topic records must be reconciled before it publishes.
+fn own_pending() -> UpdateError {
+    UpdateError::StalePreparedState {
+        fence: "this node has topic records that are not applied yet".to_owned(),
+    }
+}
+
+fn check_commit(commit: Option<&crate::CommitInfo>, graph: &GraphId) -> Result<(), UpdateError> {
+    match commit.map(|commit| commit.check(graph)) {
+        Some(Err(reason)) => Err(UpdateError::InvalidChangeSet(reason.to_owned())),
+        Some(Ok(())) | None => Ok(()),
+    }
+}
+
+/// Writes literal aliases in canonical form; deletes also remove an alias stored before canonicalization.
+pub(crate) fn canonical_changes(
+    changes: Vec<MaterializedQuadChange>,
+) -> Vec<MaterializedQuadChange> {
+    let mut canonical = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (MaterializedQuadChange::Insert {
+            graph,
+            subject,
+            predicate,
+            object,
+        }
+        | MaterializedQuadChange::Delete {
+            graph,
+            subject,
+            predicate,
+            object,
+        }) = &change;
+        let raw = [subject, predicate, object];
+        let terms = raw.map(|term| term.canonical().unwrap_or_else(|| term.clone()));
+        if terms.iter().zip(raw).all(|(term, raw)| term == raw) {
+            canonical.push(change);
+            continue;
+        }
+        let graph = graph.clone();
+        let [subject, predicate, object] = terms;
+        match change {
+            MaterializedQuadChange::Insert { .. } => {
+                canonical.push(MaterializedQuadChange::Insert {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+            }
+            MaterializedQuadChange::Delete { .. } => {
+                canonical.push(MaterializedQuadChange::Delete {
+                    graph,
+                    subject,
+                    predicate,
+                    object,
+                });
+                canonical.push(change);
+            }
+        }
+    }
+    canonical
+}
+
+fn new_mutation() -> crate::sync::MutationId {
+    crate::sync::MutationId::new()
+}
+
+fn batch_digest(batch: &Batch) -> Result<[u8; 32], MergeError> {
+    let bytes = postcard::to_allocvec(batch)
+        .map_err(crate::store::StoreError::from)
+        .map_err(MergeError::Store)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+fn encoded_digest(value: &impl serde::Serialize) -> crate::store::Result<[u8; 32]> {
+    Ok(*blake3::hash(&postcard::to_allocvec(value)?).as_bytes())
+}
+
+fn settled_repairs() -> crate::sync::RepairState {
+    crate::sync::RepairState {
+        diagnostics: crate::sync::RepairOutcome::NotRequired,
+        shacl: crate::sync::RepairOutcome::NotRequired,
+        search: crate::sync::RepairOutcome::NotRequired,
+        query_view: crate::sync::RepairOutcome::NotRequired,
+    }
+}
+
+fn delete_repairs() -> crate::sync::RepairState {
+    crate::sync::RepairState {
+        diagnostics: crate::sync::RepairOutcome::NotRequired,
+        #[cfg(feature = "shacl-core")]
+        shacl: crate::sync::RepairOutcome::Pending,
+        #[cfg(not(feature = "shacl-core"))]
+        shacl: crate::sync::RepairOutcome::NotRequired,
+        search: crate::sync::RepairOutcome::Pending,
+        query_view: crate::sync::RepairOutcome::Pending,
+    }
+}
+
+fn source_receipt(
+    graph: &GraphId,
+    plan: ApplyPlan<'_>,
+    clock: &VectorClock,
+) -> Result<crate::sync::MutationReceipt, MergeError> {
+    #[cfg(feature = "shacl-core")]
+    let shacl = crate::sync::RepairOutcome::Pending;
+    #[cfg(not(feature = "shacl-core"))]
+    let shacl = crate::sync::RepairOutcome::NotRequired;
+    Ok(crate::sync::MutationReceipt {
+        id: plan.id,
+        admission_sequence: 0,
+        graph: graph.clone(),
+        request_digest: plan.request_digest,
+        event_id: plan.event_id,
+        topic: plan.topic,
+        publish_after: plan.publish_after.cloned(),
+        topic_epoch: plan.topic_epoch,
+        topic_genesis: plan.topic_genesis,
+        search_token: None,
+        repair_graphs: vec![graph.clone()],
+        source: crate::sync::SourceOutcome::Applied,
+        persistence: crate::sync::PersistenceOutcome::Pending,
+        repairs: crate::sync::RepairState {
+            diagnostics: crate::sync::RepairOutcome::Pending,
+            shacl,
+            search: crate::sync::RepairOutcome::Pending,
+            query_view: crate::sync::RepairOutcome::Pending,
+        },
+        source_version: clock_digest(clock)?,
+        updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+    })
 }
 
 impl UpdateError {
@@ -66,6 +247,8 @@ impl UpdateError {
             Self::Store(error) => error.kind(),
             Self::Sync(error) => error.kind(),
             Self::GraphDeleted { .. } => crate::CraqleErrorKind::Conflict,
+            Self::Accepted { error_kind, .. } => *error_kind,
+            Self::ReceiptExpired | Self::ReceiptUnknown => crate::CraqleErrorKind::Conflict,
         }
     }
 }
@@ -75,6 +258,8 @@ impl MergeError {
         match self {
             Self::Store(error) => error.kind(),
             Self::InputRejected(_) => crate::CraqleErrorKind::InvalidInput,
+            Self::MissingDependencies(_) => crate::CraqleErrorKind::Conflict,
+            Self::Accepted { error_kind, .. } => *error_kind,
         }
     }
 }
@@ -82,45 +267,25 @@ impl MergeError {
 /// Outcome of merging replicated state into local state.
 #[derive(Debug)]
 pub struct MergeResult {
-    /// `true` when the merge changed local state. `false` when there was
-    /// nothing left to do: the batch was already applied, the snapshot added
-    /// no dot and no clock entry, or the graph is tombstoned.
+    /// Whether the merge changed authoritative graph state.
     pub applied: bool,
 }
 
-/// Number of shards backing [`GRAPH_WRITE_LOCKS`].
-const GRAPH_WRITE_LOCK_SHARDS: usize = 32;
+pub(crate) struct MergeReceipt {
+    pub result: MergeResult,
+    pub receipt: Option<crate::sync::MutationReceipt>,
+}
+
+pub(crate) struct PolicyMutation<'a> {
+    pub graph: &'a GraphId,
+    pub tagged: TaggedGraphPolicy,
+    pub publish: bool,
+    #[cfg(test)]
+    pub before_apply: Option<fn()>,
+}
+
 #[cfg(feature = "shacl-core")]
 const SHACL_WRITE_RETRIES: usize = 3;
-
-/// Makes publish order the apply order for one graph, and the `@context` tag
-/// mint atomic.
-///
-/// Not `graph_commit_guard`: both uses must span a call that takes that guard
-/// internally (`set_graph_context`, and `ensure_graph_topic` on a first
-/// publish), and `std::sync::Mutex` is not reentrant. Process-wide because one
-/// store is shared by several engines.
-///
-/// Lock order: **graph write lock ▸ graph commit guard**, never the reverse.
-static GRAPH_WRITE_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
-    (0..GRAPH_WRITE_LOCK_SHARDS)
-        .map(|_| Mutex::new(()))
-        .collect()
-});
-
-fn graph_write_lock(graph: &GraphId) -> &'static Mutex<()> {
-    let hash = blake3::hash(graph.as_str().as_bytes());
-    let shard = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap()) as usize;
-    &GRAPH_WRITE_LOCKS[shard % GRAPH_WRITE_LOCK_SHARDS]
-}
-
-/// Acquire a graph's engine-level write lock; see [`GRAPH_WRITE_LOCKS`] for
-/// what it orders and for the lock order it belongs to.
-pub(crate) fn graph_write_guard(graph: &GraphId) -> MutexGuard<'static, ()> {
-    graph_write_lock(graph)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
 
 /// The replication engine: local writes and CRDT merge of Irokle records.
 pub(crate) struct ReplicationEngine {
@@ -130,14 +295,15 @@ pub(crate) struct ReplicationEngine {
     sync: Option<Arc<dyn crate::sync::CraqleGraphSync>>,
     #[cfg(feature = "shacl-core")]
     shacl: Arc<crate::shacl_impl::ShaclCompiler>,
-    /// Set by a test to fail the next replicated apply with a store error,
-    /// standing in for a transient fjall failure. Per-engine rather than global
-    /// so concurrent tests cannot arm each other's nodes.
+    /// Per-engine injection prevents concurrent tests from faulting other nodes.
     #[cfg(test)]
     armed_apply_failure: std::sync::atomic::AtomicBool,
+    /// Test-only failure after a publish and before its receipt is bound.
+    #[cfg(test)]
+    armed_bind_failure: std::sync::atomic::AtomicBool,
     /// Test-only failure after the source commit and before SHACL settlement.
     #[cfg(all(test, feature = "shacl-core"))]
-    armed_settle_failure_after: std::sync::atomic::AtomicUsize,
+    settle_failure_after: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,16 +367,56 @@ impl WriteChecks {
 
 /// A local write, ready to be committed to one graph.
 struct LocalCommit<'a> {
+    id: Option<crate::sync::MutationId>,
+    write_locked: bool,
     graph: &'a GraphId,
     changes: Vec<MaterializedQuadChange>,
     checks: WriteChecks,
     prepared_fence: Option<PreparedCommitFence<'a>>,
-    render_hints: Option<RoCrateRenderHints>,
+    render_hints: Option<CrateRenderHints>,
+    commit: Option<crate::CommitInfo>,
+    request_digest: Option<[u8; 32]>,
+}
+
+/// What a local write publishes next to its quad changes.
+pub(crate) struct EventExtras {
+    pub(crate) render_hints: Option<CrateRenderHints>,
+    pub(crate) commit: Option<crate::CommitInfo>,
+    /// Identifies the request in its receipt instead of the published changes, as for a restore.
+    pub(crate) request_digest: Option<[u8; 32]>,
+}
+
+/// A strict RO-Crate change set and the versions it was prepared against.
+pub(crate) struct PreparedWrite<'a> {
+    pub(crate) graph: &'a GraphId,
+    pub(crate) changes: Vec<MaterializedQuadChange>,
+    pub(crate) data_version: Option<[u8; 32]>,
+    pub(crate) shape_versions: &'a [(GraphId, [u8; 32])],
+    pub(crate) extras: EventExtras,
 }
 
 struct PreparedCommitFence<'a> {
     data_version: Option<[u8; 32]>,
     shape_versions: &'a [(GraphId, [u8; 32])],
+}
+
+#[derive(Clone, Copy)]
+struct ApplyPlan<'a> {
+    hints: Option<&'a TaggedRenderHints>,
+    diagnostics: DiagnosticsMode,
+    id: crate::sync::MutationId,
+    event_id: Option<[u8; 32]>,
+    request_digest: [u8; 32],
+    topic: Option<irokle::TopicId>,
+    publish_after: Option<&'a irokle::ActorClock>,
+    topic_epoch: Option<u64>,
+    topic_genesis: Option<irokle::OpId>,
+}
+
+struct ApplyBatch<'a> {
+    incoming: &'a Batch,
+    clock: &'a mut VectorClock,
+    plan: ApplyPlan<'a>,
 }
 
 #[cfg(feature = "shacl-core")]
@@ -288,8 +494,10 @@ impl ReplicationEngine {
                 sync,
                 #[cfg(test)]
                 armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                armed_bind_failure: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(all(test, feature = "shacl-core"))]
-                armed_settle_failure_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                settle_failure_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
             }
         }
     }
@@ -321,12 +529,159 @@ impl ReplicationEngine {
             #[cfg(test)]
             armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            armed_settle_failure_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            armed_bind_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            settle_failure_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
 
     pub(crate) fn store(&self) -> &Arc<GraphStore> {
         &self.store
+    }
+
+    fn refresh_state(
+        &self,
+        receipt: &mut crate::sync::MutationReceipt,
+    ) -> crate::store::Result<bool> {
+        if receipt.source == crate::sync::SourceOutcome::Prepared {
+            return Ok(false);
+        }
+        let previous = receipt.repairs;
+        if matches!(
+            receipt.repairs.query_view,
+            crate::sync::RepairOutcome::Pending | crate::sync::RepairOutcome::Failed(_)
+        ) && self.store.query_view_covered(receipt)?
+        {
+            receipt.repairs.query_view = crate::sync::RepairOutcome::Complete;
+        }
+        if matches!(
+            receipt.repairs.search,
+            crate::sync::RepairOutcome::Pending | crate::sync::RepairOutcome::Failed(_)
+        ) && self.store.search_covered(receipt)?
+        {
+            receipt.repairs.search = crate::sync::RepairOutcome::Complete;
+        }
+        if matches!(
+            receipt.repairs.diagnostics,
+            crate::sync::RepairOutcome::Pending | crate::sync::RepairOutcome::Failed(_)
+        ) {
+            let _write = self.store.graph_write_guard(&receipt.graph);
+            let _commit = self.store.graph_commit_guard(&receipt.graph);
+            if self.recompute_graph_diagnostics(&receipt.graph).is_ok() {
+                receipt.repairs.diagnostics = crate::sync::RepairOutcome::Complete;
+            }
+        }
+        #[cfg(feature = "shacl-core")]
+        if matches!(
+            receipt.repairs.shacl,
+            crate::sync::RepairOutcome::Pending | crate::sync::RepairOutcome::Failed(_)
+        ) {
+            let mut settled = true;
+            for graph in &receipt.repair_graphs {
+                settled &= !self.store.shacl_graph_pending(graph)?;
+            }
+            if settled {
+                receipt.repairs.shacl = crate::sync::RepairOutcome::Complete;
+            }
+        }
+        Ok(receipt.repairs != previous)
+    }
+
+    pub(crate) fn mark_persisted(
+        &self,
+        id: &crate::sync::MutationId,
+    ) -> crate::store::Result<Option<crate::sync::MutationReceipt>> {
+        let Some(mut receipt) = self.store.mutation_receipt(id)? else {
+            return Ok(None);
+        };
+        if receipt.source == crate::sync::SourceOutcome::Prepared {
+            return Ok(Some(receipt));
+        }
+        let repair_changed = self.refresh_state(&mut receipt)?;
+        let persistence = self.store.persistence_outcome();
+        let persistence_changed = receipt.persistence != persistence;
+        if !repair_changed && !persistence_changed {
+            return Ok(Some(receipt));
+        }
+        receipt.persistence = persistence;
+        receipt.updated_unix_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let receipt = self.store.update_receipt(&receipt)?;
+        self.store.persist_receipts()?;
+        Ok(Some(receipt))
+    }
+
+    pub(crate) fn mutation_status(
+        &self,
+        lookup: &crate::sync::MutationLookup,
+    ) -> crate::store::Result<crate::sync::MutationStatus> {
+        match self.store.receipt_status(lookup)? {
+            crate::sync::MutationStatus::Known(mut receipt) => {
+                if self.refresh_state(&mut receipt)? {
+                    receipt.updated_unix_nanos =
+                        Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                    receipt = Box::new(self.store.update_receipt(&receipt)?);
+                    self.store.persist_receipts()?;
+                }
+                Ok(crate::sync::MutationStatus::Known(receipt))
+            }
+            status => Ok(status),
+        }
+    }
+
+    pub(crate) fn receipt_for_batch(
+        &self,
+        batch: &Batch,
+    ) -> crate::store::Result<crate::sync::MutationStatus> {
+        self.store.receipt_for_batch(batch)
+    }
+
+    fn accepted_store(
+        &self,
+        id: crate::sync::MutationId,
+        error: crate::store::StoreError,
+    ) -> UpdateError {
+        match self.store.mutation_receipt(&id) {
+            Ok(Some(receipt)) => UpdateError::Accepted {
+                receipt: Box::new(receipt),
+                error_kind: error.kind(),
+                reason: error.to_string(),
+            },
+            _ => UpdateError::Store(error),
+        }
+    }
+
+    fn accepted_merge(&self, id: crate::sync::MutationId, error: MergeError) -> UpdateError {
+        match self.store.mutation_receipt(&id) {
+            Ok(Some(receipt)) => UpdateError::Accepted {
+                receipt: Box::new(receipt),
+                error_kind: error.kind(),
+                reason: error.to_string(),
+            },
+            _ => merge_update_error(error),
+        }
+    }
+
+    fn accepted_sync(
+        &self,
+        id: crate::sync::MutationId,
+        error: crate::sync::CraqleSyncError,
+    ) -> UpdateError {
+        match self.store.mutation_receipt(&id) {
+            Ok(Some(receipt)) => UpdateError::Accepted {
+                receipt: Box::new(receipt),
+                error_kind: error.kind(),
+                reason: error.to_string(),
+            },
+            _ => UpdateError::Sync(error),
+        }
+    }
+
+    fn accepted_outcome(receipt: crate::sync::MutationReceipt, error: UpdateError) -> UpdateError {
+        UpdateError::Accepted {
+            error_kind: error.kind(),
+            reason: error.to_string(),
+            receipt: Box::new(receipt),
+        }
     }
 
     /// Make the next replicated apply fail with a store error. Test-only.
@@ -343,15 +698,22 @@ impl ReplicationEngine {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Make the next local publish fail before its receipt is bound. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_bind_failure(&self) {
+        self.armed_bind_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Make the next SHACL settlement fail after the source commit. Test-only.
     #[cfg(all(test, feature = "shacl-core"))]
     pub(crate) fn arm_settle_failure(&self) {
-        self.arm_settle_failure_after(0);
+        self.arm_settle_after(0);
     }
 
     #[cfg(all(test, feature = "shacl-core"))]
-    pub(crate) fn arm_settle_failure_after(&self, successful_settlements: usize) {
-        self.armed_settle_failure_after
+    pub(crate) fn arm_settle_after(&self, successful_settlements: usize) {
+        self.settle_failure_after
             .store(successful_settlements, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -359,7 +721,7 @@ impl ReplicationEngine {
     fn take_settle_failure(&self) -> bool {
         loop {
             let remaining = self
-                .armed_settle_failure_after
+                .settle_failure_after
                 .load(std::sync::atomic::Ordering::SeqCst);
             if remaining == usize::MAX {
                 return false;
@@ -370,7 +732,7 @@ impl ReplicationEngine {
                 remaining - 1
             };
             if self
-                .armed_settle_failure_after
+                .settle_failure_after
                 .compare_exchange(
                     remaining,
                     next,
@@ -394,10 +756,10 @@ impl ReplicationEngine {
         license: Option<String>,
         license_digest: Option<[u8; 32]>,
     ) -> Result<(), UpdateError> {
-        self.local_apply_bulk_bypassing_structural_rules_with_render_hints(
+        self.apply_bulk_hints(
             graph,
             Vec::new(),
-            RoCrateRenderHints {
+            CrateRenderHints {
                 context,
                 license,
                 license_digest,
@@ -409,8 +771,8 @@ impl ReplicationEngine {
     fn changed_render_hints(
         &self,
         graph: &GraphId,
-        desired: Option<RoCrateRenderHints>,
-    ) -> Result<Option<TaggedRoCrateRenderHints>, UpdateError> {
+        desired: Option<CrateRenderHints>,
+    ) -> Result<Option<TaggedRenderHints>, UpdateError> {
         let Some(desired) = desired else {
             return Ok(None);
         };
@@ -420,7 +782,7 @@ impl ReplicationEngine {
         {
             return Ok(None);
         }
-        Ok(Some(TaggedRoCrateRenderHints {
+        Ok(Some(TaggedRenderHints {
             tag: ContextTag::next_local(self.store.graph_context_tag(graph)?, self.actor),
             hints: desired,
         }))
@@ -452,7 +814,8 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        let changes = canonical_changes(changes);
+        self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
             return self.empty_batch(graph);
@@ -461,80 +824,526 @@ impl ReplicationEngine {
         self.commit_changes(graph, changes)
     }
 
-    pub(crate) fn local_apply_changes_with_render_hints(
+    /// [`Self::local_apply_changes`] for a caller that already holds the graph write lock.
+    pub(crate) fn apply_changes_locked(
+        &self,
+        request: crate::sync::MutationRequest,
+        extras: EventExtras,
+    ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(request.changes);
+        self.ensure_change_targets(&request.graph, &changes)?;
+        self.commit_with_plan(LocalCommit {
+            id: Some(request.id),
+            write_locked: true,
+            graph: &request.graph,
+            changes,
+            checks: WriteChecks::normal(DiagnosticsMode::Immediate),
+            prepared_fence: None,
+            render_hints: extras.render_hints,
+            commit: extras.commit,
+            request_digest: extras.request_digest,
+        })
+    }
+
+    pub(crate) fn apply_mutation(
+        &self,
+        mut request: crate::sync::MutationRequest,
+        commit: Option<crate::CommitInfo>,
+    ) -> Result<crate::sync::MutationReceipt, UpdateError> {
+        check_commit(commit.as_ref(), &request.graph)?;
+        request.changes = canonical_changes(request.changes);
+        self.ensure_change_targets(&request.graph, &request.changes)?;
+        if request.changes.is_empty() {
+            return Err(UpdateError::InvalidChangeSet(
+                "mutation request must contain at least one change".to_owned(),
+            ));
+        }
+        let digest = mutation_digest(&request.graph, &request.changes, None)?;
+        let retry_guard;
+        if let Some(receipt) = self.store.mutation_receipt(&request.id)? {
+            if receipt.graph != request.graph || receipt.request_digest != digest {
+                return Err(UpdateError::InvalidChangeSet(
+                    "mutation id is already bound to a different request".to_owned(),
+                ));
+            }
+            match request.admission_sequence {
+                None => return Ok(receipt),
+                Some(sequence) if sequence != receipt.admission_sequence => {
+                    return Err(UpdateError::ReceiptExpired);
+                }
+                Some(_) => {}
+            }
+            if receipt.source != crate::sync::SourceOutcome::Prepared {
+                return Ok(receipt);
+            }
+            retry_guard = Some(self.store.graph_write_guard(&request.graph));
+            if let Some(sync) = &self.sync
+                && let Some(record) = sync
+                    .find_mutation(&receipt)
+                    .map_err(|error| self.accepted_sync(request.id, error))?
+            {
+                let local = receipt
+                    .topic
+                    .is_some_and(|topic| sync.is_local_record(topic, &record));
+                self.apply_irokle_record(&record, local)
+                    .map_err(|error| self.accepted_merge(request.id, error))?;
+                return self.store.mutation_receipt(&request.id)?.ok_or_else(|| {
+                    UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
+                });
+            }
+        } else if request.admission_sequence.is_none() {
+            return self.prepare_mutation(&request);
+        } else {
+            return match self.store.receipt_status(&crate::sync::MutationLookup {
+                graph: request.graph,
+                id: request.id,
+                admission_sequence: request.admission_sequence,
+            })? {
+                crate::sync::MutationStatus::Expired => Err(UpdateError::ReceiptExpired),
+                crate::sync::MutationStatus::Known(receipt) => Ok(*receipt),
+                crate::sync::MutationStatus::Unknown => Err(UpdateError::ReceiptUnknown),
+            };
+        }
+        self.commit_with_plan(LocalCommit {
+            id: Some(request.id),
+            write_locked: retry_guard.is_some(),
+            graph: &request.graph,
+            changes: request.changes,
+            checks: WriteChecks::normal(DiagnosticsMode::Immediate),
+            prepared_fence: None,
+            render_hints: None,
+            commit,
+            request_digest: None,
+        })?;
+        drop(retry_guard);
+        self.store
+            .mutation_receipt(&request.id)?
+            .ok_or_else(|| UpdateError::InvalidChangeSet("mutation receipt was not stored".into()))
+    }
+
+    fn prepare_mutation(
+        &self,
+        request: &crate::sync::MutationRequest,
+    ) -> Result<crate::sync::MutationReceipt, UpdateError> {
+        let _write_guard = self.store.graph_write_guard(&request.graph);
+        if let Some(tombstone) = self.store.graph_tombstone(&request.graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone });
+        }
+        let _commit_guard = self.store.graph_commit_guard(&request.graph);
+        self.validate(&request.graph, &request.changes)?;
+        #[cfg(feature = "shacl-core")]
+        let (_binding_guard, _) =
+            self.prepare_shacl_commit(&request.graph, &request.changes, true)?;
+        let (topic, frontier) = if let Some(sync) = &self.sync {
+            let topic = sync.ensure_topic_guarded(&self.store, &request.graph)?;
+            let frontier = sync.topic_frontier(topic)?;
+            (Some(topic), Some(frontier))
+        } else {
+            (None, None)
+        };
+        #[cfg(feature = "shacl-core")]
+        drop(_binding_guard);
+        let receipt = crate::sync::MutationReceipt {
+            id: request.id,
+            admission_sequence: 0,
+            graph: request.graph.clone(),
+            request_digest: mutation_digest(&request.graph, &request.changes, None)?,
+            event_id: None,
+            topic,
+            publish_after: frontier.as_ref().map(|frontier| frontier.clock.clone()),
+            topic_epoch: frontier.as_ref().map(|frontier| frontier.epoch),
+            topic_genesis: frontier.as_ref().map(|frontier| frontier.genesis),
+            search_token: None,
+            repair_graphs: vec![request.graph.clone()],
+            source: crate::sync::SourceOutcome::Prepared,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: crate::sync::RepairState {
+                diagnostics: crate::sync::RepairOutcome::Pending,
+                #[cfg(feature = "shacl-core")]
+                shacl: crate::sync::RepairOutcome::Pending,
+                #[cfg(not(feature = "shacl-core"))]
+                shacl: crate::sync::RepairOutcome::NotRequired,
+                search: crate::sync::RepairOutcome::Pending,
+                query_view: crate::sync::RepairOutcome::Pending,
+            },
+            source_version: self.store.graph_version_digest(&request.graph)?,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        let _receipt_guard = self.store.receipt_guard(&request.id);
+        let mut batch = self.store.new_batch();
+        if let Some(existing) = self.store.stage_receipt(&mut batch, &receipt)? {
+            return Ok(existing);
+        }
+        self.store.commit(batch)?;
+        self.store.persist_receipts()?;
+        self.store
+            .mutation_receipt(&request.id)?
+            .ok_or_else(|| UpdateError::InvalidChangeSet("mutation receipt was not stored".into()))
+    }
+
+    pub(crate) fn set_policy(
+        &self,
+        request: PolicyMutation<'_>,
+    ) -> Result<Option<crate::sync::MutationReceipt>, UpdateError> {
+        let _write = self.store.graph_write_guard(request.graph);
+        if let Some(tombstone) = self.store.graph_tombstone(request.graph)? {
+            return Err(UpdateError::GraphDeleted { tombstone });
+        }
+        let current = self.store.graph_tagged_policy(request.graph)?;
+        if self.store.contains_graph(request.graph)? && current == request.tagged {
+            return Ok(None);
+        }
+        if request.publish
+            && let Some(sync) = &self.sync
+        {
+            let topic = sync.ensure_graph_topic(&self.store, request.graph)?;
+            let frontier = sync.topic_frontier(topic)?;
+            let record = sync.publish_policy(&self.store, request.graph, request.tagged)?;
+            #[cfg(test)]
+            if let Some(before_apply) = request.before_apply {
+                before_apply();
+            }
+            let CraqleGraphEvent::Policy { tagged, .. } = &record.event else {
+                return Err(UpdateError::InvalidChangeSet(
+                    "policy publish returned a different event".to_owned(),
+                ));
+            };
+            let id = crate::sync::MutationId::from_op(record.meta.op_id);
+            let digest = encoded_digest(tagged)?;
+            let applied = crate::sync::MutationReceipt {
+                id,
+                admission_sequence: 0,
+                graph: request.graph.clone(),
+                request_digest: digest,
+                event_id: Some(*record.meta.op_id.as_bytes()),
+                topic: Some(topic),
+                publish_after: Some(frontier.clock),
+                topic_epoch: Some(frontier.epoch),
+                topic_genesis: Some(frontier.genesis),
+                search_token: None,
+                repair_graphs: Vec::new(),
+                source: crate::sync::SourceOutcome::Applied,
+                persistence: crate::sync::PersistenceOutcome::Pending,
+                repairs: settled_repairs(),
+                source_version: digest,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            };
+            return self
+                .store
+                .set_policy_receipt(
+                    request.graph,
+                    PolicyReceipt {
+                        tagged,
+                        receipt: &applied,
+                    },
+                )
+                .map(Some)
+                .map_err(|error| Self::accepted_outcome(applied, UpdateError::Store(error)));
+        }
+
+        let id = new_mutation();
+        let digest = encoded_digest(&request.tagged)?;
+        let receipt = crate::sync::MutationReceipt {
+            id,
+            admission_sequence: 0,
+            graph: request.graph.clone(),
+            request_digest: digest,
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: settled_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .set_policy_receipt(
+                request.graph,
+                PolicyReceipt {
+                    tagged: &request.tagged,
+                    receipt: &receipt,
+                },
+            )
+            .map(Some)
+            .map_err(UpdateError::Store)
+    }
+
+    pub(crate) fn apply_policy_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<Option<crate::sync::MutationReceipt>, MergeError> {
+        let CraqleGraphEvent::Policy { graph, tagged } = &record.event else {
+            return Err(MergeError::InputRejected(
+                "expected a policy replication record".to_owned(),
+            ));
+        };
+        let current = self.store.graph_tagged_policy(graph)?;
+        if tagged.tag <= current.tag {
+            return Ok(None);
+        }
+        let digest = encoded_digest(tagged)?;
+        let receipt = crate::sync::MutationReceipt {
+            id: crate::sync::MutationId::from_op(record.meta.op_id),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: digest,
+            event_id: Some(*record.meta.op_id.as_bytes()),
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: settled_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .set_policy_receipt(
+                graph,
+                PolicyReceipt {
+                    tagged,
+                    receipt: &receipt,
+                },
+            )
+            .map(Some)
+            .map_err(MergeError::Store)
+    }
+
+    pub(crate) fn delete_graph(
+        &self,
+        graph: &GraphId,
+        publish: bool,
+    ) -> Result<Option<crate::sync::MutationReceipt>, UpdateError> {
+        let _write = self.store.graph_write_guard(graph);
+        if self.store.graph_tombstoned(graph)? && !self.store.contains_graph(graph)? {
+            return Ok(None);
+        }
+        let mut delete_clock = self.store.get_vector_clock(graph)?;
+        let delete_counter = delete_clock
+            .0
+            .get(&self.actor)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        delete_clock.advance(self.actor, delete_counter);
+        let tombstone = GraphTombstone {
+            graph: graph.clone(),
+            delete_event: EventId::graph_delete(graph, self.actor, &delete_clock),
+            delete_actor: self.actor,
+            delete_clock,
+        };
+        let digest = encoded_digest(&tombstone)?;
+        #[cfg(feature = "shacl-core")]
+        let repair_graphs = self.store.affected_shacl_graphs(graph)?;
+        #[cfg(not(feature = "shacl-core"))]
+        let repair_graphs = Vec::new();
+
+        if publish
+            && let Some(sync) = &self.sync
+            && let Some(topic) = sync.graph_topic_id(&self.store, graph)?
+        {
+            let frontier = sync.topic_frontier(topic)?;
+            let record = sync.publish_delete(&self.store, tombstone)?;
+            let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event else {
+                return Err(UpdateError::InvalidChangeSet(
+                    "delete publish returned a different event".to_owned(),
+                ));
+            };
+            let id = crate::sync::MutationId::from_op(record.meta.op_id);
+            let applied = crate::sync::MutationReceipt {
+                id,
+                admission_sequence: 0,
+                graph: graph.clone(),
+                request_digest: digest,
+                event_id: Some(*record.meta.op_id.as_bytes()),
+                topic: Some(topic),
+                publish_after: Some(frontier.clock),
+                topic_epoch: Some(frontier.epoch),
+                topic_genesis: Some(frontier.genesis),
+                search_token: None,
+                repair_graphs: repair_graphs.clone(),
+                source: crate::sync::SourceOutcome::Applied,
+                persistence: crate::sync::PersistenceOutcome::Pending,
+                repairs: delete_repairs(),
+                source_version: digest,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            };
+            return self
+                .store
+                .delete_with_receipt(tombstone, &applied)
+                .map(Some)
+                .map_err(|error| Self::accepted_outcome(applied, UpdateError::Store(error)));
+        }
+
+        let receipt = crate::sync::MutationReceipt {
+            id: new_mutation(),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: digest,
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs,
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: delete_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .delete_with_receipt(&tombstone, &receipt)
+            .map(Some)
+            .map_err(UpdateError::Store)
+    }
+
+    pub(crate) fn apply_delete_record(
+        &self,
+        record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
+    ) -> Result<Option<crate::sync::MutationReceipt>, MergeError> {
+        let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event else {
+            return Err(MergeError::InputRejected(
+                "expected a graph deletion record".to_owned(),
+            ));
+        };
+        if self.store.graph_tombstoned(&tombstone.graph)?
+            && !self.store.contains_graph(&tombstone.graph)?
+        {
+            return Ok(None);
+        }
+        let digest = encoded_digest(tombstone)?;
+        #[cfg(feature = "shacl-core")]
+        let repair_graphs = self.store.affected_shacl_graphs(&tombstone.graph)?;
+        #[cfg(not(feature = "shacl-core"))]
+        let repair_graphs = Vec::new();
+        let receipt = crate::sync::MutationReceipt {
+            id: crate::sync::MutationId::from_op(record.meta.op_id),
+            admission_sequence: 0,
+            graph: tombstone.graph.clone(),
+            request_digest: digest,
+            event_id: Some(*record.meta.op_id.as_bytes()),
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs,
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: delete_repairs(),
+            source_version: digest,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.store
+            .delete_with_receipt(tombstone, &receipt)
+            .map(Some)
+            .map_err(MergeError::Store)
+    }
+
+    pub(crate) fn apply_changes_hints(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: RoCrateRenderHints,
+        render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
-        self.commit_changes_with_plan(LocalCommit {
+        let changes = canonical_changes(changes);
+        self.ensure_change_targets(graph, &changes)?;
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: Some(render_hints),
+            commit: None,
+            request_digest: None,
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn local_apply_changes_bypassing_structural_rules(
+    pub(crate) fn apply_changes_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        let changes = canonical_changes(changes);
+        self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
             return self.empty_batch(graph);
         }
 
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
+            request_digest: None,
         })
     }
 
     /// Apply a trusted bulk change set locally and defer graph-diagnostics
     /// recomputation until the caller explicitly rebuilds diagnostics.
     #[cfg(test)]
-    pub(crate) fn local_apply_bulk_bypassing_structural_rules(
+    pub(crate) fn apply_bulk_unchecked(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        let changes = canonical_changes(changes);
+        self.ensure_change_targets(graph, &changes)?;
 
         if changes.is_empty() {
             return self.empty_batch(graph);
         }
 
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
+            request_digest: None,
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn local_apply_bulk_bypassing_structural_rules_with_render_hints(
+    pub(crate) fn apply_bulk_hints(
         &self,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: RoCrateRenderHints,
+        render_hints: CrateRenderHints,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
-        self.commit_changes_with_plan(LocalCommit {
+        let changes = canonical_changes(changes);
+        self.ensure_change_targets(graph, &changes)?;
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: None,
             render_hints: Some(render_hints),
+            commit: None,
+            request_digest: None,
         })
     }
 
@@ -543,41 +1352,45 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        let changes = canonical_changes(changes);
+        self.ensure_change_targets(graph, &changes)?;
         if changes.is_empty() {
             return self.empty_batch(graph);
         }
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Deferred),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
+            request_digest: None,
         })
     }
 
-    pub(crate) fn local_apply_bulk_prepared(
+    pub(crate) fn apply_bulk_prepared(
         &self,
-        graph: &GraphId,
-        changes: Vec<MaterializedQuadChange>,
-        data_version: Option<[u8; 32]>,
-        shape_versions: &[(GraphId, [u8; 32])],
-        render_hints: RoCrateRenderHints,
+        write: PreparedWrite<'_>,
     ) -> Result<Batch, UpdateError> {
-        self.ensure_change_set_targets(graph, &changes)?;
+        let changes = canonical_changes(write.changes);
+        self.ensure_change_targets(write.graph, &changes)?;
         let fence = PreparedCommitFence {
-            data_version,
-            shape_versions,
+            data_version: write.data_version,
+            shape_versions: write.shape_versions,
         };
-        self.commit_changes_with_plan(LocalCommit {
-            graph,
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
+            graph: write.graph,
             changes,
-            // Structural rules were evaluated over the exact encoded
-            // candidate during preparation; do not rebuild a decoded current
-            // graph and re-evaluate a different orphan-inclusive view here.
+            // Preparation already evaluated structural rules over this exact encoded candidate.
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: Some(fence),
-            render_hints: Some(render_hints),
+            render_hints: write.extras.render_hints,
+            commit: write.extras.commit,
+            request_digest: write.extras.request_digest,
         })
     }
 
@@ -600,17 +1413,15 @@ impl ReplicationEngine {
         })
     }
 
-    /// Run the checks a local apply of `changes` would run, without writing.
-    ///
-    /// The verdict describes the state visible now; a concurrent write to
-    /// `graph` can still invalidate the planned change set.
+    /// Validate without writing; later concurrent writes can invalidate this verdict.
     pub(crate) fn check_planned_changes(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
     ) -> Result<(), UpdateError> {
-        self.ensure_change_set_targets(graph, changes)?;
-        self.validate(graph, changes)
+        let changes = canonical_changes(changes.to_vec());
+        self.ensure_change_targets(graph, &changes)?;
+        self.validate(graph, &changes)
     }
 
     fn validate(
@@ -741,7 +1552,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn prepared_shacl_write_is_current(
+    fn prepared_shacl_current(
         &self,
         graph: &GraphId,
         prepared: &PreparedShaclWrite<'_>,
@@ -772,7 +1583,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn prepare_shacl_write_for_commit(
+    fn prepare_shacl_commit(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
@@ -781,7 +1592,7 @@ impl ReplicationEngine {
         for _ in 0..SHACL_WRITE_RETRIES {
             let prepared = self.prepare_shacl_write(graph, changes, enforce_shacl)?;
             let binding_guard = self.store.binding_guard();
-            if self.prepared_shacl_write_is_current(graph, &prepared)? {
+            if self.prepared_shacl_current(graph, &prepared)? {
                 return Ok((binding_guard, prepared));
             }
         }
@@ -1222,7 +2033,7 @@ impl ReplicationEngine {
 
     #[cfg(all(test, feature = "shacl-core"))]
     pub(crate) fn replay_pending_bindings(&self) -> crate::store::Result<()> {
-        let outcome = self.replay_pending_bindings_bounded(usize::MAX, None)?;
+        let outcome = self.replay_bindings_bounded(usize::MAX, None)?;
         if let Some(failure) = outcome.failures.first() {
             return Err(crate::store::StoreError::InvalidEncoding {
                 context: "SHACL pending replay",
@@ -1233,16 +2044,14 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    pub(crate) fn replay_pending_bindings_bounded(
+    pub(crate) fn replay_bindings_bounded(
         &self,
         max_graphs: usize,
         max_elapsed: Option<Duration>,
     ) -> crate::store::Result<crate::PendingReplayOutcome> {
         let started = Instant::now();
         let deadline = max_elapsed.and_then(|elapsed| started.checked_add(elapsed));
-        let scan = self
-            .store
-            .pending_shacl_queue_bounded(max_graphs, deadline)?;
+        let scan = self.store.bounded_shacl_queue(max_graphs, deadline)?;
         let mut outcome = crate::PendingReplayOutcome {
             budget_exhausted: scan.budget_exhausted,
             ..crate::PendingReplayOutcome::default()
@@ -1256,7 +2065,7 @@ impl ReplicationEngine {
             match self.settle_current(&graph) {
                 Ok(reports) => {
                     outcome.statistics.reports_produced += reports as u64;
-                    if !self.store.shacl_graph_is_pending(&graph)? {
+                    if !self.store.shacl_graph_pending(&graph)? {
                         outcome.statistics.graphs_settled += 1;
                     }
                 }
@@ -1347,11 +2156,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn persist_shacl_evaluations_post_commit(
-        &self,
-        graph: &GraphId,
-        evaluations: Vec<ShaclEvaluation>,
-    ) -> bool {
+    fn persist_shacl_post(&self, graph: &GraphId, evaluations: Vec<ShaclEvaluation>) -> bool {
         if evaluations.is_empty() {
             return true;
         }
@@ -1363,7 +2168,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn settle_bindings_post_commit(
+    fn settle_bindings_post(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
@@ -1378,7 +2183,7 @@ impl ReplicationEngine {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn settle_current_post_commit(&self, graph: &GraphId) -> bool {
+    fn settle_current_post(&self, graph: &GraphId) -> bool {
         if let Err(error) = self.settle_current(graph) {
             self.report_settlement_failure(graph, &error);
             return false;
@@ -1386,7 +2191,7 @@ impl ReplicationEngine {
         true
     }
 
-    fn ensure_change_set_targets(
+    fn ensure_change_targets(
         &self,
         graph: &GraphId,
         changes: &[MaterializedQuadChange],
@@ -1417,7 +2222,7 @@ impl ReplicationEngine {
                 .into_iter()
                 .find(|term| term.is_rdf_star())
             {
-                return Err(UnsupportedRdfStarTerm {
+                return Err(RdfStarError {
                     term: term.0.clone(),
                 }
                 .into());
@@ -1426,7 +2231,7 @@ impl ReplicationEngine {
         Ok(())
     }
 
-    fn ensure_prepared_data_current(
+    fn ensure_data_current(
         &self,
         graph: &GraphId,
         fence: &PreparedCommitFence<'_>,
@@ -1445,10 +2250,7 @@ impl ReplicationEngine {
         }
     }
 
-    fn ensure_prepared_shapes_current(
-        &self,
-        fence: &PreparedCommitFence<'_>,
-    ) -> Result<(), UpdateError> {
+    fn ensure_shapes_current(&self, fence: &PreparedCommitFence<'_>) -> Result<(), UpdateError> {
         for (graph, expected) in fence.shape_versions {
             if !self.store.contains_graph(graph)?
                 || self.store.graph_version_digest(graph)? != *expected
@@ -1467,40 +2269,52 @@ impl ReplicationEngine {
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
     ) -> Result<Batch, UpdateError> {
-        self.commit_changes_with_plan(LocalCommit {
+        self.commit_with_plan(LocalCommit {
+            id: None,
+            write_locked: false,
             graph,
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
+            request_digest: None,
         })
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %commit.graph.as_str(), change_count = commit.changes.len(), sync_enabled = self.sync.is_some()))]
-    fn commit_changes_with_plan(&self, commit: LocalCommit<'_>) -> Result<Batch, UpdateError> {
+    fn commit_with_plan(&self, commit: LocalCommit<'_>) -> Result<Batch, UpdateError> {
         let LocalCommit {
+            id,
+            write_locked,
             graph,
             changes,
             checks,
             prepared_fence,
             render_hints,
+            commit,
+            request_digest,
         } = commit;
+        check_commit(commit.as_ref(), graph)?;
+        if self.sync.is_none() && commit.is_some() {
+            return Err(UpdateError::InvalidChangeSet(
+                "commit info needs a write that publishes an Irokle event".to_owned(),
+            ));
+        }
+        let mutation_id = id.unwrap_or_else(new_mutation);
 
         // Serializes the permanent tombstone check with every local write and
         // graph delete, regardless of whether replication is configured.
-        let _write_guard = graph_write_guard(graph);
+        let _write_guard = (!write_locked).then(|| self.store.graph_write_guard(graph));
         if let Some(tombstone) = self.store.graph_tombstone(graph)? {
             return Err(UpdateError::GraphDeleted { tombstone });
         }
 
         if let Some(sync) = &self.sync {
-            // Orders this graph's publish against its own apply; see
-            // GRAPH_WRITE_LOCKS. Taken before the publish and held across it.
-            // Validation and publication are serialized with every local CRDT
-            // mutation of this graph.
+            // The store-local graph guard serializes validation, publication, and apply.
             let _commit_guard = self.store.graph_commit_guard(graph);
             if let Some(fence) = prepared_fence.as_ref() {
-                self.ensure_prepared_data_current(graph, fence)?;
+                self.ensure_data_current(graph, fence)?;
             }
             let render_hints = self.changed_render_hints(graph, render_hints)?;
             if changes.is_empty() && render_hints.is_none() {
@@ -1510,13 +2324,10 @@ impl ReplicationEngine {
                 self.validate(graph, &changes)?;
             }
             #[cfg(feature = "shacl-core")]
-            let (binding_guard, prepared_shacl) = self.prepare_shacl_write_for_commit(
-                graph,
-                &changes,
-                checks.shacl_enforcement.enabled(),
-            )?;
+            let (binding_guard, prepared_shacl) =
+                self.prepare_shacl_commit(graph, &changes, checks.shacl_enforcement.enabled())?;
             if let Some(fence) = prepared_fence.as_ref() {
-                self.ensure_prepared_shapes_current(fence)?;
+                self.ensure_shapes_current(fence)?;
             }
             #[cfg(feature = "shacl-core")]
             let pending_graphs = self.store.affected_shacl_graphs(graph)?;
@@ -1527,75 +2338,177 @@ impl ReplicationEngine {
             #[cfg(feature = "shacl-core")]
             let mut shacl_evaluations = prepared_shacl.enforce_evaluations;
 
-            sync.ensure_topic_guarded(&self.store, graph)?;
-
-            // Publish-first (G4): no source state changes until the event is
-            // durable in the topic. A failed publish therefore leaves the
-            // validated candidate unapplied.
-            let record = match render_hints {
-                Some(render_hints) => {
-                    sync.publish_rocrate_mutation(&self.store, graph, changes, render_hints)?
-                }
-                None => sync.publish_changes(&self.store, graph, changes)?,
+            let topic = sync
+                .ensure_topic_guarded(&self.store, graph)
+                .map_err(|error| self.accepted_sync(mutation_id, error))?;
+            let frontier = sync
+                .topic_frontier(topic)
+                .map_err(|error| self.accepted_sync(mutation_id, error))?;
+            // A later own dot would mark an own record that is not applied yet as seen.
+            if sync.own_pending(&self.store, topic)?.is_some() {
+                return Err(own_pending());
+            }
+            let request_digest = match request_digest {
+                Some(digest) => digest,
+                None => mutation_digest(graph, &changes, render_hints.as_ref())?,
             };
-            let Some(mutation) = crate::sync::batch_from_owned(record)? else {
+            let existing_receipt = self.store.mutation_receipt(&mutation_id)?;
+            if existing_receipt.as_ref().is_some_and(|receipt| {
+                receipt.graph != *graph || receipt.request_digest != request_digest
+            }) {
+                return Err(UpdateError::InvalidChangeSet(
+                    "mutation id is already bound to a different request".to_owned(),
+                ));
+            }
+            let prepared_receipt =
+                existing_receipt
+                    .clone()
+                    .unwrap_or(crate::sync::MutationReceipt {
+                        id: mutation_id,
+                        admission_sequence: 0,
+                        graph: graph.clone(),
+                        request_digest,
+                        event_id: None,
+                        topic: Some(topic),
+                        publish_after: Some(frontier.clock.clone()),
+                        topic_epoch: Some(frontier.epoch),
+                        topic_genesis: Some(frontier.genesis),
+                        search_token: None,
+                        repair_graphs: vec![graph.clone()],
+                        source: crate::sync::SourceOutcome::Prepared,
+                        persistence: crate::sync::PersistenceOutcome::Pending,
+                        repairs: crate::sync::RepairState {
+                            diagnostics: crate::sync::RepairOutcome::Pending,
+                            #[cfg(feature = "shacl-core")]
+                            shacl: crate::sync::RepairOutcome::Pending,
+                            #[cfg(not(feature = "shacl-core"))]
+                            shacl: crate::sync::RepairOutcome::NotRequired,
+                            search: crate::sync::RepairOutcome::Pending,
+                            query_view: crate::sync::RepairOutcome::Pending,
+                        },
+                        source_version: self.store.graph_version_digest(graph)?,
+                        updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+                    });
+            if existing_receipt.is_none() {
+                let _receipt_guard = self.store.receipt_guard(&mutation_id);
+                let mut receipt_batch = self.store.new_batch();
+                if self
+                    .store
+                    .stage_receipt(&mut receipt_batch, &prepared_receipt)?
+                    .is_none()
+                {
+                    self.store.commit(receipt_batch)?;
+                }
+            }
+
+            // Publish-first ordering leaves a failed publication unapplied locally.
+            let record = sync
+                .publish_mutation(
+                    &self.store,
+                    crate::sync::OutgoingMutation {
+                        id: mutation_id,
+                        graph: graph.clone(),
+                        changes,
+                        render_hints,
+                        commit,
+                    },
+                )
+                .map_err(|error| self.accepted_sync(mutation_id, error))?;
+            let Some(mutation) = crate::sync::batch_from_owned(record)
+                .map_err(|error| self.accepted_sync(mutation_id, error))?
+            else {
                 return Err(UpdateError::InvalidChangeSet(
                     "irokle changes publish did not return a quad-change record".to_string(),
                 ));
             };
             let batch = mutation.batch;
+            // An own record published concurrently must apply first, through reconciliation.
+            if sync
+                .own_pending(&self.store, topic)
+                .map_err(|error| self.accepted_sync(mutation_id, error))?
+                .is_some_and(|sequence| sequence != batch.counter)
+            {
+                let receipt = self.store.mutation_receipt(&mutation_id)?.ok_or_else(|| {
+                    UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
+                })?;
+                return Err(Self::accepted_outcome(receipt, own_pending()));
+            }
+            #[cfg(test)]
+            if self
+                .armed_bind_failure
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(UpdateError::InvalidChangeSet(
+                    "injected bind failure".to_owned(),
+                ));
+            }
+            let bound_receipt = self
+                .store
+                .bind_receipt_event(&mutation_id, *mutation.event_id.as_bytes())
+                .map_err(|error| self.accepted_store(mutation_id, error))?;
+            let apply = ApplyPlan {
+                hints: mutation.render_hints.as_ref(),
+                diagnostics: checks.diagnostics,
+                id: mutation.mutation_id,
+                event_id: bound_receipt.event_id,
+                request_digest,
+                topic: bound_receipt.topic,
+                publish_after: bound_receipt.publish_after.as_ref(),
+                topic_epoch: bound_receipt.topic_epoch,
+                topic_genesis: bound_receipt.topic_genesis,
+            };
             let _merged = self
-                .apply_irokle_guarded(&batch, mutation.render_hints.as_ref(), checks.diagnostics)
-                .map_err(update_error_from_merge)?;
+                .apply_irokle_guarded(&batch, apply)
+                .map_err(|error| self.accepted_merge(mutation_id, error))?;
             #[cfg(feature = "shacl-core")]
             {
                 let data_version = _merged
                     .applied
                     .then(|| self.stamp_evaluations(graph, &mut shacl_evaluations))
-                    .transpose()?;
+                    .transpose()
+                    .map_err(|error| self.accepted_store(mutation_id, error))?;
                 drop(_commit_guard);
                 drop(binding_guard);
                 drop(_write_guard);
                 if _merged.applied {
-                    let mut source_settled =
-                        self.persist_shacl_evaluations_post_commit(graph, shacl_evaluations);
+                    let mut source_settled = self.persist_shacl_post(graph, shacl_evaluations);
                     if let (Some(work), Some(changes), Some(data_version)) =
                         (advisory_work, advisory_changes, data_version)
                     {
                         source_settled &=
-                            self.settle_bindings_post_commit(graph, &changes, data_version, work);
+                            self.settle_bindings_post(graph, &changes, data_version, work);
                     }
                     self.settle_shacl_graphs(&pending_graphs, (!source_settled).then_some(graph));
+                    self.complete_shacl(mutation_id, source_settled)
+                        .map_err(|error| self.accepted_store(mutation_id, error))?;
                 }
             }
             return Ok(batch);
         }
 
-        // Guards the whole read→write cycle of this graph's CRDT state: the
-        // diagnostics read, the clock read, the counter mint, every quad op, the
-        // clock write, the FTS enqueue, the commit and the diagnostics refresh
-        // (G1, G2, G5, G6).
+        // Guard the complete CRDT read, mutation, commit, and diagnostics cycle.
         let _commit_guard = self.store.graph_commit_guard(graph);
 
         if let Some(fence) = prepared_fence.as_ref() {
-            self.ensure_prepared_data_current(graph, fence)?;
+            self.ensure_data_current(graph, fence)?;
         }
         let render_hints = self.changed_render_hints(graph, render_hints)?;
         if changes.is_empty() && render_hints.is_none() {
             return self.empty_batch(graph);
         }
+        let request_digest = match request_digest {
+            Some(digest) => digest,
+            None => mutation_digest(graph, &changes, render_hints.as_ref())?,
+        };
 
         if checks.structural_rules.enabled() {
             self.validate(graph, &changes)?;
         }
         #[cfg(feature = "shacl-core")]
-        let (binding_guard, prepared_shacl) = self.prepare_shacl_write_for_commit(
-            graph,
-            &changes,
-            checks.shacl_enforcement.enabled(),
-        )?;
+        let (binding_guard, prepared_shacl) =
+            self.prepare_shacl_commit(graph, &changes, checks.shacl_enforcement.enabled())?;
         if let Some(fence) = prepared_fence.as_ref() {
-            self.ensure_prepared_shapes_current(fence)?;
+            self.ensure_shapes_current(fence)?;
         }
         #[cfg(feature = "shacl-core")]
         let pending_graphs = self.store.affected_shacl_graphs(graph)?;
@@ -1606,9 +2519,7 @@ impl ReplicationEngine {
         #[cfg(feature = "shacl-core")]
         let mut shacl_evaluations = prepared_shacl.enforce_evaluations;
 
-        // Captured before the write, under the guard, so it describes exactly
-        // the state this commit starts from. Skipped entirely when the caller
-        // defers the refresh — reading it can itself force a recompute.
+        // Capture diagnostics under the guard unless the caller defers their potentially costly refresh.
         let pending = checks.diagnostics.pending_diagnostics(|| {
             Ok(PendingDiagnostics {
                 previous: self.store.graph_diagnostics(graph)?,
@@ -1617,6 +2528,7 @@ impl ReplicationEngine {
         })?;
 
         let mut batch = self.store.new_batch();
+        let _receipt_guard = self.store.receipt_guard(&mutation_id);
         let mut vector_clock = self.store.get_vector_clock(graph)?;
         let graph_id = self.store.stage_graph(&mut batch, graph)?;
         let counter = self.store.next_counter(
@@ -1739,25 +2651,65 @@ impl ReplicationEngine {
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(&vector_clock)?)?;
+        let receipt = source_receipt(
+            graph,
+            ApplyPlan {
+                hints: render_hints.as_ref(),
+                diagnostics: checks.diagnostics,
+                id: mutation_id,
+                event_id: None,
+                request_digest,
+                topic: None,
+                publish_after: None,
+                topic_epoch: None,
+                topic_genesis: None,
+            },
+            &vector_clock,
+        )
+        .map_err(merge_update_error)?;
+        if self.store.mutation_receipt(&mutation_id)?.is_some() {
+            self.store.stage_receipt_update(&mut batch, &receipt)?;
+        } else if self.store.stage_receipt(&mut batch, &receipt)?.is_some() {
+            return Err(UpdateError::InvalidChangeSet(
+                "mutation receipt changed".to_owned(),
+            ));
+        }
+        self.store.stage_batch_receipt(
+            &mut batch,
+            &BatchReceiptLink {
+                graph: graph_id,
+                actor: self.actor,
+                counter,
+                id: mutation_id,
+            },
+        )?;
         self.store.commit(batch)?;
+        drop(_receipt_guard);
         #[cfg(feature = "shacl-core")]
-        let data_version = self.stamp_evaluations(graph, &mut shacl_evaluations)?;
+        let data_version = self
+            .stamp_evaluations(graph, &mut shacl_evaluations)
+            .map_err(|error| self.accepted_store(mutation_id, error))?;
+
+        drop(_commit_guard);
+        #[cfg(feature = "shacl-core")]
+        drop(binding_guard);
+        drop(_write_guard);
 
         if let Some(pending) = &pending {
             self.settle_diagnostics(graph, pending)
-                .map_err(UpdateError::Store)?;
+                .map_err(|error| self.accepted_store(mutation_id, error))?;
+            self.complete_diagnostics(mutation_id)
+                .map_err(|error| self.accepted_store(mutation_id, error))?;
         }
         #[cfg(feature = "shacl-core")]
         {
-            drop(_commit_guard);
-            drop(binding_guard);
-            let mut source_settled =
-                self.persist_shacl_evaluations_post_commit(graph, shacl_evaluations);
+            let mut source_settled = self.persist_shacl_post(graph, shacl_evaluations);
             if let (Some(work), Some(changes)) = (advisory_work, advisory_changes) {
-                source_settled &=
-                    self.settle_bindings_post_commit(graph, &changes, data_version, work);
+                source_settled &= self.settle_bindings_post(graph, &changes, data_version, work);
             }
             self.settle_shacl_graphs(&pending_graphs, (!source_settled).then_some(graph));
+            self.complete_shacl(mutation_id, source_settled)
+                .map_err(|error| self.accepted_store(mutation_id, error))?;
         }
 
         Ok(Batch {
@@ -1775,55 +2727,94 @@ impl ReplicationEngine {
         cx: &mut BatchTermCtx<'_>,
         terms: QuadTerms<'_>,
     ) -> crate::store::Result<EncodedQuad> {
+        // Replicated literal aliases keep their signed spelling but share the canonical quad.
+        let resolve = |cx: &mut BatchTermCtx<'_>, term: &EncodedTerm| match term.canonical() {
+            Some(canonical) => self.store.resolve_term_cached(cx, &canonical),
+            None => self.store.resolve_term_cached(cx, term),
+        };
         Ok(EncodedQuad {
             graph: terms.graph_id,
-            subject: self.store.resolve_term_cached(cx, terms.subject)?,
-            predicate: self.store.resolve_term_cached(cx, terms.predicate)?,
-            object: self.store.resolve_term_cached(cx, terms.object)?,
+            subject: resolve(cx, terms.subject)?,
+            predicate: resolve(cx, terms.predicate)?,
+            object: resolve(cx, terms.object)?,
         })
     }
 
-    /// Apply a causally ordered batch produced from an Irokle graph event.
-    /// **Call with the graph's write lock held.**
-    ///
-    /// Irokle actor sequences include genesis and topic-control operations, so
-    /// they are not contiguous over Craqle domain events. The Irokle DAG already
-    /// enforces causal delivery; this path intentionally bypasses Craqle's old
-    /// vector-clock gap buffering while preserving OR-Set add/remove semantics.
+    /// Apply an Irokle-ordered event under the graph write lock without requiring domain counters to be contiguous.
     #[cfg(all(test, feature = "shacl-core"))]
     pub(crate) fn apply_irokle_batch(&self, incoming: Batch) -> Result<MergeResult, MergeError> {
-        self.apply_irokle_batch_with_plan(&incoming, None, DiagnosticsMode::Immediate)
+        let digest = batch_digest(&incoming)?;
+        self.apply_irokle_plan(
+            &incoming,
+            ApplyPlan {
+                hints: None,
+                diagnostics: DiagnosticsMode::Immediate,
+                id: crate::sync::MutationId(digest),
+                event_id: None,
+                request_digest: digest,
+                topic: None,
+                publish_after: None,
+                topic_epoch: None,
+                topic_genesis: None,
+            },
+        )
     }
 
-    /// Merge a batch that reached this node outside irokle.
-    /// **Call with the graph's write lock held.**
-    ///
-    /// The ops are term-checked first, exactly as a replicated record is, so a
-    /// foreign transport cannot hand the store content it could only fail on.
+    /// Validate and merge an externally transported batch under the graph write lock.
+    /// Missing causal dependencies leave source state unchanged for transport retry.
     pub(crate) fn merge_batch(&self, incoming: &Batch) -> Result<MergeResult, MergeError> {
-        crate::sync::check_ops(&incoming.ops)
+        crate::sync::check_batch(incoming)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
-        self.apply_irokle_batch_with_plan(incoming, None, DiagnosticsMode::Immediate)
+        self.check_causal_base(incoming)?;
+        let digest = batch_digest(incoming)?;
+        self.apply_irokle_plan(
+            incoming,
+            ApplyPlan {
+                hints: None,
+                diagnostics: DiagnosticsMode::Immediate,
+                id: crate::sync::MutationId(digest),
+                event_id: None,
+                request_digest: digest,
+                topic: None,
+                publish_after: None,
+                topic_epoch: None,
+                topic_genesis: None,
+            },
+        )
     }
 
-    /// **Call with the graph's write lock held.** Every caller does, and so
-    /// does every writer of a graph tombstone, which is what makes the check
-    /// below atomic against a concurrent delete.
+    /// Reject a causally unready external batch while the graph write lock keeps the verdict valid.
+    fn check_causal_base(&self, incoming: &Batch) -> Result<(), MergeError> {
+        let identity = Dot {
+            actor: incoming.actor,
+            counter: incoming.counter,
+        };
+        // Counter zero marks a batch that carries no event of its own.
+        if incoming.counter > 0 && incoming.base_clock.contains(&identity) {
+            return Err(MergeError::InputRejected(format!(
+                "batch event {}:{} declares itself as its own dependency",
+                identity.actor, identity.counter
+            )));
+        }
+        let applied = self.store.get_vector_clock(&incoming.graph)?;
+        let missing = crate::sync::missing_dots(&incoming.base_clock, &applied);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(MergeError::MissingDependencies(missing))
+        }
+    }
+
+    /// Call with the graph write lock held to make tombstone checks atomic with delete.
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
-    fn apply_irokle_batch_with_plan(
+    fn apply_irokle_plan(
         &self,
         incoming: &Batch,
-        render_hints: Option<&TaggedRoCrateRenderHints>,
-        plan: DiagnosticsMode,
+        plan: ApplyPlan<'_>,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
-        // A deleted graph stays deleted. This is also the *local* write's apply
-        // path, which never passes through `CraqleNode::apply_irokle_record`,
-        // so without the check a write racing a delete re-creates the graph the
-        // delete just tombstoned — and the tombstone then drops every later
-        // replicated record for it, so replication can never repair the
-        // divergence.
+        // Reject both local and replicated writes after a permanent tombstone.
         if self.store.graph_tombstoned(graph)? {
             return Ok(MergeResult { applied: false });
         }
@@ -1833,10 +2824,7 @@ impl ReplicationEngine {
             self.store.create_graph(graph)?;
         }
 
-        // Guards the dedup gate through to the diagnostics refresh: the clock
-        // read that decides "already applied" must be the same clock the apply
-        // then advances, or a concurrent commit can make one batch apply twice
-        // or the clock lose an entry (G1, G2).
+        // Keep dedup, clock advancement, and diagnostics under one commit guard.
         #[cfg(feature = "shacl-core")]
         let (merged, binding_work, binding_changes, data_version, pending_graphs) = {
             let _commit_guard = self.store.graph_commit_guard(graph);
@@ -1856,7 +2844,7 @@ impl ReplicationEngine {
                 .as_ref()
                 .map(|_| batch_changes(self.store.as_ref(), incoming))
                 .transpose()?;
-            let merged = self.apply_irokle_guarded(incoming, render_hints, plan)?;
+            let merged = self.apply_irokle_guarded(incoming, plan)?;
             let data_version = merged
                 .applied
                 .then(|| self.store.graph_version_digest(graph))
@@ -1872,30 +2860,33 @@ impl ReplicationEngine {
         #[cfg(not(feature = "shacl-core"))]
         let merged = {
             let _commit_guard = self.store.graph_commit_guard(graph);
-            self.apply_irokle_guarded(incoming, render_hints, plan)?
+            self.apply_irokle_guarded(incoming, plan)?
         };
         #[cfg(feature = "shacl-core")]
         let source_settled = if merged.applied {
             if let (Some(work), Some(changes), Some(data_version)) =
                 (binding_work, binding_changes, data_version)
             {
-                self.settle_bindings_post_commit(graph, &changes, data_version, work)
+                self.settle_bindings_post(graph, &changes, data_version, work)
             } else {
                 true
             }
         } else {
-            self.settle_current_post_commit(graph)
+            self.settle_current_post(graph)
         };
         #[cfg(feature = "shacl-core")]
         self.settle_shacl_graphs(&pending_graphs, (!source_settled).then_some(graph));
+        #[cfg(feature = "shacl-core")]
+        if merged.applied {
+            self.complete_shacl(plan.id, source_settled)?;
+        }
         Ok(merged)
     }
 
     fn apply_irokle_guarded(
         &self,
         incoming: &Batch,
-        render_hints: Option<&TaggedRoCrateRenderHints>,
-        plan: DiagnosticsMode,
+        plan: ApplyPlan<'_>,
     ) -> Result<MergeResult, MergeError> {
         let graph = &incoming.graph;
 
@@ -1904,27 +2895,102 @@ impl ReplicationEngine {
             actor: incoming.actor,
             counter: incoming.counter,
         }) {
+            let receipt = crate::sync::MutationReceipt {
+                id: plan.id,
+                admission_sequence: 0,
+                graph: graph.clone(),
+                request_digest: plan.request_digest,
+                event_id: plan.event_id,
+                topic: plan.topic,
+                publish_after: plan.publish_after.cloned(),
+                topic_epoch: plan.topic_epoch,
+                topic_genesis: plan.topic_genesis,
+                search_token: None,
+                repair_graphs: vec![graph.clone()],
+                source: crate::sync::SourceOutcome::Duplicate,
+                persistence: crate::sync::PersistenceOutcome::Pending,
+                repairs: settled_repairs(),
+                source_version: clock_digest(&vector_clock)?,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            };
+            let _receipt_guard = self.store.receipt_guard(&plan.id);
+            let mut batch = self.store.new_batch();
+            match self.store.mutation_receipt(&plan.id)? {
+                None => self.store.stage_receipt(&mut batch, &receipt).map(drop)?,
+                // Another path already applied this prepared record, so it is finished.
+                Some(existing)
+                    if existing.source == crate::sync::SourceOutcome::Prepared
+                        && existing.event_id.is_some()
+                        && existing.event_id == receipt.event_id =>
+                {
+                    self.store.stage_receipt_update(&mut batch, &receipt)?;
+                }
+                // Any other receipt stored for this id is kept, even one of a reused id.
+                Some(_) => return Ok(MergeResult { applied: false }),
+            }
+            self.store.commit(batch)?;
             return Ok(MergeResult { applied: false });
         }
 
-        let pending = plan.pending_diagnostics(|| {
+        let pending = plan.diagnostics.pending_diagnostics(|| {
             Ok(PendingDiagnostics {
                 previous: self.store.graph_diagnostics(graph)?,
                 summary: crate::rules::summarize_ops(graph, &incoming.ops),
             })
         })?;
 
-        self.apply_single_batch(incoming, render_hints, &mut vector_clock)?;
+        self.apply_single_batch(ApplyBatch {
+            incoming,
+            clock: &mut vector_clock,
+            plan,
+        })?;
 
         if let Some(pending) = &pending {
             self.settle_diagnostics(graph, pending)?;
+            self.complete_diagnostics(plan.id)?;
         }
         Ok(MergeResult { applied: true })
+    }
+
+    fn complete_diagnostics(&self, id: crate::sync::MutationId) -> crate::store::Result<()> {
+        let Some(mut receipt) = self.store.mutation_receipt(&id)? else {
+            return Err(crate::store::StoreError::InvalidEncoding {
+                context: "mutation receipt",
+                message: "accepted source has no receipt".to_owned(),
+            });
+        };
+        receipt.repairs.diagnostics = crate::sync::RepairOutcome::Complete;
+        receipt.updated_unix_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        self.store.update_receipt(&receipt)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "shacl-core")]
+    fn complete_shacl(
+        &self,
+        id: crate::sync::MutationId,
+        settled: bool,
+    ) -> crate::store::Result<()> {
+        let Some(mut receipt) = self.store.mutation_receipt(&id)? else {
+            return Err(crate::store::StoreError::InvalidEncoding {
+                context: "mutation receipt",
+                message: "accepted source has no receipt".to_owned(),
+            });
+        };
+        receipt.repairs.shacl = if settled {
+            crate::sync::RepairOutcome::Complete
+        } else {
+            crate::sync::RepairOutcome::Failed(crate::CraqleErrorKind::Storage)
+        };
+        receipt.updated_unix_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        self.store.update_receipt(&receipt)?;
+        Ok(())
     }
 
     pub(crate) fn apply_irokle_record(
         &self,
         record: &irokle::reducer::EventRecord<crate::sync::CraqleGraphEvent>,
+        local: bool,
     ) -> Result<Option<MergeResult>, MergeError> {
         #[cfg(test)]
         if self.take_apply_failure() {
@@ -1936,32 +3002,70 @@ impl ReplicationEngine {
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
         mutation
             .map(|mutation| {
-                self.apply_irokle_batch_with_plan(
+                let mut prior = self.store.mutation_receipt(&mutation.mutation_id)?;
+                // A reused id is local receipt bookkeeping; the record still applies as data.
+                // Only this node publishes under its ids, so its later record is the prepared one.
+                let published = |receipt: &crate::sync::MutationReceipt| {
+                    local
+                        && receipt.publish_after.as_ref().is_some_and(|after| {
+                            after.get(&record.meta.actor_id) < record.meta.actor_seq
+                        })
+                };
+                if prior.as_ref().is_some_and(|receipt| {
+                    receipt.graph != mutation.batch.graph
+                        || match receipt.event_id {
+                            Some(event) => event != *mutation.event_id.as_bytes(),
+                            None => !published(receipt),
+                        }
+                }) {
+                    prior = None;
+                }
+                if prior.as_ref().is_some_and(|receipt| {
+                    receipt.source == crate::sync::SourceOutcome::Prepared
+                        && receipt.event_id.is_none()
+                }) {
+                    prior = Some(self.store.bind_receipt_event(
+                        &mutation.mutation_id,
+                        *mutation.event_id.as_bytes(),
+                    )?);
+                }
+                self.apply_irokle_plan(
                     &mutation.batch,
-                    mutation.render_hints.as_ref(),
-                    DiagnosticsMode::Immediate,
+                    ApplyPlan {
+                        hints: mutation.render_hints.as_ref(),
+                        diagnostics: DiagnosticsMode::Immediate,
+                        id: mutation.mutation_id,
+                        event_id: prior
+                            .as_ref()
+                            .and_then(|receipt| receipt.event_id)
+                            .or(Some(*mutation.event_id.as_bytes())),
+                        request_digest: prior
+                            .as_ref()
+                            .map_or(mutation.request_digest, |receipt| receipt.request_digest),
+                        topic: prior.as_ref().and_then(|receipt| receipt.topic),
+                        publish_after: prior
+                            .as_ref()
+                            .and_then(|receipt| receipt.publish_after.as_ref()),
+                        topic_epoch: prior.as_ref().and_then(|receipt| receipt.topic_epoch),
+                        topic_genesis: prior.as_ref().and_then(|receipt| receipt.topic_genesis),
+                    },
                 )
             })
             .transpose()
     }
 
-    /// Join a snapshot taken on another replica into local state.
-    /// **Call with the graph's write lock held.**
-    ///
-    /// State-based OR-Set join: a snapshot dot joins a quad's local dot set
-    /// only when the local graph clock does not already cover it, because a
-    /// covered dot the local quad lacks is a removal this node has already
-    /// seen. The graph clock then becomes the element-wise maximum.
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %snapshot.graph.as_str(), quad_count = snapshot.quads.len()))]
-    pub(crate) fn install_snapshot(
+    pub(crate) fn install_with_receipt(
         &self,
         snapshot: &GraphReplicaSnapshot,
-    ) -> Result<MergeResult, MergeError> {
+    ) -> Result<MergeReceipt, MergeError> {
         let graph = &snapshot.graph;
         crate::sync::check_snapshot(snapshot)
             .map_err(|error| MergeError::InputRejected(error.to_string()))?;
         if self.store.graph_tombstoned(graph)? {
-            return Ok(MergeResult { applied: false });
+            return Ok(MergeReceipt {
+                result: MergeResult { applied: false },
+                receipt: None,
+            });
         }
         // Self-guarding, so it must run before the commit guard is taken.
         if !self.store.contains_graph(graph)? {
@@ -1969,38 +3073,218 @@ impl ReplicationEngine {
         }
 
         #[cfg(feature = "shacl-core")]
-        let pending_graphs;
+        let repair_graphs = self.store.affected_shacl_graphs(graph)?;
+        #[cfg(not(feature = "shacl-core"))]
+        let repair_graphs = Vec::new();
+        let id = new_mutation();
+        let request_digest = snapshot_digest(snapshot)?;
+        let source_receipt = crate::sync::MutationReceipt {
+            id,
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest,
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: repair_graphs.clone(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: crate::sync::RepairState {
+                diagnostics: crate::sync::RepairOutcome::Pending,
+                #[cfg(feature = "shacl-core")]
+                shacl: crate::sync::RepairOutcome::Pending,
+                #[cfg(not(feature = "shacl-core"))]
+                shacl: crate::sync::RepairOutcome::NotRequired,
+                search: crate::sync::RepairOutcome::Pending,
+                query_view: crate::sync::RepairOutcome::Pending,
+            },
+            source_version: clock_digest(&snapshot.clock)?,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
         let applied = {
             let _commit_guard = self.store.graph_commit_guard(graph);
-            #[cfg(feature = "shacl-core")]
-            {
-                pending_graphs = self.store.affected_shacl_graphs(graph)?;
-            }
-            self.join_snapshot(snapshot)?
+            self.join_snapshot(snapshot, Some(&source_receipt))?
         };
 
         #[cfg(feature = "shacl-core")]
         if applied {
-            let settled = self.settle_current_post_commit(graph);
-            self.settle_shacl_graphs(&pending_graphs, (!settled).then_some(graph));
+            let settled = self.settle_current_post(graph);
+            self.settle_shacl_graphs(&repair_graphs, (!settled).then_some(graph));
+            if let Err(error) = self.complete_shacl(id, settled) {
+                let Some(receipt) = self.store.mutation_receipt(&id)? else {
+                    return Err(MergeError::Store(error));
+                };
+                return Err(MergeError::Accepted {
+                    receipt: Box::new(receipt),
+                    error_kind: error.kind(),
+                    reason: error.to_string(),
+                });
+            }
         }
-        Ok(MergeResult { applied })
+        let receipt = if applied {
+            self.store.mutation_receipt(&id)?
+        } else {
+            None
+        };
+        Ok(MergeReceipt {
+            result: MergeResult { applied },
+            receipt,
+        })
+    }
+
+    pub(crate) fn preview_repair(
+        &self,
+        request: &crate::sync::RepairRequest,
+    ) -> Result<crate::sync::RepairReport, MergeError> {
+        crate::sync::check_snapshot(&request.authoritative)
+            .map_err(|error| MergeError::InputRejected(error.to_string()))?;
+        let graph = &request.authoritative.graph;
+        let local = self.store.graph_snapshot_bounded(
+            graph,
+            SnapshotLimits {
+                max_rows: 1_048_576,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )?;
+        let before_digest = snapshot_digest(&local)?;
+        let authority_digest = snapshot_digest(&request.authoritative)?;
+        if let crate::sync::RepairAuthority::HealthySnapshot { digest, .. } = &request.authority
+            && *digest != authority_digest
+        {
+            return Err(MergeError::InputRejected(
+                "healthy snapshot digest does not match its authoritative state".to_owned(),
+            ));
+        }
+        let authoritative = canonical_snapshot(&request.authoritative);
+        let tombstoned = self.store.graph_tombstoned(graph)?;
+        let result = if tombstoned {
+            crate::sync::RepairResult::Tombstoned
+        } else if local == *authoritative {
+            crate::sync::RepairResult::Exact
+        } else if request.mode == crate::sync::RepairMode::Apply
+            && request
+                .backup
+                .as_ref()
+                .is_none_or(|backup| backup.source_revision != before_digest)
+        {
+            crate::sync::RepairResult::BackupRequired
+        } else {
+            crate::sync::RepairResult::Differs
+        };
+        let diff = (local != *authoritative).then(|| crate::sync::RepairDiff {
+            unresolved: crate::sync::missing_dots(&authoritative.clock, &local.clock),
+            local,
+            authoritative: authoritative.into_owned(),
+        });
+        Ok(crate::sync::RepairReport {
+            audit: crate::sync::RepairAudit {
+                id: request.id,
+                graph: graph.clone(),
+                mode: request.mode,
+                authority: request.authority.clone(),
+                before_digest,
+                after_digest: None,
+                backup: request.backup.clone(),
+                result,
+                updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+            },
+            diff,
+        })
+    }
+
+    pub(crate) fn reconcile_snapshot(
+        &self,
+        request: &crate::sync::RepairRequest,
+    ) -> Result<crate::sync::RepairReport, MergeError> {
+        let mut report = self.preview_repair(request)?;
+        if request.mode == crate::sync::RepairMode::Apply
+            && report.audit.result == crate::sync::RepairResult::Tombstoned
+        {
+            return Err(MergeError::InputRejected(
+                "live authoritative snapshot cannot replace a permanently deleted graph".to_owned(),
+            ));
+        }
+        if request.mode == crate::sync::RepairMode::Apply
+            && matches!(
+                report.audit.result,
+                crate::sync::RepairResult::Differs | crate::sync::RepairResult::BackupRequired
+            )
+        {
+            report.audit.backup = Some(self.store.backup_snapshot(&report.audit.graph)?);
+            report.audit.result = crate::sync::RepairResult::Applied;
+            let authoritative = canonical_snapshot(&request.authoritative);
+            report.audit.after_digest = Some(snapshot_digest(&authoritative)?);
+            self.store.replace_snapshot(&authoritative, &report.audit)?;
+            let _write = self.store.graph_write_guard(&report.audit.graph);
+            let _commit = self.store.graph_commit_guard(&report.audit.graph);
+            self.recompute_graph_diagnostics(&report.audit.graph)?;
+            return Ok(report);
+        }
+        self.record_repair(&report.audit)?;
+        Ok(report)
+    }
+
+    pub(crate) fn record_repair(
+        &self,
+        audit: &crate::sync::RepairAudit,
+    ) -> crate::store::Result<()> {
+        let mut batch = self.store.new_batch();
+        self.store.stage_repair_audit(&mut batch, audit)?;
+        self.store.commit(batch)
+    }
+
+    pub(crate) fn record_history(
+        &self,
+        failure: crate::sync::HistoryFailure,
+        result: crate::sync::RepairResult,
+    ) -> Result<crate::sync::RepairReport, MergeError> {
+        if !matches!(
+            result,
+            crate::sync::RepairResult::HistoryMissing | crate::sync::RepairResult::Tombstoned
+        ) {
+            return Err(MergeError::InputRejected(
+                "history audit result must be missing or tombstoned".to_owned(),
+            ));
+        }
+        let local = self.store.graph_snapshot_bounded(
+            &failure.graph,
+            SnapshotLimits {
+                max_rows: 1_048_576,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )?;
+        let audit = crate::sync::RepairAudit {
+            id: failure.id,
+            graph: failure.graph,
+            mode: failure.mode,
+            authority: failure.authority,
+            before_digest: snapshot_digest(&local)?,
+            after_digest: None,
+            backup: None,
+            result,
+            updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        };
+        self.record_repair(&audit)?;
+        Ok(crate::sync::RepairReport { audit, diff: None })
     }
 
     /// Write the OR-Set join of local state and `snapshot`, reporting whether
     /// anything changed. **Call with the graph commit guard held.**
-    fn join_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<bool, MergeError> {
+    fn join_snapshot(
+        &self,
+        snapshot: &GraphReplicaSnapshot,
+        receipt: Option<&crate::sync::MutationReceipt>,
+    ) -> Result<bool, MergeError> {
         let graph = &snapshot.graph;
-        // The causal context of this node's state, read before the join: it
-        // decides which snapshot dots are new and which are already-seen
-        // removals.
-        let seen = self.store.get_vector_clock(graph)?;
-        let mut changed = false;
-        for (actor, counter) in &snapshot.clock.0 {
-            changed |= seen.0.get(actor).is_none_or(|local| local < counter);
-        }
-        let mut clock = seen.clone();
+        let snapshot = &*canonical_snapshot(snapshot);
+        // An absent dot covered by the other pre-merge clock is an observed removal.
+        let local = self.store.graph_snapshot(graph)?;
+        let mut clock = local.clock.clone();
         clock.merge(&snapshot.clock);
+        let mut changed = clock != local.clock;
 
         let mut batch = self.store.new_batch();
         let mut affected_subjects = HashSet::new();
@@ -2011,29 +3295,65 @@ impl ReplicationEngine {
         };
         self.store.seed_term_cache(
             &mut cx,
-            snapshot
+            local
                 .quads
                 .iter()
+                .chain(&snapshot.quads)
                 .flat_map(|quad| [&quad.subject, &quad.predicate, &quad.object]),
         )?;
         let graph_id = self
             .store
             .resolve_term(&EncodedTerm::from_named_node(&graph.0))?;
 
-        for state in &snapshot.quads {
+        for (terms, (here, there)) in join_union(&local, snapshot) {
+            let joined = join_dots(here, there, (&local.clock, &snapshot.clock));
+            let dropped = here
+                .iter()
+                .copied()
+                .filter(|dot| !joined.contains(dot))
+                .collect::<Vec<_>>();
+            let added = joined
+                .iter()
+                .copied()
+                .filter(|dot| !here.contains(dot))
+                .collect::<Vec<_>>();
+            if dropped.is_empty() && added.is_empty() {
+                continue;
+            }
+            changed = true;
             let quad = self.resolve_quad(
                 &mut cx,
                 QuadTerms {
                     graph_id,
-                    subject: &state.subject,
-                    predicate: &state.predicate,
-                    object: &state.object,
+                    subject: terms.0,
+                    predicate: terms.1,
+                    object: terms.2,
                 },
             )?;
-            for dot in state.dots.iter().filter(|dot| !seen.contains(dot)) {
-                changed |= self
-                    .store
+            // Adds first: a quad the join keeps must not look removed in
+            // between, so the derived state sees one liveness transition.
+            for dot in &added {
+                self.store
                     .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+            }
+            if !dropped.is_empty() {
+                let mut witnessed = VectorClock::new();
+                for dot in &dropped {
+                    witnessed.advance(dot.actor, dot.counter);
+                }
+                self.store.remove_quad(
+                    cx.batch,
+                    QuadRemove {
+                        quad,
+                        witnessed: &witnessed,
+                    },
+                )?;
+                // A witnessed clock covers whole counter ranges, so restore any
+                // kept dot it took with it.
+                for dot in joined.iter().filter(|dot| witnessed.contains(dot)) {
+                    self.store
+                        .insert_quad(cx.batch, QuadAdd { quad, dot: *dot })?;
+                }
             }
             affected_subjects.insert(quad.subject);
         }
@@ -2061,19 +3381,50 @@ impl ReplicationEngine {
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(&clock)?)?;
+        let mut staged_receipt = receipt.cloned();
+        if affected_subjects.is_empty()
+            && let Some(receipt) = &mut staged_receipt
+        {
+            receipt.repairs.search = crate::sync::RepairOutcome::NotRequired;
+        }
+        let _receipt_guard = staged_receipt
+            .as_ref()
+            .map(|receipt| self.store.receipt_guard(&receipt.id));
+        if let Some(receipt) = &staged_receipt
+            && self.store.stage_receipt(&mut batch, receipt)?.is_some()
+        {
+            return Err(MergeError::Store(crate::store::StoreError::ReceiptConflict));
+        }
         self.store.commit(batch)?;
-        self.recompute_graph_diagnostics(graph)?;
+        drop(_receipt_guard);
+        if let Err(error) = self.recompute_graph_diagnostics(graph) {
+            if let Some(receipt) = staged_receipt
+                .as_ref()
+                .and_then(|receipt| self.store.mutation_receipt(&receipt.id).ok().flatten())
+            {
+                return Err(MergeError::Accepted {
+                    receipt: Box::new(receipt),
+                    error_kind: error.kind(),
+                    reason: error.to_string(),
+                });
+            }
+            return Err(MergeError::Store(error));
+        }
+        if let Some(receipt) = &staged_receipt {
+            self.complete_diagnostics(receipt.id)?;
+        }
         Ok(true)
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %incoming.graph.as_str(), op_count = incoming.ops.len()))]
-    fn apply_single_batch(
-        &self,
-        incoming: &Batch,
-        render_hints: Option<&TaggedRoCrateRenderHints>,
-        vector_clock: &mut VectorClock,
-    ) -> Result<(), MergeError> {
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %apply.incoming.graph.as_str(), op_count = apply.incoming.ops.len()))]
+    fn apply_single_batch(&self, apply: ApplyBatch<'_>) -> Result<(), MergeError> {
+        let ApplyBatch {
+            incoming,
+            clock: vector_clock,
+            plan,
+        } = apply;
         let graph = &incoming.graph;
+        let _receipt_guard = self.store.receipt_guard(&plan.id);
         let mut batch = self.store.new_batch();
         let mut affected_subjects = HashSet::new();
         let mut term_cache = HashMap::new();
@@ -2162,38 +3513,60 @@ impl ReplicationEngine {
                 subjects: &affected_subjects,
             },
         )?;
-        if let Some(render_hints) = render_hints {
+        if let Some(render_hints) = plan.hints {
             self.store
                 .stage_graph_context(&mut batch, graph_id, render_hints)?;
         }
         #[cfg(feature = "shacl-core")]
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(vector_clock)?)?;
+        let receipt = source_receipt(graph, plan, vector_clock)?;
+        let existing = self.store.mutation_receipt(&plan.id)?;
+        if let Some(existing) = existing.as_ref().filter(|existing| {
+            existing.graph != receipt.graph
+                || existing.event_id != receipt.event_id
+                || existing.request_digest != receipt.request_digest
+                || existing.source != crate::sync::SourceOutcome::Prepared
+        }) {
+            // Receipts are local, so every order of arrival applies the same data.
+            tracing::warn!(
+                mutation = ?plan.id,
+                receipt_event = ?existing.event_id,
+                "kept the first receipt of a reused mutation id",
+            );
+            self.store.commit(batch)?;
+            return Ok(());
+        }
+        if existing.is_some() {
+            self.store.stage_receipt_update(&mut batch, &receipt)?;
+        } else if self.store.stage_receipt(&mut batch, &receipt)?.is_some() {
+            return Err(MergeError::Store(
+                crate::store::StoreError::InvalidEncoding {
+                    context: "mutation receipt",
+                    message: "receipt exists without applied source clock".to_owned(),
+                },
+            ));
+        }
+        self.store.stage_batch_receipt(
+            &mut batch,
+            &BatchReceiptLink {
+                graph: graph_id,
+                actor: incoming.actor,
+                counter: incoming.counter,
+                id: plan.id,
+            },
+        )?;
         self.store.commit(batch)?;
         Ok(())
     }
 
-    /// Bring the persisted diagnostics record back in step with the state the
-    /// commit just produced. **Call with the graph commit guard held.**
-    ///
-    /// Re-stamps the previous verdict when the write cannot have moved the orphan
-    /// set; otherwise recomputes.
-    ///
-    /// Validation success is not an orphan verdict; only the dependency summary
-    /// proves when the previous set remains exact.
+    /// Settle diagnostics under the graph commit guard, restamping only when reachability is unchanged.
     fn settle_diagnostics(
         &self,
         graph: &GraphId,
         pending: &PendingDiagnostics,
     ) -> crate::store::Result<()> {
-        // Case 1. `orphaned_data_entities` reads exactly two triple shapes:
-        // `?s rdf:type schema:Dataset|schema:MediaObject` (which entities count
-        // as data entities) and `?s schema:hasPart ?o` (which adds to that set
-        // and forms every edge of the reachability graph). Nothing else in the
-        // graph can affect it. `touches_reachability` is set by exactly those
-        // two shapes, so a write that leaves it clear provably leaves the orphan
-        // set identical — the previous verdict is still exact and only needs
-        // re-stamping so its clock tag matches the new state (G6).
+        // Only data-entity type and `hasPart` shapes can change the orphan set.
         if !pending.summary.touches_reachability() {
             return self.publish_graph_diagnostics(graph, &pending.previous);
         }
@@ -2202,7 +3575,7 @@ impl ReplicationEngine {
         self.recompute_graph_diagnostics(graph)
     }
 
-    /// Recompute the orphan set from post-write state and publish it (G6, G7).
+    /// Recompute and publish the post-write orphan set.
     fn recompute_graph_diagnostics(&self, graph: &GraphId) -> crate::store::Result<()> {
         // The commit already made the stored record's clock tag stale, so this
         // read recomputes. It does not persist: this is the record's writer.
@@ -2210,16 +3583,8 @@ impl ReplicationEngine {
         self.publish_graph_diagnostics(graph, &current)
     }
 
-    /// Persist `current` as the graph's orphan record and re-queue for search
-    /// every entity whose orphan status differs from the last persisted set.
-    ///
-    /// The baseline is the *persisted* record, never a caller's pre-write read:
-    /// a deferred bulk write that has committed but not yet rebuilt leaves that
-    /// read already reflecting flips the index has never seen, and persisting it
-    /// would strand them (G7).
-    ///
-    /// Re-queue first, record second: they are separate commits, and a crash
-    /// between them must leave the older baseline so the next rebuild re-queues.
+    /// Re-queue orphan changes against the persisted baseline before publishing current diagnostics.
+    /// A crash between those commits retains the older baseline for safe replay.
     fn publish_graph_diagnostics(
         &self,
         graph: &GraphId,
@@ -2339,11 +3704,13 @@ fn batch_changes(
                 ..
             } => (subject, predicate, object),
         };
+        let [subject, predicate, object] = [subject, predicate, object]
+            .map(|term| term.canonical().unwrap_or_else(|| term.clone()));
         let key = (subject.clone(), predicate.clone(), object.clone());
         let index = if let Some(index) = indexes.get(&key) {
             *index
         } else {
-            let dots = store.quad_dots(&batch.graph, subject, predicate, object)?;
+            let dots = store.quad_dots(&batch.graph, &subject, &predicate, &object)?;
             let index = quads.len();
             quads.push(BatchQuad {
                 subject: subject.clone(),
@@ -2399,7 +3766,6 @@ fn map_store_error(error: crate::CraqleError) -> crate::store::StoreError {
     }
 }
 
-#[cfg(feature = "shacl-core")]
 fn clock_digest(clock: &VectorClock) -> crate::store::Result<[u8; 32]> {
     Ok(*blake3::hash(&postcard::to_allocvec(clock)?).as_bytes())
 }
@@ -2428,10 +3794,102 @@ fn map_update_error(error: crate::CraqleError) -> UpdateError {
     }
 }
 
-fn update_error_from_merge(error: MergeError) -> UpdateError {
+type TermTriple<'a> = (&'a EncodedTerm, &'a EncodedTerm, &'a EncodedTerm);
+
+/// Merges literal aliases into their canonical quads, like applying the same events would.
+fn canonical_snapshot(snapshot: &GraphReplicaSnapshot) -> Cow<'_, GraphReplicaSnapshot> {
+    fn terms(quad: &SnapshotQuadState) -> [&EncodedTerm; 3] {
+        [&quad.subject, &quad.predicate, &quad.object]
+    }
+    let aliased =
+        |quad: &SnapshotQuadState| terms(quad).iter().any(|term| term.canonical().is_some());
+    if !snapshot.quads.iter().any(aliased) {
+        return Cow::Borrowed(snapshot);
+    }
+    let mut quads: BTreeMap<[EncodedTerm; 3], Vec<Dot>> = BTreeMap::new();
+    for quad in &snapshot.quads {
+        let key = terms(quad).map(|term| term.canonical().unwrap_or_else(|| term.clone()));
+        quads.entry(key).or_default().extend(&quad.dots);
+    }
+    let quads = quads
+        .into_iter()
+        .map(|([subject, predicate, object], mut dots)| {
+            dots.sort_unstable_by_key(|dot| (dot.actor, dot.counter));
+            dots.dedup();
+            SnapshotQuadState {
+                subject,
+                predicate,
+                object,
+                dots,
+            }
+        })
+        .collect();
+    Cow::Owned(GraphReplicaSnapshot {
+        graph: snapshot.graph.clone(),
+        clock: snapshot.clock.clone(),
+        quads,
+    })
+}
+
+/// Include unilateral quads so the opposite clock can prove an observed removal.
+fn join_union<'a>(
+    local: &'a GraphReplicaSnapshot,
+    remote: &'a GraphReplicaSnapshot,
+) -> BTreeMap<TermTriple<'a>, (&'a [Dot], &'a [Dot])> {
+    let mut rows: BTreeMap<TermTriple<'a>, (&'a [Dot], &'a [Dot])> = BTreeMap::new();
+    for quad in &local.quads {
+        rows.insert(
+            (&quad.subject, &quad.predicate, &quad.object),
+            (&quad.dots, &[]),
+        );
+    }
+    for quad in &remote.quads {
+        rows.entry((&quad.subject, &quad.predicate, &quad.object))
+            .or_insert((&[], &[]))
+            .1 = &quad.dots;
+    }
+    rows
+}
+
+/// Dots the OR-Set join keeps for one quad: the dots both sides hold, plus
+/// each side's dots the other side's pre-merge context does not cover.
+fn join_dots(local: &[Dot], remote: &[Dot], contexts: (&VectorClock, &VectorClock)) -> Vec<Dot> {
+    let (here, there) = contexts;
+    let mut joined = local
+        .iter()
+        .copied()
+        .filter(|dot| remote.contains(dot) || !there.contains(dot))
+        .collect::<Vec<_>>();
+    joined.extend(
+        remote
+            .iter()
+            .copied()
+            .filter(|dot| !local.contains(dot) && !here.contains(dot)),
+    );
+    joined
+}
+
+fn snapshot_digest(snapshot: &GraphReplicaSnapshot) -> Result<[u8; 32], MergeError> {
+    let bytes = postcard::to_allocvec(snapshot)
+        .map_err(crate::store::StoreError::from)
+        .map_err(MergeError::Store)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+fn merge_update_error(error: MergeError) -> UpdateError {
     match error {
         MergeError::Store(error) => UpdateError::Store(error),
         MergeError::InputRejected(message) => UpdateError::InvalidChangeSet(message),
+        MergeError::MissingDependencies(_) => UpdateError::InvalidChangeSet(error.to_string()),
+        MergeError::Accepted {
+            receipt,
+            error_kind,
+            reason,
+        } => UpdateError::Accepted {
+            receipt,
+            error_kind,
+            reason,
+        },
     }
 }
 
@@ -2452,6 +3910,105 @@ mod tests {
         (store, engine)
     }
 
+    fn settled_receipt(
+        store: &GraphStore,
+        graph: &GraphId,
+        persistence: crate::sync::PersistenceOutcome,
+    ) -> crate::sync::MutationReceipt {
+        crate::sync::MutationReceipt {
+            id: crate::sync::MutationId::new(),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: [7; 32],
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: crate::sync::SourceOutcome::Applied,
+            persistence,
+            repairs: settled_repairs(),
+            source_version: store.graph_version_digest(graph).unwrap(),
+            updated_unix_nanos: 1,
+        }
+    }
+
+    fn store_receipt(store: &GraphStore, receipt: &crate::sync::MutationReceipt) {
+        let _guard = store.receipt_guard(&receipt.id);
+        let mut batch = store.new_batch();
+        assert!(store.stage_receipt(&mut batch, receipt).unwrap().is_none());
+        store.commit(batch).unwrap();
+        store.persist_receipts().unwrap();
+    }
+
+    #[test]
+    fn status_skips_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let graph = GraphId::new("urn:test:receipt-status-work");
+        store.create_graph(&graph).unwrap();
+        let receipt = settled_receipt(&store, &graph, store.persistence_outcome());
+        store_receipt(&store, &receipt);
+        let stored = store.mutation_receipt(&receipt.id).unwrap().unwrap();
+        let lookup = crate::sync::MutationLookup {
+            graph,
+            id: stored.id,
+            admission_sequence: Some(stored.admission_sequence),
+        };
+        let before = store.receipt_work();
+
+        assert!(matches!(
+            engine.mutation_status(&lookup).unwrap(),
+            crate::sync::MutationStatus::Known(_)
+        ));
+        assert!(matches!(
+            engine.mutation_status(&lookup).unwrap(),
+            crate::sync::MutationStatus::Known(_)
+        ));
+
+        let after = store.receipt_work();
+        assert_eq!(after.writes, before.writes);
+        assert_eq!(after.persists, before.persists);
+    }
+
+    #[test]
+    fn persist_writes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, engine) = engine_at(dir.path());
+        let graph = GraphId::new("urn:test:receipt-persist-work");
+        store.create_graph(&graph).unwrap();
+        let receipt = settled_receipt(&store, &graph, crate::sync::PersistenceOutcome::Pending);
+        store_receipt(&store, &receipt);
+        let before = store.receipt_work();
+
+        engine.mark_persisted(&receipt.id).unwrap().unwrap();
+
+        let after = store.receipt_work();
+        assert_eq!(after.writes - before.writes, 1);
+        assert_eq!(after.persists - before.persists, 1);
+    }
+
+    #[test]
+    fn store_locks_isolate() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_a = Arc::new(GraphStore::open(dir_a.path()).unwrap());
+        let store_b = Arc::new(GraphStore::open(dir_b.path()).unwrap());
+        let graph = GraphId::new("urn:test:store-lock-isolation");
+        let held = store_a.graph_write_guard(&graph);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other_graph = graph.clone();
+        std::thread::spawn(move || {
+            let _guard = store_b.graph_write_guard(&other_graph);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(180))
+            .expect("an unrelated store was blocked by the same graph IRI");
+        drop(held);
+    }
+
     fn pending_engine(
         dir: &std::path::Path,
         policy: ShaclWritePolicy,
@@ -2461,7 +4018,7 @@ mod tests {
         let shapes = GraphId::new("urn:test:pending-shapes");
         let focus = EncodedTerm("<urn:test:pending-focus>".to_owned());
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -2472,7 +4029,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -2581,12 +4138,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_queue_replay_survives_restart() {
+    fn replay_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, engine) = engine_at(dir.path());
             queued_graphs(&store, 5);
-            let outcome = engine.replay_pending_bindings_bounded(2, None).unwrap();
+            let outcome = engine.replay_bindings_bounded(2, None).unwrap();
             assert_eq!(outcome.statistics.pending_queue_entries_scanned, 2);
             assert_eq!(outcome.statistics.graphs_settled, 2);
             assert_eq!(outcome.statistics.reports_produced, 2);
@@ -2596,9 +4153,7 @@ mod tests {
         }
 
         let (store, engine) = engine_at(dir.path());
-        let outcome = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let outcome = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(outcome.statistics.graphs_settled, 3);
         assert_eq!(outcome.statistics.reports_produced, 3);
         assert!(!outcome.budget_exhausted);
@@ -2606,15 +4161,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_continues_after_one_graph_fails() {
+    fn replay_isolates_failures() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine) = engine_at(dir.path());
         queued_graphs(&store, 3);
-        engine.arm_settle_failure_after(1);
+        engine.arm_settle_after(1);
 
-        let outcome = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let outcome = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.statistics.graphs_settled, 2);
         assert_eq!(outcome.statistics.reports_produced, 2);
@@ -2628,21 +4181,17 @@ mod tests {
             crate::ShaclValidationState::Pending
         );
 
-        let retry = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let retry = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(retry.statistics.graphs_settled, 1);
         assert_eq!(retry.statistics.reports_produced, 1);
         assert_eq!(store.pending_shacl_count().unwrap(), 0);
     }
 
     #[test]
-    fn empty_queue_replay_does_no_graph_work() {
+    fn empty_replay_idle() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine) = engine_at(dir.path());
-        let outcome = engine
-            .replay_pending_bindings_bounded(usize::MAX, None)
-            .unwrap();
+        let outcome = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
         assert_eq!(outcome.statistics.pending_queue_entries_scanned, 0);
         assert_eq!(outcome.statistics.graphs_settled, 0);
         assert_eq!(outcome.statistics.reports_produced, 0);
@@ -2703,7 +4252,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_local_settlement_failures_stay_pending_across_restart() {
+    fn settlement_debt_survives() {
         for policy in [ShaclWritePolicy::Enforce, ShaclWritePolicy::Advisory] {
             let dir = tempfile::tempdir().unwrap();
             let (data, snapshot) = {
@@ -2737,9 +4286,7 @@ mod tests {
             };
 
             let (store, engine) = engine_at(dir.path());
-            let replay = engine
-                .replay_pending_bindings_bounded(usize::MAX, None)
-                .unwrap();
+            let replay = engine.replay_bindings_bounded(usize::MAX, None).unwrap();
             assert_eq!(replay.statistics.graphs_settled, 1);
             assert_eq!(store.graph_snapshot(&data).unwrap(), snapshot);
             assert_eq!(
@@ -2751,14 +4298,14 @@ mod tests {
     }
 
     #[test]
-    fn affected_graph_settlement_failure_does_not_reject_shape_write() {
+    fn settlement_preserves_shapes() {
         let dir = tempfile::tempdir().unwrap();
         let (store, engine, data, binding) = pending_engine(dir.path(), ShaclWritePolicy::Advisory);
         engine.replay_pending_bindings().unwrap();
         engine.arm_settle_failure();
         let shapes = binding.shapes_graph;
         let batch = engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![MaterializedQuadChange::Insert {
                     graph: shapes.clone(),
@@ -2817,7 +4364,7 @@ mod tests {
     }
 
     #[test]
-    fn open_can_defer_and_resume_pending_queue() {
+    fn open_defers_replay() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
         let data = {
@@ -2856,7 +4403,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_open_has_zero_pending_startup_work() {
+    fn empty_startup_idle() {
         let dir = tempfile::tempdir().unwrap();
         let node = crate::CraqleNode::open(dir.path()).unwrap();
         let startup = node.startup_pending_replay();
@@ -2867,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_reopen_does_not_scan_binding_records() {
+    fn healthy_open_lazy() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
         {
@@ -2914,7 +4461,7 @@ mod tests {
         receiver.replay_pending_bindings().unwrap();
         let shapes = GraphId::new("urn:test:pending-shapes");
         let batch = sender
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![MaterializedQuadChange::Insert {
                     graph: shapes.clone(),
@@ -2962,7 +4509,7 @@ mod tests {
             receiver.replay_pending_bindings().unwrap();
             let shapes = GraphId::new("urn:test:pending-shapes");
             let batch = sender
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     &shapes,
                     vec![
                         MaterializedQuadChange::Insert {
@@ -3047,7 +4594,7 @@ mod tests {
         let before = store.graph_version_digest(&data).unwrap();
 
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -3076,7 +4623,7 @@ mod tests {
         let before = (
             store.graph_snapshot(&data).unwrap(),
             store.get_vector_clock(&data).unwrap(),
-            store.query_index_status_fast().unwrap(),
+            store.index_status_fast().unwrap(),
             store.shacl_binding_statuses(&data).unwrap(),
         );
 
@@ -3106,7 +4653,7 @@ mod tests {
 
         assert_eq!(store.graph_snapshot(&data).unwrap(), before.0);
         assert_eq!(store.get_vector_clock(&data).unwrap(), before.1);
-        assert_eq!(store.query_index_status_fast().unwrap(), before.2);
+        assert_eq!(store.index_status_fast().unwrap(), before.2);
         assert_eq!(store.shacl_binding_statuses(&data).unwrap(), before.3);
     }
 
@@ -3118,7 +4665,7 @@ mod tests {
         let shape = EncodedTerm("<urn:test:pending-shape>".to_owned());
         let property = EncodedTerm("<urn:test:pending-property>".to_owned());
         setup
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -3155,7 +4702,7 @@ mod tests {
             )
             .unwrap();
         setup
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -3188,7 +4735,7 @@ mod tests {
         let before = (
             store.graph_snapshot(&data).unwrap(),
             store.get_vector_clock(&data).unwrap(),
-            store.query_index_status_fast().unwrap(),
+            store.index_status_fast().unwrap(),
             store.shacl_binding_statuses(&data).unwrap(),
         );
 
@@ -3207,7 +4754,7 @@ mod tests {
 
         assert_eq!(store.graph_snapshot(&data).unwrap(), before.0);
         assert_eq!(store.get_vector_clock(&data).unwrap(), before.1);
-        assert_eq!(store.query_index_status_fast().unwrap(), before.2);
+        assert_eq!(store.index_status_fast().unwrap(), before.2);
         assert_eq!(store.shacl_binding_statuses(&data).unwrap(), before.3);
         assert!(store.drain_fts_queue(usize::MAX).unwrap().is_empty());
         assert!(sync.graph_topic_id(&store, &data).unwrap().is_none());
@@ -3228,7 +4775,7 @@ mod tests {
         let imported = GraphId::new("urn:test:arrive-import");
         let focus = EncodedTerm("<urn:test:arrive-focus>".to_owned());
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -3239,7 +4786,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &root,
                 vec![MaterializedQuadChange::Insert {
                     graph: root.clone(),
@@ -3295,7 +4842,7 @@ mod tests {
         assert_eq!(store.pending_shacl_graphs().unwrap(), vec![data.clone()]);
 
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &imported,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -3337,7 +4884,7 @@ mod tests {
         let focus = EncodedTerm("<urn:test:stale-deps-focus>".to_owned());
         let imports = EncodedTerm("<http://www.w3.org/2002/07/owl#imports>".to_owned());
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -3349,7 +4896,7 @@ mod tests {
             .unwrap();
         for (graph, import) in [(&root, &first), (&first, &nested)] {
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     graph,
                     vec![MaterializedQuadChange::Insert {
                         graph: graph.clone(),
@@ -3362,7 +4909,7 @@ mod tests {
         }
         let old_nested = store.graph_version_digest(&nested).unwrap();
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &nested,
                 vec![MaterializedQuadChange::Insert {
                     graph: nested.clone(),
@@ -3447,7 +4994,7 @@ mod tests {
         );
 
         engine
-            .local_apply_changes_bypassing_structural_rules(
+            .apply_changes_unchecked(
                 &second,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -3485,7 +5032,7 @@ mod tests {
             let shapes = if imported { &import } else { &root };
             let focus = EncodedTerm("<urn:test:error-focus>".to_owned());
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     &data,
                     vec![MaterializedQuadChange::Insert {
                         graph: data.clone(),
@@ -3497,7 +5044,7 @@ mod tests {
                 .unwrap();
             if imported {
                 engine
-                    .local_apply_changes_bypassing_structural_rules(
+                    .apply_changes_unchecked(
                         &root,
                         vec![MaterializedQuadChange::Insert {
                             graph: root.clone(),
@@ -3511,7 +5058,7 @@ mod tests {
                     .unwrap();
             }
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     shapes,
                     vec![
                         MaterializedQuadChange::Insert {
@@ -3579,7 +5126,7 @@ mod tests {
             engine.replay_pending_bindings().unwrap();
 
             engine
-                .local_apply_changes_bypassing_structural_rules(
+                .apply_changes_unchecked(
                     shapes,
                     vec![MaterializedQuadChange::Insert {
                         graph: shapes.clone(),

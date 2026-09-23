@@ -1,5 +1,15 @@
+//! Bounds cached entries and maintains their recency order.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
+use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::mem::size_of;
+
+/// Conservative allocator, control-byte, and indirect handle reserve per entry.
+const ENTRY_RESERVE: usize = 4 * size_of::<usize>();
+const ALLOCATION_RESERVE: usize = 2 * size_of::<usize>();
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -9,24 +19,34 @@ pub(crate) struct CacheStatistics {
     pub(crate) hits: u64,
     pub(crate) misses: u64,
     pub(crate) evictions: u64,
+    /// Keys the removal predicate was asked about.
+    pub(crate) inspections: u64,
+    /// Times the recency order was rebuilt and sorted.
+    pub(crate) compactions: u64,
+    /// Times the storage was shrunk to fit, each a full table rebuild.
+    pub(crate) shrinks: u64,
 }
 
 struct CacheEntry<V> {
     value: V,
-    bytes: usize,
-    stamp: u64,
+    payload_bytes: usize,
 }
 
 pub(crate) struct BoundedCache<K, V> {
     entries: HashMap<K, CacheEntry<V>>,
-    order: VecDeque<(u64, K)>,
+    order: VecDeque<K>,
     max_entries: usize,
     max_bytes: usize,
-    bytes: usize,
-    stamp: u64,
+    payload_bytes: usize,
     hits: u64,
     misses: u64,
     evictions: u64,
+    #[cfg(test)]
+    inspections: u64,
+    #[cfg(test)]
+    compactions: u64,
+    #[cfg(test)]
+    shrinks: u64,
 }
 
 impl<K, V> BoundedCache<K, V>
@@ -39,122 +59,201 @@ where
             order: VecDeque::new(),
             max_entries,
             max_bytes,
-            bytes: 0,
-            stamp: 0,
+            payload_bytes: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
+            #[cfg(test)]
+            inspections: 0,
+            #[cfg(test)]
+            compactions: 0,
+            #[cfg(test)]
+            shrinks: 0,
         }
     }
 
-    pub(crate) fn get_cloned(&mut self, key: &K) -> Option<V>
+    pub(crate) fn get_cloned<Q>(&mut self, key: &Q) -> Option<V>
     where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
         V: Clone,
     {
-        let Some(entry) = self.entries.get_mut(key) else {
+        let Some(entry) = self.entries.get(key) else {
             self.misses = self.misses.saturating_add(1);
             return None;
         };
         self.hits = self.hits.saturating_add(1);
-        self.stamp = self.stamp.wrapping_add(1);
-        entry.stamp = self.stamp;
-        self.order.push_back((self.stamp, key.clone()));
-        let value = entry.value.clone();
-        self.compact_order_if_needed();
-        Some(value)
+        Some(entry.value.clone())
+    }
+
+    /// Reads under a shared borrow. The caller counts the hit, because this
+    /// path never reorders entries and takes no exclusive lock.
+    pub(crate) fn peek<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.entries.get(key).map(|entry| &entry.value)
     }
 
     pub(crate) fn insert(&mut self, key: K, value: V, bytes: usize) {
-        if self.max_entries == 0 || bytes > self.max_bytes {
+        if self.max_entries == 0 || bytes.saturating_add(Self::entry_reserve()) > self.max_bytes {
             self.remove(&key);
             return;
         }
-        if let Some(previous) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        if let Some(previous) = self.entries.get_mut(&key) {
+            self.payload_bytes = self.payload_bytes.saturating_sub(previous.payload_bytes);
+            self.payload_bytes = self.payload_bytes.saturating_add(bytes);
+            previous.value = value;
+            previous.payload_bytes = bytes;
+            self.enforce_limits();
+            return;
         }
-        self.stamp = self.stamp.wrapping_add(1);
-        self.bytes = self.bytes.saturating_add(bytes);
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes);
         self.entries.insert(
             key.clone(),
             CacheEntry {
                 value,
-                bytes,
-                stamp: self.stamp,
+                payload_bytes: bytes,
             },
         );
-        self.order.push_back((self.stamp, key));
-        while self.entries.len() > self.max_entries || self.bytes > self.max_bytes {
-            self.evict_oldest();
-        }
-        self.compact_order_if_needed();
+        self.order.push_back(key);
+        self.enforce_limits();
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         let entry = self.entries.remove(key)?;
-        self.bytes = self.bytes.saturating_sub(entry.bytes);
+        self.payload_bytes = self.payload_bytes.saturating_sub(entry.payload_bytes);
+        self.order.retain(|queued| queued != key);
+        if self.entries.is_empty() || self.retained_bytes() > self.max_bytes {
+            self.shrink_storage();
+        }
         Some(entry.value)
     }
 
     pub(crate) fn remove_where(&mut self, mut predicate: impl FnMut(&K) -> bool) {
-        let keys = self
-            .entries
-            .keys()
-            .filter(|key| predicate(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.remove(&key);
+        #[cfg(test)]
+        {
+            self.inspections = self.inspections.saturating_add(self.entries.len() as u64);
         }
-        self.compact_order();
+        let before = self.entries.len();
+        let payload_bytes = &mut self.payload_bytes;
+        self.entries.retain(|key, entry| {
+            if predicate(key) {
+                *payload_bytes = payload_bytes.saturating_sub(entry.payload_bytes);
+                false
+            } else {
+                true
+            }
+        });
+        if self.entries.len() == before {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.compactions = self.compactions.saturating_add(1);
+        }
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
+        self.shrink_storage();
     }
 
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
-        self.bytes = 0;
+        self.entries.shrink_to_fit();
+        self.order.shrink_to_fit();
+        self.payload_bytes = 0;
     }
 
     #[cfg(test)]
     pub(crate) fn statistics(&self) -> CacheStatistics {
         CacheStatistics {
             entries: self.entries.len(),
-            bytes: self.bytes,
+            bytes: self.retained_bytes(),
             hits: self.hits,
             misses: self.misses,
             evictions: self.evictions,
+            inspections: self.inspections,
+            compactions: self.compactions,
+            shrinks: self.shrinks,
         }
     }
 
     fn evict_oldest(&mut self) {
-        while let Some((stamp, key)) = self.order.pop_front() {
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|entry| entry.stamp == stamp)
-            {
-                self.remove(&key);
-                self.evictions = self.evictions.saturating_add(1);
-                return;
+        if let Some(key) = self.order.pop_front()
+            && let Some(entry) = self.entries.remove(&key)
+        {
+            self.payload_bytes = self.payload_bytes.saturating_sub(entry.payload_bytes);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+    }
+
+    fn enforce_limits(&mut self) {
+        while self.entries.len() > self.max_entries || self.estimated_bytes() > self.max_bytes {
+            self.evict_oldest();
+        }
+        if self.retained_bytes() > self.max_bytes {
+            // Evicting an eighth first leaves the rebuilt table room for later inserts, so it
+            // is not regrown and shrunk again on every insert.
+            let keep = self.entries.len() - self.entries.len() / 8;
+            while self.entries.len() > keep {
+                self.evict_oldest();
             }
+            self.shrink_storage();
+        }
+        while self.retained_bytes() > self.max_bytes && !self.entries.is_empty() {
+            self.evict_oldest();
+            self.shrink_storage();
         }
     }
 
-    fn compact_order_if_needed(&mut self) {
-        let maximum = self.entries.len().saturating_mul(4).max(64);
-        if self.order.len() > maximum {
-            self.compact_order();
-        }
+    fn entry_reserve() -> usize {
+        size_of::<K>()
+            .saturating_add(size_of::<CacheEntry<V>>())
+            .saturating_add(size_of::<K>())
+            .saturating_add(ENTRY_RESERVE)
     }
 
-    fn compact_order(&mut self) {
-        let mut order = self
-            .entries
-            .iter()
-            .map(|(key, entry)| (entry.stamp, key.clone()))
-            .collect::<Vec<_>>();
-        order.sort_unstable_by_key(|(stamp, _)| *stamp);
-        self.order = order.into();
+    /// Reserves two hash buckets per live entry for load factor and growth.
+    fn estimated_bytes(&self) -> usize {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        self.payload_bytes
+            .saturating_add(
+                self.entries
+                    .len()
+                    .saturating_mul(Self::entry_reserve().saturating_mul(2)),
+            )
+            .saturating_add(ALLOCATION_RESERVE)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        if self.entries.is_empty() && self.entries.capacity() == 0 && self.order.capacity() == 0 {
+            return 0;
+        }
+        let bucket_bytes = size_of::<(K, CacheEntry<V>)>().saturating_add(size_of::<usize>());
+        self.payload_bytes
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(2)
+                    .saturating_mul(bucket_bytes),
+            )
+            .saturating_add(self.order.capacity().saturating_mul(size_of::<K>()))
+            .saturating_add(self.entries.len().saturating_mul(ENTRY_RESERVE))
+            .saturating_add(ALLOCATION_RESERVE)
+    }
+
+    fn shrink_storage(&mut self) {
+        #[cfg(test)]
+        {
+            self.shrinks = self.shrinks.saturating_add(1);
+        }
+        self.entries.shrink_to_fit();
+        self.order.shrink_to_fit();
     }
 }
 
@@ -163,17 +262,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hits_bound_work() {
+        let mut cache: BoundedCache<u64, u64> = BoundedCache::new(8, 4_096);
+        for key in 0..8u64 {
+            cache.insert(key, key, 8);
+        }
+        for _ in 0..1_000 {
+            assert_eq!(cache.get_cloned(&3), Some(3));
+        }
+        assert_eq!(cache.order.len(), cache.entries.len());
+        assert_eq!(cache.statistics().compactions, 0);
+        cache.insert(100, 100, 8);
+        assert_eq!(cache.get_cloned(&0), None);
+        assert_eq!(cache.get_cloned(&3), Some(3));
+    }
+
+    #[test]
     fn bounded_cache_eviction() {
-        let mut cache = BoundedCache::new(2, 8);
+        let mut cache = BoundedCache::new(2, 1_024);
         cache.insert(1, "one", 3);
         cache.insert(2, "two", 3);
         assert_eq!(Some("one"), cache.get_cloned(&1));
         cache.insert(3, "three", 3);
 
-        assert_eq!(Some("one"), cache.get_cloned(&1));
-        assert_eq!(None, cache.get_cloned(&2));
+        assert_eq!(None, cache.get_cloned(&1));
+        assert_eq!(Some("two"), cache.get_cloned(&2));
         assert_eq!(Some("three"), cache.get_cloned(&3));
         assert_eq!(2, cache.statistics().entries);
         assert_eq!(1, cache.statistics().evictions);
+    }
+
+    #[test]
+    fn bytes_include_storage() {
+        let mut cache = BoundedCache::new(8, 1_024);
+        cache.insert(1u64, 2u64, 8);
+        assert!(cache.statistics().bytes > 8);
+        assert!(cache.statistics().bytes <= 1_024);
+    }
+
+    /// A byte-bounded cache at its limit must not rebuild its table on every insert.
+    #[test]
+    fn full_cache_amortized() {
+        let max_bytes = 1_000_000;
+        let mut cache = BoundedCache::new(usize::MAX, max_bytes);
+        let inserts = 20_000u64;
+        for key in 0..inserts {
+            cache.insert(u128::from(key), std::sync::Arc::new(()), 60);
+            assert!(cache.retained_bytes() <= max_bytes, "insert {key}");
+        }
+        let statistics = cache.statistics();
+        assert!(statistics.entries > 0);
+        assert!(
+            statistics.shrinks < inserts / 100,
+            "{} table rebuilds for {inserts} inserts",
+            statistics.shrinks
+        );
+    }
+
+    #[test]
+    fn oversized_replace_releases() {
+        let mut cache = BoundedCache::new(1_024, 64 * 1_024);
+        for key in 0..256u64 {
+            cache.insert(key, key, 8);
+        }
+        cache.insert(0, 0, usize::MAX);
+        for key in 1..256u64 {
+            cache.remove(&key);
+        }
+        assert_eq!(cache.statistics().entries, 0);
+        assert_eq!(cache.statistics().bytes, 0);
     }
 }

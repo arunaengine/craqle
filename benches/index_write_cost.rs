@@ -1,10 +1,7 @@
-//! Persistent-index write-cost benchmark.
-//!
-//! Fixture construction is deliberately kept outside Criterion's measured
-//! closures. Every local case receives a new database per iteration, while
-//! the replicated case receives a new two-peer Irokle-backed cluster. The
-//! canonical CRDT state is checked before the benchmark starts, and the
-//! resulting database bytes are printed as a paired-commit comparison aid.
+//! Measures persistent-index write costs with fresh local or replicated storage.
+//! Builds fixtures outside measured closures and checks canonical state first.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use std::collections::HashMap;
 use std::env;
@@ -15,17 +12,17 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use craqle::{
-    ActorId, Batch, CraqleFjallPersistMode, CraqleNode, CraqleOptions, CreateCrateRequest,
-    EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy, MaterializedQuadChange, PermissionGrant,
-    PermissionLevel, SearchStorage,
+    ActorId, Batch, CraqleFjallPersistMode as PersistMode, CraqleNode, CraqleOptions,
+    CreateCrateRequest, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy, MaterializedQuadChange,
+    PermissionGrant, PermissionLevel, SearchStorage,
 };
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
-#[path = "support/allocation.rs"]
+#[path = "allocation.rs"]
 mod allocation;
-#[path = "../tests/support/sim.rs"]
+#[path = "../tests/sim_support.rs"]
 mod sim;
-#[path = "support/mod.rs"]
+#[path = "support.rs"]
 mod support;
 
 use support::BenchWriteExt as _;
@@ -40,7 +37,7 @@ use support::{
 const LOCAL_GRAPH: &str = "urn:craqle:bench:index-write-cost:local";
 const MERGE_GRAPH: &str = "urn:craqle:bench:index-write-cost:merge";
 const CONCURRENT_WRITERS: usize = 4;
-const CONCURRENT_ROWS_PER_WRITER: usize = 100;
+const ROWS_PER_WRITER: usize = 100;
 const LOAD_BATCH_SIZE: usize = 512;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -184,10 +181,10 @@ fn node_options(actor_byte: u8) -> CraqleOptions {
     CraqleOptions::new()
         .with_actor(ActorId::from_bytes([actor_byte; 32]))
         .with_search_storage(SearchStorage::Memory)
-        .with_graph_store_persist_mode(CraqleFjallPersistMode::Buffer)
+        .with_graph_store_persist_mode(PersistMode::Buffer)
 }
 
-fn local_options(actor_byte: u8, mode: CraqleFjallPersistMode) -> CraqleOptions {
+fn local_options(actor_byte: u8, mode: PersistMode) -> CraqleOptions {
     node_options(actor_byte).with_graph_store_persist_mode(mode)
 }
 
@@ -198,6 +195,12 @@ struct LocalFixture {
     graph: GraphId,
     graphs: Vec<GraphId>,
     changes: Vec<MaterializedQuadChange>,
+}
+
+struct UnionConfig {
+    corpus: CorpusConfig,
+    mode: PersistMode,
+    invalidate: bool,
 }
 
 fn preload_corpus(node: &CraqleNode, config: CorpusConfig, base: &GraphId) -> Vec<GraphId> {
@@ -220,13 +223,13 @@ fn preload_corpus(node: &CraqleNode, config: CorpusConfig, base: &GraphId) -> Ve
         });
         if partitions[graph_index].len() >= LOAD_BATCH_SIZE {
             let changes = std::mem::take(&mut partitions[graph_index]);
-            node.apply_changes_bulk_unchecked(&graphs[graph_index], changes)
+            node.apply_bulk_unchecked(&graphs[graph_index], changes)
                 .expect("preload graph-scoped write corpus");
         }
     }
     for (index, changes) in partitions.into_iter().enumerate() {
         if !changes.is_empty() {
-            node.apply_changes_bulk_unchecked(&graphs[index], changes)
+            node.apply_bulk_unchecked(&graphs[index], changes)
                 .expect("finish graph-scoped write corpus preload");
         }
     }
@@ -245,7 +248,7 @@ fn preload_corpus(node: &CraqleNode, config: CorpusConfig, base: &GraphId) -> Ve
 fn local_fixture_mode(
     config: CorpusConfig,
     changes: Vec<MaterializedQuadChange>,
-    mode: CraqleFjallPersistMode,
+    mode: PersistMode,
 ) -> LocalFixture {
     let database = tempfile::tempdir().expect("create local write benchmark database");
     let node = CraqleNode::open_with_options(database.path(), local_options(0xA5, mode))
@@ -263,17 +266,12 @@ fn local_fixture_mode(
 }
 
 fn local_fixture(config: CorpusConfig, changes: Vec<MaterializedQuadChange>) -> LocalFixture {
-    local_fixture_mode(config, changes, CraqleFjallPersistMode::Buffer)
+    local_fixture_mode(config, changes, PersistMode::Buffer)
 }
 
-fn local_fixture_union_proof_state(
-    config: CorpusConfig,
-    changes: Vec<MaterializedQuadChange>,
-    mode: CraqleFjallPersistMode,
-    invalidate: bool,
-) -> LocalFixture {
-    let fixture = local_fixture_mode(config, changes, mode);
-    let spec = DeterministicCorpus::new(config)
+fn local_union_fixture(config: UnionConfig, changes: Vec<MaterializedQuadChange>) -> LocalFixture {
+    let fixture = local_fixture_mode(config.corpus, changes, config.mode);
+    let spec = DeterministicCorpus::new(config.corpus)
         .expect("validated write benchmark corpus")
         .iter()
         .next()
@@ -288,7 +286,7 @@ fn local_fixture_union_proof_state(
         .node
         .apply_changes_unchecked(&duplicate, vec![warm.change(&duplicate, false)])
         .expect("restore the warmed union-proof write state");
-    if invalidate {
+    if config.invalidate {
         let triple = triple_from_spec(spec);
         fixture
             .node
@@ -368,23 +366,15 @@ fn delete_fixture(config: CorpusConfig, triples: &[Triple]) -> LocalFixture {
 fn concurrent_fixture(config: CorpusConfig, triples: &[Triple]) -> ConcurrentFixture {
     let database = tempfile::tempdir().expect("create concurrent write benchmark database");
     let node = Arc::new(
-        CraqleNode::open_with_options(
-            database.path(),
-            local_options(0xA6, CraqleFjallPersistMode::Buffer),
-        )
-        .expect("open concurrent write benchmark node"),
+        CraqleNode::open_with_options(database.path(), local_options(0xA6, PersistMode::Buffer))
+            .expect("open concurrent write benchmark node"),
     );
     let graph = GraphId::new(LOCAL_GRAPH);
     let graphs = preload_corpus(&node, config, &graph);
     let batches = (0..CONCURRENT_WRITERS)
         .map(|writer| {
-            let start = writer * CONCURRENT_ROWS_PER_WRITER;
-            changes_for(
-                &graph,
-                triples,
-                start..start + CONCURRENT_ROWS_PER_WRITER,
-                true,
-            )
+            let start = writer * ROWS_PER_WRITER;
+            changes_for(&graph, triples, start..start + ROWS_PER_WRITER, true)
         })
         .collect();
     ConcurrentFixture {
@@ -517,7 +507,7 @@ fn apply_local(node: &CraqleNode, changes: Vec<MaterializedQuadChange>, bulk: bo
     let mut result = None;
     for (graph, changes) in change_groups(changes) {
         let batch = if bulk {
-            node.apply_changes_bulk_unchecked(&graph, changes)
+            node.apply_bulk_unchecked(&graph, changes)
         } else {
             node.apply_changes_unchecked(&graph, changes)
         }
@@ -650,7 +640,7 @@ fn assert_local_contract(
         },
         allocation.allocations,
         allocation.allocated_bytes,
-        allocation.peak_live_delta_bytes,
+        allocation.peak_delta_bytes,
     );
     drop(node);
     drop(database);
@@ -686,7 +676,7 @@ fn assert_delete_contract(config: CorpusConfig, triples: &[Triple], fixture_hash
         config.quads + 1,
         allocation.allocations,
         allocation.allocated_bytes,
-        allocation.peak_live_delta_bytes,
+        allocation.peak_delta_bytes,
     );
     drop(node);
     drop(database);
@@ -702,7 +692,7 @@ fn assert_concurrent_contract(config: CorpusConfig, triples: &[Triple], fixture_
         batches,
     } = fixture;
     let changed_rows: usize = batches.iter().map(Vec::len).sum();
-    let expected_rows = config.quads + batches.len() * CONCURRENT_ROWS_PER_WRITER;
+    let expected_rows = config.quads + batches.len() * ROWS_PER_WRITER;
     let before = directory_bytes(&database.path().join("store"));
     let start = Arc::new(Barrier::new(batches.len()));
     let allocation = AllocationInterval::begin();
@@ -722,7 +712,7 @@ fn assert_concurrent_contract(config: CorpusConfig, triples: &[Triple], fixture_
     println!(
         "index_write_cost case=concurrent_local_writes corpus_version={CORPUS_VERSION} \
          seed={DEFAULT_SEED:#x} rows={expected_rows} writers={CONCURRENT_WRITERS} \
-         rows_per_writer={CONCURRENT_ROWS_PER_WRITER} db_bytes={bytes} db_growth={} \
+         rows_per_writer={ROWS_PER_WRITER} db_bytes={bytes} db_growth={} \
          persistence=buffer write_path=raw_unchecked_changes validation_reads=0 \
          source_keys_written={changed_rows} qv_keys_written={} \
          key_count_scope=logical_quad_rows_and_qv_orders \
@@ -733,7 +723,7 @@ fn assert_concurrent_contract(config: CorpusConfig, triples: &[Triple], fixture_
         changed_rows.saturating_mul(3),
         allocation.allocations,
         allocation.allocated_bytes,
-        allocation.peak_live_delta_bytes,
+        allocation.peak_delta_bytes,
     );
     drop(node);
     drop(database);
@@ -780,7 +770,7 @@ fn assert_merge_contract(triples: &[Triple]) -> u64 {
         bytes.saturating_sub(before),
         allocation.allocations,
         allocation.allocated_bytes,
-        allocation.peak_live_delta_bytes,
+        allocation.peak_delta_bytes,
     );
     drop(cluster);
     drop(database);
@@ -792,7 +782,7 @@ fn assert_sync_data(config: CorpusConfig, triples: &[Triple], fixture_hash: &str
     let fixture = local_fixture_mode(
         config,
         changes_for(&graph, triples, 0..1, true),
-        CraqleFjallPersistMode::SyncData,
+        PersistMode::SyncData,
     );
     let before = directory_bytes(&fixture.database.path().join("store"));
     let allocation = AllocationInterval::begin();
@@ -813,7 +803,7 @@ fn assert_sync_data(config: CorpusConfig, triples: &[Triple], fixture_hash: &str
         bytes.saturating_sub(before),
         allocation.allocations,
         allocation.allocated_bytes,
-        allocation.peak_live_delta_bytes,
+        allocation.peak_delta_bytes,
     );
     bytes
 }
@@ -849,7 +839,7 @@ fn env_sample_size() -> usize {
     }
 }
 
-fn index_write_cost_benchmarks(c: &mut Criterion) {
+fn write_cost_benches(c: &mut Criterion) {
     let config = write_config();
     let triples = write_corpus(config);
     let fixture_hash = corpus_hash(config);
@@ -934,11 +924,13 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let graph = GraphId::new(LOCAL_GRAPH);
-                local_fixture_union_proof_state(
-                    config,
+                local_union_fixture(
+                    UnionConfig {
+                        corpus: config,
+                        mode: PersistMode::Buffer,
+                        invalidate: false,
+                    },
                     changes_for(&graph, &triples, 0..1, true),
-                    CraqleFjallPersistMode::Buffer,
-                    false,
                 )
             },
             |fixture| apply_local_fixture(fixture, false),
@@ -950,11 +942,13 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let graph = GraphId::new(LOCAL_GRAPH);
-                local_fixture_union_proof_state(
-                    config,
+                local_union_fixture(
+                    UnionConfig {
+                        corpus: config,
+                        mode: PersistMode::Buffer,
+                        invalidate: true,
+                    },
                     changes_for(&graph, &triples, 0..1, true),
-                    CraqleFjallPersistMode::Buffer,
-                    true,
                 )
             },
             |fixture| apply_local_fixture(fixture, false),
@@ -996,7 +990,7 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Elements(
-        (CONCURRENT_WRITERS * CONCURRENT_ROWS_PER_WRITER) as u64,
+        (CONCURRENT_WRITERS * ROWS_PER_WRITER) as u64,
     ));
     group.bench_function("concurrent_local_writes", |b| {
         b.iter_batched(
@@ -1014,7 +1008,7 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
                 local_fixture_mode(
                     config,
                     changes_for(&graph, &triples, 0..1, true),
-                    CraqleFjallPersistMode::SyncData,
+                    PersistMode::SyncData,
                 )
             },
             |fixture| apply_durable(fixture, false),
@@ -1026,11 +1020,13 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let graph = GraphId::new(LOCAL_GRAPH);
-                local_fixture_union_proof_state(
-                    config,
+                local_union_fixture(
+                    UnionConfig {
+                        corpus: config,
+                        mode: PersistMode::SyncData,
+                        invalidate: false,
+                    },
                     changes_for(&graph, &triples, 0..1, true),
-                    CraqleFjallPersistMode::SyncData,
-                    false,
                 )
             },
             |fixture| apply_durable(fixture, false),
@@ -1042,11 +1038,13 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let graph = GraphId::new(LOCAL_GRAPH);
-                local_fixture_union_proof_state(
-                    config,
+                local_union_fixture(
+                    UnionConfig {
+                        corpus: config,
+                        mode: PersistMode::SyncData,
+                        invalidate: true,
+                    },
                     changes_for(&graph, &triples, 0..1, true),
-                    CraqleFjallPersistMode::SyncData,
-                    true,
                 )
             },
             |fixture| apply_durable(fixture, false),
@@ -1065,5 +1063,5 @@ fn index_write_cost_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, index_write_cost_benchmarks);
+criterion_group!(benches, write_cost_benches);
 criterion_main!(benches);

@@ -1,14 +1,6 @@
-//! WS0 concurrency guarantees, exercised end to end through the public
-//! `CraqleNode` API.
-//!
-//! The guard-level proofs — parallel `insert_quad` + `commit` keeping the dot set
-//! intact, the self-guarding store functions not deadlocking, and the
-//! `#[cfg(test)]` corrupt-index hook showing that the detecting commit repairs
-//! the index — live in `src/internal/store.rs`'s unit tests, because
-//! `craqle::store` is a private module and `GraphCommitGuard` is `pub(crate)`.
-//! Integration tests cannot name either. What they can do is show the same
-//! guarantees from the outside: concurrent writers lose nothing, and concurrent
-//! graph-lifecycle calls make progress.
+//! Verifies public-node concurrency remains lossless and makes progress.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 mod support;
 
@@ -32,9 +24,7 @@ fn named(iri: &str) -> EncodedTerm {
     EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked(iri))
 }
 
-/// Write triples verbatim. These tests are about write concurrency, not about
-/// crate structure, so they skip the structural validation that would reject a
-/// bare `schema:name` triple with no surrounding crate.
+/// Writes bare triples so structural validation does not mask concurrency.
 fn write_unchecked(
     node: &CraqleNode,
     graph: &GraphId,
@@ -54,14 +44,7 @@ fn write_unchecked(
     node.apply_changes_unchecked(graph, changes).unwrap();
 }
 
-/// Concurrent writers on one graph must all land: every insert gets its own
-/// dot, and the graph clock accounts for every committed batch (G1, G2).
-///
-/// Today the local write path is still serialized by `ReplicationEngine`'s
-/// engine-wide `local_commit_lock`. WS1-T2 deletes that lock in favour of the
-/// per-graph commit guard, so this test is the end-to-end regression guard for
-/// that swap: if the guard is not adopted at every read→write site, the counter
-/// mint and the dot-set read-modify-write interleave and adds are lost.
+/// Parallel inserts must keep unique dots and complete graph-clock coverage.
 #[test]
 fn parallel_inserts_persist() {
     with_watchdog("parallel_inserts_persist", || {
@@ -116,10 +99,8 @@ fn parallel_inserts_persist() {
         dots.dedup();
         assert_eq!(unique, dots.len(), "two inserts shared a dot");
 
-        // Exact, not `max >= expected`: counters are minted contiguously from 1
-        // per actor, so the clock entries sum to the number of dots. Taking the
-        // maximum only catches a lost advance when the *highest* counter is the
-        // one that was lost — every other interleaving slips through.
+        // Contiguous actor counters make their sum the exact minted-dot count.
+        // A maximum would miss lost intermediate advances.
         let clock = node.vector_clock(&graph).unwrap();
         let covered: u64 = clock.0.values().sum();
         assert_eq!(
@@ -129,9 +110,7 @@ fn parallel_inserts_persist() {
     });
 }
 
-/// Writers on different graphs share the 64 commit-lock shards, so they can
-/// contend even though they are logically independent. That contention must
-/// only serialize them, never lose writes.
+/// Commit-shard contention across graphs may serialize but never lose writes.
 #[test]
 fn multigraph_inserts_persist() {
     with_watchdog("multigraph_inserts_persist", || {
@@ -181,8 +160,7 @@ fn multigraph_inserts_persist() {
 }
 
 /// The self-guarding node operations take a graph commit guard internally.
-/// Calling them concurrently — including on graphs that collide on a lock
-/// shard — must make progress rather than deadlock on the non-reentrant mutex.
+/// Concurrent calls on colliding graph-lock shards must still make progress.
 #[test]
 fn lifecycle_never_deadlocks() {
     with_watchdog("lifecycle_never_deadlocks", || {
@@ -233,12 +211,8 @@ fn lifecycle_never_deadlocks() {
     });
 }
 
-/// fjall applies a write batch item by item, so a reader can see a commit's
-/// quads while the same batch's clock key has not landed. A freshness check
-/// reading the durable clock then matches the *previous* orphan record and
-/// serves a pre-write orphan set as current (G6). One wide batch holds that
-/// gap open long enough to catch it reliably; `reads_stay_consistent` only
-/// catches it a few times in a hundred runs.
+/// A wide Fjall batch exposes any gap between quad publication and the clock
+/// used to validate diagnostics freshness.
 #[test]
 fn diagnostics_never_lag() {
     with_watchdog("diagnostics_never_lag", || {
@@ -258,9 +232,7 @@ fn diagnostics_never_lag() {
                 let done = Arc::clone(&done);
                 scope.spawn(move || {
                     while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                        // One quad per entity and one orphan per quad, so the
-                        // orphan set a diagnostics read returns is the quad
-                        // count of the graph it read.
+                        // Each entity contributes one quad and one orphan.
                         let (before, _, _) = node.graph_fingerprint(&graph).unwrap();
                         let orphaned = node.graph_diagnostics(&graph).unwrap().orphaned_entities;
                         let (after, _, _) = node.graph_fingerprint(&graph).unwrap();
@@ -408,9 +380,7 @@ fn snapshots_never_tear() {
     });
 }
 
-/// Reads must stay consistent with writes while both run: a diagnostics read
-/// never observes a set that disagrees with the graph it is reading, and never
-/// blocks writers indefinitely.
+/// Concurrent diagnostics must match an observed graph state without blocking writes.
 #[test]
 fn reads_stay_consistent() {
     with_watchdog("reads_stay_consistent", || {
@@ -447,14 +417,8 @@ fn reads_stay_consistent() {
                 let graph = graph.clone();
                 scope.spawn(move || {
                     for _ in 0..WRITES {
-                        // Every write contributes exactly one quad and exactly
-                        // one orphan, so the orphan set a diagnostics read
-                        // returns *is* the quad count of the graph it read.
-                        // The writer only ever grows that count, so sandwiching
-                        // the read between two fingerprints pins the equality
-                        // without pinning which instant was observed. A bound of
-                        // `<= count` alone is satisfied by arbitrarily stale
-                        // diagnostics, including an empty set.
+                        // Fingerprints bracket the growing graph state observed by
+                        // diagnostics; a one-sided bound would permit stale emptiness.
                         let (before, _, _) = node.graph_fingerprint(&graph).unwrap();
                         let orphaned = node.graph_diagnostics(&graph).unwrap().orphaned_entities;
                         let (after, _, _) = node.graph_fingerprint(&graph).unwrap();

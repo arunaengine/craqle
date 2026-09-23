@@ -1,3 +1,7 @@
+//! Compares query result collection allocations and runtime.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -7,6 +11,12 @@ use std::time::Duration;
 
 use craqle::EncodedTerm;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use serde_json::{json, to_string};
+
+#[path = "support.rs"]
+mod support;
+
+use support::fixture::{binary_blake3, repository_commit};
 
 struct CountingAllocator;
 
@@ -34,9 +44,8 @@ fn record_deallocation(bytes: usize) {
     });
 }
 
-// SAFETY: every operation delegates to `System` with the original pointer and
-// layout. The additional atomics only observe sizes and never alter allocation
-// results or pointer ownership.
+// SAFETY: operations delegate to `System` with the original pointer and layout.
+// The atomics only observe sizes and never alter ownership or results.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: delegated with the caller-provided layout.
@@ -163,6 +172,38 @@ fn collect_positional_compat(
     positional_to_compatibility(&collect_positional(variables, source))
 }
 
+fn push_value(hasher: &mut blake3::Hasher, variable: &str, value: Option<&EncodedTerm>) {
+    hasher.update(&(variable.len() as u64).to_le_bytes());
+    hasher.update(variable.as_bytes());
+    if let Some(value) = value {
+        hasher.update(&[1]);
+        hasher.update(&(value.0.len() as u64).to_le_bytes());
+        hasher.update(value.0.as_bytes());
+    } else {
+        hasher.update(&[0]);
+    }
+}
+
+fn row_digest(variables: &[String], rows: &[Vec<Option<EncodedTerm>>]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for row in rows {
+        for (variable, value) in variables.iter().zip(row) {
+            push_value(&mut hasher, variable, value.as_ref());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn map_digest(variables: &[String], rows: &[HashMap<String, EncodedTerm>]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for row in rows {
+        for variable in variables {
+            push_value(&mut hasher, variable, row.get(variable));
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn env_sample_size() -> usize {
     match std::env::var("CRAQLE_BENCH_SAMPLE_SIZE") {
         Ok(value) => {
@@ -199,7 +240,24 @@ fn benchmark_result_collection(c: &mut Criterion) {
     group.warm_up_time(warm_up);
     group.measurement_time(measurement);
 
-    for row_count in [10_usize, 1_000, 10_000, 100_000] {
+    let row_counts = [10_usize, 1_000, 10_000, 100_000];
+    println!(
+        "{}",
+        to_string(&json!({
+            "record": "query_result_collection_provenance",
+            "commit": repository_commit(),
+            "binary_blake3": binary_blake3(),
+            "row_counts": row_counts,
+            "variables": ["s", "name", "date"],
+            "transport": "in_process_collection",
+            "timing_allocator": "global counting allocator installed; Criterion timings include its disabled atomic check per allocation",
+            "allocation_boundary": "diagnostic interval around one collection call before Criterion timing",
+            "public_api": "compatibility map conversion remains required and unchanged",
+        }))
+        .expect("serialize result-collection provenance")
+    );
+
+    for row_count in row_counts {
         let (variables, source) = source_rows(row_count);
         let positional = collect_positional(&variables, &source);
 
@@ -214,6 +272,15 @@ fn benchmark_result_collection(c: &mut Criterion) {
         assert_eq!(current, converted);
         assert_eq!(current, conversion_only);
         assert_eq!(positional_result.rows.len(), row_count);
+        let fixture_digest = row_digest(&variables, &source);
+        let current_digest = map_digest(&variables, &current);
+        assert_eq!(fixture_digest, current_digest);
+        assert_eq!(
+            current_digest,
+            row_digest(&variables, &positional_result.rows)
+        );
+        assert_eq!(current_digest, map_digest(&variables, &converted));
+        assert_eq!(current_digest, map_digest(&variables, &conversion_only));
         for (mode, statistics) in [
             ("current", current_allocations),
             ("positional", positional_allocations),
@@ -221,8 +288,21 @@ fn benchmark_result_collection(c: &mut Criterion) {
             ("positional_conversion_only", conversion_only_allocations),
         ] {
             println!(
-                "query_result_collection allocations: rows={row_count} mode={mode} allocations={} allocated_bytes={} peak_live_bytes={}",
-                statistics.allocations, statistics.allocated_bytes, statistics.peak_live_bytes
+                "{}",
+                to_string(&json!({
+                    "record": "query_result_collection_allocation",
+                    "rows": row_count,
+                    "variables": variables.len(),
+                    "mode": mode,
+                    "fixture_digest": &fixture_digest,
+                    "result_digest": &current_digest,
+                    "exact_compatibility_equal": true,
+                    "allocations": statistics.allocations,
+                    "allocated_bytes": statistics.allocated_bytes,
+                    "peak_live_bytes": statistics.peak_live_bytes,
+                    "counted_as_timing": false,
+                }))
+                .expect("serialize result-collection allocation")
             );
         }
 

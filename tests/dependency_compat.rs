@@ -1,8 +1,14 @@
+//! Checks RDF-star rejection and the SHACL dependency feature contract.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 #![cfg(feature = "shacl-core")]
 
 use oxrdf::{Literal, NamedNode, Term, Triple};
 use rocraters::ro_crate::context::RoCrateContext;
-use rocraters::ro_crate::rdf::{RdfError, RdfGraph, ResolvedContext, rdf_graph_to_rocrate};
+use rocraters::ro_crate::rdf::{
+    RdfError, RdfGraph, ResolvedContext, rdf_graph_to_rocrate as graph_to_crate,
+};
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
 use shacl::ir::IRSchema;
@@ -12,7 +18,7 @@ use shacl::validator::store::Graph;
 use shacl::validator::{ShaclConfig, ShaclValidationMode};
 
 #[test]
-fn rocrate_rdf_star_term_is_rejected() {
+fn quoted_terms_rejected() {
     let quoted = Triple::new(
         NamedNode::new_unchecked("urn:craqle:test:quoted-subject"),
         NamedNode::new_unchecked("urn:craqle:test:quoted-predicate"),
@@ -28,13 +34,13 @@ fn rocrate_rdf_star_term_is_rejected() {
     ));
 
     assert!(matches!(
-        rdf_graph_to_rocrate(graph),
+        graph_to_crate(graph),
         Err(RdfError::UnsupportedRdfStarTerm)
     ));
 }
 
 #[test]
-fn rudof_native_validation_runs_without_sparql() {
+fn native_validation_independent() {
     let shapes = r#"
         @prefix sh: <http://www.w3.org/ns/shacl#> .
         <urn:craqle:test:shape> a sh:NodeShape ;

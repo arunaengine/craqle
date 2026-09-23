@@ -1,4 +1,6 @@
 //! Craqle-owned SHACL compilation types.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,14 +11,8 @@ use crate::{CrateViolation, EncodedTerm, QueryCancellation, ReadStatistics, RoCr
 /// SHACL feature profile implemented by Craqle's native validator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ShaclProfile {
-    /// Craqle SHACL Core Subset v1.
-    ///
-    /// Supports node, class, subjects-of, objects-of, and implicit-class
-    /// targets; direct, inverse, sequence, alternative, zero-or-one,
-    /// zero-or-more, and one-or-more paths; and the native constraint forms
-    /// documented in the README. Recursive shapes, SHACL-SPARQL, SHACL-JS,
-    /// SHACL-AF, custom components and targets, reifier shapes, RDF-star, and
-    /// remote imports are unsupported.
+    /// Supports the documented Core Subset v1 targets, paths, and constraints.
+    /// Recursive, extension, remote-import, reifier, and RDF-star forms are unsupported.
     CoreSubsetV1,
 }
 

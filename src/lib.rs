@@ -1,18 +1,8 @@
 //! Craqle stores, validates, queries, searches, and replicates RO-Crates.
-//!
-//! The integration surface is the root API: [`CraqleNode`], the typed request
-//! structs, and RO-Crate JSON-LD import/export. Everything under
-//! `src/internal/` is private to the crate.
-//!
-//! # Compatibility in 0.2.x
-//!
-//! Documented public APIs remain source compatible throughout 0.2.x unless a
-//! correctness or security defect makes that impossible. Authoritative CRDT
-//! data written by 0.2 remains readable by later 0.2 releases. Query and search
-//! indexes and compiled SHACL caches are derived data and may be rebuilt or
-//! discarded. Unsupported forms return an error. A future 0.3 release may make
-//! breaking changes with a migration note.
-
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+//! Public compatibility and migration details are in README.md and CHANGELOG.md.
+#![doc = include_str!("visibility.md")]
 #![warn(unreachable_pub)]
 
 #[path = "internal/cache.rs"]
@@ -23,19 +13,29 @@ mod core;
 mod count_exec;
 #[path = "internal/count_plan.rs"]
 mod count_plan;
+#[path = "internal/graph_distinct.rs"]
+mod graph_distinct;
+#[path = "internal/graph_join.rs"]
+mod graph_join;
+#[path = "internal/memory.rs"]
+mod memory;
 #[path = "internal/planner.rs"]
 mod planner;
-#[allow(dead_code)]
-#[path = "internal/query_context.rs"]
-mod query_context;
-#[allow(dead_code)]
-#[path = "internal/query_cursor.rs"]
-mod query_cursor;
-#[path = "internal/query_worker.rs"]
-mod query_worker;
-#[allow(dead_code)]
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod policy_tests;
+#[path = "internal/query/mod.rs"]
+mod query;
+#[path = "internal/qv_gate.rs"]
+mod qv_gate;
 #[path = "internal/rdf_read.rs"]
 mod rdf_read;
+#[cfg(test)]
+#[path = "internal/read_ladder.rs"]
+mod read_ladder;
+#[cfg(test)]
+#[path = "receipt_tests.rs"]
+mod receipt_tests;
 #[path = "internal/replication.rs"]
 mod replication;
 #[path = "internal/rocrate.rs"]
@@ -43,13 +43,11 @@ mod rocrate;
 #[path = "internal/rules.rs"]
 mod rules;
 #[cfg(feature = "search")]
-#[path = "internal/search.rs"]
+#[path = "internal/search/mod.rs"]
 mod search;
 #[cfg(not(feature = "search"))]
 #[path = "search_stub.rs"]
 mod search;
-#[path = "internal/search_queue.rs"]
-mod search_queue;
 #[cfg(feature = "shacl-core")]
 #[path = "internal/shacl/mod.rs"]
 mod shacl_impl;
@@ -63,27 +61,23 @@ mod store;
 mod validation_delta;
 
 mod auth;
+mod history;
 #[cfg(feature = "shacl-core")]
 pub mod shacl;
 mod sync;
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::panic;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
-#[cfg(feature = "shacl-core")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::core::{
-    EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreMaterializedQuadChange,
-};
+use crate::core::{EncodedTerm as CoreEncodedTerm, MaterializedQuadChange as CoreChange};
 #[cfg(feature = "shacl-core")]
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 #[cfg(feature = "shacl-core")]
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::replication::ReplicationEngine;
@@ -104,8 +98,9 @@ pub use crate::core::{
     TaggedGraphPolicy, UnsupportedRdfStarTerm, VectorClock, vocab,
 };
 pub use crate::core::{Dot, GraphReplicaSnapshot, QuadOp, SnapshotQuadState};
+pub use crate::memory::{MemoryBudget, MemoryBudgetError};
 pub use crate::planner::{JoinKind, JoinMode, PlannedJoin};
-pub use crate::query_context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
+pub use crate::query::context::{QueryCancellation, QueryReadMode, ReadAccessPath, ReadStatistics};
 pub use crate::replication::{
     CheckMode, DiagnosticsMode, MergeError, MergeResult, UpdateError, WriteChecks,
 };
@@ -131,20 +126,26 @@ pub use crate::sparql::{
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{
-    CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, DenyRemotePolicyChanges,
-    IrokleGraphSync, RejectedReplicationRecord, RemotePolicyAuthorizer, TopicCursorRepairAudit,
-    topic_cursor_digest,
+    BackupProof, CommitInfo, CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError,
+    DenyRemotePolicyChanges, GraphHints, GraphRenderHints, HistoryPoint, HistoryRequest,
+    HistorySnapshot, IrokleGraphSync, MutationCommit, MutationId, MutationLookup, MutationReceipt,
+    MutationRequest, MutationStatus, PersistenceOutcome, ReconcileRequest, ReconcileSource,
+    RejectedReplicationRecord, RemotePolicyAuthorizer, RepairAudit, RepairAuthority, RepairDiff,
+    RepairMode, RepairOutcome, RepairReport, RepairRequest, RepairResult, RepairState,
+    SourceOutcome, TopicCursorRepairAudit, topic_cursor_digest,
 };
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
 };
+pub use history::{
+    GraphHistory, HistoryCompare, HistoryDiff, HistoryError, HistoryLog, HistoryOperation,
+    HistoryPage, HistoryProjection, HistoryRestore, HistoryRestored,
+};
 pub use irokle;
 
 /// Stable high-level classification for public Craqle failures.
-///
-/// Detailed error variants may gain additional context during 0.2.x. Callers
-/// that need durable control flow should use [`CraqleError::kind`].
+/// Use [`CraqleError::kind`] for durable control flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[non_exhaustive]
 pub enum CraqleErrorKind {
@@ -160,13 +161,10 @@ pub enum CraqleErrorKind {
     CorruptAuthoritativeData,
     DependencyUnavailable,
     Cancelled,
+    ResourceLimit,
 }
 
-/// Authoritative on-disk format understood by this release.
-///
-/// The version covers CRDT source state, graph recovery metadata, and committed
-/// policy bindings. Disposable indexes and caches have their own format
-/// markers and do not change this version.
+/// Format for authoritative state, recovery metadata, and policy bindings.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
 )]
@@ -184,32 +182,22 @@ impl DiskFormatVersion {
 /// Current authoritative disk format written by Craqle 0.2.
 pub const DISK_FORMAT_VERSION: DiskFormatVersion = DiskFormatVersion::new(1, 0);
 
-/// Test-only stall between a publish and its own apply, in microseconds.
-///
-/// The pair is one critical section: the window between the two is exactly
-/// where a concurrent write slips in and makes apply order differ from publish
-/// order. In a real run that window is a few instructions wide, far too narrow
-/// to hit on purpose, so tests widen it. Compiled out of every non-test build.
+/// Test-only delay widens the publish-before-apply race without shipping it.
+/// Jitter prevents equal delays from preserving writer entry order.
 #[cfg(test)]
-static PUBLISH_APPLY_STALL_MICROS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PUBLISH_STALL_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 fn stall_publish_apply() {
-    let micros = PUBLISH_APPLY_STALL_MICROS.load(Ordering::Relaxed);
+    let micros = PUBLISH_STALL_MICROS.load(Ordering::Relaxed);
     if micros == 0 {
         return;
     }
-    // Jittered: a fixed stall would delay every writer equally and so preserve
-    // the order they entered in, which is the order under test.
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| u64::from(since.subsec_nanos()));
     std::thread::sleep(Duration::from_micros(jitter % micros + 1));
 }
-
-#[cfg(not(test))]
-fn stall_publish_apply() {}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -227,11 +215,11 @@ pub enum CraqleError {
     #[error("SPARQL query cancelled")]
     QueryCancelled,
     #[error("update: {0}")]
-    Update(#[from] replication::UpdateError),
+    Update(#[source] replication::UpdateError),
     #[error("merge: {0}")]
-    Merge(#[from] replication::MergeError),
+    Merge(#[source] replication::MergeError),
     #[error("rocrate: {0}")]
-    RoCrate(#[from] rocrate::RoCrateError),
+    RoCrate(#[source] rocrate::RoCrateError),
     #[cfg(feature = "shacl-core")]
     #[error("shacl: {0}")]
     Shacl(#[from] ShaclError),
@@ -245,14 +233,34 @@ pub enum CraqleError {
     SyncInputRejected(String),
     #[error("sync: {0}")]
     Sync(#[from] sync::CraqleSyncError),
+    #[error("history: {0}")]
+    History(#[from] HistoryError),
     #[error("search worker: {0}")]
     SearchWorker(String),
+    #[error("search wait for target {target}: {reason}")]
+    SearchWait {
+        target: u64,
+        reason: SearchWaitError,
+    },
+    #[error("search maintenance for target {target}: {source}")]
+    SearchMaintenance {
+        target: u64,
+        kind: CraqleErrorKind,
+        #[source]
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
     #[error("unsupported update across multiple graphs")]
     MultiGraphUpdateUnsupported,
     #[error(transparent)]
     UnsupportedRdfStarTerm(#[from] UnsupportedRdfStarTerm),
     #[error("replication record rejected: {reason}")]
     ReplicationRejected {
+        error_kind: CraqleErrorKind,
+        reason: String,
+    },
+    #[error("authoritative repair was accepted but follow-up work failed: {reason}")]
+    RepairAccepted {
+        report: Box<RepairReport>,
         error_kind: CraqleErrorKind,
         reason: String,
     },
@@ -269,11 +277,68 @@ impl From<sparql::SparqlError> for CraqleError {
     }
 }
 
+impl From<replication::UpdateError> for CraqleError {
+    fn from(error: replication::UpdateError) -> Self {
+        Self::Update(outbound_update(error))
+    }
+}
+
+impl From<rocrate::RoCrateError> for CraqleError {
+    fn from(error: rocrate::RoCrateError) -> Self {
+        Self::RoCrate(match error {
+            rocrate::RoCrateError::Update(error) => {
+                rocrate::RoCrateError::Update(outbound_update(error))
+            }
+            error => error,
+        })
+    }
+}
+
+fn outbound_update(error: replication::UpdateError) -> replication::UpdateError {
+    match error {
+        replication::UpdateError::Accepted {
+            receipt,
+            error_kind,
+            reason,
+        } => replication::UpdateError::Accepted {
+            receipt: Box::new((*receipt).outbound()),
+            error_kind,
+            reason,
+        },
+        error => error,
+    }
+}
+
+impl From<replication::MergeError> for CraqleError {
+    fn from(error: replication::MergeError) -> Self {
+        Self::Merge(match error {
+            replication::MergeError::Accepted {
+                receipt,
+                error_kind,
+                reason,
+            } => replication::MergeError::Accepted {
+                receipt: Box::new((*receipt).outbound()),
+                error_kind,
+                reason,
+            },
+            error => error,
+        })
+    }
+}
+
 impl CraqleError {
-    /// Stable category for programmatic error handling in the 0.2 series.
+    /// Stable category for programmatic error handling.
     pub fn kind(&self) -> CraqleErrorKind {
         match self {
             Self::Io(_) | Self::SearchWorker(_) => CraqleErrorKind::Storage,
+            Self::SearchMaintenance { kind, .. } => *kind,
+            Self::SearchWait { reason, .. } => match reason {
+                SearchWaitError::Capacity | SearchWaitError::Deadline => {
+                    CraqleErrorKind::ResourceLimit
+                }
+                SearchWaitError::Cancelled => CraqleErrorKind::Cancelled,
+                SearchWaitError::Stopped => CraqleErrorKind::DependencyUnavailable,
+            },
             Self::Authorization(_) => CraqleErrorKind::Unauthorized,
             Self::Store(error) => error.kind(),
             Self::Search(error) => error.kind(),
@@ -290,9 +355,11 @@ impl CraqleError {
             Self::RoCratePolicyRequired { .. } => CraqleErrorKind::InvalidInput,
             Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
             Self::Sync(error) => error.kind(),
+            Self::History(error) => error.kind(),
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
             Self::UnsupportedRdfStarTerm(_) => CraqleErrorKind::Unsupported,
             Self::ReplicationRejected { error_kind, .. } => *error_kind,
+            Self::RepairAccepted { error_kind, .. } => *error_kind,
         }
     }
 
@@ -310,6 +377,9 @@ impl CraqleError {
 }
 
 pub type Result<T> = std::result::Result<T, CraqleError>;
+
+#[cfg(test)]
+type GraphLockHook = Box<dyn FnOnce(&CraqleNode) + Send>;
 
 /// Request-path durability policy for callers with an external durable WAL.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -329,6 +399,20 @@ impl CraqleRequestDurability {
     fn publishes_irokle(self) -> bool {
         matches!(self, Self::Durable)
     }
+}
+
+/// A strict RO-Crate replacement for [`CraqleNode::apply_rocrate_with`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoCrateWrite<'a> {
+    pub graph: GraphId,
+    pub jsonld: &'a str,
+    /// Stored when the write creates the graph.
+    pub policy: GraphPolicy,
+    pub durability: CraqleRequestDurability,
+    /// CRDT actor for writes that do not publish; ignored when `durability` publishes.
+    pub actor: Option<ActorId>,
+    /// Signed into the published event; a write that does not publish fails unchanged.
+    pub commit: Option<CommitInfo>,
 }
 
 /// Fjall persistence mode used when Craqle explicitly persists its graph store.
@@ -363,10 +447,7 @@ impl CraqleFjallPersistMode {
     }
 }
 
-/// Lifecycle state of Craqle's disposable persistent query indexes.
-///
-/// The canonical CRDT quad state remains authoritative in every state. A
-/// non-ready state affects query-index availability only, never source reads.
+/// Lifecycle state of disposable query indexes; CRDT source remains authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum QueryIndexState {
@@ -393,10 +474,7 @@ pub struct QueryIndexStatus {
     pub last_build_sequence: u64,
 }
 
-/// A bounded diagnostic report for persistent-query-index verification.
-///
-/// Problems are stable implementation identifiers only; no RDF term or value
-/// bytes are included.
+/// Bounded query-index verification without RDF term or value bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct QueryIndexVerification {
@@ -454,9 +532,9 @@ impl RoCrateVersion {
 
     pub(crate) const fn context_bytes(self) -> &'static [u8] {
         match self {
-            Self::V1_1 => include_bytes!("resources/ro_crate_1_1.jsonld"),
-            Self::V1_2 => include_bytes!("resources/ro_crate_1_2.jsonld"),
-            Self::V1_3 => include_bytes!("resources/ro_crate_1_3.jsonld"),
+            Self::V1_1 => include_bytes!("rocrate/1_1.jsonld"),
+            Self::V1_2 => include_bytes!("rocrate/1_2.jsonld"),
+            Self::V1_3 => include_bytes!("rocrate/1_3.jsonld"),
         }
     }
 }
@@ -607,11 +685,30 @@ pub struct SearchRequest<'a> {
     pub limit: usize,
 }
 
+/// Cancellation and a timeout for one search request.
+#[derive(Clone, Debug, Default)]
+pub struct SearchOptions {
+    pub timeout: Option<Duration>,
+    pub cancellation: QueryCancellation,
+}
+
+/// Full-text search with explicit cancellation and timeout.
+pub struct SearchRun<'a> {
+    pub request: SearchRequest<'a>,
+    pub options: &'a SearchOptions,
+}
+
 /// Full-text search restricted to an explicit set of graphs.
 pub struct GraphSearchRequest<'a> {
     pub graphs: &'a [GraphId],
     pub query: &'a str,
     pub limit: usize,
+}
+
+/// Graph-scoped full-text search with explicit cancellation and timeout.
+pub struct GraphSearchRun<'a> {
+    pub request: GraphSearchRequest<'a>,
+    pub options: &'a SearchOptions,
 }
 
 /// One subject to resolve into its visible `(predicate, object)` pairs.
@@ -620,162 +717,552 @@ pub struct DescribeRequest<'a> {
     pub subject_id: &'a str,
 }
 
-/// Hard cap on a caller-supplied search limit, applied at every entry point.
-///
-/// Tantivy's top-k collector pre-allocates `limit * 2` and the over-fetch
-/// multiplies the limit again before that, so an unbounded limit is an
-/// allocation the caller picks — `fts:limit 10000000000000` from a remote
-/// query aborted the process. Ten thousand rows is well past any real page
-/// and still a trivially sized collector.
+/// Hard cap applied before Tantivy allocates its top-k collector.
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
 
 #[cfg(test)]
-const MAX_SYNC_POLICY_PATHS: usize = 1_024;
-const SEARCH_QUEUE_FLUSH_CHUNK: usize = 50_000;
-/// Smallest Tantivy over-fetch before authorization filtering.
-const SEARCH_MIN_FETCH: usize = 64;
+const MAX_POLICY_PATHS: usize = 1_024;
+const SEARCH_FLUSH_CHUNK: usize = 50_000;
+/// Control messages one worker cycle collects before it goes back to work.
+/// Anything past this stays in the channel for the next cycle.
+const MAX_CONTROL_MESSAGES: usize = 1_024;
 /// Above this many selected graphs, `search_graphs` runs one filtered search
 /// instead of one full top-k collection per graph.
-const SEARCH_GRAPHS_PER_GRAPH_LIMIT: usize = 8;
+const LINEAR_GRAPH_LIMIT: usize = 8;
 /// Graphs reindexed between Tantivy commits in `reindex_search`.
-const REINDEX_COMMIT_BATCH_GRAPHS: usize = 64;
+const REINDEX_BATCH_GRAPHS: usize = 64;
 
+/// Completion of an explicit maintenance shutdown attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownState {
+    Complete,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SearchWaitError {
+    #[error("maintenance worker stopped")]
+    Stopped,
+    #[error("maintenance waiter capacity exhausted")]
+    Capacity,
+    #[error("maintenance wait cancelled; durable work remains queued")]
+    Cancelled,
+    #[error("maintenance wait deadline expired; durable work remains queued")]
+    Deadline,
+}
+
+pub struct QueryRequest<'a> {
+    pub sparql: &'a str,
+    pub options: &'a QueryOptions,
+}
+
+/// Waiting limits do not discard the durable indexing obligation.
+#[derive(Clone, Debug, Default)]
+pub struct SearchFlushOptions {
+    pub timeout: Option<Duration>,
+    pub cancellation: QueryCancellation,
+}
+
+/// Reader coverage includes the submitted target and attached recovery work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchReceipt {
+    pub target: u64,
+    pub covered: u64,
+    pub recovery: Option<u64>,
+    pub index_id: [u8; 16],
+}
+
+const MAX_PENDING_FLUSHES: usize = 1_024;
+const SEARCH_WAIT_POLL: Duration = Duration::from_millis(5);
+
+type SearchReply = std::result::Result<SearchReceipt, MaintenanceFailure>;
+
+#[derive(Clone, Debug)]
+struct MaintenanceFailure {
+    kind: CraqleErrorKind,
+    source: Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl MaintenanceFailure {
+    fn search(error: search::SearchError) -> Self {
+        Self {
+            kind: error.kind(),
+            source: Arc::new(error),
+        }
+    }
+
+    fn store(error: store::StoreError) -> Self {
+        Self {
+            kind: error.kind(),
+            source: Arc::new(error),
+        }
+    }
+
+    fn message(kind: CraqleErrorKind, message: String) -> Self {
+        Self {
+            kind,
+            source: Arc::new(std::io::Error::other(message)),
+        }
+    }
+
+    fn into_error(self, target: u64) -> CraqleError {
+        CraqleError::SearchMaintenance {
+            target,
+            kind: self.kind,
+            source: self.source,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FlushPermit {
+    pending: Arc<AtomicUsize>,
+    released: AtomicBool,
+}
+
+impl FlushPermit {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for FlushPermit {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct FlushWaiter {
+    control: search::queue::DrainControl,
+    permit: Arc<FlushPermit>,
+}
+
+impl Drop for FlushWaiter {
+    fn drop(&mut self) {
+        self.control.cancel();
+        self.permit.release();
+    }
+}
+
+#[derive(Debug)]
+struct FlushRequest {
+    requested: u64,
+    target: u64,
+    recovery: Option<u64>,
+    control: search::queue::DrainControl,
+    reply: mpsc::Sender<SearchReply>,
+    _permit: Option<Arc<FlushPermit>>,
+}
+
+#[derive(Debug)]
 enum SearchWorkerMessage {
     Wake,
-    Flush(mpsc::Sender<std::result::Result<(), String>>),
+    Flush(FlushRequest),
     Stop,
 }
 
+impl SearchWorkerMessage {
+    #[cfg(test)]
+    fn flush_reply(reply: mpsc::Sender<SearchReply>, target: u64) -> Self {
+        Self::Flush(FlushRequest {
+            requested: target,
+            target,
+            recovery: None,
+            control: search::queue::DrainControl::default(),
+            reply,
+            _permit: None,
+        })
+    }
+}
+
 struct SearchUpdateWorker {
-    sender: mpsc::Sender<SearchWorkerMessage>,
-    /// `true` once a wake has been sent and not yet consumed by the worker.
-    /// Collapses a burst of writes into a single channel message instead of
-    /// one unbounded-channel send per write.
+    sender: mpsc::SyncSender<SearchWorkerMessage>,
+    store: Arc<GraphStore>,
     wake_pending: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SearchUpdateWorker {
     fn start(store: Arc<GraphStore>, search: Arc<SearchIndex>) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_FLUSHES + 2);
         let wake_pending = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::new(AtomicBool::new(false));
         let ctx = SearchWorkerCtx {
-            store,
+            store: store.clone(),
             search,
             wake_pending: wake_pending.clone(),
+            stopping: stopping.clone(),
         };
-        let handle = std::thread::spawn(move || {
-            run_search_update_worker(receiver, ctx);
-        });
-
+        let handle = std::thread::spawn(move || run_search_worker(receiver, ctx));
         Self {
             sender,
+            store,
             wake_pending,
+            stopping,
+            pending: Arc::new(AtomicUsize::new(0)),
             handle: Some(handle),
         }
     }
 
-    /// Ask the worker to drain the FTS queues.
-    ///
-    /// Skipping the send while a wake is already outstanding is safe: the
-    /// worker clears the flag *before* it starts draining, so any enqueue that
-    /// observed the flag set is guaranteed to be visible to that drain. A
-    /// one-second receive timeout backstops the flag either way.
+    fn stop(&self) {
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.try_send(SearchWorkerMessage::Stop);
+        }
+    }
+
+    fn shutdown(&mut self) -> bool {
+        self.stop();
+        self.handle
+            .take()
+            .is_none_or(|handle| handle.join().is_ok())
+    }
+
+    fn shutdown_within(&mut self, timeout: Duration) -> Result<ShutdownState> {
+        self.stop();
+        let started = Instant::now();
+        while self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(ShutdownState::TimedOut);
+            }
+            // JoinHandle has no timed join; ownership stays here until it finishes.
+            std::thread::sleep(remaining.min(SEARCH_WAIT_POLL));
+        }
+        if self.shutdown() {
+            Ok(ShutdownState::Complete)
+        } else {
+            Err(CraqleError::SearchWorker(
+                "maintenance thread panicked".to_owned(),
+            ))
+        }
+    }
+
     fn wake(&self) {
-        if self.wake_pending.swap(true, Ordering::SeqCst) {
+        if self.stopping.load(Ordering::Acquire) || self.wake_pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if self.sender.send(SearchWorkerMessage::Wake).is_err() {
-            self.wake_pending.store(false, Ordering::SeqCst);
+        if self.sender.try_send(SearchWorkerMessage::Wake).is_err() {
+            self.wake_pending.store(false, Ordering::Release);
         }
     }
 
     fn flush(&self) -> Result<()> {
-        let (sender, receiver) = mpsc::channel();
-        self.sender
-            .send(SearchWorkerMessage::Flush(sender))
-            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?;
-        receiver
-            .recv()
-            .map_err(|_| CraqleError::SearchWorker("stopped".to_string()))?
-            .map_err(CraqleError::SearchWorker)
+        self.flush_with(&SearchFlushOptions::default()).map(|_| ())
+    }
+
+    fn flush_with(&self, options: &SearchFlushOptions) -> Result<SearchReceipt> {
+        #[cfg(not(feature = "search"))]
+        {
+            let _ = options;
+            return Err(search::SearchError::Disabled.into());
+        }
+        #[cfg(feature = "search")]
+        {
+            let target = self.store.current_dirty_token();
+            let failure = |reason| CraqleError::SearchWait { target, reason };
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(failure(SearchWaitError::Stopped));
+            }
+            if options.cancellation.is_cancelled() {
+                return Err(failure(SearchWaitError::Cancelled));
+            }
+            self.pending
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < MAX_PENDING_FLUSHES).then(|| count + 1)
+                })
+                .map_err(|_| failure(SearchWaitError::Capacity))?;
+            let permit = Arc::new(FlushPermit {
+                pending: self.pending.clone(),
+                released: AtomicBool::new(false),
+            });
+            let control = search::queue::DrainControl::with_stop(self.stopping.clone());
+            let _waiter = FlushWaiter {
+                control: control.clone(),
+                permit: permit.clone(),
+            };
+            let (reply, receiver) = mpsc::channel();
+            let request = FlushRequest {
+                requested: target,
+                target,
+                recovery: None,
+                control,
+                reply,
+                _permit: Some(permit),
+            };
+            self.sender
+                .try_send(SearchWorkerMessage::Flush(request))
+                .map_err(|error| {
+                    failure(match error {
+                        mpsc::TrySendError::Full(_) => SearchWaitError::Capacity,
+                        mpsc::TrySendError::Disconnected(_) => SearchWaitError::Stopped,
+                    })
+                })?;
+            let started = Instant::now();
+            loop {
+                if options.cancellation.is_cancelled() {
+                    return Err(failure(SearchWaitError::Cancelled));
+                }
+                let remaining = options
+                    .timeout
+                    .map(|timeout| timeout.saturating_sub(started.elapsed()));
+                if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                    return Err(failure(SearchWaitError::Deadline));
+                }
+                match receiver
+                    .recv_timeout(remaining.unwrap_or(SEARCH_WAIT_POLL).min(SEARCH_WAIT_POLL))
+                {
+                    Ok(result) => return result.map_err(|error| error.into_error(target)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(failure(SearchWaitError::Stopped));
+                    }
+                }
+            }
+        }
     }
 }
 
 impl Drop for SearchUpdateWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(SearchWorkerMessage::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        let _ = self.shutdown();
     }
 }
 
-/// Everything the background indexer thread owns.
 struct SearchWorkerCtx {
     store: Arc<GraphStore>,
     search: Arc<SearchIndex>,
     wake_pending: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
 }
 
-fn run_search_update_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
+fn collect_search_messages(
+    receiver: &mpsc::Receiver<SearchWorkerMessage>,
+    pending: &mut Vec<FlushRequest>,
+    wait: Duration,
+) -> (bool, bool) {
+    let mut woke = false;
+    let mut message = match receiver.recv_timeout(wait) {
+        Ok(message) => Some(message),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => return (true, false),
+    };
+    for index in 0..MAX_CONTROL_MESSAGES {
+        match message.take() {
+            Some(SearchWorkerMessage::Stop) => return (true, woke),
+            Some(SearchWorkerMessage::Flush(request)) if !request.control.is_cancelled() => {
+                pending.push(request);
+                woke = true;
+            }
+            Some(SearchWorkerMessage::Wake) => woke = true,
+            Some(SearchWorkerMessage::Flush(_)) | None => {}
+        }
+        if index + 1 == MAX_CONTROL_MESSAGES {
+            break;
+        }
+        message = receiver.try_recv().ok();
+        if message.is_none() {
+            break;
+        }
+    }
+    (false, woke)
+}
+
+fn settle_search_failures(
+    pending: &mut Vec<FlushRequest>,
+    failures: &[search::queue::DrainFailure],
+) -> Option<u64> {
+    let retry_at = failures
+        .iter()
+        .filter_map(|failure| (failure.retry_at_ms != u64::MAX).then_some(failure.retry_at_ms))
+        .min();
+    let mut kept = Vec::new();
+    for request in pending.drain(..) {
+        let permanent = failures
+            .iter()
+            .find(|failure| failure.owed_from <= request.target && failure.retry_at_ms == u64::MAX);
+        if let Some(failure) = permanent {
+            let failure = MaintenanceFailure::message(
+                failure.error_kind,
+                describe_search_failures(std::slice::from_ref(failure)),
+            );
+            let _ = request.reply.send(Err(failure));
+        } else {
+            kept.push(request);
+        }
+    }
+    *pending = kept;
+    retry_at
+}
+
+fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchWorkerCtx) {
+    let mut pending: Vec<FlushRequest> = Vec::new();
+    let mut active = false;
+    let mut certified = None;
+    let mut cleanup_reported = false;
+    let mut retry_at = None;
     loop {
-        let mut flush_replies = Vec::new();
-        if collect_search_worker_messages(&receiver, &mut flush_replies) {
-            for reply in flush_replies {
-                let _ = reply.send(Err("stopped".to_string()));
+        pending.retain(|request| !request.control.is_cancelled());
+        let wait = if active {
+            Duration::ZERO
+        } else if let Some(retry_at) = retry_at {
+            ctx.search.retry_wait(retry_at).min(SEARCH_WAIT_POLL)
+        } else if !pending.is_empty() {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1)
+        };
+        let (stop, woke) = collect_search_messages(&receiver, &mut pending, wait);
+        if stop || ctx.stopping.load(Ordering::Acquire) {
+            for request in pending.drain(..) {
+                request.control.cancel();
+                let _ = request.reply.send(Err(MaintenanceFailure::message(
+                    CraqleErrorKind::DependencyUnavailable,
+                    "maintenance worker stopped".to_owned(),
+                )));
             }
             break;
         }
-
-        // Cleared before the drain, so a writer that enqueues after this point
-        // always gets a fresh wake through.
-        ctx.wake_pending.store(false, Ordering::SeqCst);
-
-        let result = drain_search_queue_guarded(&ctx);
-        let failed = result.is_err();
-        for reply in flush_replies {
-            let _ = reply.send(result.clone());
+        ctx.wake_pending.store(false, Ordering::Release);
+        let repairing = ctx.search.queue_repairs(&ctx.store);
+        if let Some(due) = retry_at
+            && !woke
+            && !repairing
+            && !ctx.search.retry_wait(due).is_zero()
+        {
+            continue;
         }
-        if failed {
-            std::thread::sleep(Duration::from_millis(250));
+        retry_at = None;
+        let selected = pending
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, request)| request.target)
+            .map(|(index, _)| index);
+        let target = selected
+            .map_or_else(
+                || ctx.store.current_dirty_token(),
+                |index| pending[index].target,
+            )
+            .max(certified.unwrap_or(0));
+        // One caller abandoning its wait must not cancel shared indexing work.
+        let control = search::queue::DrainControl::with_stop(ctx.stopping.clone());
+        let progress = drain_search_slice(
+            &ctx,
+            search::queue::DrainRequest {
+                bound: search::queue::QueueBound {
+                    chunk: SEARCH_FLUSH_CHUNK,
+                    max_token: Some(target),
+                },
+                control,
+            },
+        );
+        match progress {
+            Err(error) => {
+                for request in pending.drain(..) {
+                    let _ = request.reply.send(Err(error.clone()));
+                }
+                active = false;
+            }
+            Ok(progress) => {
+                if let Some(failure) = progress
+                    .cleanup_failures
+                    .first()
+                    .filter(|_| !cleanup_reported)
+                {
+                    tracing::warn!(
+                        jobs = progress.cleanup_failures.len(),
+                        generation = ?failure.generation,
+                        bytes = failure.bytes,
+                        limit = failure.limit,
+                        "search cleanup exceeds its memory budget"
+                    );
+                    cleanup_reported = true;
+                }
+                if let Some(recovery) = progress.recovery {
+                    certified = None;
+                    for request in &mut pending {
+                        request.target = request.target.max(recovery);
+                        request.recovery = Some(request.recovery.unwrap_or(0).max(recovery));
+                    }
+                    if recovery > target {
+                        active = true;
+                        continue;
+                    }
+                }
+                if !progress.failures.is_empty() {
+                    retry_at = settle_search_failures(&mut pending, &progress.failures);
+                    active = retry_at.is_none() && progress.covered != 0 && progress.remaining;
+                    continue;
+                }
+                active = progress.remaining;
+                if progress.remaining {
+                    continue;
+                }
+                if pending.is_empty() && progress.covered == 0 && certified == Some(target) {
+                    continue;
+                }
+                let completed = ctx
+                    .search
+                    .complete_coverage(&ctx.store, target)
+                    .map_err(MaintenanceFailure::search)
+                    .and_then(|()| ctx.store.persist().map_err(MaintenanceFailure::store));
+                if completed.is_ok() {
+                    certified = Some(target);
+                }
+                let mut kept = Vec::new();
+                for request in pending.drain(..) {
+                    if request.target > target {
+                        kept.push(request);
+                        continue;
+                    }
+                    #[cfg(feature = "search")]
+                    let result = completed.clone().map(|()| SearchReceipt {
+                        target: request.requested,
+                        covered: target,
+                        recovery: request.recovery,
+                        index_id: ctx.search.index_id(),
+                    });
+                    #[cfg(not(feature = "search"))]
+                    let result = completed.clone().and(Err(MaintenanceFailure::search(
+                        search::SearchError::Disabled,
+                    )));
+                    let _ = request.reply.send(result);
+                }
+                pending = kept;
+            }
         }
     }
 }
 
-fn collect_search_worker_messages(
-    receiver: &mpsc::Receiver<SearchWorkerMessage>,
-    flush_replies: &mut Vec<mpsc::Sender<std::result::Result<(), String>>>,
-) -> bool {
-    match receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(SearchWorkerMessage::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Ok(SearchWorkerMessage::Flush(reply)) => flush_replies.push(reply),
-        Ok(SearchWorkerMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
-    }
-
-    while let Ok(message) = receiver.try_recv() {
-        match message {
-            SearchWorkerMessage::Wake => {}
-            SearchWorkerMessage::Flush(reply) => flush_replies.push(reply),
-            SearchWorkerMessage::Stop => return true,
+fn drain_search_slice(
+    ctx: &SearchWorkerCtx,
+    request: search::queue::DrainRequest,
+) -> std::result::Result<search::queue::DrainProgress, MaintenanceFailure> {
+    let operation = panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if ctx.search.take_drain_panic() {
+            panic!("injected drain panic");
         }
-    }
-
-    false
-}
-
-/// Runs one drain cycle, turning a panic into an error rather than losing the
-/// indexer thread — it is the only thread that can repair the index.
-fn drain_search_queue_guarded(ctx: &SearchWorkerCtx) -> std::result::Result<(), String> {
-    let drain = panic::AssertUnwindSafe(|| flush_search_queue(&ctx.store, &ctx.search));
-    match panic::catch_unwind(drain) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(payload) => Err(format!(
-            "search worker panicked: {}",
-            panic_message(&*payload)
-        )),
-    }
+        if let Err(error) = ctx.store.repair_query_with(&ctx.stopping) {
+            tracing::warn!(%error, "query index repair remains pending");
+        }
+        ctx.search
+            .drain_queues(&ctx.store, request)
+            .map_err(MaintenanceFailure::search)
+    });
+    panic::catch_unwind(operation).unwrap_or_else(|payload| {
+        Err(MaintenanceFailure::message(
+            CraqleErrorKind::Storage,
+            format!("maintenance worker panicked: {}", panic_message(&*payload)),
+        ))
+    })
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -788,33 +1275,68 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-/// Drains the FTS queues until everything enqueued *before this call* is indexed.
-///
-/// Bounded by the dirty token observed on entry: without that, a writer that
-/// keeps enqueueing holds the loop open and `flush_search_updates()` never
-/// returns.
+// Tests synchronously drain the same fixed coverage boundary as the worker.
+#[cfg(test)]
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
     #[cfg(test)]
-    if search.take_armed_drain_panic() {
+    if search.take_drain_panic() {
         panic!("injected drain panic");
     }
-
-    let max_token = store.current_dirty_token();
-    let mut processed_any = false;
+    let mut target = store.current_dirty_token();
+    let control = search::queue::DrainControl::default();
+    let started = Instant::now();
     loop {
-        let bound = search::QueueBound {
-            chunk: SEARCH_QUEUE_FLUSH_CHUNK,
-            max_token: Some(max_token),
-        };
-        let processed = search.process_queued_updates(store, bound)?;
-        if processed == 0 {
-            if processed_any {
-                store.persist()?;
-            }
-            return Ok(());
+        let progress = search.drain_queues(
+            store,
+            search::queue::DrainRequest {
+                bound: search::queue::QueueBound {
+                    chunk: SEARCH_FLUSH_CHUNK,
+                    max_token: Some(target),
+                },
+                control: control.clone(),
+            },
+        )?;
+        if started.elapsed() > Duration::from_secs(180) {
+            return Err(CraqleError::SearchWorker(
+                "search test flush exceeded its deadlock cap".to_owned(),
+            ));
         }
-        processed_any = true;
+        if let Some(recovery) = progress.recovery
+            && recovery > target
+        {
+            target = recovery;
+            continue;
+        }
+        if !progress.failures.is_empty() {
+            return Err(CraqleError::SearchWorker(describe_search_failures(
+                &progress.failures,
+            )));
+        }
+        if !progress.remaining {
+            break;
+        }
     }
+    search.complete_coverage(store, target)?;
+    store.persist()?;
+    Ok(())
+}
+
+/// Name what a flush could not cover, with the first entry's diagnostic.
+fn describe_search_failures(failures: &[search::queue::DrainFailure]) -> String {
+    let mut message = format!("{} search queue entries still owed", failures.len());
+    if let Some(first) = failures.first() {
+        message.push_str(&format!(
+            "; {} {:?} target {} failed {} times ({}; retry at {}): {}",
+            first.graph.as_str(),
+            first.kind,
+            first.target,
+            first.attempts,
+            first.code,
+            first.retry_at_ms,
+            first.diagnostic
+        ));
+    }
+    message
 }
 
 /// A graph whose reindex scan was pinned at `upto`. Only queue entries at or
@@ -841,11 +1363,34 @@ pub struct CraqleNode {
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
     remote_policy_authorizer: Arc<dyn RemotePolicyAuthorizer>,
     reconcile_guard: Mutex<()>,
+    /// Test-only work run on entry, before a write takes its graph lock.
+    #[cfg(test)]
+    before_graph_lock: Mutex<Option<GraphLockHook>>,
     replication_rejections: AtomicU64,
     /// Set by a test to hold a reindex between a graph's scan and the queue
     /// clear that covers it.
     #[cfg(test)]
     reindex_gate: std::sync::Mutex<Option<ReindexGate>>,
+}
+
+struct PolicyWrite<'a> {
+    graph: &'a GraphId,
+    policy: GraphPolicy,
+    durability: CraqleRequestDurability,
+}
+
+struct BatchFinish<'a> {
+    graph: &'a GraphId,
+    batch: Batch,
+    durability: CraqleRequestDurability,
+}
+
+struct CrateBuild<'a> {
+    auth: &'a dyn Authorizer,
+    request: CreateCrateRequest,
+    durability: CraqleRequestDurability,
+    actor: Option<ActorId>,
+    version: RoCrateVersion,
 }
 
 /// Reports that a reindex reached the point between a scan and its clear, then
@@ -862,7 +1407,8 @@ pub struct CraqleOptions {
     sync: Option<Arc<dyn sync::CraqleGraphSync>>,
     remote_policy_authorizer: Arc<dyn RemotePolicyAuthorizer>,
     search_storage: SearchStorage,
-    graph_store_persist_mode: CraqleFjallPersistMode,
+    store_mode: CraqleFjallPersistMode,
+    memory_budget: MemoryBudget,
     #[cfg(feature = "shacl-core")]
     pending_replay_policy: PendingReplayPolicy,
 }
@@ -882,7 +1428,8 @@ impl Default for CraqleOptions {
             sync: None,
             remote_policy_authorizer: Arc::new(DenyRemotePolicyChanges),
             search_storage: SearchStorage::default(),
-            graph_store_persist_mode: CraqleFjallPersistMode::default(),
+            store_mode: CraqleFjallPersistMode::default(),
+            memory_budget: MemoryBudget::default(),
             #[cfg(feature = "shacl-core")]
             pending_replay_policy: PendingReplayPolicy::default(),
         }
@@ -904,13 +1451,18 @@ impl CraqleOptions {
         self
     }
 
+    pub fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
     pub fn with_graph_store_persist_mode(mut self, mode: CraqleFjallPersistMode) -> Self {
-        self.graph_store_persist_mode = mode;
+        self.store_mode = mode;
         self
     }
 
     pub fn graph_store_persist_mode(&self) -> CraqleFjallPersistMode {
-        self.graph_store_persist_mode
+        self.store_mode
     }
 
     #[cfg(feature = "shacl-core")]
@@ -992,51 +1544,57 @@ impl CraqleNode {
 
     /// Open a node rooted at `path` with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: CraqleOptions) -> Result<Self> {
+        options
+            .memory_budget
+            .validate()
+            .map_err(store::StoreError::from)?;
         let root = path.as_ref();
         std::fs::create_dir_all(root)?;
         let search_storage = options.search_storage;
-        let graph_store_persist_mode = options.graph_store_persist_mode;
+        let store_mode = options.store_mode;
         #[cfg(feature = "shacl-core")]
         let pending_replay_policy = options.pending_replay_policy;
 
-        let store = Arc::new(GraphStore::open_with_persist_mode(
+        let store = Arc::new(GraphStore::open_with_budget(
             root.join("store"),
-            graph_store_persist_mode.into_store_mode(),
+            store_mode.into_store_mode(),
+            options.memory_budget,
         )?);
+        let budget = store.memory_budget();
         let search = Arc::new(match search_storage {
-            SearchStorage::Disk => SearchIndex::open(root.join("search"))?,
-            SearchStorage::Memory => SearchIndex::open_in_memory()?,
+            SearchStorage::Disk => SearchIndex::open_with_budget(root.join("search"), budget)?,
+            SearchStorage::Memory => SearchIndex::memory_with_budget(budget)?,
         });
-        let search_needs_rebuild =
-            search.needs_rebuild() || search_storage == SearchStorage::Memory;
+        let search_needs_rebuild = search.bind_store(&store)?.is_some();
+        if search_needs_rebuild {
+            store.persist()?;
+        }
         #[allow(unused_mut)]
-        let mut node = Self::from_store_and_search(store, search.clone(), options);
+        let mut node = Self::assemble_store(store, search.clone(), options);
         reconcile_at_open(&node)?;
         #[cfg(feature = "shacl-core")]
         {
             let startup_started = Instant::now();
             let mut outcome = PendingReplayOutcome::default();
-            if node.store.pending_shacl_queue_repair_required()? {
+            if node.store.shacl_repair_needed()? {
                 let repair = {
                     let _binding_guard = node.store.binding_guard();
-                    node.store.repair_pending_shacl_queue()?
+                    node.store.repair_shacl_queue()?
                 };
                 node.persist_fjall()?;
                 outcome.statistics.binding_records_scanned = repair.binding_records_scanned;
-                outcome.statistics.pending_queue_entries_scanned =
-                    repair.pending_queue_entries_scanned;
+                outcome.statistics.pending_queue_entries_scanned = repair.pending_entries_scanned;
             }
             let replay = match pending_replay_policy {
-                PendingReplayPolicy::ReplayAllBeforeOpen => Some(
-                    node.replication
-                        .replay_pending_bindings_bounded(usize::MAX, None)?,
-                ),
+                PendingReplayPolicy::ReplayAllBeforeOpen => {
+                    Some(node.replication.replay_bindings_bounded(usize::MAX, None)?)
+                }
                 PendingReplayPolicy::ReplayBounded {
                     max_graphs,
                     max_elapsed,
                 } => Some(
                     node.replication
-                        .replay_pending_bindings_bounded(max_graphs, Some(max_elapsed))?,
+                        .replay_bindings_bounded(max_graphs, Some(max_elapsed))?,
                 ),
                 PendingReplayPolicy::Defer => None,
             };
@@ -1052,12 +1610,32 @@ impl CraqleNode {
             node.startup_pending_replay = outcome;
         }
         if search_needs_rebuild {
-            node.schedule_full_search_reindex()?;
+            node.schedule_search_update();
         }
         Ok(node)
     }
 
     pub fn from_store_and_search(
+        store: Arc<GraphStore>,
+        search: Arc<SearchIndex>,
+        options: CraqleOptions,
+    ) -> Self {
+        let repair = search
+            .bind_store(&store)
+            .map_err(CraqleError::from)
+            .and_then(|target| {
+                if target.is_some() {
+                    store.persist()?;
+                }
+                Ok(())
+            });
+        if let Err(error) = repair {
+            tracing::warn!(%error, "search initialization remains pending");
+        }
+        Self::assemble_store(store, search, options)
+    }
+
+    fn assemble_store(
         store: Arc<GraphStore>,
         search: Arc<SearchIndex>,
         options: CraqleOptions,
@@ -1111,6 +1689,8 @@ impl CraqleNode {
             sync,
             remote_policy_authorizer,
             reconcile_guard: Mutex::new(()),
+            #[cfg(test)]
+            before_graph_lock: Mutex::new(None),
             replication_rejections: AtomicU64::new(0),
             #[cfg(test)]
             reindex_gate: std::sync::Mutex::new(None),
@@ -1198,8 +1778,8 @@ impl CraqleNode {
             }
             .into());
         }
-        self.ensure_prepared_document_current(document)?;
-        self.ensure_rocrate_policy_current(policy)?;
+        self.ensure_prepared_current(document)?;
+        self.ensure_policy_current(policy)?;
 
         let shacl = self.shacl.validate_delta(
             &document.graph,
@@ -1208,14 +1788,14 @@ impl CraqleNode {
             &options.validation,
         )?;
 
-        self.ensure_prepared_document_current(document)?;
-        self.ensure_rocrate_policy_current(policy)?;
+        self.ensure_prepared_current(document)?;
+        self.ensure_policy_current(policy)?;
         let conforms = document.structural_findings.is_empty() && shacl.conforms;
-        let accepted_by_write_policy =
+        let accepted_write_policy =
             document.structural_findings.is_empty() && shacl.accepted_by_write_policy;
         Ok(RoCratePolicyReport {
             conforms,
-            accepted_by_write_policy,
+            accepted_by_write_policy: accepted_write_policy,
             detected_version: document.detected_version,
             document_digest: document.document_digest,
             rocrate_violations: document.structural_findings.clone(),
@@ -1244,6 +1824,8 @@ impl CraqleNode {
         policy: Option<&CompiledRoCratePolicy>,
         mode: PreparedCommitMode,
     ) -> Result<PreparedRoCrateCommitOutcome> {
+        self.reconcile_pending(&document.graph);
+        let _write = self.lock_graph(&document.graph);
         self.authorize_prepared_document(auth, &document, Action::Write)?;
         if !document.structural_findings.is_empty() {
             return Err(CraqleError::RoCrate(RoCrateError::Update(
@@ -1520,7 +2102,7 @@ impl CraqleNode {
     ) -> Result<PendingReplayOutcome> {
         Ok(self
             .replication
-            .replay_pending_bindings_bounded(max_graphs, Some(max_elapsed))?)
+            .replay_bindings_bounded(max_graphs, Some(max_elapsed))?)
     }
 
     #[cfg(feature = "shacl-core")]
@@ -1528,12 +2110,12 @@ impl CraqleNode {
         let started = Instant::now();
         let repair = {
             let _binding_guard = self.store.binding_guard();
-            self.store.repair_pending_shacl_queue()?
+            self.store.repair_shacl_queue()?
         };
         self.persist_fjall()?;
         Ok(PendingReplayStatistics {
             binding_records_scanned: repair.binding_records_scanned,
-            pending_queue_entries_scanned: repair.pending_queue_entries_scanned,
+            pending_queue_entries_scanned: repair.pending_entries_scanned,
             elapsed: started.elapsed(),
             ..PendingReplayStatistics::default()
         })
@@ -1623,7 +2205,7 @@ impl CraqleNode {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn ensure_prepared_document_current(&self, document: &PreparedRoCrateDocument) -> Result<()> {
+    fn ensure_prepared_current(&self, document: &PreparedRoCrateDocument) -> Result<()> {
         let current = match &document.base {
             PreparedGraphBase::New => !self.store.contains_graph(&document.graph)?,
             PreparedGraphBase::Existing { data_version } => {
@@ -1642,7 +2224,7 @@ impl CraqleNode {
     }
 
     #[cfg(feature = "shacl-core")]
-    fn ensure_rocrate_policy_current(&self, policy: &CompiledRoCratePolicy) -> Result<()> {
+    fn ensure_policy_current(&self, policy: &CompiledRoCratePolicy) -> Result<()> {
         let shape_versions = policy.shacl.shape_versions();
         if policy.compiler_model_version != SHACL_COMPILER_MODEL_VERSION
             || policy.shacl.model_version() != SHACL_COMPILER_MODEL_VERSION
@@ -1743,12 +2325,10 @@ impl CraqleNode {
         Ok(topic_id)
     }
 
-    /// Deterministic graph topic id, binding it locally only if its genesis is
-    /// already present. Never mints, so concurrent callers on different nodes
-    /// cannot fork rival geneses for the same graph.
+    /// Bind a deterministic topic only when its genesis is already present.
     pub fn bind_or_derive_irokle_topic(&self, graph: &GraphId) -> Result<irokle::TopicId> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        if let Some(topic_id) = sync.bind_graph_topic_if_present(&self.store, graph)? {
+        if let Some(topic_id) = sync.bind_existing_topic(&self.store, graph)? {
             self.persist_fjall()?;
             return Ok(topic_id);
         }
@@ -1758,16 +2338,14 @@ impl CraqleNode {
     /// Binds the graph's topic id if its genesis is present locally, else `None`.
     pub fn bind_irokle_topic(&self, graph: &GraphId) -> Result<Option<irokle::TopicId>> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        let bound = sync.bind_graph_topic_if_present(&self.store, graph)?;
+        let bound = sync.bind_existing_topic(&self.store, graph)?;
         if bound.is_some() {
             self.persist_fjall()?;
         }
         Ok(bound)
     }
 
-    /// Mints the graph's topic genesis with an explicit member set (or binds an
-    /// existing one). The only path that creates a graph genesis; callers own
-    /// the single-minter discipline.
+    /// Mint or bind a topic genesis; callers enforce single-minter discipline.
     pub fn mint_irokle_topic(
         &self,
         graph: &GraphId,
@@ -1798,6 +2376,171 @@ impl CraqleNode {
         Ok(sync.sync_status(&self.store, graph)?)
     }
 
+    pub fn apply_mutation(
+        &self,
+        auth: &dyn Authorizer,
+        request: MutationRequest,
+    ) -> Result<MutationReceipt> {
+        self.reconcile_pending(&request.graph);
+        let _write = self.lock_graph(&request.graph);
+        self.ensure_graph_action(&request.graph, auth, Action::Write)?;
+        let receipt = self.replication.apply_mutation(request, None)?;
+        self.finish_mutation(receipt)
+    }
+
+    /// [`Self::apply_mutation`] whose published event carries `request.commit`.
+    /// A call that only returns an admission ticket publishes nothing and keeps no commit.
+    pub fn apply_mutation_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: MutationCommit,
+    ) -> Result<MutationReceipt> {
+        let MutationCommit { request, commit } = request;
+        self.reconcile_pending(&request.graph);
+        let _write = self.lock_graph(&request.graph);
+        self.ensure_graph_action(&request.graph, auth, Action::Write)?;
+        let receipt = self.replication.apply_mutation(request, Some(commit))?;
+        self.finish_mutation(receipt)
+    }
+
+    fn finish_mutation(&self, receipt: MutationReceipt) -> Result<MutationReceipt> {
+        if receipt.source == SourceOutcome::Prepared {
+            return Ok(receipt.outbound());
+        }
+        if let Err(error) = self.schedule_graph_search(&receipt.graph) {
+            return Err(accepted_error(receipt, error));
+        }
+        self.persist_receipt(receipt).map(MutationReceipt::outbound)
+    }
+
+    pub fn mutation_status(
+        &self,
+        auth: &dyn Authorizer,
+        lookup: MutationLookup,
+    ) -> Result<MutationStatus> {
+        if self.store.graph_tombstoned(&lookup.graph)? {
+            let policy = self
+                .store
+                .deleted_graph_policy(&lookup.graph)?
+                .ok_or_else(|| AuthorizationError::PermissionDenied {
+                    action: Action::Write,
+                    graph: lookup.graph.to_string(),
+                })?;
+            auth.authorize(&lookup.graph, &policy, Action::Write)?;
+        } else {
+            self.ensure_graph_action(&lookup.graph, auth, Action::Read)?;
+        }
+        Ok(match self.replication.mutation_status(&lookup)? {
+            MutationStatus::Known(receipt) => {
+                MutationStatus::Known(Box::new((*receipt).outbound()))
+            }
+            status => status,
+        })
+    }
+
+    pub fn reconcile_graph(
+        &self,
+        auth: &dyn Authorizer,
+        request: ReconcileRequest,
+    ) -> Result<RepairReport> {
+        let action = match request.mode {
+            RepairMode::DryRun => Action::Read,
+            RepairMode::Apply => Action::Write,
+        };
+        if self.store.graph_tombstoned(&request.graph)? {
+            let policy = self
+                .store
+                .deleted_graph_policy(&request.graph)?
+                .ok_or_else(|| AuthorizationError::PermissionDenied {
+                    action,
+                    graph: request.graph.to_string(),
+                })?;
+            auth.authorize(&request.graph, &policy, action)?;
+        } else {
+            self.ensure_graph_action(&request.graph, auth, action)?;
+        }
+        let report = match request.source {
+            ReconcileSource::HealthySnapshot {
+                source,
+                snapshot,
+                digest,
+            } => {
+                if snapshot.graph != request.graph {
+                    return Err(CraqleError::SyncInputRejected(
+                        "healthy snapshot graph does not match the authorized graph".to_owned(),
+                    ));
+                }
+                self.replication.reconcile_snapshot(&RepairRequest {
+                    id: request.id,
+                    authority: RepairAuthority::HealthySnapshot { source, digest },
+                    authoritative: snapshot,
+                    mode: request.mode,
+                    backup: None,
+                })?
+            }
+            ReconcileSource::History { topic } => {
+                let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+                if self.store.topic_graph_binding(topic.as_bytes())?.as_deref()
+                    != Some(request.graph.as_str())
+                {
+                    return Err(CraqleError::SyncInputRejected(
+                        "history topic is not bound to the authorized graph".to_owned(),
+                    ));
+                }
+                let frontier = sync.topic_frontier(topic)?;
+                let authority = RepairAuthority::History {
+                    topic,
+                    target: frontier.clock.clone(),
+                };
+                let history = sync.history_snapshot(&HistoryRequest {
+                    topic,
+                    graph: request.graph.clone(),
+                    target: frontier.clock,
+                });
+                match history {
+                    Ok(HistorySnapshot::Live(snapshot)) => {
+                        self.replication.reconcile_snapshot(&RepairRequest {
+                            id: request.id,
+                            authority,
+                            authoritative: snapshot,
+                            mode: request.mode,
+                            backup: None,
+                        })?
+                    }
+                    Ok(HistorySnapshot::Tombstoned) => self.replication.record_history(
+                        sync::HistoryFailure {
+                            id: request.id,
+                            graph: request.graph.clone(),
+                            authority,
+                            mode: request.mode,
+                        },
+                        RepairResult::Tombstoned,
+                    )?,
+                    Err(_) => self.replication.record_history(
+                        sync::HistoryFailure {
+                            id: request.id,
+                            graph: request.graph.clone(),
+                            authority,
+                            mode: request.mode,
+                        },
+                        RepairResult::HistoryMissing,
+                    )?,
+                }
+            }
+        };
+        if report.audit.result == RepairResult::Applied {
+            self.schedule_search_update();
+        }
+        if let Err(error) = self.persist_fjall() {
+            return Err(CraqleError::RepairAccepted {
+                error_kind: error.kind(),
+                reason: error.to_string(),
+                report: Box::new(report),
+            });
+        }
+        Ok(report)
+    }
+
     /// Apply every craqle topic's outstanding records, returning the graphs
     /// whose content changed. Callers that only want a count read `.len()`.
     pub fn reconcile_irokle(&self) -> Result<HashSet<GraphId>> {
@@ -1814,7 +2557,7 @@ impl CraqleNode {
         // Topics carry independent cursors, so one stall holds back only its
         // own topic; the first failure is reported once the rest have run.
         for topic_id in sync.craqle_topic_ids()? {
-            match self.reconcile_irokle_topic(sync, topic_id) {
+            match self.reconcile_topic(sync, topic_id) {
                 Ok(pass) => {
                     applied.extend(pass.applied);
                     stalled = stalled.or(pass.stalled);
@@ -1833,76 +2576,98 @@ impl CraqleNode {
         }
     }
 
+    /// Holds the graph write lock, under which reconciliation applies records, from the
+    /// authorization after it through the commit.
+    fn lock_graph(&self, graph: &GraphId) -> store::GraphWriteGuard<'_> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_graph_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hook(self);
+        }
+        self.store.graph_write_guard(graph)
+    }
+
+    /// Reconciles the graph's topic when this node published records the store does not cover.
+    /// Runs before authorization, so a revoking policy applies first; failures only log.
+    fn reconcile_pending(&self, graph: &GraphId) {
+        if let Err(error) = self.reconcile_graph_topic(graph) {
+            tracing::warn!(graph = %graph.as_str(), %error, "left own topic records pending");
+        }
+    }
+
+    /// Call it without graph locks held; the engine refuses a publish while records stay pending.
+    fn reconcile_graph_topic(&self, graph: &GraphId) -> Result<()> {
+        let Some(sync) = &self.sync else {
+            return Ok(());
+        };
+        let Some(topic) = sync.graph_topic_id(&self.store, graph)? else {
+            return Ok(());
+        };
+        if sync.own_pending(&self.store, topic)?.is_none() {
+            return Ok(());
+        }
+        let _reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pass = self.reconcile_topic(sync, topic)?;
+        if !pass.applied.is_empty() {
+            self.persist_fjall()?;
+        }
+        pass.stalled.map_or(Ok(()), Err)
+    }
+
     /// Apply a topic's outstanding records in order, stopping at the first
     /// failure a retry could clear rather than losing that record for good.
-    fn reconcile_irokle_topic(
+    fn reconcile_topic(
         &self,
         sync: &Arc<dyn sync::CraqleGraphSync>,
         topic_id: irokle::TopicId,
     ) -> Result<TopicPass> {
-        let stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
-        // A history read that fails is retryable, so it stalls its topic. A
-        // silent skip would leave the topic unread for the rest of the process.
-        let catchup = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
-
-        let sync::TopicCatchup {
-            records,
-            mut cursor,
-        } = catchup;
-
+        let mut stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
         let mut applied = HashSet::new();
         let mut stalled = None;
-        for topic_record in &records {
-            if let sync::TopicRecord::Rejected(record) = topic_record {
-                cursor.consume(topic_record);
-                let cursor_bytes = cursor
-                    .encode()?
-                    .expect("a consumed replication record has a cursor");
-                let graph = self
-                    .store
-                    .topic_graph_binding(topic_id.as_bytes())?
-                    .map(|graph| GraphId::new(&graph));
-                let rejection = RejectedReplicationRecord {
-                    topic: topic_id,
-                    record_id: record.meta.op_id,
-                    actor: record.meta.actor_id,
-                    sequence: record.meta.actor_seq,
-                    graph,
-                    payload_digest: record.payload_digest,
-                    error_kind: record.error_kind,
-                    reason: record.reason.clone(),
-                    seen_count: 0,
-                    acknowledged: false,
-                };
-                let rejection = self
-                    .store
-                    .record_replication_rejection(rejection, Some(&cursor_bytes))?;
-                self.store.persist()?;
-                self.replication_rejections.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    topic = %topic_id,
-                    record = %rejection.record_id,
-                    error_kind = ?rejection.error_kind,
-                    seen_count = rejection.seen_count,
-                    "persisted rejected craqle replication payload before cursor advance",
-                );
-                continue;
+        loop {
+            let sync::TopicCatchup {
+                records,
+                mut cursor,
+                more,
+            } = sync.topic_records_since(topic_id, stored_cursor.as_deref())?;
+            if records.is_empty() && more {
+                return Err(CraqleError::SyncInputRejected(
+                    "replication page made no progress".to_owned(),
+                ));
             }
-            let sync::TopicRecord::Event(record) = topic_record else {
-                unreachable!()
-            };
-            match self.apply_reconciled_record(sync, topic_id, record) {
-                Ok(Some(graph)) => {
-                    applied.insert(graph);
+            for topic_record in &records {
+                if matches!(topic_record, sync::TopicRecord::Control(_)) {
                     cursor.consume(topic_record);
+                    continue;
                 }
-                Ok(None) => cursor.consume(topic_record),
-                Err(error) if error.rejects_record() => {
+                if let sync::TopicRecord::Rejected(record) = topic_record {
                     cursor.consume(topic_record);
-                    let cursor_bytes = cursor
-                        .encode()?
-                        .expect("a consumed replication record has a cursor");
-                    let rejection = self.rejected_replication_record(topic_id, record, &error)?;
+                    let cursor_bytes = cursor.encode()?.ok_or_else(|| {
+                        CraqleError::SyncInputRejected("consumed record has no cursor".to_owned())
+                    })?;
+                    let graph = self
+                        .store
+                        .topic_graph_binding(topic_id.as_bytes())?
+                        .map(|graph| GraphId::new(&graph));
+                    let rejection = RejectedReplicationRecord {
+                        topic: topic_id,
+                        record_id: record.meta.op_id,
+                        actor: record.meta.actor_id,
+                        sequence: record.meta.actor_seq,
+                        graph,
+                        payload_digest: record.payload_digest,
+                        error_kind: record.error_kind,
+                        reason: record.reason.clone(),
+                        seen_count: 0,
+                        acknowledged: false,
+                    };
                     let rejection = self
                         .store
                         .record_replication_rejection(rejection, Some(&cursor_bytes))?;
@@ -1913,26 +2678,67 @@ impl CraqleNode {
                         record = %rejection.record_id,
                         error_kind = ?rejection.error_kind,
                         seen_count = rejection.seen_count,
-                        "persisted rejected craqle replication record before cursor advance",
+                        "persisted rejected craqle replication payload before cursor advance",
                     );
+                    continue;
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        topic = %topic_id,
-                        %error,
-                        "stalled craqle reconcile at a retryable failure",
-                    );
-                    stalled = Some(error);
-                    break;
+                let sync::TopicRecord::Event(record) = topic_record else {
+                    unreachable!()
+                };
+                match self.apply_reconciled_record(sync, topic_id, record) {
+                    Ok(Some(graph)) => {
+                        applied.insert(graph);
+                        cursor.consume(topic_record);
+                    }
+                    Ok(None) => cursor.consume(topic_record),
+                    Err(error) if error.rejects_record() => {
+                        cursor.consume(topic_record);
+                        let cursor_bytes = cursor.encode()?.ok_or_else(|| {
+                            CraqleError::SyncInputRejected(
+                                "consumed record has no cursor".to_owned(),
+                            )
+                        })?;
+                        let rejection =
+                            self.rejected_replication_record(topic_id, record, &error)?;
+                        let rejection = self
+                            .store
+                            .record_replication_rejection(rejection, Some(&cursor_bytes))?;
+                        self.store.persist()?;
+                        self.replication_rejections.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            topic = %topic_id,
+                            record = %rejection.record_id,
+                            error_kind = ?rejection.error_kind,
+                            seen_count = rejection.seen_count,
+                            "persisted rejected craqle replication record before cursor advance",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            topic = %topic_id,
+                            %error,
+                            "stalled craqle reconcile at a retryable failure",
+                        );
+                        stalled = Some(error);
+                        break;
+                    }
                 }
             }
-        }
 
-        // Persisted even when the pass stalled: it covers exactly the prefix
-        // that was consumed, so the retry resumes at the failed record.
-        if let Some(cursor) = cursor.encode()? {
-            self.store
-                .set_applied_topic_clock(topic_id.as_bytes(), &cursor)?;
+            let previous = stored_cursor.clone();
+            if let Some(encoded) = cursor.encode()? {
+                self.store.set_topic_clock(topic_id.as_bytes(), &encoded)?;
+                self.store.persist()?;
+                stored_cursor = Some(encoded);
+            }
+            if stalled.is_some() || !more {
+                break;
+            }
+            if stored_cursor == previous {
+                return Err(CraqleError::SyncInputRejected(
+                    "replication cursor did not advance".to_owned(),
+                ));
+            }
         }
         Ok(TopicPass { applied, stalled })
     }
@@ -1962,9 +2768,9 @@ impl CraqleNode {
             None => sync.bind_graph_topic(&self.store, graph, topic_id)?,
         }
         let local_record = sync.is_local_record(topic_id, record);
-        let _write_guard = replication::graph_write_guard(graph);
+        let _write_guard = self.store.graph_write_guard(graph);
         Ok(self
-            .apply_irokle_record_locked(record, local_record)?
+            .apply_record_locked(record, local_record)?
             .then(|| graph.clone()))
     }
 
@@ -2043,17 +2849,17 @@ impl CraqleNode {
         };
         self.authorize_rejection_record(auth, &rejected, Action::Write)?;
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        let topic_record = sync
-            .topic_records_since(topic, None)?
-            .records
-            .into_iter()
-            .find(|record| record.meta().op_id == record_id)
-            .ok_or_else(|| {
-                CraqleError::SyncInputRejected(format!(
-                    "rejected record {record_id} is no longer available in topic {topic}"
-                ))
-            })?;
+        let topic_record = sync.topic_record(topic, record_id)?.ok_or_else(|| {
+            CraqleError::SyncInputRejected(format!(
+                "rejected record {record_id} is no longer available in topic {topic}"
+            ))
+        })?;
         let record = match topic_record {
+            sync::TopicRecord::Control(_) => {
+                return Err(CraqleError::SyncInputRejected(
+                    "rejected record is not an event".to_owned(),
+                ));
+            }
             sync::TopicRecord::Event(record) => record,
             sync::TopicRecord::Rejected(record) => {
                 let rejection = RejectedReplicationRecord {
@@ -2145,7 +2951,7 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         topic: irokle::TopicId,
-        expected_old_cursor_digest: [u8; 32],
+        expected_digest: [u8; 32],
         replacement_position: irokle::ActorClock,
     ) -> Result<TopicCursorRepairAudit> {
         let _reconcile_guard = self
@@ -2162,10 +2968,11 @@ impl CraqleNode {
                 ))
             })?;
         self.ensure_graph_action(&graph, auth, Action::Write)?;
-        let replacement = sync::encode_topic_cursor(topic, &replacement_position)?;
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let replacement = sync.topic_cursor_at(topic, &replacement_position)?;
         let audit = self.store.repair_topic_cursor(
             topic,
-            expected_old_cursor_digest,
+            expected_digest,
             &replacement,
             Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
         )?;
@@ -2202,10 +3009,7 @@ impl CraqleNode {
     }
 
     pub fn graph_violations(&self, graph: &GraphId) -> Result<Vec<CrateViolation>> {
-        Ok(crate::rules::post_merge_violations_from_store(
-            &self.store,
-            graph,
-        )?)
+        Ok(crate::rules::post_merge_violations(&self.store, graph)?)
     }
 
     /// Return the RO-Crate version from its live marker or retained context evidence.
@@ -2233,13 +3037,13 @@ impl CraqleNode {
         if let Some(license) = options.license {
             request.license = Some(license);
         }
-        self.create_crate_with_durability_as_version(
+        self.create_versioned(CrateBuild {
             auth,
             request,
-            CraqleRequestDurability::Durable,
-            None,
-            options.version,
-        )
+            durability: CraqleRequestDurability::Durable,
+            actor: None,
+            version: options.version,
+        })
     }
 
     /// Create a new RO-Crate graph with an explicit request durability policy.
@@ -2252,9 +3056,7 @@ impl CraqleNode {
         self.create_crate_with_durability_as(auth, request, durability, None)
     }
 
-    /// Like [`CraqleNode::create_crate_with_durability`], but non-publishing
-    /// writes are authored under `actor`, so replicas materializing the same
-    /// logical event emit identical CRDT ops.
+    /// Author non-publishing writes under `actor` for deterministic CRDT ops.
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
     pub fn create_crate_with_durability_as(
         &self,
@@ -2263,24 +3065,17 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
         actor: Option<ActorId>,
     ) -> Result<Batch> {
-        self.create_crate_with_durability_as_version(
+        self.create_versioned(CrateBuild {
             auth,
             request,
             durability,
             actor,
-            RoCrateVersion::default(),
-        )
+            version: RoCrateVersion::default(),
+        })
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(graph = %request.graph.as_str()))]
-    fn create_crate_with_durability_as_version(
-        &self,
-        auth: &dyn Authorizer,
-        request: CreateCrateRequest,
-        durability: CraqleRequestDurability,
-        actor: Option<ActorId>,
-        version: RoCrateVersion,
-    ) -> Result<Batch> {
+    #[tracing::instrument(level = "debug", skip_all, fields(graph = %build.request.graph.as_str()))]
+    fn create_versioned(&self, build: CrateBuild<'_>) -> Result<Batch> {
         let CreateCrateRequest {
             graph,
             name,
@@ -2288,11 +3083,13 @@ impl CraqleNode {
             date_published,
             license,
             policy,
-        } = request;
+        } = build.request;
         let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let manager = self.manager_with(durability, actor);
-        let batch = if version == RoCrateVersion::default() {
+        self.reconcile_pending(&graph);
+        let _write = self.lock_graph(&graph);
+        self.ensure_policy_action(&graph, &policy, build.auth, Action::Write)?;
+        let manager = self.manager_with(build.durability, build.actor);
+        let batch = if build.version == RoCrateVersion::default() {
             manager.create_crate(
                 graph.clone(),
                 &name,
@@ -2301,28 +3098,33 @@ impl CraqleNode {
                 license.as_deref(),
             )?
         } else {
-            manager.create_crate_with_version(
+            manager.create_crate_version(
                 graph.clone(),
                 &name,
                 &description,
                 &date_published,
                 license.as_deref(),
-                version,
+                build.version,
             )?
         };
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.persist_policy(PolicyWrite {
+            graph: &graph,
+            policy,
+            durability: build.durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability: build.durability,
+        })
     }
 
-    /// Validate and materialize a create-crate request without applying it.
-    ///
-    /// Returns the changes that would be applied, but does not mutate the graph
-    /// store, persist policy, enqueue search, or publish Irokle records.
+    /// Validate and materialize crate changes without applying side effects.
     pub fn validate_create_crate(
         &self,
         auth: &dyn Authorizer,
         request: CreateCrateRequest,
-    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+    ) -> Result<Vec<CoreChange>> {
         let CreateCrateRequest {
             graph,
             name,
@@ -2371,6 +3173,8 @@ impl CraqleNode {
             replaced_predicates,
         } = request;
         let graph = entity.graph;
+        self.reconcile_pending(&graph);
+        let _write = self.lock_graph(&graph);
         self.ensure_graph_action(&graph, auth, Action::Write)?;
         let batch = self.manager_with(durability, actor).patch_data_entity(
             &graph,
@@ -2380,7 +3184,11 @@ impl CraqleNode {
             entity.additional_triples,
             &replaced_predicates,
         )?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
     /// Create or replace a root-linked data entity.
@@ -2405,6 +3213,8 @@ impl CraqleNode {
         name: &str,
         additional_triples: Vec<(NamedNode, Term)>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.manager().add_data_entity(
             graph,
@@ -2423,10 +3233,10 @@ impl CraqleNode {
         graph: &GraphId,
         entities: Vec<NewDataEntity>,
     ) -> Result<AppendDataEntitiesReport> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        let report = self
-            .manager()
-            .append_new_root_data_entities(graph, entities)?;
+        let report = self.manager().append_root_entities(graph, entities)?;
         self.finish_report(graph, report)
     }
 
@@ -2441,7 +3251,7 @@ impl CraqleNode {
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let report = self
             .manager()
-            .append_new_data_entities_under(graph, parent_id, entities)?;
+            .append_entities_under(graph, parent_id, entities)?;
         self.finish_report(graph, report)
     }
 
@@ -2474,6 +3284,8 @@ impl CraqleNode {
             replaced_predicates,
         } = request;
         let graph = entity.graph;
+        self.reconcile_pending(&graph);
+        let _write = self.lock_graph(&graph);
         self.ensure_graph_action(&graph, auth, Action::Write)?;
         let batch = self
             .manager_with(durability, actor)
@@ -2485,7 +3297,11 @@ impl CraqleNode {
                 entity.additional_triples,
                 &replaced_predicates,
             )?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
     /// Create or replace a contextual entity.
@@ -2517,6 +3333,8 @@ impl CraqleNode {
         name: &str,
         additional_triples: Vec<(NamedNode, Term)>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.manager().add_contextual_entity(
             graph,
@@ -2575,9 +3393,7 @@ impl CraqleNode {
         limit: usize,
     ) -> Result<RoCratePage> {
         self.ensure_graph_action(graph, auth, Action::Read)?;
-        Ok(self
-            .manager()
-            .export_jsonld_page_after(graph, cursor, limit)?)
+        Ok(self.manager().export_page_after(graph, cursor, limit)?)
     }
 
     /// Replace the current visible RO-Crate state from a JSON-LD document.
@@ -2587,6 +3403,8 @@ impl CraqleNode {
         graph: GraphId,
         jsonld: &str,
     ) -> Result<Batch> {
+        self.reconcile_pending(&graph);
+        let _write = self.lock_graph(&graph);
         self.ensure_graph_action(&graph, auth, Action::Write)?;
         let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
         self.finish_batch(&graph, batch)
@@ -2620,12 +3438,22 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
     ) -> Result<Batch> {
         let policy = policy.normalized();
+        self.reconcile_pending(&graph);
+        let _write = self.lock_graph(&graph);
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
         let batch = self
             .manager_for_durability(durability)
             .import_jsonld(graph.clone(), jsonld)?;
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.persist_policy(PolicyWrite {
+            graph: &graph,
+            policy,
+            durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &graph,
+            batch,
+            durability,
+        })
     }
 
     /// Strict variant of `apply_rocrate_document_with_policy` that validates
@@ -2660,6 +3488,32 @@ impl CraqleNode {
         )
     }
 
+    /// Strict RO-Crate replacement described by `write`, optionally with commit metadata.
+    pub fn apply_rocrate_with(
+        &self,
+        auth: &dyn Authorizer,
+        write: RoCrateWrite<'_>,
+    ) -> Result<Batch> {
+        let policy = write.policy.normalized();
+        self.reconcile_pending(&write.graph);
+        let _write = self.lock_graph(&write.graph);
+        self.ensure_policy_action(&write.graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager_with(write.durability, write.actor)
+            .with_commit(write.commit)
+            .import_jsonld_checked(write.graph.clone(), write.jsonld)?;
+        self.persist_policy(PolicyWrite {
+            graph: &write.graph,
+            policy,
+            durability: write.durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &write.graph,
+            batch,
+            durability: write.durability,
+        })
+    }
+
     /// Strict RO-Crate replacement authored under an explicit CRDT actor for
     /// non-publishing writes.
     pub fn apply_rocrate_document_checked_with_policy_and_durability_as(
@@ -2671,42 +3525,34 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
         actor: Option<ActorId>,
     ) -> Result<Batch> {
-        let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self
-            .manager_with(durability, actor)
-            .import_jsonld_checked(graph.clone(), jsonld)?;
-        self.persist_graph_policy_with_durability(&graph, policy, durability)?;
-        self.finish_batch_with_durability(&graph, batch, durability)
+        self.apply_rocrate_with(
+            auth,
+            RoCrateWrite {
+                graph,
+                jsonld,
+                policy,
+                durability,
+                actor,
+                commit: None,
+            },
+        )
     }
 
-    /// Strictly validate and materialize a RO-Crate document without applying it.
-    ///
-    /// Returns the changes that would be applied, but does not mutate the graph
-    /// store, persist policy, enqueue search, or publish Irokle records.
+    /// Strictly validate and materialize RO-Crate changes without side effects.
     pub fn validate_rocrate_document_checked_with_policy(
         &self,
         auth: &dyn Authorizer,
         graph: GraphId,
         jsonld: &str,
         policy: GraphPolicy,
-    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+    ) -> Result<Vec<CoreChange>> {
         let policy = policy.normalized();
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        Ok(self.manager().plan_import_jsonld_checked(&graph, jsonld)?)
+        Ok(self.manager().plan_checked_import(&graph, jsonld)?)
     }
 
-    /// Change set the strict RO-Crate replacement would commit for `jsonld`,
-    /// without applying it.
-    ///
-    /// Runs the same complete-RO-Crate validation as
-    /// [`CraqleNode::apply_rocrate_document_checked_with_policy`] and requires
-    /// the same write authorization as
-    /// [`CraqleNode::apply_rocrate_document`]. Mutates nothing: no quads, no
-    /// policy, no search queue, no replication record.
-    ///
-    /// The change set describes the state visible now, so a concurrent write
-    /// to `graph` can still invalidate it.
+    /// Plan a strict authorized RO-Crate replacement without side effects.
+    /// Concurrent graph writes may invalidate the returned change set.
     pub fn plan_rocrate_document_checked(
         &self,
         auth: &dyn Authorizer,
@@ -2714,15 +3560,11 @@ impl CraqleNode {
         jsonld: &str,
     ) -> Result<Vec<MaterializedQuadChange>> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        Ok(self.manager().plan_import_jsonld_checked(graph, jsonld)?)
+        Ok(self.manager().plan_checked_import(graph, jsonld)?)
     }
 
-    /// Change set [`CraqleNode::patch_data_with`] would commit for `request`,
-    /// without applying it.
-    ///
-    /// Structurally validated exactly as the applying variant is, against the
-    /// state visible now, which a concurrent write to the graph can still
-    /// invalidate. Mutates nothing.
+    /// Plan a validated data patch without applying side effects.
+    /// Concurrent graph writes may invalidate the returned change set.
     pub fn plan_patch_data(
         &self,
         auth: &dyn Authorizer,
@@ -2769,7 +3611,7 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         graph: &GraphId,
         jsonld: &str,
-    ) -> Result<Vec<CoreMaterializedQuadChange>> {
+    ) -> Result<Vec<CoreChange>> {
         if self.store.contains_graph(graph)? {
             self.ensure_graph_action(graph, auth, Action::Write)?;
         }
@@ -2797,17 +3639,22 @@ impl CraqleNode {
             return Ok(None);
         }
 
-        let mut authorized = HashSet::new();
-        for change in &changes {
-            let graph = match change {
-                CoreMaterializedQuadChange::Insert { graph, .. }
-                | CoreMaterializedQuadChange::Delete { graph, .. } => graph,
-            };
-            if authorized.insert(graph.clone()) {
-                self.ensure_graph_action(graph, auth, Action::Write)?;
-            }
+        let graphs = changes
+            .iter()
+            .map(|change| match change {
+                CoreChange::Insert { graph, .. } | CoreChange::Delete { graph, .. } => graph,
+            })
+            .collect::<HashSet<_>>();
+        for graph in &graphs {
+            self.reconcile_pending(graph);
         }
-        let graph = single_graph_for_changes(&changes)?;
+        // Updates spanning several graphs are refused below, so at most one lock is taken.
+        let single = single_change_graph(&changes);
+        let _write = single.as_ref().ok().map(|graph| self.lock_graph(graph));
+        for graph in graphs {
+            self.ensure_graph_action(graph, auth, Action::Write)?;
+        }
+        let graph = single?;
         let batch = self.replication.local_apply_changes(&graph, changes)?;
         Ok(Some(self.finish_batch(&graph, batch)?))
     }
@@ -2819,6 +3666,8 @@ impl CraqleNode {
         graph: &GraphId,
         quads: Vec<(CoreEncodedTerm, CoreEncodedTerm, CoreEncodedTerm)>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.replication.local_insert_quads(graph, quads)?;
         self.finish_batch(graph, batch)
@@ -2829,22 +3678,22 @@ impl CraqleNode {
         &self,
         auth: &dyn Authorizer,
         graph: &GraphId,
-        changes: Vec<CoreMaterializedQuadChange>,
+        changes: Vec<CoreChange>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.replication.local_apply_changes(graph, changes)?;
         self.finish_batch(graph, batch)
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_changes_bypassing_structural_rules(
+    pub(crate) fn apply_unchecked(
         &self,
         graph: &GraphId,
-        changes: Vec<CoreMaterializedQuadChange>,
+        changes: Vec<CoreChange>,
     ) -> Result<Batch> {
-        let batch = self
-            .replication
-            .local_apply_changes_bypassing_structural_rules(graph, changes)?;
+        let batch = self.replication.apply_changes_unchecked(graph, changes)?;
         self.finish_batch(graph, batch)
     }
 
@@ -2864,6 +3713,8 @@ impl CraqleNode {
         old_value: Option<&str>,
         new_value: &str,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let batch = self.manager().update_property(
             graph,
@@ -2877,31 +3728,42 @@ impl CraqleNode {
         self.finish_batch(graph, batch)
     }
 
-    /// Execute a SPARQL query against the local node.
-    ///
-    /// Visibility is decided lazily, once per graph the evaluation touches,
-    /// rather than by materializing the whole visible set up front.
-    ///
-    /// Persisted graph policy is read from the same durable snapshot as query
-    /// data. A policy read error or missing graph denies visibility (G8).
+    /// Query with lazy graph visibility from the same snapshot as policy.
+    /// Missing or denying policy hides a graph; a policy read error fails the query.
     pub fn query(&self, auth: &dyn Authorizer, sparql: &str) -> Result<QueryResults> {
-        Ok(self
+        let policy = PolicyVisibility::new(&self.store, auth);
+        let results = self
             .sparql
-            .query_with_snapshot_visibility(sparql, &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            })?)
+            .query_snapshot(sparql, &|snapshot, graph: &GraphId| {
+                policy.visible(snapshot, graph)
+            });
+        policy.finish(results.map_err(CraqleError::from))
     }
 
-    /// Parse a SPARQL query for repeated execution.
-    ///
-    /// The prepared value contains no store snapshot or authorization state;
-    /// both are acquired afresh on every execution.
+    /// Parse a reusable query without snapshot or authorization state.
     pub fn prepare_query(&self, sparql: &str) -> Result<PreparedQuery> {
         Ok(self.sparql.prepare_query(sparql)?)
+    }
+
+    pub fn prepare_with_limits(&self, sparql: &str, limits: &QueryLimits) -> Result<PreparedQuery> {
+        Ok(self.sparql.prepare_with_limits(sparql, limits)?)
+    }
+
+    pub fn query_with_options(
+        &self,
+        auth: &dyn Authorizer,
+        request: QueryRequest<'_>,
+    ) -> Result<QueryExecution> {
+        let policy = PolicyVisibility::new(&self.store, auth);
+        let execution = self.sparql.query_with_options(
+            sparql::QueryRun {
+                sparql: request.sparql,
+                options: request.options,
+            },
+            &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
+        );
+        let (prepared, execution) = policy.finish(execution.map_err(CraqleError::from))?;
+        Ok(scoped_execution(auth, &prepared, execution))
     }
 
     /// Execute a SPARQL query and return its complete result with diagnostics.
@@ -2910,16 +3772,13 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         sparql: &str,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.query_with_snapshot_visibility_statistics(
-            sparql,
-            &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
+        self.query_with_options(
+            auth,
+            QueryRequest {
+                sparql,
+                options: &QueryOptions::default(),
             },
-        )?)
+        )
     }
 
     /// Execute a prepared query against a fresh authorized store snapshot.
@@ -2929,19 +3788,16 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        Ok(self.sparql.execute_prepared_with_snapshot_visibility(
+        let policy = PolicyVisibility::new(&self.store, auth);
+        let execution = self.sparql.execute_prepared_snapshot(
             query,
-            &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            },
+            &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
             options,
             Duration::ZERO,
             true,
-        )?)
+        );
+        let execution = policy.finish(execution.map_err(CraqleError::from))?;
+        Ok(scoped_execution(auth, query, execution))
     }
 
     /// Inspect the current logical and physical plan without executing it.
@@ -2951,17 +3807,14 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryPlan> {
-        Ok(self.sparql.explain_prepared_with_snapshot_visibility(
+        let policy = PolicyVisibility::new(&self.store, auth);
+        let plan = self.sparql.explain_prepared_snapshot(
             query,
-            &|snapshot, graph: &GraphId| {
-                snapshot
-                    .graph_policy(&self.store, graph)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|policy| auth.authorize(graph, &policy, Action::Read).is_ok())
-            },
+            &|snapshot, graph: &GraphId| policy.visible(snapshot, graph),
             options,
-        )?)
+        );
+        let plan = policy.finish(plan.map_err(CraqleError::from))?;
+        Ok(scoped_plan(auth, query, plan))
     }
 
     /// Execute a prepared query completely and return its measured plan.
@@ -2974,18 +3827,19 @@ impl CraqleNode {
         Ok(self.execute_prepared(auth, query, options)?.statistics.plan)
     }
 
-    /// Execute a SPARQL query against an explicit, wholly authorized graph set.
-    ///
-    /// Missing and unreadable graph names both fail the complete request with
-    /// an authorization error; neither is silently removed from the dataset.
+    /// Query an explicit graph set, failing on missing or unreadable graphs.
     pub fn query_in_graphs(
         &self,
         auth: &dyn Authorizer,
         graphs: &[GraphId],
         sparql: &str,
     ) -> Result<QueryResults> {
+        let options = QueryOptions {
+            collect_plan_statistics: false,
+            ..QueryOptions::default()
+        };
         Ok(self
-            .query_in_graphs_with_options(auth, graphs, sparql, &QueryOptions::default())?
+            .query_in_graphs_with_options(auth, graphs, sparql, &options)?
             .results)
     }
 
@@ -2997,8 +3851,13 @@ impl CraqleNode {
         sparql: &str,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        let query = self.prepare_query(sparql)?;
-        self.execute_prepared_in_graphs(auth, graphs, &query, options)
+        let (prepared, execution) = self.sparql.query_graphs_options(sparql::GraphQuery {
+            auth,
+            graphs,
+            sparql,
+            options,
+        })?;
+        Ok(scoped_execution(auth, &prepared, execution))
     }
 
     /// Execute a prepared query over an explicit, wholly authorized graph set.
@@ -3009,9 +3868,10 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryExecution> {
-        Ok(self
+        let execution = self
             .sparql
-            .execute_prepared_in_graphs(auth, query, graphs, options)?)
+            .execute_prepared_graphs(auth, query, graphs, options)?;
+        Ok(scoped_execution(auth, query, execution))
     }
 
     /// Inspect a prepared plan for an explicit, wholly authorized graph set.
@@ -3022,9 +3882,10 @@ impl CraqleNode {
         query: &PreparedQuery,
         options: &QueryOptions,
     ) -> Result<QueryPlan> {
-        Ok(self
+        let plan = self
             .sparql
-            .explain_prepared_in_graphs(auth, query, graphs, options)?)
+            .explain_prepared_graphs(auth, query, graphs, options)?;
+        Ok(scoped_plan(auth, query, plan))
     }
 
     /// Execute over explicit authorized graphs and return the measured plan.
@@ -3041,153 +3902,163 @@ impl CraqleNode {
             .plan)
     }
 
-    /// Execute a SPARQL query where graph visibility is decided by `visible`.
-    ///
-    /// The predicate is evaluated lazily over the union view: it runs at most
-    /// once per graph the evaluation actually touches (memoized for the
-    /// duration of the query), so the cost scales with the graphs a query
-    /// reaches instead of the total corpus. A quad participates in evaluation
-    /// iff its graph satisfies the predicate; the predicate must be cheap and
-    /// side-effect free.
-    #[cfg(test)]
-    pub(crate) fn query_graphs_with<F>(&self, visible: F, sparql: &str) -> Result<QueryResults>
-    where
-        F: Fn(&GraphId) -> bool,
-    {
-        Ok(self.sparql.query_with_visibility(sparql, &visible)?)
-    }
-
     /// Compatibility no-op: durable qv indexes are maintained with graph
     /// commits and source storage remains the fallback authority.
     pub fn ensure_query_indexes(&self) {
         self.store.ensure_derived_indexes();
     }
 
-    /// Search visible resources in the local search index.
-    ///
-    /// Clamps the limit, authorizes hits against stored policy, and drops
-    /// duplicates so each graph-and-subject pair fills at most one page slot.
+    /// Search one pinned index view and recheck permissions before returning hits.
     pub fn search(&self, auth: &dyn Authorizer, req: SearchRequest<'_>) -> Result<Vec<SearchHit>> {
+        self.search_with_options(
+            auth,
+            SearchRun {
+                request: req,
+                options: &SearchOptions::default(),
+            },
+        )
+    }
+
+    /// Search like [`CraqleNode::search`] under one cooperative budget through the final
+    /// recheck; cancellation or timeout fails even an empty result (see crate docs).
+    pub fn search_with_options(
+        &self,
+        auth: &dyn Authorizer,
+        run: SearchRun<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        self.collect_hits(&SearchScope::new(auth, run.options), run.request)
+    }
+
+    fn collect_hits(
+        &self,
+        scope: &SearchScope<'_>,
+        req: SearchRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
         self.search.ensure_available()?;
+        scope.check()?;
         let limit = req.limit.min(MAX_SEARCH_LIMIT);
         if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let mut readable = ReadableGraphs::new(self, auth);
-        // Bounded by the clamp above: escalation only widens while the index
-        // actually filled the previous fetch, so it tracks the corpus.
-        let mut fetch = limit.saturating_mul(4).max(SEARCH_MIN_FETCH);
-        loop {
-            let raw_hits = self.search.search(req.query, fetch)?;
-            // Fewer hits than asked for means the index has nothing more to
-            // give; widening again cannot produce another readable hit.
-            let index_exhausted = raw_hits.len() < fetch;
-
-            let mut seen = SeenHits::default();
-            let mut hits = Vec::with_capacity(raw_hits.len().min(limit));
-            for hit in raw_hits {
-                if seen.admits(&hit) && readable.allows(&hit.graph_id)? {
-                    hits.push(hit);
-                }
-            }
-
-            if hits.len() >= limit || index_exhausted {
-                // Score-descending order arrives from the index and both
-                // filters preserve it, so no re-sort is needed here.
-                hits.truncate(limit);
-                return Ok(hits);
-            }
-            fetch = fetch.saturating_mul(4);
-        }
+        let readable = Mutex::new(ReadableGraphs::new(self, scope.auth));
+        let allows = |graph: &str| {
+            readable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allows(graph)
+        };
+        let hits = self.search.search_checked(
+            search::AuthorizedQuery {
+                query: req.query,
+                limit,
+                subject: None,
+                allows: &allows,
+            },
+            &|| scope.check(),
+        )?;
+        drop(readable);
+        self.recheck_hits(scope, hits)
     }
 
-    /// Search visible resources in an explicit set of graph IRIs.
-    ///
-    /// `req.limit` is clamped to [`MAX_SEARCH_LIMIT`] (10_000), never rejected.
-    ///
-    /// Every selected graph is authorized against its stored policy *before*
-    /// the index is consulted, so no post-filtering — and therefore no
-    /// escalation loop — is needed: every hit the index can return already
-    /// belongs to a graph the caller may read. Missing or non-readable graphs
-    /// are ignored, matching [`CraqleNode::search`].
+    /// Search a graph set with one parse, one index view, and final authorization.
     pub fn search_graphs(
         &self,
         auth: &dyn Authorizer,
         req: GraphSearchRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
+        self.search_graphs_with(
+            auth,
+            GraphSearchRun {
+                request: req,
+                options: &SearchOptions::default(),
+            },
+        )
+    }
+
+    /// Search a graph set like [`CraqleNode::search_graphs`] under the cancellation and
+    /// timeout rules of [`CraqleNode::search_with_options`].
+    pub fn search_graphs_with(
+        &self,
+        auth: &dyn Authorizer,
+        run: GraphSearchRun<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let scope = SearchScope::new(auth, run.options);
         self.search.ensure_available()?;
-        // Clamped once here, so both arms and the final ordering agree on it.
-        let req = GraphSearchRequest {
-            limit: req.limit.min(MAX_SEARCH_LIMIT),
-            ..req
-        };
-        if req.limit == 0 {
+        scope.check()?;
+        let req = run.request;
+        let limit = req.limit.min(MAX_SEARCH_LIMIT);
+        if limit == 0 || req.graphs.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut seen = std::collections::HashSet::new();
-        let mut selected = Vec::new();
-        for graph in req.graphs {
-            if !seen.insert(graph.as_str()) {
-                continue;
-            }
-            if !self.store.contains_graph(graph)?
-                || auth
-                    .authorize(graph, &self.store.graph_policy(graph)?, Action::Read)
-                    .is_err()
-            {
-                continue;
-            }
-            selected.push(graph.clone());
-        }
-
-        if selected.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // A per-graph search is a full top-k collection each, so it only pays
-        // off for a handful of graphs; beyond that one filtered search over
-        // the whole set is cheaper. This is a performance fork only — the two
-        // arms must answer identically, which `graph_arms_agree` pins down.
-        let hits = if selected.len() <= SEARCH_GRAPHS_PER_GRAPH_LIMIT {
-            self.search_graph_arm(&selected, &req)?
+        let selected = if req.graphs.len() > LINEAR_GRAPH_LIMIT {
+            let bytes = req
+                .graphs
+                .len()
+                .saturating_mul(std::mem::size_of::<&str>() * 4);
+            self.search.check_query_bytes(bytes.saturating_mul(4))?;
+            Some(
+                req.graphs
+                    .iter()
+                    .map(GraphId::as_str)
+                    .collect::<HashSet<_>>(),
+            )
         } else {
-            self.search_set_arm(&selected, &req)?
+            None
         };
-
-        // Both arms are ordered here rather than in one of them, so a tie
-        // cannot resolve differently either side of the threshold.
-        Ok(limit_search_hits(hits, req.limit))
-    }
-
-    /// One full top-k collection per graph, concatenated for the caller to order.
-    fn search_graph_arm(
-        &self,
-        selected: &[GraphId],
-        req: &GraphSearchRequest<'_>,
-    ) -> Result<Vec<SearchHit>> {
-        let mut hits = Vec::new();
-        for graph in selected {
-            hits.extend(
-                self.search
-                    .search_in_graph(graph.as_str(), req.query, req.limit)?,
+        let readable = Mutex::new(ReadableGraphs::new(self, auth));
+        let allows = |graph: &str| {
+            let selected = selected.as_ref().map_or_else(
+                || {
+                    req.graphs
+                        .iter()
+                        .any(|candidate| candidate.as_str() == graph)
+                },
+                |selected| selected.contains(graph),
             );
-        }
-        Ok(hits)
+            if !selected {
+                return Ok(false);
+            }
+            readable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allows(graph)
+        };
+        let hits = self.search.search_checked(
+            search::AuthorizedQuery {
+                query: req.query,
+                limit,
+                subject: None,
+                allows: &allows,
+            },
+            &|| scope.check(),
+        )?;
+        drop(readable);
+        drop(selected);
+        self.recheck_hits(&scope, hits)
     }
 
-    /// One collection over the whole set, narrowed by a graph filter.
-    fn search_set_arm(
+    fn recheck_hits(
         &self,
-        selected: &[GraphId],
-        req: &GraphSearchRequest<'_>,
+        scope: &SearchScope<'_>,
+        hits: Vec<SearchHit>,
     ) -> Result<Vec<SearchHit>> {
-        Ok(self.search.search_in_graphs(search::GraphSetQuery {
-            graphs: selected,
-            query: req.query,
-            limit: req.limit,
-        })?)
+        let mut readable = ReadableGraphs::new(self, scope.auth);
+        let keep = {
+            let mut seen = HashSet::new();
+            hits.iter()
+                .map(|hit| {
+                    scope.check()?;
+                    Ok(readable.allows(&hit.graph_id)?
+                        && seen.insert((hit.graph_id.as_str(), hit.subject_iri.as_str())))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        scope.check()?;
+        Ok(hits
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(hit, keep)| keep.then_some(hit))
+            .collect())
     }
 
     /// Resolve one visible subject into `(predicate, object)` pairs.
@@ -3201,27 +4072,30 @@ impl CraqleNode {
         self.describe_in_ctx(&ctx, req.subject_id)
     }
 
-    /// Hydrate search hits with visible RDF properties.
-    ///
-    /// Search results usually cluster into a handful of graphs, so the policy
-    /// read and the orphan-set rebuild are memoized per graph rather than
-    /// repeated per hit. Hits in a graph the caller may not read
-    /// are skipped rather than failing the whole call, matching how
-    /// [`CraqleNode::search`] drops them.
+    /// Hydrate visible hits with policy and orphan state memoized per graph.
     pub fn hydrate_search_hits(
         &self,
         auth: &dyn Authorizer,
+        hits: &[SearchHit],
+    ) -> Result<Vec<HydratedSearchHit>> {
+        self.hydrate_hits(&SearchScope::new(auth, &SearchOptions::default()), hits)
+    }
+
+    fn hydrate_hits(
+        &self,
+        scope: &SearchScope<'_>,
         hits: &[SearchHit],
     ) -> Result<Vec<HydratedSearchHit>> {
         let mut contexts: HashMap<String, Option<DescribeCtx>> = HashMap::new();
         let mut hydrated = Vec::with_capacity(hits.len());
 
         for hit in hits {
+            scope.check()?;
             let ctx = match contexts.entry(hit.graph_id.clone()) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let graph = GraphId::new(&hit.graph_id);
-                    let ctx = match self.ensure_graph_action(&graph, auth, Action::Read) {
+                    let ctx = match self.ensure_graph_action(&graph, scope.auth, Action::Read) {
                         Ok(()) => Some(self.describe_ctx(&graph)?),
                         Err(CraqleError::Authorization(_)) => None,
                         Err(error) => return Err(error),
@@ -3238,7 +4112,7 @@ impl CraqleNode {
                 properties: self.describe_in_ctx(ctx, &hit.subject_iri)?,
             });
         }
-
+        scope.check()?;
         Ok(hydrated)
     }
 
@@ -3248,63 +4122,79 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         req: SearchRequest<'_>,
     ) -> Result<Vec<HydratedSearchHit>> {
-        let hits = self.search(auth, req)?;
-        self.hydrate_search_hits(auth, &hits)
+        self.search_resources_with(
+            auth,
+            SearchRun {
+                request: req,
+                options: &SearchOptions::default(),
+            },
+        )
     }
 
-    /// Block until the background full-text indexer has processed queued work.
+    /// Search and hydrate like [`CraqleNode::search_resources`]; one budget from
+    /// [`CraqleNode::search_with_options`] also covers hydration.
+    pub fn search_resources_with(
+        &self,
+        auth: &dyn Authorizer,
+        run: SearchRun<'_>,
+    ) -> Result<Vec<HydratedSearchHit>> {
+        let scope = SearchScope::new(auth, run.options);
+        let hits = self.collect_hits(&scope, run.request)?;
+        self.hydrate_hits(&scope, &hits)
+    }
+
+    /// Wait for queued search work; search-disabled builds keep it owed.
     pub fn flush_search_updates(&self) -> Result<()> {
         self.search_worker.flush()
     }
 
-    /// Rebuild the full-text index from store state.
-    ///
-    /// Commits Tantivy and persists Fjall once per batch of graphs rather than
-    /// once per graph: every commit replays the queued deletes against every
-    /// segment, which made a per-graph commit super-linear in corpus size.
+    /// Wait for maintenance to stop without discarding a still-running worker.
+    pub fn shutdown(&mut self, timeout: Duration) -> Result<ShutdownState> {
+        self.search_worker.shutdown_within(timeout)
+    }
+
+    pub fn flush_search(&self, options: &SearchFlushOptions) -> Result<SearchReceipt> {
+        self.search_worker.flush_with(options)
+    }
+
+    /// Rebuild search with one commit and persist per graph batch.
     pub fn reindex_search(&self) -> Result<()> {
-        let mut covered = Vec::with_capacity(REINDEX_COMMIT_BATCH_GRAPHS);
-        for graph in self.store.graphs()? {
-            // Pinned before the scan reads anything: a write landing later is
-            // not covered by it and must outlive the clear below.
-            // `current_dirty_token` is the next token to be minted, so the
-            // highest one this scan can cover is the one before it.
-            let upto = self.store.current_dirty_token().saturating_sub(1);
+        let mut covered = Vec::with_capacity(REINDEX_BATCH_GRAPHS);
+        let snapshot = self.store.read_snapshot();
+        for graph in snapshot.graph_term_iter(&self.store) {
+            let term = self.store.decode_term(graph?)?;
+            let graph = term.to_named_node().map(GraphId).ok_or_else(|| {
+                store::StoreError::InvalidEncoding {
+                    context: "reindex graph identity",
+                    message: "graph name is not an IRI".to_owned(),
+                }
+            })?;
+            // Later writes must survive acknowledgement of this scan's cutoff.
+            let upto = self.store.current_dirty_token();
             self.search.reindex_from_store(&self.store, &graph)?;
             covered.push(ScannedGraph { graph, upto });
             #[cfg(test)]
             self.gate_after_scan();
-            if covered.len() >= REINDEX_COMMIT_BATCH_GRAPHS {
+            if covered.len() >= REINDEX_BATCH_GRAPHS {
                 self.commit_reindexed_graphs(&mut covered)?;
             }
         }
         self.commit_reindexed_graphs(&mut covered)
     }
 
-    /// Commit the Tantivy work for `covered`, then clear those graphs' FTS
-    /// queue entries, then persist once.
-    ///
-    /// ORDERING HAZARD (G7): the queue clearing MUST follow the Tantivy commit
-    /// that covers these graphs. Clear first and crash before the commit, and
-    /// those updates are lost permanently — nothing would ever re-enqueue
-    /// them. Crash after the commit but before the clear and the worker merely
-    /// re-does the work on its next drain. Only the second direction is safe,
-    /// so the order below is not an implementation detail.
+    // Commit before acknowledgement so a crash cannot erase unindexed work.
     fn commit_reindexed_graphs(&self, covered: &mut Vec<ScannedGraph>) -> Result<()> {
         if covered.is_empty() {
             return Ok(());
         }
         self.search.commit()?;
         for scanned in covered.drain(..) {
-            self.store
-                .clear_fts_queue_for_graph(&scanned.graph, scanned.upto)?;
+            self.store.clear_graph_queue(&scanned.graph, scanned.upto)?;
         }
         self.persist_fjall()
     }
 
-    /// Hold a reindex between a graph's scan and the clear that covers it,
-    /// reporting arrival and waiting for release. Test-only: it makes a window
-    /// that is otherwise microseconds wide something a test can step through.
+    /// Hold a reindex after scan so tests can control the queue-clear window.
     #[cfg(test)]
     fn gate_after_scan(&self) {
         let gate = self
@@ -3347,7 +4237,7 @@ impl CraqleNode {
 
     /// Return query-index v2 readiness using metadata and exact counters only.
     pub fn query_index_status_fast(&self) -> Result<QueryIndexStatus> {
-        Ok(self.store.query_index_status_fast()?)
+        Ok(self.store.index_status_fast()?)
     }
 
     /// Rebuild the disposable persistent query indexes from canonical CRDT quad state.
@@ -3366,25 +4256,16 @@ impl CraqleNode {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_graph_policy_bypassing_authorization(
-        &self,
-        graph: &GraphId,
-        policy: GraphPolicy,
-    ) -> Result<()> {
+    pub(crate) fn set_policy_unchecked(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
         self.validate_sync_policy(graph, &policy)?;
-        self.set_local_graph_policy(graph, policy.normalized())?;
+        self.set_test_policy(graph, policy.normalized())?;
         self.persist_fjall()
     }
 
-    /// Every graph the caller may read.
-    ///
-    /// Streams graph term ids and decodes each name through the shared term
-    /// cache instead of materializing the full graph list first. This is O(corpus)
-    /// by definition; prefer [`CraqleNode::query`], which checks visibility
-    /// only for the graphs a query touches.
+    /// Stream every readable graph; prefer lazy [`CraqleNode::query`] for queries.
     pub fn visible_graphs(&self, auth: &dyn Authorizer) -> Result<Vec<GraphId>> {
         let mut visible = Vec::new();
-        for graph_id in self.store.graph_term_id_iter() {
+        for graph_id in self.store.graph_term_iter() {
             let term = self.store.decode_term(graph_id?)?;
             let Some(graph) = term.to_named_node().map(GraphId) else {
                 continue;
@@ -3407,44 +4288,16 @@ impl CraqleNode {
 
     pub fn delete_graph(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<()> {
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.delete_graph_after_authorization(graph)
+        self.delete_authorized(graph)
     }
 
-    fn delete_graph_after_authorization(&self, graph: &GraphId) -> Result<()> {
-        // Orders the tombstone against this graph's writes, and the publish
-        // against its own apply; see `replication::GRAPH_WRITE_LOCKS`. Every
-        // tombstone writer takes it, so a write that checks the tombstone
-        // before applying cannot race one halfway through.
-        let _write_guard = replication::graph_write_guard(graph);
-
-        if self.store.graph_tombstoned(graph)? {
+    fn delete_authorized(&self, graph: &GraphId) -> Result<()> {
+        let Some(receipt) = self.replication.delete_graph(graph, true)? else {
             return Ok(());
-        }
-        let mut delete_clock = self.store.get_vector_clock(graph)?;
-        let delete_counter = delete_clock
-            .0
-            .get(&self.actor)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
-        delete_clock.advance(self.actor, delete_counter);
-        let tombstone = GraphTombstone {
-            graph: graph.clone(),
-            delete_event: EventId::graph_delete(graph, self.actor, &delete_clock),
-            delete_actor: self.actor,
-            delete_clock,
         };
-
-        if let Some(sync) = &self.sync
-            && sync.graph_topic_id(&self.store, graph)?.is_some()
-        {
-            let record = sync.publish_delete(&self.store, tombstone)?;
-            self.apply_irokle_record_locked(&record, true)?;
-            return self.persist_fjall();
-        }
-        self.store.delete_graph_tombstoned(&tombstone)?;
         self.schedule_search_update();
-        self.persist_fjall()
+        self.persist_receipt(receipt)?;
+        Ok(())
     }
 
     pub fn vector_clock(&self, graph: &GraphId) -> Result<VectorClock> {
@@ -3455,75 +4308,56 @@ impl CraqleNode {
         Ok(self.store.graph_fingerprint(graph)?)
     }
 
-    /// Read-only dump of one graph's quad and dot state.
-    ///
-    /// Quads and each quad's dots are sorted by value, so two replicas holding
-    /// the same state produce equal snapshots regardless of local term ids or
-    /// arrival order. That makes this both a diagnostic and the state an
-    /// application replicates with [`CraqleNode::install_graph_snapshot`].
-    ///
-    /// A graph this node does not hold reports an empty clock and no quads.
+    /// Return deterministic sorted quad and dot state for diagnosis or replication.
     pub fn graph_snapshot(&self, graph: &GraphId) -> Result<GraphReplicaSnapshot> {
         Ok(self.store.graph_snapshot(graph)?)
     }
 
-    /// Merge a batch authored on another replica that reached this node
-    /// through the application's own transport instead of irokle.
-    ///
-    /// Applies the batch's ops in order under the graph's write lock with the
-    /// OR-Set semantics of replicated records: adds carry the batch dot,
-    /// removes drop exactly the dots they witnessed, and the graph is created
-    /// when it is missing. Nothing is published back to irokle.
-    ///
-    /// Idempotent by the batch dot: merging a batch whose `(actor, counter)`
-    /// this graph's clock already contains reports `applied: false`, as does
-    /// merging into a graph this node has tombstoned.
-    ///
-    /// Fails when an op carries a term the store cannot hold: an RDF-star
-    /// term, a term over four megabytes, or one that is not an encoded IRI,
-    /// literal or blank node.
+    /// Merge an external batch with idempotent OR-Set semantics.
+    /// Invalid terms and tombstoned graphs fail without Irokle publication.
     pub fn merge_batch(&self, batch: &Batch) -> Result<MergeResult> {
-        // Orders this merge against every other write to the same graph; see
-        // `replication::GRAPH_WRITE_LOCKS`.
-        let _write_guard = replication::graph_write_guard(&batch.graph);
-        let merged = self.replication.merge_batch(batch)?;
-        if merged.applied {
-            self.schedule_search_update_for_graph(&batch.graph)?;
+        let merged = {
+            let _write_guard = self.store.graph_write_guard(&batch.graph);
+            self.replication.merge_batch(batch)?
+        };
+        let status = self.replication.receipt_for_batch(batch)?;
+        if merged.applied
+            && let Err(error) = self.schedule_graph_search(&batch.graph)
+        {
+            return match status {
+                MutationStatus::Known(receipt) => Err(accepted_error(*receipt, error)),
+                MutationStatus::Expired | MutationStatus::Unknown => Err(error),
+            };
         }
-        self.persist_fjall()?;
+        match status {
+            MutationStatus::Known(receipt) => {
+                self.persist_receipt(*receipt)?;
+            }
+            MutationStatus::Expired | MutationStatus::Unknown => self.persist_fjall()?,
+        }
         Ok(merged)
     }
 
-    /// Install a snapshot taken on another replica, seeding or repairing a
-    /// local copy of that graph.
-    ///
-    /// The result is the state-based OR-Set join of the two states: a snapshot
-    /// dot joins a quad's local dot set only when this graph's clock does not
-    /// already cover it, the graph clock then becomes the element-wise maximum
-    /// of the two clocks, and a graph this node does not hold is created.
-    ///
-    /// A dot the local clock covers but the local quad no longer carries is a
-    /// removal this node has already seen, so it stays removed: installing a
-    /// lagging replica's snapshot never resurrects a quad, and a device may be
-    /// seeded from several holders in any order.
-    ///
-    /// Later [`CraqleNode::merge_batch`] calls compose with the join, so a
-    /// remove that witnessed the snapshot's dots still removes them.
-    ///
-    /// Installing the same snapshot twice reports `applied: false`, as does
-    /// installing a snapshot this node's clock already covers or installing
-    /// into a graph this node has tombstoned.
-    ///
-    /// Fails when a quad carries a term the store cannot hold, as for
-    /// [`CraqleNode::merge_batch`].
+    /// Join a replica snapshot without resurrecting covered removals.
+    /// Repeated, covered, tombstoned, and invalid input does not alter state.
     pub fn install_graph_snapshot(&self, snapshot: &GraphReplicaSnapshot) -> Result<MergeResult> {
-        let _write_guard = replication::graph_write_guard(&snapshot.graph);
-        let merged = self.replication.install_snapshot(snapshot)?;
-        if merged.applied {
-            self.schedule_search_update_for_graph(&snapshot.graph)?;
+        let _write_guard = self.store.graph_write_guard(&snapshot.graph);
+        let outcome = self.replication.install_with_receipt(snapshot)?;
+        drop(_write_guard);
+        if outcome.result.applied
+            && let Err(error) = self.schedule_graph_search(&snapshot.graph)
+        {
+            return match outcome.receipt {
+                Some(receipt) => Err(accepted_error(receipt, error)),
+                None => Err(error),
+            };
         }
-        self.persist_fjall()?;
-        Ok(merged)
+        if let Some(receipt) = outcome.receipt {
+            self.persist_receipt(receipt)?;
+        } else {
+            self.persist_fjall()?;
+        }
+        Ok(outcome.result)
     }
 
     /// Build the per-graph state `describe_in_ctx` needs.
@@ -3535,18 +4369,8 @@ impl CraqleNode {
         })
     }
 
-    /// Resolve a subject's visible `(predicate, object)` pairs within a graph
-    /// whose readability the caller has already established.
-    ///
-    /// The orphan set is load-bearing twice: it hides orphaned subjects, and it
-    /// drops triples whose *object* points at an orphan. Both are required for
-    /// G6 ("invalid visible crates are never exported"). Returning an empty
-    /// list for an orphaned subject, rather than an error, is deliberate.
-    ///
-    /// `subject_id` may name a blank node (`_:b0`) — search indexes and returns
-    /// them in that form — so it is encoded with `from_subject_id`. Encoding it
-    /// as an IRI both let an orphaned blank node through the check below and
-    /// made every non-orphaned blank node describe as empty.
+    /// Resolve visible subject pairs while hiding orphan subjects and objects.
+    /// Subject encoding preserves blank-node identifiers returned by search.
     fn describe_in_ctx(
         &self,
         ctx: &DescribeCtx,
@@ -3600,49 +4424,46 @@ impl CraqleNode {
     }
 
     fn persist_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
-        self.persist_graph_policy_with_durability(graph, policy, CraqleRequestDurability::Durable)
+        let receipt = self.persist_policy(PolicyWrite {
+            graph,
+            policy,
+            durability: CraqleRequestDurability::Durable,
+        })?;
+        if let Some(receipt) = receipt {
+            self.persist_receipt(receipt)?;
+        } else {
+            self.persist_fjall()?;
+        }
+        Ok(())
     }
 
-    fn persist_graph_policy_with_durability(
-        &self,
-        graph: &GraphId,
-        policy: GraphPolicy,
-        durability: CraqleRequestDurability,
-    ) -> Result<()> {
-        let _write_guard = replication::graph_write_guard(graph);
-        if let Some(tombstone) = self.store.graph_tombstone(graph)? {
-            return Err(UpdateError::GraphDeleted { tombstone }.into());
-        }
-        let previous = self.store.graph_tagged_policy(graph)?;
-        let policy = policy.normalized();
-        if self.store.contains_graph(graph)? && previous.policy == policy {
-            return Ok(());
+    fn persist_policy(&self, request: PolicyWrite<'_>) -> Result<Option<MutationReceipt>> {
+        let previous = self.store.graph_tagged_policy(request.graph)?;
+        let policy = request.policy.normalized();
+        if self.store.contains_graph(request.graph)? && previous.policy == policy {
+            return Ok(None);
         }
         let tagged = TaggedGraphPolicy {
             policy,
             tag: PolicyTag::next_local(previous.tag, self.actor),
         };
-
-        if durability.publishes_irokle()
-            && let Some(sync) = &self.sync
-        {
-            let record = sync.publish_policy(&self.store, graph, tagged)?;
-            stall_publish_apply();
-            self.apply_irokle_record_locked(&record, true)?;
-            return Ok(());
-        }
-
-        self.store.set_tagged_graph_policy(graph, &tagged)?;
-        Ok(())
+        Ok(self.replication.set_policy(replication::PolicyMutation {
+            graph: request.graph,
+            tagged,
+            publish: request.durability.publishes_irokle(),
+            #[cfg(test)]
+            before_apply: Some(stall_publish_apply),
+        })?)
     }
 
     #[cfg(test)]
-    fn set_local_graph_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
-        self.persist_graph_policy_with_durability(
+    fn set_test_policy(&self, graph: &GraphId, policy: GraphPolicy) -> Result<()> {
+        self.persist_policy(PolicyWrite {
             graph,
             policy,
-            CraqleRequestDurability::WalAlreadyDurable,
-        )
+            durability: CraqleRequestDurability::WalAlreadyDurable,
+        })?;
+        Ok(())
     }
 
     fn orphaned_entities(&self, graph: &GraphId) -> Result<std::collections::HashSet<EncodedTerm>> {
@@ -3655,21 +4476,48 @@ impl CraqleNode {
             .collect())
     }
 
-    fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
-        self.finish_batch_with_durability(graph, batch, CraqleRequestDurability::Durable)
+    fn persist_receipt(&self, receipt: MutationReceipt) -> Result<MutationReceipt> {
+        match self.replication.mark_persisted(&receipt.id) {
+            Ok(Some(receipt)) => Ok(receipt),
+            Ok(None) => Err(accepted_error(
+                receipt,
+                CraqleError::Update(UpdateError::ReceiptUnknown),
+            )),
+            Err(error) => Err(accepted_error(receipt, error.into())),
+        }
     }
 
-    fn finish_batch_with_durability(
-        &self,
-        graph: &GraphId,
-        batch: Batch,
-        durability: CraqleRequestDurability,
-    ) -> Result<Batch> {
-        self.schedule_search_update_for_graph(graph)?;
-        if durability.persists_fjall() {
-            self.persist_fjall()?;
+    fn finish_batch(&self, graph: &GraphId, batch: Batch) -> Result<Batch> {
+        self.settle_batch(BatchFinish {
+            graph,
+            batch,
+            durability: CraqleRequestDurability::Durable,
+        })
+    }
+
+    fn settle_batch(&self, request: BatchFinish<'_>) -> Result<Batch> {
+        let status = self.replication.receipt_for_batch(&request.batch)?;
+        if let Err(error) = self.schedule_graph_search(request.graph) {
+            return match &status {
+                MutationStatus::Known(receipt) => {
+                    Err(accepted_error(receipt.as_ref().clone(), error))
+                }
+                MutationStatus::Expired => Err(CraqleError::Update(UpdateError::ReceiptExpired)),
+                MutationStatus::Unknown => Err(error),
+            };
         }
-        Ok(batch)
+        if request.durability.persists_fjall() {
+            match status {
+                MutationStatus::Known(receipt) => {
+                    self.persist_receipt(*receipt)?;
+                }
+                MutationStatus::Expired => {
+                    return Err(CraqleError::Update(UpdateError::ReceiptExpired));
+                }
+                MutationStatus::Unknown => self.persist_fjall()?,
+            }
+        }
+        Ok(request.batch)
     }
 
     fn finish_report(
@@ -3677,23 +4525,29 @@ impl CraqleNode {
         graph: &GraphId,
         report: AppendDataEntitiesReport,
     ) -> Result<AppendDataEntitiesReport> {
-        self.schedule_search_update_for_graph(graph)?;
-        self.persist_fjall()?;
+        let status = self.replication.receipt_for_batch(&report.batch)?;
+        if let Err(error) = self.schedule_graph_search(graph) {
+            return match &status {
+                MutationStatus::Known(receipt) => {
+                    Err(accepted_error(receipt.as_ref().clone(), error))
+                }
+                MutationStatus::Expired => Err(CraqleError::Update(UpdateError::ReceiptExpired)),
+                MutationStatus::Unknown => Err(error),
+            };
+        }
+        match status {
+            MutationStatus::Known(receipt) => {
+                self.persist_receipt(*receipt)?;
+            }
+            MutationStatus::Expired => {
+                return Err(CraqleError::Update(UpdateError::ReceiptExpired));
+            }
+            MutationStatus::Unknown => self.persist_fjall()?,
+        }
         Ok(report)
     }
 
-    fn schedule_full_search_reindex(&self) -> Result<()> {
-        let mut batch = self.store.new_batch();
-        for graph_id in self.store.graph_term_ids()? {
-            self.store.enqueue_fts_reindex(&mut batch, graph_id)?;
-        }
-        self.store.commit(batch)?;
-        self.persist_fjall()?;
-        self.schedule_search_update();
-        Ok(())
-    }
-
-    fn schedule_search_update_for_graph(&self, graph: &GraphId) -> Result<()> {
+    fn schedule_graph_search(&self, graph: &GraphId) -> Result<()> {
         if self.store.contains_graph(graph)? {
             self.schedule_search_update();
         }
@@ -3708,15 +4562,8 @@ impl CraqleNode {
         Ok(self.store.persist()?)
     }
 
-    /// Apply one replicated record to local state.
-    ///
-    /// Every arm here is a compare-and-set — read the tombstone, the stored
-    /// policy or the stored context tag, then decide whether to write — so the
-    /// whole record has to be applied under the graph's write lock. Without it
-    /// two applies both read the same stored value, both conclude they win, and
-    /// the one that lands second decides the outcome by arrival order; for the
-    /// `@context` register that means the local value can end up superseded on
-    /// every peer but this one, with no later event to correct it (G5, G8).
+    /// Apply each replicated compare-and-set under the graph write lock.
+    /// This preserves tombstone, policy, and context ordering across peers.
     #[cfg(test)]
     fn apply_irokle_record(
         &self,
@@ -3724,21 +4571,21 @@ impl CraqleNode {
     ) -> Result<bool> {
         // Orders this apply against every other write to the same graph; see
         // `replication::GRAPH_WRITE_LOCKS`.
-        let _write_guard = replication::graph_write_guard(record.event.graph());
-        self.apply_irokle_record_locked(record, false)
+        let _write_guard = self.store.graph_write_guard(record.event.graph());
+        self.apply_record_locked(record, false)
     }
 
     /// **Call with the graph's write lock held**, so a publish and its own
     /// apply cannot be reordered against a concurrent one.
-    fn apply_irokle_record_locked(
+    fn apply_record_locked(
         &self,
         record: &irokle::reducer::EventRecord<CraqleGraphEvent>,
         local_record: bool,
     ) -> Result<bool> {
-        if let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event {
-            self.store.delete_graph_tombstoned(tombstone)?;
+        if matches!(&record.event, CraqleGraphEvent::GraphDeleted { .. }) {
+            let applied = self.replication.apply_delete_record(record)?.is_some();
             self.schedule_search_update();
-            return Ok(true);
+            return Ok(applied);
         }
         if let Some(tombstone) = self.store.graph_tombstone(record.event.graph())? {
             return Err(CraqleError::ReplicationRejected {
@@ -3772,24 +4619,18 @@ impl CraqleNode {
                         reason: "remote actor is not authorized to change graph policy".to_owned(),
                     });
                 }
-                let current = self.store.graph_tagged_policy(graph)?;
-                if tagged.tag <= current.tag {
-                    return Ok(false);
-                }
-                let tagged = TaggedGraphPolicy {
-                    policy: tagged.policy.clone().normalized(),
-                    tag: tagged.tag,
-                };
-                self.store.set_tagged_graph_policy(graph, &tagged)?;
-                Ok(true)
+                Ok(self.replication.apply_policy_record(record)?.is_some())
             }
             CraqleGraphEvent::QuadChanges { graph, .. }
-            | CraqleGraphEvent::RoCrateMutation { graph, .. } => {
-                let Some(result) = self.replication.apply_irokle_record(record)? else {
+            | CraqleGraphEvent::RoCrateMutation { graph, .. }
+            | CraqleGraphEvent::Mutation { graph, .. }
+            | CraqleGraphEvent::CommittedMutation { graph, .. } => {
+                let Some(result) = self.replication.apply_irokle_record(record, local_record)?
+                else {
                     return Ok(false);
                 };
                 if result.applied {
-                    self.schedule_search_update_for_graph(graph)?;
+                    self.schedule_graph_search(graph)?;
                 }
                 Ok(result.applied)
             }
@@ -3798,11 +4639,11 @@ impl CraqleNode {
 
     #[cfg(test)]
     fn validate_sync_policy(&self, graph: &GraphId, policy: &GraphPolicy) -> Result<()> {
-        if policy.permission_paths.len() > MAX_SYNC_POLICY_PATHS {
+        if policy.permission_paths.len() > MAX_POLICY_PATHS {
             return Err(CraqleError::SyncInputRejected(format!(
                 "sync policy for graph `{}` exceeded {} permission paths",
                 graph.as_str(),
-                MAX_SYNC_POLICY_PATHS
+                MAX_POLICY_PATHS
             )));
         }
         Ok(())
@@ -3841,6 +4682,70 @@ impl CraqleNode {
     }
 }
 
+/// Keeps store-wide counts only for callers that may read every graph.
+/// Snapshot policy visibility that keeps the first policy read failure of one request.
+struct PolicyVisibility<'a> {
+    store: &'a GraphStore,
+    auth: &'a dyn Authorizer,
+    failure: Mutex<Option<store::StoreError>>,
+}
+
+impl<'a> PolicyVisibility<'a> {
+    fn new(store: &'a GraphStore, auth: &'a dyn Authorizer) -> Self {
+        Self {
+            store,
+            auth,
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// Hides a graph without readable permission; a failed read also hides it until `finish`.
+    fn visible(&self, snapshot: &store::StoreReadSnapshot, graph: &GraphId) -> bool {
+        match snapshot.graph_policy(self.store, graph) {
+            Ok(policy) => policy
+                .is_some_and(|policy| self.auth.authorize(graph, &policy, Action::Read).is_ok()),
+            Err(error) => {
+                self.failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert(error);
+                false
+            }
+        }
+    }
+
+    /// Turns any request that could not read required policy into that error.
+    fn finish<T>(self, result: Result<T>) -> Result<T> {
+        match self
+            .failure
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(error) => Err(error.into()),
+            None => result,
+        }
+    }
+}
+
+/// Withholds diagnostics that could reflect graphs this caller may not read.
+fn scoped_execution(
+    auth: &dyn Authorizer,
+    prepared: &PreparedQuery,
+    mut execution: QueryExecution,
+) -> QueryExecution {
+    if !auth.reads_all() {
+        execution.statistics.withhold_details(prepared);
+    }
+    execution
+}
+
+fn scoped_plan(auth: &dyn Authorizer, prepared: &PreparedQuery, mut plan: QueryPlan) -> QueryPlan {
+    if !auth.reads_all() {
+        plan.withhold_details(prepared);
+    }
+    plan
+}
+
 #[cfg(feature = "shacl-core")]
 fn rocrate_policy_id(shapes_graph: &GraphId, schema: &CompiledShaclSchema) -> PolicyId {
     let mut hasher = blake3::Hasher::new();
@@ -3852,21 +4757,20 @@ fn rocrate_policy_id(shapes_graph: &GraphId, schema: &CompiledShaclSchema) -> Po
     PolicyId(*hasher.finalize().as_bytes())
 }
 
-fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<GraphId> {
+fn single_change_graph(changes: &[CoreChange]) -> Result<GraphId> {
     let Some(first) = changes.first() else {
         return Err(CraqleError::MultiGraphUpdateUnsupported);
     };
     let graph = match first {
-        CoreMaterializedQuadChange::Insert { graph, .. }
-        | CoreMaterializedQuadChange::Delete { graph, .. } => graph.clone(),
+        CoreChange::Insert { graph, .. } | CoreChange::Delete { graph, .. } => graph.clone(),
     };
 
     if changes.iter().all(|change| match change {
-        CoreMaterializedQuadChange::Insert {
+        CoreChange::Insert {
             graph: change_graph,
             ..
         }
-        | CoreMaterializedQuadChange::Delete {
+        | CoreChange::Delete {
             graph: change_graph,
             ..
         } => *change_graph == graph,
@@ -3877,23 +4781,49 @@ fn single_graph_for_changes(changes: &[CoreMaterializedQuadChange]) -> Result<Gr
     }
 }
 
-/// Per-graph state for resolving several subjects of the same graph.
-///
-/// `graph_tid` is `None` when the graph name was never interned, i.e. the
-/// graph holds no triples to describe.
+/// Per-graph subject state; an absent id means no stored triples.
 struct DescribeCtx {
     graph_tid: Option<store::TermId>,
     orphaned: std::collections::HashSet<EncodedTerm>,
 }
 
-/// Memo of "may this caller read this graph?", valid for one call.
-///
-/// Authorization is always re-evaluated against the policy currently in the
-/// store, so a policy change is picked up by the next call (G8).
+/// Memo of graph readability for one call and one policy view.
+/// The caller and cooperative budget shared by every phase of one search request.
+struct SearchScope<'a> {
+    auth: &'a dyn Authorizer,
+    started: Instant,
+    options: &'a SearchOptions,
+}
+
+impl<'a> SearchScope<'a> {
+    fn new(auth: &'a dyn Authorizer, options: &'a SearchOptions) -> Self {
+        Self {
+            auth,
+            started: Instant::now(),
+            options,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.options.cancellation.is_cancelled() {
+            return Err(search::SearchError::Cancelled.into());
+        }
+        if self
+            .options
+            .timeout
+            .is_some_and(|timeout| self.started.elapsed() >= timeout)
+        {
+            return Err(search::SearchError::Deadline.into());
+        }
+        Ok(())
+    }
+}
+
 struct ReadableGraphs<'a> {
     node: &'a CraqleNode,
     auth: &'a dyn Authorizer,
-    memo: HashMap<String, bool>,
+    snapshot: store::StoreReadSnapshot,
+    memo: cache::BoundedCache<String, bool>,
 }
 
 impl<'a> ReadableGraphs<'a> {
@@ -3901,55 +4831,35 @@ impl<'a> ReadableGraphs<'a> {
         Self {
             node,
             auth,
-            memo: HashMap::new(),
+            snapshot: node.store.read_snapshot(),
+            memo: cache::BoundedCache::new(1_024, node.search.query_bytes() / 4),
         }
     }
 
     fn allows(&mut self, graph_id: &str) -> Result<bool> {
-        if let Some(readable) = self.memo.get(graph_id) {
-            return Ok(*readable);
+        if let Some(readable) = self.memo.get_cloned(graph_id) {
+            return Ok(readable);
         }
-
         let graph = GraphId::new(graph_id);
-        let readable = self.node.store.contains_graph(&graph)?
-            && self
-                .auth
-                .authorize(&graph, &self.node.store.graph_policy(&graph)?, Action::Read)
-                .is_ok();
-        self.memo.insert(graph_id.to_string(), readable);
+        let readable = self
+            .snapshot
+            .graph_policy(&self.node.store, &graph)?
+            .is_some_and(|policy| self.auth.authorize(&graph, &policy, Action::Read).is_ok());
+        self.memo.insert(
+            graph_id.to_owned(),
+            readable,
+            graph_id.len().saturating_mul(2),
+        );
         Ok(readable)
     }
 }
 
-fn score_key(score: f32) -> i64 {
-    (score as f64 * 1_000_000.0) as i64
-}
-
-/// Remembers graph-and-subject pairs so later duplicates can be dropped.
-#[derive(Default)]
-pub(crate) struct SeenHits(std::collections::HashSet<(String, String)>);
-
-impl SeenHits {
-    /// True exactly once per pair: only the first occurrence is admitted.
-    pub(crate) fn admits(&mut self, hit: &SearchHit) -> bool {
-        self.0
-            .insert((hit.graph_id.clone(), hit.subject_iri.clone()))
-    }
-}
-
-/// Merge hits from several searches into one score-ordered page, keeping only
-/// the highest-scoring occurrence of each graph-and-subject pair.
-fn limit_search_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
-    hits.sort_unstable_by(|left, right| {
-        Reverse(score_key(left.score))
-            .cmp(&Reverse(score_key(right.score)))
-            .then_with(|| left.graph_id.cmp(&right.graph_id))
-            .then_with(|| left.subject_iri.cmp(&right.subject_iri))
-    });
-    let mut seen = SeenHits::default();
-    hits.retain(|hit| seen.admits(hit));
-    hits.truncate(limit);
-    hits
+fn accepted_error(receipt: MutationReceipt, error: CraqleError) -> CraqleError {
+    CraqleError::Update(UpdateError::Accepted {
+        error_kind: error.kind(),
+        reason: error.to_string(),
+        receipt: Box::new(receipt.outbound()),
+    })
 }
 
 #[cfg(test)]
@@ -4015,7 +4925,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_request_persists_with_configured_mode() {
+    fn durability_uses_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             directory.path(),
@@ -4025,11 +4935,11 @@ mod tests {
         let graph = GraphId::new("urn:test:durability:configured");
         let persists = node.store.persists();
 
-        node.finish_batch_with_durability(
-            &graph,
-            empty_test_batch(&graph, node.actor()),
-            CraqleRequestDurability::Durable,
-        )
+        node.settle_batch(BatchFinish {
+            graph: &graph,
+            batch: empty_test_batch(&graph, node.actor()),
+            durability: CraqleRequestDurability::Durable,
+        })
         .unwrap();
 
         assert_eq!(
@@ -4040,17 +4950,17 @@ mod tests {
     }
 
     #[test]
-    fn wal_already_durable_does_not_force_local_persist() {
+    fn durable_wal_reused() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(directory.path()).unwrap();
         let graph = GraphId::new("urn:test:durability:external-wal");
         let persists = node.store.persists();
 
-        node.finish_batch_with_durability(
-            &graph,
-            empty_test_batch(&graph, node.actor()),
-            CraqleRequestDurability::WalAlreadyDurable,
-        )
+        node.settle_batch(BatchFinish {
+            graph: &graph,
+            batch: empty_test_batch(&graph, node.actor()),
+            durability: CraqleRequestDurability::WalAlreadyDurable,
+        })
         .unwrap();
 
         assert_eq!(persists, node.store.persists());
@@ -4109,7 +5019,7 @@ mod tests {
             let focus = format!("urn:test:{prefix}:focus:{index}");
             let shape = format!("urn:test:{prefix}:shape:{index}");
             let property = format!("urn:test:{prefix}:property:{index}");
-            node.apply_changes_bypassing_structural_rules(
+            node.apply_unchecked(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4132,8 +5042,7 @@ mod tests {
                 predicate: EncodedTerm(format!("<{sh_min_count}>")),
                 object: EncodedTerm(format!("\"1\"^^<{xsd_integer}>")),
             });
-            node.apply_changes_bypassing_structural_rules(&shapes, shape_changes)
-                .unwrap();
+            node.apply_unchecked(&shapes, shape_changes).unwrap();
             node.bind_shacl(
                 &AllowAllAuthorizer,
                 &ShaclBinding {
@@ -4151,7 +5060,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn separate_structural_and_shacl_write_checks() {
+    fn separates_write_checks() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             directory.path(),
@@ -4167,7 +5076,7 @@ mod tests {
         );
 
         let error = node
-            .apply_changes_bypassing_structural_rules(
+            .apply_unchecked(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4187,7 +5096,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn independent_shacl_writers_validate_concurrently() {
+    fn independent_writers_overlap() {
         for count in [1usize, 2, 4, 8, 16] {
             for (label, policy, rejected) in [
                 ("disabled", ShaclWritePolicy::Disabled, false),
@@ -4251,7 +5160,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn same_graph_shacl_writers_remain_serialized() {
+    fn graph_writers_serialize() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
             CraqleNode::open_with_options(
@@ -4301,7 +5210,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn shape_dependency_mutation_during_validation_rechecks_fences() {
+    fn validation_rechecks_dependencies() {
         for imported in [false, true] {
             let label = if imported { "import" } else { "root" };
             let directory = tempfile::tempdir().unwrap();
@@ -4322,7 +5231,7 @@ mod tests {
             let focus = format!("urn:test:shape-race:{label}:focus");
             let shape = format!("urn:test:shape-race:{label}:shape");
             let property = format!("urn:test:shape-race:{label}:property");
-            node.apply_changes_bypassing_structural_rules(
+            node.apply_unchecked(
                 &data,
                 vec![shacl_change(
                     &data,
@@ -4370,10 +5279,9 @@ mod tests {
                 predicate: EncodedTerm("<http://www.w3.org/ns/shacl#minCount>".to_owned()),
                 object: EncodedTerm("\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned()),
             });
-            node.apply_changes_bypassing_structural_rules(&dependency, shape_changes)
-                .unwrap();
+            node.apply_unchecked(&dependency, shape_changes).unwrap();
             if imported {
-                node.apply_changes_bypassing_structural_rules(
+                node.apply_unchecked(
                     &root,
                     vec![shacl_change(
                         &root,
@@ -4423,7 +5331,7 @@ mod tests {
                 assert!(wait_started.elapsed() < Duration::from_secs(5));
                 std::thread::yield_now();
             }
-            node.apply_changes_bypassing_structural_rules(
+            node.apply_unchecked(
                 &dependency,
                 vec![MaterializedQuadChange::Insert {
                     graph: dependency.clone(),
@@ -4442,7 +5350,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn sync_local_settlement_failure_returns_committed_batch() {
+    fn settlement_preserves_acceptance() {
         let directory = tempfile::tempdir().unwrap();
         let node = sync_node(&directory);
         let (data, focus) =
@@ -4498,7 +5406,7 @@ mod tests {
     }
 
     #[test]
-    fn query_authorization_uses_the_data_snapshot_policy() {
+    fn authorization_uses_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
             CraqleNode::open_with_options(
@@ -4549,7 +5457,20 @@ mod tests {
                     })
                 }
             };
-            node_for_query.query(&auth, &query).unwrap()
+            let options = QueryOptions {
+                limits: QueryLimits::unbounded(),
+                ..QueryOptions::default()
+            };
+            node_for_query
+                .query_with_options(
+                    &auth,
+                    QueryRequest {
+                        sparql: &query,
+                        options: &options,
+                    },
+                )
+                .unwrap()
+                .results
         });
 
         let reached = reached_rx
@@ -4585,7 +5506,7 @@ mod tests {
 
     #[cfg(feature = "search")]
     #[test]
-    fn query_fts_reauthorizes_hits_after_search() {
+    fn search_reauthorizes_hits() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
             CraqleNode::open_with_options(
@@ -4636,7 +5557,20 @@ mod tests {
                     })
                 }
             };
-            node_for_query.query(&auth, &query).unwrap()
+            let options = QueryOptions {
+                limits: QueryLimits::unbounded(),
+                ..QueryOptions::default()
+            };
+            node_for_query
+                .query_with_options(
+                    &auth,
+                    QueryRequest {
+                        sparql: &query,
+                        options: &options,
+                    },
+                )
+                .unwrap()
+                .results
         });
 
         reached_rx
@@ -4663,9 +5597,7 @@ mod tests {
         ));
     }
 
-    /// Both node-level search entry points take a caller-supplied limit that
-    /// Tantivy turns into a `limit * 2` pre-allocation, so `usize::MAX` used
-    /// to abort the process rather than return a page.
+    /// Search entry points must clamp limits before Tantivy allocation.
     #[test]
     #[cfg(feature = "search")]
     fn huge_limit_clamps() {
@@ -4706,10 +5638,7 @@ mod tests {
         assert_eq!(1, hits.len());
     }
 
-    /// `search_graphs` forks strategy above `SEARCH_GRAPHS_PER_GRAPH_LIMIT`
-    /// graphs. That is a performance fork, so both arms must answer
-    /// identically — including for a query carrying characters the Tantivy
-    /// parser reads as syntax, which the set arm used to hand over unescaped.
+    /// Both graph-search strategies must handle Tantivy syntax identically.
     #[test]
     #[cfg(feature = "search")]
     fn graph_arms_agree() {
@@ -4721,9 +5650,7 @@ mod tests {
         .unwrap();
         let auth = writer_auth();
 
-        // Only the first seven graphs carry the needle, so querying seven
-        // graphs and querying all nine must return the same hits — one query
-        // either side of the threshold.
+        // Seven matching graphs exercise both sides of the strategy threshold.
         let graphs: Vec<GraphId> = (0..9)
             .map(|i| GraphId::new(&format!("urn:t:arm{i}")))
             .collect();
@@ -4758,10 +5685,7 @@ mod tests {
         assert_eq!(per_graph, run(&graphs), "the two arms disagree");
     }
 
-    /// A whole-graph rebuild clears the graph, then refills it from a store
-    /// scan. An upsert for the same graph landing in that window survived the
-    /// clear and was then duplicated by the refill, leaving two documents for
-    /// one subject that the acknowledged queue entries called settled (G7).
+    /// A rebuild must exclude an upsert between graph clearing and refill.
     #[test]
     #[cfg(feature = "search")]
     fn rebuild_excludes_upsert() {
@@ -4894,7 +5818,21 @@ mod tests {
                 }
             }
         "#;
-        let rows = match node.query_graphs_with(|_| true, sparql).unwrap() {
+        let options = QueryOptions {
+            limits: QueryLimits::unbounded(),
+            ..QueryOptions::default()
+        };
+        let rows = match node
+            .query_with_options(
+                &AllowAllAuthorizer,
+                QueryRequest {
+                    sparql,
+                    options: &options,
+                },
+            )
+            .unwrap()
+            .results
+        {
             QueryResults::Solutions(rows) => rows,
             other => panic!("expected solutions, got {other:?}"),
         };
@@ -5040,6 +5978,7 @@ mod tests {
             .create_crate(&writer_auth(), crate_request(&graph, "prefix"))
             .unwrap();
         replica.reconcile_irokle().unwrap();
+        #[cfg(feature = "search")]
         replica.flush_search_updates().unwrap();
         let topic = origin.irokle_topic_id(&graph).unwrap().unwrap();
         let baseline = topic_cursor(&replica, topic);
@@ -5104,13 +6043,7 @@ mod tests {
         );
     }
 
-    /// G3 — a retryable apply failure must stop the pass at that record, and a
-    /// later pass must still deliver it.
-    ///
-    /// Quarantining it instead loses it twice over: the cursor moves past it,
-    /// and the record behind it raises the graph clock past its dot, so the
-    /// dedup gate would drop it even on redelivery. The replica then stays
-    /// short one write forever, with nothing left to repair it.
+    /// A retryable apply failure stops the pass without advancing its cursor.
     #[test]
     fn stall_retries_record() {
         let pair = replica_pair();
@@ -5211,7 +6144,7 @@ mod tests {
         let corrupt = vec![0x81, 0x02, 0x03];
         pair.replica
             .store
-            .set_applied_topic_clock(topic.as_bytes(), &corrupt)
+            .set_topic_clock(topic.as_bytes(), &corrupt)
             .unwrap();
         let error = pair.replica.reconcile_irokle().unwrap_err();
         assert_eq!(error.kind(), CraqleErrorKind::CorruptAuthoritativeData);
@@ -5248,6 +6181,130 @@ mod tests {
         assert_eq!(audit.old_cursor_digest, topic_cursor_digest(&corrupt));
         pair.replica.reconcile_irokle().unwrap();
         assert!(pair.replica.contains_graph(&graph).unwrap());
+    }
+
+    #[test]
+    fn locked_revocation_denies() {
+        let pair = replica_pair();
+        let node = &pair.origin;
+        let graph = GraphId::new("urn:test:locked-revocation");
+        node.create_crate(&writer_auth(), crate_request(&graph, "locked"))
+            .unwrap();
+        let revoked = graph.clone();
+        // The revocation lands after the write's entry and before it takes the graph lock.
+        *node.before_graph_lock.lock().unwrap() = Some(Box::new(move |node: &CraqleNode| {
+            let policy = GraphPolicy {
+                public: true,
+                permission_paths: vec!["/elsewhere".to_owned()],
+            };
+            node.set_graph_policy(&AllowAllAuthorizer, &revoked, policy)
+                .unwrap();
+            node.reconcile_irokle().unwrap();
+        }));
+        let before = node.graph_snapshot(&graph).unwrap();
+        let error = node
+            .insert_quads(
+                &writer_auth(),
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&graph.0),
+                    EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    keyword_object("denied"),
+                )],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::Unauthorized);
+        assert!(node.before_graph_lock.lock().unwrap().is_none());
+        assert_eq!(node.graph_snapshot(&graph).unwrap().quads, before.quads);
+    }
+
+    #[test]
+    fn unbound_restore_recovers() {
+        let pair = replica_pair();
+        let node = &pair.origin;
+        let graph = GraphId::new("urn:test:unbound-restore");
+        node.create_crate(&writer_auth(), crate_request(&graph, "unbound"))
+            .unwrap();
+        let original = node.graph_heads(&AllowAllAuthorizer, &graph).unwrap();
+        write_keyword(node, &graph, "changed");
+        let request = HistoryRestore {
+            graph: graph.clone(),
+            heads: original,
+            expected: None,
+            id: Some(MutationId::new()),
+            max_operations: 100,
+            max_bytes: 1024 * 1024,
+            commit: None,
+        };
+        // The restore publishes, then fails as a crash would before its receipt is bound.
+        node.replication.arm_bind_failure();
+        node.restore_history(&AllowAllAuthorizer, &request)
+            .unwrap_err();
+        let published = node.graph_heads(&AllowAllAuthorizer, &graph).unwrap();
+        write_keyword(node, &graph, "later");
+        node.reconcile_irokle().unwrap();
+        let restored = node
+            .restore_history(&AllowAllAuthorizer, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(vec![restored.operation], published);
+        assert!(!has_keyword(node, &graph, "changed"));
+        assert!(has_keyword(node, &graph, "later"));
+    }
+
+    #[test]
+    fn rewound_reused_ids() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:rewound-reused-ids");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "rewound"))
+            .unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let id = MutationId::new();
+        for value in ["first", "second"] {
+            pair.irokle
+                .open_topic::<CraqleGraphEvent>(topic)
+                .unwrap()
+                .publish(CraqleGraphEvent::Mutation {
+                    id,
+                    graph: graph.clone(),
+                    changes: vec![MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: EncodedTerm::from_named_node(&graph.0),
+                        predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                        object: keyword_object(value),
+                    }],
+                    render_hints: None,
+                })
+                .unwrap();
+        }
+        pair.origin.reconcile_irokle().unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let cursor = topic_cursor(&pair.replica, topic).unwrap();
+        // Rewinding re-delivers records whose data and first receipt are already committed.
+        pair.replica
+            .repair_irokle_topic_cursor(
+                &AllowAllAuthorizer,
+                topic,
+                topic_cursor_digest(&cursor),
+                irokle::ActorClock::default(),
+            )
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(has_keyword(&pair.replica, &graph, "first"));
+        assert!(has_keyword(&pair.replica, &graph, "second"));
+        assert_eq!(
+            pair.origin.graph_fingerprint(&graph).unwrap(),
+            pair.replica.graph_fingerprint(&graph).unwrap()
+        );
+        assert_eq!(topic_cursor(&pair.replica, topic), Some(cursor));
+        assert!(
+            pair.replica
+                .list_rejected_replication_records(&AllowAllAuthorizer)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// An open must not fail on a reconcile a retry clears, or a node whose
@@ -5324,7 +6381,7 @@ mod tests {
     /// A record no retry could ever accept stays quarantined: the pass skips
     /// it and still applies the records behind it.
     #[test]
-    fn rejection_ledger_before_cursor_advance() {
+    fn rejection_precedes_cursor() {
         let ReplicaPair {
             _dir,
             irokle,
@@ -5357,6 +6414,9 @@ mod tests {
             .unwrap();
         write_keyword(&origin, &graph, "after");
 
+        // Idle search maintenance cannot consume the one armed commit failure.
+        #[cfg(feature = "search")]
+        replica.flush_search_updates().unwrap();
         replica.store.arm_commit_failure();
         assert!(replica.reconcile_irokle().is_err());
         assert_eq!(baseline_cursor, topic_cursor(&replica, topic));
@@ -5435,12 +6495,7 @@ mod tests {
         );
     }
 
-    /// A panic inside the indexer drain must not take the worker thread down.
-    ///
-    /// The search index is derived state, and the thread that repairs it is the
-    /// same one that drains the queue. If a panic killed it, the index would
-    /// stay diverged from the store until the process restarted — the lingering
-    /// inconsistency the recovery rules forbid.
+    /// A drain panic must not stop the worker that repairs derived search state.
     #[test]
     #[cfg(feature = "search")]
     fn worker_survives_panic() {
@@ -5469,7 +6524,7 @@ mod tests {
         node.flush_search_updates()
             .expect("worker must still be alive after the panic");
         assert!(
-            !node.search.take_armed_drain_panic(),
+            !node.search.take_drain_panic(),
             "the injected panic must actually have fired, or this test is vacuous"
         );
 
@@ -5489,11 +6544,7 @@ mod tests {
         );
     }
 
-    /// G5 — two `@context` writes must never mint the same last-write-wins tag.
-    ///
-    /// The tag is `stored_counter + 1`, so an unsynchronised mint hands the
-    /// identical `(counter, actor)` to two different context values: a tie the
-    /// register cannot break, which leaves peers free to disagree forever.
+    /// Concurrent context writes must mint distinct last-write-wins tags.
     #[test]
     fn context_tags_distinct() {
         const WRITERS: usize = 8;
@@ -5532,14 +6583,7 @@ mod tests {
         );
     }
 
-    /// G5 — two RO-Crate render-hint mutations racing on one graph must converge on
-    /// the higher tag, not on whichever landed last.
-    ///
-    /// The apply is a compare-and-set: read the stored tag, decide, write. Run
-    /// unsynchronised, both applies read the same stored tag, both conclude
-    /// they dominate it, and arrival order picks the winner — so the register
-    /// can settle on a value every peer has already superseded, with no later
-    /// event to correct it.
+    /// Racing context mutations must converge on the higher tag.
     #[test]
     fn context_applies_converge() {
         const ROUNDS: usize = 32;
@@ -5562,8 +6606,8 @@ mod tests {
                     &node.store,
                     &graph,
                     Vec::new(),
-                    crate::core::TaggedRoCrateRenderHints {
-                        hints: crate::core::RoCrateRenderHints {
+                    crate::core::TaggedRenderHints {
+                        hints: crate::core::CrateRenderHints {
                             context: Some(value.to_string()),
                             license: None,
                             license_digest: None,
@@ -5611,14 +6655,7 @@ mod tests {
         }
     }
 
-    /// G8 — concurrent policy writes must leave this node on the policy their
-    /// publish sequence ends with, which is the one every peer converges to.
-    ///
-    /// A policy event carries no ordering tag, so publish order is the only
-    /// thing that decides the winner. Publishing and applying without a lock
-    /// between them lets two writes apply in the opposite order, leaving this
-    /// node on a policy its peers have already replaced — the permissive one,
-    /// if that is the one that lost.
+    /// Concurrent policy writes must settle locally in publication order.
     #[test]
     fn policy_writes_settle() {
         const ROUNDS: usize = 10;
@@ -5630,10 +6667,10 @@ mod tests {
 
         // Widen the publish→apply window, so a writer that does not hold it
         // open under a lock is overtaken instead of merely being able to be.
-        PUBLISH_APPLY_STALL_MICROS.store(STALL_MICROS, Ordering::Relaxed);
+        PUBLISH_STALL_MICROS.store(STALL_MICROS, Ordering::Relaxed);
         for round in 0..ROUNDS {
             let graph = GraphId::new(&format!("urn:test:policy-race-{round}"));
-            node.set_graph_policy_bypassing_authorization(&graph, policy_at("seed"))
+            node.set_policy_unchecked(&graph, policy_at("seed"))
                 .unwrap();
 
             let (tx, rx) = mpsc::channel();
@@ -5656,7 +6693,7 @@ mod tests {
                 "round {round} settled on a policy its peers have replaced"
             );
         }
-        PUBLISH_APPLY_STALL_MICROS.store(0, Ordering::Relaxed);
+        PUBLISH_STALL_MICROS.store(0, Ordering::Relaxed);
     }
 
     /// The policy a peer replaying this graph's topic ends up on.
@@ -5675,19 +6712,13 @@ mod tests {
                     CraqleGraphEvent::Policy { tagged, .. } => Some(tagged.policy.normalized()),
                     _ => None,
                 },
-                sync::TopicRecord::Rejected(_) => None,
+                sync::TopicRecord::Rejected(_) | sync::TopicRecord::Control(_) => None,
             })
             .next_back()
             .expect("at least one published policy")
     }
 
-    /// G4 — a write racing a delete must not resurrect the graph.
-    ///
-    /// The local write applies through the replication engine, which never
-    /// passes `CraqleNode::apply_irokle_record`'s tombstone check; without one
-    /// of its own it re-creates the graph the delete just tombstoned. Nothing
-    /// clears a tombstone, so every later replicated record for that graph is
-    /// dropped and the divergence can never be repaired.
+    /// A write racing a delete must not resurrect the tombstoned graph.
     #[test]
     fn write_never_resurrects() {
         const ROUNDS: usize = 16;
@@ -5698,7 +6729,7 @@ mod tests {
 
         for round in 0..ROUNDS {
             let graph = GraphId::new(&format!("urn:test:delete-race-{round}"));
-            node.set_graph_policy_bypassing_authorization(&graph, policy_at("delete-race"))
+            node.set_policy_unchecked(&graph, policy_at("delete-race"))
                 .unwrap();
             seed_write(&node, &graph);
 
@@ -5711,7 +6742,7 @@ mod tests {
                 std::thread::spawn(move || {
                     start.wait();
                     if racer == 0 {
-                        node.delete_graph_after_authorization(&graph).unwrap();
+                        node.delete_authorized(&graph).unwrap();
                     } else {
                         if let Err(error) = seed_write_result(&node, &graph) {
                             assert_eq!(error.kind(), CraqleErrorKind::Conflict);
@@ -5738,7 +6769,7 @@ mod tests {
     }
 
     #[test]
-    fn local_write_after_delete_and_same_id_recreation_conflict() {
+    fn deletion_prevents_recreation() {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),
@@ -5765,7 +6796,7 @@ mod tests {
     }
 
     #[test]
-    fn post_delete_remote_record_rejection() {
+    fn deletion_rejects_remote() {
         let pair = replica_pair();
         let graph = GraphId::new("urn:test:post-delete-remote-record");
         pair.origin
@@ -5812,7 +6843,7 @@ mod tests {
     }
 
     #[test]
-    fn three_replica_delete_write_arrival_order_permutations_converge() {
+    fn delete_permutations_converge() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = sync_node(&source_dir);
         let graph = GraphId::new("urn:test:delete-arrival-permutations");
@@ -5886,7 +6917,7 @@ mod tests {
         let shapes = GraphId::new("urn:test:delete-replay-shapes");
         let focus = EncodedTerm("<urn:test:delete-replay-focus>".to_owned());
         pair.origin
-            .apply_changes_bypassing_structural_rules(
+            .apply_unchecked(
                 &data,
                 vec![MaterializedQuadChange::Insert {
                     graph: data.clone(),
@@ -5897,7 +6928,7 @@ mod tests {
             )
             .unwrap();
         pair.origin
-            .apply_changes_bypassing_structural_rules(
+            .apply_unchecked(
                 &shapes,
                 vec![
                     MaterializedQuadChange::Insert {
@@ -5932,9 +6963,10 @@ mod tests {
             )
             .unwrap();
 
-        pair.origin
-            .delete_graph_after_authorization(&shapes)
-            .unwrap();
+        pair.origin.delete_authorized(&shapes).unwrap();
+        // Idle search maintenance cannot consume the one armed commit failure.
+        #[cfg(feature = "search")]
+        pair.replica.flush_search_updates().unwrap();
         pair.replica.store.set_graph_tombstone(&shapes).unwrap();
         pair.replica.store.arm_commit_failure();
         assert!(pair.replica.reconcile_irokle().is_err());
@@ -5955,7 +6987,7 @@ mod tests {
 
     #[cfg(feature = "shacl-core")]
     #[test]
-    fn binding_status_reads_scale_with_records_not_shape_triples() {
+    fn status_bounds_reads() {
         let directory = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             directory.path(),
@@ -6048,7 +7080,7 @@ mod tests {
     }
 
     fn seed_write_result(node: &CraqleNode, graph: &GraphId) -> Result<Batch> {
-        node.apply_changes_bypassing_structural_rules(
+        node.apply_unchecked(
             graph,
             vec![MaterializedQuadChange::Insert {
                 graph: graph.clone(),
@@ -6057,5 +7089,166 @@ mod tests {
                 object: EncodedTerm("\"race\"".to_string()),
             }],
         )
+    }
+
+    /// One work slice bounds replies and leaves excess control messages queued.
+    #[test]
+    fn control_messages_bounded() {
+        let (sender, receiver) = mpsc::channel();
+        let mut keep_alive = Vec::new();
+        for _ in 0..10_000 {
+            let (reply, waiter) = mpsc::channel();
+            sender
+                .send(SearchWorkerMessage::flush_reply(reply, 0))
+                .unwrap();
+            keep_alive.push(waiter);
+        }
+
+        let mut replies = Vec::new();
+        collect_search_messages(&receiver, &mut replies, Duration::ZERO);
+
+        assert!(
+            replies.len() <= MAX_CONTROL_MESSAGES,
+            "collected {} pending flush replies in one cycle",
+            replies.len()
+        );
+
+        let mut later = Vec::new();
+        collect_search_messages(&receiver, &mut later, Duration::ZERO);
+        assert!(
+            !later.is_empty(),
+            "waiters past the cap must stay queued for the next cycle"
+        );
+    }
+
+    #[test]
+    fn retry_failure_settles() {
+        let (retry_reply, retry_result) = mpsc::channel();
+        let (permanent_reply, permanent_result) = mpsc::channel();
+        let (unrelated_reply, unrelated_result) = mpsc::channel();
+        let request = |reply, target| match SearchWorkerMessage::flush_reply(reply, target) {
+            SearchWorkerMessage::Flush(request) => request,
+            SearchWorkerMessage::Wake | SearchWorkerMessage::Stop => unreachable!(),
+        };
+        let mut pending = vec![
+            request(retry_reply, 10),
+            request(permanent_reply, 25),
+            request(unrelated_reply, 4),
+        ];
+        let graph = GraphId::new("urn:test:worker-retry");
+        let failures = [
+            search::queue::DrainFailure {
+                kind: search::queue::QueueKind::Reindex,
+                error_kind: CraqleErrorKind::CorruptDerivedData,
+                graph: graph.clone(),
+                owed_from: 5,
+                target: 10,
+                attempts: 1,
+                retry_at_ms: 250,
+                code: "store-transient".to_string(),
+                diagnostic: "retry deferred".to_string(),
+            },
+            search::queue::DrainFailure {
+                kind: search::queue::QueueKind::Reindex,
+                error_kind: CraqleErrorKind::QueryLimit,
+                graph,
+                owed_from: 20,
+                target: 25,
+                attempts: 1,
+                retry_at_ms: u64::MAX,
+                code: "item-too-large".to_string(),
+                diagnostic: "permanent".to_string(),
+            },
+        ];
+
+        assert_eq!(Some(250), settle_search_failures(&mut pending, &failures));
+        assert_eq!(
+            vec![10, 4],
+            pending
+                .iter()
+                .map(|request| request.target)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            retry_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(permanent_result.try_recv().unwrap().is_err());
+        assert!(matches!(
+            unrelated_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    /// The shutdown flag must bypass a saturated control-channel backlog.
+    #[test]
+    fn shutdown_outruns_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(store::GraphStore::open(dir.path().join("store")).unwrap());
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        let mut worker = SearchUpdateWorker::start(store, search);
+
+        let mut keep_alive = Vec::new();
+        for _ in 0..10_000 {
+            let (reply, waiter) = mpsc::channel();
+            if worker
+                .sender
+                .try_send(SearchWorkerMessage::flush_reply(reply, 0))
+                .is_err()
+            {
+                break;
+            }
+            keep_alive.push(waiter);
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || sender.send(worker.shutdown()).unwrap());
+        assert!(
+            receiver.recv_timeout(PROGRESS_TIMEOUT).unwrap(),
+            "the indexer thread did not observe shutdown behind the backlog"
+        );
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn drop_joins_completion() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (entered, observed) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let completed = finished.clone();
+        let handle = std::thread::spawn(move || {
+            assert!(matches!(
+                receiver.recv_timeout(PROGRESS_TIMEOUT).unwrap(),
+                SearchWorkerMessage::Stop
+            ));
+            entered.send(()).unwrap();
+            resume.recv_timeout(PROGRESS_TIMEOUT).unwrap();
+            completed.store(true, Ordering::SeqCst);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(GraphStore::open(directory.path()).unwrap());
+        let mut worker = SearchUpdateWorker {
+            sender,
+            store,
+            pending: Arc::new(AtomicUsize::new(0)),
+            wake_pending: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            handle: Some(handle),
+        };
+        assert_eq!(
+            worker.shutdown_within(Duration::ZERO).unwrap(),
+            ShutdownState::TimedOut
+        );
+        assert!(worker.handle.is_some());
+        let (done, result) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            drop(worker);
+            done.send(finished.load(Ordering::SeqCst)).unwrap();
+        });
+        observed.recv_timeout(PROGRESS_TIMEOUT).unwrap();
+        release.send(()).unwrap();
+        assert!(result.recv_timeout(PROGRESS_TIMEOUT).unwrap());
+        owner.join().unwrap();
     }
 }

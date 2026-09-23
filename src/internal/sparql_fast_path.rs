@@ -1,3 +1,7 @@
+//! Recognizes and evaluates bounded specialized SPARQL plans.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -8,7 +12,7 @@ use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{QueryBudget, QueryResults, Result};
 use crate::store::{EncodedQuad, QueryTermId, TermId};
@@ -86,7 +90,7 @@ pub(crate) enum FastPathPlan {
         triples: Vec<TriplePlan>,
         output: String,
     },
-    OptionalSubjectStarCount {
+    OptionalStarCount {
         mandatory: Vec<TriplePlan>,
         optional: Vec<TriplePlan>,
         output: String,
@@ -129,7 +133,7 @@ impl FastPathPlan {
                 PatternGraph::Named(_) => QueryFastPathKind::NamedCount,
                 PatternGraph::DefaultUnion => QueryFastPathKind::UnionCount,
             },
-            Self::SubjectStarCount { .. } | Self::OptionalSubjectStarCount { .. } => {
+            Self::SubjectStarCount { .. } | Self::OptionalStarCount { .. } => {
                 QueryFastPathKind::SubjectStarCount
             }
             Self::SubjectSetCount { .. } => QueryFastPathKind::HashJoinCount,
@@ -152,7 +156,7 @@ pub(crate) struct FastPathOutcome {
     pub(crate) kind: QueryFastPathKind,
     pub(crate) execution_time: Duration,
     pub(crate) collection_time: Duration,
-    pub(crate) time_to_first_result: Option<Duration>,
+    pub(crate) first_result_time: Option<Duration>,
     pub(crate) intermediate_rows: u64,
     pub(crate) result_rows: u64,
     pub(crate) result_cells: u64,
@@ -568,9 +572,9 @@ fn pattern_term(term: &TermPattern) -> Option<PatternTerm> {
         TermPattern::NamedNode(node) => {
             Some(PatternTerm::Constant(EncodedTerm::from_named_node(node)))
         }
-        TermPattern::Literal(literal) => Some(PatternTerm::Constant(
-            EncodedTerm::from_non_star_term(&Term::Literal(literal.clone())),
-        )),
+        TermPattern::Literal(literal) => Some(PatternTerm::Constant(EncodedTerm::from_plain_term(
+            &Term::Literal(literal.clone()),
+        ))),
         TermPattern::Variable(variable) => {
             Some(PatternTerm::Variable(variable.as_str().to_owned()))
         }
@@ -624,7 +628,10 @@ impl TriplePlan {
         context: &ReadContext<'_>,
     ) -> Result<Option<ResolvedTriple<'a>>> {
         let selector = match &self.graph {
-            PatternGraph::DefaultUnion => GraphSelector::DefaultUnion,
+            // One selected graph holds each triple once, so its range is the distinct union.
+            PatternGraph::DefaultUnion => context
+                .single_graph()
+                .map_or(GraphSelector::DefaultUnion, GraphSelector::Named),
             PatternGraph::Named(graph) => {
                 let Some(graph) = view.lookup_term(context, graph)? else {
                     return Ok(None);
@@ -686,7 +693,7 @@ pub(crate) fn execute(
                 kind: QueryFastPathKind::Ask,
                 execution_time: started.elapsed(),
                 collection_time: Duration::ZERO,
-                time_to_first_result: Some(started.elapsed()),
+                first_result_time: Some(started.elapsed()),
                 intermediate_rows: u64::from(value),
                 result_rows: 1,
                 result_cells: 1,
@@ -740,10 +747,10 @@ pub(crate) fn execute(
                         (domain, grouping),
                         (
                             crate::count_plan::CountValueDomain::Subject,
-                            crate::query_cursor::CountGrouping::Subject
+                            crate::query::cursor::CountGrouping::Subject
                         ) | (
                             crate::count_plan::CountValueDomain::Object,
-                            crate::query_cursor::CountGrouping::Object
+                            crate::query::cursor::CountGrouping::Object
                         )
                     );
                     let mut last_value = None;
@@ -795,13 +802,11 @@ pub(crate) fn execute(
         FastPathPlan::SubjectStarCount { triples, output } => {
             subject_star_count(triples, output, view, context, budget, started)
         }
-        FastPathPlan::OptionalSubjectStarCount {
+        FastPathPlan::OptionalStarCount {
             mandatory,
             optional,
             output,
-        } => {
-            optional_subject_star_count(mandatory, optional, output, view, context, budget, started)
-        }
+        } => optional_star_count(mandatory, optional, output, view, context, budget, started),
         FastPathPlan::SubjectSetCount {
             outer,
             inner,
@@ -814,7 +819,16 @@ pub(crate) fn execute(
             variables,
             limit,
         } => execute_property_star(
-            triples, subject, variables, *limit, view, context, started, budget,
+            view,
+            context,
+            StarInput {
+                triples,
+                subject_term: subject,
+                projected: variables,
+                limit: *limit,
+                started,
+                budget,
+            },
         ),
         FastPathPlan::HashJoinCount {
             left,
@@ -838,7 +852,7 @@ fn execute_projection(
 ) -> Result<FastPathOutcome> {
     let mut rows = Vec::with_capacity(limit.min(1_024));
     let mut collection_time = Duration::ZERO;
-    let mut time_to_first_result = None;
+    let mut first_result_time = None;
     if let Some(triple) = triple.resolve(view, context)? {
         let mut cursor = view.scan(context, triple.selector, triple.pattern)?;
         while rows.len() < limit {
@@ -847,8 +861,8 @@ fn execute_projection(
             };
             let quad = quad?;
             budget.observe_intermediate(1)?;
-            if time_to_first_result.is_none() {
-                time_to_first_result = Some(started.elapsed());
+            if first_result_time.is_none() {
+                first_result_time = Some(started.elapsed());
             }
             let collecting = Instant::now();
             let row = collect_row(view, context, &triple, quad, variables)?;
@@ -866,7 +880,7 @@ fn execute_projection(
         kind,
         execution_time: started.elapsed().saturating_sub(collection_time),
         collection_time,
-        time_to_first_result,
+        first_result_time,
         intermediate_rows: result_rows,
         result_rows,
         result_cells,
@@ -903,7 +917,7 @@ fn triangle_ask(
         if let Some(mut edges) = raw_triangle_edges(view, context, triple, budget)? {
             let intermediate_rows = u64::try_from(edges.len()).unwrap_or(u64::MAX);
             (
-                sorted_edges_contain_triangle(&mut edges, context, budget)?,
+                edges_have_triangle(&mut edges, context, budget)?,
                 intermediate_rows,
             )
         } else {
@@ -917,7 +931,7 @@ fn triangle_ask(
             }
             let intermediate_rows = u64::try_from(edges.len()).unwrap_or(u64::MAX);
             (
-                sorted_edges_contain_triangle(&mut edges, context, budget)?,
+                edges_have_triangle(&mut edges, context, budget)?,
                 intermediate_rows,
             )
         };
@@ -930,8 +944,7 @@ fn raw_triangle_edges(
     triple: ResolvedTriple<'_>,
     budget: &QueryBudget,
 ) -> Result<Option<Vec<(QueryTermId, QueryTermId)>>> {
-    let Some(mut cursor) = view.raw_query_index_keys(context, triple.selector, triple.pattern)?
-    else {
+    let Some(mut cursor) = view.raw_index_keys(context, triple.selector, triple.pattern)? else {
         return Ok(None);
     };
     let mut edges = Vec::new();
@@ -949,11 +962,11 @@ fn raw_triangle_edges(
                     context.check_cancelled()?;
                 }
                 let (matches, extracted) = cursor.matches(key);
-                context.record_key_fields_extracted(extracted);
+                context.record_key_fields(extracted);
                 if !matches {
                     continue;
                 }
-                context.record_key_fields_extracted(2);
+                context.record_key_fields(2);
                 let edge = (key.subject(), key.object());
                 if !orphaned.is_empty()
                     && (orphaned.contains(&cursor.source_term(edge.0)?)
@@ -981,11 +994,11 @@ fn raw_triangle_edges(
                     context.check_cancelled()?;
                 }
                 let (matches, extracted) = cursor.matches(key);
-                context.record_key_fields_extracted(extracted);
+                context.record_key_fields(extracted);
                 if !matches {
                     continue;
                 }
-                context.record_key_fields_extracted(2);
+                context.record_key_fields(2);
                 let edge = (key.subject(), key.object());
                 if current_edge != Some(edge) {
                     current_edge = Some(edge);
@@ -996,7 +1009,7 @@ fn raw_triangle_edges(
                     continue;
                 }
 
-                context.record_key_fields_extracted(1);
+                context.record_key_fields(1);
                 let query_graph = key.graph();
                 let orphaned = if let Some(orphaned) = graph_cache.get(&query_graph) {
                     orphaned.clone()
@@ -1031,7 +1044,7 @@ fn raw_triangle_edges(
     Ok(Some(edges))
 }
 
-fn sorted_edges_contain_triangle<T: Copy + Ord>(
+fn edges_have_triangle<T: Copy + Ord>(
     edges: &mut Vec<(T, T)>,
     context: &ReadContext<'_>,
     budget: &QueryBudget,
@@ -1069,7 +1082,7 @@ fn boolean_ask_outcome(
         kind: QueryFastPathKind::Ask,
         execution_time: started.elapsed(),
         collection_time: Duration::ZERO,
-        time_to_first_result: Some(started.elapsed()),
+        first_result_time: Some(started.elapsed()),
         intermediate_rows,
         result_rows: 1,
         result_cells: 1,
@@ -1170,7 +1183,7 @@ fn subject_star_count(
     )
 }
 
-fn optional_subject_star_count(
+fn optional_star_count(
     mandatory: &[TriplePlan],
     optional: &[TriplePlan],
     output: &str,
@@ -1203,7 +1216,7 @@ fn optional_subject_star_count(
         .iter()
         .map(|triple| (triple.selector, triple.pattern))
         .collect();
-    if let Some((count, intermediate_rows)) = crate::count_exec::optional_subject_star_count(
+    if let Some((count, intermediate_rows)) = crate::count_exec::optional_star_count(
         view,
         context,
         &patterns[..mandatory.len()],
@@ -1464,12 +1477,13 @@ fn hash_join_count(
             budget,
         );
     };
-    let (build_plan, build, probe_plan, probe) =
-        if estimated_rows(view, left_resolved) <= estimated_rows(view, right_resolved) {
-            (left, left_resolved, right, right_resolved)
-        } else {
-            (right, right_resolved, left, left_resolved)
-        };
+    let (build_plan, build, probe_plan, probe) = if estimated_rows(view, context, left_resolved)
+        <= estimated_rows(view, context, right_resolved)
+    {
+        (left, left_resolved, right, right_resolved)
+    } else {
+        (right, right_resolved, left, left_resolved)
+    };
     if let [join_variable] = join_variables {
         let raw = match (
             build_plan.count_value_domain(join_variable),
@@ -1502,7 +1516,7 @@ fn hash_join_count(
             (
                 Some(crate::count_plan::CountValueDomain::Object),
                 Some(crate::count_plan::CountValueDomain::Subject),
-            ) => crate::count_exec::object_subject_join_count(
+            ) => crate::count_exec::object_subject_count(
                 view,
                 context,
                 build.selector,
@@ -1514,7 +1528,7 @@ fn hash_join_count(
             (
                 Some(crate::count_plan::CountValueDomain::Subject),
                 Some(crate::count_plan::CountValueDomain::Object),
-            ) => crate::count_exec::subject_object_join_count(
+            ) => crate::count_exec::subject_object_count(
                 view,
                 context,
                 build.selector,
@@ -1579,13 +1593,20 @@ fn hash_join_count(
     )
 }
 
-fn estimated_rows(view: &StoreReadView<'_>, triple: ResolvedTriple<'_>) -> usize {
+fn estimated_rows(
+    view: &StoreReadView<'_>,
+    context: &ReadContext<'_>,
+    triple: ResolvedTriple<'_>,
+) -> usize {
     if let (Some(predicate), Some(object)) = (triple.pattern.predicate, triple.pattern.object) {
-        view.store().stat_predicate_object_count(predicate, object)
+        view.planner_stat(
+            context,
+            crate::store::PlannerStat::PredicateObject(predicate, object),
+        )
     } else if let Some(predicate) = triple.pattern.predicate {
-        view.store().stat_predicate_count(predicate)
+        view.planner_stat(context, crate::store::PlannerStat::Predicate(predicate))
     } else {
-        view.store().stat_total_quads()
+        view.planner_stat(context, crate::store::PlannerStat::Total)
     }
 }
 
@@ -1619,7 +1640,7 @@ fn count_outcome(
     let collecting = Instant::now();
     let row = HashMap::from([(
         output.to_owned(),
-        EncodedTerm::from_non_star_term(&Term::Literal(Literal::from(count))),
+        EncodedTerm::from_plain_term(&Term::Literal(Literal::from(count))),
     )]);
     budget.observe_solution(&row)?;
     let collection_time = collecting.elapsed();
@@ -1628,24 +1649,35 @@ fn count_outcome(
         kind,
         execution_time: started.elapsed().saturating_sub(collection_time),
         collection_time,
-        time_to_first_result: Some(started.elapsed()),
+        first_result_time: Some(started.elapsed()),
         intermediate_rows,
         result_rows: 1,
         result_cells: 1,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_property_star(
-    triples: &[TriplePlan],
-    subject_term: &PatternTerm,
-    projected: &[String],
+struct StarInput<'a> {
+    triples: &'a [TriplePlan],
+    subject_term: &'a PatternTerm,
+    projected: &'a [String],
     limit: usize,
+    started: Instant,
+    budget: &'a QueryBudget,
+}
+
+fn execute_property_star(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    started: Instant,
-    budget: &QueryBudget,
+    input: StarInput<'_>,
 ) -> Result<FastPathOutcome> {
+    let StarInput {
+        triples,
+        subject_term,
+        projected,
+        limit,
+        started,
+        budget,
+    } = input;
     let mut resolved = Vec::with_capacity(triples.len());
     for triple in triples {
         let Some(triple) = triple.resolve(view, context)? else {
@@ -1663,9 +1695,12 @@ fn execute_property_star(
             if let (Some(predicate), Some(object)) =
                 (triple.pattern.predicate, triple.pattern.object)
             {
-                view.store().stat_predicate_object_count(predicate, object)
+                view.planner_stat(
+                    context,
+                    crate::store::PlannerStat::PredicateObject(predicate, object),
+                )
             } else if let Some(predicate) = triple.pattern.predicate {
-                view.store().stat_predicate_count(predicate)
+                view.planner_stat(context, crate::store::PlannerStat::Predicate(predicate))
             } else {
                 usize::MAX
             }
@@ -1681,7 +1716,7 @@ fn execute_property_star(
     let mut visited = HashSet::new();
     let mut rows = Vec::new();
     let mut collection_time = Duration::ZERO;
-    let mut time_to_first_result = None;
+    let mut first_result_time = None;
     let mut intermediate_rows = 0_u64;
 
     while rows.len() < limit {
@@ -1703,7 +1738,7 @@ fn execute_property_star(
         if let PatternTerm::Variable(subject_variable) = subject_term {
             binding.insert(subject_variable.as_str(), subject);
         }
-        let mut bindings = vec![binding];
+        let mut properties = Vec::with_capacity(triples.len());
         for (plan, triple) in triples.iter().zip(&resolved) {
             let mut pattern = triple.pattern;
             pattern.subject = Some(subject);
@@ -1731,37 +1766,35 @@ fn execute_property_star(
                 }
             };
             if values.is_empty() {
-                bindings.clear();
                 break;
             }
-            let next_len = bindings.len().saturating_mul(values.len());
-            budget.observe_intermediate(next_len)?;
-            let mut next = Vec::with_capacity(next_len);
-            for binding in bindings {
-                for value in &values {
-                    let mut binding = binding.clone();
-                    if let (PatternTerm::Variable(variable), Some(value)) = (&plan.object, value) {
-                        binding.insert(variable.as_str(), *value);
-                    }
-                    next.push(binding);
+            properties.push(values);
+        }
+        if properties.len() != triples.len() {
+            continue;
+        }
+        let mut positions = vec![0; properties.len()];
+        loop {
+            for ((plan, values), position) in triples.iter().zip(&properties).zip(&positions) {
+                if let (PatternTerm::Variable(variable), Some(value)) =
+                    (&plan.object, values[*position])
+                {
+                    binding.insert(variable.as_str(), value);
                 }
             }
-            intermediate_rows =
-                intermediate_rows.saturating_add(u64::try_from(next.len()).unwrap_or(u64::MAX));
-            bindings = next;
-        }
-        for binding in bindings {
-            if rows.len() == limit {
-                break;
-            }
-            if time_to_first_result.is_none() {
-                time_to_first_result = Some(started.elapsed());
+            budget.observe_intermediate(1)?;
+            intermediate_rows = intermediate_rows.saturating_add(1);
+            if first_result_time.is_none() {
+                first_result_time = Some(started.elapsed());
             }
             let collecting = Instant::now();
             let row = decode_binding(view, context, &binding, projected)?;
             budget.observe_solution(&row)?;
             rows.push(row);
             collection_time = collection_time.saturating_add(collecting.elapsed());
+            if rows.len() == limit || !advance_positions(&mut positions, &properties) {
+                break;
+            }
         }
     }
     let result_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
@@ -1773,11 +1806,22 @@ fn execute_property_star(
         kind: QueryFastPathKind::PropertyStar,
         execution_time: started.elapsed().saturating_sub(collection_time),
         collection_time,
-        time_to_first_result,
+        first_result_time,
         intermediate_rows,
         result_rows,
         result_cells,
     })
+}
+
+fn advance_positions(positions: &mut [usize], properties: &[Vec<Option<TermId>>]) -> bool {
+    for index in (0..positions.len()).rev() {
+        positions[index] += 1;
+        if positions[index] < properties[index].len() {
+            return true;
+        }
+        positions[index] = 0;
+    }
+    false
 }
 
 fn empty_property_star(started: Instant) -> FastPathOutcome {
@@ -1786,7 +1830,7 @@ fn empty_property_star(started: Instant) -> FastPathOutcome {
         kind: QueryFastPathKind::PropertyStar,
         execution_time: started.elapsed(),
         collection_time: Duration::ZERO,
-        time_to_first_result: None,
+        first_result_time: None,
         intermediate_rows: 0,
         result_rows: 0,
         result_cells: 0,
@@ -1840,7 +1884,7 @@ mod tests {
     use spargebra::SparqlParser;
 
     #[test]
-    fn recognizes_guarded_algebra_shapes() {
+    fn recognizes_guarded_shapes() {
         for query in [
             "ASK { <urn:s> <urn:p> <urn:o> }",
             "SELECT ?s WHERE { ?s <urn:p> ?o } LIMIT 10",

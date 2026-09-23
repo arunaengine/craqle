@@ -1,13 +1,11 @@
+//! Checks graph creation, existence, and mutation boundaries.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
-/// Graph-existence semantics (charter G9, finding K5).
-///
-/// A named graph exists for SPARQL iff its metadata record exists **and** it is
-/// visible to the caller — identically whether the visible set is small enough
-/// for the explicit-dataset regime or large enough to force the union regime.
-/// Empty graphs exist. Graphs whose entities are all orphan-hidden exist.
-/// Deleted graphs do not, even though their IRI stays interned in the term
-/// table.
+/// Checks identical graph-existence semantics across explicit and union views.
+/// Empty and orphan-hidden graphs exist; deleted graphs do not.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -16,10 +14,9 @@ mod tests {
 
     use crate::support::*;
 
-    /// Mirrors `sparql::EXPLICIT_DATASET_GRAPH_LIMIT`: at or below it the query
-    /// runs against an explicit spareval dataset spec, above it against the
-    /// union view. The two used to answer graph existence differently.
-    const EXPLICIT_DATASET_GRAPH_LIMIT: usize = 32;
+    /// Straddles the internal dataset threshold so both query regimes must
+    /// return the same existence result.
+    const EXPLICIT_GRAPH_LIMIT: usize = 32;
     const SMALL_VISIBLE: usize = 5;
     const LARGE_VISIBLE: usize = 40;
     /// `empty` and `orphaned` are visible on top of the populated ones.
@@ -27,14 +24,14 @@ mod tests {
 
     // The two visible-set sizes really must straddle the regime boundary, or
     // this whole file would test one code path twice.
-    const _: () = assert!(SMALL_VISIBLE <= EXPLICIT_DATASET_GRAPH_LIMIT);
-    const _: () = assert!(LARGE_VISIBLE > EXPLICIT_DATASET_GRAPH_LIMIT);
+    const _: () = assert!(SMALL_VISIBLE <= EXPLICIT_GRAPH_LIMIT);
+    const _: () = assert!(LARGE_VISIBLE > EXPLICIT_GRAPH_LIMIT);
 
     const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     const SCHEMA_NAME: &str = "http://schema.org/name";
     const SCHEMA_DATASET: &str = "http://schema.org/Dataset";
     const SCHEMA_MEDIA_OBJECT: &str = "http://schema.org/MediaObject";
-    const SCHEMA_IS_BASED_ON: &str = "http://schema.org/isBasedOn";
+    const SCHEMA_BASED_ON: &str = "http://schema.org/isBasedOn";
 
     fn iri(value: &str) -> EncodedTerm {
         EncodedTerm(format!("<{value}>"))
@@ -93,7 +90,7 @@ mod tests {
             graphs
         }
 
-        /// Visible graphs that still have a metadata record — exactly the set
+        /// Visible graphs that still have a metadata record, exactly the set
         /// `GRAPH ?g {}` must enumerate.
         fn existing_visible(&self) -> BTreeSet<String> {
             self.populated
@@ -131,14 +128,12 @@ mod tests {
                 ),
             ];
             if idx == 0 {
-                // Keeps the deleted graph's IRI interned independently of the
-                // deleted graph itself, so this really tests "deleted graph
-                // whose term survives".
+                // Keeps the deleted graph IRI interned after the graph is gone.
                 changes.push(insert(
                     &graph,
                     Triple {
                         subject: &root,
-                        predicate: SCHEMA_IS_BASED_ON,
+                        predicate: SCHEMA_BASED_ON,
                         object: iri(deleted.as_str()),
                     },
                 ));
@@ -387,13 +382,13 @@ mod tests {
 
         for corpus in [&small, &large] {
             // The IRI is still a live object term, so it is certainly still
-            // interned — yet the graph itself is gone.
+            // interned, yet the graph itself is gone.
             let referenced = solution_rows(
                 node.query_in_graphs(
                     &AllowAllAuthorizer,
                     &corpus.visible(),
                     &format!(
-                        "SELECT ?s WHERE {{ ?s <{SCHEMA_IS_BASED_ON}> <{}> }}",
+                        "SELECT ?s WHERE {{ ?s <{SCHEMA_BASED_ON}> <{}> }}",
                         corpus.deleted.as_str()
                     ),
                 )

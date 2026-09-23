@@ -1,24 +1,6 @@
-//! Craqle-owned query plan optimization.
-//!
-//! Rewrites the spargebra AST before it is handed to spareval, using the
-//! store's real cardinality statistics instead of sparopt's static guesses:
-//!
-//! * Triple patterns inside each BGP are reordered by estimated cardinality.
-//!   Selective outer inputs remain explicit `Lateral` chains; broad repeated
-//!   probes become hash joins. This also keeps OPTIONAL and EXISTS bodies
-//!   ordered using their already-bound outer variables.
-//! * `FILTER(?v = <iri>)`, `FILTER(?v = "string")` and `FILTER(sameTerm(...))`
-//!   over a BGP are folded into the patterns as bound terms (index lookups),
-//!   with an Extend re-binding the variable. Numeric/value equality is never
-//!   folded (`"01"^^xsd:integer = "1"^^xsd:integer` is value-equal but not
-//!   term-equal), and string folds are skipped when a non-canonical
-//!   `^^xsd:string` spelling of the same value exists in the term table.
-//! * LIMIT caps are pushed through row-preserving operators (Project/Extend)
-//!   into UNION branches.
-//!
-//! Everything else (OPTIONAL scoping, MINUS, DISTINCT/ORDER interactions,
-//! property paths, sub-SELECTs, SERVICE bodies) is left untouched: the pass
-//! only recurses into those nodes, it never moves work across them.
+//! Optimizes query plans using store cardinalities, safe term folds, and bounded limit pushdown.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -30,7 +12,8 @@ use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExp
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use crate::core::EncodedTerm;
-use crate::store::GraphStore;
+use crate::query::context::{CostStatistics, QueryCost};
+use crate::store::{GraphStore, PlannerEstimate, PlannerStat, TermId};
 
 /// Test and benchmark control for connected BGP join selection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,24 +49,25 @@ pub struct PlannedJoin {
 pub(crate) enum PlannerError {
     #[error("forced join mode {0:?} cannot represent this query")]
     ForcedModeUnavailable(JoinMode),
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
 }
 
 #[derive(Default)]
 pub(crate) struct PlannerTrace {
     pub(crate) joins: Vec<PlannedJoin>,
+    pub(crate) costs: CostStatistics,
 }
 
-/// State shared by one `optimize_query` pass.
-///
-/// The greedy BGP ordering calls `estimate_pattern` O(k²) times on top of the
-/// initial pass, and every call re-resolves the same constant terms — roughly
-/// 150 term-table point reads for a five-pattern BGP, all loop-invariant.
-/// `term_ids` memoizes them for the duration of the pass.
-///
-/// Derived-state note: the memo lives and dies with a single
-/// optimization pass, so it needs no invalidation path. Store errors are
-/// deliberately *not* memoized, so a transient failure cannot pin a wrong
-/// verdict for the rest of the pass.
+#[derive(Clone, Copy)]
+pub(crate) struct PlanMode {
+    pub(crate) join: JoinMode,
+    pub(crate) collect_costs: bool,
+    /// The one graph a query reads, whose own counters replace store-wide estimates.
+    pub(crate) graph: Option<TermId>,
+}
+
+/// Per-pass planner state that memoizes constant term ids but never transient errors.
 struct PlanCtx<'a> {
     store: &'a GraphStore,
     term_ids: RefCell<HashMap<EncodedTerm, Option<u128>>>,
@@ -91,43 +75,101 @@ struct PlanCtx<'a> {
     forced_mode_used: Cell<bool>,
     error: RefCell<Option<PlannerError>>,
     planned_joins: RefCell<Vec<PlannedJoin>>,
+    costs: QueryCost,
+    stats: RefCell<HashMap<PlannerStat, PlannerEstimate>>,
+    row_demand: Cell<Option<u64>>,
+    graph: Option<TermId>,
+    graph_var: RefCell<Option<String>>,
+    /// Every enclosing graph variable, bound or not; folding one would drop its graph constraint.
+    graph_names: RefCell<Vec<String>>,
 }
 
 impl<'a> PlanCtx<'a> {
-    fn new(store: &'a GraphStore, join_mode: JoinMode) -> Self {
+    fn new(store: &'a GraphStore, mode: PlanMode) -> Self {
         Self {
             store,
             term_ids: RefCell::new(HashMap::new()),
-            join_mode,
+            join_mode: mode.join,
             forced_mode_used: Cell::new(false),
             error: RefCell::new(None),
             planned_joins: RefCell::new(Vec::new()),
+            costs: QueryCost::planner(mode.collect_costs),
+            stats: RefCell::new(HashMap::new()),
+            row_demand: Cell::new(None),
+            graph: mode.graph,
+            graph_var: RefCell::new(None),
+            graph_names: RefCell::new(Vec::new()),
         }
+    }
+
+    fn stat(&self, stat: PlannerStat) -> PlannerEstimate {
+        // Exact per-graph counters exist for these; other estimates stay store-wide bounds.
+        let stat = match (self.graph, stat) {
+            (Some(graph), PlannerStat::Predicate(predicate)) => {
+                PlannerStat::GraphPredicate(graph, predicate)
+            }
+            (Some(graph), PlannerStat::PredicateObject(predicate, object)) => {
+                PlannerStat::GraphPredicateObject(graph, predicate, object)
+            }
+            (Some(graph), PlannerStat::Total) => PlannerStat::Graph(graph),
+            (_, stat) => stat,
+        };
+        if let Some(value) = self.stats.borrow().get(&stat).copied() {
+            self.costs.planner_memo(true);
+            return value;
+        }
+        self.costs.planner_memo(false);
+        let value = self.store.planner_estimate(stat, &self.costs);
+        self.stats.borrow_mut().insert(stat, value);
+        value
+    }
+
+    fn rows(&self, stat: PlannerStat) -> u64 {
+        u64::try_from(self.stat(stat).row_upper()).unwrap_or(u64::MAX)
+    }
+
+    fn distinct(&self, stat: PlannerStat) -> u64 {
+        u64::try_from(self.stat(stat).distinct_lower()).unwrap_or(u64::MAX)
     }
 }
 
-/// Per-row cost guesses for patterns whose selective position is a variable
-/// that will already be bound when the pattern runs inside a lateral chain.
-/// They only need to compare correctly against real corpus counts.
-const COST_BOUND_S_CONST_PO: u64 = 1;
-const COST_BOUND_S_CONST_P: u64 = 3;
+/// Relative costs for patterns whose selective variable is already bound by a lateral chain.
+const COST_S_PO: u64 = 1;
+const COST_S_P: u64 = 3;
 const COST_BOUND_S: u64 = 6;
-const COST_CONST_P_BOUND_O: u64 = 4;
+const COST_P_O: u64 = 4;
 const COST_BOUND_O: u64 = 8;
-const COST_BOUND_ONLY_P: u64 = 1 << 20;
+const COST_ONLY_P: u64 = 1 << 20;
 
 #[cfg(test)]
 pub(crate) fn optimize_query(query: &mut Query, store: &GraphStore) {
-    optimize_query_with_mode(query, store, JoinMode::Auto)
+    optimize_with_mode(query, store, JoinMode::Auto)
         .expect("automatic join planning must always have a fallback");
 }
 
-pub(crate) fn optimize_query_with_mode(
+#[cfg(test)]
+pub(crate) fn optimize_with_mode(
     query: &mut Query,
     store: &GraphStore,
     join_mode: JoinMode,
 ) -> Result<PlannerTrace, PlannerError> {
-    let cx = PlanCtx::new(store, join_mode);
+    optimize_with_costs(
+        query,
+        store,
+        PlanMode {
+            join: join_mode,
+            collect_costs: false,
+            graph: None,
+        },
+    )
+}
+
+pub(crate) fn optimize_with_costs(
+    query: &mut Query,
+    store: &GraphStore,
+    mode: PlanMode,
+) -> Result<PlannerTrace, PlannerError> {
+    let cx = PlanCtx::new(store, mode);
     match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
@@ -145,11 +187,12 @@ pub(crate) fn optimize_query_with_mode(
     if let Some(error) = cx.error.into_inner() {
         return Err(error);
     }
-    if !matches!(join_mode, JoinMode::Auto) && !cx.forced_mode_used.get() {
-        return Err(PlannerError::ForcedModeUnavailable(join_mode));
+    if !matches!(mode.join, JoinMode::Auto) && !cx.forced_mode_used.get() {
+        return Err(PlannerError::ForcedModeUnavailable(mode.join));
     }
     Ok(PlannerTrace {
         joins: cx.planned_joins.into_inner(),
+        costs: cx.costs.snapshot(),
     })
 }
 
@@ -168,6 +211,13 @@ fn predicate_var_key(predicate: &NamedNodePattern) -> Option<String> {
         NamedNodePattern::Variable(v) => Some(v.as_str().to_string()),
         NamedNodePattern::NamedNode(_) => None,
     }
+}
+
+/// Triple variables plus the enclosing unbound graph variable, which every pattern binds.
+fn pattern_var_keys(pattern: &TriplePattern, cx: &PlanCtx<'_>) -> Vec<String> {
+    let mut keys = triple_var_keys(pattern);
+    keys.extend(cx.graph_var.borrow().clone());
+    keys
 }
 
 fn triple_var_keys(pattern: &TriplePattern) -> Vec<String> {
@@ -240,6 +290,27 @@ fn collect_pattern_vars(pattern: &GraphPattern, out: &mut HashSet<String>) {
     }
 }
 
+fn supports_demand(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Project { inner, .. } | GraphPattern::Graph { inner, .. } => {
+            supports_demand(inner)
+        }
+        GraphPattern::Bgp { patterns } => {
+            let [left, right] = patterns.as_slice() else {
+                return false;
+            };
+            let Some(left) = pattern_variables(left) else {
+                return false;
+            };
+            let Some(right) = pattern_variables(right) else {
+                return false;
+            };
+            left.iter().any(|variable| right.contains(variable))
+        }
+        _ => false,
+    }
+}
+
 fn optimize_pattern(
     pattern: GraphPattern,
     bound: &HashSet<String>,
@@ -285,7 +356,7 @@ fn optimize_pattern(
             collect_pattern_vars(&inner, &mut expr_bound);
             let expr = optimize_expression(expr, &expr_bound, cx);
             if let GraphPattern::Bgp { patterns } = *inner {
-                rewrite_filter_over_bgp(FilterOverBgp { expr, patterns }, bound, cx)
+                rewrite_bgp_filter(FilterOverBgp { expr, patterns }, bound, cx)
             } else {
                 GraphPattern::Filter {
                     expr,
@@ -298,11 +369,19 @@ fn optimize_pattern(
             right: Box::new(optimize_pattern(*right, bound, cx)),
         },
         GraphPattern::Graph { name, inner } => {
-            let mut inner_bound = bound.clone();
-            inner_bound.extend(predicate_var_key(&name));
+            // An unbound graph variable joins every inner pattern and is bound by the first match.
+            let free = predicate_var_key(&name).filter(|key| !bound.contains(key));
+            let outer = cx.graph_var.replace(free);
+            let named = predicate_var_key(&name);
+            cx.graph_names.borrow_mut().extend(named.clone());
+            let inner = optimize_pattern(*inner, bound, cx);
+            if named.is_some() {
+                cx.graph_names.borrow_mut().pop();
+            }
+            cx.graph_var.replace(outer);
             GraphPattern::Graph {
                 name,
-                inner: Box::new(optimize_pattern(*inner, &inner_bound, cx)),
+                inner: Box::new(inner),
             }
         }
         GraphPattern::Extend {
@@ -357,7 +436,16 @@ fn optimize_pattern(
             start,
             length,
         } => {
+            let demand = length
+                .filter(|length| *length != 0)
+                .map(|length| start.saturating_add(length))
+                .filter(|_| supports_demand(&inner))
+                .map(|demand| u64::try_from(demand).unwrap_or(u64::MAX));
+            let previous = demand.map(|demand| cx.row_demand.replace(Some(demand)));
             let mut inner = optimize_pattern(*inner, bound, cx);
+            if let Some(previous) = previous {
+                cx.row_demand.set(previous);
+            }
             if let Some(length) = length {
                 inner = push_slice_cap(inner, start.saturating_add(length));
             }
@@ -521,15 +609,21 @@ fn foldable_equality(conjunct: &Expression) -> Option<(oxrdf::Variable, Foldable
 
 /// True when a non-canonical spelling of the same string value exists in the
 /// term table; folding would then miss value-equal rows the filter matches.
-fn has_non_canonical_string_spelling(cx: &PlanCtx<'_>, literal: &Literal) -> bool {
+fn has_noncanonical_spelling(cx: &PlanCtx<'_>, literal: &Literal) -> bool {
     let alternate = EncodedTerm(format!(
         "{}^^<http://www.w3.org/2001/XMLSchema#string>",
         literal
     ));
-    matches!(cx.store.lookup_term(&alternate), Ok(Some(_)))
+    match cx.store.lookup_term(&alternate) {
+        Ok(found) => found.is_some(),
+        Err(error) => {
+            *cx.error.borrow_mut() = Some(PlannerError::Store(error));
+            true
+        }
+    }
 }
 
-fn fold_variable_into_patterns(
+fn fold_variable_patterns(
     patterns: &mut [TriplePattern],
     variable: &oxrdf::Variable,
     constant: &FoldableConstant,
@@ -581,13 +675,13 @@ fn fold_variable_into_patterns(
     true
 }
 
-/// A `FILTER` applied directly over a BGP — the shape equality folding rewrites.
+/// A `FILTER` applied directly over a BGP that shape equality folding rewrites.
 struct FilterOverBgp {
     expr: Expression,
     patterns: Vec<TriplePattern>,
 }
 
-fn rewrite_filter_over_bgp(
+fn rewrite_bgp_filter(
     filter: FilterOverBgp,
     bound: &HashSet<String>,
     cx: &PlanCtx<'_>,
@@ -600,15 +694,23 @@ fn rewrite_filter_over_bgp(
     let mut remaining = Vec::with_capacity(conjuncts.len());
     for conjunct in conjuncts {
         let folded = foldable_equality(&conjunct).and_then(|(variable, constant)| {
+            if cx
+                .graph_names
+                .borrow()
+                .iter()
+                .any(|name| name == variable.as_str())
+            {
+                return None;
+            }
             match &constant {
                 FoldableConstant::StringLiteral(literal)
-                    if has_non_canonical_string_spelling(cx, literal) =>
+                    if has_noncanonical_spelling(cx, literal) =>
                 {
                     return None;
                 }
                 _ => {}
             }
-            fold_variable_into_patterns(&mut patterns, &variable, &constant)
+            fold_variable_patterns(&mut patterns, &variable, &constant)
                 .then_some((variable, constant))
         });
         match folded {
@@ -655,7 +757,7 @@ fn term_slot(term: &TermPattern, bound: &HashSet<String>, cx: &PlanCtx<'_>) -> S
         TermPattern::NamedNode(node) => const_slot(cx, &EncodedTerm::from_named_node(node)),
         TermPattern::Literal(literal) => const_slot(
             cx,
-            &EncodedTerm::from_non_star_term(&Term::Literal(literal.clone())),
+            &EncodedTerm::from_plain_term(&Term::Literal(literal.clone())),
         ),
         TermPattern::Variable(v) => {
             if bound.contains(v.as_str()) {
@@ -678,8 +780,11 @@ fn term_slot(term: &TermPattern, bound: &HashSet<String>, cx: &PlanCtx<'_>) -> S
 
 fn const_slot(cx: &PlanCtx<'_>, term: &EncodedTerm) -> Slot {
     if let Some(&id) = cx.term_ids.borrow().get(term) {
+        cx.costs.planner_cache(true);
         return Slot::Const(id);
     }
+    cx.costs.planner_cache(false);
+    cx.costs.planner_points(1);
     match cx.store.lookup_term(term) {
         Ok(id) => {
             let id = id.map(|id| id.0);
@@ -703,9 +808,7 @@ fn predicate_slot(predicate: &NamedNodePattern, bound: &HashSet<String>, cx: &Pl
     }
 }
 
-/// Approximate match count for one triple pattern given the variables that
-/// will already be bound when it executes. Real corpus counts for free
-/// patterns, small constants for index-addressable bound positions.
+/// Estimate matches from corpus counts for free slots and constants for bound index slots.
 fn estimate_pattern(
     pattern: &TriplePattern,
     bound: &HashSet<String>,
@@ -730,45 +833,47 @@ fn estimate_pattern(
 
     Some(match (subject, predicate, object) {
         (Slot::Const(Some(s)), predicate, object) => {
-            let mut estimate = cx.store.stat_subject_count(TermId(s)) as u64;
+            let mut estimate = cx.rows(PlannerStat::Subject(TermId(s)));
             match (&predicate, &object) {
                 (Slot::Const(Some(p)), Slot::Const(Some(o))) => {
-                    let pair = cx.store.stat_predicate_object_count(TermId(*p), TermId(*o)) as u64;
+                    let pair = cx.rows(PlannerStat::PredicateObject(TermId(*p), TermId(*o)));
                     estimate = estimate.min(pair).min(1);
                 }
                 (Slot::Const(Some(p)), _) => {
-                    estimate = estimate.min(cx.store.stat_predicate_count(TermId(*p)) as u64);
+                    estimate = estimate.min(cx.rows(PlannerStat::Predicate(TermId(*p))));
                 }
                 (_, Slot::Const(Some(o))) => {
-                    estimate = estimate.min(cx.store.stat_object_count(TermId(*o)) as u64);
+                    estimate = estimate.min(cx.rows(PlannerStat::Object(TermId(*o))));
                 }
                 _ => {}
             }
             estimate
         }
-        (Slot::BoundVar, Slot::Const(_), Slot::Const(_) | Slot::BoundVar) => COST_BOUND_S_CONST_PO,
-        (Slot::BoundVar, Slot::Const(_), _) => COST_BOUND_S_CONST_P,
+        (Slot::BoundVar, Slot::Const(_), Slot::Const(_) | Slot::BoundVar) => COST_S_PO,
+        (Slot::BoundVar, Slot::Const(_), _) => COST_S_P,
         (Slot::BoundVar, _, _) => COST_BOUND_S,
         (Slot::FreeVar, Slot::Const(Some(p)), Slot::Const(Some(o))) => {
-            cx.store.stat_predicate_object_count(TermId(p), TermId(o)) as u64
+            cx.rows(PlannerStat::PredicateObject(TermId(p), TermId(o)))
         }
-        (Slot::FreeVar, Slot::Const(_), Slot::BoundVar) => COST_CONST_P_BOUND_O,
+        (Slot::FreeVar, Slot::Const(_), Slot::BoundVar) => COST_P_O,
         (Slot::FreeVar, Slot::Const(Some(p)), Slot::FreeVar) => {
-            cx.store.stat_predicate_count(TermId(p)) as u64
+            cx.rows(PlannerStat::Predicate(TermId(p)))
         }
-        (Slot::FreeVar, _, Slot::Const(Some(o))) => cx.store.stat_object_count(TermId(o)) as u64,
+        (Slot::FreeVar, _, Slot::Const(Some(o))) => cx.rows(PlannerStat::Object(TermId(o))),
         (Slot::FreeVar, _, Slot::BoundVar) => COST_BOUND_O,
         (Slot::FreeVar, Slot::BoundVar, Slot::FreeVar) => {
-            COST_BOUND_ONLY_P.min(cx.store.stat_total_quads() as u64)
+            COST_ONLY_P.min(cx.rows(PlannerStat::Total))
         }
-        (Slot::FreeVar, Slot::FreeVar, Slot::FreeVar) => cx.store.stat_total_quads() as u64,
+        (Slot::FreeVar, Slot::FreeVar, Slot::FreeVar) => cx.rows(PlannerStat::Total),
         // Const(None) and Unsupported handled above.
-        _ => cx.store.stat_total_quads() as u64,
+        _ => cx.rows(PlannerStat::Total),
     })
 }
 
 const INDEXED_LOOKUP_COST: u64 = 8;
-const HASH_MIN_OUTER_ROWS: u64 = 256;
+const HASH_OUTER_MIN: u64 = 256;
+/// First visit to a graph reads its visibility and orphan records, about 16 scanned rows.
+const GRAPH_VISIT_COST: u64 = 16;
 
 fn pattern_variables(pattern: &TriplePattern) -> Option<Vec<oxrdf::Variable>> {
     let mut variables = HashMap::new();
@@ -838,13 +943,13 @@ fn estimate_variable_distinct(
     };
     let estimate = match (subject, object) {
         (true, false) => predicate.map_or_else(
-            || cx.store.distinct_subject_count(),
-            |predicate| cx.store.predicate_subject_count(predicate),
-        ) as u64,
+            || cx.distinct(PlannerStat::DistinctSubjects),
+            |predicate| cx.distinct(PlannerStat::PredicateSubjects(predicate)),
+        ),
         (false, true) => predicate.map_or_else(
-            || cx.store.distinct_object_count(),
-            |predicate| cx.store.predicate_object_count(predicate),
-        ) as u64,
+            || cx.distinct(PlannerStat::DistinctObjects),
+            |predicate| cx.distinct(PlannerStat::PredicateObjects(predicate)),
+        ),
         _ => rows,
     };
     estimate.min(rows).max(u64::from(rows > 0))
@@ -887,6 +992,33 @@ fn join_estimate(
     }
 }
 
+fn apply_demand(estimate: &mut PlannedJoin, right_distinct: u64, demand: u64) {
+    if demand >= estimate.estimated_output_rows {
+        return;
+    }
+    let output = demand;
+    let left_per_probe = ceil_div(
+        estimate.estimated_left_rows,
+        estimate.estimated_distinct_join_keys.max(1),
+    );
+    let probe_rows = ceil_div(output, left_per_probe.max(1)).min(estimate.estimated_right_rows);
+    estimate.estimated_hash_cost = estimate
+        .estimated_left_rows
+        .saturating_add(probe_rows)
+        .saturating_add(output);
+
+    let right_per_left = ceil_div(estimate.estimated_right_rows, right_distinct.max(1));
+    let outer_rows = ceil_div(output, right_per_left.max(1)).min(estimate.estimated_left_rows);
+    estimate.estimated_lateral_cost = outer_rows
+        .saturating_add(outer_rows.saturating_mul(INDEXED_LOOKUP_COST))
+        .saturating_add(output);
+    estimate.physical_operator = if estimate.estimated_hash_cost < estimate.estimated_lateral_cost {
+        JoinKind::Hash
+    } else {
+        JoinKind::IndexedLateral
+    };
+}
+
 fn physical_chain(
     patterns: Vec<TriplePattern>,
     bound: &HashSet<String>,
@@ -896,17 +1028,19 @@ fn physical_chain(
     let first = patterns.next().expect("non-empty pattern chain");
     let mut left_rows = estimate_pattern(&first, bound, cx).unwrap_or(u64::MAX);
     let mut left_distinct = HashMap::new();
-    for key in triple_var_keys(&first) {
-        let estimate =
-            if matches!(cx.join_mode, JoinMode::ForceHash) || left_rows >= HASH_MIN_OUTER_ROWS {
-                estimate_variable_distinct(&first, &key, left_rows, cx)
-            } else {
-                left_rows
-            };
+    let mut projected = bound.clone();
+    projected.extend(cx.graph_var.borrow().clone());
+    for key in pattern_var_keys(&first, cx) {
+        let estimate = if matches!(cx.join_mode, JoinMode::ForceHash) || left_rows >= HASH_OUTER_MIN
+        {
+            estimate_variable_distinct(&first, &key, left_rows, cx)
+        } else {
+            left_rows
+        };
         left_distinct.insert(key, estimate);
     }
     let mut left_variables = pattern_variables(&first).map(|mut variables| {
-        include_bound_variables(&mut variables, bound);
+        include_bound_variables(&mut variables, &projected);
         variables
     });
     let mut node = GraphPattern::Bgp {
@@ -916,10 +1050,10 @@ fn physical_chain(
     for pattern in patterns {
         let right_rows = estimate_pattern(&pattern, bound, cx).unwrap_or(u64::MAX);
         let right_variables = pattern_variables(&pattern).map(|mut variables| {
-            include_bound_variables(&mut variables, bound);
+            include_bound_variables(&mut variables, &projected);
             variables
         });
-        let right_keys: HashSet<_> = triple_var_keys(&pattern).into_iter().collect();
+        let right_keys: HashSet<_> = pattern_var_keys(&pattern, cx).into_iter().collect();
         let join_keys: Vec<_> = right_keys
             .iter()
             .filter(|key| left_distinct.contains_key(*key))
@@ -931,7 +1065,7 @@ fn physical_chain(
             .min()
             .unwrap_or(left_rows);
         let consider_hash = matches!(cx.join_mode, JoinMode::ForceHash)
-            || (matches!(cx.join_mode, JoinMode::Auto) && left_rows >= HASH_MIN_OUTER_ROWS);
+            || (matches!(cx.join_mode, JoinMode::Auto) && left_rows >= HASH_OUTER_MIN);
         let right_key_count = if consider_hash {
             join_keys
                 .iter()
@@ -942,6 +1076,25 @@ fn physical_chain(
             right_rows
         };
         let mut estimate = join_estimate(left_rows, right_rows, left_key_count, right_key_count);
+        if matches!(cx.join_mode, JoinMode::Auto)
+            && let Some(demand) = cx.row_demand.get()
+        {
+            apply_demand(&mut estimate, right_key_count, demand);
+        }
+        // A hash side on the graph variable may visit graphs the left side never reached.
+        if let Some(graph) = cx.graph_var.borrow().as_ref()
+            && join_keys.contains(graph)
+        {
+            let visited = left_distinct.get(graph).copied().unwrap_or(left_rows);
+            let reached = estimate_variable_distinct(&pattern, graph, right_rows, cx);
+            let unvisited = reached.saturating_sub(visited);
+            estimate.estimated_hash_cost = estimate
+                .estimated_hash_cost
+                .saturating_add(unvisited.saturating_mul(GRAPH_VISIT_COST));
+            if estimate.estimated_hash_cost >= estimate.estimated_lateral_cost {
+                estimate.physical_operator = JoinKind::IndexedLateral;
+            }
+        }
         let hash_eligible =
             !join_keys.is_empty() && left_variables.is_some() && right_variables.is_some();
         estimate.physical_operator = match cx.join_mode {
@@ -1028,7 +1181,7 @@ fn reorder_bgp(
     let free_vars: Vec<HashSet<String>> = patterns
         .iter()
         .map(|pattern| {
-            triple_var_keys(pattern)
+            pattern_var_keys(pattern, cx)
                 .into_iter()
                 .filter(|key| !bound.contains(key))
                 .collect()
@@ -1118,11 +1271,7 @@ fn reorder_bgp(
         .expect("non-empty BGP")
 }
 
-// --- LIMIT pushdown ----------------------------------------------------------
-
-/// Pushes an upper row bound through row-preserving operators into UNION
-/// branches. The outer Slice stays in place; this only caps how much each
-/// branch may produce.
+/// Push an upper row bound through row-preserving operators while retaining the outer slice.
 fn push_slice_cap(pattern: GraphPattern, cap: usize) -> GraphPattern {
     match pattern {
         GraphPattern::Project { inner, variables } => GraphPattern::Project {
@@ -1264,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn bgp_reorder_puts_selective_pattern_first_regardless_of_written_order() {
+    fn selective_patterns_lead() {
         let (_dir, store) = seeded_store();
         for written in [
             "SELECT ?d WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> \"Dataset 7\" }",
@@ -1281,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_string_equality_folds_into_index_lookup() {
+    fn string_equality_folds() {
         let (_dir, store) = seeded_store();
         let mut query = parse(
             "SELECT ?d ?n WHERE { ?d <http://schema.org/name> ?n . FILTER(?n = \"Dataset 7\") }",
@@ -1311,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_numeric_equality_is_not_folded() {
+    fn numeric_equality_remains() {
         let (_dir, store) = seeded_store();
         let mut query =
             parse("SELECT ?d WHERE { ?d <http://schema.org/version> ?v . FILTER(?v = 1) }");
@@ -1327,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_terms_estimate_to_zero_and_lead_the_chain() {
+    fn missing_terms_lead() {
         let (_dir, store) = seeded_store();
         let mut query = parse(
             "SELECT ?d WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> \"No Such Name\" }",
@@ -1338,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_patterns_stay_joined_not_lateral() {
+    fn disconnected_patterns_join() {
         let (_dir, store) = seeded_store();
         let mut query = parse(
             "SELECT * WHERE { ?a <http://schema.org/name> ?n . ?b a <http://schema.org/Dataset> }",
@@ -1382,12 +1531,30 @@ mod tests {
     }
 
     #[test]
+    fn stat_memo_reuses() {
+        let (_dir, store) = seeded_store();
+        let cx = PlanCtx::new(
+            &store,
+            PlanMode {
+                join: JoinMode::Auto,
+                collect_costs: true,
+                graph: None,
+            },
+        );
+        let first = cx.stat(PlannerStat::Total);
+        assert_eq!(cx.stat(PlannerStat::Total), first);
+        let costs = cx.costs.snapshot();
+        assert_eq!(costs.planner_memo_misses, 1);
+        assert_eq!(costs.planner_memo_hits, 1);
+    }
+
+    #[test]
     fn forced_join_shapes() {
         let (_dir, store) = seeded_store();
         let text = "SELECT ?d ?n WHERE { ?d a <http://schema.org/Dataset> . ?d <http://schema.org/name> ?n }";
 
         let mut hash = parse(text);
-        let hash_trace = optimize_query_with_mode(&mut hash, &store, JoinMode::ForceHash).unwrap();
+        let hash_trace = optimize_with_mode(&mut hash, &store, JoinMode::ForceHash).unwrap();
         assert_eq!(hash_trace.joins.len(), 1);
         assert_eq!(hash_trace.joins[0].physical_operator, JoinKind::Hash);
         fn has_guarded_hash(pattern: &GraphPattern) -> bool {
@@ -1406,7 +1573,7 @@ mod tests {
 
         let mut lateral = parse(text);
         let lateral_trace =
-            optimize_query_with_mode(&mut lateral, &store, JoinMode::ForceLateral).unwrap();
+            optimize_with_mode(&mut lateral, &store, JoinMode::ForceLateral).unwrap();
         assert_eq!(lateral_trace.joins.len(), 1);
         assert_eq!(
             lateral_trace.joins[0].physical_operator,
@@ -1415,12 +1582,48 @@ mod tests {
         assert!(first_lateral_leaf(select_pattern(&lateral)).is_some());
     }
 
+    /// Inside `GRAPH ?g`, a hash side that reaches unvisited graphs loses to lateral probes.
+    #[test]
+    fn graph_visits_priced() {
+        let (_dir, store) = setup_store();
+        for idx in 0..600 {
+            let graph = format!("urn:g:{idx}");
+            let root = format!("<{graph}>");
+            insert(
+                &store,
+                &graph,
+                &format!("<urn:d:{idx}>"),
+                "<urn:about>",
+                &root,
+            );
+            insert(&store, &graph, &root, "<urn:name>", "\"n\"");
+            if idx % 2 == 0 {
+                insert(&store, &graph, &root, "<urn:author>", "<urn:person>");
+            }
+        }
+        let plan = |text: &str| {
+            let mut query = parse(text);
+            let trace = optimize_with_mode(&mut query, &store, JoinMode::Auto).unwrap();
+            trace.joins[0].physical_operator
+        };
+        assert_eq!(
+            plan(
+                "SELECT ?g WHERE { GRAPH ?g { ?d <urn:about> ?g . ?g <urn:author> <urn:person> } }"
+            ),
+            JoinKind::IndexedLateral
+        );
+        assert_eq!(
+            plan("SELECT ?g WHERE { GRAPH ?g { ?d <urn:about> ?g . ?g <urn:name> ?n } }"),
+            JoinKind::Hash
+        );
+    }
+
     #[test]
     fn forced_join_fallback() {
         let (_dir, store) = seeded_store();
         let mut query = parse("SELECT ?d WHERE { ?d a <http://schema.org/Dataset> }");
         assert!(matches!(
-            optimize_query_with_mode(&mut query, &store, JoinMode::ForceHash),
+            optimize_with_mode(&mut query, &store, JoinMode::ForceHash),
             Err(PlannerError::ForcedModeUnavailable(JoinMode::ForceHash))
         ));
 
@@ -1428,7 +1631,7 @@ mod tests {
             "SELECT * WHERE { _:d a <http://schema.org/Dataset> . _:d <http://schema.org/name> ?n }",
         );
         assert!(matches!(
-            optimize_query_with_mode(&mut blank_join, &store, JoinMode::ForceHash),
+            optimize_with_mode(&mut blank_join, &store, JoinMode::ForceHash),
             Err(PlannerError::ForcedModeUnavailable(JoinMode::ForceHash))
         ));
     }

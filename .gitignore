@@ -1,2 +1,6 @@
+# Excludes build output and local generated state.
+# Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+# SPDX-License-Identifier: MIT
+
 /target
 .internal

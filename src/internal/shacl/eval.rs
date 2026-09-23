@@ -1,9 +1,13 @@
+//! Evaluates SHACL shapes with bounded traversal and recursion.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView};
 use crate::shacl::{ShaclValidationOptions, ShaclValidationReport, ShaclValidationStatistics};
 use crate::store::{TermId, hash_term};
@@ -487,7 +491,7 @@ impl<V: RdfReadView> Validator<'_, '_, '_, V> {
                 }
             }
             ResolvedConstraint::LessThan(predicate)
-            | ResolvedConstraint::LessThanOrEquals(predicate) => {
+            | ResolvedConstraint::LessOrEqual(predicate) => {
                 let other = self.predicate_values(focus, *predicate)?;
                 for value in values.iter().copied() {
                     let left = self.term_meta.get(self.view, self.context, value)?.cloned();
@@ -502,7 +506,7 @@ impl<V: RdfReadView> Validator<'_, '_, '_, V> {
                                 ResolvedConstraint::LessThan(_) => {
                                     comparison == Some(Ordering::Less)
                                 }
-                                ResolvedConstraint::LessThanOrEquals(_) => {
+                                ResolvedConstraint::LessOrEqual(_) => {
                                     matches!(comparison, Some(Ordering::Less | Ordering::Equal))
                                 }
                                 _ => unreachable!(),
@@ -760,10 +764,10 @@ fn node_kind_matches(expected: NodeKindPlan, actual: Option<TermKind>) -> bool {
         NodeKindPlan::Iri => actual == Some(TermKind::Iri),
         NodeKindPlan::Literal => actual == Some(TermKind::Literal),
         NodeKindPlan::BlankNode => actual == Some(TermKind::BlankNode),
-        NodeKindPlan::BlankNodeOrIri => {
+        NodeKindPlan::BlankOrIri => {
             matches!(actual, Some(TermKind::BlankNode | TermKind::Iri))
         }
-        NodeKindPlan::BlankNodeOrLiteral => {
+        NodeKindPlan::BlankOrLiteral => {
             matches!(actual, Some(TermKind::BlankNode | TermKind::Literal))
         }
         NodeKindPlan::IriOrLiteral => matches!(actual, Some(TermKind::Iri | TermKind::Literal)),

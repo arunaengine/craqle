@@ -1,21 +1,25 @@
+//! Executes planned counts over graph and union query views.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::count_plan::{CountValueDomain, SubjectSetMode};
-use crate::query_context::ReadContext;
-use crate::query_cursor::CountGrouping;
+use crate::query::context::ReadContext;
+use crate::query::cursor::CountGrouping;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::sparql::{QueryBudget, Result, SparqlError};
 use crate::store::{QueryTermId, StoreError, TermId};
 
 const CANCELLATION_CHECK_INTERVAL: usize = 1_024;
 #[cfg(not(test))]
-const PARALLEL_COUNT_MIN_ROWS: u64 = 65_536;
+const PARALLEL_MIN_ROWS: u64 = 65_536;
 #[cfg(test)]
-const PARALLEL_COUNT_MIN_ROWS: u64 = 32;
+const PARALLEL_MIN_ROWS: u64 = 32;
 type GraphOrphanCache = HashMap<QueryTermId, Option<Rc<HashSet<TermId>>>>;
-type ParallelGraphOrphanCache = Arc<HashMap<QueryTermId, Option<Arc<HashSet<TermId>>>>>;
+type ParallelOrphanCache = Arc<HashMap<QueryTermId, Option<Arc<HashSet<TermId>>>>>;
 
 fn enforce_hash_entries(entries: usize, budget: &QueryBudget) -> Result<()> {
     budget
@@ -140,7 +144,7 @@ pub(crate) fn single_pattern_count(
     }
     if matches!(domain, CountValueDomain::Scalar)
         && matches!(selector, GraphSelector::DefaultUnion)
-        && let Some(count) = exact_default_union_count(view, context, pattern)?
+        && let Some(count) = exact_union_count(view, context, pattern)?
     {
         return Ok(Some(count));
     }
@@ -152,20 +156,20 @@ pub(crate) fn single_pattern_count(
     } else {
         None
     };
-    let mut cursor = match view.raw_query_index_keys(context, selector, pattern) {
+    let mut cursor = match view.raw_index_keys(context, selector, pattern) {
         Ok(Some(cursor)) => cursor,
         Ok(None)
             if matches!(selector, GraphSelector::DefaultUnion)
                 && !matches!(domain, CountValueDomain::Scalar) =>
         {
-            return source_union_distinct_count(view, context, pattern, domain, budget).map(Some);
+            return source_distinct_count(view, context, pattern, domain, budget).map(Some);
         }
         Ok(None) => return Ok(None),
         Err(StoreError::QueryIndexUnavailable(_))
             if matches!(selector, GraphSelector::DefaultUnion)
                 && !matches!(domain, CountValueDomain::Scalar) =>
         {
-            return source_union_distinct_count(view, context, pattern, domain, budget).map(Some);
+            return source_distinct_count(view, context, pattern, domain, budget).map(Some);
         }
         Err(error) => return Err(error.into()),
     };
@@ -188,19 +192,19 @@ pub(crate) fn single_pattern_count(
                     context.check_cancelled()?;
                 }
                 let (matches, extracted) = cursor.matches(key);
-                context.record_key_fields_extracted(extracted);
+                context.record_key_fields(extracted);
                 if !matches {
                     continue;
                 }
 
                 let subject = (matches!(domain, CountValueDomain::Subject) || !orphaned.is_empty())
                     .then(|| {
-                        context.record_key_fields_extracted(1);
+                        context.record_key_fields(1);
                         key.subject()
                     });
                 let object = (matches!(domain, CountValueDomain::Object) || !orphaned.is_empty())
                     .then(|| {
-                        context.record_key_fields_extracted(1);
+                        context.record_key_fields(1);
                         key.object()
                     });
                 if !orphaned.is_empty() {
@@ -244,11 +248,11 @@ pub(crate) fn single_pattern_count(
             }))
         }
         GraphSelector::DefaultUnion => {
-            if parallel_rows.is_some_and(|rows| rows >= PARALLEL_COUNT_MIN_ROWS) {
-                let workers = crate::query_worker::worker_count();
+            if parallel_rows.is_some_and(|rows| rows >= PARALLEL_MIN_ROWS) {
+                let workers = crate::query::worker::worker_count();
                 match cursor.into_scalar_partitions(workers) {
                     Ok(partitions) => {
-                        return parallel_default_union_count(view, context, partitions, budget);
+                        return parallel_union_count(view, context, partitions, budget);
                     }
                     Err(original) => cursor = *original,
                 }
@@ -259,7 +263,7 @@ pub(crate) fn single_pattern_count(
     }
 }
 
-fn source_union_distinct_count(
+fn source_distinct_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     pattern: QuadPattern,
@@ -296,20 +300,20 @@ fn source_union_distinct_count(
     Ok(count)
 }
 
-fn exact_default_union_count(
+fn exact_union_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     pattern: QuadPattern,
 ) -> Result<Option<ScalarCount>> {
     if pattern.subject.is_some()
         || (pattern.predicate.is_none() && pattern.object.is_some())
-        || view.qv_union_duplicate_free(context)? != Some(true)
+        || view.qv_union_unique(context)? != Some(true)
     {
         return Ok(None);
     }
 
     let mut count = ScalarCount::default();
-    for graph in view.graph_term_id_iter() {
+    for graph in view.graph_term_iter() {
         context.check_cancelled()?;
         let graph = graph?;
         if !view.graph_is_visible(context, graph)? {
@@ -363,7 +367,7 @@ pub(crate) fn subject_join_count(
     let mut table = SubjectKeySet::default();
     let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         build_selector,
@@ -385,7 +389,7 @@ pub(crate) fn subject_join_count(
     }
 
     let mut count = ScalarCount::default();
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         probe_selector,
@@ -416,7 +420,7 @@ pub(crate) fn object_join_count(
     let mut table = ObjectKeySet::default();
     let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         build_selector,
@@ -438,7 +442,7 @@ pub(crate) fn object_join_count(
     }
 
     let mut count = ScalarCount::default();
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         probe_selector,
@@ -457,7 +461,7 @@ pub(crate) fn object_join_count(
     Ok(Some((count, intermediate_rows)))
 }
 
-pub(crate) fn object_subject_join_count(
+pub(crate) fn object_subject_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     build_selector: GraphSelector,
@@ -469,7 +473,7 @@ pub(crate) fn object_subject_join_count(
     let mut table = ObjectKeySet::default();
     let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         build_selector,
@@ -491,7 +495,7 @@ pub(crate) fn object_subject_join_count(
     }
 
     let mut count = ScalarCount::default();
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         probe_selector,
@@ -510,7 +514,7 @@ pub(crate) fn object_subject_join_count(
     Ok(Some((count, intermediate_rows)))
 }
 
-pub(crate) fn subject_object_join_count(
+pub(crate) fn subject_object_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     build_selector: GraphSelector,
@@ -522,7 +526,7 @@ pub(crate) fn subject_object_join_count(
     let mut table = SubjectKeySet::default();
     let mut hash_entries = 0usize;
     let mut intermediate_rows = 0_u64;
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         build_selector,
@@ -544,7 +548,7 @@ pub(crate) fn subject_object_join_count(
     }
 
     let mut count = ScalarCount::default();
-    if for_each_join_key(
+    if for_each_key(
         view,
         context,
         probe_selector,
@@ -574,7 +578,7 @@ pub(crate) fn subject_star_count(
     let mut hash_entries = 0usize;
     for &(selector, pattern) in patterns {
         let mut relation = SubjectKeySet::default();
-        if for_each_join_key(
+        if for_each_key(
             view,
             context,
             selector,
@@ -619,7 +623,7 @@ pub(crate) fn subject_star_count(
     Ok(Some((count, intermediate_rows)))
 }
 
-pub(crate) fn optional_subject_star_count(
+pub(crate) fn optional_star_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     mandatory: &[(GraphSelector, QuadPattern)],
@@ -631,7 +635,7 @@ pub(crate) fn optional_subject_star_count(
     let mut hash_entries = 0usize;
     for &(selector, pattern) in mandatory.iter().chain(optional) {
         let mut relation = SubjectKeySet::default();
-        if for_each_join_key(
+        if for_each_key(
             view,
             context,
             selector,
@@ -712,7 +716,7 @@ pub(crate) fn subject_set_count(
     let mut hash_entries = 0usize;
     for &(selector, pattern) in outer {
         let mut relation = SubjectKeySet::default();
-        if for_each_join_key(
+        if for_each_key(
             view,
             context,
             selector,
@@ -737,7 +741,7 @@ pub(crate) fn subject_set_count(
     let mut inner_relations = Vec::with_capacity(inner.len());
     for &(selector, pattern) in inner {
         let mut relation = HashSet::new();
-        if for_each_join_key(
+        if for_each_key(
             view,
             context,
             selector,
@@ -801,7 +805,7 @@ enum JoinKeyDomain {
     Object,
 }
 
-fn for_each_join_key(
+fn for_each_key(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
     selector: GraphSelector,
@@ -810,7 +814,7 @@ fn for_each_join_key(
     budget: &QueryBudget,
     mut observe: impl FnMut(QueryTermId) -> Result<()>,
 ) -> Result<Option<()>> {
-    let Some(mut cursor) = view.raw_query_index_keys(context, selector, pattern)? else {
+    let Some(mut cursor) = view.raw_index_keys(context, selector, pattern)? else {
         return Ok(None);
     };
     match selector {
@@ -827,12 +831,12 @@ fn for_each_join_key(
                     context.check_cancelled()?;
                 }
                 let (matches, extracted) = cursor.matches(key);
-                context.record_key_fields_extracted(extracted);
+                context.record_key_fields(extracted);
                 if !matches {
                     continue;
                 }
 
-                context.record_key_fields_extracted(1);
+                context.record_key_fields(1);
                 let selected = match domain {
                     JoinKeyDomain::Subject => key.subject(),
                     JoinKeyDomain::Object => key.object(),
@@ -841,13 +845,13 @@ fn for_each_join_key(
                     let subject = match domain {
                         JoinKeyDomain::Subject => selected,
                         JoinKeyDomain::Object => {
-                            context.record_key_fields_extracted(1);
+                            context.record_key_fields(1);
                             key.subject()
                         }
                     };
                     let object = match domain {
                         JoinKeyDomain::Subject => {
-                            context.record_key_fields_extracted(1);
+                            context.record_key_fields(1);
                             key.object()
                         }
                         JoinKeyDomain::Object => selected,
@@ -878,12 +882,12 @@ fn for_each_join_key(
                     context.check_cancelled()?;
                 }
                 let (matches, extracted) = cursor.matches(key);
-                context.record_key_fields_extracted(extracted);
+                context.record_key_fields(extracted);
                 if !matches {
                     continue;
                 }
 
-                context.record_key_fields_extracted(3);
+                context.record_key_fields(3);
                 let subject = key.subject();
                 let object = key.object();
                 let group = (subject, key.predicate(), object);
@@ -896,7 +900,7 @@ fn for_each_join_key(
                     continue;
                 }
 
-                context.record_key_fields_extracted(1);
+                context.record_key_fields(1);
                 let Some(orphaned) =
                     graph_orphans(view, context, &cursor, &mut graph_cache, key.graph())?
                 else {
@@ -953,7 +957,7 @@ fn exact_named_count(
 fn default_union_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    cursor: &mut crate::query_cursor::RawQueryIndexKeyCursor,
+    cursor: &mut crate::query::cursor::RawIndexCursor,
     domain: CountValueDomain,
     budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
@@ -981,7 +985,7 @@ fn default_union_count(
             context.check_cancelled()?;
         }
         let (matches, extracted) = cursor.matches(key);
-        context.record_key_fields_extracted(extracted);
+        context.record_key_fields(extracted);
         if !matches {
             continue;
         }
@@ -990,7 +994,7 @@ fn default_union_count(
         let mut object = None;
         let group = match domain {
             CountValueDomain::Scalar => {
-                context.record_key_fields_extracted(3);
+                context.record_key_fields(3);
                 let extracted_subject = key.subject();
                 let extracted_object = key.object();
                 subject = Some(extracted_subject);
@@ -998,13 +1002,13 @@ fn default_union_count(
                 (extracted_subject, key.predicate(), extracted_object)
             }
             CountValueDomain::Subject => {
-                context.record_key_fields_extracted(1);
+                context.record_key_fields(1);
                 let extracted = key.subject();
                 subject = Some(extracted);
                 (extracted, QueryTermId(0), QueryTermId(0))
             }
             CountValueDomain::Object => {
-                context.record_key_fields_extracted(1);
+                context.record_key_fields(1);
                 let extracted = key.object();
                 object = Some(extracted);
                 (extracted, QueryTermId(0), QueryTermId(0))
@@ -1021,7 +1025,7 @@ fn default_union_count(
             }
         }
 
-        context.record_key_fields_extracted(1);
+        context.record_key_fields(1);
         let Some(orphaned) = graph_orphans(view, context, cursor, &mut graph_cache, key.graph())?
         else {
             continue;
@@ -1030,14 +1034,14 @@ fn default_union_count(
             let subject = match subject {
                 Some(subject) => subject,
                 None => {
-                    context.record_key_fields_extracted(1);
+                    context.record_key_fields(1);
                     key.subject()
                 }
             };
             let object = match object {
                 Some(object) => object,
                 None => {
-                    context.record_key_fields_extracted(1);
+                    context.record_key_fields(1);
                     key.object()
                 }
             };
@@ -1095,16 +1099,16 @@ struct ParallelCountWork {
     key_fields_extracted: u64,
 }
 
-fn parallel_default_union_count(
+fn parallel_union_count(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    partitions: Vec<crate::query_cursor::RawQueryIndexKeyCursor>,
+    partitions: Vec<crate::query::cursor::RawIndexCursor>,
     budget: &QueryBudget,
 ) -> Result<Option<ScalarCount>> {
     let graph_cache = parallel_graph_cache(view, context)?;
     let cancellation = context.cancellation();
-    let results = crate::query_worker::map_ordered(partitions, |cursor| {
-        count_default_union_partition(cursor, &graph_cache, &cancellation, budget)
+    let results = crate::query::worker::map_ordered(partitions, |cursor| {
+        count_union_partition(cursor, &graph_cache, &cancellation, budget)
     })?;
 
     let mut count = ScalarCount::default();
@@ -1115,7 +1119,7 @@ fn parallel_default_union_count(
         context.record_matching_quads(result.matching_quads);
         context.record_duplicate_groups(result.duplicate_groups);
         context.record_skipped_copies(result.skipped_copies);
-        context.record_key_fields_extracted(result.key_fields_extracted);
+        context.record_key_fields(result.key_fields_extracted);
     }
     Ok(Some(count))
 }
@@ -1123,9 +1127,9 @@ fn parallel_default_union_count(
 fn parallel_graph_cache(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-) -> Result<ParallelGraphOrphanCache> {
+) -> Result<ParallelOrphanCache> {
     let mut cache = HashMap::new();
-    for graph in view.graph_term_id_iter() {
+    for graph in view.graph_term_iter() {
         context.check_cancelled()?;
         let graph = graph?;
         let Some(query_graph) = view.query_term_id(context, graph)? else {
@@ -1141,10 +1145,10 @@ fn parallel_graph_cache(
     Ok(Arc::new(cache))
 }
 
-fn count_default_union_partition(
-    mut cursor: crate::query_cursor::RawQueryIndexKeyCursor,
-    graph_cache: &ParallelGraphOrphanCache,
-    cancellation: &crate::query_context::QueryCancellation,
+fn count_union_partition(
+    mut cursor: crate::query::cursor::RawIndexCursor,
+    graph_cache: &ParallelOrphanCache,
+    cancellation: &crate::query::context::QueryCancellation,
     budget: &QueryBudget,
 ) -> Result<ParallelCountWork> {
     let mut result = ParallelCountWork::default();
@@ -1184,7 +1188,7 @@ fn count_default_union_partition(
 
         result.key_fields_extracted = result.key_fields_extracted.saturating_add(1);
         let orphaned = graph_cache.get(&key.graph()).ok_or_else(|| {
-            crate::store::StoreError::InvalidQueryIndexEncoding {
+            crate::store::StoreError::InvalidIndexEncoding {
                 context: "qv2 graph mapping",
                 message: "query index row references an unknown graph".to_owned(),
             }
@@ -1213,7 +1217,7 @@ fn count_default_union_partition(
 fn graph_orphans(
     view: &StoreReadView<'_>,
     context: &ReadContext<'_>,
-    cursor: &crate::query_cursor::RawQueryIndexKeyCursor,
+    cursor: &crate::query::cursor::RawIndexCursor,
     cache: &mut GraphOrphanCache,
     query_graph: QueryTermId,
 ) -> Result<Option<Rc<HashSet<TermId>>>> {

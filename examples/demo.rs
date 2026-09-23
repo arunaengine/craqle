@@ -1,3 +1,7 @@
+//! Demonstrates crate creation, entity edits, and query results.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::error::Error;
 use std::fs;
 

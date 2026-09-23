@@ -1,6 +1,153 @@
+<!-- Records released behavior and upgrade requirements. -->
+<!-- Copyright (c) 2026 ArunaStorage Team @ JLU Giessen -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Changelog
 
 All notable changes to Craqle are documented here.
+
+## 0.3.0 - Unreleased
+
+### Changed
+
+- Source fallback for an explicit graph union deduplicates visible triples under
+  query hash limits, preserving bag multiplicity in later joins and aggregates.
+- Queries honor a single `FROM` graph and authorized `FROM NAMED` graphs. Repeated
+  dataset names are deduplicated; multiple distinct default graphs in `FROM` or
+  update `USING` are rejected explicitly because RDF-merge semantics are unsupported.
+- Local writes store literal aliases such as `"x"^^xsd:string`, escaped characters
+  and upper-case language tags in their canonical N-Triples form, so equal RDF
+  literals match in patterns, joins, DISTINCT and GROUP BY. Deletes also remove the
+  raw spelling written by earlier versions. Replicated events and snapshots keep
+  their signed spelling but apply to the canonical quad, and the first open merges
+  aliases that earlier versions stored under their raw spelling.
+- Integrates Irokle 0.3.0 at revision `f3770c5186d34603753e26912b6450d077680205`.
+- Requires Rust 1.97.1 or newer. Craqle's authoritative RDF disk format remains `1.0`.
+- Background maintenance retries failed search entries and rebuilds uncovered query
+  indexes. Rebuilds prepare an inactive index and replay concurrent source changes
+  before a short publication fence.
+- Dropping a node joins its maintenance worker; an active storage or search call
+  must finish before shutdown completes.
+- Query statistics, explain, and analyze keep only timings, result counts, the
+  query form, and a fingerprint of the query text unless the authorizer reads every
+  graph. The physical plan, join choices, fast-path kind, access paths, estimates,
+  and store counters can depend on unreadable graphs, so they are withheld and the
+  plan root reports `QueryPhysicalOperator::Withheld`. `details_withheld` on
+  `QueryPlan` and `QueryExecutionStatistics` tells a withheld zero from a measured
+  one. `Authorizer::reads_all` defaults to `false`; `AllowAllAuthorizer` returns `true`.
+- Search fails with `CorruptDerivedData` when a live index document has missing or
+  malformed metadata, and queues a reindex of its graph, instead of skipping it.
+  Damage without a readable graph scope, or beyond 64 pending graphs, queues a
+  whole search rebuild. A repair stays pending until the store accepts it, and a
+  late report from an older search view cannot replace a current one. A whole
+  rebuild ends by deleting every document outside the published and staged
+  generations, so damaged records with no usable scope or key are removed.
+- A query over exactly one explicit graph reads that graph's own index range,
+  including counts from its per-graph counters, instead of scanning the union of all
+  graphs and discarding rows from others. Results are unchanged. Larger graph lists
+  and policy-based default unions still use the union scan with visibility checks.
+- Join planning for one explicit graph estimates predicate and total rows from that
+  graph's own counters, so unrelated graphs no longer change the chosen join.
+- Join planning inside `GRAPH ?g` treats an unbound `?g` as a shared join variable
+  bound by the first match, instead of as already bound. Patterns connected only
+  through `?g` now form one join chain, which roughly halves typical dataset searches.
+- `SELECT DISTINCT` over `GRAPH ?g { ... }` and `COUNT(DISTINCT ?g)` grouped by
+  pattern variables run a native graph-level plan over the query index. It joins index
+  ranges in memory, keeps only the variables the result needs, and stops at the first
+  match when a graph only has to exist. Results are unchanged. Disabling fast paths in
+  `QueryOptions` keeps the general evaluator; explain still shows the general plan.
+- A query reads each graph's metadata, clock, and diagnostics at most once, and by range
+  when it visits many graphs. Mappings from query index IDs to terms are shared between
+  queries of one index generation. Explicit graph lists skip unlisted graphs before any
+  visibility check.
+- Default-union queries, statistics, prepared execution, explain, and analyze fail
+  with the store error when a graph policy cannot be read. Earlier versions hid
+  that graph and could return fewer rows, a smaller count, or a false `ASK`.
+  A missing or denying policy still hides the graph.
+
+### Added
+
+- Fixed-target search flush receipts, request cancellation, and explicit timed
+  shutdown that retains ownership of unfinished maintenance.
+- Mutation receipts with separate acceptance, durability, and repair outcomes.
+  Keyed mutations first return an admission ticket, then apply when that ticket
+  is supplied; expired tickets cannot silently repeat a mutation.
+- Authorized graph reconciliation from retained history or a verified healthy
+  snapshot, with a durable backup and an audit of the replacement.
+- Explicit process and store memory reservations shared by live stores.
+  A default `MemoryBudget` shrinks its store share toward the minimum as live
+  stores fill the process budget; explicit budgets keep their exact sizes.
+- Graph history for Irokle-backed graphs. `graph_heads` lists the current heads.
+  `history_log` pages signed operations newest first with parents, actor, sequence
+  and recorded quad changes. `compare_history` returns the quad changes and any
+  RO-Crate context or license change between two head sets. `project_history`
+  replays heads into a separate disposable store. `restore_history` writes the
+  quads, context and license at chosen heads as one new validated local mutation,
+  never rewriting history. It first applies outstanding records of the graph's
+  topic and diffs against the store, failing with a conflict if a head is still
+  unapplied. A caller `MutationId` makes a repeated restore return its first
+  result. The id names the graph, heads, expected heads and commit of the restore,
+  so a retry after a failed publish recomputes the changes against the current
+  store, and a different restore with the same id fails. The optional expected-heads fence is best effort, not compare-and-swap:
+  Irokle can admit a remote operation after the check, and `HistoryRestored::extends`
+  reports whether the new operation's parents are exactly the fenced heads. Every
+  call checks graph permissions first and fails with `HistoryError` instead of
+  returning partial results when its bounds are exceeded. Records that cannot be
+  decoded, target another graph, or were rejected by the store are listed as
+  rejected and skipped in every replay, as reconciliation skips them.
+- Commit metadata for graph history. `CommitInfo` holds a message, author name, author
+  email, author time in Unix milliseconds, the author's time zone offset in minutes, and
+  `sources`: `HistoryPoint` heads of other graphs, such as a fork point or a merged
+  branch. The caller sets every field; Craqle stores sources without checking that they
+  exist. The info is signed into a new `CraqleGraphEvent::CommittedMutation` event, so
+  every peer reads the same commit from `HistoryOperation::commit`.
+  `apply_mutation_with` takes a `MutationCommit`, `apply_rocrate_with` takes a
+  `RoCrateWrite` with the arguments of
+  `apply_rocrate_document_checked_with_policy_and_durability_as` plus an optional commit,
+  and `HistoryRestore::commit` records a revert message. The `CommitInfo::MAX_*` bounds
+  limit the message, author name and email, time zone offset, number of sources, and
+  heads per source. An author field with a control character, a source without heads, a
+  repeated source graph or head, or a source naming the commit's own graph is also invalid.
+  Invalid info fails a local write with `InvalidInput` and makes a replicated record a
+  rejected record. A write with a commit that cannot publish an Irokle event, because
+  replication is off or its durability does not publish, fails unchanged. A write that
+  changes nothing publishes no event and stores no commit: `apply_rocrate_with` returns an
+  empty batch and `restore_history` returns `None`. Commit metadata is not part of a
+  mutation id's request, except for a restore, so retrying a published mutation keeps
+  its first commit.
+- `QueryOptions::results_only()` runs a query without per-operator statistics.
+  `QueryOptions::default()` still collects them for compatibility.
+- `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a
+  timeout. Either stops the search with an error instead of returning partial hits.
+  `search_graphs_with` and `search_resources_with` apply the same options to
+  graph-scoped and hydrated search. One budget covers setup, scoring, the final
+  permission recheck, and hydration, and an ended budget fails even when nothing
+  matches. Checks are cooperative, so this is not a strict wall-clock bound.
+- `?s fts:complete true` in the FTS `SERVICE` returns every matching resource instead
+  of the top-ranked page. It cannot be combined with `fts:limit` or `fts:score`. More
+  matches than the query's intermediate-row limit or the search memory share fail with
+  an error instead of returning a partial answer.
+
+### Upgrading from 0.2
+
+- Query and update limits cover storage reads and materialized results while
+  preserving supported SPARQL operators. Generic evaluator buffers are not fully
+  accounted for, and cancellation inside those operators remains cooperative.
+- Search-disabled builds retain index repair debt and report search flush as
+  unsupported. Reopening with search enabled repairs that debt before coverage
+  can be certified.
+
+- Applications that depend directly on Irokle must use the same revision as Craqle,
+  or use the `craqle::irokle` re-export so both libraries share identical types.
+- Upgrade replication peers together: Irokle 0.3 uses the `irokle/sync/2` protocol.
+  Peers without `CraqleGraphEvent::CommittedMutation` reject such records. Exhaustive
+  matches over `CraqleGraphEvent` need an arm for it; it is appended last, so stored
+  events keep decoding.
+- Back up Irokle's Fjall database before its first open with this version. Irokle
+  upgrades schema 1 to schema 2 in place and resumes an interrupted migration.
+  Older Irokle binaries reject schema 2; rollback requires the pre-upgrade backup.
+- Derived-index repair preserves surviving RDF source state. It cannot reconstruct
+  source events lost by older bugs without an authoritative history or healthy replica.
 
 ## 0.2.0 - 2026-08-22
 

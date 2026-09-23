@@ -1,6 +1,10 @@
+<!-- Records provenance and coverage of the RO-Crate fixtures. -->
+<!-- Copyright (c) 2026 ArunaStorage Team @ JLU Giessen -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # RO-Crate JSON-LD fixtures
 
-`src/resources/ro_crate_1_3.jsonld` is copied byte-for-byte from the
+The bundled RO-Crate 1.3 context is copied byte-for-byte from the
 `ro-crate-rs` tag `v0.6.0` at commit
 `855b8038e7170028bd2c3f8a2425a3abc73e2b93`.
 

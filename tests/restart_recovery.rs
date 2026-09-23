@@ -1,13 +1,6 @@
-//! WS0 restart-recovery guarantees, exercised end to end through the public
-//! `CraqleNode` API.
-//!
-//! The store-level proofs (clock-tag mismatch detection, FTS queue token
-//! ordering, the legacy-clock migration fallback) live in
-//! `src/internal/store.rs`'s unit tests, because `craqle::store` is a private
-//! module and integration tests cannot reach `GraphStore` or any of the
-//! `pub(crate)` WS0 API. What is testable from out here is the observable
-//! contract those mechanisms exist to uphold: after a reopen the node reports
-//! exactly the state it committed, and nothing is served stale.
+//! Verifies reopened nodes expose exactly the committed public state.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 mod support;
 
@@ -110,9 +103,7 @@ fn diagnostics_survive_reopen() {
     );
 }
 
-/// G10: after a bulk ingest under the WS0-T7 fjall configuration, recovery
-/// reproduces exactly the committed state — same quad count, same content
-/// fingerprint, same dot sets.
+/// Reopen must preserve bulk-ingest count, fingerprint, clock, and dot sets.
 #[test]
 fn reopen_fingerprint_matches() {
     const ENTITIES: usize = 1_500;
@@ -163,7 +154,7 @@ fn reopen_fingerprint_matches() {
 /// A deleted graph's tombstone survives reopen and permanently prevents reuse
 /// of the graph ID.
 #[test]
-fn deleted_graph_tombstone_survives_reopen() {
+fn tombstone_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let graph = GraphId::new("urn:test:restart:clock-resurrection");
 
@@ -212,19 +203,8 @@ fn quokka_hits(node: &CraqleNode, auth: &GrantAuthorizer) -> Vec<String> {
     hits
 }
 
-/// G7 across a restart: work queued before shutdown and work queued after it
-/// must both reach the search index. This is the observable consequence of the
-/// FTS queue tokens resuming past every live token (K4) — with the counter
-/// restarting at 1, post-restart entries can be acknowledged away by a
-/// pre-restart token and their subjects never get indexed.
-///
-/// Nothing here re-derives the index. The pre-restart entry is left in the
-/// durable queue (no `flush_search_updates` before the shutdown) and the
-/// reopened node is never asked to `reindex_search`, so both subjects have to
-/// reach tantivy through the queue that survived the restart. The previous
-/// version flushed first and rebuilt after, which left every queue empty at
-/// reopen — bit-identical to the bug — and then recomputed the whole index
-/// anyway, so it passed with the fix reverted.
+/// Queue tokens must resume after restart so old and new debt both reach search.
+/// The test leaves debt queued and never requests a full reindex.
 #[cfg(feature = "search")]
 #[test]
 fn updates_survive_restart() {

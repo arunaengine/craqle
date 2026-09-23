@@ -1,7 +1,11 @@
+//! Evaluates compiled SHACL constraints against focus nodes.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::HashMap;
 
 use crate::Result;
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::RdfReadView;
 use crate::store::TermId;
 

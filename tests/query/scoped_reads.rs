@@ -1,0 +1,478 @@
+//! Checks that one explicit graph scope reads only that graph and keeps union semantics.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
+#[path = "../support.rs"]
+mod support;
+
+use crate::support::TestWriteExt as _;
+use craqle::{
+    AllowAllAuthorizer, CraqleNode, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
+    QueryExecution, QueryOptions, QueryReadMode, QueryResults,
+};
+
+const TARGET: &str = "urn:test:scope:target";
+const SHARED: &str = "urn:test:scope:shared";
+const UNRELATED: &str = "urn:test:scope:unrelated";
+const NAME: &str = "urn:test:scope:name";
+const KNOWS: &str = "urn:test:scope:knows";
+
+/// Queries whose default-graph answer over the target alone has a `GRAPH` oracle.
+const QUERIES: [(&str, &str); 6] = [
+    (
+        "multi-valued",
+        "SELECT ?s ?name WHERE { ?s <urn:test:scope:name> ?name }",
+    ),
+    (
+        "join",
+        "SELECT ?s ?o ?name WHERE { ?s <urn:test:scope:knows> ?o . ?o <urn:test:scope:name> ?name }",
+    ),
+    (
+        "count",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:test:scope:name> ?name }",
+    ),
+    (
+        "ordered",
+        "SELECT ?name WHERE { ?s <urn:test:scope:name> ?name } ORDER BY DESC(?name) LIMIT 3",
+    ),
+    (
+        "deleted",
+        "ASK { <urn:test:scope:s:gone> <urn:test:scope:name> \"gone\" }",
+    ),
+    (
+        "shared",
+        "SELECT ?s WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> }",
+    ),
+];
+
+fn iri(value: &str) -> EncodedTerm {
+    EncodedTerm(format!("<{value}>"))
+}
+
+/// Inserts one `(subject, predicate, object)` triple into a graph.
+fn quad(
+    graph: &GraphId,
+    (subject, predicate, object): (&str, &str, EncodedTerm),
+) -> MaterializedQuadChange {
+    MaterializedQuadChange::Insert {
+        graph: graph.clone(),
+        subject: iri(subject),
+        predicate: iri(predicate),
+        object,
+    }
+}
+
+/// Target data, a graph sharing some of its triples, and `unrelated` rows elsewhere.
+fn fixture(unrelated: usize) -> (tempfile::TempDir, CraqleNode) {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let [target, shared, other] = [TARGET, SHARED, UNRELATED].map(GraphId::new);
+    for graph in [&target, &shared, &other] {
+        node.import_graph_policy(graph, GraphPolicy::default())
+            .unwrap();
+    }
+    let mut changes = Vec::new();
+    for index in 0..6 {
+        let subject = format!("urn:test:scope:s:{index}");
+        for value in ["alpha", "beta"] {
+            let name = EncodedTerm(format!("\"{value} {index}\""));
+            changes.push(quad(&target, (&subject, NAME, name)));
+        }
+        let next = format!("urn:test:scope:s:{}", (index + 1) % 6);
+        changes.push(quad(&target, (&subject, KNOWS, iri(&next))));
+    }
+    changes.push(quad(
+        &target,
+        (
+            "urn:test:scope:s:gone",
+            NAME,
+            EncodedTerm("\"gone\"".into()),
+        ),
+    ));
+    node.apply_changes_unchecked(&target, changes).unwrap();
+    node.apply_changes_unchecked(
+        &target,
+        vec![MaterializedQuadChange::Delete {
+            graph: target.clone(),
+            subject: iri("urn:test:scope:s:gone"),
+            predicate: iri(NAME),
+            object: EncodedTerm("\"gone\"".into()),
+        }],
+    )
+    .unwrap();
+    // The same triples in a second graph must not duplicate default-union rows.
+    let copies = vec![
+        quad(
+            &shared,
+            ("urn:test:scope:s:0", KNOWS, iri("urn:test:scope:s:1")),
+        ),
+        quad(
+            &shared,
+            (
+                "urn:test:scope:s:gone",
+                NAME,
+                EncodedTerm("\"gone\"".into()),
+            ),
+        ),
+    ];
+    node.apply_changes_unchecked(&shared, copies).unwrap();
+    let noise = (0..unrelated)
+        .flat_map(|index| {
+            let subject = format!("urn:test:scope:noise:{index}");
+            let name = EncodedTerm(format!("\"noise {index}\""));
+            [
+                quad(&other, (&subject, NAME, name)),
+                quad(&other, (&subject, KNOWS, iri("urn:test:scope:s:1"))),
+            ]
+        })
+        .collect();
+    node.apply_changes_unchecked(&other, noise).unwrap();
+    (directory, node)
+}
+
+/// Every solution as sorted `name=term` cells, keeping duplicate rows and, if asked, order.
+fn canonical(results: QueryResults, ordered: bool) -> Vec<String> {
+    let QueryResults::Solutions(rows) = results else {
+        return vec![format!("{results:?}")];
+    };
+    let mut rows: Vec<String> = rows
+        .into_iter()
+        .map(|row| {
+            let mut cells: Vec<String> = row
+                .into_iter()
+                .map(|(name, term)| format!("{name}={}", term.0))
+                .collect();
+            cells.sort();
+            cells.join(" ")
+        })
+        .collect();
+    if !ordered {
+        rows.sort();
+    }
+    rows
+}
+
+fn scoped(node: &CraqleNode, graphs: &[&str], query: &str) -> QueryExecution {
+    let graphs: Vec<GraphId> = graphs.iter().map(|graph| GraphId::new(graph)).collect();
+    let mut options = QueryOptions::default();
+    options.collect_costs = true;
+    node.query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+        .unwrap()
+}
+
+/// The same query with every default-graph pattern placed inside `GRAPH <target>`.
+fn oracle(node: &CraqleNode, query: &str) -> QueryResults {
+    let open = query.find('{').unwrap();
+    let close = query.rfind('}').unwrap();
+    let rewritten = format!(
+        "{} {{ GRAPH <{TARGET}> {} }}{}",
+        &query[..open],
+        &query[open..=close],
+        &query[close + 1..]
+    );
+    node.query(&AllowAllAuthorizer, &rewritten).unwrap()
+}
+
+#[test]
+fn single_scope_matches() {
+    let (_directory, node) = fixture(40);
+    for (label, query) in QUERIES {
+        let ordered = label == "ordered";
+        let expected = canonical(oracle(&node, query), ordered);
+        for graphs in [&[TARGET][..], &[TARGET, TARGET][..]] {
+            let actual = canonical(scoped(&node, graphs, query).results, ordered);
+            assert_eq!(expected, actual, "{label} over {graphs:?}");
+        }
+    }
+    let count = canonical(scoped(&node, &[TARGET], QUERIES[2].1).results, false);
+    assert_eq!(
+        vec!["n=\"12\"^^<http://www.w3.org/2001/XMLSchema#integer>"],
+        count
+    );
+}
+
+#[test]
+fn union_stays_distinct() {
+    let (_directory, node) = fixture(40);
+    let shared = QUERIES[5].1;
+    let union = canonical(scoped(&node, &[TARGET, SHARED], shared).results, false);
+    assert_eq!(vec!["s=<urn:test:scope:s:0>"], union);
+    let deleted = canonical(
+        scoped(&node, &[TARGET, SHARED], QUERIES[4].1).results,
+        false,
+    );
+    assert_eq!(vec!["Boolean(true)"], deleted);
+    let named = "SELECT ?g WHERE { GRAPH ?g { <urn:test:scope:s:0> <urn:test:scope:knows> ?o } }";
+    let copies = canonical(scoped(&node, &[TARGET, SHARED], named).results, false);
+    assert_eq!(2, copies.len(), "named graph copies stay separate");
+}
+
+#[test]
+fn unrelated_rows_unread() {
+    let (_small_directory, small) = fixture(4);
+    let (_large_directory, large) = fixture(4_000);
+    for (label, query) in QUERIES {
+        let small_run = scoped(&small, &[TARGET], query);
+        let large_run = scoped(&large, &[TARGET], query);
+        assert_eq!(
+            canonical(small_run.results.clone(), false),
+            canonical(large_run.results.clone(), false),
+            "{label}"
+        );
+        let work = |run: &QueryExecution| {
+            (
+                run.statistics.candidate_quads,
+                run.statistics.qv_keys_read,
+                run.statistics.source_keys_read,
+            )
+        };
+        assert_eq!(
+            work(&small_run),
+            work(&large_run),
+            "{label}: unrelated rows changed the scoped read work"
+        );
+    }
+}
+
+#[test]
+fn unions_ignore_noise() {
+    let (_small_directory, small) = fixture(4);
+    let (_large_directory, large) = fixture(4_000);
+    for query in [
+        "SELECT DISTINCT ?s ?o WHERE { ?s <urn:test:scope:name> ?o }",
+        "SELECT DISTINCT ?s ?p WHERE { ?s ?p <urn:test:scope:s:1> }",
+        "SELECT DISTINCT ?p ?o WHERE { <urn:test:scope:s:0> ?p ?o }",
+        "SELECT DISTINCT ?s ?p ?o WHERE { ?s ?p ?o }",
+    ] {
+        let small_run = scoped(&small, &[TARGET, SHARED], query);
+        let large_run = scoped(&large, &[TARGET, SHARED], query);
+        assert_eq!(
+            canonical(small_run.results, false),
+            canonical(large_run.results, false),
+            "{query}"
+        );
+        assert_eq!(
+            small_run.statistics.qv_keys_read, large_run.statistics.qv_keys_read,
+            "unrelated graphs changed union index work: {query}"
+        );
+        assert!(large_run.statistics.qv_keys_read <= 20, "{query}");
+    }
+}
+
+#[test]
+fn union_crosses_graphs() {
+    let (_directory, node) = fixture(4);
+    let shared = GraphId::new(SHARED);
+    node.apply_changes_unchecked(
+        &shared,
+        vec![quad(
+            &shared,
+            ("urn:test:scope:cross", KNOWS, iri("urn:test:scope:s:0")),
+        )],
+    )
+    .unwrap();
+    let query = "SELECT ?name WHERE { <urn:test:scope:cross> <urn:test:scope:knows> ?o . \
+                 ?o <urn:test:scope:name> ?name } ORDER BY ?name";
+    for graph in [TARGET, SHARED] {
+        assert!(canonical(scoped(&node, &[graph], query).results, true).is_empty());
+    }
+    let graphs = [TARGET, SHARED, TARGET].map(GraphId::new);
+    for read_mode in [
+        QueryReadMode::Auto,
+        QueryReadMode::ForceQv,
+        QueryReadMode::ForceSource,
+    ] {
+        let mut options = QueryOptions::default();
+        options.read_mode = read_mode;
+        let actual = node
+            .query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .unwrap();
+        assert_eq!(
+            canonical(actual.results, true),
+            ["name=\"alpha 0\"", "name=\"beta 0\""],
+            "{read_mode:?}"
+        );
+    }
+}
+
+#[test]
+fn source_union_matches() {
+    let (_directory, node) = fixture(4);
+    let graphs = [TARGET, SHARED].map(GraphId::new);
+    for query in [
+        "SELECT ?s WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> }",
+        "SELECT ?s ?name WHERE { ?s <urn:test:scope:knows> <urn:test:scope:s:1> ; \
+         <urn:test:scope:name> ?name } ORDER BY ?name",
+        "SELECT ?g ?s WHERE { GRAPH ?g { ?s <urn:test:scope:knows> <urn:test:scope:s:1> } }",
+    ] {
+        let expected = canonical(scoped(&node, &[TARGET, SHARED], query).results, false);
+        let mut options = QueryOptions::default();
+        options.read_mode = QueryReadMode::ForceSource;
+        options.fast_paths = craqle::QueryFastPathMode::Disabled;
+        let actual = node
+            .query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .unwrap();
+        assert_eq!(canonical(actual.results, false), expected, "{query}");
+    }
+}
+
+#[test]
+fn source_union_bounds() {
+    let (_directory, node) = fixture(4);
+    let graphs = [TARGET, SHARED].map(GraphId::new);
+    let mut options = QueryOptions::default();
+    options.read_mode = QueryReadMode::ForceSource;
+    options.fast_paths = craqle::QueryFastPathMode::Disabled;
+    options.limits.max_hash_entries = 1;
+    let query = "SELECT ?s ?name WHERE { ?s <urn:test:scope:name> ?name }";
+    assert!(
+        node.query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .is_err()
+    );
+    options.limits.max_hash_entries = 1_000_000;
+    options.limits.max_hash_bytes = 64;
+    assert!(
+        node.query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, query, &options)
+            .is_err()
+    );
+    options.collect_costs = true;
+    let empty = node
+        .query_in_graphs_with_options(&AllowAllAuthorizer, &[], query, &options)
+        .unwrap();
+    assert!(canonical(empty.results, false).is_empty());
+    assert_eq!(empty.statistics.source_keys_read, 0);
+}
+
+#[test]
+fn declared_datasets_match() {
+    let (_directory, node) = fixture(4);
+    let plain = "SELECT ?s ?name WHERE { ?s <urn:test:scope:name> ?name } ORDER BY ?s ?name";
+    let expected = canonical(scoped(&node, &[TARGET], plain).results, true);
+    let query = plain.replace(" WHERE ", &format!(" FROM <{TARGET}> WHERE "));
+    for mode in [QueryReadMode::Auto, QueryReadMode::ForceSource] {
+        let mut options = QueryOptions::default();
+        options.read_mode = mode;
+        let actual = node
+            .query_with_options(
+                &AllowAllAuthorizer,
+                craqle::QueryRequest {
+                    sparql: &query,
+                    options: &options,
+                },
+            )
+            .unwrap();
+        assert_eq!(canonical(actual.results, true), expected);
+        let graphs = [TARGET, SHARED, UNRELATED].map(GraphId::new);
+        let actual = node
+            .query_in_graphs_with_options(&AllowAllAuthorizer, &graphs, &query, &options)
+            .unwrap();
+        assert_eq!(canonical(actual.results, true), expected);
+    }
+    let query = format!("SELECT ?s FROM NAMED <{TARGET}> WHERE {{ ?s ?p ?o }}");
+    assert!(canonical(node.query(&AllowAllAuthorizer, &query).unwrap(), false).is_empty());
+    let query =
+        format!("SELECT ?g FROM NAMED <{TARGET}> FROM NAMED <{TARGET}> WHERE {{ GRAPH ?g {{}} }}");
+    assert_eq!(
+        canonical(node.query(&AllowAllAuthorizer, &query).unwrap(), false),
+        [format!("g=<{TARGET}>")]
+    );
+    let deny = |graph: &GraphId, _: &GraphPolicy, action: craqle::Action| {
+        Err(craqle::AuthorizationError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_owned(),
+        })
+    };
+    assert!(canonical(node.query(&deny, &query).unwrap(), false).is_empty());
+    let query = plain.replace(
+        " WHERE ",
+        &format!(" FROM <{TARGET}> FROM <{SHARED}> WHERE "),
+    );
+    assert_eq!(
+        node.prepare_query(&query).unwrap_err().kind(),
+        craqle::CraqleErrorKind::Unsupported
+    );
+}
+
+#[test]
+fn unsupported_update_atomic() {
+    let (_directory, node) = fixture(4);
+    let graph = GraphId::new(TARGET);
+    let before = node.graph_snapshot(&graph).unwrap();
+    let query = format!(
+        "INSERT DATA {{ GRAPH <{TARGET}> {{ <urn:test:new> <urn:test:p> <urn:test:o> }} }}; \
+         INSERT {{ GRAPH <{TARGET}> {{ ?s <urn:test:copied> ?o }} }} \
+         USING <{TARGET}> USING <{SHARED}> WHERE {{ ?s <{KNOWS}> ?o }}"
+    );
+    assert_eq!(
+        node.apply_sparql_update(&AllowAllAuthorizer, &query)
+            .unwrap_err()
+            .kind(),
+        craqle::CraqleErrorKind::Unsupported
+    );
+    assert_eq!(node.graph_snapshot(&graph).unwrap(), before);
+}
+
+/// Left and right join rows in the target, plus `skew` right rows elsewhere on three keys.
+fn join_fixture(skew: usize) -> (tempfile::TempDir, CraqleNode) {
+    let directory = tempfile::tempdir().unwrap();
+    let node = CraqleNode::open(directory.path()).unwrap();
+    let [target, other] = [TARGET, UNRELATED].map(GraphId::new);
+    let key = |index: usize| iri(&format!("urn:test:scope:key:{index}"));
+    let mut rows = Vec::new();
+    for index in 0..400 {
+        rows.push(quad(
+            &target,
+            (
+                &format!("urn:test:scope:l:{index}"),
+                "urn:test:scope:left",
+                key(index % 100),
+            ),
+        ));
+        rows.push(quad(
+            &target,
+            (
+                &format!("urn:test:scope:r:{index}"),
+                "urn:test:scope:right",
+                key(index % 100),
+            ),
+        ));
+    }
+    node.apply_changes_unchecked(&target, rows).unwrap();
+    let skewed: Vec<_> = (0..skew)
+        .map(|index| {
+            quad(
+                &other,
+                (
+                    &format!("urn:test:scope:x:{index}"),
+                    "urn:test:scope:right",
+                    key(index % 3),
+                ),
+            )
+        })
+        .collect();
+    for chunk in skewed.chunks(10_000) {
+        node.apply_changes_unchecked(&other, chunk.to_vec())
+            .unwrap();
+    }
+    (directory, node)
+}
+
+#[test]
+fn plan_ignores_unrelated() {
+    const JOIN: &str =
+        "SELECT ?l ?r WHERE { ?l <urn:test:scope:left> ?k . ?r <urn:test:scope:right> ?k }";
+    let plan = |skew| {
+        let (_directory, node) = join_fixture(skew);
+        let run = scoped(&node, &[TARGET], JOIN);
+        let joins: Vec<_> = run
+            .statistics
+            .planned_joins
+            .iter()
+            .map(|join| join.physical_operator)
+            .collect();
+        (joins, canonical(run.results, false))
+    };
+    // Store-wide counts once chose a lateral join here because of rows the query never reads.
+    assert_eq!(plan(0), plan(10_000));
+}

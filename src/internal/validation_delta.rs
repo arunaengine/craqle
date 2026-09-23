@@ -1,10 +1,13 @@
-use std::cmp::Ordering;
+//! Overlays pending mutations on snapshot RDF reads for validation.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::core::{EncodedTerm, GraphId, MaterializedQuadChange, vocab};
-use crate::query_context::ReadContext;
-use crate::query_cursor::{CandidateStorage, QueryCursor, RawQuadCandidate, RawQuadCursor};
+use crate::query::context::ReadContext;
+use crate::query::cursor::{CandidateStorage, QueryCursor, RawQuadCandidate, RawQuadCursor};
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView, StoreReadView};
 use crate::store::{EncodedQuad, GraphStore, Result, StoreError, TermId, hash_term};
 
@@ -72,9 +75,7 @@ impl QuadKey {
     }
 }
 
-/// Last-change-wins state for one selected graph. Its term map is bounded by
-/// the caller's delta (one graph id, fixed vocabulary, and at most three
-/// terms per operation), and no term is interned while building it.
+/// Last-change-wins state whose terms and rows are bounded by one graph's delta.
 #[derive(Debug)]
 pub(crate) struct DeltaIndex {
     graph: TermId,
@@ -327,14 +328,12 @@ impl OverlayCursor<'_> {
     }
 }
 
-/// The two-source state machine behind a delta read. It never copies the base
-/// graph: only base rows touched by a final live delta state are remembered,
-/// so the seen set is bounded by the delta.
+/// Two-source cursor that remembers only base rows touched by final live delta state.
 pub(crate) struct DeltaQuadCursor<'delta> {
     base: Option<RawQuadCursor>,
     overlay: OverlayCursor<'delta>,
     index: &'delta DeltaIndex,
-    base_live_delta_rows: HashSet<QuadKey>,
+    base_delta_rows: HashSet<QuadKey>,
 }
 
 impl<'delta> DeltaQuadCursor<'delta> {
@@ -347,7 +346,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
             base: Some(base),
             overlay: index.overlay(pattern),
             index,
-            base_live_delta_rows: HashSet::new(),
+            base_delta_rows: HashSet::new(),
         }
     }
 
@@ -359,7 +358,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
                         match self.index.state(candidate.quad) {
                             Some(false) => candidate.live = false,
                             Some(true) => {
-                                self.base_live_delta_rows
+                                self.base_delta_rows
                                     .insert(QuadKey::from_quad(candidate.quad));
                             }
                             None => {}
@@ -377,7 +376,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
             quad: key.quad(),
             // A deletion or a row already emitted from the base remains a
             // candidate for exact accounting, never a matching row.
-            live: present && !self.base_live_delta_rows.contains(&key),
+            live: present && !self.base_delta_rows.contains(&key),
             storage: CandidateStorage::Delta,
             bytes_read: 0,
             key_fields_extracted: 0,
@@ -386,9 +385,7 @@ impl<'delta> DeltaQuadCursor<'delta> {
     }
 }
 
-/// Post-change RDF view layered over the durable read view. The base remains
-/// authoritative; this adapter only supplies the candidate write's final
-/// last-change-wins overlay.
+/// Post-change RDF view layering a final last-change-wins overlay over durable truth.
 pub(crate) struct DeltaReadView<'store, 'delta> {
     base: StoreReadView<'store>,
     index: &'delta DeltaIndex,
@@ -403,9 +400,7 @@ impl<'store, 'delta> DeltaReadView<'store, 'delta> {
         self.index.graph()
     }
 
-    /// Whether the durable pre-state had any row for `subject`. Rules use this
-    /// only to preserve their existing "newly introduced untyped subject"
-    /// scope; all normal candidate reads use the final delta view.
+    /// Test pre-state subject existence only for newly introduced untyped-subject scope.
     pub(crate) fn base_subject_exists(
         &self,
         context: &ReadContext<'_>,
@@ -436,6 +431,7 @@ impl<'store, 'delta> DeltaReadView<'store, 'delta> {
 }
 
 impl RdfReadView for DeltaReadView<'_, '_> {
+    #[cfg(feature = "shacl-core")]
     fn contains_graph(&self, graph: &GraphId) -> Result<bool> {
         Ok(self.base.contains_graph(graph)?
             || (hash_term(&EncodedTerm::from_named_node(&graph.0)) == self.graph()
@@ -601,23 +597,6 @@ impl RdfReadView for DeltaReadView<'_, '_> {
         self.base.decode_term(context, term)
     }
 
-    fn terms_equal(&self, context: &ReadContext<'_>, left: TermId, right: TermId) -> Result<bool> {
-        context.check_cancelled()?;
-        Ok(left == right)
-    }
-
-    fn compare_terms(
-        &self,
-        context: &ReadContext<'_>,
-        left: TermId,
-        right: TermId,
-    ) -> Result<Ordering> {
-        Ok(self
-            .decode_term(context, left)?
-            .0
-            .cmp(&self.decode_term(context, right)?.0))
-    }
-
     fn graph_is_visible(&self, context: &ReadContext<'_>, graph: TermId) -> Result<bool> {
         self.base.graph_is_visible(context, graph)
     }
@@ -630,7 +609,7 @@ impl RdfReadView for DeltaReadView<'_, '_> {
 #[cfg(test)]
 mod tests {
     use crate::core::{ActorId, Dot};
-    use crate::query_context::QueryCancellation;
+    use crate::query::context::QueryCancellation;
     use crate::store::{ClockUpdate, CounterKey, QuadAdd};
 
     use super::*;
@@ -681,7 +660,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        let mut clock = store.get_vector_clock_by_id(graph_id).unwrap();
+        let mut clock = store.vector_clock_id(graph_id).unwrap();
         clock.advance(actor, counter);
         store
             .set_vector_clock(
@@ -752,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_only_insert_is_visible_without_store_mutation() {
+    fn delta_inserts_visible() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:delta-only");
         let changes = vec![insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")];
@@ -781,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_and_reordered_changes_have_base_aware_final_state() {
+    fn delta_respects_base() {
         for base_present in [false, true] {
             let (_directory, store) = setup_store();
             let graph = GraphId::new(if base_present {
@@ -849,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_operations_never_duplicate_or_underflow() {
+    fn repeated_operations_stable() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:repeated");
         let inserts = vec![
@@ -873,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn base_present_final_insert_is_emitted_once() {
+    fn final_insert_unique() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:base-present");
         add_quad(&store, &graph, "urn:test:s", "urn:test:p", "urn:test:o");
@@ -890,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_graph_changes_do_not_affect_the_selected_view_or_impact() {
+    fn foreign_changes_isolated() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:selected");
         let foreign = GraphId::new("urn:test:foreign");
@@ -905,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn impact_is_id_based_and_limited_to_the_selected_graph() {
+    fn impact_scopes_identifiers() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:impact");
         let foreign = GraphId::new("urn:test:impact:foreign");
@@ -949,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_terms_decode_and_collisions_fail_explicitly() {
+    fn delta_terms_checked() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:delta-terms");
         let changes = vec![insert(&graph, "urn:test:s", "urn:test:p", "urn:test:o")];
@@ -975,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn exists_and_bounded_count_stop_after_their_cap() {
+    fn counts_stop_early() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:early-stop");
         for index in 0..3 {
@@ -1060,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_ranges_stop_after_two_matching_count_forward_and_inverse_rows() {
+    fn overlay_ranges_bounded() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:overlay-ranges");
         let forward_subject = "urn:test:forward:subject";
@@ -1159,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_a_large_overlay_scan() {
+    fn overlay_scan_cancels() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:overlay-cancellation");
         let changes: Vec<_> = (0..1_025)
@@ -1193,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn final_forward_and_inverse_walks_include_the_overlay() {
+    fn walks_include_overlay() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:walks");
         add_quad(
@@ -1240,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_visibility_includes_orphans_without_weakening_normal_reads() {
+    fn validation_includes_orphans() {
         let (_directory, store) = setup_store();
         let graph = GraphId::new("urn:test:validation-orphan");
         let orphan = add_quad(

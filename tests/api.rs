@@ -1,3 +1,7 @@
+//! Checks public API authorization, durability, and replication contracts.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 use craqle::*;
@@ -12,7 +16,7 @@ struct OtherAppEvent {
 }
 
 #[test]
-fn normal_release_surface_has_no_benchmark_only_loader() {
+fn release_excludes_loader() {
     let manifest = include_str!("../Cargo.toml");
     let library = include_str!("../src/lib.rs");
     assert!(!manifest.contains("bench-internals"));
@@ -21,7 +25,7 @@ fn normal_release_surface_has_no_benchmark_only_loader() {
 }
 
 #[test]
-fn public_disk_version_and_error_categories_are_stable() {
+fn public_categories_stable() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     assert_eq!(DISK_FORMAT_VERSION, node.disk_format_version());
@@ -65,7 +69,7 @@ fn reader_auth() -> GrantAuthorizer {
 }
 
 #[test]
-fn public_graphs_are_visible_without_grants() {
+fn public_graphs_visible() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let graph = GraphId::new("urn:test:public");
@@ -100,7 +104,7 @@ fn public_graphs_are_visible_without_grants() {
 }
 
 #[test]
-fn default_persist_mode_is_sync_all() {
+fn default_durability_syncs() {
     let dir = tempfile::tempdir().unwrap();
 
     assert_eq!(
@@ -120,7 +124,7 @@ fn default_persist_mode_is_sync_all() {
 }
 
 #[test]
-fn explicit_buffer_mode_is_retained() {
+fn explicit_buffer_retained() {
     let dir = tempfile::tempdir().unwrap();
     let options =
         CraqleOptions::new().with_graph_store_persist_mode(CraqleFjallPersistMode::Buffer);
@@ -138,7 +142,7 @@ fn explicit_buffer_mode_is_retained() {
 }
 
 #[test]
-fn query_graphs_with_filters_by_lazy_predicate() {
+fn graph_queries_filter() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();
@@ -163,7 +167,7 @@ fn query_graphs_with_filters_by_lazy_predicate() {
         .unwrap();
     }
 
-    let rows = match support::query_with_test_visibility(
+    let rows = match support::query_with_visibility(
         &node,
         |graph: &GraphId| graph.as_str() == "urn:test:lazy:one",
         "SELECT ?name WHERE { ?s schema:name ?name }",
@@ -180,26 +184,21 @@ fn query_graphs_with_filters_by_lazy_predicate() {
     );
 
     assert_eq!(
-        support::query_with_test_visibility(&node, |_: &GraphId| false, "ASK { ?s ?p ?o }",)
-            .unwrap(),
+        support::query_with_visibility(&node, |_: &GraphId| false, "ASK { ?s ?p ?o }").unwrap(),
         QueryResults::Boolean(false)
     );
 }
 
-/// `CraqleNode::query` now decides visibility with a lazy per-graph predicate
-/// instead of materializing the visible set and handing it to
-/// `query_graphs` (finding R1). Results must be unchanged, including above the
-/// 32-graph limit where `query_graphs` switches from an explicit dataset to the
-/// union view.
+/// Lazy and explicit visibility must agree above and below the graph threshold.
 #[test]
 fn query_matches_visible() {
     // Small visible set: explicit-dataset regime.
-    assert_query_regimes_agree(6, 2);
+    assert_regimes_agree(6, 2);
     // 40 visible graphs: crosses the explicit-dataset threshold.
-    assert_query_regimes_agree(40, 8);
+    assert_regimes_agree(40, 8);
 }
 
-fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
+fn assert_regimes_agree(readable: usize, unreadable: usize) {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let reader = reader_auth();
@@ -230,16 +229,37 @@ fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
     let visible = node.visible_graphs(&reader).unwrap();
     assert_eq!(visible.len(), readable, "visible set size");
 
-    for sparql in [
-        "SELECT ?s ?name WHERE { ?s schema:name ?name }",
-        "SELECT ?g ?name WHERE { GRAPH ?g { ?s schema:name ?name } }",
-        "SELECT ?name WHERE { ?s schema:name ?name } ORDER BY ?name LIMIT 5",
+    for (sparql, needs_unbounded) in [
+        ("SELECT ?s ?name WHERE { ?s schema:name ?name }", false),
+        (
+            "SELECT ?g ?name WHERE { GRAPH ?g { ?s schema:name ?name } }",
+            false,
+        ),
+        (
+            "SELECT ?name WHERE { ?s schema:name ?name } ORDER BY ?name LIMIT 5",
+            true,
+        ),
     ] {
+        let mut options = QueryOptions::default();
+        if needs_unbounded {
+            options.limits = QueryLimits::unbounded();
+        }
+        let prepared = node.prepare_query(sparql).unwrap();
         assert_eq!(
-            canonical_rows(node.query(&reader, sparql).unwrap()),
             canonical_rows(
-                node.query_in_graphs(&AllowAllAuthorizer, &visible, sparql)
-                    .unwrap(),
+                node.execute_prepared(&reader, &prepared, &options)
+                    .unwrap()
+                    .results,
+            ),
+            canonical_rows(
+                node.execute_prepared_in_graphs(
+                    &AllowAllAuthorizer,
+                    &visible,
+                    &prepared,
+                    &options,
+                )
+                .unwrap()
+                .results,
             ),
             "query and query_graphs(visible_graphs) disagree on `{sparql}` \
              with {readable} readable / {unreadable} unreadable graphs"
@@ -252,7 +272,7 @@ fn assert_query_regimes_agree(readable: usize, unreadable: usize) {
             .unwrap()
     );
 
-    // G8 soundness: no hidden graph's data may appear either way.
+    // No hidden graph data may appear through either visibility path.
     let rows = canonical_rows(
         node.query(&reader, "SELECT ?name WHERE { ?s schema:name ?name }")
             .unwrap(),
@@ -300,7 +320,7 @@ fn canonical_rows(results: QueryResults) -> Vec<Vec<(String, String)>> {
 }
 
 #[test]
-fn read_requires_matching_path_while_write_implies_read() {
+fn grants_enforce_paths() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let graph = GraphId::new("urn:test:private");
@@ -352,7 +372,7 @@ fn read_requires_matching_path_while_write_implies_read() {
 /// Wrapped: this hung once under extreme load, and a hang is a defect the
 /// harness should report rather than a run it should burn.
 #[test]
-fn write_access_is_required_for_updates() {
+fn updates_require_write() {
     with_watchdog("write_access_is_required_for_updates", || {
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open(dir.path()).unwrap();
@@ -384,16 +404,19 @@ fn write_access_is_required_for_updates() {
             .unwrap_err();
         assert!(matches!(err, CraqleError::Authorization(_)));
 
-        node.apply_sparql_update(
+        let mut options = UpdateOptions::default();
+        options.limits = UpdateLimits::unbounded();
+        node.apply_sparql_update_with_options(
             &writer,
             "INSERT { GRAPH <urn:test:update> { ?root schema:hasPart <urn:test:item> . <urn:test:item> rdf:type schema:MediaObject . <urn:test:item> schema:name \"allowed\" } } WHERE { GRAPH <urn:test:update> { ?root rdf:type schema:Dataset . ?root schema:datePublished ?date . } }",
+            &options,
         )
         .unwrap();
     });
 }
 
 #[test]
-fn sparql_update_private_read_exfiltration_is_rejected_before_write() {
+fn updates_reject_exfiltration() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();
@@ -462,7 +485,7 @@ fn sparql_update_private_read_exfiltration_is_rejected_before_write() {
 }
 
 #[test]
-fn external_irokle_instance_can_be_shared_with_other_topics() {
+fn irokle_shares_topics() {
     let dir = tempfile::tempdir().unwrap();
     let irokle = irokle::Irokle::builder().build().unwrap();
     let other_topic = irokle
@@ -511,7 +534,7 @@ fn external_irokle_instance_can_be_shared_with_other_topics() {
 }
 
 #[test]
-fn wal_already_durable_create_crate_does_not_publish_irokle_graph_topic() {
+fn durable_creation_unpublished() {
     let dir = tempfile::tempdir().unwrap();
     let irokle = irokle::Irokle::builder().build().unwrap();
     let node = CraqleNode::open_with_options(
@@ -545,7 +568,7 @@ fn wal_already_durable_create_crate_does_not_publish_irokle_graph_topic() {
 }
 
 #[test]
-fn wal_already_durable_apply_rocrate_does_not_publish_irokle_graph_topic() {
+fn durable_apply_unpublished() {
     let dir = tempfile::tempdir().unwrap();
     let irokle = irokle::Irokle::builder().build().unwrap();
     let node = CraqleNode::open_with_options(
@@ -717,7 +740,7 @@ fn patch_preserves_properties() {
 }
 
 #[test]
-fn opening_with_irokle_replays_durable_graph_events() {
+fn opening_replays_events() {
     let dir = tempfile::tempdir().unwrap();
     let craqle_dir = dir.path().join("craqle");
     let irokle_dir = dir.path().join("irokle");
@@ -781,7 +804,7 @@ fn opening_with_irokle_replays_durable_graph_events() {
 /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
 #[cfg(feature = "search")]
 #[test]
-fn search_filters_private_graphs_by_policy() {
+fn search_filters_private() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();
@@ -846,7 +869,7 @@ fn search_filters_private_graphs_by_policy() {
 /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
 #[cfg(feature = "search")]
 #[test]
-fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
+fn search_scopes_retention() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();
@@ -925,10 +948,8 @@ fn search_graphs_ignores_unselected_and_invisible_hits_before_limit() {
     assert_eq!(subjects, vec![selected_a.as_str(), selected_b.as_str()]);
 }
 
-/// The large-set path of `search_graphs` swaps one search-per-graph for a
-/// single search with an index-side graph filter (finding R8). Both paths must
-/// return the same graph-restricted, policy-respecting page.
-/// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
+/// Large-set and per-graph search must return the same authorized page.
+/// This requires real Tantivy hits and does not run with the search stub.
 #[cfg(feature = "search")]
 #[test]
 fn search_crosses_threshold() {
@@ -1019,7 +1040,7 @@ fn search_crosses_threshold() {
 /// Asserts on real tantivy hits, which the `search`-off stub cannot produce.
 #[cfg(feature = "search")]
 #[test]
-fn search_hits_can_be_hydrated_from_rdf() {
+fn search_hydrates_hits() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let writer = writer_auth();
@@ -1078,7 +1099,7 @@ fn search_hits_can_be_hydrated_from_rdf() {
 }
 
 #[test]
-fn cluster_sync_converges_through_public_api() {
+fn cluster_sync_converges() {
     let dir = tempfile::tempdir().unwrap();
     let mut cluster = CraqleCluster::new(2, dir.path()).unwrap();
     let graph = GraphId::new("urn:test:cluster");
@@ -1139,7 +1160,7 @@ fn cluster_sync_converges_through_public_api() {
 }
 
 #[test]
-fn cluster_query_options_can_fan_out_across_peers() {
+fn cluster_queries_fanout() {
     let dir = tempfile::tempdir().unwrap();
     let cluster = CraqleCluster::new(2, dir.path()).unwrap();
     let writer = writer_auth();
@@ -1225,7 +1246,7 @@ fn cluster_query_options_can_fan_out_across_peers() {
 }
 
 #[test]
-fn federated_queries_do_not_leak_remote_private_graphs() {
+fn federated_queries_authorize() {
     let dir = tempfile::tempdir().unwrap();
     let cluster = CraqleCluster::new(2, dir.path()).unwrap();
     let writer = writer_auth();
@@ -1379,7 +1400,7 @@ fn imports_nested_objects() {
 }
 
 #[test]
-fn update_property_rejects_unknown_compact_property_names() {
+fn rejects_unknown_properties() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let graph = GraphId::new("urn:test:unknown-property");
@@ -1412,7 +1433,7 @@ fn update_property_rejects_unknown_compact_property_names() {
 }
 
 #[test]
-fn add_data_entity_rejects_unknown_compact_types() {
+fn rejects_unknown_types() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let graph = GraphId::new("urn:test:unknown-type");
@@ -1445,7 +1466,7 @@ fn add_data_entity_rejects_unknown_compact_types() {
 }
 
 #[test]
-fn preview_rocrate_update_returns_canonical_changes() {
+fn preview_canonicalizes_changes() {
     let dir = tempfile::tempdir().unwrap();
     let node = CraqleNode::open(dir.path()).unwrap();
     let graph = GraphId::new("urn:test:preview-rocrate");
@@ -1511,7 +1532,7 @@ fn preview_rocrate_update_returns_canonical_changes() {
 }
 
 #[test]
-fn validate_create_crate_does_not_create_graph_or_publish_irokle_topic() {
+fn creation_validation_pure() {
     let dir = tempfile::tempdir().unwrap();
     let irokle = irokle::Irokle::builder().build().unwrap();
     let node = CraqleNode::open_with_options(
@@ -1546,7 +1567,7 @@ fn validate_create_crate_does_not_create_graph_or_publish_irokle_topic() {
 }
 
 #[test]
-fn validate_rocrate_document_checked_with_policy_is_non_mutating_and_rejects_invalid_rocrate() {
+fn policy_validation_pure() {
     let dir = tempfile::tempdir().unwrap();
     let irokle = irokle::Irokle::builder().build().unwrap();
     let node = CraqleNode::open_with_options(

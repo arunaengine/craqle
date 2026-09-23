@@ -1,3 +1,7 @@
+//! Checks structural graph rules under local and concurrent edits.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 #[cfg(test)]
@@ -7,7 +11,7 @@ mod tests {
     use crate::support::*;
 
     #[test]
-    fn test_rules_prevent_orphan_creation() {
+    fn rules_prevent_orphans() {
         let (_tmp, net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate1");
         let writer = writer_auth();
@@ -71,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn test_orphaned_entity_after_concurrent_edit_scenario() {
+    fn concurrent_orphan_hidden() {
         let (_tmp, mut net) = setup_network(2);
         let graph = GraphId::new("urn:test:crate-orphans");
         let writer = writer_auth();
@@ -119,8 +123,10 @@ mod tests {
             graph.as_str(),
             graph.as_str()
         );
+        let mut options = UpdateOptions::default();
+        options.limits = UpdateLimits::unbounded();
         net.peer_mut(1)
-            .apply_sparql_update(&writer_auth(), &remove_link)
+            .apply_sparql_update_with_options(&writer_auth(), &remove_link, &options)
             .unwrap();
         net.sync_until_converged(10).unwrap();
 
@@ -162,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rules_prevent_root_destruction_scenario() {
+    fn rules_preserve_root() {
         let (_tmp, mut net) = setup_network(1);
         let graph = GraphId::new("urn:test:crate-root-guard");
         create_test_crate(&net, 0, &graph);
@@ -173,10 +179,13 @@ mod tests {
             graph.as_str()
         );
 
-        match net
-            .peer_mut(0)
-            .apply_sparql_update(&writer_auth(), &delete_root)
-        {
+        let mut options = UpdateOptions::default();
+        options.limits = UpdateLimits::unbounded();
+        match net.peer_mut(0).apply_sparql_update_with_options(
+            &writer_auth(),
+            &delete_root,
+            &options,
+        ) {
             Err(craqle::CraqleError::Update(UpdateError::ValidationFailed(violations))) => {
                 assert!(
                     violations
@@ -325,8 +334,7 @@ mod tests {
             .unwrap();
     }
 
-    /// W4 — the delta index resolves a triple last-writer-wins, so deleting and
-    /// re-inserting the root type in one change set leaves the root intact.
+    /// Re-inserting the root type in one change set leaves the root intact.
     #[test]
     fn reinsert_passes_validation() {
         let (_tmp, net) = setup_network(1);
@@ -404,9 +412,7 @@ mod tests {
         }
     }
 
-    /// A `hasPart` cycle that is not attached to the root is unreachable: the
-    /// walk must not call the members reachable just because they reach each
-    /// other. Pinned on both the validated path and the recomputed diagnostics.
+    /// A cycle with no root path remains orphaned during writes and diagnostic rebuilds.
     #[test]
     fn detached_cycle_rejected() {
         let (_tmp, net) = setup_network(1);

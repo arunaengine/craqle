@@ -1,6 +1,10 @@
+//! Assembles deterministic SHACL validation reports and statistics.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::time::Instant;
 
-use crate::query_context::ReadContext;
+use crate::query::context::ReadContext;
 use crate::rdf_read::RdfReadView;
 use crate::shacl::{
     ShaclBlockingSeverity, ShaclError, ShaclMessage, ShaclValidationReport, ShaclValidationResult,
@@ -200,7 +204,7 @@ pub(crate) fn component_iri(constraint: &ResolvedConstraint) -> &'static str {
         ResolvedConstraint::LessThan(_) => {
             concat!("http://www.w3.org/ns/shacl#", "LessThanConstraintComponent")
         }
-        ResolvedConstraint::LessThanOrEquals(_) => concat!(
+        ResolvedConstraint::LessOrEqual(_) => concat!(
             "http://www.w3.org/ns/shacl#",
             "LessThanOrEqualsConstraintComponent"
         ),

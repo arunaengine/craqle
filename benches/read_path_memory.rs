@@ -1,8 +1,7 @@
-//! Coarse process-memory baseline for completed public SPARQL query results.
-//!
-//! VmRSS/VmHWM describe the whole process, not a query-local allocator. The
-//! current public API fully collects `QueryResults`, so this observes retained
-//! completed results rather than first-row latency or an exact allocation peak.
+//! Measures process memory for completed public SPARQL query results.
+//! Covers retained results rather than query-local allocations or first-row latency.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use std::env;
 use std::hint::black_box;
@@ -13,13 +12,13 @@ use std::fs;
 use craqle::QueryResults;
 use criterion::{Criterion, criterion_group, criterion_main};
 
-#[path = "support/mod.rs"]
+#[path = "support.rs"]
 mod support;
 
 use support::QUADS_1M;
 use support::fixture::Fixture;
 
-fn read_path_memory_benchmarks(c: &mut Criterion) {
+fn read_memory_benches(c: &mut Criterion) {
     let before_fixture = process_memory();
     print_process_memory("before_fixture", before_fixture);
 
@@ -87,7 +86,7 @@ struct MemoryCase {
 #[derive(Clone, Copy)]
 enum MemoryCaseKind {
     BoundAskHit,
-    FixedPredicateObjectLimit,
+    FixedObjectLimit,
     BroadVisibleUnion,
     DuplicateHeavyUnion,
 }
@@ -96,14 +95,14 @@ impl MemoryCase {
     fn run(&self, fixture: &Fixture) -> QueryResults {
         match self.kind {
             MemoryCaseKind::BoundAskHit => fixture.run_hot_path(0),
-            MemoryCaseKind::FixedPredicateObjectLimit => fixture.run_hot_path(2),
+            MemoryCaseKind::FixedObjectLimit => fixture.run_hot_path(2),
             MemoryCaseKind::BroadVisibleUnion => fixture.run_visible_query(
                 self.sparql
                     .as_deref()
                     .expect("broad visible-union query is configured"),
                 self.label,
             ),
-            MemoryCaseKind::DuplicateHeavyUnion => fixture.run_all_graph_query(
+            MemoryCaseKind::DuplicateHeavyUnion => fixture.run_global_query(
                 self.sparql
                     .as_deref()
                     .expect("duplicate-heavy union query is configured"),
@@ -127,7 +126,7 @@ fn memory_cases(fixture: &Fixture, broad_enabled: bool) -> Vec<MemoryCase> {
         },
         MemoryCase {
             label: "fixed_predicate_object_select_limit10",
-            kind: MemoryCaseKind::FixedPredicateObjectLimit,
+            kind: MemoryCaseKind::FixedObjectLimit,
             sparql: None,
         },
     ];
@@ -147,14 +146,14 @@ fn memory_cases(fixture: &Fixture, broad_enabled: bool) -> Vec<MemoryCase> {
 }
 
 fn broad_scan_enabled(fixture: &Fixture) -> bool {
-    match memory_broad_scan_setting() {
+    match broad_scan_setting() {
         Some(false) => false,
         Some(true) => true,
         None => fixture.config().corpus.quads < QUADS_1M,
     }
 }
 
-fn memory_broad_scan_setting() -> Option<bool> {
+fn broad_scan_setting() -> Option<bool> {
     match env::var("CRAQLE_MEMORY_BROAD_SCAN") {
         Ok(value) => match value.trim() {
             "1" => Some(true),
@@ -197,7 +196,7 @@ fn assert_untimed_case(kind: MemoryCaseKind, result: &QueryResults) -> ResultSum
                 "ASK must be true"
             );
         }
-        MemoryCaseKind::FixedPredicateObjectLimit => {
+        MemoryCaseKind::FixedObjectLimit => {
             assert!(
                 matches!(result, QueryResults::Solutions(rows) if rows.len() == 10),
                 "fixed predicate-object SELECT must return exactly ten rows"
@@ -285,5 +284,5 @@ fn process_memory() -> ProcessMemory {
     }
 }
 
-criterion_group!(benches, read_path_memory_benchmarks);
+criterion_group!(benches, read_memory_benches);
 criterion_main!(benches);

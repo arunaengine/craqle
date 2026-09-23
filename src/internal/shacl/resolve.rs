@@ -1,4 +1,9 @@
+//! Resolves SHACL shapes and their local import dependencies.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::BTreeSet;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use regex::{Regex, RegexBuilder};
@@ -11,6 +16,21 @@ use super::model::{
     CompiledSchemaInner, ConstraintPlan, NodeKindPlan, PathPlan, ShapeId, TargetPlan,
 };
 use super::term_meta::TermMeta;
+
+const ALLOCATION_RESERVE: usize = 2 * size_of::<usize>();
+/// Regex does not expose engine allocations; reserve combined opaque retained state.
+const REGEX_RESERVE: usize = 16 * 1_048_576;
+
+fn slice_bytes<T>(slice: &[T]) -> usize {
+    slice
+        .len()
+        .saturating_mul(size_of::<T>())
+        .saturating_add(ALLOCATION_RESERVE)
+}
+
+fn sum_bytes(values: impl Iterator<Item = usize>) -> usize {
+    values.fold(0, usize::saturating_add)
+}
 
 pub(crate) struct ResolvedSchema {
     pub(crate) portable: Arc<CompiledSchemaInner>,
@@ -59,7 +79,7 @@ pub(crate) enum ResolvedConstraint {
     Equals(TermId),
     Disjoint(TermId),
     LessThan(TermId),
-    LessThanOrEquals(TermId),
+    LessOrEqual(TermId),
     Or(Box<[ShapeId]>),
     And(Box<[ShapeId]>),
     Not(ShapeId),
@@ -77,6 +97,95 @@ pub(crate) enum ResolvedConstraint {
     Closed {
         ignored_properties: BTreeSet<TermId>,
     },
+}
+
+impl ResolvedSchema {
+    /// Conservative cache admission estimate, not a process RSS measurement.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(ALLOCATION_RESERVE)
+            // Charge shared portable backing here because this cache may be its sole owner.
+            .saturating_add(self.portable.estimated_bytes())
+            .saturating_add(slice_bytes(&self.shapes))
+            .saturating_add(sum_bytes(
+                self.shapes.iter().map(ResolvedShape::estimated_bytes),
+            ))
+    }
+}
+
+impl ResolvedShape {
+    fn estimated_bytes(&self) -> usize {
+        slice_bytes(&self.targets)
+            .saturating_add(
+                self.path
+                    .as_ref()
+                    .map(ResolvedPath::estimated_bytes)
+                    .unwrap_or(0),
+            )
+            .saturating_add(slice_bytes(&self.constraints))
+            .saturating_add(sum_bytes(
+                self.constraints
+                    .iter()
+                    .map(ResolvedConstraint::estimated_bytes),
+            ))
+    }
+}
+
+impl ResolvedPath {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Predicate(_) => 0,
+            Self::Alternative(paths) | Self::Sequence(paths) => slice_bytes(paths)
+                .saturating_add(sum_bytes(paths.iter().map(Self::estimated_bytes))),
+            Self::Inverse(path)
+            | Self::ZeroOrMore(path)
+            | Self::OneOrMore(path)
+            | Self::ZeroOrOne(path) => size_of::<Self>()
+                .saturating_add(ALLOCATION_RESERVE)
+                .saturating_add(path.estimated_bytes()),
+        }
+    }
+}
+
+impl ResolvedConstraint {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::MinExclusive(meta)
+            | Self::MaxExclusive(meta)
+            | Self::MinInclusive(meta)
+            | Self::MaxInclusive(meta) => meta.estimated_bytes(),
+            Self::Pattern(regex) => REGEX_RESERVE.saturating_add(regex.as_str().len()),
+            Self::LanguageIn(values) => slice_bytes(values).saturating_add(sum_bytes(
+                values
+                    .iter()
+                    .map(|value| value.capacity().saturating_add(ALLOCATION_RESERVE)),
+            )),
+            Self::Or(shapes) | Self::And(shapes) | Self::Xone(shapes) => slice_bytes(shapes),
+            Self::In(terms)
+            | Self::Closed {
+                ignored_properties: terms,
+            } => terms
+                .len()
+                .saturating_mul(size_of::<TermId>().saturating_add(4 * size_of::<usize>()))
+                .saturating_add(ALLOCATION_RESERVE),
+            Self::QualifiedValueShape { siblings, .. } => slice_bytes(siblings),
+            Self::Class(_)
+            | Self::Datatype(_)
+            | Self::NodeKind(_)
+            | Self::MinCount(_)
+            | Self::MaxCount(_)
+            | Self::MinLength(_)
+            | Self::MaxLength(_)
+            | Self::UniqueLang(_)
+            | Self::Equals(_)
+            | Self::Disjoint(_)
+            | Self::LessThan(_)
+            | Self::LessOrEqual(_)
+            | Self::Not(_)
+            | Self::Node(_)
+            | Self::HasValue(_) => 0,
+        }
+    }
 }
 
 pub(crate) fn resolve(
@@ -200,8 +309,8 @@ fn resolve_constraint(
         ConstraintPlan::LessThan(predicate) => {
             ResolvedConstraint::LessThan(resolve_term(store, predicate)?)
         }
-        ConstraintPlan::LessThanOrEquals(predicate) => {
-            ResolvedConstraint::LessThanOrEquals(resolve_term(store, predicate)?)
+        ConstraintPlan::LessOrEqual(predicate) => {
+            ResolvedConstraint::LessOrEqual(resolve_term(store, predicate)?)
         }
         ConstraintPlan::Or(shapes) => ResolvedConstraint::Or(shapes.clone()),
         ConstraintPlan::And(shapes) => ResolvedConstraint::And(shapes.clone()),

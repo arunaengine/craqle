@@ -1,17 +1,60 @@
-use std::collections::{BTreeSet, HashMap};
+//! Connects graph events, topic cursors, and Irokle replication.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::core::{
-    ActorId, Batch, ContextTag, EncodedTerm, GraphId, GraphTombstone, MaterializedQuadChange,
-    QuadOp, RoCrateRenderHints, TaggedGraphPolicy, TaggedRoCrateRenderHints, VectorClock,
+    ActorId, Batch, ContextTag, CrateRenderHints as RenderHints, Dot, EncodedTerm, GraphId,
+    GraphTombstone, MaterializedQuadChange, QuadOp, TaggedGraphPolicy, TaggedRenderHints,
+    VectorClock,
 };
 use crate::store::GraphStore;
 use chrono::Utc;
-use irokle::history::DagQuery;
 use irokle::oplog::Oplog;
 use irokle::reducer::{EventRecord, OpMeta};
 use irokle::{Event, PublishOptions, ReplicationPolicy, TopicGenesis, WriteConcern};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphHints {
+    pub context: Option<String>,
+    pub license: Option<String>,
+    pub license_digest: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRenderHints {
+    pub hints: GraphHints,
+    pub tag: ContextTag,
+}
+
+impl From<TaggedRenderHints> for GraphRenderHints {
+    fn from(tagged: TaggedRenderHints) -> Self {
+        Self {
+            hints: GraphHints {
+                context: tagged.hints.context,
+                license: tagged.hints.license,
+                license_digest: tagged.hints.license_digest,
+            },
+            tag: tagged.tag,
+        }
+    }
+}
+
+impl From<GraphRenderHints> for TaggedRenderHints {
+    fn from(wire: GraphRenderHints) -> Self {
+        Self {
+            hints: RenderHints {
+                context: wire.hints.context,
+                license: wire.hints.license,
+                license_digest: wire.hints.license_digest,
+            },
+            tag: wire.tag,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
 #[irokle(type_id = "craqle.graph.v1")]
@@ -35,6 +78,20 @@ pub enum CraqleGraphEvent {
     GraphDeleted {
         tombstone: GraphTombstone,
     },
+    Mutation {
+        id: MutationId,
+        graph: GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: Option<GraphRenderHints>,
+    },
+    /// A [`Self::Mutation`] with commit metadata; appended last so older records keep decoding.
+    CommittedMutation {
+        id: MutationId,
+        graph: GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: Option<GraphRenderHints>,
+        commit: Box<CommitInfo>,
+    },
 }
 
 impl CraqleGraphEvent {
@@ -42,10 +99,103 @@ impl CraqleGraphEvent {
         match self {
             Self::QuadChanges { graph, .. }
             | Self::RoCrateMutation { graph, .. }
-            | Self::Policy { graph, .. } => graph,
+            | Self::Policy { graph, .. }
+            | Self::Mutation { graph, .. }
+            | Self::CommittedMutation { graph, .. } => graph,
             Self::GraphDeleted { tombstone } => &tombstone.graph,
         }
     }
+
+    /// The commit metadata this event was signed with, if any.
+    pub fn commit(&self) -> Option<&CommitInfo> {
+        match self {
+            Self::CommittedMutation { commit, .. } => Some(commit.as_ref()),
+            Self::QuadChanges { .. }
+            | Self::RoCrateMutation { .. }
+            | Self::Policy { .. }
+            | Self::GraphDeleted { .. }
+            | Self::Mutation { .. } => None,
+        }
+    }
+}
+
+/// Commit metadata signed and replicated with one mutation. Every field comes from the caller;
+/// Craqle does not check the time, and the operation signature proves only which actor wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Author time in Unix milliseconds.
+    pub author_time_ms: i64,
+    /// Offset of the author's time zone from UTC, as in Git's `+0200`.
+    pub author_offset_minutes: i16,
+    /// Extra parents from other graphs, such as a fork point or a merged branch.
+    /// Craqle stores them but does not check that these graphs or heads exist.
+    pub sources: Vec<HistoryPoint>,
+}
+
+/// Heads of another graph's history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryPoint {
+    pub graph: GraphId,
+    pub heads: Vec<irokle::OpId>,
+}
+
+impl CommitInfo {
+    pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+    /// Limit for `author_name` and for `author_email`.
+    pub const MAX_AUTHOR_BYTES: usize = 256;
+    /// Eighteen hours either side of UTC.
+    pub const MAX_OFFSET_MINUTES: u16 = 18 * 60;
+    pub const MAX_SOURCES: usize = 16;
+    /// Each source needs at least one head and at most this many.
+    pub const MAX_SOURCE_HEADS: usize = 64;
+
+    /// Fails with the reason when this info is out of bounds for a commit to `graph`.
+    pub(crate) fn check(&self, graph: &GraphId) -> Result<(), &'static str> {
+        if self.message.len() > Self::MAX_MESSAGE_BYTES {
+            return Err("commit message exceeds its byte limit");
+        }
+        for field in [&self.author_name, &self.author_email] {
+            if field.len() > Self::MAX_AUTHOR_BYTES {
+                return Err("commit author exceeds its byte limit");
+            }
+            if field.chars().any(char::is_control) {
+                return Err("commit author contains a control character");
+            }
+        }
+        if self.author_offset_minutes.unsigned_abs() > Self::MAX_OFFSET_MINUTES {
+            return Err("commit time zone offset is out of range");
+        }
+        if self.sources.len() > Self::MAX_SOURCES {
+            return Err("commit has too many sources");
+        }
+        let mut graphs = HashSet::with_capacity(self.sources.len());
+        for point in &self.sources {
+            if point.heads.is_empty() || point.heads.len() > Self::MAX_SOURCE_HEADS {
+                return Err("commit source has no heads or too many heads");
+            }
+            if point.graph == *graph || !graphs.insert(&point.graph) {
+                return Err("commit source repeats a graph or names its own graph");
+            }
+            let mut heads = BTreeSet::new();
+            if !point.heads.iter().all(|head| heads.insert(head)) {
+                return Err("commit source repeats a head");
+            }
+            if check_graph(&point.graph).is_err() {
+                return Err("commit source graph is not a valid IRI");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A mutation request and the commit metadata its signed event carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationCommit {
+    pub request: MutationRequest,
+    pub commit: CommitInfo,
 }
 
 /// Authorization hook for graph-policy events authored by another replica.
@@ -110,19 +260,266 @@ pub struct TopicCursorRepairAudit {
     pub repaired_at_unix_nanos: i64,
 }
 
+/// Stable identity used to inspect or retry one logical mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MutationId(pub [u8; 32]);
+
+impl MutationId {
+    pub fn new() -> Self {
+        Self(*ActorId::random().as_bytes())
+    }
+
+    pub fn from_op(id: irokle::OpId) -> Self {
+        Self(*id.as_bytes())
+    }
+}
+
+impl Default for MutationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceOutcome {
+    Prepared,
+    Applied,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistenceOutcome {
+    Pending,
+    Buffered,
+    DataSynced,
+    FullySynced,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairOutcome {
+    NotRequired,
+    Pending,
+    Complete,
+    Failed(crate::CraqleErrorKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairState {
+    pub diagnostics: RepairOutcome,
+    pub shacl: RepairOutcome,
+    pub search: RepairOutcome,
+    pub query_view: RepairOutcome,
+}
+
+/// Durable state of a mutation after its source commit point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationReceipt {
+    pub id: MutationId,
+    pub admission_sequence: u64,
+    pub graph: GraphId,
+    pub request_digest: [u8; 32],
+    pub event_id: Option<[u8; 32]>,
+    pub topic: Option<irokle::TopicId>,
+    pub publish_after: Option<irokle::ActorClock>,
+    pub topic_epoch: Option<u64>,
+    pub topic_genesis: Option<irokle::OpId>,
+    pub search_token: Option<u64>,
+    pub repair_graphs: Vec<GraphId>,
+    pub source: SourceOutcome,
+    pub persistence: PersistenceOutcome,
+    pub repairs: RepairState,
+    pub source_version: [u8; 32],
+    pub updated_unix_nanos: i64,
+}
+
+impl MutationReceipt {
+    pub(crate) fn outbound(mut self) -> Self {
+        let includes_graph = self.repair_graphs.iter().any(|graph| graph == &self.graph);
+        self.repair_graphs.clear();
+        if includes_graph {
+            self.repair_graphs.push(self.graph.clone());
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationRequest {
+    pub id: MutationId,
+    pub admission_sequence: Option<u64>,
+    pub graph: GraphId,
+    pub changes: Vec<MaterializedQuadChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationLookup {
+    pub graph: GraphId,
+    pub id: MutationId,
+    pub admission_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationStatus {
+    Known(Box<MutationReceipt>),
+    Expired,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupProof {
+    pub location: String,
+    pub archive_digest: [u8; 32],
+    pub source_revision: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairMode {
+    DryRun,
+    Apply,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairAuthority {
+    History {
+        topic: irokle::TopicId,
+        target: irokle::ActorClock,
+    },
+    HealthySnapshot {
+        source: String,
+        digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairResult {
+    Exact,
+    Differs,
+    Applied,
+    Tombstoned,
+    HistoryMissing,
+    BackupRequired,
+    ChangedDuringRepair,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairAudit {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub mode: RepairMode,
+    pub authority: RepairAuthority,
+    pub before_digest: [u8; 32],
+    pub after_digest: Option<[u8; 32]>,
+    pub backup: Option<BackupProof>,
+    pub result: RepairResult,
+    pub updated_unix_nanos: i64,
+}
+
+/// Exact states compared by an authorized reconciliation dry run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairDiff {
+    pub local: crate::GraphReplicaSnapshot,
+    pub authoritative: crate::GraphReplicaSnapshot,
+    pub unresolved: Vec<Dot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairReport {
+    pub audit: RepairAudit,
+    pub diff: Option<RepairDiff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairRequest {
+    pub id: MutationId,
+    pub authority: RepairAuthority,
+    pub authoritative: crate::GraphReplicaSnapshot,
+    pub mode: RepairMode,
+    pub backup: Option<BackupProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconcileSource {
+    History {
+        topic: irokle::TopicId,
+    },
+    HealthySnapshot {
+        source: String,
+        snapshot: crate::GraphReplicaSnapshot,
+        digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileRequest {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub mode: RepairMode,
+    pub source: ReconcileSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRequest {
+    pub topic: irokle::TopicId,
+    pub graph: GraphId,
+    pub target: irokle::ActorClock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistorySnapshot {
+    Live(crate::GraphReplicaSnapshot),
+    Tombstoned,
+}
+
+pub(crate) struct HistoryFailure {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub authority: RepairAuthority,
+    pub mode: RepairMode,
+}
+
 pub(crate) struct TopicCatchup {
     pub records: Vec<TopicRecord>,
     pub cursor: TopicCursor,
+    pub more: bool,
 }
 
 pub(crate) struct ReplicatedGraphMutation {
     pub(crate) batch: Batch,
-    pub(crate) render_hints: Option<TaggedRoCrateRenderHints>,
+    pub(crate) render_hints: Option<TaggedRenderHints>,
+    pub(crate) mutation_id: MutationId,
+    pub(crate) request_digest: [u8; 32],
+    pub(crate) event_id: irokle::OpId,
+}
+
+fn request_digest(
+    graph: &GraphId,
+    changes: &[MaterializedQuadChange],
+    hints: Option<&TaggedRenderHints>,
+) -> SyncResult<[u8; 32]> {
+    let bytes = postcard::to_allocvec(&(graph, changes, hints))
+        .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+pub(crate) struct OutgoingMutation {
+    pub id: MutationId,
+    pub graph: GraphId,
+    pub changes: Vec<MaterializedQuadChange>,
+    pub render_hints: Option<TaggedRenderHints>,
+    pub commit: Option<CommitInfo>,
+}
+
+pub(crate) struct TopicFrontier {
+    pub clock: irokle::ActorClock,
+    pub epoch: u64,
+    pub genesis: irokle::OpId,
 }
 
 pub(crate) enum TopicRecord {
     Event(EventRecord<CraqleGraphEvent>),
     Rejected(RejectedTopicRecord),
+    Control(OpMeta),
 }
 
 pub(crate) struct RejectedTopicRecord {
@@ -137,32 +534,90 @@ impl TopicRecord {
         match self {
             Self::Event(record) => &record.meta,
             Self::Rejected(record) => &record.meta,
+            Self::Control(meta) => meta,
         }
     }
 }
 
-/// How far a reconcile pass has consumed a topic's history.
-///
-/// Records are consumed one at a time, so a record the pass could not apply
-/// leaves the cursor behind it and the next pass redelivers it (G3).
+const TOPIC_PAGE_RECORDS: usize = 1024;
+const TOPIC_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordCandidate {
+    generation: u64,
+    actor: irokle::ActorId,
+    sequence: u64,
+    id: irokle::OpId,
+}
+
+impl Ord for RecordCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.generation, self.actor, self.sequence, self.id).cmp(&(
+            other.generation,
+            other.actor,
+            other.sequence,
+            other.id,
+        ))
+    }
+}
+
+impl PartialOrd for RecordCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActorPoint {
+    actor: irokle::ActorId,
+    after: u64,
+}
+
+fn next_record(
+    read: &dyn irokle::storage::SnapshotRead,
+    topic: &irokle::TopicId,
+    point: ActorPoint,
+) -> irokle::Result<Option<RecordCandidate>> {
+    let Some((sequence, id)) = read
+        .actor_range(topic, &point.actor, point.after, 1)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let header = read
+        .get_header(&id)?
+        .ok_or_else(|| irokle::Error::Storage(format!("missing op header for {id}")))?;
+    if header.topic_id != *topic || header.actor_id != point.actor || header.actor_seq != sequence {
+        return Err(irokle::Error::Storage(format!(
+            "actor index disagrees with op header for {id}"
+        )));
+    }
+    Ok(Some(RecordCandidate {
+        generation: header.generation,
+        actor: point.actor,
+        sequence,
+        id,
+    }))
+}
+
+/// Consumed topic history; a failed record leaves the cursor behind it for redelivery.
 pub(crate) struct TopicCursor {
-    topic: irokle::TopicId,
-    clock: irokle::ActorClock,
+    state: TopicCursorPayload,
     consumed: bool,
 }
 
 impl TopicCursor {
-    fn resuming(topic: irokle::TopicId, clock: irokle::ActorClock) -> Self {
+    fn resuming(state: TopicCursorPayload) -> Self {
         Self {
-            topic,
-            clock,
+            state,
             consumed: false,
         }
     }
 
     pub(crate) fn consume(&mut self, record: &TopicRecord) {
         let meta = record.meta();
-        self.clock.observe(meta.actor_id, meta.actor_seq);
+        self.state.clock.observe(meta.actor_id, meta.actor_seq);
         self.consumed = true;
     }
 
@@ -172,17 +627,20 @@ impl TopicCursor {
         if !self.consumed {
             return Ok(None);
         }
-        encode_topic_cursor(self.topic, &self.clock).map(Some)
+        encode_topic_cursor(&self.state).map(Some)
     }
 }
 
-const TOPIC_CURSOR_FORMAT_VERSION: u8 = 1;
+const TOPIC_CURSOR_VERSION: u8 = 2;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TopicCursorPayload {
     version: u8,
     topic: irokle::TopicId,
+    epoch: u64,
+    genesis: irokle::OpId,
     clock: irokle::ActorClock,
+    target: Option<irokle::ActorClock>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,19 +649,24 @@ struct TopicCursorEnvelope {
     checksum: [u8; 32],
 }
 
-pub(crate) fn encode_topic_cursor(
+#[derive(Serialize, Deserialize)]
+struct LegacyCursorPayload {
+    version: u8,
     topic: irokle::TopicId,
-    clock: &irokle::ActorClock,
-) -> SyncResult<Vec<u8>> {
-    let payload = TopicCursorPayload {
-        version: TOPIC_CURSOR_FORMAT_VERSION,
-        topic,
-        clock: clock.clone(),
-    };
+    clock: irokle::ActorClock,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyCursorEnvelope {
+    payload: LegacyCursorPayload,
+    checksum: [u8; 32],
+}
+
+fn encode_topic_cursor(payload: &TopicCursorPayload) -> SyncResult<Vec<u8>> {
     let payload_bytes = postcard::to_allocvec(&payload)
         .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
     postcard::to_allocvec(&TopicCursorEnvelope {
-        payload,
+        payload: payload.clone(),
         checksum: *blake3::hash(&payload_bytes).as_bytes(),
     })
     .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))
@@ -212,13 +675,36 @@ pub(crate) fn encode_topic_cursor(
 fn decode_topic_cursor(
     expected_topic: irokle::TopicId,
     bytes: &[u8],
-) -> SyncResult<irokle::ActorClock> {
-    let envelope: TopicCursorEnvelope =
-        postcard::from_bytes(bytes).map_err(|error| CraqleSyncError::CorruptCursor {
-            topic: expected_topic,
-            reason: error.to_string(),
-        })?;
-    if envelope.payload.version != TOPIC_CURSOR_FORMAT_VERSION {
+) -> SyncResult<TopicCursorPayload> {
+    let envelope: TopicCursorEnvelope = match postcard::from_bytes(bytes) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            if let Ok(legacy) = postcard::from_bytes::<LegacyCursorEnvelope>(bytes) {
+                let payload = postcard::to_allocvec(&legacy.payload).map_err(|legacy_error| {
+                    CraqleSyncError::CorruptCursor {
+                        topic: expected_topic,
+                        reason: legacy_error.to_string(),
+                    }
+                })?;
+                if legacy.payload.version == 1
+                    && legacy.payload.topic == expected_topic
+                    && legacy.checksum == *blake3::hash(&payload).as_bytes()
+                {
+                    return Err(CraqleSyncError::ExpiredCursor {
+                        topic: expected_topic,
+                        reason:
+                            "version 1 cursor lacks a branch fence; authorized repair is required"
+                                .to_owned(),
+                    });
+                }
+            }
+            return Err(CraqleSyncError::CorruptCursor {
+                topic: expected_topic,
+                reason: error.to_string(),
+            });
+        }
+    };
+    if envelope.payload.version != TOPIC_CURSOR_VERSION {
         return Err(CraqleSyncError::CorruptCursor {
             topic: expected_topic,
             reason: format!("unsupported cursor version {}", envelope.payload.version),
@@ -242,7 +728,15 @@ fn decode_topic_cursor(
             reason: "cursor checksum mismatch".to_owned(),
         });
     }
-    Ok(envelope.payload.clock)
+    Ok(envelope.payload)
+}
+
+/// The per-actor positions an applied topic cursor has consumed.
+pub(crate) fn applied_clock(
+    topic: irokle::TopicId,
+    bytes: &[u8],
+) -> SyncResult<irokle::ActorClock> {
+    Ok(decode_topic_cursor(topic, bytes)?.clock)
 }
 
 pub fn topic_cursor_digest(bytes: &[u8]) -> [u8; 32] {
@@ -303,6 +797,11 @@ pub enum CraqleSyncError {
         topic: irokle::TopicId,
         reason: String,
     },
+    #[error("expired authoritative cursor for topic {topic}: {reason}")]
+    ExpiredCursor {
+        topic: irokle::TopicId,
+        reason: String,
+    },
 }
 
 impl CraqleSyncError {
@@ -314,6 +813,7 @@ impl CraqleSyncError {
             Self::InvalidEvent(_) | Self::CorruptCursor { .. } => {
                 crate::CraqleErrorKind::CorruptAuthoritativeData
             }
+            Self::ExpiredCursor { .. } => crate::CraqleErrorKind::Conflict,
             Self::Irokle(_) => crate::CraqleErrorKind::Storage,
         }
     }
@@ -323,7 +823,7 @@ impl CraqleSyncError {
     pub fn rejects_record(&self) -> bool {
         match self {
             Self::InvalidEvent(_) => true,
-            Self::CorruptCursor { .. } => false,
+            Self::CorruptCursor { .. } | Self::ExpiredCursor { .. } => false,
             Self::Store(error) => error.rejects_record(),
             Self::Irokle(error) => matches!(
                 error,
@@ -339,6 +839,24 @@ impl CraqleSyncError {
 pub(crate) type SyncResult<T> = std::result::Result<T, CraqleSyncError>;
 
 pub(crate) trait CraqleGraphSync: Send + Sync {
+    fn publish_mutation(
+        &self,
+        store: &GraphStore,
+        mutation: OutgoingMutation,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        if mutation.commit.is_some() {
+            return Err(CraqleSyncError::InvalidEvent(
+                "this sync backend cannot publish commit info".to_owned(),
+            ));
+        }
+        match mutation.render_hints {
+            Some(hints) => {
+                self.publish_rocrate_mutation(store, &mutation.graph, mutation.changes, hints)
+            }
+            None => self.publish_changes(store, &mutation.graph, mutation.changes),
+        }
+    }
+
     fn publish_changes(
         &self,
         store: &GraphStore,
@@ -351,7 +869,7 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         store: &GraphStore,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: TaggedRoCrateRenderHints,
+        render_hints: TaggedRenderHints,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>>;
 
     fn publish_policy(
@@ -393,20 +911,14 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         topic_id: irokle::TopicId,
     ) -> SyncResult<()>;
 
-    /// Bind the graph's deterministic topic id only if its genesis is already
-    /// present locally (self-minted or adopted from a peer). Never mints, so a
-    /// concurrent caller cannot fork a rival genesis. Returns `None` when no
-    /// genesis exists yet.
-    fn bind_graph_topic_if_present(
+    /// Bind an existing deterministic topic genesis without minting a competing branch.
+    fn bind_existing_topic(
         &self,
         store: &GraphStore,
         graph: &GraphId,
     ) -> SyncResult<Option<irokle::TopicId>>;
 
-    /// Mint the graph's deterministic topic genesis with an explicit member set,
-    /// or bind an existing one if a concurrent admission already created it. The
-    /// single-minter discipline lives in the embedder; this is the only path
-    /// that creates a graph genesis.
+    /// Mint a deterministic topic with explicit members, or bind a concurrently admitted genesis.
     fn mint_graph_topic(
         &self,
         store: &GraphStore,
@@ -416,11 +928,70 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
 
     fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>>;
 
+    /// One signed operation of `topic`, or `None` when it is missing or foreign.
+    fn history_entry(
+        &self,
+        _topic: irokle::TopicId,
+        _id: irokle::OpId,
+    ) -> SyncResult<Option<crate::history::HistoryEntry>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    /// The causal generation of one operation of `topic`, without reading its payload.
+    fn history_generation(
+        &self,
+        _topic: irokle::TopicId,
+        _id: irokle::OpId,
+    ) -> SyncResult<Option<u64>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn topic_heads(&self, _topic: irokle::TopicId) -> SyncResult<BTreeSet<irokle::OpId>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
     fn topic_records_since(
         &self,
         topic_id: irokle::TopicId,
         cursor: Option<&[u8]>,
     ) -> SyncResult<TopicCatchup>;
+
+    fn topic_cursor_at(
+        &self,
+        _topic_id: irokle::TopicId,
+        _clock: &irokle::ActorClock,
+    ) -> SyncResult<Vec<u8>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn topic_frontier(&self, _topic_id: irokle::TopicId) -> SyncResult<TopicFrontier> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn topic_record(
+        &self,
+        _topic_id: irokle::TopicId,
+        _id: irokle::OpId,
+    ) -> SyncResult<Option<TopicRecord>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn history_snapshot(&self, _request: &HistoryRequest) -> SyncResult<HistorySnapshot> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    fn find_mutation(
+        &self,
+        _receipt: &MutationReceipt,
+    ) -> SyncResult<Option<EventRecord<CraqleGraphEvent>>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    /// The sequence of this node's first graph-event record in the topic that the store
+    /// covers neither by apply nor by reconciliation.
+    fn own_pending(&self, _store: &GraphStore, _topic: irokle::TopicId) -> SyncResult<Option<u64>> {
+        Ok(None)
+    }
 
     fn is_local_record(
         &self,
@@ -449,13 +1020,8 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
 pub struct IrokleGraphSync<S: irokle::Storage> {
     node: irokle::Irokle<S>,
     options: CraqleIrokleOptions,
-    /// Memo of confirmed graph → irokle topic bindings (derived-state register
-    /// row 12). Bindings are write-once for a live graph, so a hit can never be
-    /// wrong while the graph exists; only *confirmed* bindings are inserted and
-    /// a miss is never cached, because a concurrent sync admission can create
-    /// the topic between two calls.
-    ///
-    /// Shared across clones so every handle to one node sees one memo.
+    /// Shared confirmed graph-to-topic bindings. Misses remain uncached because
+    /// concurrent admission may create the topic between calls.
     topic_memo: Arc<RwLock<HashMap<GraphId, irokle::TopicId>>>,
     /// Set by a test to fail the next history read, standing in for an
     /// unreadable topic. Shared across clones, like the memo.
@@ -541,7 +1107,7 @@ impl<S: irokle::Storage> IrokleGraphSync<S> {
         if guarded {
             store.set_topic_guarded(graph, *topic_id.as_bytes())?;
         } else {
-            store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+            store.set_topic_id(graph, *topic_id.as_bytes())?;
         }
         self.remember_topic(graph, topic_id);
         Ok(topic_id)
@@ -601,6 +1167,32 @@ struct GraphTopic<'a> {
 }
 
 impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
+    fn publish_mutation(
+        &self,
+        store: &GraphStore,
+        mutation: OutgoingMutation,
+    ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        let topic = self.open_graph_topic(store, &mutation.graph)?;
+        let (id, graph, changes) = (mutation.id, mutation.graph, mutation.changes);
+        let render_hints = mutation.render_hints.map(Into::into);
+        let event = match mutation.commit {
+            Some(commit) => CraqleGraphEvent::CommittedMutation {
+                id,
+                graph,
+                changes,
+                render_hints,
+                commit: Box::new(commit),
+            },
+            None => CraqleGraphEvent::Mutation {
+                id,
+                graph,
+                changes,
+                render_hints,
+            },
+        };
+        Ok(topic.publish_with(event, self.publish_options())?)
+    }
+
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
     fn publish_changes(
         &self,
@@ -624,7 +1216,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         store: &GraphStore,
         graph: &GraphId,
         changes: Vec<MaterializedQuadChange>,
-        render_hints: TaggedRoCrateRenderHints,
+        render_hints: TaggedRenderHints,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, graph)?;
         Ok(topic.publish_with(
@@ -723,7 +1315,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         Ok(())
     }
 
-    fn bind_graph_topic_if_present(
+    fn bind_existing_topic(
         &self,
         store: &GraphStore,
         graph: &GraphId,
@@ -741,7 +1333,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 actual: state.event_type_id,
             }));
         }
-        store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+        store.set_topic_id(graph, *topic_id.as_bytes())?;
         Ok(Some(topic_id))
     }
 
@@ -755,7 +1347,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         let topic_id = graph_topic_id(graph);
         let mut genesis_error = None;
         for _ in 0..2 {
-            if let Some(topic_id) = self.bind_graph_topic_if_present(store, graph)? {
+            if let Some(topic_id) = self.bind_existing_topic(store, graph)? {
                 return Ok(topic_id);
             }
             let actor_id = irokle::actor_id_for(topic_id, self.node.peer_id());
@@ -767,7 +1359,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             let oplog = Oplog::with_storage(self.node.storage().clone());
             match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
                 Ok(_) => {
-                    store.set_irokle_topic_id(graph, *topic_id.as_bytes())?;
+                    store.set_topic_id(graph, *topic_id.as_bytes())?;
                     return Ok(topic_id);
                 }
                 Err(error) => genesis_error = Some(error),
@@ -788,6 +1380,74 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             .collect())
     }
 
+    fn history_entry(
+        &self,
+        topic: irokle::TopicId,
+        id: irokle::OpId,
+    ) -> SyncResult<Option<crate::history::HistoryEntry>> {
+        let Some(op) = self.node.storage().get_op(&id)? else {
+            return Ok(None);
+        };
+        op.validate()?;
+        if op.id != id {
+            return Err(CraqleSyncError::InvalidEvent(
+                "stored history operation has a different id".into(),
+            ));
+        }
+        if op.signed.body.topic_id != topic {
+            return Ok(None);
+        }
+        let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload else {
+            return Ok(Some(crate::history::HistoryEntry {
+                op,
+                record: None,
+                rejected: false,
+            }));
+        };
+        let stored = self
+            .node
+            .storage()
+            .get_meta(&op.id)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing op meta for {}", op.id)))?;
+        // Like reconcile, an undecodable payload is a rejected record, not a failed read.
+        let record = envelope
+            .decode_event::<CraqleGraphEvent>()
+            .ok()
+            .filter(|event| check_commit(event).is_ok())
+            .map(|event| EventRecord {
+                event,
+                meta: OpMeta {
+                    op_id: op.id,
+                    actor_id: stored.actor_id,
+                    actor_seq: stored.actor_seq,
+                    observed_clock: stored.observed_clock,
+                },
+            });
+        let rejected = record.is_none();
+        Ok(Some(crate::history::HistoryEntry {
+            op,
+            record,
+            rejected,
+        }))
+    }
+
+    fn history_generation(
+        &self,
+        topic: irokle::TopicId,
+        id: irokle::OpId,
+    ) -> SyncResult<Option<u64>> {
+        Ok(self
+            .node
+            .storage()
+            .get_position(&id)?
+            .filter(|position| position.topic_id == topic)
+            .map(|position| position.generation))
+    }
+
+    fn topic_heads(&self, topic: irokle::TopicId) -> SyncResult<BTreeSet<irokle::OpId>> {
+        Ok(self.node.storage().heads(&topic)?)
+    }
+
     fn topic_records_since(
         &self,
         topic_id: irokle::TopicId,
@@ -799,54 +1459,507 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 "injected history failure".to_owned(),
             )));
         }
-        let clock: irokle::ActorClock = match cursor {
-            Some(bytes) => decode_topic_cursor(topic_id, bytes)?,
-            None => irokle::ActorClock::default(),
-        };
-        let topic = self.node.open_topic::<CraqleGraphEvent>(topic_id)?;
-        let mut records = Vec::new();
-        for op in topic.dag(DagQuery::default())? {
-            let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload else {
-                continue;
-            };
-            if clock.get(&op.signed.body.actor_id) >= op.signed.body.actor_seq {
-                continue;
+        let stored = cursor
+            .map(|bytes| decode_topic_cursor(topic_id, bytes))
+            .transpose()?;
+        let page = self.node.storage().read_snapshot(|read| {
+            let view = read.topic_view(&topic_id, None)?.ok_or_else(|| {
+                irokle::Error::Storage(format!("missing topic state for {topic_id}"))
+            })?;
+            let mut state = stored.unwrap_or_else(|| TopicCursorPayload {
+                version: TOPIC_CURSOR_VERSION,
+                topic: topic_id,
+                epoch: view.epoch,
+                genesis: view.state.genesis,
+                clock: irokle::ActorClock::default(),
+                target: None,
+            });
+            if state.epoch != view.epoch || state.genesis != view.state.genesis {
+                return Err(irokle::Error::Storage(
+                    "expired replication cursor: topic branch changed".to_owned(),
+                ));
             }
-            let stored_meta =
-                self.node.storage().get_meta(&op.id)?.ok_or_else(|| {
-                    irokle::Error::Storage(format!("missing op meta for {}", op.id))
+            let target = state.target.clone().unwrap_or_else(|| view.clock.clone());
+            for (actor, sequence) in state.clock.iter() {
+                if *sequence > target.get(actor) {
+                    return Err(irokle::Error::Storage(format!(
+                        "expired replication cursor: progress exceeds target for actor {actor}"
+                    )));
+                }
+            }
+            let mut candidates = Vec::with_capacity(target.iter().count());
+            for (actor, target_sequence) in target.iter() {
+                let after = state.clock.get(actor);
+                if after >= *target_sequence {
+                    continue;
+                }
+                if let Some(candidate) = next_record(
+                    read,
+                    &topic_id,
+                    ActorPoint {
+                        actor: *actor,
+                        after,
+                    },
+                )? {
+                    if candidate.sequence > *target_sequence {
+                        return Err(irokle::Error::Storage(format!(
+                            "expired replication cursor: position missing for actor {actor}"
+                        )));
+                    }
+                    candidates.push(candidate);
+                } else {
+                    return Err(irokle::Error::Storage(format!(
+                        "expired replication cursor: position missing for actor {actor}"
+                    )));
+                }
+            }
+
+            let mut records = Vec::new();
+            let mut used_bytes = 0usize;
+            while records.len() < TOPIC_PAGE_RECORDS && !candidates.is_empty() {
+                let index = candidates
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, candidate)| **candidate)
+                    .map(|(index, _)| index)
+                    .expect("non-empty candidate set has a minimum");
+                let candidate = candidates.swap_remove(index);
+                let mut op_bytes = 0usize;
+                let mut over_budget = false;
+                let op = match read.get_reserved_op(&candidate.id, &mut |bytes| {
+                    if bytes > TOPIC_PAGE_BYTES.saturating_sub(used_bytes) {
+                        over_budget = true;
+                        return Err(irokle::Error::SyncCapacity(format!(
+                            "replication record {} exceeds the remaining {} byte page budget",
+                            candidate.id,
+                            TOPIC_PAGE_BYTES.saturating_sub(used_bytes)
+                        )));
+                    }
+                    op_bytes = bytes;
+                    Ok(())
+                }) {
+                    Ok(Some(op)) => op,
+                    Ok(None) => {
+                        return Err(irokle::Error::Storage(format!(
+                            "missing op for {}",
+                            candidate.id
+                        )));
+                    }
+                    Err(_) if over_budget && !records.is_empty() => {
+                        candidates.push(candidate);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                used_bytes = used_bytes.saturating_add(op_bytes);
+                let stored_meta = read.get_meta(&candidate.id)?.ok_or_else(|| {
+                    irokle::Error::Storage(format!("missing op meta for {}", candidate.id))
                 })?;
+                let meta = OpMeta {
+                    op_id: candidate.id,
+                    actor_id: stored_meta.actor_id,
+                    actor_seq: stored_meta.actor_seq,
+                    observed_clock: stored_meta.observed_clock,
+                };
+                let record = match &op.signed.body.payload {
+                    irokle::TopicPayload::Event(envelope) => {
+                        match envelope.decode_event::<CraqleGraphEvent>() {
+                            Ok(event) => TopicRecord::Event(EventRecord { event, meta }),
+                            Err(error) => {
+                                let error_kind =
+                                    if matches!(error, irokle::Error::EventTypeMismatch { .. }) {
+                                        crate::CraqleErrorKind::Unsupported
+                                    } else {
+                                        crate::CraqleErrorKind::CorruptAuthoritativeData
+                                    };
+                                TopicRecord::Rejected(RejectedTopicRecord {
+                                    meta,
+                                    payload_digest: *blake3::hash(&envelope.payload).as_bytes(),
+                                    error_kind,
+                                    reason: if error_kind == crate::CraqleErrorKind::Unsupported {
+                                        "unsupported graph-event version or type".to_owned()
+                                    } else {
+                                        "malformed or poison graph-event payload".to_owned()
+                                    },
+                                })
+                            }
+                        }
+                    }
+                    _ => TopicRecord::Control(meta),
+                };
+                records.push(record);
+                if candidate.sequence < target.get(&candidate.actor) {
+                    let next = next_record(
+                        read,
+                        &topic_id,
+                        ActorPoint {
+                            actor: candidate.actor,
+                            after: candidate.sequence,
+                        },
+                    )?
+                    .ok_or_else(|| {
+                        irokle::Error::Storage(format!(
+                            "expired replication cursor: position missing for actor {}",
+                            candidate.actor
+                        ))
+                    })?;
+                    if next.sequence > target.get(&candidate.actor) {
+                        return Err(irokle::Error::Storage(format!(
+                            "expired replication cursor: position missing for actor {}",
+                            candidate.actor
+                        )));
+                    }
+                    candidates.push(next);
+                }
+            }
+            let more = !candidates.is_empty();
+            state.target = more.then_some(target);
+            Ok((records, state, more))
+        });
+        let (records, state, more) = match page {
+            Err(irokle::Error::Storage(reason))
+                if reason.starts_with("expired replication cursor: ") =>
+            {
+                return Err(CraqleSyncError::ExpiredCursor {
+                    topic: topic_id,
+                    reason,
+                });
+            }
+            result => result?,
+        };
+        Ok(TopicCatchup {
+            records,
+            cursor: TopicCursor::resuming(state),
+            more,
+        })
+    }
+
+    fn topic_cursor_at(
+        &self,
+        topic_id: irokle::TopicId,
+        clock: &irokle::ActorClock,
+    ) -> SyncResult<Vec<u8>> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic_id, None)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing topic state for {topic_id}")))?;
+        for (actor, sequence) in clock.iter() {
+            if *sequence > view.clock.get(actor) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "replacement cursor exceeds topic history for actor {actor}"
+                )));
+            }
+        }
+        encode_topic_cursor(&TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic: topic_id,
+            epoch: view.epoch,
+            genesis: view.state.genesis,
+            clock: clock.clone(),
+            target: None,
+        })
+    }
+
+    fn topic_frontier(&self, topic_id: irokle::TopicId) -> SyncResult<TopicFrontier> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic_id, None)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing topic state for {topic_id}")))?;
+        Ok(TopicFrontier {
+            clock: view.clock,
+            epoch: view.epoch,
+            genesis: view.state.genesis,
+        })
+    }
+
+    fn topic_record(
+        &self,
+        topic_id: irokle::TopicId,
+        id: irokle::OpId,
+    ) -> SyncResult<Option<TopicRecord>> {
+        Ok(self.node.storage().read_snapshot(|read| {
+            if read.topic_view(&topic_id, None)?.is_none() {
+                return Ok(None);
+            }
+            let Some(stored_meta) = read.get_meta(&id)? else {
+                return Ok(None);
+            };
+            if stored_meta.topic_id != topic_id {
+                return Ok(None);
+            }
+            let Some(op) = read.get_reserved_op(&id, &mut |bytes| {
+                if bytes > TOPIC_PAGE_BYTES {
+                    return Err(irokle::Error::SyncCapacity(format!(
+                        "replication record {id} exceeds the {TOPIC_PAGE_BYTES} byte limit"
+                    )));
+                }
+                Ok(())
+            })?
+            else {
+                return Err(irokle::Error::Storage(format!("missing op for {id}")));
+            };
+            if op.signed.body.topic_id != topic_id
+                || op.signed.body.actor_id != stored_meta.actor_id
+                || op.signed.body.actor_seq != stored_meta.actor_seq
+            {
+                return Err(irokle::Error::Storage(format!(
+                    "op body disagrees with stored metadata for {id}"
+                )));
+            }
             let meta = OpMeta {
-                op_id: op.id,
+                op_id: id,
                 actor_id: stored_meta.actor_id,
                 actor_seq: stored_meta.actor_seq,
                 observed_clock: stored_meta.observed_clock,
             };
-            match envelope.decode_event::<CraqleGraphEvent>() {
-                Ok(event) => records.push(TopicRecord::Event(EventRecord { event, meta })),
-                Err(error) => {
-                    let error_kind = if matches!(error, irokle::Error::EventTypeMismatch { .. }) {
-                        crate::CraqleErrorKind::Unsupported
-                    } else {
-                        crate::CraqleErrorKind::CorruptAuthoritativeData
-                    };
-                    records.push(TopicRecord::Rejected(RejectedTopicRecord {
-                        meta,
-                        payload_digest: *blake3::hash(&envelope.payload).as_bytes(),
-                        error_kind,
-                        reason: if error_kind == crate::CraqleErrorKind::Unsupported {
-                            "unsupported graph-event version or type".to_owned()
-                        } else {
-                            "malformed or poison graph-event payload".to_owned()
-                        },
-                    }));
+            let record = match &op.signed.body.payload {
+                irokle::TopicPayload::Event(envelope) => {
+                    match envelope.decode_event::<CraqleGraphEvent>() {
+                        Ok(event) => TopicRecord::Event(EventRecord { event, meta }),
+                        Err(error) => {
+                            let error_kind =
+                                if matches!(error, irokle::Error::EventTypeMismatch { .. }) {
+                                    crate::CraqleErrorKind::Unsupported
+                                } else {
+                                    crate::CraqleErrorKind::CorruptAuthoritativeData
+                                };
+                            TopicRecord::Rejected(RejectedTopicRecord {
+                                meta,
+                                payload_digest: *blake3::hash(&envelope.payload).as_bytes(),
+                                error_kind,
+                                reason: if error_kind == crate::CraqleErrorKind::Unsupported {
+                                    "unsupported graph-event version or type".to_owned()
+                                } else {
+                                    "malformed or poison graph-event payload".to_owned()
+                                },
+                            })
+                        }
+                    }
+                }
+                _ => TopicRecord::Control(meta),
+            };
+            Ok(Some(record))
+        })?)
+    }
+
+    fn history_snapshot(&self, request: &HistoryRequest) -> SyncResult<HistorySnapshot> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&request.topic, None)?
+            .ok_or_else(|| {
+                irokle::Error::Storage(format!("missing topic state for {}", request.topic))
+            })?;
+        if request.target != view.clock {
+            return Err(CraqleSyncError::InvalidEvent(
+                "history repair target is not the current branch frontier".to_owned(),
+            ));
+        }
+        for (actor, sequence) in request.target.iter() {
+            if *sequence > view.clock.get(actor) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "history target exceeds stored topic position for actor {actor}"
+                )));
+            }
+        }
+        let initial = TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic: request.topic,
+            epoch: view.epoch,
+            genesis: view.state.genesis,
+            clock: irokle::ActorClock::default(),
+            target: Some(request.target.clone()),
+        };
+        let mut cursor = Some(encode_topic_cursor(&initial)?);
+        let mut state = HistoryBuild {
+            snapshot: crate::GraphReplicaSnapshot {
+                graph: request.graph.clone(),
+                clock: VectorClock::default(),
+                quads: Vec::new(),
+            },
+            bytes: 0,
+        };
+        loop {
+            let catchup = self.topic_records_since(request.topic, cursor.as_deref())?;
+            let TopicCatchup {
+                records,
+                cursor: mut progress,
+                more,
+            } = catchup;
+            for record in &records {
+                match record {
+                    TopicRecord::Rejected(record) => {
+                        return Err(CraqleSyncError::InvalidEvent(format!(
+                            "authoritative history contains rejected record {}",
+                            record.meta.op_id
+                        )));
+                    }
+                    TopicRecord::Control(_) => {}
+                    TopicRecord::Event(record) => {
+                        if apply_history(&mut state, record)? {
+                            return Ok(HistorySnapshot::Tombstoned);
+                        }
+                    }
+                }
+                progress.consume(record);
+            }
+            if !more {
+                for quad in &mut state.snapshot.quads {
+                    quad.dots
+                        .sort_unstable_by_key(|dot| (dot.actor, dot.counter));
+                }
+                state.snapshot.quads.sort_unstable_by(|left, right| {
+                    (&left.subject, &left.predicate, &left.object).cmp(&(
+                        &right.subject,
+                        &right.predicate,
+                        &right.object,
+                    ))
+                });
+                return Ok(HistorySnapshot::Live(state.snapshot));
+            }
+            cursor = progress.encode()?;
+            if cursor.is_none() {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "history page made no cursor progress".to_owned(),
+                ));
+            }
+        }
+    }
+
+    fn find_mutation(
+        &self,
+        receipt: &MutationReceipt,
+    ) -> SyncResult<Option<EventRecord<CraqleGraphEvent>>> {
+        let (Some(topic), Some(after), Some(epoch), Some(genesis)) = (
+            receipt.topic,
+            receipt.publish_after.as_ref(),
+            receipt.topic_epoch,
+            receipt.topic_genesis,
+        ) else {
+            return Ok(None);
+        };
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic, None)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing topic state for {topic}")))?;
+        if view.epoch != epoch || view.state.genesis != genesis {
+            return Err(CraqleSyncError::ExpiredCursor {
+                topic,
+                reason: "prepared mutation belongs to an expired topic branch".to_owned(),
+            });
+        }
+        if let Some(event_id) = receipt.event_id {
+            let id = irokle::OpId::from_bytes(event_id);
+            return match self.topic_record(topic, id)? {
+                Some(TopicRecord::Event(record))
+                    if matches!(
+                        &record.event,
+                        CraqleGraphEvent::Mutation { id, .. }
+                            | CraqleGraphEvent::CommittedMutation { id, .. } if *id == receipt.id
+                    ) =>
+                {
+                    Ok(Some(record))
+                }
+                Some(_) => Err(CraqleSyncError::InvalidEvent(
+                    "receipt event does not carry its stable mutation id".to_owned(),
+                )),
+                None => Err(CraqleSyncError::ExpiredCursor {
+                    topic,
+                    reason: "receipt event is no longer available".to_owned(),
+                }),
+            };
+        }
+        let initial = TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic,
+            epoch,
+            genesis,
+            clock: after.clone(),
+            target: Some(view.clock),
+        };
+        let mut cursor = Some(encode_topic_cursor(&initial)?);
+        let local = irokle::actor_id_for(topic, self.node.peer_id());
+        loop {
+            let catchup = self.topic_records_since(topic, cursor.as_deref())?;
+            let TopicCatchup {
+                records,
+                cursor: mut progress,
+                more,
+            } = catchup;
+            for record in &records {
+                match record {
+                    // A peer record may reuse the id; only this node's record is the prepared one.
+                    TopicRecord::Event(record)
+                        if record.meta.actor_id == local
+                            && matches!(
+                                &record.event,
+                                CraqleGraphEvent::Mutation { id, .. }
+                                    | CraqleGraphEvent::CommittedMutation { id, .. }
+                                    if *id == receipt.id
+                            ) =>
+                    {
+                        return Ok(Some(record.clone()));
+                    }
+                    // Only this node publishes its prepared mutation, so peer rejections cannot hide it.
+                    TopicRecord::Rejected(record) if record.meta.actor_id == local => {
+                        return Err(CraqleSyncError::InvalidEvent(format!(
+                            "prepared mutation search reached rejected record {}",
+                            record.meta.op_id
+                        )));
+                    }
+                    _ => progress.consume(record),
+                }
+            }
+            if !more {
+                return Ok(None);
+            }
+            cursor = progress.encode()?;
+            if cursor.is_none() {
+                return Err(CraqleSyncError::InvalidEvent(
+                    "prepared mutation search made no cursor progress".to_owned(),
+                ));
+            }
+        }
+    }
+
+    fn own_pending(&self, store: &GraphStore, topic: irokle::TopicId) -> SyncResult<Option<u64>> {
+        let Some(graph) = store.topic_graph_binding(topic.as_bytes())? else {
+            return Ok(None);
+        };
+        let local = irokle::actor_id_for(topic, self.node.peer_id());
+        let applied = store
+            .get_vector_clock(&GraphId::new(&graph))?
+            .0
+            .get(&actor_from_irokle(local))
+            .copied()
+            .unwrap_or_default();
+        // The cursor also covers records that reconciliation quarantined.
+        let consumed = match store.applied_topic_clock(topic.as_bytes())? {
+            Some(bytes) => applied_clock(topic, &bytes)?.get(&local),
+            None => 0,
+        };
+        let mut after = applied.max(consumed);
+        loop {
+            let page = self
+                .node
+                .storage()
+                .actor_range(&topic, &local, after, 256)?;
+            let Some((last, _)) = page.last() else {
+                return Ok(None);
+            };
+            after = *last;
+            for (sequence, id) in page {
+                match self.topic_record(topic, id)? {
+                    Some(TopicRecord::Event(_) | TopicRecord::Rejected(_)) => {
+                        return Ok(Some(sequence));
+                    }
+                    Some(TopicRecord::Control(_)) | None => {}
                 }
             }
         }
-        Ok(TopicCatchup {
-            records,
-            cursor: TopicCursor::resuming(topic_id, clock),
-        })
     }
 
     fn is_local_record(
@@ -911,12 +2024,7 @@ struct EventBatchCtx<'a> {
     meta: &'a OpMeta,
 }
 
-/// Turn one event's changes into a replication [`Batch`].
-///
-/// Op order is the event's change order, unchanged — irokle delivers records in
-/// causal order and craqle applies them in delivery order (G3), so reordering
-/// here would break both the OR-Set semantics of a delete-then-add pair and the
-/// publish-first contract (G4).
+/// Convert an event to a [`Batch`] without changing its causally delivered operation order.
 fn batch_from_changes<I>(cx: EventBatchCtx<'_>, changes: I) -> SyncResult<Batch>
 where
     I: IntoIterator<Item = MaterializedQuadChange>,
@@ -937,9 +2045,127 @@ where
 /// and small enough that one record cannot be an allocation attack.
 pub(crate) const MAX_TERM_BYTES: usize = 4 * 1024 * 1024;
 
-/// Reject a term the store could only fail on: oversized, or outside the three
-/// N-Triples shapes craqle encodes.
-fn check_term(term: &EncodedTerm) -> SyncResult<()> {
+/// Aggregate limits for one record or snapshot. A per-term cap bounds a single
+/// string, never the total work an envelope can demand.
+const MAX_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ENVELOPE_ROWS: usize = 1 << 20;
+const MAX_ENVELOPE_DOTS: usize = 1 << 20;
+const MAX_ENVELOPE_ACTORS: usize = 1 << 16;
+
+/// Which RDF term form an encoded string holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TermShape {
+    Iri,
+    Blank,
+    Literal,
+}
+
+/// A quad position, with the term forms RDF allows there.
+#[derive(Clone, Copy)]
+enum Place {
+    Subject,
+    Predicate,
+    Object,
+}
+
+impl Place {
+    fn allows(self, shape: TermShape) -> bool {
+        match self {
+            Self::Subject => shape != TermShape::Literal,
+            Self::Predicate => shape == TermShape::Iri,
+            Self::Object => true,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::Predicate => "predicate",
+            Self::Object => "object",
+        }
+    }
+}
+
+const PLACES: [Place; 3] = [Place::Subject, Place::Predicate, Place::Object];
+
+fn rejected(text: &str) -> CraqleSyncError {
+    CraqleSyncError::InvalidEvent(format!(
+        "term `{}` is not a complete encoded IRI, literal or blank node",
+        text.chars().take(64).collect::<String>()
+    ))
+}
+
+/// Accepts unambiguous N-Triples IRIREF bodies, including relative RO-Crate
+/// entity identifiers.
+fn iri_body_ok(body: &str) -> bool {
+    !body.is_empty()
+        && !body.chars().any(|ch| {
+            ch <= ' ' || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+        })
+}
+
+/// N-Triples LANGTAG.
+fn language_ok(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let primary = parts.next().unwrap_or_default();
+    !primary.is_empty()
+        && primary.chars().all(|ch| ch.is_ascii_alphabetic())
+        && parts.all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
+}
+
+/// Consume an N-Triples literal completely: a quoted value with legal escapes,
+/// then an optional language tag or datatype IRI and nothing after it.
+fn literal_ok(text: &str) -> bool {
+    let Some(mut rest) = text.strip_prefix('"') else {
+        return false;
+    };
+    loop {
+        let Some(next) = rest.chars().next() else {
+            return false;
+        };
+        rest = &rest[next.len_utf8()..];
+        match next {
+            '"' => break,
+            '\\' => {
+                let Some(escape) = rest.chars().next() else {
+                    return false;
+                };
+                rest = &rest[escape.len_utf8()..];
+                let width = match escape {
+                    't' | 'b' | 'n' | 'r' | 'f' | '"' | '\'' | '\\' => 0,
+                    'u' => 4,
+                    'U' => 8,
+                    _ => return false,
+                };
+                if rest.len() < width
+                    || !rest.is_char_boundary(width)
+                    || !rest[..width].chars().all(|ch| ch.is_ascii_hexdigit())
+                {
+                    return false;
+                }
+                rest = &rest[width..];
+            }
+            _ => {}
+        }
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    if let Some(tag) = rest.strip_prefix('@') {
+        return language_ok(tag);
+    }
+    match rest
+        .strip_prefix("^^<")
+        .and_then(|iri| iri.strip_suffix('>'))
+    {
+        Some(datatype) => iri_body_ok(datatype),
+        None => false,
+    }
+}
+
+/// Parses a complete term and its valid quad positions; delimiter prefixes
+/// alone do not prove that an RDF reader accepts the term.
+fn check_term(term: &EncodedTerm) -> SyncResult<TermShape> {
     let text = term.0.as_str();
     if term.is_rdf_star() {
         return Err(CraqleSyncError::InvalidEvent(format!(
@@ -952,22 +2178,126 @@ fn check_term(term: &EncodedTerm) -> SyncResult<()> {
             text.len()
         )));
     }
-    let shaped = (text.starts_with('<') && text.ends_with('>'))
-        || (text.starts_with('"') && text.len() > 1)
-        || text.starts_with("_:");
-    if shaped {
-        Ok(())
-    } else {
-        Err(CraqleSyncError::InvalidEvent(format!(
-            "term `{}` is not an encoded IRI, literal or blank node",
-            text.chars().take(64).collect::<String>()
-        )))
+    if let Some(body) = text
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        if iri_body_ok(body) {
+            return Ok(TermShape::Iri);
+        }
+    } else if let Some(label) = text.strip_prefix("_:") {
+        if oxrdf::BlankNode::new(label).is_ok() {
+            return Ok(TermShape::Blank);
+        }
+    } else if text.starts_with('"') && literal_ok(text) {
+        return Ok(TermShape::Literal);
     }
+    Err(rejected(text))
+}
+
+/// Every dot a claimed context holds that `known` does not cover.
+pub(crate) fn missing_dots(claim: &VectorClock, known: &VectorClock) -> Vec<Dot> {
+    claim
+        .0
+        .iter()
+        .map(|(&actor, &counter)| Dot { actor, counter })
+        .filter(|dot| !known.contains(dot))
+        .collect()
+}
+
+/// Running checks for one record or snapshot: each distinct term is parsed
+/// once, and the totals a per-term cap cannot bound are accumulated.
+struct Envelope<'a> {
+    shapes: HashMap<&'a str, TermShape>,
+    actors: HashSet<ActorId>,
+    bytes: usize,
+    rows: usize,
+    dots: usize,
+}
+
+impl<'a> Envelope<'a> {
+    fn new() -> Self {
+        Self {
+            shapes: HashMap::new(),
+            actors: HashSet::new(),
+            bytes: 0,
+            rows: 0,
+            dots: 0,
+        }
+    }
+
+    /// Validate one quad's three terms in their own positions.
+    fn quad(&mut self, terms: [&'a EncodedTerm; 3]) -> SyncResult<()> {
+        self.rows += 1;
+        if self.rows > MAX_ENVELOPE_ROWS {
+            return Err(CraqleSyncError::InvalidEvent(format!(
+                "envelope exceeds the {MAX_ENVELOPE_ROWS} row limit"
+            )));
+        }
+        for (term, place) in terms.into_iter().zip(PLACES) {
+            self.bytes = self.bytes.saturating_add(term.0.len());
+            if self.bytes > MAX_ENVELOPE_BYTES {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "envelope exceeds the {MAX_ENVELOPE_BYTES} byte limit"
+                )));
+            }
+            let shape = match self.shapes.get(term.0.as_str()) {
+                Some(shape) => *shape,
+                None => {
+                    let shape = check_term(term)?;
+                    self.shapes.insert(term.0.as_str(), shape);
+                    shape
+                }
+            };
+            if !place.allows(shape) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "term `{}` is not a legal RDF {}",
+                    term.0.chars().take(64).collect::<String>(),
+                    place.label()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Count the actors one declared context names.
+    fn clock(&mut self, clock: &VectorClock) -> SyncResult<()> {
+        self.actors.extend(clock.0.keys().copied());
+        self.limit()
+    }
+
+    /// Count one dot set.
+    fn dots(&mut self, dots: &[Dot]) -> SyncResult<()> {
+        self.dots = self.dots.saturating_add(dots.len());
+        if self.dots > MAX_ENVELOPE_DOTS {
+            return Err(CraqleSyncError::InvalidEvent(format!(
+                "envelope exceeds the {MAX_ENVELOPE_DOTS} dot limit"
+            )));
+        }
+        self.actors.extend(dots.iter().map(|dot| dot.actor));
+        self.limit()
+    }
+
+    fn limit(&self) -> SyncResult<()> {
+        if self.actors.len() > MAX_ENVELOPE_ACTORS {
+            return Err(CraqleSyncError::InvalidEvent(format!(
+                "envelope exceeds the {MAX_ENVELOPE_ACTORS} actor limit"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A graph name keys every row of the graph, so it must itself be a complete
+/// encoded IRI that any peer can reproduce.
+fn check_graph(graph: &GraphId) -> SyncResult<()> {
+    check_term(&EncodedTerm::from_named_node(&graph.0)).map(|_| ())
 }
 
 /// Validate every term a record carries before any of it reaches the store, so
 /// content a retry could never accept is rejected here.
 fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
+    let mut envelope = Envelope::new();
     for change in changes {
         let terms = match change {
             MaterializedQuadChange::Insert {
@@ -983,43 +2313,94 @@ fn check_changes(changes: &[MaterializedQuadChange]) -> SyncResult<()> {
                 ..
             } => [subject, predicate, object],
         };
-        for term in terms {
-            check_term(term)?;
-        }
+        envelope.quad(terms)?;
     }
     Ok(())
 }
 
-/// Same guard for a batch that reached craqle outside irokle: no op may carry
-/// content the store could only fail on.
-pub(crate) fn check_ops(ops: &[QuadOp]) -> SyncResult<()> {
-    for op in ops {
-        let terms = match op {
+/// Validates an external batch: adds carry its event and removes witness only
+/// the declared base clock.
+pub(crate) fn check_batch(batch: &Batch) -> SyncResult<()> {
+    check_graph(&batch.graph)?;
+    let mut envelope = Envelope::new();
+    envelope.clock(&batch.base_clock)?;
+    let identity = Dot {
+        actor: batch.actor,
+        counter: batch.counter,
+    };
+    for op in &batch.ops {
+        match op {
             QuadOp::Add {
                 subject,
                 predicate,
                 object,
-                ..
+                dot,
+            } => {
+                envelope.quad([subject, predicate, object])?;
+                envelope.dots(std::slice::from_ref(dot))?;
+                // One event dot may cover several quads of the same batch, but
+                // it is always that batch's own event.
+                if *dot != identity {
+                    return Err(CraqleSyncError::InvalidEvent(format!(
+                        "add dot {}:{} does not match the batch event {}:{}",
+                        dot.actor, dot.counter, identity.actor, identity.counter
+                    )));
+                }
             }
-            | QuadOp::Remove {
+            QuadOp::Remove {
                 subject,
                 predicate,
                 object,
-                ..
-            } => [subject, predicate, object],
-        };
-        for term in terms {
-            check_term(term)?;
+                witnessed,
+            } => {
+                envelope.quad([subject, predicate, object])?;
+                envelope.clock(witnessed)?;
+                if let Some(dot) = missing_dots(witnessed, &batch.base_clock).first() {
+                    return Err(CraqleSyncError::InvalidEvent(format!(
+                        "remove witnessed {}:{} beyond the batch base clock",
+                        dot.actor, dot.counter
+                    )));
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Same guard for a replica snapshot handed to craqle by an application.
+/// Rejects application snapshots with out-of-context dots, repeated quads, or
+/// repeated dots because no replica can hold that state.
 pub(crate) fn check_snapshot(snapshot: &crate::GraphReplicaSnapshot) -> SyncResult<()> {
+    check_graph(&snapshot.graph)?;
+    let mut envelope = Envelope::new();
+    envelope.clock(&snapshot.clock)?;
+    let mut keys = HashSet::new();
     for quad in &snapshot.quads {
-        for term in [&quad.subject, &quad.predicate, &quad.object] {
-            check_term(term)?;
+        envelope.quad([&quad.subject, &quad.predicate, &quad.object])?;
+        envelope.dots(&quad.dots)?;
+        if quad.dots.is_empty() {
+            return Err(CraqleSyncError::InvalidEvent(
+                "snapshot holds a live quad with no dot".to_string(),
+            ));
+        }
+        if !keys.insert((&quad.subject.0, &quad.predicate.0, &quad.object.0)) {
+            return Err(CraqleSyncError::InvalidEvent(
+                "snapshot repeats a quad identity".to_string(),
+            ));
+        }
+        let mut seen = HashSet::with_capacity(quad.dots.len());
+        for dot in &quad.dots {
+            if !seen.insert(*dot) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "snapshot repeats dot {}:{}",
+                    dot.actor, dot.counter
+                )));
+            }
+            if !snapshot.clock.contains(dot) {
+                return Err(CraqleSyncError::InvalidEvent(format!(
+                    "live dot {}:{} is not covered by the snapshot clock",
+                    dot.actor, dot.counter
+                )));
+            }
         }
     }
     Ok(())
@@ -1030,8 +2411,10 @@ pub(crate) fn check_snapshot(snapshot: &crate::GraphReplicaSnapshot) -> SyncResu
 pub(crate) fn batch_from_record(
     record: &EventRecord<CraqleGraphEvent>,
 ) -> SyncResult<Option<ReplicatedGraphMutation>> {
-    let (graph, changes, render_hints) = match &record.event {
-        CraqleGraphEvent::QuadChanges { graph, changes } => (graph, changes, None),
+    let (graph, changes, render_hints, mutation_id) = match &record.event {
+        CraqleGraphEvent::QuadChanges { graph, changes } => {
+            (graph, changes, None, MutationId::from_op(record.meta.op_id))
+        }
         CraqleGraphEvent::RoCrateMutation {
             graph,
             changes,
@@ -1042,18 +2425,36 @@ pub(crate) fn batch_from_record(
         } => (
             graph,
             changes,
-            Some(TaggedRoCrateRenderHints {
-                hints: RoCrateRenderHints {
+            Some(TaggedRenderHints {
+                hints: RenderHints {
                     context: context.clone(),
                     license: license.clone(),
                     license_digest: *license_digest,
                 },
                 tag: *tag,
             }),
+            MutationId::from_op(record.meta.op_id),
         ),
-        _ => return Ok(None),
+        CraqleGraphEvent::Mutation {
+            id,
+            graph,
+            changes,
+            render_hints,
+        }
+        | CraqleGraphEvent::CommittedMutation {
+            id,
+            graph,
+            changes,
+            render_hints,
+            ..
+        } => (graph, changes, render_hints.clone().map(Into::into), *id),
+        CraqleGraphEvent::Policy { .. } | CraqleGraphEvent::GraphDeleted { .. } => {
+            return Ok(None);
+        }
     };
+    check_commit(&record.event)?;
     check_changes(changes)?;
+    let request_digest = request_digest(graph, changes, render_hints.as_ref())?;
     let cx = EventBatchCtx {
         graph,
         meta: &record.meta,
@@ -1061,6 +2462,9 @@ pub(crate) fn batch_from_record(
     Ok(Some(ReplicatedGraphMutation {
         batch: batch_from_changes(cx, changes.iter().cloned())?,
         render_hints,
+        mutation_id,
+        request_digest,
+        event_id: record.meta.op_id,
     }))
 }
 
@@ -1070,8 +2474,12 @@ pub(crate) fn batch_from_owned(
     record: EventRecord<CraqleGraphEvent>,
 ) -> SyncResult<Option<ReplicatedGraphMutation>> {
     let EventRecord { event, meta } = record;
-    let (graph, changes, render_hints) = match event {
-        CraqleGraphEvent::QuadChanges { graph, changes } => (graph, changes, None),
+    let event_id = meta.op_id;
+    check_commit(&event)?;
+    let (graph, changes, render_hints, mutation_id) = match event {
+        CraqleGraphEvent::QuadChanges { graph, changes } => {
+            (graph, changes, None, MutationId::from_op(event_id))
+        }
         CraqleGraphEvent::RoCrateMutation {
             graph,
             changes,
@@ -1082,18 +2490,35 @@ pub(crate) fn batch_from_owned(
         } => (
             graph,
             changes,
-            Some(TaggedRoCrateRenderHints {
-                hints: RoCrateRenderHints {
+            Some(TaggedRenderHints {
+                hints: RenderHints {
                     context,
                     license,
                     license_digest,
                 },
                 tag,
             }),
+            MutationId::from_op(event_id),
         ),
-        _ => return Ok(None),
+        CraqleGraphEvent::Mutation {
+            id,
+            graph,
+            changes,
+            render_hints,
+        }
+        | CraqleGraphEvent::CommittedMutation {
+            id,
+            graph,
+            changes,
+            render_hints,
+            ..
+        } => (graph, changes, render_hints.map(Into::into), id),
+        CraqleGraphEvent::Policy { .. } | CraqleGraphEvent::GraphDeleted { .. } => {
+            return Ok(None);
+        }
     };
     check_changes(&changes)?;
+    let request_digest = request_digest(&graph, &changes, render_hints.as_ref())?;
     let cx = EventBatchCtx {
         graph: &graph,
         meta: &meta,
@@ -1101,7 +2526,18 @@ pub(crate) fn batch_from_owned(
     Ok(Some(ReplicatedGraphMutation {
         batch: batch_from_changes(cx, changes)?,
         render_hints,
+        mutation_id,
+        request_digest,
+        event_id,
     }))
+}
+
+/// A peer's commit info outside the local bounds rejects its record.
+fn check_commit(event: &CraqleGraphEvent) -> SyncResult<()> {
+    match event.commit().map(|commit| commit.check(event.graph())) {
+        Some(Err(reason)) => Err(CraqleSyncError::InvalidEvent(reason.to_owned())),
+        Some(Ok(())) | None => Ok(()),
+    }
 }
 
 fn actor_from_irokle(actor: irokle::ActorId) -> ActorId {
@@ -1116,15 +2552,175 @@ fn clock_from_irokle(clock: &irokle::ActorClock) -> VectorClock {
     out
 }
 
+struct HistoryBuild {
+    snapshot: crate::GraphReplicaSnapshot,
+    bytes: usize,
+}
+
+fn apply_history(
+    state: &mut HistoryBuild,
+    record: &EventRecord<CraqleGraphEvent>,
+) -> SyncResult<bool> {
+    let snapshot = &mut state.snapshot;
+    if record.event.graph() != &snapshot.graph {
+        return Err(CraqleSyncError::InvalidEvent(
+            "history record targets a graph outside its topic binding".to_owned(),
+        ));
+    }
+    if matches!(&record.event, CraqleGraphEvent::GraphDeleted { .. }) {
+        return Ok(true);
+    }
+    let Some(mutation) = batch_from_record(record)? else {
+        return Ok(false);
+    };
+    for op in &mutation.batch.ops {
+        let (subject, predicate, object) = match op {
+            QuadOp::Add {
+                subject,
+                predicate,
+                object,
+                ..
+            }
+            | QuadOp::Remove {
+                subject,
+                predicate,
+                object,
+                ..
+            } => (subject, predicate, object),
+        };
+        // History reduces literal aliases like replica apply does, so repair compares equal state.
+        let [subject, predicate, object] = [subject, predicate, object]
+            .map(|term| term.canonical().unwrap_or_else(|| term.clone()));
+        let index = snapshot.quads.iter().position(|quad| {
+            quad.subject == subject && quad.predicate == predicate && quad.object == object
+        });
+        match op {
+            QuadOp::Add { dot, .. } => {
+                if let Some(index) = index {
+                    if !snapshot.quads[index].dots.contains(dot) {
+                        if state.bytes.saturating_add(40) > MAX_ENVELOPE_BYTES {
+                            return Err(CraqleSyncError::InvalidEvent(
+                                "authoritative graph history exceeds the byte limit".to_owned(),
+                            ));
+                        }
+                        snapshot.quads[index].dots.push(*dot);
+                        state.bytes += 40;
+                    }
+                } else {
+                    let added = subject
+                        .0
+                        .len()
+                        .saturating_add(predicate.0.len())
+                        .saturating_add(object.0.len())
+                        .saturating_add(40);
+                    if snapshot.quads.len() >= MAX_ENVELOPE_ROWS
+                        || state.bytes.saturating_add(added) > MAX_ENVELOPE_BYTES
+                    {
+                        return Err(CraqleSyncError::InvalidEvent(
+                            "authoritative graph history exceeds the row or byte limit".to_owned(),
+                        ));
+                    }
+                    snapshot.quads.push(crate::SnapshotQuadState {
+                        subject: subject.clone(),
+                        predicate: predicate.clone(),
+                        object: object.clone(),
+                        dots: vec![*dot],
+                    });
+                    state.bytes += added;
+                }
+            }
+            QuadOp::Remove { witnessed, .. } => {
+                if let Some(index) = index {
+                    let before = snapshot.quads[index].dots.len();
+                    snapshot.quads[index]
+                        .dots
+                        .retain(|dot| !witnessed.contains(dot));
+                    state.bytes = state
+                        .bytes
+                        .saturating_sub((before - snapshot.quads[index].dots.len()) * 40);
+                    if snapshot.quads[index].dots.is_empty() {
+                        state.bytes = state
+                            .bytes
+                            .saturating_sub(subject.0.len() + predicate.0.len() + object.0.len());
+                        snapshot.quads.swap_remove(index);
+                    }
+                }
+            }
+        }
+    }
+    snapshot
+        .clock
+        .advance(mutation.batch.actor, mutation.batch.counter);
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn topic_cursor_rejects_malformed_wrong_topic_checksum_and_future_version() {
+    fn outbound_hides_repairs() {
+        let graph = GraphId::new("urn:test:receipt:visible");
+        let hidden = GraphId::new("urn:test:receipt:hidden");
+        let internal = MutationReceipt {
+            id: MutationId([1; 32]),
+            admission_sequence: 7,
+            graph: graph.clone(),
+            request_digest: [2; 32],
+            event_id: Some([3; 32]),
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: Some(9),
+            repair_graphs: vec![graph.clone(), hidden],
+            source: SourceOutcome::Applied,
+            persistence: PersistenceOutcome::DataSynced,
+            repairs: RepairState {
+                diagnostics: RepairOutcome::Complete,
+                shacl: RepairOutcome::Pending,
+                search: RepairOutcome::Complete,
+                query_view: RepairOutcome::Complete,
+            },
+            source_version: [4; 32],
+            updated_unix_nanos: 11,
+        };
+
+        let outbound = internal.clone().outbound();
+        assert_eq!(internal.repair_graphs.len(), 2);
+        assert_eq!(outbound.repair_graphs, vec![graph]);
+    }
+
+    #[test]
+    fn causal_candidates_order() {
+        let first = RecordCandidate {
+            generation: 3,
+            actor: irokle::ActorId::from_bytes([9; 32]),
+            sequence: 7,
+            id: irokle::OpId::from_bytes([2; 32]),
+        };
+        let dependency = RecordCandidate {
+            generation: 2,
+            actor: irokle::ActorId::from_bytes([8; 32]),
+            sequence: 4,
+            id: irokle::OpId::from_bytes([3; 32]),
+        };
+        assert!(dependency < first);
+    }
+
+    #[test]
+    fn rejects_invalid_cursors() {
         let topic = irokle::TopicId::from_bytes([1; 32]);
         let other = irokle::TopicId::from_bytes([2; 32]);
-        let encoded = encode_topic_cursor(topic, &irokle::ActorClock::default()).unwrap();
+        let payload = TopicCursorPayload {
+            version: TOPIC_CURSOR_VERSION,
+            topic,
+            epoch: 3,
+            genesis: irokle::OpId::from_bytes([4; 32]),
+            clock: irokle::ActorClock::default(),
+            target: None,
+        };
+        let encoded = encode_topic_cursor(&payload).unwrap();
 
         assert!(matches!(
             decode_topic_cursor(topic, &[0xff]),
@@ -1148,9 +2744,12 @@ mod tests {
         ));
 
         let payload = TopicCursorPayload {
-            version: TOPIC_CURSOR_FORMAT_VERSION + 1,
+            version: TOPIC_CURSOR_VERSION + 1,
             topic,
+            epoch: 3,
+            genesis: irokle::OpId::from_bytes([4; 32]),
             clock: irokle::ActorClock::default(),
+            target: None,
         };
         let payload_bytes = postcard::to_allocvec(&payload).unwrap();
         let future = postcard::to_allocvec(&TopicCursorEnvelope {
@@ -1161,6 +2760,22 @@ mod tests {
         assert!(matches!(
             decode_topic_cursor(topic, &future),
             Err(CraqleSyncError::CorruptCursor { .. })
+        ));
+
+        let payload = LegacyCursorPayload {
+            version: 1,
+            topic,
+            clock: irokle::ActorClock::default(),
+        };
+        let payload_bytes = postcard::to_allocvec(&payload).unwrap();
+        let legacy = postcard::to_allocvec(&LegacyCursorEnvelope {
+            payload,
+            checksum: *blake3::hash(&payload_bytes).as_bytes(),
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_topic_cursor(topic, &legacy),
+            Err(CraqleSyncError::ExpiredCursor { .. })
         ));
     }
 }

@@ -1,3 +1,7 @@
+//! Defines RDF terms, observed-remove state, and replication snapshots.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
@@ -5,7 +9,36 @@ use oxrdf::NamedNode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// ── Identity ────────────────────────────────────────────────────────────────
+pub(crate) mod quad_cursor {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S>(value: &Option<[u8; 64]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let parts = value.as_ref().map(|bytes| {
+            let mut first = [0; 32];
+            let mut second = [0; 32];
+            first.copy_from_slice(&bytes[..32]);
+            second.copy_from_slice(&bytes[32..]);
+            (first, second)
+        });
+        parts.serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 64]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let parts = Option::<([u8; 32], [u8; 32])>::deserialize(deserializer)?;
+        Ok(parts.map(|(first, second)| {
+            let mut bytes = [0; 64];
+            bytes[..32].copy_from_slice(&first);
+            bytes[32..].copy_from_slice(&second);
+            bytes
+        }))
+    }
+}
 
 /// A named-graph IRI identifying one RO-Crate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -93,15 +126,8 @@ impl std::fmt::Display for EventId {
     }
 }
 
-/// Last-write-wins ordering tag for a graph's RO-Crate `@context` register.
-///
-/// Ordered lexicographically by `(counter, actor)` so every peer converges on
-/// the same winning context regardless of RO-Crate mutation arrival order. A
-/// local context write sets `counter = stored_counter + 1`
-/// (Lamport-style max-seen + 1) with the writer's [`ActorId`] as the tiebreaker,
-/// and an incoming tag only overwrites the stored one when it is strictly
-/// greater. Because the derived field order is `(counter, actor)`, a strictly
-/// higher counter always wins and equal counters break ties on the actor id.
+/// Last-write-wins tag ordered by `(counter, actor)` for deterministic context convergence.
+/// Local writers advance the maximum counter and actor ids break ties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ContextTag {
     pub counter: u64,
@@ -116,9 +142,7 @@ impl ContextTag {
         actor: ActorId([0u8; 32]),
     };
 
-    /// The tag for a fresh local context write by `actor`, given the currently
-    /// stored tag. Bumps the counter past everything observed so far so the new
-    /// write wins locally, while remaining deterministic across peers.
+    /// Advance the observed counter for a deterministic local context write by `actor`.
     pub fn next_local(previous: ContextTag, actor: ActorId) -> Self {
         Self {
             counter: previous.counter.saturating_add(1),
@@ -133,16 +157,16 @@ impl Default for ContextTag {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RoCrateRenderHints {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CrateRenderHints {
     pub(crate) context: Option<String>,
     pub(crate) license: Option<String>,
     pub(crate) license_digest: Option<[u8; 32]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TaggedRoCrateRenderHints {
-    pub(crate) hints: RoCrateRenderHints,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaggedRenderHints {
+    pub(crate) hints: CrateRenderHints,
     pub(crate) tag: ContextTag,
 }
 
@@ -172,8 +196,6 @@ impl Default for PolicyTag {
         Self::GENESIS
     }
 }
-
-// ── Causality ───────────────────────────────────────────────────────────────
 
 /// A single event identifier: (actor, monotonic counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -221,8 +243,6 @@ pub struct GraphTombstone {
     pub delete_clock: VectorClock,
 }
 
-// ── Quad Operations (CRDT primitives) ───────────────────────────────────────
-
 /// An RDF term serialized as a string for transport. We use oxrdf's
 /// Display/FromStr round-trip via N-Triples syntax.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -262,7 +282,7 @@ impl EncodedTerm {
         Self(node.to_string())
     }
 
-    pub(crate) fn from_non_star_term(t: &oxrdf::Term) -> Self {
+    pub(crate) fn from_plain_term(t: &oxrdf::Term) -> Self {
         Self::from_term(t).expect("caller supplied a non-RDF-star term")
     }
 
@@ -270,11 +290,7 @@ impl EncodedTerm {
         self.0.starts_with("<<")
     }
 
-    /// Encode a subject id that may name an IRI or a blank node.
-    ///
-    /// Every string → `EncodedTerm` round trip for a subject must come through
-    /// here: `from_named_node` would turn `_:b0` into `<_:b0>`, which matches no
-    /// interned term, so lookups silently miss on both reads and writes.
+    /// Encode an IRI or blank-node subject without turning `_:b0` into the unrelated `<_:b0>`.
     pub fn from_subject_id(id: &str) -> Self {
         if id.starts_with("_:") {
             Self(id.to_string())
@@ -299,6 +315,24 @@ impl EncodedTerm {
         } else {
             None
         }
+    }
+
+    /// The oxrdf spelling of a literal alias, so equal RDF terms share one stored identity.
+    pub(crate) fn canonical(&self) -> Option<Self> {
+        let Some(oxrdf::Term::Literal(literal)) = self.to_term() else {
+            return None;
+        };
+        let text = match literal.language() {
+            Some(language) if language.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                oxrdf::Literal::new_language_tagged_literal_unchecked(
+                    literal.value(),
+                    language.to_ascii_lowercase(),
+                )
+                .to_string()
+            }
+            _ => literal.to_string(),
+        };
+        (text != self.0).then_some(Self(text))
     }
 
     pub fn to_named_node(&self) -> Option<NamedNode> {
@@ -426,8 +460,6 @@ pub enum QuadOp {
     },
 }
 
-// ── Replication Batch ───────────────────────────────────────────────────────
-
 /// The unit of replication: a committed set of operations on a single graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
@@ -454,18 +486,8 @@ impl CrossGraphChange {
 }
 
 impl Batch {
-    /// Build a replication batch from a materialized change set, without
-    /// touching any store.
-    ///
-    /// Every insert shares the single dot `(actor, counter)`; every delete
-    /// becomes an OR-Set remove that witnesses `base_clock`, so it drops
-    /// exactly the dots the author had seen. Op order is the change order,
-    /// which a delete-then-add pair on the same quad depends on.
-    ///
-    /// `counter` must not repeat for `actor` in `graph`: a merge that already
-    /// saw `(actor, counter)` treats the batch as applied and skips it.
-    ///
-    /// Fails when a change targets a graph other than `graph`.
+    /// Build an ordered replication batch whose inserts share one dot and deletes witness the base.
+    /// Rejects changes targeting another graph; callers must supply a fresh actor counter.
     pub fn from_changes(
         graph: GraphId,
         actor: ActorId,
@@ -548,8 +570,6 @@ pub struct GraphReplicaSnapshot {
     pub clock: VectorClock,
     pub quads: Vec<SnapshotQuadState>,
 }
-
-// ── Violations ──────────────────────────────────────────────────────────────
 
 /// Structural violations detectable by SHACL guards or post-merge checks.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -682,8 +702,6 @@ pub struct TaggedGraphPolicy {
     pub tag: PolicyTag,
 }
 
-// ── Materialized Changes (SPARQL evaluator output) ──────────────────────────
-
 /// A concrete quad change produced by SPARQL Update evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaterializedQuadChange {
@@ -700,8 +718,6 @@ pub enum MaterializedQuadChange {
         object: EncodedTerm,
     },
 }
-
-// ── Search Filter ───────────────────────────────────────────────────────────
 
 /// Predicates that trigger Tantivy reindexing.
 #[derive(Debug, Clone)]
@@ -721,8 +737,6 @@ impl Default for PredicateFilter {
         }
     }
 }
-
-// ── Well-known IRIs ─────────────────────────────────────────────────────────
 
 pub mod vocab {
     use oxrdf::NamedNode;
@@ -777,22 +791,37 @@ mod tests {
     use super::*;
     use oxrdf::{Literal, Term};
 
+    #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+    struct CursorValue(#[serde(with = "quad_cursor")] Option<[u8; 64]>);
+
     #[test]
-    fn encoded_term_round_trips_escaped_literals() {
+    fn cursor_format_stable() {
+        let cursor = [7; 64];
+        let encoded = postcard::to_allocvec(&CursorValue(Some(cursor))).unwrap();
+        let expected = postcard::to_allocvec(&Some(([7u8; 32], [7u8; 32]))).unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            postcard::from_bytes::<CursorValue>(&encoded).unwrap(),
+            CursorValue(Some(cursor))
+        );
+    }
+
+    #[test]
+    fn escaped_literals_roundtrip() {
         let literal = Literal::new_typed_literal(
             "Quote: \" slash: \\\\ newline:\n snowman:\u{2603}",
             NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#string"),
         );
-        let encoded = EncodedTerm::from_non_star_term(&Term::Literal(literal.clone()));
+        let encoded = EncodedTerm::from_plain_term(&Term::Literal(literal.clone()));
         let decoded = encoded.to_term().unwrap();
 
         assert_eq!(decoded, Term::Literal(literal));
     }
 
     #[test]
-    fn encoded_term_round_trips_language_literals() {
+    fn language_literals_roundtrip() {
         let literal = Literal::new_language_tagged_literal_unchecked("bonjour", "fr-ca");
-        let encoded = EncodedTerm::from_non_star_term(&Term::Literal(literal.clone()));
+        let encoded = EncodedTerm::from_plain_term(&Term::Literal(literal.clone()));
         let decoded = encoded.to_term().unwrap();
 
         assert_eq!(decoded, Term::Literal(literal));
