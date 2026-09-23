@@ -414,7 +414,8 @@ fn crash_child() {
         if should_crash {
             hook_store.persist().unwrap();
             write_marker(&marker, &hook_mode);
-            std::process::abort();
+            // Exits without destructors like a crash, but leaves no core dump behind.
+            std::process::exit(101);
         }
     }));
     let _ = store.rebuild_query_indexes();
