@@ -2924,6 +2924,18 @@ impl ReplicationEngine {
         mutation
             .map(|mutation| {
                 let mut prior = self.store.mutation_receipt(&mutation.mutation_id)?;
+                // A record that reuses a mutation id bound to other content can never apply.
+                if prior.as_ref().is_some_and(|receipt| {
+                    receipt.graph != mutation.batch.graph
+                        || match receipt.event_id {
+                            Some(event) => event != *mutation.event_id.as_bytes(),
+                            None => receipt.request_digest != mutation.request_digest,
+                        }
+                }) {
+                    return Err(MergeError::InputRejected(
+                        "mutation id is already bound to another record".to_owned(),
+                    ));
+                }
                 if prior.as_ref().is_some_and(|receipt| {
                     receipt.source == crate::sync::SourceOutcome::Prepared
                         && receipt.event_id.is_none()
