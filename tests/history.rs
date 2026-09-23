@@ -1602,3 +1602,157 @@ fn hides_store_rejections() {
     assert!(rejected.rejected && rejected.event.is_none());
     assert!(rejected.changes().is_empty());
 }
+
+fn keyword(fixture: &Fixture, value: &str) -> MaterializedQuadChange {
+    MaterializedQuadChange::Insert {
+        graph: fixture.graph.clone(),
+        subject: EncodedTerm::from_named_node(&fixture.graph.0),
+        predicate: EncodedTerm("<http://schema.org/keywords>".into()),
+        object: EncodedTerm(format!("\"{value}\"")),
+    }
+}
+
+#[test]
+fn rejected_scope_absent() {
+    let fixture = Fixture::new();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let other = GraphId::new("urn:history:unauthorized-graph");
+    // This node's own actor publishes a record that names another graph.
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::QuadChanges {
+            graph: other.clone(),
+            changes: vec![MaterializedQuadChange::Insert {
+                graph: other.clone(),
+                subject: EncodedTerm("<urn:history:unexpected>".into()),
+                predicate: EncodedTerm("<urn:p>".into()),
+                object: EncodedTerm("\"rejected payload\"".into()),
+            }],
+        })
+        .unwrap();
+    fixture.node.reconcile_irokle().unwrap();
+    assert!(!fixture.node.contains_graph(&other).unwrap());
+    let rejected = fixture
+        .node
+        .list_rejected_replication_records(&AllowAllAuthorizer)
+        .unwrap();
+    assert_eq!(rejected.len(), 1);
+    let auth = |graph: &GraphId, _: &GraphPolicy, action: Action| {
+        if graph == &fixture.graph {
+            Ok(())
+        } else {
+            Err(AuthorizationError::PermissionDenied {
+                graph: graph.to_string(),
+                action,
+            })
+        }
+    };
+    fixture
+        .node
+        .apply_changes(
+            &auth,
+            &fixture.graph,
+            vec![keyword(&fixture, "local write")],
+        )
+        .unwrap();
+    assert!(!fixture.node.contains_graph(&other).unwrap());
+    assert_eq!(
+        fixture
+            .node
+            .list_rejected_replication_records(&AllowAllAuthorizer)
+            .unwrap(),
+        rejected
+    );
+}
+
+#[test]
+fn recovered_dependencies_converge() {
+    let fixture = Fixture::new();
+    let peer = Irokle::builder()
+        .with_signer(irokle::Ed25519Signer::from_bytes(&[80; 32]))
+        .build()
+        .unwrap();
+    fixture
+        .node
+        .add_irokle_peer(&fixture.graph, peer.peer_id())
+        .unwrap();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let summary = peer.sync_summary(topic).unwrap();
+    let data = fixture
+        .native
+        .plan_sync_data(peer.peer_id(), &summary)
+        .unwrap();
+    peer.receive_sync_data_from(fixture.native.peer_id(), data)
+        .unwrap();
+    let removed = fixture.insert("causally removed");
+    peer.open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::QuadChanges {
+            graph: fixture.graph.clone(),
+            changes: vec![removed.clone()],
+        })
+        .unwrap();
+    let summary = fixture.native.sync_summary(topic).unwrap();
+    let data = peer
+        .plan_sync_data(fixture.native.peer_id(), &summary)
+        .unwrap();
+    fixture
+        .native
+        .receive_sync_data_from(peer.peer_id(), data)
+        .unwrap();
+    let MaterializedQuadChange::Insert {
+        graph,
+        subject,
+        predicate,
+        object,
+    } = removed
+    else {
+        unreachable!()
+    };
+    // The log holds the peer insert and an own delete of it; the store has applied neither.
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::QuadChanges {
+            graph: graph.clone(),
+            changes: vec![MaterializedQuadChange::Delete {
+                graph,
+                subject,
+                predicate,
+                object: object.clone(),
+            }],
+        })
+        .unwrap();
+    fixture
+        .node
+        .apply_changes(
+            &AllowAllAuthorizer,
+            &fixture.graph,
+            vec![keyword(&fixture, "later write")],
+        )
+        .unwrap();
+    fixture.node.reconcile_irokle().unwrap();
+    let reference = CraqleNode::open_with_options(
+        fixture.directory.path().join("causal-reference"),
+        CraqleOptions::new()
+            .with_search_storage(SearchStorage::Memory)
+            .with_irokle(fixture.native.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let replayed = reference.graph_snapshot(&fixture.graph).unwrap();
+    let recovered = fixture.node.graph_snapshot(&fixture.graph).unwrap();
+    assert_eq!(recovered.clock, replayed.clock);
+    assert!(!recovered.quads.iter().any(|quad| quad.object == object));
+    assert!(!replayed.quads.iter().any(|quad| quad.object == object));
+}

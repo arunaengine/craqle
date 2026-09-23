@@ -987,13 +987,10 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         Err(CraqleSyncError::NotConfigured)
     }
 
-    /// This node's records in the topic past `applied`, which a failed local apply leaves behind.
-    fn own_records(
-        &self,
-        _topic: irokle::TopicId,
-        _applied: &VectorClock,
-    ) -> SyncResult<Vec<EventRecord<CraqleGraphEvent>>> {
-        Ok(Vec::new())
+    /// The sequence of this node's first graph-event record in the topic that the store
+    /// covers neither by apply nor by reconciliation.
+    fn own_pending(&self, _store: &GraphStore, _topic: irokle::TopicId) -> SyncResult<Option<u64>> {
+        Ok(None)
     }
 
     fn is_local_record(
@@ -1928,31 +1925,38 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         }
     }
 
-    fn own_records(
-        &self,
-        topic: irokle::TopicId,
-        applied: &VectorClock,
-    ) -> SyncResult<Vec<EventRecord<CraqleGraphEvent>>> {
+    fn own_pending(&self, store: &GraphStore, topic: irokle::TopicId) -> SyncResult<Option<u64>> {
+        let Some(graph) = store.topic_graph_binding(topic.as_bytes())? else {
+            return Ok(None);
+        };
         let local = irokle::actor_id_for(topic, self.node.peer_id());
-        let mut after = applied
+        let applied = store
+            .get_vector_clock(&GraphId::new(&graph))?
             .0
             .get(&actor_from_irokle(local))
             .copied()
             .unwrap_or_default();
-        let mut records = Vec::new();
+        // The cursor also covers records that reconciliation quarantined.
+        let consumed = match store.applied_topic_clock(topic.as_bytes())? {
+            Some(bytes) => applied_clock(topic, &bytes)?.get(&local),
+            None => 0,
+        };
+        let mut after = applied.max(consumed);
         loop {
             let page = self
                 .node
                 .storage()
                 .actor_range(&topic, &local, after, 256)?;
             let Some((last, _)) = page.last() else {
-                return Ok(records);
+                return Ok(None);
             };
             after = *last;
-            for (_, id) in page {
-                // A rejected record is skipped, as reconciliation skips it.
-                if let Some(TopicRecord::Event(record)) = self.topic_record(topic, id)? {
-                    records.push(record);
+            for (sequence, id) in page {
+                match self.topic_record(topic, id)? {
+                    Some(TopicRecord::Event(_) | TopicRecord::Rejected(_)) => {
+                        return Ok(Some(sequence));
+                    }
+                    Some(TopicRecord::Control(_)) | None => {}
                 }
             }
         }

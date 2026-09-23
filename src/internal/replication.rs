@@ -98,6 +98,13 @@ fn mutation_digest(
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+/// A retryable failure: this node's own topic records must be reconciled before it publishes.
+fn own_pending() -> UpdateError {
+    UpdateError::StalePreparedState {
+        fence: "this node has topic records that are not applied yet".to_owned(),
+    }
+}
+
 fn check_commit(commit: Option<&crate::CommitInfo>, graph: &GraphId) -> Result<(), UpdateError> {
     match commit.map(|commit| commit.check(graph)) {
         Some(Err(reason)) => Err(UpdateError::InvalidChangeSet(reason.to_owned())),
@@ -2304,19 +2311,6 @@ impl ReplicationEngine {
         }
 
         if let Some(sync) = &self.sync {
-            // A later own dot would mark an own record left unapplied by a failed write as seen.
-            if let Some(topic) = sync.graph_topic_id(&self.store, graph)? {
-                let applied = self.store.get_vector_clock(graph)?;
-                for record in sync.own_records(topic, &applied)? {
-                    match self.apply_irokle_record(&record, true) {
-                        Ok(_) => {}
-                        // Reconciliation quarantines such a record, so every replica skips it.
-                        Err(MergeError::InputRejected(_)) => {}
-                        Err(MergeError::Store(error)) if error.rejects_record() => {}
-                        Err(error) => return Err(merge_update_error(error)),
-                    }
-                }
-            }
             // The store-local graph guard serializes validation, publication, and apply.
             let _commit_guard = self.store.graph_commit_guard(graph);
             if let Some(fence) = prepared_fence.as_ref() {
@@ -2350,6 +2344,10 @@ impl ReplicationEngine {
             let frontier = sync
                 .topic_frontier(topic)
                 .map_err(|error| self.accepted_sync(mutation_id, error))?;
+            // A later own dot would mark an own record that is not applied yet as seen.
+            if sync.own_pending(&self.store, topic)?.is_some() {
+                return Err(own_pending());
+            }
             let request_digest = match request_digest {
                 Some(digest) => digest,
                 None => mutation_digest(graph, &changes, render_hints.as_ref())?,
@@ -2424,6 +2422,17 @@ impl ReplicationEngine {
                 ));
             };
             let batch = mutation.batch;
+            // An own record published concurrently must apply first, through reconciliation.
+            if sync
+                .own_pending(&self.store, topic)
+                .map_err(|error| self.accepted_sync(mutation_id, error))?
+                .is_some_and(|sequence| sequence != batch.counter)
+            {
+                let receipt = self.store.mutation_receipt(&mutation_id)?.ok_or_else(|| {
+                    UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
+                })?;
+                return Err(Self::accepted_outcome(receipt, own_pending()));
+            }
             #[cfg(test)]
             if self
                 .armed_bind_failure
