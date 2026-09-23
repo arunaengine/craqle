@@ -8,7 +8,7 @@ mod support;
 use crate::support::TestWriteExt as _;
 use craqle::{
     AllowAllAuthorizer, Authorizer, CraqleNode, EncodedTerm, GrantAuthorizer, GraphId, GraphPolicy,
-    JoinMode, MaterializedQuadChange, QueryFastPathMode, QueryLimits, QueryOptions, QueryResults,
+    JoinMode, MaterializedQuadChange, QueryLimits, QueryOptions, QueryResults,
 };
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -527,7 +527,7 @@ fn literal_aliases_merge() {
         rows.sort();
         rows
     };
-    let run = |sparql: &str, fast_paths: QueryFastPathMode| {
+    let run = |sparql: &str, fast_paths: craqle::QueryFastPathMode| {
         let prepared = node.prepare_query(sparql).unwrap();
         let mut options = QueryOptions::default();
         options.fast_paths = fast_paths;
@@ -542,7 +542,10 @@ fn literal_aliases_merge() {
             "\"{value}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
         ))
     };
-    for mode in [QueryFastPathMode::Auto, QueryFastPathMode::Disabled] {
+    for mode in [
+        craqle::QueryFastPathMode::Auto,
+        craqle::QueryFastPathMode::Disabled,
+    ] {
         let bound = format!("SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{TEST_PREDICATE}> \"same\" }} }}");
         assert_eq!(run(&bound, mode), graph_rows(&graphs[..3]), "{mode:?}");
         let grouped = format!(
@@ -582,7 +585,7 @@ fn literal_aliases_merge() {
         .unwrap();
     let bound = format!("SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{TEST_PREDICATE}> \"same\" }} }}");
     assert_eq!(
-        run(&bound, QueryFastPathMode::Auto),
+        run(&bound, craqle::QueryFastPathMode::Auto),
         graph_rows(&graphs[1..3])
     );
 }

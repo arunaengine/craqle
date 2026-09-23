@@ -129,7 +129,7 @@ pub struct CommitInfo {
     /// Author time in Unix milliseconds.
     pub author_time_ms: i64,
     /// Offset of the author's time zone from UTC, as in Git's `+0200`.
-    pub author_tz_offset_minutes: i16,
+    pub author_offset_minutes: i16,
     /// Extra parents from other graphs, such as a fork point or a merged branch.
     /// Craqle stores them but does not check that these graphs or heads exist.
     pub sources: Vec<HistoryPoint>,
@@ -147,7 +147,7 @@ impl CommitInfo {
     /// Limit for `author_name` and for `author_email`.
     pub const MAX_AUTHOR_BYTES: usize = 256;
     /// Eighteen hours either side of UTC.
-    pub const MAX_TZ_OFFSET_MINUTES: u16 = 18 * 60;
+    pub const MAX_OFFSET_MINUTES: u16 = 18 * 60;
     pub const MAX_SOURCES: usize = 16;
     /// Each source needs at least one head and at most this many.
     pub const MAX_SOURCE_HEADS: usize = 64;
@@ -165,7 +165,7 @@ impl CommitInfo {
                 return Err("commit author contains a control character");
             }
         }
-        if self.author_tz_offset_minutes.unsigned_abs() > Self::MAX_TZ_OFFSET_MINUTES {
+        if self.author_offset_minutes.unsigned_abs() > Self::MAX_OFFSET_MINUTES {
             return Err("commit time zone offset is out of range");
         }
         if self.sources.len() > Self::MAX_SOURCES {

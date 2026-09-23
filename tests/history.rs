@@ -1,3 +1,7 @@
+//! Checks graph history paging, comparison, replay, restore and commit metadata.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
+
 mod support;
 
 use std::collections::BTreeSet;
@@ -164,7 +168,7 @@ fn commit(message: &str) -> CommitInfo {
         author_name: "Ada Lovelace".to_owned(),
         author_email: "ada@example.org".to_owned(),
         author_time_ms: 1_790_000_000_000,
-        author_tz_offset_minutes: 120,
+        author_offset_minutes: 120,
         sources: Vec::new(),
     }
 }
@@ -188,7 +192,7 @@ fn invalid_commits(graph: &GraphId) -> Vec<CommitInfo> {
     let mut broken = base.clone();
     broken.author_name = "Ada\nCommitter: Eve".to_owned();
     let mut zone = base.clone();
-    zone.author_tz_offset_minutes = -1081;
+    zone.author_offset_minutes = -1081;
     let with_sources = |sources: Vec<HistoryPoint>| CommitInfo {
         sources,
         ..base.clone()
@@ -258,7 +262,7 @@ fn names(changes: &[MaterializedQuadChange]) -> (Vec<String>, Vec<String>) {
 }
 
 #[test]
-fn pages_log_newest_first() {
+fn pages_newest_first() {
     let fixture = Fixture::new();
     fixture.rename("Second");
     fixture.rename("Third");
@@ -350,7 +354,7 @@ fn compares_two_states() {
 }
 
 #[test]
-fn restores_as_new_operation() {
+fn restores_new_operation() {
     let fixture = Fixture::new();
     let original = fixture.heads();
     let original_content = fixture.content();
@@ -449,7 +453,7 @@ fn fences_current_heads() {
 }
 
 #[test]
-fn repeats_restore_by_id() {
+fn restores_by_id() {
     let fixture = Fixture::new();
     let original = fixture.heads();
     fixture.rename("Changed");
@@ -473,7 +477,7 @@ fn repeats_restore_by_id() {
 }
 
 #[test]
-fn restores_over_unapplied_records() {
+fn restores_unapplied_records() {
     let fixture = Fixture::new();
     let original = fixture.heads();
     let original_content = fixture.content();
@@ -581,7 +585,7 @@ fn rejects_unauthorized_history() {
 }
 
 #[test]
-fn fails_when_bounds_exceeded() {
+fn rejects_exceeded_bounds() {
     let fixture = Fixture::new();
     let original = fixture.heads();
     fixture.rename("Changed");
@@ -740,7 +744,7 @@ fn skips_rejected_records() {
 }
 
 #[test]
-fn restores_context_and_license() {
+fn restores_render_hints() {
     let fixture = Fixture::new();
     let original = fixture.heads();
     let exported = fixture
@@ -1089,7 +1093,7 @@ fn syncs_commit_messages() {
             changes: vec![change.clone()],
         },
         commit: CommitInfo {
-            author_tz_offset_minutes: -330,
+            author_offset_minutes: -330,
             sources: vec![point("urn:history:fork", 2), point("urn:history:merged", 1)],
             ..commit("Add a synced keyword")
         },

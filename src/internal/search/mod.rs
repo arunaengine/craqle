@@ -1361,9 +1361,8 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Deletes every document outside published and staged generations after a whole
-    /// rebuild, including damage with no usable scope or key that cleanup cannot address.
-    /// The caller holds `work_lock`.
+    /// Deletes documents outside published and staged generations after a whole rebuild,
+    /// including damage cleanup cannot address. The caller holds `work_lock`.
     fn sweep_unaddressed(&self, store: &GraphStore, active: &GenerationView) -> Result<()> {
         let key = |graph: &str, generation| {
             Term::from_field_text(

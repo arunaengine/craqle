@@ -1,4 +1,6 @@
 //! Reads, compares, replays and restores a graph's signed causal history.
+// Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+// SPDX-License-Identifier: MIT
 
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::PathBuf;
