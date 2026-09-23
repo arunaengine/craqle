@@ -81,6 +81,82 @@ mod tests {
     }
 
     #[test]
+    fn reused_prepared_publishes() {
+        let (_tmp, mut net) = setup_network(2);
+        let graph = GraphId::new("urn:test:reused-prepared-id");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+        let topic = net.peer(0).irokle_topic_id(&graph).unwrap().unwrap();
+        net.partition(0, 1);
+        keyword_insert(net.peer(0), &graph, "reused-target");
+        let id = MutationId::new();
+        let delete = MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: EncodedTerm::from_named_node(&graph.0),
+            predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+            object: literal_term("reused-target"),
+        };
+        let request = |admission_sequence| MutationRequest {
+            id,
+            admission_sequence,
+            graph: graph.clone(),
+            changes: vec![delete.clone()],
+        };
+        let prepared = net
+            .peer(0)
+            .apply_mutation(&AllowAllAuthorizer, request(None))
+            .unwrap();
+        assert_eq!(prepared.source, SourceOutcome::Prepared);
+        // The peer's delete has the same id and digest but never saw the local insert.
+        let peer_record = net
+            .irokle(1)
+            .open_topic::<CraqleGraphEvent>(topic)
+            .unwrap()
+            .publish(CraqleGraphEvent::Mutation {
+                id,
+                graph: graph.clone(),
+                changes: vec![delete.clone()],
+                render_hints: None,
+            })
+            .unwrap();
+        net.heal(0, 1);
+        net.sync_until_converged(10).unwrap();
+        let lookup = MutationLookup {
+            graph: graph.clone(),
+            id,
+            admission_sequence: Some(prepared.admission_sequence),
+        };
+        let MutationStatus::Known(pending) = net
+            .peer(0)
+            .mutation_status(&AllowAllAuthorizer, lookup)
+            .unwrap()
+        else {
+            panic!("the prepared receipt must remain queryable");
+        };
+        assert_eq!(pending.source, SourceOutcome::Prepared);
+
+        let applied = net
+            .peer(0)
+            .apply_mutation(
+                &AllowAllAuthorizer,
+                request(Some(prepared.admission_sequence)),
+            )
+            .unwrap();
+        assert_eq!(applied.source, SourceOutcome::Applied);
+        assert!(applied.event_id.is_some());
+        assert_ne!(applied.event_id, Some(*peer_record.meta.op_id.as_bytes()));
+        net.sync_until_converged(10).unwrap();
+        for index in 0..2 {
+            let state = graph_state(&net, index, &graph);
+            assert!(
+                !state
+                    .iter()
+                    .any(|(_, _, object)| object == "\"reused-target\"")
+            );
+        }
+    }
+
+    #[test]
     fn tagged_policy_convergence() {
         let (_tmp, mut net) = setup_network(3);
         let graph = GraphId::new("urn:test:tagged-policy-convergence");

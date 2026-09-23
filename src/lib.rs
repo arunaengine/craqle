@@ -4536,7 +4536,8 @@ impl CraqleNode {
             | CraqleGraphEvent::RoCrateMutation { graph, .. }
             | CraqleGraphEvent::Mutation { graph, .. }
             | CraqleGraphEvent::CommittedMutation { graph, .. } => {
-                let Some(result) = self.replication.apply_irokle_record(record)? else {
+                let Some(result) = self.replication.apply_irokle_record(record, local_record)?
+                else {
                     return Ok(false);
                 };
                 if result.applied {

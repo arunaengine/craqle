@@ -857,7 +857,10 @@ impl ReplicationEngine {
                     .find_mutation(&receipt)
                     .map_err(|error| self.accepted_sync(request.id, error))?
             {
-                self.apply_irokle_record(&record)
+                let local = receipt
+                    .topic
+                    .is_some_and(|topic| sync.is_local_record(topic, &record));
+                self.apply_irokle_record(&record, local)
                     .map_err(|error| self.accepted_merge(request.id, error))?;
                 return self.store.mutation_receipt(&request.id)?.ok_or_else(|| {
                     UpdateError::InvalidChangeSet("mutation receipt was not stored".into())
@@ -2912,6 +2915,7 @@ impl ReplicationEngine {
     pub(crate) fn apply_irokle_record(
         &self,
         record: &irokle::reducer::EventRecord<crate::sync::CraqleGraphEvent>,
+        local: bool,
     ) -> Result<Option<MergeResult>, MergeError> {
         #[cfg(test)]
         if self.take_apply_failure() {
@@ -2925,11 +2929,12 @@ impl ReplicationEngine {
             .map(|mutation| {
                 let mut prior = self.store.mutation_receipt(&mutation.mutation_id)?;
                 // A reused id is local receipt bookkeeping; the record still applies as data.
+                // Only this node's own record may claim an unbound receipt.
                 if prior.as_ref().is_some_and(|receipt| {
                     receipt.graph != mutation.batch.graph
                         || match receipt.event_id {
                             Some(event) => event != *mutation.event_id.as_bytes(),
-                            None => receipt.request_digest != mutation.request_digest,
+                            None => !local || receipt.request_digest != mutation.request_digest,
                         }
                 }) {
                     prior = None;
