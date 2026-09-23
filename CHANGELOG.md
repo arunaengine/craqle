@@ -105,7 +105,7 @@ All notable changes to Craqle are documented here.
   and `HistoryRestore::commit` records a revert message. The `CommitInfo::MAX_*` bounds
   limit the message, author name and email, time zone offset, number of sources, and
   heads per source. An author field with a control character, a source without heads, a
-  repeated source graph, or a source naming the commit's own graph is also invalid.
+  repeated source graph or head, or a source naming the commit's own graph is also invalid.
   Invalid info fails a local write with `InvalidInput` and makes a replicated record a
   rejected record. A write that publishes no Irokle event cannot keep a commit and fails
   unchanged. Commit metadata is not part of a mutation id's request, so retrying a

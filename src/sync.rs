@@ -179,6 +179,10 @@ impl CommitInfo {
             if point.graph == *graph || !graphs.insert(&point.graph) {
                 return Err("commit source repeats a graph or names its own graph");
             }
+            let mut heads = BTreeSet::new();
+            if !point.heads.iter().all(|head| heads.insert(head)) {
+                return Err("commit source repeats a head");
+            }
             if check_graph(&point.graph).is_err() {
                 return Err("commit source graph is not a valid IRI");
             }

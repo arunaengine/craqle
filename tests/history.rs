@@ -212,6 +212,10 @@ fn invalid_commits(graph: &GraphId) -> Vec<CommitInfo> {
             point("urn:source:twice", 2),
         ]),
         with_sources(vec![point(graph.as_str(), 1)]),
+        with_sources(vec![HistoryPoint {
+            graph: GraphId::new("urn:source:repeat"),
+            heads: vec![OpId::from_bytes([7; 32]); 2],
+        }]),
     ]
 }
 
