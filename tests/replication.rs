@@ -33,6 +33,54 @@ mod tests {
     }
 
     #[test]
+    fn reused_ids_converge() {
+        let (_tmp, mut net) = setup_network(2);
+        let graph = GraphId::new("urn:test:reused-mutation-id");
+        create_test_crate(&net, 0, &graph);
+        net.sync_until_converged(10).unwrap();
+        let topic = net.peer(0).irokle_topic_id(&graph).unwrap().unwrap();
+        net.partition(0, 1);
+        let id = MutationId::new();
+        let object = |index: usize| EncodedTerm(format!("\"peer {index}\""));
+        for index in 0..2 {
+            net.irokle(index)
+                .open_topic::<CraqleGraphEvent>(topic)
+                .unwrap()
+                .publish(CraqleGraphEvent::Mutation {
+                    id,
+                    graph: graph.clone(),
+                    changes: vec![MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: EncodedTerm("<urn:reused>".into()),
+                        predicate: EncodedTerm("<urn:p>".into()),
+                        object: object(index),
+                    }],
+                    render_hints: None,
+                })
+                .unwrap();
+            // Each peer applies its own record first, so the two see opposite orders.
+            net.peer(index).reconcile_irokle().unwrap();
+        }
+        net.heal(0, 1);
+        net.sync_until_converged(10).unwrap();
+        let snapshot = net.peer(0).graph_snapshot(&graph).unwrap();
+        assert_eq!(snapshot, net.peer(1).graph_snapshot(&graph).unwrap());
+        for index in 0..2 {
+            assert!(
+                snapshot
+                    .quads
+                    .iter()
+                    .any(|quad| quad.object == object(index))
+            );
+            let rejected = net
+                .peer(index)
+                .list_rejected_replication_records(&AllowAllAuthorizer)
+                .unwrap();
+            assert!(rejected.is_empty());
+        }
+    }
+
+    #[test]
     fn tagged_policy_convergence() {
         let (_tmp, mut net) = setup_network(3);
         let graph = GraphId::new("urn:test:tagged-policy-convergence");

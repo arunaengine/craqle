@@ -1498,45 +1498,6 @@ fn failed_restore_retries() {
 }
 
 #[test]
-fn rejects_reused_ids() {
-    let fixture = Fixture::new();
-    let topic = fixture
-        .node
-        .irokle_topic_id(&fixture.graph)
-        .unwrap()
-        .unwrap();
-    let native = fixture
-        .native
-        .open_topic::<CraqleGraphEvent>(topic)
-        .unwrap();
-    let publish = |id: MutationId, label: &str| {
-        native
-            .publish(CraqleGraphEvent::Mutation {
-                id,
-                graph: fixture.graph.clone(),
-                changes: vec![fixture.insert(label)],
-                render_hints: None,
-            })
-            .unwrap()
-    };
-    let id = MutationId::new();
-    publish(id, "first");
-    fixture.node.reconcile_irokle().unwrap();
-    let rejections = fixture.node.replication_rejection_count();
-    publish(id, "conflicting");
-    publish(MutationId::new(), "later");
-    fixture.node.reconcile_irokle().unwrap();
-    assert_eq!(fixture.node.replication_rejection_count(), rejections + 1);
-    let content = fixture.content();
-    let object = |label: &str| {
-        content
-            .iter()
-            .any(|(_, _, object)| object.0 == format!("\"{label}\""))
-    };
-    assert!(object("first") && object("later") && !object("conflicting"));
-}
-
-#[test]
 fn hides_store_rejections() {
     let fixture = Fixture::new();
     let topic = fixture

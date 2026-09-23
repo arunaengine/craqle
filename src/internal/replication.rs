@@ -2924,7 +2924,7 @@ impl ReplicationEngine {
         mutation
             .map(|mutation| {
                 let mut prior = self.store.mutation_receipt(&mutation.mutation_id)?;
-                // A record that reuses a mutation id bound to other content can never apply.
+                // A reused id is local receipt bookkeeping; the record still applies as data.
                 if prior.as_ref().is_some_and(|receipt| {
                     receipt.graph != mutation.batch.graph
                         || match receipt.event_id {
@@ -2932,9 +2932,7 @@ impl ReplicationEngine {
                             None => receipt.request_digest != mutation.request_digest,
                         }
                 }) {
-                    return Err(MergeError::InputRejected(
-                        "mutation id is already bound to another record".to_owned(),
-                    ));
+                    prior = None;
                 }
                 if prior.as_ref().is_some_and(|receipt| {
                     receipt.source == crate::sync::SourceOutcome::Prepared
@@ -3435,7 +3433,22 @@ impl ReplicationEngine {
         self.store
             .stage_pending_bindings(&mut batch, graph, clock_digest(vector_clock)?)?;
         let receipt = source_receipt(graph, plan, vector_clock)?;
-        if self.store.mutation_receipt(&plan.id)?.is_some() {
+        let existing = self.store.mutation_receipt(&plan.id)?;
+        if let Some(existing) = existing.as_ref().filter(|existing| {
+            existing.graph != receipt.graph
+                || existing.event_id != receipt.event_id
+                || existing.request_digest != receipt.request_digest
+        }) {
+            // Receipts are local, so every order of arrival applies the same data.
+            tracing::warn!(
+                mutation = ?plan.id,
+                receipt_event = ?existing.event_id,
+                "kept the first receipt of a reused mutation id",
+            );
+            self.store.commit(batch)?;
+            return Ok(());
+        }
+        if existing.is_some() {
             self.store.stage_receipt_update(&mut batch, &receipt)?;
         } else if self.store.stage_receipt(&mut batch, &receipt)?.is_some() {
             return Err(MergeError::Store(

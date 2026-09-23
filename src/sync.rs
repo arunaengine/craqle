@@ -1885,13 +1885,15 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             } = catchup;
             for record in &records {
                 match record {
+                    // A peer record may reuse the id; only this node's record is the prepared one.
                     TopicRecord::Event(record)
-                        if matches!(
-                            &record.event,
-                            CraqleGraphEvent::Mutation { id, .. }
-                                | CraqleGraphEvent::CommittedMutation { id, .. }
-                                if *id == receipt.id
-                        ) =>
+                        if record.meta.actor_id == local
+                            && matches!(
+                                &record.event,
+                                CraqleGraphEvent::Mutation { id, .. }
+                                    | CraqleGraphEvent::CommittedMutation { id, .. }
+                                    if *id == receipt.id
+                            ) =>
                     {
                         return Ok(Some(record.clone()));
                     }
