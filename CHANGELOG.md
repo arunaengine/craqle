@@ -82,7 +82,9 @@ All notable changes to Craqle are documented here.
   `restore_history` writes the content at chosen heads as one new validated local
   mutation, never rewriting history, with an optional expected-heads fence. Every
   call checks graph permissions first and fails with `HistoryError` instead of
-  returning partial results when its bounds are exceeded.
+  returning partial results when its bounds are exceeded. Records that cannot be
+  decoded, target another graph, or were rejected by the store are listed as
+  rejected and skipped in every replay, as reconciliation skips them.
 - `QueryOptions::results_only()` runs a query without per-operator statistics.
   `QueryOptions::default()` still collects them for compatibility.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a

@@ -1268,24 +1268,37 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         if op.signed.body.topic_id != topic {
             return Ok(None);
         }
-        let record = if let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload {
-            let stored =
-                self.node.storage().get_meta(&op.id)?.ok_or_else(|| {
-                    irokle::Error::Storage(format!("missing op meta for {}", op.id))
-                })?;
-            Some(EventRecord {
-                event: envelope.decode_event::<CraqleGraphEvent>()?,
+        let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload else {
+            return Ok(Some(crate::history::HistoryEntry {
+                op,
+                record: None,
+                rejected: false,
+            }));
+        };
+        let stored = self
+            .node
+            .storage()
+            .get_meta(&op.id)?
+            .ok_or_else(|| irokle::Error::Storage(format!("missing op meta for {}", op.id)))?;
+        // Like reconcile, an undecodable payload is a rejected record, not a failed read.
+        let record = envelope
+            .decode_event::<CraqleGraphEvent>()
+            .ok()
+            .map(|event| EventRecord {
+                event,
                 meta: OpMeta {
                     op_id: op.id,
                     actor_id: stored.actor_id,
                     actor_seq: stored.actor_seq,
                     observed_clock: stored.observed_clock,
                 },
-            })
-        } else {
-            None
-        };
-        Ok(Some(crate::history::HistoryEntry { op, record }))
+            });
+        let rejected = record.is_none();
+        Ok(Some(crate::history::HistoryEntry {
+            op,
+            record,
+            rejected,
+        }))
     }
 
     fn history_generation(

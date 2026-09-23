@@ -52,8 +52,11 @@ pub struct HistoryOperation {
     pub actor: irokle::ActorId,
     pub sequence: u64,
     pub generation: u64,
-    /// `None` for topic control operations such as the genesis or membership changes.
+    /// `None` for topic control operations and for rejected records.
     pub event: Option<CraqleGraphEvent>,
+    /// The record could not be decoded, targets another graph, or the store rejected it.
+    /// Rejected records are skipped when history is replayed.
+    pub rejected: bool,
 }
 
 impl HistoryOperation {
@@ -103,8 +106,6 @@ pub enum HistoryError {
     ByteLimit,
     #[error("history operation {0} is unavailable for this graph")]
     Unavailable(OpId),
-    #[error("history contains an operation for another graph")]
-    ForeignGraph,
     #[error("graph history heads changed")]
     HeadsChanged,
     #[error("history heads describe a deleted graph")]
@@ -116,13 +117,13 @@ impl HistoryError {
         match self {
             Self::InvalidRequest | Self::Unavailable(_) => CraqleErrorKind::InvalidInput,
             Self::OperationLimit | Self::ByteLimit => CraqleErrorKind::ResourceLimit,
-            Self::ForeignGraph => CraqleErrorKind::CorruptAuthoritativeData,
             Self::HeadsChanged | Self::GraphDeleted => CraqleErrorKind::Conflict,
         }
     }
 }
 
 pub(crate) struct TopicHistory {
+    pub graph: GraphId,
     pub topic: irokle::TopicId,
     pub heads: Vec<OpId>,
     pub limit: usize,
@@ -132,6 +133,7 @@ pub(crate) struct TopicHistory {
 pub(crate) struct HistoryEntry {
     pub op: irokle::Op,
     pub record: Option<EventRecord<CraqleGraphEvent>>,
+    pub rejected: bool,
 }
 
 type Quads = BTreeMap<(EncodedTerm, EncodedTerm, EncodedTerm), Vec<Dot>>;
@@ -159,6 +161,7 @@ impl CraqleNode {
             return Err(HistoryError::InvalidRequest.into());
         }
         let (entries, next) = self.history_page(&TopicHistory {
+            graph: request.graph.clone(),
             topic: self.history_topic(&request.graph)?,
             heads: request.heads.clone(),
             limit: request.limit,
@@ -167,15 +170,8 @@ impl CraqleNode {
         let operations = entries
             .into_iter()
             .map(|entry| {
-                if entry
-                    .record
-                    .as_ref()
-                    .is_some_and(|record| record.event.graph() != &request.graph)
-                {
-                    return Err(HistoryError::ForeignGraph.into());
-                }
                 let body = entry.op.signed.body;
-                Ok(HistoryOperation {
+                HistoryOperation {
                     id: entry.op.id,
                     parents: body.deps.into_iter().collect(),
                     author: body.author,
@@ -183,9 +179,10 @@ impl CraqleNode {
                     sequence: body.actor_seq,
                     generation: body.generation,
                     event: entry.record.map(|record| record.event),
-                })
+                    rejected: entry.rejected,
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect();
         Ok(HistoryPage { operations, next })
     }
 
@@ -203,15 +200,13 @@ impl CraqleNode {
         )?;
         let topic = self.history_topic(&request.graph)?;
         let side = |heads: &[OpId]| {
-            self.history_content(
-                &request.graph,
-                &TopicHistory {
-                    topic,
-                    heads: heads.to_vec(),
-                    limit: request.max_operations,
-                    max_bytes: request.max_bytes,
-                },
-            )
+            self.history_content(&TopicHistory {
+                graph: request.graph.clone(),
+                topic,
+                heads: heads.to_vec(),
+                limit: request.max_operations,
+                max_bytes: request.max_bytes,
+            })
         };
         let from = side(&request.from)?;
         let to = side(&request.to)?;
@@ -230,12 +225,13 @@ impl CraqleNode {
         auth.authorize(&request.graph, &policy, Action::Write)?;
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
         let mut query = TopicHistory {
+            graph: request.graph.clone(),
             topic: self.history_topic(&request.graph)?,
             heads: request.heads.clone(),
             limit: request.max_operations,
             max_bytes: request.max_bytes,
         };
-        let target = self.history_content(&request.graph, &query)?;
+        let target = self.history_content(&query)?;
         // Deletes remove the dots their causal past observed, so diff against the current heads.
         let write_guard = self.store.graph_write_guard(&request.graph);
         query.heads = sync.topic_heads(query.topic)?.into_iter().collect();
@@ -244,7 +240,7 @@ impl CraqleNode {
         {
             return Err(HistoryError::HeadsChanged.into());
         }
-        let current = self.history_content(&request.graph, &query)?;
+        let current = self.history_content(&query)?;
         let changes = content_changes(&request.graph, &current, &target);
         if changes.is_empty() {
             return Ok(None);
@@ -279,15 +275,13 @@ impl CraqleNode {
         )?;
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
         let topic = self.history_topic(&request.graph)?;
-        let entries = self.history_entries(
-            &request.graph,
-            &TopicHistory {
-                topic,
-                heads: request.heads.clone(),
-                limit: request.max_operations,
-                max_bytes: request.max_bytes,
-            },
-        )?;
+        let entries = self.history_entries(&TopicHistory {
+            graph: request.graph.clone(),
+            topic,
+            heads: request.heads.clone(),
+            limit: request.max_operations,
+            max_bytes: request.max_bytes,
+        })?;
         std::fs::create_dir(&request.directory)?;
         let options = CraqleOptions::new()
             .with_actor(self.actor)
@@ -297,9 +291,12 @@ impl CraqleNode {
         let node = CraqleNode::open_with_options(&request.directory, options)?;
         let mut operations = Vec::with_capacity(entries.len());
         for entry in entries {
-            if let Some(record) = entry.record {
+            if let Some(record) = entry.record.filter(|_| !entry.rejected) {
                 let _guard = node.store.graph_write_guard(record.event.graph());
-                node.apply_record_locked(&record, sync.is_local_record(topic, &record))?;
+                match node.apply_record_locked(&record, sync.is_local_record(topic, &record)) {
+                    Err(error) if !error.rejects_record() => return Err(error),
+                    Ok(_) | Err(_) => {}
+                }
             }
             operations.push(entry.op);
         }
@@ -348,9 +345,21 @@ impl CraqleNode {
             if !seen.insert(id) {
                 continue;
             }
-            let entry = sync
+            let mut entry = sync
                 .history_entry(query.topic, id)?
                 .ok_or(HistoryError::Unavailable(id))?;
+            if entry
+                .record
+                .as_ref()
+                .is_some_and(|record| record.event.graph() != &query.graph)
+            {
+                entry.record = None;
+                entry.rejected = true;
+            }
+            entry.rejected |= self
+                .store
+                .replication_rejection(&query.topic, &id)?
+                .is_some();
             let body = &entry.op.signed.body;
             if body.generation != level {
                 return Err(CraqleSyncError::InvalidEvent(
@@ -385,7 +394,7 @@ impl CraqleNode {
     }
 
     /// The complete causal past of the heads, oldest first, or an error.
-    fn history_entries(&self, graph: &GraphId, query: &TopicHistory) -> Result<Vec<HistoryEntry>> {
+    fn history_entries(&self, query: &TopicHistory) -> Result<Vec<HistoryEntry>> {
         if query.heads.is_empty() || query.limit == 0 || query.max_bytes == 0 {
             return Err(HistoryError::InvalidRequest.into());
         }
@@ -393,30 +402,24 @@ impl CraqleNode {
         if !next.is_empty() {
             return Err(HistoryError::OperationLimit.into());
         }
-        if entries.iter().any(|entry| {
-            entry
-                .record
-                .as_ref()
-                .is_some_and(|record| record.event.graph() != graph)
-        }) {
-            return Err(HistoryError::ForeignGraph.into());
-        }
         entries.reverse();
         Ok(entries)
     }
 
     /// Replays the observed-remove quad set of the heads in memory.
-    fn history_content(&self, graph: &GraphId, query: &TopicHistory) -> Result<Quads> {
+    fn history_content(&self, query: &TopicHistory) -> Result<Quads> {
         let mut quads = Quads::new();
-        for entry in self.history_entries(graph, query)? {
-            let Some(record) = entry.record else {
+        for entry in self.history_entries(query)? {
+            let Some(record) = entry.record.filter(|_| !entry.rejected) else {
                 continue;
             };
             if matches!(record.event, CraqleGraphEvent::GraphDeleted { .. }) {
                 return Err(HistoryError::GraphDeleted.into());
             }
-            let Some(mutation) = crate::sync::batch_from_record(&record)? else {
-                continue;
+            let mutation = match crate::sync::batch_from_record(&record) {
+                Ok(Some(mutation)) => mutation,
+                Err(error) if !error.rejects_record() => return Err(error.into()),
+                Ok(None) | Err(_) => continue,
             };
             for op in mutation.batch.ops {
                 match op {

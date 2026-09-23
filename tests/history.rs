@@ -3,12 +3,18 @@ mod support;
 use std::collections::BTreeSet;
 
 use craqle::{
-    Action, AllowAllAuthorizer, AuthorizationError, CraqleErrorKind, CraqleIrokleOptions,
-    CraqleNode, CraqleOptions, CreateCrateRequest, DenyAllAuthorizer, EncodedTerm, GraphHistory,
-    GraphId, GraphPolicy, HistoryCompare, HistoryLog, HistoryRestore, MaterializedQuadChange,
-    SearchStorage,
+    Action, AllowAllAuthorizer, AuthorizationError, CraqleErrorKind, CraqleGraphEvent,
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CreateCrateRequest, DenyAllAuthorizer,
+    EncodedTerm, GraphHistory, GraphId, GraphPolicy, HistoryCompare, HistoryLog, HistoryRestore,
+    MaterializedQuadChange, SearchStorage,
 };
 use irokle::{Irokle, MemoryStorage, OpId};
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, irokle::Event)]
+#[irokle(type_id = "craqle.graph.v1")]
+struct PoisonEvent {
+    junk: Vec<u64>,
+}
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -462,6 +468,85 @@ fn fails_when_bounds_exceeded() {
     );
     assert_eq!(fixture.heads(), heads);
     assert_eq!(fixture.content(), content);
+}
+
+#[test]
+fn skips_rejected_records() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    fixture
+        .native
+        .open_topic::<PoisonEvent>(topic)
+        .unwrap()
+        .publish(PoisonEvent { junk: vec![7; 9] })
+        .unwrap();
+    let other = GraphId::new("urn:history:other");
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::QuadChanges {
+            graph: other.clone(),
+            changes: vec![MaterializedQuadChange::Insert {
+                graph: other,
+                subject: EncodedTerm("<urn:hidden>".into()),
+                predicate: EncodedTerm("<urn:p>".into()),
+                object: EncodedTerm("\"secret\"".into()),
+            }],
+        })
+        .unwrap();
+    fixture.node.reconcile_irokle().unwrap();
+    let heads = fixture.heads();
+    let page = fixture
+        .node
+        .history_log(
+            &AllowAllAuthorizer,
+            &HistoryLog {
+                graph: fixture.graph.clone(),
+                heads: heads.clone(),
+                limit: 2,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+    assert!(
+        page.operations
+            .iter()
+            .all(|op| op.rejected && op.event.is_none())
+    );
+    let compare = HistoryCompare {
+        graph: fixture.graph.clone(),
+        from: original,
+        to: heads.clone(),
+        max_operations: 100,
+        max_bytes: 1024 * 1024,
+    };
+    assert!(
+        fixture
+            .node
+            .compare_history(&AllowAllAuthorizer, &compare)
+            .unwrap()
+            .is_empty()
+    );
+    let view = fixture
+        .node
+        .project_history(
+            &AllowAllAuthorizer,
+            &GraphHistory {
+                heads,
+                ..fixture.request("poisoned")
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        view.node.graph_snapshot(&fixture.graph).unwrap(),
+        fixture.node.graph_snapshot(&fixture.graph).unwrap()
+    );
 }
 
 #[test]
