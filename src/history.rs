@@ -262,7 +262,7 @@ impl CraqleNode {
     }
 
     /// Requires current graph READ permission and a destination that does not exist.
-    /// Never publishes; incomplete history or exhausted bounds fail without a partial result.
+    /// Never publishes; a failure removes the destination it created and leaves no partial result.
     pub fn project_history(
         &self,
         auth: &dyn Authorizer,
@@ -273,16 +273,28 @@ impl CraqleNode {
             &self.history_policy(&request.graph)?,
             Action::Read,
         )?;
-        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        let topic = self.history_topic(&request.graph)?;
         let entries = self.history_entries(&TopicHistory {
             graph: request.graph.clone(),
-            topic,
+            topic: self.history_topic(&request.graph)?,
             heads: request.heads.clone(),
             limit: request.max_operations,
             max_bytes: request.max_bytes,
         })?;
         std::fs::create_dir(&request.directory)?;
+        self.fill_projection(request, entries).inspect_err(|_| {
+            if let Err(error) = std::fs::remove_dir_all(&request.directory) {
+                tracing::warn!(%error, "could not remove a failed history projection");
+            }
+        })
+    }
+
+    fn fill_projection(
+        &self,
+        request: &GraphHistory,
+        entries: Vec<HistoryEntry>,
+    ) -> Result<HistoryProjection> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let topic = self.history_topic(&request.graph)?;
         let options = CraqleOptions::new()
             .with_actor(self.actor)
             .with_remote_policy_authorizer(self.remote_policy_authorizer.clone())
