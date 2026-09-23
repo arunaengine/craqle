@@ -107,9 +107,11 @@ All notable changes to Craqle are documented here.
   heads per source. An author field with a control character, a source without heads, a
   repeated source graph or head, or a source naming the commit's own graph is also invalid.
   Invalid info fails a local write with `InvalidInput` and makes a replicated record a
-  rejected record. A write that publishes no Irokle event cannot keep a commit and fails
-  unchanged. Commit metadata is not part of a mutation id's request, so retrying a
-  published mutation keeps its first commit.
+  rejected record. A write with a commit that cannot publish an Irokle event, because
+  replication is off or its durability does not publish, fails unchanged. A write that
+  changes nothing publishes no event and stores no commit: `apply_rocrate_with` returns an
+  empty batch and `restore_history` returns `None`. Commit metadata is not part of a
+  mutation id's request, so retrying a published mutation keeps its first commit.
 - `QueryOptions::results_only()` runs a query without per-operator statistics.
   `QueryOptions::default()` still collects them for compatibility.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a
