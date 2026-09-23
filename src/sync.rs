@@ -832,6 +832,10 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         Err(CraqleSyncError::NotConfigured)
     }
 
+    fn topic_heads(&self, _topic: irokle::TopicId) -> SyncResult<BTreeSet<irokle::OpId>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
     fn topic_records_since(
         &self,
         topic_id: irokle::TopicId,
@@ -1295,6 +1299,10 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             .get_position(&id)?
             .filter(|position| position.topic_id == topic)
             .map(|position| position.generation))
+    }
+
+    fn topic_heads(&self, topic: irokle::TopicId) -> SyncResult<BTreeSet<irokle::OpId>> {
+        Ok(self.node.open_topic::<CraqleGraphEvent>(topic)?.heads()?)
     }
 
     fn topic_records_since(

@@ -1,11 +1,12 @@
 //! Reads, compares, replays and restores a graph's signed causal history.
 
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::PathBuf;
 
 use crate::{
     Action, AuthorizationError, Authorizer, CraqleErrorKind, CraqleGraphEvent, CraqleNode,
-    CraqleOptions, CraqleSyncError, GraphId, GraphPolicy, MemoryBudget, Result, SearchStorage,
+    CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
+    MemoryBudget, QuadOp, Result, SearchStorage,
 };
 use irokle::OpId;
 use irokle::reducer::EventRecord;
@@ -23,6 +24,61 @@ pub struct GraphHistory {
 pub struct HistoryProjection {
     pub node: CraqleNode,
     pub operations: Vec<irokle::Op>,
+}
+
+/// One page of a graph's history, walked newest first from `heads`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryLog {
+    pub graph: GraphId,
+    /// Start points; pass [`HistoryPage::next`] to read the following page.
+    pub heads: Vec<OpId>,
+    pub limit: usize,
+    pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub operations: Vec<HistoryOperation>,
+    /// Heads of the next page; empty once the walk reached the topic genesis.
+    pub next: Vec<OpId>,
+}
+
+/// One signed operation. Irokle operations carry no wall-clock timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryOperation {
+    pub id: OpId,
+    pub parents: Vec<OpId>,
+    pub author: irokle::PeerId,
+    pub actor: irokle::ActorId,
+    pub sequence: u64,
+    pub generation: u64,
+    /// `None` for topic control operations such as the genesis or membership changes.
+    pub event: Option<CraqleGraphEvent>,
+}
+
+impl HistoryOperation {
+    /// Quad inserts and deletes recorded by this operation.
+    pub fn changes(&self) -> &[MaterializedQuadChange] {
+        match &self.event {
+            Some(
+                CraqleGraphEvent::QuadChanges { changes, .. }
+                | CraqleGraphEvent::RoCrateMutation { changes, .. }
+                | CraqleGraphEvent::Mutation { changes, .. },
+            ) => changes,
+            Some(CraqleGraphEvent::Policy { .. } | CraqleGraphEvent::GraphDeleted { .. })
+            | None => &[],
+        }
+    }
+}
+
+/// Selects the graph content at `from` and at `to`; bounds apply to each side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryCompare {
+    pub graph: GraphId,
+    pub from: Vec<OpId>,
+    pub to: Vec<OpId>,
+    pub max_operations: usize,
+    pub max_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -67,7 +123,90 @@ pub(crate) struct HistoryEntry {
     pub record: Option<EventRecord<CraqleGraphEvent>>,
 }
 
+type Quads = BTreeMap<(EncodedTerm, EncodedTerm, EncodedTerm), Vec<Dot>>;
+
 impl CraqleNode {
+    /// Current causal heads of a graph's history; requires graph READ permission.
+    pub fn graph_heads(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<Vec<OpId>> {
+        auth.authorize(graph, &self.history_policy(graph)?, Action::Read)?;
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        Ok(sync
+            .topic_heads(self.history_topic(graph)?)?
+            .into_iter()
+            .collect())
+    }
+
+    /// Reads at most `limit` operations newest first; requires graph READ permission.
+    /// Exceeding `max_bytes` fails the page instead of shortening it.
+    pub fn history_log(&self, auth: &dyn Authorizer, request: &HistoryLog) -> Result<HistoryPage> {
+        auth.authorize(
+            &request.graph,
+            &self.history_policy(&request.graph)?,
+            Action::Read,
+        )?;
+        if request.limit == 0 || request.max_bytes == 0 {
+            return Err(HistoryError::InvalidRequest.into());
+        }
+        let (entries, next) = self.history_page(&TopicHistory {
+            topic: self.history_topic(&request.graph)?,
+            heads: request.heads.clone(),
+            limit: request.limit,
+            max_bytes: request.max_bytes,
+        })?;
+        let operations = entries
+            .into_iter()
+            .map(|entry| {
+                if entry
+                    .record
+                    .as_ref()
+                    .is_some_and(|record| record.event.graph() != &request.graph)
+                {
+                    return Err(HistoryError::ForeignGraph.into());
+                }
+                let body = entry.op.signed.body;
+                Ok(HistoryOperation {
+                    id: entry.op.id,
+                    parents: body.deps.into_iter().collect(),
+                    author: body.author,
+                    actor: body.actor_id,
+                    sequence: body.actor_seq,
+                    generation: body.generation,
+                    event: entry.record.map(|record| record.event),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(HistoryPage { operations, next })
+    }
+
+    /// Returns the quad changes that turn the content at `from` into the content at `to`.
+    /// Requires graph READ permission; a side that exceeds its bounds fails the call.
+    pub fn compare_history(
+        &self,
+        auth: &dyn Authorizer,
+        request: &HistoryCompare,
+    ) -> Result<Vec<MaterializedQuadChange>> {
+        auth.authorize(
+            &request.graph,
+            &self.history_policy(&request.graph)?,
+            Action::Read,
+        )?;
+        let topic = self.history_topic(&request.graph)?;
+        let side = |heads: &[OpId]| {
+            self.history_content(
+                &request.graph,
+                &TopicHistory {
+                    topic,
+                    heads: heads.to_vec(),
+                    limit: request.max_operations,
+                    max_bytes: request.max_bytes,
+                },
+            )
+        };
+        let from = side(&request.from)?;
+        let to = side(&request.to)?;
+        Ok(content_changes(&request.graph, &from, &to))
+    }
+
     /// Requires current graph READ permission and a destination that does not exist.
     /// Never publishes; incomplete history or exhausted bounds fail without a partial result.
     pub fn project_history(
@@ -207,6 +346,72 @@ impl CraqleNode {
         entries.reverse();
         Ok(entries)
     }
+
+    /// Replays the observed-remove quad set of the heads in memory.
+    fn history_content(&self, graph: &GraphId, query: &TopicHistory) -> Result<Quads> {
+        let mut quads = Quads::new();
+        for entry in self.history_entries(graph, query)? {
+            let Some(record) = entry.record else {
+                continue;
+            };
+            if matches!(record.event, CraqleGraphEvent::GraphDeleted { .. }) {
+                return Err(HistoryError::GraphDeleted.into());
+            }
+            let Some(mutation) = crate::sync::batch_from_record(&record)? else {
+                continue;
+            };
+            for op in mutation.batch.ops {
+                match op {
+                    QuadOp::Add {
+                        subject,
+                        predicate,
+                        object,
+                        dot,
+                    } => {
+                        let dots = quads.entry((subject, predicate, object)).or_default();
+                        if !dots.contains(&dot) {
+                            dots.push(dot);
+                        }
+                    }
+                    QuadOp::Remove {
+                        subject,
+                        predicate,
+                        object,
+                        witnessed,
+                    } => {
+                        let key = (subject, predicate, object);
+                        if let Some(dots) = quads.get_mut(&key) {
+                            dots.retain(|dot| !witnessed.contains(dot));
+                            if dots.is_empty() {
+                                quads.remove(&key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(quads)
+    }
+}
+
+fn content_changes(graph: &GraphId, from: &Quads, to: &Quads) -> Vec<MaterializedQuadChange> {
+    let removed = from.keys().filter(|key| !to.contains_key(*key)).map(|key| {
+        MaterializedQuadChange::Delete {
+            graph: graph.clone(),
+            subject: key.0.clone(),
+            predicate: key.1.clone(),
+            object: key.2.clone(),
+        }
+    });
+    let added = to.keys().filter(|key| !from.contains_key(*key)).map(|key| {
+        MaterializedQuadChange::Insert {
+            graph: graph.clone(),
+            subject: key.0.clone(),
+            predicate: key.1.clone(),
+            object: key.2.clone(),
+        }
+    });
+    removed.chain(added).collect()
 }
 
 /// The smallest store reservation the memory budget accepts, so projections stay cheap.

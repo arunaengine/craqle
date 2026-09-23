@@ -138,7 +138,10 @@ pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
 };
-pub use history::{GraphHistory, HistoryError, HistoryProjection};
+pub use history::{
+    GraphHistory, HistoryCompare, HistoryError, HistoryLog, HistoryOperation, HistoryPage,
+    HistoryProjection,
+};
 pub use irokle;
 
 /// Stable high-level classification for public Craqle failures.
