@@ -9,8 +9,8 @@ use crate::sync::GraphHints;
 use crate::{
     Action, AuthorizationError, Authorizer, CommitInfo, CraqleErrorKind, CraqleGraphEvent,
     CraqleNode, CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy,
-    MaterializedQuadChange, MemoryBudget, MutationId, MutationRequest, QuadOp, Result,
-    SearchStorage, SourceOutcome,
+    MaterializedQuadChange, MemoryBudget, MutationId, MutationReceipt, MutationRequest,
+    PersistenceOutcome, QuadOp, RepairOutcome, RepairState, Result, SearchStorage, SourceOutcome,
 };
 use irokle::OpId;
 use irokle::reducer::EventRecord;
@@ -355,6 +355,9 @@ impl CraqleNode {
                     .clone()
                     .zip(target.hints.license_digest);
         if changes.is_empty() && !hints_changed {
+            if let Some(id) = request.id {
+                self.record_noop(&request.graph, id)?;
+            }
             return Ok(None);
         }
         let id = request.id.unwrap_or_default();
@@ -373,7 +376,56 @@ impl CraqleNode {
         drop(write_guard);
         drop(reconcile_guard);
         self.finish_batch(&request.graph, batch)?;
-        self.restored(topic, self.store.mutation_receipt(&id)?)
+        let receipt = self.store.mutation_receipt(&id)?;
+        if request.id.is_some() && receipt.is_none() {
+            self.record_noop(&request.graph, id)?;
+        }
+        self.restored(topic, receipt)
+    }
+
+    /// Durably records that restore `id` changed nothing, so a retry returns `None` too.
+    fn record_noop(&self, graph: &GraphId, id: MutationId) -> Result<()> {
+        let done = RepairState {
+            diagnostics: RepairOutcome::NotRequired,
+            shacl: RepairOutcome::NotRequired,
+            search: RepairOutcome::NotRequired,
+            query_view: RepairOutcome::NotRequired,
+        };
+        let receipt = match self.store.mutation_receipt(&id)? {
+            Some(prepared) => self.store.update_receipt(&MutationReceipt {
+                source: SourceOutcome::Applied,
+                repairs: done,
+                ..prepared
+            })?,
+            None => {
+                let receipt = MutationReceipt {
+                    id,
+                    admission_sequence: 0,
+                    graph: graph.clone(),
+                    request_digest: [0; 32],
+                    event_id: None,
+                    topic: None,
+                    publish_after: None,
+                    topic_epoch: None,
+                    topic_genesis: None,
+                    search_token: None,
+                    repair_graphs: Vec::new(),
+                    source: SourceOutcome::Applied,
+                    persistence: PersistenceOutcome::Pending,
+                    repairs: done,
+                    source_version: self.store.graph_version_digest(graph)?,
+                    updated_unix_nanos: chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .unwrap_or(i64::MAX),
+                };
+                let mut batch = self.store.new_batch();
+                self.store.stage_receipt(&mut batch, &receipt)?;
+                self.store.commit(batch)?;
+                receipt
+            }
+        };
+        self.persist_receipt(receipt)?;
+        Ok(())
     }
 
     fn restored(

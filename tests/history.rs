@@ -1385,6 +1385,22 @@ fn replays_plain_mutations() {
 }
 
 #[test]
+fn repeats_noop_restore() {
+    let fixture = Fixture::new();
+    let request = HistoryRestore {
+        id: Some(MutationId::new()),
+        ..fixture.restore(&fixture.heads(), None)
+    };
+    let first = fixture.node.restore_history(&AllowAllAuthorizer, &request);
+    assert!(first.unwrap().is_none());
+    fixture.rename("Later edit");
+    let content = fixture.content();
+    let retry = fixture.node.restore_history(&AllowAllAuthorizer, &request);
+    assert!(retry.unwrap().is_none());
+    assert_eq!(fixture.content(), content);
+}
+
+#[test]
 fn restore_rechecks_policy() {
     let fixture = Fixture::new();
     let original = fixture.heads();
