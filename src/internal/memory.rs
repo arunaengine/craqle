@@ -15,6 +15,7 @@ const MIN_COMPONENT_BYTES: u64 = 4 * MIB;
 const MIN_SEARCH_BYTES: u64 = 15 * MIB;
 const MIN_STORE_BYTES: u64 = 3 * MIN_COMPONENT_BYTES + MIN_SEARCH_BYTES;
 const CGROUP_UNLIMITED_BYTES: u64 = 1 << 62;
+const DEFAULT_STORE_SHARE: u64 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryBudgetError {
@@ -40,14 +41,18 @@ pub struct MemoryBudget {
     application_bytes: u64,
     search_writer_bytes: u64,
     prepared_work_bytes: u64,
+    adaptive: bool,
 }
 
 impl Default for MemoryBudget {
     fn default() -> Self {
         let process = process_memory_limit().unwrap_or(FALLBACK_PROCESS_BYTES);
         let available = process.saturating_mul(3) / 4;
-        let store = available.div_ceil(32).max(MIN_STORE_BYTES);
-        Self::new(process, store)
+        let store = available.div_ceil(DEFAULT_STORE_SHARE).max(MIN_STORE_BYTES);
+        Self {
+            adaptive: true,
+            ..Self::new(process, store)
+        }
     }
 }
 
@@ -75,26 +80,31 @@ impl MemoryBudget {
             application_bytes: scale(DEFAULT_APP_BYTES, MIN_COMPONENT_BYTES),
             search_writer_bytes: scale(DEFAULT_SEARCH_BYTES, MIN_SEARCH_BYTES),
             prepared_work_bytes: scale(DEFAULT_PREPARED_BYTES, MIN_COMPONENT_BYTES),
+            adaptive: false,
         }
     }
 
     pub fn with_storage(mut self, bytes: u64) -> Self {
         self.storage_bytes = bytes;
+        self.adaptive = false;
         self
     }
 
     pub fn with_application(mut self, bytes: u64) -> Self {
         self.application_bytes = bytes;
+        self.adaptive = false;
         self
     }
 
     pub fn with_search_writer(mut self, bytes: u64) -> Self {
         self.search_writer_bytes = bytes;
+        self.adaptive = false;
         self
     }
 
     pub fn with_prepared_work(mut self, bytes: u64) -> Self {
         self.prepared_work_bytes = bytes;
+        self.adaptive = false;
         self
     }
 
@@ -127,10 +137,9 @@ impl MemoryBudget {
         let mut state = PROCESS_BUDGET
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        state.reserve(self.process_bytes, self.store_bytes)?;
-        Ok(MemoryLease {
-            bytes: self.store_bytes,
-        })
+        let budget = if self.adaptive { state.fit(self) } else { self };
+        state.reserve(budget.process_bytes, budget.store_bytes)?;
+        Ok(MemoryLease { budget })
     }
 
     pub fn validate(self) -> std::result::Result<(), MemoryBudgetError> {
@@ -184,6 +193,22 @@ impl ProcessBudget {
         Ok(())
     }
 
+    /// Shrinks a default reservation toward the minimum as live stores fill the budget.
+    fn fit(&self, budget: MemoryBudget) -> MemoryBudget {
+        let process = self.process_bytes.map_or(budget.process_bytes, |current| {
+            current.min(budget.process_bytes)
+        });
+        let free = (process.saturating_mul(3) / 4).saturating_sub(self.reserved_bytes);
+        let store = (free / DEFAULT_STORE_SHARE).max(MIN_STORE_BYTES);
+        if store >= budget.store_bytes {
+            return budget;
+        }
+        MemoryBudget {
+            adaptive: true,
+            ..MemoryBudget::new(budget.process_bytes, store)
+        }
+    }
+
     fn release(&mut self, bytes: u64) {
         self.reserved_bytes = self.reserved_bytes.saturating_sub(bytes);
         if self.reserved_bytes == 0 {
@@ -196,7 +221,13 @@ static PROCESS_BUDGET: LazyLock<Mutex<ProcessBudget>> =
     LazyLock::new(|| Mutex::new(ProcessBudget::new()));
 
 pub(crate) struct MemoryLease {
-    bytes: u64,
+    budget: MemoryBudget,
+}
+
+impl MemoryLease {
+    pub(crate) fn budget(&self) -> MemoryBudget {
+        self.budget
+    }
 }
 
 impl Drop for MemoryLease {
@@ -204,7 +235,7 @@ impl Drop for MemoryLease {
         let mut state = PROCESS_BUDGET
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        state.release(self.bytes);
+        state.release(self.budget.store_bytes);
     }
 }
 
@@ -325,6 +356,37 @@ mod tests {
             pool.reserve(budget.process_bytes(), budget.store_bytes())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn defaults_shrink_crowded() {
+        let explicit = MemoryBudget::new(4_096 * MIB, 96 * MIB);
+        let default = MemoryBudget {
+            adaptive: true,
+            ..explicit
+        };
+        let mut pool = ProcessBudget::new();
+        let mut stores = 0;
+        loop {
+            let fitted = pool.fit(default);
+            fitted.validate().unwrap();
+            if pool
+                .reserve(fitted.process_bytes(), fitted.store_bytes())
+                .is_err()
+            {
+                break;
+            }
+            stores += 1;
+        }
+        assert!(stores > 64, "{stores}");
+        assert!(pool.reserved_bytes <= 3_072 * MIB);
+        assert_eq!(pool.fit(default).store_bytes(), MIN_STORE_BYTES);
+        assert!(
+            pool.reserve(explicit.process_bytes(), explicit.store_bytes())
+                .is_err()
+        );
+        pool.release(MIN_STORE_BYTES);
+        assert!(pool.reserve(4_096 * MIB, MIN_STORE_BYTES).is_ok());
     }
 
     #[test]

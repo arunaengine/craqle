@@ -73,6 +73,8 @@ All notable changes to Craqle are documented here.
 - Authorized graph reconciliation from retained history or a verified healthy
   snapshot, with a durable backup and an audit of the replacement.
 - Explicit process and store memory reservations shared by live stores.
+  A default `MemoryBudget` shrinks its store share toward the minimum as live
+  stores fill the process budget; explicit budgets keep their exact sizes.
 - Graph history for Irokle-backed graphs. `graph_heads` lists the current heads.
   `history_log` pages signed operations newest first with parents, actor, sequence
   and recorded quad changes. `compare_history` returns the quad changes between two

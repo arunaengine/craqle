@@ -7299,6 +7299,7 @@ impl GraphStore {
         memory: MemoryBudget,
     ) -> Result<Self> {
         let memory_lease = memory.reserve()?;
+        let memory = memory_lease.budget();
         let worker_threads = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
@@ -7322,6 +7323,11 @@ impl GraphStore {
         )
     }
 
+    /// Reports the budget this store actually reserved.
+    pub(crate) fn memory_budget(&self) -> MemoryBudget {
+        self._memory_lease.budget()
+    }
+
     pub fn from_database(db: Database) -> Result<Self> {
         Self::with_persist_mode(db, PersistMode::Buffer)
     }
@@ -7329,8 +7335,8 @@ impl GraphStore {
     /// Build a store on an already-open database with an explicit durability
     /// mode; [`GraphStore::open_with_mode`] opens the database first.
     pub fn with_persist_mode(db: Database, persist_mode: PersistMode) -> Result<Self> {
-        let budget = MemoryBudget::default();
-        let lease = budget.reserve()?;
+        let lease = MemoryBudget::default().reserve()?;
+        let budget = lease.budget();
         Self::with_memory(db, persist_mode, OpenMemory { budget, lease })
     }
 

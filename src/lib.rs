@@ -1540,11 +1540,10 @@ impl CraqleNode {
             store_mode.into_store_mode(),
             options.memory_budget,
         )?);
+        let budget = store.memory_budget();
         let search = Arc::new(match search_storage {
-            SearchStorage::Disk => {
-                SearchIndex::open_with_budget(root.join("search"), options.memory_budget)?
-            }
-            SearchStorage::Memory => SearchIndex::memory_with_budget(options.memory_budget)?,
+            SearchStorage::Disk => SearchIndex::open_with_budget(root.join("search"), budget)?,
+            SearchStorage::Memory => SearchIndex::memory_with_budget(budget)?,
         });
         let search_needs_rebuild = search.bind_store(&store)?.is_some();
         if search_needs_rebuild {

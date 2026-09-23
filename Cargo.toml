@@ -380,6 +380,10 @@ name = "maintenance_crash"
 path = "tests/maintenance_crash.rs"
 
 [[test]]
+name = "memory_budget"
+path = "tests/memory_budget.rs"
+
+[[test]]
 name = "merge_api"
 path = "tests/merge_api.rs"
 
