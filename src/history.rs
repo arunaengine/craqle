@@ -293,16 +293,12 @@ impl CraqleNode {
         }
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
         let topic = self.history_topic(&request.graph)?;
-        if let Some(id) = request.id
-            && let Some(receipt) = self.store.mutation_receipt(&id)?
+        let digest = restore_digest(request)?;
+        // A prepared receipt is finished below, like a retried `apply_mutation`.
+        if let Some(receipt) = self.restore_receipt(request, digest)?
+            && receipt.source != SourceOutcome::Prepared
         {
-            if receipt.graph != request.graph {
-                return Err(HistoryError::InvalidRequest.into());
-            }
-            // A prepared receipt is finished below, like a retried `apply_mutation`.
-            if receipt.source != SourceOutcome::Prepared {
-                return self.restored(topic, Some(receipt));
-            }
+            return self.restored(topic, Some(receipt));
         }
         let target = self.history_content(&TopicHistory {
             graph: request.graph.clone(),
@@ -327,8 +323,7 @@ impl CraqleNode {
         let policy = self.history_policy(&request.graph)?;
         auth.authorize(&request.graph, &policy, Action::Read)?;
         auth.authorize(&request.graph, &policy, Action::Write)?;
-        if let Some(id) = request.id
-            && let Some(receipt) = self.store.mutation_receipt(&id)?
+        if let Some(receipt) = self.restore_receipt(request, digest)?
             && receipt.source != SourceOutcome::Prepared
         {
             return self.restored(topic, Some(receipt));
@@ -357,9 +352,7 @@ impl CraqleNode {
                     .clone()
                     .zip(target.hints.license_digest);
         if changes.is_empty() && !hints_changed {
-            if let Some(id) = request.id {
-                self.record_noop(&request.graph, id)?;
-            }
+            self.record_noop(request, digest)?;
             return Ok(None);
         }
         let id = request.id.unwrap_or_default();
@@ -373,20 +366,49 @@ impl CraqleNode {
             EventExtras {
                 render_hints: Some(target.hints),
                 commit: request.commit.clone(),
+                request_digest: Some(digest),
             },
         )?;
         drop(write_guard);
         drop(reconcile_guard);
         self.finish_batch(&request.graph, batch)?;
         let receipt = self.store.mutation_receipt(&id)?;
-        if request.id.is_some() && receipt.is_none() {
-            self.record_noop(&request.graph, id)?;
+        if receipt.is_none() {
+            self.record_noop(request, digest)?;
         }
         self.restored(topic, receipt)
     }
 
-    /// Durably records that restore `id` changed nothing, so a retry returns `None` too.
-    fn record_noop(&self, graph: &GraphId, id: MutationId) -> Result<()> {
+    /// Returns the receipt of the restore id, failing when another request owns it.
+    fn restore_receipt(
+        &self,
+        request: &HistoryRestore,
+        digest: [u8; 32],
+    ) -> Result<Option<MutationReceipt>> {
+        let Some(id) = request.id else {
+            return Ok(None);
+        };
+        let Some(receipt) = self.store.mutation_receipt(&id)? else {
+            return Ok(None);
+        };
+        if receipt.graph != request.graph {
+            return Err(HistoryError::InvalidRequest.into());
+        }
+        if receipt.request_digest != digest {
+            return Err(UpdateError::InvalidChangeSet(
+                "mutation id is already bound to a different request".to_owned(),
+            )
+            .into());
+        }
+        Ok(Some(receipt))
+    }
+
+    /// Durably records that the restore changed nothing, so a retry returns `None` too.
+    fn record_noop(&self, request: &HistoryRestore, digest: [u8; 32]) -> Result<()> {
+        let Some(id) = request.id else {
+            return Ok(());
+        };
+        let graph = &request.graph;
         let done = RepairState {
             diagnostics: RepairOutcome::NotRequired,
             shacl: RepairOutcome::NotRequired,
@@ -404,7 +426,7 @@ impl CraqleNode {
                     id,
                     admission_sequence: 0,
                     graph: graph.clone(),
-                    request_digest: [0; 32],
+                    request_digest: digest,
                     event_id: None,
                     topic: None,
                     publish_after: None,
@@ -707,6 +729,19 @@ fn canonical_key(
     let [subject, predicate, object] =
         [subject, predicate, object].map(|term| term.canonical().unwrap_or(term));
     (subject, predicate, object)
+}
+
+/// Identifies a restore request, so a retry recomputes its changes against the current store.
+fn restore_digest(request: &HistoryRestore) -> Result<[u8; 32]> {
+    let identity = (
+        "craqle restore",
+        &request.graph,
+        &request.heads,
+        &request.expected,
+        &request.commit,
+    );
+    let bytes = postcard::to_allocvec(&identity).map_err(crate::store::StoreError::from)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 fn content_changes(graph: &GraphId, from: &Quads, to: &Quads) -> Vec<MaterializedQuadChange> {

@@ -1205,6 +1205,7 @@ impl RoCrateManager {
                 extras: crate::replication::EventExtras {
                     render_hints: Some(document.metadata.render_hints),
                     commit: self.commit.clone(),
+                    request_digest: None,
                 },
             })?;
         self.engine.rebuild_graph_diagnostics(&document.graph)?;

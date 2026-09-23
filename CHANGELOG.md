@@ -86,7 +86,9 @@ All notable changes to Craqle are documented here.
   never rewriting history. It first applies outstanding records of the graph's
   topic and diffs against the store, failing with a conflict if a head is still
   unapplied. A caller `MutationId` makes a repeated restore return its first
-  result. The optional expected-heads fence is best effort, not compare-and-swap:
+  result. The id names the graph, heads, expected heads and commit of the restore,
+  so a retry after a failed publish recomputes the changes against the current
+  store, and a different restore with the same id fails. The optional expected-heads fence is best effort, not compare-and-swap:
   Irokle can admit a remote operation after the check, and `HistoryRestored::extends`
   reports whether the new operation's parents are exactly the fenced heads. Every
   call checks graph permissions first and fails with `HistoryError` instead of
@@ -111,7 +113,8 @@ All notable changes to Craqle are documented here.
   replication is off or its durability does not publish, fails unchanged. A write that
   changes nothing publishes no event and stores no commit: `apply_rocrate_with` returns an
   empty batch and `restore_history` returns `None`. Commit metadata is not part of a
-  mutation id's request, so retrying a published mutation keeps its first commit.
+  mutation id's request, except for a restore, so retrying a published mutation keeps
+  its first commit.
 - `QueryOptions::results_only()` runs a query without per-operator statistics.
   `QueryOptions::default()` still collects them for compatibility.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a

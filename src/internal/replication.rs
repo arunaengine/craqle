@@ -365,12 +365,15 @@ struct LocalCommit<'a> {
     prepared_fence: Option<PreparedCommitFence<'a>>,
     render_hints: Option<CrateRenderHints>,
     commit: Option<crate::CommitInfo>,
+    request_digest: Option<[u8; 32]>,
 }
 
 /// What a local write publishes next to its quad changes.
 pub(crate) struct EventExtras {
     pub(crate) render_hints: Option<CrateRenderHints>,
     pub(crate) commit: Option<crate::CommitInfo>,
+    /// Identifies the request in its receipt instead of the published changes, as for a restore.
+    pub(crate) request_digest: Option<[u8; 32]>,
 }
 
 /// A strict RO-Crate change set and the versions it was prepared against.
@@ -817,6 +820,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: extras.render_hints,
             commit: extras.commit,
+            request_digest: extras.request_digest,
         })
     }
 
@@ -888,6 +892,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: None,
             commit,
+            request_digest: None,
         })?;
         drop(retry_guard);
         self.store
@@ -1241,6 +1246,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: Some(render_hints),
             commit: None,
+            request_digest: None,
         })
     }
 
@@ -1266,6 +1272,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: None,
             commit: None,
+            request_digest: None,
         })
     }
 
@@ -1293,6 +1300,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: None,
             commit: None,
+            request_digest: None,
         })
     }
 
@@ -1314,6 +1322,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: Some(render_hints),
             commit: None,
+            request_digest: None,
         })
     }
 
@@ -1336,6 +1345,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: None,
             commit: None,
+            request_digest: None,
         })
     }
 
@@ -1359,6 +1369,7 @@ impl ReplicationEngine {
             prepared_fence: Some(fence),
             render_hints: write.extras.render_hints,
             commit: write.extras.commit,
+            request_digest: write.extras.request_digest,
         })
     }
 
@@ -2246,6 +2257,7 @@ impl ReplicationEngine {
             prepared_fence: None,
             render_hints: None,
             commit: None,
+            request_digest: None,
         })
     }
 
@@ -2260,6 +2272,7 @@ impl ReplicationEngine {
             prepared_fence,
             render_hints,
             commit,
+            request_digest,
         } = commit;
         check_commit(commit.as_ref(), graph)?;
         if self.sync.is_none() && commit.is_some() {
@@ -2310,7 +2323,10 @@ impl ReplicationEngine {
             let frontier = sync
                 .topic_frontier(topic)
                 .map_err(|error| self.accepted_sync(mutation_id, error))?;
-            let request_digest = mutation_digest(graph, &changes, render_hints.as_ref())?;
+            let request_digest = match request_digest {
+                Some(digest) => digest,
+                None => mutation_digest(graph, &changes, render_hints.as_ref())?,
+            };
             let existing_receipt = self.store.mutation_receipt(&mutation_id)?;
             if existing_receipt.as_ref().is_some_and(|receipt| {
                 receipt.graph != *graph || receipt.request_digest != request_digest
@@ -2390,7 +2406,7 @@ impl ReplicationEngine {
                 diagnostics: checks.diagnostics,
                 id: mutation.mutation_id,
                 event_id: bound_receipt.event_id,
-                request_digest: mutation.request_digest,
+                request_digest,
                 topic: bound_receipt.topic,
                 publish_after: bound_receipt.publish_after.as_ref(),
                 topic_epoch: bound_receipt.topic_epoch,
@@ -2435,7 +2451,10 @@ impl ReplicationEngine {
         if changes.is_empty() && render_hints.is_none() {
             return self.empty_batch(graph);
         }
-        let request_digest = mutation_digest(graph, &changes, render_hints.as_ref())?;
+        let request_digest = match request_digest {
+            Some(digest) => digest,
+            None => mutation_digest(graph, &changes, render_hints.as_ref())?,
+        };
 
         if checks.structural_rules.enabled() {
             self.validate(graph, &changes)?;
@@ -2960,7 +2979,9 @@ impl ReplicationEngine {
                             .as_ref()
                             .and_then(|receipt| receipt.event_id)
                             .or(Some(*mutation.event_id.as_bytes())),
-                        request_digest: mutation.request_digest,
+                        request_digest: prior
+                            .as_ref()
+                            .map_or(mutation.request_digest, |receipt| receipt.request_digest),
                         topic: prior.as_ref().and_then(|receipt| receipt.topic),
                         publish_after: prior
                             .as_ref()

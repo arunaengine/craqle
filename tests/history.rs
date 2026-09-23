@@ -1502,6 +1502,72 @@ fn failed_restore_retries() {
 }
 
 #[test]
+fn restore_resumes_edited() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let content = fixture.content();
+    fixture.rename("Changed");
+    let admin = Irokle::builder()
+        .with_storage(fixture.native.storage().clone())
+        .with_signer(irokle::Ed25519Signer::from_bytes(&[78; 32]))
+        .build()
+        .unwrap();
+    fixture
+        .node
+        .add_irokle_peer(&fixture.graph, admin.peer_id())
+        .unwrap();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let control = admin.open_topic::<CraqleGraphEvent>(topic).unwrap();
+    control.remove_peer(fixture.native.peer_id()).unwrap();
+    let request = HistoryRestore {
+        id: Some(MutationId::new()),
+        commit: Some(commit("restore")),
+        ..fixture.restore(&original, None)
+    };
+    assert!(
+        fixture
+            .node
+            .restore_history(&AllowAllAuthorizer, &request)
+            .is_err()
+    );
+    control.add_peer(fixture.native.peer_id()).unwrap();
+    // The edit changes the delta the retry must compute, but not the request.
+    fixture.rename("Edited");
+    let other = HistoryRestore {
+        commit: Some(commit("other")),
+        ..request.clone()
+    };
+    assert!(
+        fixture
+            .node
+            .restore_history(&AllowAllAuthorizer, &other)
+            .is_err()
+    );
+    let restored = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(restored.id), request.id);
+    assert_eq!(fixture.content(), content);
+    let repeated = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap();
+    assert_eq!(repeated, Some(restored));
+    assert!(
+        fixture
+            .node
+            .restore_history(&AllowAllAuthorizer, &other)
+            .is_err()
+    );
+}
+
+#[test]
 fn hides_store_rejections() {
     let fixture = Fixture::new();
     let topic = fixture
