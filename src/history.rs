@@ -573,7 +573,8 @@ impl CraqleNode {
                         object,
                         dot,
                     } => {
-                        let dots = quads.entry((subject, predicate, object)).or_default();
+                        let dots = quads.entry(canonical_key(subject, predicate, object));
+                        let dots = dots.or_default();
                         if !dots.contains(&dot) {
                             dots.push(dot);
                         }
@@ -584,7 +585,7 @@ impl CraqleNode {
                         object,
                         witnessed,
                     } => {
-                        let key = (subject, predicate, object);
+                        let key = canonical_key(subject, predicate, object);
                         if let Some(dots) = quads.get_mut(&key) {
                             dots.retain(|dot| !witnessed.contains(dot));
                             if dots.is_empty() {
@@ -605,6 +606,17 @@ impl CraqleNode {
         );
         Ok(Content { quads, hints })
     }
+}
+
+/// Replays literal aliases onto the canonical quad, as replica apply does.
+fn canonical_key(
+    subject: EncodedTerm,
+    predicate: EncodedTerm,
+    object: EncodedTerm,
+) -> (EncodedTerm, EncodedTerm, EncodedTerm) {
+    let [subject, predicate, object] =
+        [subject, predicate, object].map(|term| term.canonical().unwrap_or(term));
+    (subject, predicate, object)
 }
 
 fn content_changes(graph: &GraphId, from: &Quads, to: &Quads) -> Vec<MaterializedQuadChange> {
