@@ -2850,8 +2850,10 @@ impl ReplicationEngine {
                 updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
             };
             let _receipt_guard = self.store.receipt_guard(&plan.id);
-            let mut batch = self.store.new_batch();
-            if self.store.stage_receipt(&mut batch, &receipt)?.is_none() {
+            // Any receipt already stored for this id is kept, even one of a reused id.
+            if self.store.mutation_receipt(&plan.id)?.is_none() {
+                let mut batch = self.store.new_batch();
+                self.store.stage_receipt(&mut batch, &receipt)?;
                 self.store.commit(batch)?;
             }
             return Ok(MergeResult { applied: false });
@@ -3443,6 +3445,7 @@ impl ReplicationEngine {
             existing.graph != receipt.graph
                 || existing.event_id != receipt.event_id
                 || existing.request_digest != receipt.request_digest
+                || existing.source != crate::sync::SourceOutcome::Prepared
         }) {
             // Receipts are local, so every order of arrival applies the same data.
             tracing::warn!(

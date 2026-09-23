@@ -6094,6 +6094,61 @@ mod tests {
         assert!(pair.replica.contains_graph(&graph).unwrap());
     }
 
+    #[test]
+    fn rewound_reused_ids() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:rewound-reused-ids");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "rewound"))
+            .unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let id = MutationId::new();
+        for value in ["first", "second"] {
+            pair.irokle
+                .open_topic::<CraqleGraphEvent>(topic)
+                .unwrap()
+                .publish(CraqleGraphEvent::Mutation {
+                    id,
+                    graph: graph.clone(),
+                    changes: vec![MaterializedQuadChange::Insert {
+                        graph: graph.clone(),
+                        subject: EncodedTerm::from_named_node(&graph.0),
+                        predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                        object: keyword_object(value),
+                    }],
+                    render_hints: None,
+                })
+                .unwrap();
+        }
+        pair.origin.reconcile_irokle().unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let cursor = topic_cursor(&pair.replica, topic).unwrap();
+        // Rewinding re-delivers records whose data and first receipt are already committed.
+        pair.replica
+            .repair_irokle_topic_cursor(
+                &AllowAllAuthorizer,
+                topic,
+                topic_cursor_digest(&cursor),
+                irokle::ActorClock::default(),
+            )
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(has_keyword(&pair.replica, &graph, "first"));
+        assert!(has_keyword(&pair.replica, &graph, "second"));
+        assert_eq!(
+            pair.origin.graph_fingerprint(&graph).unwrap(),
+            pair.replica.graph_fingerprint(&graph).unwrap()
+        );
+        assert_eq!(topic_cursor(&pair.replica, topic), Some(cursor));
+        assert!(
+            pair.replica
+                .list_rejected_replication_records(&AllowAllAuthorizer)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// An open must not fail on a reconcile a retry clears, or a node whose
     /// peer blipped once would refuse to start at all.
     #[test]
