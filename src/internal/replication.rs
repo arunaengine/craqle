@@ -780,6 +780,7 @@ impl ReplicationEngine {
     pub(crate) fn apply_changes_locked(
         &self,
         request: crate::sync::MutationRequest,
+        render_hints: Option<CrateRenderHints>,
     ) -> Result<Batch, UpdateError> {
         let changes = canonical_changes(request.changes);
         self.ensure_change_targets(&request.graph, &changes)?;
@@ -790,7 +791,7 @@ impl ReplicationEngine {
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
-            render_hints: None,
+            render_hints,
         })
     }
 

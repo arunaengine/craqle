@@ -230,7 +230,7 @@ fn compares_two_states() {
         .compare_history(&AllowAllAuthorizer, &request)
         .unwrap();
     assert_eq!(
-        names(&changes),
+        names(&changes.changes),
         (
             vec!["\"Changed\"".to_owned()],
             vec!["\"Original\"".to_owned()]
@@ -245,6 +245,7 @@ fn compares_two_states() {
             .node
             .compare_history(&AllowAllAuthorizer, &same)
             .unwrap()
+            .changes
             .is_empty()
     );
 }
@@ -620,6 +621,7 @@ fn skips_rejected_records() {
             .node
             .compare_history(&AllowAllAuthorizer, &compare)
             .unwrap()
+            .changes
             .is_empty()
     );
     let view = fixture
@@ -635,6 +637,68 @@ fn skips_rejected_records() {
     assert_eq!(
         view.node.graph_snapshot(&fixture.graph).unwrap(),
         fixture.node.graph_snapshot(&fixture.graph).unwrap()
+    );
+}
+
+#[test]
+fn restores_context_and_license() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let exported = fixture
+        .node
+        .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+        .unwrap();
+    let mut doc: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    doc["@context"] = serde_json::json!([
+        doc["@context"].clone(),
+        {"extra": "https://example.org/extra"}
+    ]);
+    let root = doc["@graph"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|value| value["@type"] == "Dataset")
+        .unwrap();
+    root["license"] = serde_json::json!("https://example.org/other");
+    fixture
+        .node
+        .apply_rocrate_document_checked_with_policy(
+            &AllowAllAuthorizer,
+            fixture.graph.clone(),
+            &doc.to_string(),
+            fixture.node.graph_policy(&fixture.graph).unwrap(),
+        )
+        .unwrap();
+    let changed = fixture
+        .node
+        .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+        .unwrap();
+    assert_ne!(changed, exported);
+    let diff = fixture
+        .node
+        .compare_history(
+            &AllowAllAuthorizer,
+            &HistoryCompare {
+                graph: fixture.graph.clone(),
+                from: fixture.heads(),
+                to: original.clone(),
+                max_operations: 100,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+    assert!(diff.hints.is_some());
+    fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &fixture.restore(&original, None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fixture
+            .node
+            .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+            .unwrap(),
+        exported
     );
 }
 

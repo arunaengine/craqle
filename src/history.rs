@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::PathBuf;
 
+use crate::core::{CrateRenderHints, TaggedRenderHints};
+use crate::sync::GraphHints;
 use crate::{
     Action, AuthorizationError, Authorizer, CraqleErrorKind, CraqleGraphEvent, CraqleNode,
     CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
@@ -84,7 +86,15 @@ pub struct HistoryCompare {
     pub max_bytes: usize,
 }
 
-/// Writes the graph content at `heads` back as one new local mutation.
+/// What turns the graph at `from` into the graph at `to`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryDiff {
+    pub changes: Vec<MaterializedQuadChange>,
+    /// The RO-Crate context and license at `to`, when they differ from `from`.
+    pub hints: Option<GraphHints>,
+}
+
+/// Writes the graph content and RO-Crate hints at `heads` back as one new local mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryRestore {
     pub graph: GraphId,
@@ -161,6 +171,12 @@ pub(crate) struct HistoryEntry {
 
 type Quads = BTreeMap<(EncodedTerm, EncodedTerm, EncodedTerm), Vec<Dot>>;
 
+/// Graph content replayed from history, with its last-writer-wins RO-Crate hints.
+struct Content {
+    quads: Quads,
+    hints: CrateRenderHints,
+}
+
 impl CraqleNode {
     /// Current causal heads of a graph's history; requires graph READ permission.
     pub fn graph_heads(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<Vec<OpId>> {
@@ -209,13 +225,13 @@ impl CraqleNode {
         Ok(HistoryPage { operations, next })
     }
 
-    /// Returns the quad changes that turn the content at `from` into the content at `to`.
+    /// Returns the quad and hint changes that turn the content at `from` into the one at `to`.
     /// Requires graph READ permission; a side that exceeds its bounds fails the call.
     pub fn compare_history(
         &self,
         auth: &dyn Authorizer,
         request: &HistoryCompare,
-    ) -> Result<Vec<MaterializedQuadChange>> {
+    ) -> Result<HistoryDiff> {
         auth.authorize(
             &request.graph,
             &self.history_policy(&request.graph)?,
@@ -233,7 +249,14 @@ impl CraqleNode {
         };
         let from = side(&request.from)?;
         let to = side(&request.to)?;
-        Ok(content_changes(&request.graph, &from, &to))
+        Ok(HistoryDiff {
+            changes: content_changes(&request.graph, &from.quads, &to.quads),
+            hints: (from.hints != to.hints).then(|| GraphHints {
+                context: to.hints.context,
+                license: to.hints.license,
+                license_digest: to.hints.license_digest,
+            }),
+        })
     }
 
     /// Requires graph READ and WRITE permission. Writes the content at `heads` as one new
@@ -290,17 +313,27 @@ impl CraqleNode {
             .into_iter()
             .map(|quad| ((quad.subject, quad.predicate, quad.object), quad.dots))
             .collect();
-        let changes = content_changes(&request.graph, &current, &target);
-        if changes.is_empty() {
+        let changes = content_changes(&request.graph, &current, &target.quads);
+        let hints_changed = self.store.graph_context(&request.graph)? != target.hints.context
+            || self.store.graph_license(&request.graph)?
+                != target
+                    .hints
+                    .license
+                    .clone()
+                    .zip(target.hints.license_digest);
+        if changes.is_empty() && !hints_changed {
             return Ok(None);
         }
         let id = request.id.unwrap_or_default();
-        let batch = self.replication.apply_changes_locked(MutationRequest {
-            id,
-            admission_sequence: None,
-            graph: request.graph.clone(),
-            changes,
-        })?;
+        let batch = self.replication.apply_changes_locked(
+            MutationRequest {
+                id,
+                admission_sequence: None,
+                graph: request.graph.clone(),
+                changes,
+            },
+            Some(target.hints),
+        )?;
         drop(write_guard);
         drop(reconcile_guard);
         self.finish_batch(&request.graph, batch)?;
@@ -512,8 +545,9 @@ impl CraqleNode {
     }
 
     /// Replays the observed-remove quad set of the heads in memory.
-    fn history_content(&self, query: &TopicHistory) -> Result<Quads> {
+    fn history_content(&self, query: &TopicHistory) -> Result<Content> {
         let mut quads = Quads::new();
+        let mut hints: Option<TaggedRenderHints> = None;
         for entry in self.history_entries(query)? {
             let Some(record) = entry.record.filter(|_| !entry.rejected) else {
                 continue;
@@ -526,6 +560,11 @@ impl CraqleNode {
                 Err(error) if !error.rejects_record() => return Err(error.into()),
                 Ok(None) | Err(_) => continue,
             };
+            if let Some(next) = mutation.render_hints
+                && hints.as_ref().is_none_or(|current| next.tag > current.tag)
+            {
+                hints = Some(next);
+            }
             for op in mutation.batch.ops {
                 match op {
                     QuadOp::Add {
@@ -556,7 +595,15 @@ impl CraqleNode {
                 }
             }
         }
-        Ok(quads)
+        let hints = hints.map_or(
+            CrateRenderHints {
+                context: None,
+                license: None,
+                license_digest: None,
+            },
+            |tagged| tagged.hints,
+        );
+        Ok(Content { quads, hints })
     }
 }
 

@@ -139,8 +139,8 @@ pub use auth::{
     PermissionGrant, PermissionLevel,
 };
 pub use history::{
-    GraphHistory, HistoryCompare, HistoryError, HistoryLog, HistoryOperation, HistoryPage,
-    HistoryProjection, HistoryRestore, HistoryRestored,
+    GraphHistory, HistoryCompare, HistoryDiff, HistoryError, HistoryLog, HistoryOperation,
+    HistoryPage, HistoryProjection, HistoryRestore, HistoryRestored,
 };
 pub use irokle;
 

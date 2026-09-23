@@ -77,12 +77,13 @@ All notable changes to Craqle are documented here.
   stores fill the process budget; explicit budgets keep their exact sizes.
 - Graph history for Irokle-backed graphs. `graph_heads` lists the current heads.
   `history_log` pages signed operations newest first with parents, actor, sequence
-  and recorded quad changes. `compare_history` returns the quad changes between two
-  head sets. `project_history` replays heads into a separate disposable store.
-  `restore_history` writes the content at chosen heads as one new validated local
-  mutation, never rewriting history. It first applies outstanding records of the
-  graph's topic and diffs against the store, failing with a conflict if a head is
-  still unapplied. A caller `MutationId` makes a repeated restore return its first
+  and recorded quad changes. `compare_history` returns the quad changes and any
+  RO-Crate context or license change between two head sets. `project_history`
+  replays heads into a separate disposable store. `restore_history` writes the
+  quads, context and license at chosen heads as one new validated local mutation,
+  never rewriting history. It first applies outstanding records of the graph's
+  topic and diffs against the store, failing with a conflict if a head is still
+  unapplied. A caller `MutationId` makes a repeated restore return its first
   result. The optional expected-heads fence is best effort, not compare-and-swap:
   Irokle can admit a remote operation after the check, and `HistoryRestored::extends`
   reports whether the new operation's parents are exactly the fenced heads. Every
