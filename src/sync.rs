@@ -1315,7 +1315,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
     }
 
     fn topic_heads(&self, topic: irokle::TopicId) -> SyncResult<BTreeSet<irokle::OpId>> {
-        Ok(self.node.open_topic::<CraqleGraphEvent>(topic)?.heads()?)
+        Ok(self.node.storage().heads(&topic)?)
     }
 
     fn topic_records_since(

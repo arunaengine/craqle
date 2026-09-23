@@ -150,7 +150,7 @@ impl CraqleNode {
     }
 
     /// Reads at most `limit` operations newest first; requires graph READ permission.
-    /// Exceeding `max_bytes` fails the page instead of shortening it.
+    /// More heads than `limit` or more than `max_bytes` fail the page instead of shortening it.
     pub fn history_log(&self, auth: &dyn Authorizer, request: &HistoryLog) -> Result<HistoryPage> {
         auth.authorize(
             &request.graph,
@@ -331,9 +331,12 @@ impl CraqleNode {
             let known = sync.history_generation(query.topic, id)?;
             Ok((known.ok_or(HistoryError::Unavailable(id))?, id))
         };
-        let mut pending = query
-            .heads
-            .iter()
+        let heads = query.heads.iter().collect::<BTreeSet<_>>();
+        if heads.len() > query.limit {
+            return Err(HistoryError::OperationLimit.into());
+        }
+        let mut pending = heads
+            .into_iter()
             .map(|id| generation(*id))
             .collect::<Result<BinaryHeap<_>>>()?;
         let mut seen = BTreeSet::new();
