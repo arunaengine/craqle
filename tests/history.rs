@@ -125,6 +125,7 @@ impl Fixture {
             graph: self.graph.clone(),
             heads: heads.to_vec(),
             expected,
+            id: None,
             max_operations: 100,
             max_bytes: 1024 * 1024,
         }
@@ -264,6 +265,8 @@ fn restores_as_new_operation() {
         .restore_history(&AllowAllAuthorizer, &fixture.restore(&original, None))
         .unwrap()
         .unwrap();
+    assert!(restored.extends(&changed));
+    let restored = restored.operation;
     assert_eq!(fixture.heads(), vec![restored]);
     assert_eq!(fixture.content(), original_content);
     assert_eq!(
@@ -337,11 +340,97 @@ fn fences_current_heads() {
         .node
         .restore_history(
             &AllowAllAuthorizer,
-            &fixture.restore(&original, Some(current)),
+            &fixture.restore(&original, Some(current.clone())),
         )
         .unwrap()
         .unwrap();
-    assert_eq!(fixture.heads(), vec![restored]);
+    assert!(restored.extends(&current));
+    assert_eq!(fixture.heads(), vec![restored.operation]);
+}
+
+#[test]
+fn repeats_restore_by_id() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    fixture.rename("Changed");
+    let mut request = fixture.restore(&original, None);
+    request.id = Some(craqle::MutationId::new());
+    let first = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap()
+        .unwrap();
+    fixture.rename("Again");
+    let heads = fixture.heads();
+    let second = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second, first);
+    assert_eq!(Some(second.id), request.id);
+    assert_eq!(fixture.heads(), heads);
+}
+
+#[test]
+fn restores_over_unapplied_records() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let original_content = fixture.content();
+    for name in ["Two", "Three", "Four", "Five"] {
+        fixture.rename(name);
+    }
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::QuadChanges {
+            graph: fixture.graph.clone(),
+            changes: vec![MaterializedQuadChange::Insert {
+                graph: fixture.graph.clone(),
+                subject: EncodedTerm("<urn:late>".into()),
+                predicate: EncodedTerm("<urn:p>".into()),
+                object: EncodedTerm("\"late\"".into()),
+            }],
+        })
+        .unwrap();
+    let mut walk = HistoryLog {
+        graph: fixture.graph.clone(),
+        heads: original.clone(),
+        limit: 100,
+        max_bytes: 1024 * 1024,
+    };
+    let past = fixture
+        .node
+        .history_log(&AllowAllAuthorizer, &walk)
+        .unwrap();
+    assert!(past.next.is_empty());
+    let mut request = fixture.restore(&original, None);
+    request.max_operations = past.operations.len();
+    fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.content(), original_content);
+    fixture.node.reconcile_irokle().unwrap();
+    assert_eq!(fixture.content(), original_content);
+    walk.heads = fixture.heads();
+    walk.limit = past.operations.len();
+    assert_eq!(
+        fixture
+            .node
+            .history_log(&AllowAllAuthorizer, &walk)
+            .unwrap()
+            .operations
+            .len(),
+        past.operations.len()
+    );
 }
 
 #[test]

@@ -630,6 +630,14 @@ fn decode_topic_cursor(
     Ok(envelope.payload)
 }
 
+/// The per-actor positions an applied topic cursor has consumed.
+pub(crate) fn applied_clock(
+    topic: irokle::TopicId,
+    bytes: &[u8],
+) -> SyncResult<irokle::ActorClock> {
+    Ok(decode_topic_cursor(topic, bytes)?.clock)
+}
+
 pub fn topic_cursor_digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }

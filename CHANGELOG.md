@@ -80,7 +80,12 @@ All notable changes to Craqle are documented here.
   and recorded quad changes. `compare_history` returns the quad changes between two
   head sets. `project_history` replays heads into a separate disposable store.
   `restore_history` writes the content at chosen heads as one new validated local
-  mutation, never rewriting history, with an optional expected-heads fence. Every
+  mutation, never rewriting history. It first applies outstanding records of the
+  graph's topic and diffs against the store, failing with a conflict if a head is
+  still unapplied. A caller `MutationId` makes a repeated restore return its first
+  result. The optional expected-heads fence is best effort, not compare-and-swap:
+  Irokle can admit a remote operation after the check, and `HistoryRestored::extends`
+  reports whether the new operation's parents are exactly the fenced heads. Every
   call checks graph permissions first and fails with `HistoryError` instead of
   returning partial results when its bounds are exceeded. Records that cannot be
   decoded, target another graph, or were rejected by the store are listed as

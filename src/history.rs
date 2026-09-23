@@ -89,10 +89,31 @@ pub struct HistoryCompare {
 pub struct HistoryRestore {
     pub graph: GraphId,
     pub heads: Vec<OpId>,
-    /// When set, the current heads must equal these or the restore fails unchanged.
+    /// Best effort, not compare-and-swap: the restore fails unchanged unless the current heads
+    /// equal these, but Irokle can still admit a remote operation before the new one is signed.
     pub expected: Option<Vec<OpId>>,
+    /// Repeating a restore with the same id returns its first result instead of writing again.
+    pub id: Option<MutationId>,
     pub max_operations: usize,
     pub max_bytes: usize,
+}
+
+/// The operation a restore wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryRestored {
+    pub id: MutationId,
+    pub operation: OpId,
+    pub parents: Vec<OpId>,
+    /// The writing actor's previous operation, which Irokle always adds as a parent.
+    pub previous: Option<OpId>,
+}
+
+impl HistoryRestored {
+    /// Whether the parents are exactly `heads` plus `previous`, so no other operation joined.
+    pub fn extends(&self, heads: &[OpId]) -> bool {
+        let expected = heads.iter().chain(&self.previous).collect::<BTreeSet<_>>();
+        self.parents.iter().collect::<BTreeSet<_>>() == expected
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -110,6 +131,8 @@ pub enum HistoryError {
     HeadsChanged,
     #[error("history heads describe a deleted graph")]
     GraphDeleted,
+    #[error("graph history heads are not yet applied to the store")]
+    NotApplied,
 }
 
 impl HistoryError {
@@ -117,7 +140,7 @@ impl HistoryError {
         match self {
             Self::InvalidRequest | Self::Unavailable(_) => CraqleErrorKind::InvalidInput,
             Self::OperationLimit | Self::ByteLimit => CraqleErrorKind::ResourceLimit,
-            Self::HeadsChanged | Self::GraphDeleted => CraqleErrorKind::Conflict,
+            Self::HeadsChanged | Self::GraphDeleted | Self::NotApplied => CraqleErrorKind::Conflict,
         }
     }
 }
@@ -214,38 +237,64 @@ impl CraqleNode {
     }
 
     /// Requires graph READ and WRITE permission. Writes the content at `heads` as one new
-    /// validated local mutation and returns its operation, or `None` when nothing changes.
+    /// validated local mutation, or returns `None` when nothing changes.
     pub fn restore_history(
         &self,
         auth: &dyn Authorizer,
         request: &HistoryRestore,
-    ) -> Result<Option<OpId>> {
+    ) -> Result<Option<HistoryRestored>> {
         let policy = self.history_policy(&request.graph)?;
         auth.authorize(&request.graph, &policy, Action::Read)?;
         auth.authorize(&request.graph, &policy, Action::Write)?;
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
-        let mut query = TopicHistory {
+        let topic = self.history_topic(&request.graph)?;
+        if let Some(id) = request.id
+            && let Some(receipt) = self.store.mutation_receipt(&id)?
+        {
+            if receipt.graph != request.graph {
+                return Err(HistoryError::InvalidRequest.into());
+            }
+            return self.restored(topic, Some(receipt));
+        }
+        let target = self.history_content(&TopicHistory {
             graph: request.graph.clone(),
-            topic: self.history_topic(&request.graph)?,
+            topic,
             heads: request.heads.clone(),
             limit: request.max_operations,
             max_bytes: request.max_bytes,
-        };
-        let target = self.history_content(&query)?;
-        // Deletes remove the dots their causal past observed, so diff against the current heads.
+        })?;
+        let reconcile_guard = self
+            .reconcile_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pass = self.reconcile_topic(sync, topic)?;
+        if !pass.applied.is_empty() {
+            self.persist_fjall()?;
+        }
+        if let Some(error) = pass.stalled {
+            return Err(error);
+        }
         let write_guard = self.store.graph_write_guard(&request.graph);
-        query.heads = sync.topic_heads(query.topic)?.into_iter().collect();
+        let heads = sync.topic_heads(topic)?.into_iter().collect::<Vec<_>>();
         if let Some(expected) = &request.expected
-            && expected.iter().collect::<BTreeSet<_>>() != query.heads.iter().collect()
+            && expected.iter().collect::<BTreeSet<_>>() != heads.iter().collect()
         {
             return Err(HistoryError::HeadsChanged.into());
         }
-        let current = self.history_content(&query)?;
+        // The diff must see every record the new operation's deletes will cover.
+        self.ensure_applied(topic, &heads)?;
+        let current = self
+            .store
+            .graph_snapshot(&request.graph)?
+            .quads
+            .into_iter()
+            .map(|quad| ((quad.subject, quad.predicate, quad.object), quad.dots))
+            .collect();
         let changes = content_changes(&request.graph, &current, &target);
         if changes.is_empty() {
             return Ok(None);
         }
-        let id = MutationId::new();
+        let id = request.id.unwrap_or_default();
         let batch = self.replication.apply_changes_locked(MutationRequest {
             id,
             admission_sequence: None,
@@ -253,12 +302,53 @@ impl CraqleNode {
             changes,
         })?;
         drop(write_guard);
+        drop(reconcile_guard);
         self.finish_batch(&request.graph, batch)?;
-        Ok(self
-            .store
-            .mutation_receipt(&id)?
-            .and_then(|receipt| receipt.event_id)
-            .map(OpId::from_bytes))
+        self.restored(topic, self.store.mutation_receipt(&id)?)
+    }
+
+    fn restored(
+        &self,
+        topic: irokle::TopicId,
+        receipt: Option<crate::MutationReceipt>,
+    ) -> Result<Option<HistoryRestored>> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let Some((id, event)) = receipt.and_then(|receipt| Some((receipt.id, receipt.event_id?)))
+        else {
+            return Ok(None);
+        };
+        let operation = OpId::from_bytes(event);
+        let body = sync
+            .history_entry(topic, operation)?
+            .ok_or(HistoryError::Unavailable(operation))?
+            .op
+            .signed
+            .body;
+        Ok(Some(HistoryRestored {
+            id,
+            operation,
+            parents: body.deps.into_iter().collect(),
+            previous: body.actor_prev,
+        }))
+    }
+
+    /// Fails unless reconciliation has consumed every head, and so their causal past.
+    fn ensure_applied(&self, topic: irokle::TopicId, heads: &[OpId]) -> Result<()> {
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let clock = match self.store.applied_topic_clock(topic.as_bytes())? {
+            Some(bytes) => crate::sync::applied_clock(topic, &bytes)?,
+            None => irokle::ActorClock::default(),
+        };
+        for head in heads {
+            let entry = sync
+                .history_entry(topic, *head)?
+                .ok_or(HistoryError::Unavailable(*head))?;
+            let body = &entry.op.signed.body;
+            if clock.get(&body.actor_id) < body.actor_seq {
+                return Err(HistoryError::NotApplied.into());
+            }
+        }
+        Ok(())
     }
 
     /// Requires current graph READ permission and a destination that does not exist.
