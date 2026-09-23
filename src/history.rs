@@ -318,6 +318,10 @@ impl CraqleNode {
             return Err(error);
         }
         let write_guard = self.store.graph_write_guard(&request.graph);
+        // Reconcile may have applied a policy that removes the caller's access.
+        let policy = self.history_policy(&request.graph)?;
+        auth.authorize(&request.graph, &policy, Action::Read)?;
+        auth.authorize(&request.graph, &policy, Action::Write)?;
         let heads = sync.topic_heads(topic)?.into_iter().collect::<Vec<_>>();
         if let Some(expected) = &request.expected
             && expected.iter().collect::<BTreeSet<_>>() != heads.iter().collect()

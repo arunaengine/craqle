@@ -1385,6 +1385,61 @@ fn replays_plain_mutations() {
 }
 
 #[test]
+fn restore_rechecks_policy() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    fixture.rename("Changed");
+    let content = fixture.content();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let actor = irokle::actor_id_for(topic, fixture.native.peer_id());
+    // Written by the node's own peer, so reconcile applies it without remote policy checks.
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::Policy {
+            graph: fixture.graph.clone(),
+            tagged: craqle::TaggedGraphPolicy {
+                policy: GraphPolicy {
+                    public: true,
+                    permission_paths: vec!["/revoked".into()],
+                },
+                tag: craqle::PolicyTag {
+                    counter: 100,
+                    actor: craqle::ActorId::from_bytes(*actor.as_bytes()),
+                },
+            },
+        })
+        .unwrap();
+    let auth = |graph: &GraphId, policy: &GraphPolicy, action: Action| {
+        if action == Action::Read
+            || policy
+                .permission_paths
+                .iter()
+                .any(|path| path == "/history")
+        {
+            return Ok(());
+        }
+        Err(AuthorizationError::PermissionDenied {
+            graph: graph.to_string(),
+            action,
+        })
+    };
+    let error = fixture
+        .node
+        .restore_history(&auth, &fixture.restore(&original, None))
+        .unwrap_err();
+    assert_eq!(error.kind(), CraqleErrorKind::Unauthorized);
+    let policy = fixture.node.graph_policy(&fixture.graph).unwrap();
+    assert_eq!(policy.permission_paths, ["/revoked"]);
+    assert_eq!(fixture.content(), content);
+}
+
+#[test]
 fn rejects_reused_ids() {
     let fixture = Fixture::new();
     let topic = fixture
