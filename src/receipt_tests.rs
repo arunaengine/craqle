@@ -90,7 +90,7 @@ fn persistence_reports_acceptance() {
         .apply_mutation(&AllowAllAuthorizer, request.clone())
         .unwrap();
     request.admission_sequence = Some(prepared.admission_sequence);
-    let accepted = node.replication.apply_mutation(request).unwrap();
+    let accepted = node.replication.apply_mutation(request, None).unwrap();
     assert_eq!(accepted.source, SourceOutcome::Applied);
     let MutationStatus::Known(accepted) = node
         .replication

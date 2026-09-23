@@ -98,6 +98,13 @@ fn mutation_digest(
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+fn check_commit(commit: Option<&crate::CommitInfo>, graph: &GraphId) -> Result<(), UpdateError> {
+    match commit.map(|commit| commit.check(graph)) {
+        Some(Err(reason)) => Err(UpdateError::InvalidChangeSet(reason.to_owned())),
+        Some(Ok(())) | None => Ok(()),
+    }
+}
+
 /// Writes literal aliases in canonical form; deletes also remove an alias stored before canonicalization.
 pub(crate) fn canonical_changes(
     changes: Vec<MaterializedQuadChange>,
@@ -357,6 +364,22 @@ struct LocalCommit<'a> {
     checks: WriteChecks,
     prepared_fence: Option<PreparedCommitFence<'a>>,
     render_hints: Option<CrateRenderHints>,
+    commit: Option<crate::CommitInfo>,
+}
+
+/// What a local write publishes next to its quad changes.
+pub(crate) struct EventExtras {
+    pub(crate) render_hints: Option<CrateRenderHints>,
+    pub(crate) commit: Option<crate::CommitInfo>,
+}
+
+/// A strict RO-Crate change set and the versions it was prepared against.
+pub(crate) struct PreparedWrite<'a> {
+    pub(crate) graph: &'a GraphId,
+    pub(crate) changes: Vec<MaterializedQuadChange>,
+    pub(crate) data_version: Option<[u8; 32]>,
+    pub(crate) shape_versions: &'a [(GraphId, [u8; 32])],
+    pub(crate) extras: EventExtras,
 }
 
 struct PreparedCommitFence<'a> {
@@ -781,7 +804,7 @@ impl ReplicationEngine {
     pub(crate) fn apply_changes_locked(
         &self,
         request: crate::sync::MutationRequest,
-        render_hints: Option<CrateRenderHints>,
+        extras: EventExtras,
     ) -> Result<Batch, UpdateError> {
         let changes = canonical_changes(request.changes);
         self.ensure_change_targets(&request.graph, &changes)?;
@@ -792,14 +815,17 @@ impl ReplicationEngine {
             changes,
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
-            render_hints,
+            render_hints: extras.render_hints,
+            commit: extras.commit,
         })
     }
 
     pub(crate) fn apply_mutation(
         &self,
         mut request: crate::sync::MutationRequest,
+        commit: Option<crate::CommitInfo>,
     ) -> Result<crate::sync::MutationReceipt, UpdateError> {
+        check_commit(commit.as_ref(), &request.graph)?;
         request.changes = canonical_changes(request.changes);
         self.ensure_change_targets(&request.graph, &request.changes)?;
         if request.changes.is_empty() {
@@ -858,6 +884,7 @@ impl ReplicationEngine {
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: None,
+            commit,
         })?;
         drop(retry_guard);
         self.store
@@ -1210,6 +1237,7 @@ impl ReplicationEngine {
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: Some(render_hints),
+            commit: None,
         })
     }
 
@@ -1234,6 +1262,7 @@ impl ReplicationEngine {
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
         })
     }
 
@@ -1260,6 +1289,7 @@ impl ReplicationEngine {
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
         })
     }
 
@@ -1280,6 +1310,7 @@ impl ReplicationEngine {
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: None,
             render_hints: Some(render_hints),
+            commit: None,
         })
     }
 
@@ -1301,32 +1332,30 @@ impl ReplicationEngine {
             checks: WriteChecks::normal(DiagnosticsMode::Deferred),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
         })
     }
 
     pub(crate) fn apply_bulk_prepared(
         &self,
-        graph: &GraphId,
-        changes: Vec<MaterializedQuadChange>,
-        data_version: Option<[u8; 32]>,
-        shape_versions: &[(GraphId, [u8; 32])],
-        render_hints: CrateRenderHints,
+        write: PreparedWrite<'_>,
     ) -> Result<Batch, UpdateError> {
-        let changes = canonical_changes(changes);
-        self.ensure_change_targets(graph, &changes)?;
+        let changes = canonical_changes(write.changes);
+        self.ensure_change_targets(write.graph, &changes)?;
         let fence = PreparedCommitFence {
-            data_version,
-            shape_versions,
+            data_version: write.data_version,
+            shape_versions: write.shape_versions,
         };
         self.commit_with_plan(LocalCommit {
             id: None,
             write_locked: false,
-            graph,
+            graph: write.graph,
             changes,
             // Preparation already evaluated structural rules over this exact encoded candidate.
             checks: WriteChecks::bypassing_structural_rules(DiagnosticsMode::Deferred),
             prepared_fence: Some(fence),
-            render_hints: Some(render_hints),
+            render_hints: write.extras.render_hints,
+            commit: write.extras.commit,
         })
     }
 
@@ -2213,6 +2242,7 @@ impl ReplicationEngine {
             checks: WriteChecks::normal(DiagnosticsMode::Immediate),
             prepared_fence: None,
             render_hints: None,
+            commit: None,
         })
     }
 
@@ -2226,7 +2256,14 @@ impl ReplicationEngine {
             checks,
             prepared_fence,
             render_hints,
+            commit,
         } = commit;
+        check_commit(commit.as_ref(), graph)?;
+        if self.sync.is_none() && commit.is_some() {
+            return Err(UpdateError::InvalidChangeSet(
+                "commit info needs a write that publishes an Irokle event".to_owned(),
+            ));
+        }
         let mutation_id = id.unwrap_or_else(new_mutation);
 
         // Serializes the permanent tombstone check with every local write and
@@ -2329,6 +2366,7 @@ impl ReplicationEngine {
                         graph: graph.clone(),
                         changes,
                         render_hints,
+                        commit,
                     },
                 )
                 .map_err(|error| self.accepted_sync(mutation_id, error))?;

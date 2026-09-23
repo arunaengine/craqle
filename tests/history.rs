@@ -128,6 +128,7 @@ impl Fixture {
             id: None,
             max_operations: 100,
             max_bytes: 1024 * 1024,
+            commit: None,
         }
     }
 }
@@ -937,6 +938,7 @@ fn preserves_concurrent_heads() {
                 id: None,
                 max_operations: 100,
                 max_bytes: 1024 * 1024,
+                commit: None,
             },
         )
         .unwrap()

@@ -93,6 +93,23 @@ All notable changes to Craqle are documented here.
   returning partial results when its bounds are exceeded. Records that cannot be
   decoded, target another graph, or were rejected by the store are listed as
   rejected and skipped in every replay, as reconciliation skips them.
+- Commit metadata for graph history. `CommitInfo` holds a message, author name, author
+  email, author time in Unix milliseconds, the author's time zone offset in minutes, and
+  `sources`: `HistoryPoint` heads of other graphs, such as a fork point or a merged
+  branch. The caller sets every field; Craqle stores sources without checking that they
+  exist. The info is signed into a new `CraqleGraphEvent::CommittedMutation` event, so
+  every peer reads the same commit from `HistoryOperation::commit`.
+  `apply_mutation_with` takes a `MutationCommit`, `apply_rocrate_with` takes a
+  `RoCrateWrite` with the arguments of
+  `apply_rocrate_document_checked_with_policy_and_durability_as` plus an optional commit,
+  and `HistoryRestore::commit` records a revert message. The `CommitInfo::MAX_*` bounds
+  limit the message, author name and email, time zone offset, number of sources, and
+  heads per source. An author field with a control character, a source without heads, a
+  repeated source graph, or a source naming the commit's own graph is also invalid.
+  Invalid info fails a local write with `InvalidInput` and makes a replicated record a
+  rejected record. A write that publishes no Irokle event cannot keep a commit and fails
+  unchanged. Commit metadata is not part of a mutation id's request, so retrying a
+  published mutation keeps its first commit.
 - `QueryOptions::results_only()` runs a query without per-operator statistics.
   `QueryOptions::default()` still collects them for compatibility.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a
@@ -118,6 +135,9 @@ All notable changes to Craqle are documented here.
 - Applications that depend directly on Irokle must use the same revision as Craqle,
   or use the `craqle::irokle` re-export so both libraries share identical types.
 - Upgrade replication peers together: Irokle 0.3 uses the `irokle/sync/2` protocol.
+  Peers without `CraqleGraphEvent::CommittedMutation` reject such records. Exhaustive
+  matches over `CraqleGraphEvent` need an arm for it; it is appended last, so stored
+  events keep decoding.
 - Back up Irokle's Fjall database before its first open with this version. Irokle
   upgrades schema 1 to schema 2 in place and resumes an interrupted migration.
   Older Irokle binaries reject schema 2; rollback requires the pre-upgrade backup.

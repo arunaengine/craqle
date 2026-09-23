@@ -439,11 +439,20 @@ pub struct AppendDataEntitiesReport {
 /// RO-Crate lifecycle management built on the replication engine.
 pub(crate) struct RoCrateManager {
     engine: Arc<ReplicationEngine>,
+    /// Signed into the event of each prepared commit.
+    commit: Option<crate::CommitInfo>,
 }
 
 impl RoCrateManager {
     pub(crate) fn new(engine: Arc<ReplicationEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            commit: None,
+        }
+    }
+
+    pub(crate) fn with_commit(self, commit: Option<crate::CommitInfo>) -> Self {
+        Self { commit, ..self }
     }
 
     pub(crate) fn crate_version(&self, graph_id: &GraphId) -> Result<RoCrateVersion, RoCrateError> {
@@ -1186,13 +1195,18 @@ impl RoCrateManager {
             PreparedGraphBase::New => None,
             PreparedGraphBase::Existing { data_version } => Some(data_version),
         };
-        let batch = self.engine.apply_bulk_prepared(
-            &document.graph,
-            document.encoded_changes,
-            expected_data_version,
-            shape_versions,
-            document.metadata.render_hints,
-        )?;
+        let batch = self
+            .engine
+            .apply_bulk_prepared(crate::replication::PreparedWrite {
+                graph: &document.graph,
+                changes: document.encoded_changes,
+                data_version: expected_data_version,
+                shape_versions,
+                extras: crate::replication::EventExtras {
+                    render_hints: Some(document.metadata.render_hints),
+                    commit: self.commit.clone(),
+                },
+            })?;
         self.engine.rebuild_graph_diagnostics(&document.graph)?;
         Ok(batch)
     }

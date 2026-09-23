@@ -4,11 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::PathBuf;
 
 use crate::core::{CrateRenderHints, TaggedRenderHints};
+use crate::replication::{EventExtras, UpdateError};
 use crate::sync::GraphHints;
 use crate::{
-    Action, AuthorizationError, Authorizer, CraqleErrorKind, CraqleGraphEvent, CraqleNode,
-    CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
-    MemoryBudget, MutationId, MutationRequest, QuadOp, Result, SearchStorage,
+    Action, AuthorizationError, Authorizer, CommitInfo, CraqleErrorKind, CraqleGraphEvent,
+    CraqleNode, CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy,
+    MaterializedQuadChange, MemoryBudget, MutationId, MutationRequest, QuadOp, Result,
+    SearchStorage,
 };
 use irokle::OpId;
 use irokle::reducer::EventRecord;
@@ -68,11 +70,17 @@ impl HistoryOperation {
             Some(
                 CraqleGraphEvent::QuadChanges { changes, .. }
                 | CraqleGraphEvent::RoCrateMutation { changes, .. }
-                | CraqleGraphEvent::Mutation { changes, .. },
+                | CraqleGraphEvent::Mutation { changes, .. }
+                | CraqleGraphEvent::CommittedMutation { changes, .. },
             ) => changes,
             Some(CraqleGraphEvent::Policy { .. } | CraqleGraphEvent::GraphDeleted { .. })
             | None => &[],
         }
+    }
+
+    /// The commit metadata signed with this operation, if any.
+    pub fn commit(&self) -> Option<&CommitInfo> {
+        self.event.as_ref().and_then(CraqleGraphEvent::commit)
     }
 }
 
@@ -106,6 +114,8 @@ pub struct HistoryRestore {
     pub id: Option<MutationId>,
     pub max_operations: usize,
     pub max_bytes: usize,
+    /// Signed with the new operation, like a revert message.
+    pub commit: Option<CommitInfo>,
 }
 
 /// The operation a restore wrote.
@@ -269,6 +279,13 @@ impl CraqleNode {
         let policy = self.history_policy(&request.graph)?;
         auth.authorize(&request.graph, &policy, Action::Read)?;
         auth.authorize(&request.graph, &policy, Action::Write)?;
+        if let Some(Err(reason)) = request
+            .commit
+            .as_ref()
+            .map(|commit| commit.check(&request.graph))
+        {
+            return Err(UpdateError::InvalidChangeSet(reason.to_owned()).into());
+        }
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
         let topic = self.history_topic(&request.graph)?;
         if let Some(id) = request.id
@@ -332,7 +349,10 @@ impl CraqleNode {
                 graph: request.graph.clone(),
                 changes,
             },
-            Some(target.hints),
+            EventExtras {
+                render_hints: Some(target.hints),
+                commit: request.commit.clone(),
+            },
         )?;
         drop(write_guard);
         drop(reconcile_guard);

@@ -126,13 +126,13 @@ pub use crate::sparql::{
 };
 pub use crate::sparql_fast_path::{QueryFastPathKind, QueryFastPathMode};
 pub use crate::sync::{
-    BackupProof, CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError, DenyRemotePolicyChanges,
-    GraphHints, GraphRenderHints, HistoryRequest, HistorySnapshot, IrokleGraphSync, MutationId,
-    MutationLookup, MutationReceipt, MutationRequest, MutationStatus, PersistenceOutcome,
-    ReconcileRequest, ReconcileSource, RejectedReplicationRecord, RemotePolicyAuthorizer,
-    RepairAudit, RepairAuthority, RepairDiff, RepairMode, RepairOutcome, RepairReport,
-    RepairRequest, RepairResult, RepairState, SourceOutcome, TopicCursorRepairAudit,
-    topic_cursor_digest,
+    BackupProof, CommitInfo, CraqleGraphEvent, CraqleIrokleOptions, CraqleSyncError,
+    DenyRemotePolicyChanges, GraphHints, GraphRenderHints, HistoryPoint, HistoryRequest,
+    HistorySnapshot, IrokleGraphSync, MutationCommit, MutationId, MutationLookup, MutationReceipt,
+    MutationRequest, MutationStatus, PersistenceOutcome, ReconcileRequest, ReconcileSource,
+    RejectedReplicationRecord, RemotePolicyAuthorizer, RepairAudit, RepairAuthority, RepairDiff,
+    RepairMode, RepairOutcome, RepairReport, RepairRequest, RepairResult, RepairState,
+    SourceOutcome, TopicCursorRepairAudit, topic_cursor_digest,
 };
 pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
@@ -396,6 +396,20 @@ impl CraqleRequestDurability {
     fn publishes_irokle(self) -> bool {
         matches!(self, Self::Durable)
     }
+}
+
+/// A strict RO-Crate replacement for [`CraqleNode::apply_rocrate_with`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoCrateWrite<'a> {
+    pub graph: GraphId,
+    pub jsonld: &'a str,
+    /// Stored when the write creates the graph.
+    pub policy: GraphPolicy,
+    pub durability: CraqleRequestDurability,
+    /// CRDT actor for writes that do not publish; ignored when `durability` publishes.
+    pub actor: Option<ActorId>,
+    /// Signed into the published event; a write that does not publish fails unchanged.
+    pub commit: Option<CommitInfo>,
 }
 
 /// Fjall persistence mode used when Craqle explicitly persists its graph store.
@@ -2358,7 +2372,24 @@ impl CraqleNode {
         request: MutationRequest,
     ) -> Result<MutationReceipt> {
         self.ensure_graph_action(&request.graph, auth, Action::Write)?;
-        let receipt = self.replication.apply_mutation(request)?;
+        let receipt = self.replication.apply_mutation(request, None)?;
+        self.finish_mutation(receipt)
+    }
+
+    /// [`Self::apply_mutation`] whose published event carries `request.commit`.
+    /// A call that only returns an admission ticket publishes nothing and keeps no commit.
+    pub fn apply_mutation_with(
+        &self,
+        auth: &dyn Authorizer,
+        request: MutationCommit,
+    ) -> Result<MutationReceipt> {
+        let MutationCommit { request, commit } = request;
+        self.ensure_graph_action(&request.graph, auth, Action::Write)?;
+        let receipt = self.replication.apply_mutation(request, Some(commit))?;
+        self.finish_mutation(receipt)
+    }
+
+    fn finish_mutation(&self, receipt: MutationReceipt) -> Result<MutationReceipt> {
         if receipt.source == SourceOutcome::Prepared {
             return Ok(receipt.outbound());
         }
@@ -3382,6 +3413,30 @@ impl CraqleNode {
         )
     }
 
+    /// Strict RO-Crate replacement described by `write`, optionally with commit metadata.
+    pub fn apply_rocrate_with(
+        &self,
+        auth: &dyn Authorizer,
+        write: RoCrateWrite<'_>,
+    ) -> Result<Batch> {
+        let policy = write.policy.normalized();
+        self.ensure_policy_action(&write.graph, &policy, auth, Action::Write)?;
+        let batch = self
+            .manager_with(write.durability, write.actor)
+            .with_commit(write.commit)
+            .import_jsonld_checked(write.graph.clone(), write.jsonld)?;
+        self.persist_policy(PolicyWrite {
+            graph: &write.graph,
+            policy,
+            durability: write.durability,
+        })?;
+        self.settle_batch(BatchFinish {
+            graph: &write.graph,
+            batch,
+            durability: write.durability,
+        })
+    }
+
     /// Strict RO-Crate replacement authored under an explicit CRDT actor for
     /// non-publishing writes.
     pub fn apply_rocrate_document_checked_with_policy_and_durability_as(
@@ -3393,21 +3448,17 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
         actor: Option<ActorId>,
     ) -> Result<Batch> {
-        let policy = policy.normalized();
-        self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        let batch = self
-            .manager_with(durability, actor)
-            .import_jsonld_checked(graph.clone(), jsonld)?;
-        self.persist_policy(PolicyWrite {
-            graph: &graph,
-            policy,
-            durability,
-        })?;
-        self.settle_batch(BatchFinish {
-            graph: &graph,
-            batch,
-            durability,
-        })
+        self.apply_rocrate_with(
+            auth,
+            RoCrateWrite {
+                graph,
+                jsonld,
+                policy,
+                durability,
+                actor,
+                commit: None,
+            },
+        )
     }
 
     /// Strictly validate and materialize RO-Crate changes without side effects.
@@ -4483,7 +4534,8 @@ impl CraqleNode {
             }
             CraqleGraphEvent::QuadChanges { graph, .. }
             | CraqleGraphEvent::RoCrateMutation { graph, .. }
-            | CraqleGraphEvent::Mutation { graph, .. } => {
+            | CraqleGraphEvent::Mutation { graph, .. }
+            | CraqleGraphEvent::CommittedMutation { graph, .. } => {
                 let Some(result) = self.replication.apply_irokle_record(record)? else {
                     return Ok(false);
                 };

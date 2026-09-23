@@ -84,6 +84,14 @@ pub enum CraqleGraphEvent {
         changes: Vec<MaterializedQuadChange>,
         render_hints: Option<GraphRenderHints>,
     },
+    /// A [`Self::Mutation`] with commit metadata; appended last so older records keep decoding.
+    CommittedMutation {
+        id: MutationId,
+        graph: GraphId,
+        changes: Vec<MaterializedQuadChange>,
+        render_hints: Option<GraphRenderHints>,
+        commit: Box<CommitInfo>,
+    },
 }
 
 impl CraqleGraphEvent {
@@ -92,10 +100,98 @@ impl CraqleGraphEvent {
             Self::QuadChanges { graph, .. }
             | Self::RoCrateMutation { graph, .. }
             | Self::Policy { graph, .. }
-            | Self::Mutation { graph, .. } => graph,
+            | Self::Mutation { graph, .. }
+            | Self::CommittedMutation { graph, .. } => graph,
             Self::GraphDeleted { tombstone } => &tombstone.graph,
         }
     }
+
+    /// The commit metadata this event was signed with, if any.
+    pub fn commit(&self) -> Option<&CommitInfo> {
+        match self {
+            Self::CommittedMutation { commit, .. } => Some(commit.as_ref()),
+            Self::QuadChanges { .. }
+            | Self::RoCrateMutation { .. }
+            | Self::Policy { .. }
+            | Self::GraphDeleted { .. }
+            | Self::Mutation { .. } => None,
+        }
+    }
+}
+
+/// Commit metadata signed and replicated with one mutation. Every field comes from the caller;
+/// Craqle does not check the time, and the operation signature proves only which actor wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Author time in Unix milliseconds.
+    pub author_time_ms: i64,
+    /// Offset of the author's time zone from UTC, as in Git's `+0200`.
+    pub author_tz_offset_minutes: i16,
+    /// Extra parents from other graphs, such as a fork point or a merged branch.
+    /// Craqle stores them but does not check that these graphs or heads exist.
+    pub sources: Vec<HistoryPoint>,
+}
+
+/// Heads of another graph's history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryPoint {
+    pub graph: GraphId,
+    pub heads: Vec<irokle::OpId>,
+}
+
+impl CommitInfo {
+    pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+    /// Limit for `author_name` and for `author_email`.
+    pub const MAX_AUTHOR_BYTES: usize = 256;
+    /// Eighteen hours either side of UTC.
+    pub const MAX_TZ_OFFSET_MINUTES: u16 = 18 * 60;
+    pub const MAX_SOURCES: usize = 16;
+    /// Each source needs at least one head and at most this many.
+    pub const MAX_SOURCE_HEADS: usize = 64;
+
+    /// Fails with the reason when this info is out of bounds for a commit to `graph`.
+    pub(crate) fn check(&self, graph: &GraphId) -> Result<(), &'static str> {
+        if self.message.len() > Self::MAX_MESSAGE_BYTES {
+            return Err("commit message exceeds its byte limit");
+        }
+        for field in [&self.author_name, &self.author_email] {
+            if field.len() > Self::MAX_AUTHOR_BYTES {
+                return Err("commit author exceeds its byte limit");
+            }
+            if field.chars().any(char::is_control) {
+                return Err("commit author contains a control character");
+            }
+        }
+        if self.author_tz_offset_minutes.unsigned_abs() > Self::MAX_TZ_OFFSET_MINUTES {
+            return Err("commit time zone offset is out of range");
+        }
+        if self.sources.len() > Self::MAX_SOURCES {
+            return Err("commit has too many sources");
+        }
+        let mut graphs = HashSet::with_capacity(self.sources.len());
+        for point in &self.sources {
+            if point.heads.is_empty() || point.heads.len() > Self::MAX_SOURCE_HEADS {
+                return Err("commit source has no heads or too many heads");
+            }
+            if point.graph == *graph || !graphs.insert(&point.graph) {
+                return Err("commit source repeats a graph or names its own graph");
+            }
+            if check_graph(&point.graph).is_err() {
+                return Err("commit source graph is not a valid IRI");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A mutation request and the commit metadata its signed event carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationCommit {
+    pub request: MutationRequest,
+    pub commit: CommitInfo,
 }
 
 /// Authorization hook for graph-policy events authored by another replica.
@@ -407,6 +503,7 @@ pub(crate) struct OutgoingMutation {
     pub graph: GraphId,
     pub changes: Vec<MaterializedQuadChange>,
     pub render_hints: Option<TaggedRenderHints>,
+    pub commit: Option<CommitInfo>,
 }
 
 pub(crate) struct TopicFrontier {
@@ -1061,15 +1158,24 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         mutation: OutgoingMutation,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
         let topic = self.open_graph_topic(store, &mutation.graph)?;
-        Ok(topic.publish_with(
-            CraqleGraphEvent::Mutation {
-                id: mutation.id,
-                graph: mutation.graph,
-                changes: mutation.changes,
-                render_hints: mutation.render_hints.map(Into::into),
+        let (id, graph, changes) = (mutation.id, mutation.graph, mutation.changes);
+        let render_hints = mutation.render_hints.map(Into::into);
+        let event = match mutation.commit {
+            Some(commit) => CraqleGraphEvent::CommittedMutation {
+                id,
+                graph,
+                changes,
+                render_hints,
+                commit: Box::new(commit),
             },
-            self.publish_options(),
-        )?)
+            None => CraqleGraphEvent::Mutation {
+                id,
+                graph,
+                changes,
+                render_hints,
+            },
+        };
+        Ok(topic.publish_with(event, self.publish_options())?)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(graph = %graph.as_str(), change_count = changes.len()))]
@@ -1292,6 +1398,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         let record = envelope
             .decode_event::<CraqleGraphEvent>()
             .ok()
+            .filter(|event| check_commit(event).is_ok())
             .map(|event| EventRecord {
                 event,
                 meta: OpMeta {
@@ -1735,7 +1842,8 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 Some(TopicRecord::Event(record))
                     if matches!(
                         &record.event,
-                        CraqleGraphEvent::Mutation { id, .. } if *id == receipt.id
+                        CraqleGraphEvent::Mutation { id, .. }
+                            | CraqleGraphEvent::CommittedMutation { id, .. } if *id == receipt.id
                     ) =>
                 {
                     Ok(Some(record))
@@ -1771,7 +1879,9 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                     TopicRecord::Event(record)
                         if matches!(
                             &record.event,
-                            CraqleGraphEvent::Mutation { id, .. } if *id == receipt.id
+                            CraqleGraphEvent::Mutation { id, .. }
+                                | CraqleGraphEvent::CommittedMutation { id, .. }
+                                if *id == receipt.id
                         ) =>
                     {
                         return Ok(Some(record.clone()));
@@ -2276,9 +2386,19 @@ pub(crate) fn batch_from_record(
             graph,
             changes,
             render_hints,
+        }
+        | CraqleGraphEvent::CommittedMutation {
+            id,
+            graph,
+            changes,
+            render_hints,
+            ..
         } => (graph, changes, render_hints.clone().map(Into::into), *id),
-        _ => return Ok(None),
+        CraqleGraphEvent::Policy { .. } | CraqleGraphEvent::GraphDeleted { .. } => {
+            return Ok(None);
+        }
     };
+    check_commit(&record.event)?;
     check_changes(changes)?;
     let request_digest = request_digest(graph, changes, render_hints.as_ref())?;
     let cx = EventBatchCtx {
@@ -2301,6 +2421,7 @@ pub(crate) fn batch_from_owned(
 ) -> SyncResult<Option<ReplicatedGraphMutation>> {
     let EventRecord { event, meta } = record;
     let event_id = meta.op_id;
+    check_commit(&event)?;
     let (graph, changes, render_hints, mutation_id) = match event {
         CraqleGraphEvent::QuadChanges { graph, changes } => {
             (graph, changes, None, MutationId::from_op(event_id))
@@ -2330,8 +2451,17 @@ pub(crate) fn batch_from_owned(
             graph,
             changes,
             render_hints,
+        }
+        | CraqleGraphEvent::CommittedMutation {
+            id,
+            graph,
+            changes,
+            render_hints,
+            ..
         } => (graph, changes, render_hints.map(Into::into), id),
-        _ => return Ok(None),
+        CraqleGraphEvent::Policy { .. } | CraqleGraphEvent::GraphDeleted { .. } => {
+            return Ok(None);
+        }
     };
     check_changes(&changes)?;
     let request_digest = request_digest(&graph, &changes, render_hints.as_ref())?;
@@ -2346,6 +2476,14 @@ pub(crate) fn batch_from_owned(
         request_digest,
         event_id,
     }))
+}
+
+/// A peer's commit info outside the local bounds rejects its record.
+fn check_commit(event: &CraqleGraphEvent) -> SyncResult<()> {
+    match event.commit().map(|commit| commit.check(event.graph())) {
+        Some(Err(reason)) => Err(CraqleSyncError::InvalidEvent(reason.to_owned())),
+        Some(Ok(())) | None => Ok(()),
+    }
 }
 
 fn actor_from_irokle(actor: irokle::ActorId) -> ActorId {
