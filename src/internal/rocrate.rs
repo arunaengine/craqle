@@ -4213,11 +4213,12 @@ mod tests {
             self.inner.craqle_topic_ids()
         }
 
-        fn selected_history(
+        fn history_entry(
             &self,
-            query: &crate::history::TopicHistory,
-        ) -> SyncResult<Vec<crate::history::HistoryEntry>> {
-            self.inner.selected_history(query)
+            topic: irokle::TopicId,
+            id: irokle::OpId,
+        ) -> SyncResult<Option<crate::history::HistoryEntry>> {
+            self.inner.history_entry(topic, id)
         }
 
         fn topic_records_since(

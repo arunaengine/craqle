@@ -814,10 +814,23 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
 
     fn craqle_topic_ids(&self) -> SyncResult<Vec<irokle::TopicId>>;
 
-    fn selected_history(
+    /// One signed operation of `topic`, or `None` when it is missing or foreign.
+    fn history_entry(
         &self,
-        query: &crate::history::TopicHistory,
-    ) -> SyncResult<Vec<crate::history::HistoryEntry>>;
+        _topic: irokle::TopicId,
+        _id: irokle::OpId,
+    ) -> SyncResult<Option<crate::history::HistoryEntry>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
+
+    /// The causal generation of one operation of `topic`, without reading its payload.
+    fn history_generation(
+        &self,
+        _topic: irokle::TopicId,
+        _id: irokle::OpId,
+    ) -> SyncResult<Option<u64>> {
+        Err(CraqleSyncError::NotConfigured)
+    }
 
     fn topic_records_since(
         &self,
@@ -1234,91 +1247,54 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             .collect())
     }
 
-    fn selected_history(
+    fn history_entry(
         &self,
-        query: &crate::history::TopicHistory,
-    ) -> SyncResult<Vec<crate::history::HistoryEntry>> {
-        self.node.open_topic::<CraqleGraphEvent>(query.topic)?;
-        if query.heads.len() > query.limit {
+        topic: irokle::TopicId,
+        id: irokle::OpId,
+    ) -> SyncResult<Option<crate::history::HistoryEntry>> {
+        let Some(op) = self.node.storage().get_op(&id)? else {
+            return Ok(None);
+        };
+        op.validate()?;
+        if op.id != id {
             return Err(CraqleSyncError::InvalidEvent(
-                "history operation limit exceeded".into(),
+                "stored history operation has a different id".into(),
             ));
         }
-        let mut pending = query.heads.iter().copied().collect::<BTreeSet<_>>();
-        let mut seen = BTreeSet::new();
-        let mut bytes = 0usize;
-        while let Some(id) = pending.pop_first() {
-            if !seen.insert(id) {
-                continue;
-            }
-            if seen.len() > query.limit {
-                return Err(CraqleSyncError::InvalidEvent(
-                    "history operation limit exceeded".into(),
-                ));
-            }
-            let op = self.node.storage().get_op(&id)?.ok_or_else(|| {
-                CraqleSyncError::InvalidEvent("history operation is unavailable".into())
-            })?;
-            op.validate()?;
-            if op.id != id || op.signed.body.topic_id != query.topic {
-                return Err(CraqleSyncError::InvalidEvent(
-                    "foreign history operation".into(),
-                ));
-            }
-            let encoded = postcard::to_allocvec(&op)
-                .map_err(|error| CraqleSyncError::InvalidEvent(error.to_string()))?;
-            bytes = bytes.checked_add(encoded.len()).ok_or_else(|| {
-                CraqleSyncError::InvalidEvent("history byte limit overflow".into())
-            })?;
-            if bytes > query.max_bytes {
-                return Err(CraqleSyncError::InvalidEvent(
-                    "history byte limit exceeded".into(),
-                ));
-            }
-            for parent in op
-                .signed
-                .body
-                .deps
-                .iter()
-                .chain(op.signed.body.actor_prev.iter())
-            {
-                if !seen.contains(parent) {
-                    pending.insert(*parent);
-                    if pending.len() > query.limit.saturating_sub(seen.len()) {
-                        return Err(CraqleSyncError::InvalidEvent(
-                            "history operation limit exceeded".into(),
-                        ));
-                    }
-                }
-            }
+        if op.signed.body.topic_id != topic {
+            return Ok(None);
         }
-        let operations = irokle::oplog::topological_subset(self.node.storage(), &seen)?;
-        if operations.len() != seen.len() {
-            return Err(CraqleSyncError::InvalidEvent(
-                "history is not causally complete".into(),
-            ));
-        }
-        let mut entries = Vec::with_capacity(operations.len());
-        for op in operations {
-            let record = if let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                let stored = self.node.storage().get_meta(&op.id)?.ok_or_else(|| {
+        let record = if let irokle::TopicPayload::Event(envelope) = &op.signed.body.payload {
+            let stored =
+                self.node.storage().get_meta(&op.id)?.ok_or_else(|| {
                     irokle::Error::Storage(format!("missing op meta for {}", op.id))
                 })?;
-                Some(EventRecord {
-                    event: envelope.decode_event::<CraqleGraphEvent>()?,
-                    meta: OpMeta {
-                        op_id: op.id,
-                        actor_id: stored.actor_id,
-                        actor_seq: stored.actor_seq,
-                        observed_clock: stored.observed_clock,
-                    },
-                })
-            } else {
-                None
-            };
-            entries.push(crate::history::HistoryEntry { op, record });
-        }
-        Ok(entries)
+            Some(EventRecord {
+                event: envelope.decode_event::<CraqleGraphEvent>()?,
+                meta: OpMeta {
+                    op_id: op.id,
+                    actor_id: stored.actor_id,
+                    actor_seq: stored.actor_seq,
+                    observed_clock: stored.observed_clock,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(Some(crate::history::HistoryEntry { op, record }))
+    }
+
+    fn history_generation(
+        &self,
+        topic: irokle::TopicId,
+        id: irokle::OpId,
+    ) -> SyncResult<Option<u64>> {
+        Ok(self
+            .node
+            .storage()
+            .get_position(&id)?
+            .filter(|position| position.topic_id == topic)
+            .map(|position| position.generation))
     }
 
     fn topic_records_since(

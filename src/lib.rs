@@ -138,7 +138,7 @@ pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
 };
-pub use history::{GraphHistory, HistoryProjection};
+pub use history::{GraphHistory, HistoryError, HistoryProjection};
 pub use irokle;
 
 /// Stable high-level classification for public Craqle failures.
@@ -230,6 +230,8 @@ pub enum CraqleError {
     SyncInputRejected(String),
     #[error("sync: {0}")]
     Sync(#[from] sync::CraqleSyncError),
+    #[error("history: {0}")]
+    History(#[from] HistoryError),
     #[error("search worker: {0}")]
     SearchWorker(String),
     #[error("search wait for target {target}: {reason}")]
@@ -350,6 +352,7 @@ impl CraqleError {
             Self::RoCratePolicyRequired { .. } => CraqleErrorKind::InvalidInput,
             Self::SyncInputRejected(_) => CraqleErrorKind::InvalidInput,
             Self::Sync(error) => error.kind(),
+            Self::History(error) => error.kind(),
             Self::MultiGraphUpdateUnsupported => CraqleErrorKind::Unsupported,
             Self::UnsupportedRdfStarTerm(_) => CraqleErrorKind::Unsupported,
             Self::ReplicationRejected { error_kind, .. } => *error_kind,
