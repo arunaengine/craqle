@@ -776,6 +776,24 @@ impl ReplicationEngine {
         self.commit_changes(graph, changes)
     }
 
+    /// [`Self::local_apply_changes`] for a caller that already holds the graph write lock.
+    pub(crate) fn apply_changes_locked(
+        &self,
+        request: crate::sync::MutationRequest,
+    ) -> Result<Batch, UpdateError> {
+        let changes = canonical_changes(request.changes);
+        self.ensure_change_targets(&request.graph, &changes)?;
+        self.commit_with_plan(LocalCommit {
+            id: Some(request.id),
+            write_locked: true,
+            graph: &request.graph,
+            changes,
+            checks: WriteChecks::normal(DiagnosticsMode::Immediate),
+            prepared_fence: None,
+            render_hints: None,
+        })
+    }
+
     pub(crate) fn apply_mutation(
         &self,
         mut request: crate::sync::MutationRequest,

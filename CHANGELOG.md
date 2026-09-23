@@ -73,6 +73,14 @@ All notable changes to Craqle are documented here.
 - Authorized graph reconciliation from retained history or a verified healthy
   snapshot, with a durable backup and an audit of the replacement.
 - Explicit process and store memory reservations shared by live stores.
+- Graph history for Irokle-backed graphs. `graph_heads` lists the current heads.
+  `history_log` pages signed operations newest first with parents, actor, sequence
+  and recorded quad changes. `compare_history` returns the quad changes between two
+  head sets. `project_history` replays heads into a separate disposable store.
+  `restore_history` writes the content at chosen heads as one new validated local
+  mutation, never rewriting history, with an optional expected-heads fence. Every
+  call checks graph permissions first and fails with `HistoryError` instead of
+  returning partial results when its bounds are exceeded.
 - `QueryOptions::results_only()` runs a query without per-operator statistics.
   `QueryOptions::default()` still collects them for compatibility.
 - `CraqleNode::search_with_options` accepts `SearchOptions` with cancellation and a

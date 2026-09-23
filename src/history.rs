@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::{
     Action, AuthorizationError, Authorizer, CraqleErrorKind, CraqleGraphEvent, CraqleNode,
     CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy, MaterializedQuadChange,
-    MemoryBudget, QuadOp, Result, SearchStorage,
+    MemoryBudget, MutationId, MutationRequest, QuadOp, Result, SearchStorage,
 };
 use irokle::OpId;
 use irokle::reducer::EventRecord;
@@ -77,6 +77,17 @@ pub struct HistoryCompare {
     pub graph: GraphId,
     pub from: Vec<OpId>,
     pub to: Vec<OpId>,
+    pub max_operations: usize,
+    pub max_bytes: usize,
+}
+
+/// Writes the graph content at `heads` back as one new local mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryRestore {
+    pub graph: GraphId,
+    pub heads: Vec<OpId>,
+    /// When set, the current heads must equal these or the restore fails unchanged.
+    pub expected: Option<Vec<OpId>>,
     pub max_operations: usize,
     pub max_bytes: usize,
 }
@@ -205,6 +216,53 @@ impl CraqleNode {
         let from = side(&request.from)?;
         let to = side(&request.to)?;
         Ok(content_changes(&request.graph, &from, &to))
+    }
+
+    /// Requires graph READ and WRITE permission. Writes the content at `heads` as one new
+    /// validated local mutation and returns its operation, or `None` when nothing changes.
+    pub fn restore_history(
+        &self,
+        auth: &dyn Authorizer,
+        request: &HistoryRestore,
+    ) -> Result<Option<OpId>> {
+        let policy = self.history_policy(&request.graph)?;
+        auth.authorize(&request.graph, &policy, Action::Read)?;
+        auth.authorize(&request.graph, &policy, Action::Write)?;
+        let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        let mut query = TopicHistory {
+            topic: self.history_topic(&request.graph)?,
+            heads: request.heads.clone(),
+            limit: request.max_operations,
+            max_bytes: request.max_bytes,
+        };
+        let target = self.history_content(&request.graph, &query)?;
+        // Deletes remove the dots their causal past observed, so diff against the current heads.
+        let write_guard = self.store.graph_write_guard(&request.graph);
+        query.heads = sync.topic_heads(query.topic)?.into_iter().collect();
+        if let Some(expected) = &request.expected
+            && expected.iter().collect::<BTreeSet<_>>() != query.heads.iter().collect()
+        {
+            return Err(HistoryError::HeadsChanged.into());
+        }
+        let current = self.history_content(&request.graph, &query)?;
+        let changes = content_changes(&request.graph, &current, &target);
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        let id = MutationId::new();
+        let batch = self.replication.apply_changes_locked(MutationRequest {
+            id,
+            admission_sequence: None,
+            graph: request.graph.clone(),
+            changes,
+        })?;
+        drop(write_guard);
+        self.finish_batch(&request.graph, batch)?;
+        Ok(self
+            .store
+            .mutation_receipt(&id)?
+            .and_then(|receipt| receipt.event_id)
+            .map(OpId::from_bytes))
     }
 
     /// Requires current graph READ permission and a destination that does not exist.

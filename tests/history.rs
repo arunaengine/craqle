@@ -3,9 +3,10 @@ mod support;
 use std::collections::BTreeSet;
 
 use craqle::{
-    AllowAllAuthorizer, CraqleIrokleOptions, CraqleNode, CraqleOptions, CreateCrateRequest,
-    DenyAllAuthorizer, GraphHistory, GraphId, GraphPolicy, HistoryCompare, HistoryLog,
-    MaterializedQuadChange, SearchStorage,
+    Action, AllowAllAuthorizer, AuthorizationError, CraqleErrorKind, CraqleIrokleOptions,
+    CraqleNode, CraqleOptions, CreateCrateRequest, DenyAllAuthorizer, EncodedTerm, GraphHistory,
+    GraphId, GraphPolicy, HistoryCompare, HistoryLog, HistoryRestore, MaterializedQuadChange,
+    SearchStorage,
 };
 use irokle::{Irokle, MemoryStorage, OpId};
 
@@ -102,6 +103,39 @@ impl Fixture {
         self.node
             .graph_heads(&AllowAllAuthorizer, &self.graph)
             .unwrap()
+    }
+
+    fn content(&self) -> BTreeSet<(EncodedTerm, EncodedTerm, EncodedTerm)> {
+        let snapshot = self.node.graph_snapshot(&self.graph).unwrap();
+        snapshot
+            .quads
+            .into_iter()
+            .map(|quad| (quad.subject, quad.predicate, quad.object))
+            .collect()
+    }
+
+    fn restore(&self, heads: &[OpId], expected: Option<Vec<OpId>>) -> HistoryRestore {
+        HistoryRestore {
+            graph: self.graph.clone(),
+            heads: heads.to_vec(),
+            expected,
+            max_operations: 100,
+            max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+fn read_only(
+    _: &GraphId,
+    _: &GraphPolicy,
+    action: Action,
+) -> std::result::Result<(), AuthorizationError> {
+    match action {
+        Action::Read => Ok(()),
+        Action::Write => Err(AuthorizationError::PermissionDenied {
+            action,
+            graph: String::new(),
+        }),
     }
 }
 
@@ -206,6 +240,228 @@ fn compares_two_states() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn restores_as_new_operation() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let original_content = fixture.content();
+    let exported = fixture
+        .node
+        .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+        .unwrap();
+    fixture.rename("Changed");
+    let changed = fixture.heads();
+    let restored = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &fixture.restore(&original, None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.heads(), vec![restored]);
+    assert_eq!(fixture.content(), original_content);
+    assert_eq!(
+        fixture
+            .node
+            .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+            .unwrap(),
+        exported
+    );
+    let page = fixture
+        .node
+        .history_log(
+            &AllowAllAuthorizer,
+            &HistoryLog {
+                graph: fixture.graph.clone(),
+                heads: vec![restored],
+                limit: 2,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.operations[0].parents, changed);
+    assert_eq!(page.operations[1].id, changed[0]);
+    let (added, removed) = names(page.operations[0].changes());
+    assert_eq!(added, vec!["\"Original\"".to_owned()]);
+    assert_eq!(removed, vec!["\"Changed\"".to_owned()]);
+    let old = fixture.request("old");
+    let view = fixture
+        .node
+        .project_history(
+            &AllowAllAuthorizer,
+            &GraphHistory {
+                heads: changed.clone(),
+                ..old
+            },
+        )
+        .unwrap();
+    assert!(
+        view.node
+            .export_rocrate(&AllowAllAuthorizer, &fixture.graph)
+            .unwrap()
+            .contains("Changed")
+    );
+    assert_eq!(
+        fixture
+            .node
+            .restore_history(&AllowAllAuthorizer, &fixture.restore(&original, None))
+            .unwrap(),
+        None
+    );
+    assert_eq!(fixture.heads(), vec![restored]);
+}
+
+#[test]
+fn fences_current_heads() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    fixture.rename("Changed");
+    let content = fixture.content();
+    let stale = fixture
+        .node
+        .restore_history(
+            &AllowAllAuthorizer,
+            &fixture.restore(&original, Some(original.clone())),
+        )
+        .unwrap_err();
+    assert_eq!(stale.kind(), CraqleErrorKind::Conflict);
+    assert_eq!(fixture.content(), content);
+    let current = fixture.heads();
+    let restored = fixture
+        .node
+        .restore_history(
+            &AllowAllAuthorizer,
+            &fixture.restore(&original, Some(current)),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.heads(), vec![restored]);
+}
+
+#[test]
+fn rejects_unauthorized_history() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    fixture.rename("Changed");
+    let heads = fixture.heads();
+    let content = fixture.content();
+    let log = HistoryLog {
+        graph: fixture.graph.clone(),
+        heads: heads.clone(),
+        limit: 10,
+        max_bytes: 1024 * 1024,
+    };
+    let compare = HistoryCompare {
+        graph: fixture.graph.clone(),
+        from: original.clone(),
+        to: heads.clone(),
+        max_operations: 100,
+        max_bytes: 1024 * 1024,
+    };
+    let denied = [
+        fixture
+            .node
+            .graph_heads(&DenyAllAuthorizer, &fixture.graph)
+            .map(drop),
+        fixture.node.history_log(&DenyAllAuthorizer, &log).map(drop),
+        fixture
+            .node
+            .compare_history(&DenyAllAuthorizer, &compare)
+            .map(drop),
+        fixture
+            .node
+            .restore_history(&DenyAllAuthorizer, &fixture.restore(&original, None))
+            .map(drop),
+        fixture
+            .node
+            .restore_history(&read_only, &fixture.restore(&original, None))
+            .map(drop),
+    ];
+    for result in denied {
+        assert_eq!(result.unwrap_err().kind(), CraqleErrorKind::Unauthorized);
+    }
+    assert!(fixture.node.history_log(&read_only, &log).is_ok());
+    assert_eq!(fixture.heads(), heads);
+    assert_eq!(fixture.content(), content);
+}
+
+#[test]
+fn fails_when_bounds_exceeded() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    fixture.rename("Changed");
+    let heads = fixture.heads();
+    let content = fixture.content();
+    let log = HistoryLog {
+        graph: fixture.graph.clone(),
+        heads: heads.clone(),
+        limit: 10,
+        max_bytes: 1,
+    };
+    let kind = |result: craqle::Result<()>| result.unwrap_err().kind();
+    assert_eq!(
+        kind(
+            fixture
+                .node
+                .history_log(&AllowAllAuthorizer, &log)
+                .map(drop)
+        ),
+        CraqleErrorKind::ResourceLimit
+    );
+    let empty = HistoryLog {
+        limit: 0,
+        max_bytes: 1024,
+        ..log
+    };
+    assert_eq!(
+        kind(
+            fixture
+                .node
+                .history_log(&AllowAllAuthorizer, &empty)
+                .map(drop)
+        ),
+        CraqleErrorKind::InvalidInput
+    );
+    let compare = HistoryCompare {
+        graph: fixture.graph.clone(),
+        from: original.clone(),
+        to: heads.clone(),
+        max_operations: 1,
+        max_bytes: 1024 * 1024,
+    };
+    assert_eq!(
+        kind(
+            fixture
+                .node
+                .compare_history(&AllowAllAuthorizer, &compare)
+                .map(drop)
+        ),
+        CraqleErrorKind::ResourceLimit
+    );
+    let mut restore = fixture.restore(&original, None);
+    restore.max_operations = 1;
+    assert_eq!(
+        kind(
+            fixture
+                .node
+                .restore_history(&AllowAllAuthorizer, &restore)
+                .map(drop)
+        ),
+        CraqleErrorKind::ResourceLimit
+    );
+    restore.max_operations = 100;
+    restore.heads = vec![OpId::from_bytes([0xff; 32])];
+    assert_eq!(
+        kind(
+            fixture
+                .node
+                .restore_history(&AllowAllAuthorizer, &restore)
+                .map(drop)
+        ),
+        CraqleErrorKind::InvalidInput
+    );
+    assert_eq!(fixture.heads(), heads);
+    assert_eq!(fixture.content(), content);
 }
 
 #[test]

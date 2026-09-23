@@ -140,7 +140,7 @@ pub use auth::{
 };
 pub use history::{
     GraphHistory, HistoryCompare, HistoryError, HistoryLog, HistoryOperation, HistoryPage,
-    HistoryProjection,
+    HistoryProjection, HistoryRestore,
 };
 pub use irokle;
 
