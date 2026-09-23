@@ -844,6 +844,11 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         store: &GraphStore,
         mutation: OutgoingMutation,
     ) -> SyncResult<EventRecord<CraqleGraphEvent>> {
+        if mutation.commit.is_some() {
+            return Err(CraqleSyncError::InvalidEvent(
+                "this sync backend cannot publish commit info".to_owned(),
+            ));
+        }
         match mutation.render_hints {
             Some(hints) => {
                 self.publish_rocrate_mutation(store, &mutation.graph, mutation.changes, hints)
