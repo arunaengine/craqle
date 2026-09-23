@@ -21,7 +21,7 @@ All notable changes to Craqle are documented here.
   raw spelling written by earlier versions. Replicated events and snapshots keep
   their signed spelling but apply to the canonical quad, and the first open merges
   aliases that earlier versions stored under their raw spelling.
-- Integrates Irokle 0.3.0 at revision `d9d6688bc3b6bca9d321cf5bd668ecd438dbbfe3`.
+- Integrates Irokle 0.3.0 at revision `f3770c5186d34603753e26912b6450d077680205`.
 - Requires Rust 1.97.1 or newer. Craqle's authoritative RDF disk format remains `1.0`.
 - Background maintenance retries failed search entries and rebuilds uncovered query
   indexes. Rebuilds prepare an inactive index and replay concurrent source changes
