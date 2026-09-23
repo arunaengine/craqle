@@ -291,6 +291,9 @@ pub(crate) struct ReplicationEngine {
     /// Per-engine injection prevents concurrent tests from faulting other nodes.
     #[cfg(test)]
     armed_apply_failure: std::sync::atomic::AtomicBool,
+    /// Test-only failure after a publish and before its receipt is bound.
+    #[cfg(test)]
+    armed_bind_failure: std::sync::atomic::AtomicBool,
     /// Test-only failure after the source commit and before SHACL settlement.
     #[cfg(all(test, feature = "shacl-core"))]
     settle_failure_after: std::sync::atomic::AtomicUsize,
@@ -484,6 +487,8 @@ impl ReplicationEngine {
                 sync,
                 #[cfg(test)]
                 armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                armed_bind_failure: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(all(test, feature = "shacl-core"))]
                 settle_failure_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
             }
@@ -516,6 +521,8 @@ impl ReplicationEngine {
             shacl,
             #[cfg(test)]
             armed_apply_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            armed_bind_failure: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             settle_failure_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
@@ -682,6 +689,13 @@ impl ReplicationEngine {
     pub(crate) fn take_apply_failure(&self) -> bool {
         self.armed_apply_failure
             .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make the next local publish fail before its receipt is bound. Test-only.
+    #[cfg(test)]
+    pub(crate) fn arm_bind_failure(&self) {
+        self.armed_bind_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make the next SHACL settlement fail after the source commit. Test-only.
@@ -2290,6 +2304,19 @@ impl ReplicationEngine {
         }
 
         if let Some(sync) = &self.sync {
+            // A later own dot would mark an own record left unapplied by a failed write as seen.
+            if let Some(topic) = sync.graph_topic_id(&self.store, graph)? {
+                let applied = self.store.get_vector_clock(graph)?;
+                for record in sync.own_records(topic, &applied)? {
+                    match self.apply_irokle_record(&record, true) {
+                        Ok(_) => {}
+                        // Reconciliation quarantines such a record, so every replica skips it.
+                        Err(MergeError::InputRejected(_)) => {}
+                        Err(MergeError::Store(error)) if error.rejects_record() => {}
+                        Err(error) => return Err(merge_update_error(error)),
+                    }
+                }
+            }
             // The store-local graph guard serializes validation, publication, and apply.
             let _commit_guard = self.store.graph_commit_guard(graph);
             if let Some(fence) = prepared_fence.as_ref() {
@@ -2397,6 +2424,15 @@ impl ReplicationEngine {
                 ));
             };
             let batch = mutation.batch;
+            #[cfg(test)]
+            if self
+                .armed_bind_failure
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(UpdateError::InvalidChangeSet(
+                    "injected bind failure".to_owned(),
+                ));
+            }
             let bound_receipt = self
                 .store
                 .bind_receipt_event(&mutation_id, *mutation.event_id.as_bytes())
@@ -2869,12 +2905,21 @@ impl ReplicationEngine {
                 updated_unix_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
             };
             let _receipt_guard = self.store.receipt_guard(&plan.id);
-            // Any receipt already stored for this id is kept, even one of a reused id.
-            if self.store.mutation_receipt(&plan.id)?.is_none() {
-                let mut batch = self.store.new_batch();
-                self.store.stage_receipt(&mut batch, &receipt)?;
-                self.store.commit(batch)?;
+            let mut batch = self.store.new_batch();
+            match self.store.mutation_receipt(&plan.id)? {
+                None => self.store.stage_receipt(&mut batch, &receipt).map(drop)?,
+                // Another path already applied this prepared record, so it is finished.
+                Some(existing)
+                    if existing.source == crate::sync::SourceOutcome::Prepared
+                        && existing.event_id.is_some()
+                        && existing.event_id == receipt.event_id =>
+                {
+                    self.store.stage_receipt_update(&mut batch, &receipt)?;
+                }
+                // Any other receipt stored for this id is kept, even one of a reused id.
+                Some(_) => return Ok(MergeResult { applied: false }),
             }
+            self.store.commit(batch)?;
             return Ok(MergeResult { applied: false });
         }
 
@@ -2950,12 +2995,18 @@ impl ReplicationEngine {
             .map(|mutation| {
                 let mut prior = self.store.mutation_receipt(&mutation.mutation_id)?;
                 // A reused id is local receipt bookkeeping; the record still applies as data.
-                // Only this node's own record may claim an unbound receipt.
+                // Only this node publishes under its ids, so its later record is the prepared one.
+                let published = |receipt: &crate::sync::MutationReceipt| {
+                    local
+                        && receipt.publish_after.as_ref().is_some_and(|after| {
+                            after.get(&record.meta.actor_id) < record.meta.actor_seq
+                        })
+                };
                 if prior.as_ref().is_some_and(|receipt| {
                     receipt.graph != mutation.batch.graph
                         || match receipt.event_id {
                             Some(event) => event != *mutation.event_id.as_bytes(),
-                            None => !local || receipt.request_digest != mutation.request_digest,
+                            None => !published(receipt),
                         }
                 }) {
                     prior = None;

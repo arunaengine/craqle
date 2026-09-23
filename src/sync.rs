@@ -987,6 +987,15 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         Err(CraqleSyncError::NotConfigured)
     }
 
+    /// This node's records in the topic past `applied`, which a failed local apply leaves behind.
+    fn own_records(
+        &self,
+        _topic: irokle::TopicId,
+        _applied: &VectorClock,
+    ) -> SyncResult<Vec<EventRecord<CraqleGraphEvent>>> {
+        Ok(Vec::new())
+    }
+
     fn is_local_record(
         &self,
         topic_id: irokle::TopicId,
@@ -1915,6 +1924,36 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 return Err(CraqleSyncError::InvalidEvent(
                     "prepared mutation search made no cursor progress".to_owned(),
                 ));
+            }
+        }
+    }
+
+    fn own_records(
+        &self,
+        topic: irokle::TopicId,
+        applied: &VectorClock,
+    ) -> SyncResult<Vec<EventRecord<CraqleGraphEvent>>> {
+        let local = irokle::actor_id_for(topic, self.node.peer_id());
+        let mut after = applied
+            .0
+            .get(&actor_from_irokle(local))
+            .copied()
+            .unwrap_or_default();
+        let mut records = Vec::new();
+        loop {
+            let page = self
+                .node
+                .storage()
+                .actor_range(&topic, &local, after, 256)?;
+            let Some((last, _)) = page.last() else {
+                return Ok(records);
+            };
+            after = *last;
+            for (_, id) in page {
+                // A rejected record is skipped, as reconciliation skips it.
+                if let Some(TopicRecord::Event(record)) = self.topic_record(topic, id)? {
+                    records.push(record);
+                }
             }
         }
     }

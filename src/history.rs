@@ -323,10 +323,16 @@ impl CraqleNode {
         let policy = self.history_policy(&request.graph)?;
         auth.authorize(&request.graph, &policy, Action::Read)?;
         auth.authorize(&request.graph, &policy, Action::Write)?;
-        if let Some(receipt) = self.restore_receipt(request, digest)?
-            && receipt.source != SourceOutcome::Prepared
-        {
-            return self.restored(topic, Some(receipt));
+        if let Some(receipt) = self.restore_receipt(request, digest)? {
+            if receipt.source != SourceOutcome::Prepared {
+                return self.restored(topic, Some(receipt));
+            }
+            // The first attempt may have published before its receipt was bound.
+            if let Some(record) = sync.find_mutation(&receipt)? {
+                self.apply_record_locked(&record, sync.is_local_record(topic, &record))?;
+                self.persist_fjall()?;
+                return self.restored(topic, self.restore_receipt(request, digest)?);
+            }
         }
         let heads = sync.topic_heads(topic)?.into_iter().collect::<Vec<_>>();
         if let Some(expected) = &request.expected

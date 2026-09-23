@@ -6095,6 +6095,40 @@ mod tests {
     }
 
     #[test]
+    fn unbound_restore_recovers() {
+        let pair = replica_pair();
+        let node = &pair.origin;
+        let graph = GraphId::new("urn:test:unbound-restore");
+        node.create_crate(&writer_auth(), crate_request(&graph, "unbound"))
+            .unwrap();
+        let original = node.graph_heads(&AllowAllAuthorizer, &graph).unwrap();
+        write_keyword(node, &graph, "changed");
+        let request = HistoryRestore {
+            graph: graph.clone(),
+            heads: original,
+            expected: None,
+            id: Some(MutationId::new()),
+            max_operations: 100,
+            max_bytes: 1024 * 1024,
+            commit: None,
+        };
+        // The restore publishes, then fails as a crash would before its receipt is bound.
+        node.replication.arm_bind_failure();
+        node.restore_history(&AllowAllAuthorizer, &request)
+            .unwrap_err();
+        let published = node.graph_heads(&AllowAllAuthorizer, &graph).unwrap();
+        write_keyword(node, &graph, "later");
+        node.reconcile_irokle().unwrap();
+        let restored = node
+            .restore_history(&AllowAllAuthorizer, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(vec![restored.operation], published);
+        assert!(!has_keyword(node, &graph, "changed"));
+        assert!(has_keyword(node, &graph, "later"));
+    }
+
+    #[test]
     fn rewound_reused_ids() {
         let pair = replica_pair();
         let graph = GraphId::new("urn:test:rewound-reused-ids");
