@@ -251,7 +251,7 @@ impl CraqleNode {
         let to = side(&request.to)?;
         Ok(HistoryDiff {
             changes: content_changes(&request.graph, &from.quads, &to.quads),
-            hints: (from.hints != to.hints).then(|| GraphHints {
+            hints: (from.hints != to.hints).then_some(GraphHints {
                 context: to.hints.context,
                 license: to.hints.license,
                 license_digest: to.hints.license_digest,
