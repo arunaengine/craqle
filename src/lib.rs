@@ -1816,8 +1816,8 @@ impl CraqleNode {
         policy: Option<&CompiledRoCratePolicy>,
         mode: PreparedCommitMode,
     ) -> Result<PreparedRoCrateCommitOutcome> {
+        self.reconcile_pending(&document.graph);
         self.authorize_prepared_document(auth, &document, Action::Write)?;
-        self.reconcile_pending(&document.graph)?;
         if !document.structural_findings.is_empty() {
             return Err(CraqleError::RoCrate(RoCrateError::Update(
                 UpdateError::ValidationFailed(document.structural_findings.clone()),
@@ -2372,8 +2372,8 @@ impl CraqleNode {
         auth: &dyn Authorizer,
         request: MutationRequest,
     ) -> Result<MutationReceipt> {
+        self.reconcile_pending(&request.graph);
         self.ensure_graph_action(&request.graph, auth, Action::Write)?;
-        self.reconcile_pending(&request.graph)?;
         let receipt = self.replication.apply_mutation(request, None)?;
         self.finish_mutation(receipt)
     }
@@ -2386,8 +2386,8 @@ impl CraqleNode {
         request: MutationCommit,
     ) -> Result<MutationReceipt> {
         let MutationCommit { request, commit } = request;
+        self.reconcile_pending(&request.graph);
         self.ensure_graph_action(&request.graph, auth, Action::Write)?;
-        self.reconcile_pending(&request.graph)?;
         let receipt = self.replication.apply_mutation(request, Some(commit))?;
         self.finish_mutation(receipt)
     }
@@ -2565,9 +2565,16 @@ impl CraqleNode {
         }
     }
 
-    /// Reconciles the graph's topic when this node published records the store does not cover,
-    /// so a local write never publishes past them. Call it without graph locks held.
-    fn reconcile_pending(&self, graph: &GraphId) -> Result<()> {
+    /// Reconciles the graph's topic when this node published records the store does not cover.
+    /// Runs before authorization, so a revoking policy applies first; failures only log.
+    fn reconcile_pending(&self, graph: &GraphId) {
+        if let Err(error) = self.reconcile_graph_topic(graph) {
+            tracing::warn!(graph = %graph.as_str(), %error, "left own topic records pending");
+        }
+    }
+
+    /// Call it without graph locks held; the engine refuses a publish while records stay pending.
+    fn reconcile_graph_topic(&self, graph: &GraphId) -> Result<()> {
         let Some(sync) = &self.sync else {
             return Ok(());
         };
@@ -3052,8 +3059,8 @@ impl CraqleNode {
             policy,
         } = build.request;
         let policy = policy.normalized();
+        self.reconcile_pending(&graph);
         self.ensure_policy_action(&graph, &policy, build.auth, Action::Write)?;
-        self.reconcile_pending(&graph)?;
         let manager = self.manager_with(build.durability, build.actor);
         let batch = if build.version == RoCrateVersion::default() {
             manager.create_crate(
@@ -3139,8 +3146,8 @@ impl CraqleNode {
             replaced_predicates,
         } = request;
         let graph = entity.graph;
+        self.reconcile_pending(&graph);
         self.ensure_graph_action(&graph, auth, Action::Write)?;
-        self.reconcile_pending(&graph)?;
         let batch = self.manager_with(durability, actor).patch_data_entity(
             &graph,
             &entity.entity_id,
@@ -3178,8 +3185,8 @@ impl CraqleNode {
         name: &str,
         additional_triples: Vec<(NamedNode, Term)>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.reconcile_pending(graph)?;
         let batch = self.manager().add_data_entity(
             graph,
             entity_id,
@@ -3197,8 +3204,8 @@ impl CraqleNode {
         graph: &GraphId,
         entities: Vec<NewDataEntity>,
     ) -> Result<AppendDataEntitiesReport> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.reconcile_pending(graph)?;
         let report = self.manager().append_root_entities(graph, entities)?;
         self.finish_report(graph, report)
     }
@@ -3247,8 +3254,8 @@ impl CraqleNode {
             replaced_predicates,
         } = request;
         let graph = entity.graph;
+        self.reconcile_pending(&graph);
         self.ensure_graph_action(&graph, auth, Action::Write)?;
-        self.reconcile_pending(&graph)?;
         let batch = self
             .manager_with(durability, actor)
             .patch_contextual_entity(
@@ -3295,8 +3302,8 @@ impl CraqleNode {
         name: &str,
         additional_triples: Vec<(NamedNode, Term)>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.reconcile_pending(graph)?;
         let batch = self.manager().add_contextual_entity(
             graph,
             entity_id,
@@ -3364,8 +3371,8 @@ impl CraqleNode {
         graph: GraphId,
         jsonld: &str,
     ) -> Result<Batch> {
+        self.reconcile_pending(&graph);
         self.ensure_graph_action(&graph, auth, Action::Write)?;
-        self.reconcile_pending(&graph)?;
         let batch = self.manager().import_jsonld(graph.clone(), jsonld)?;
         self.finish_batch(&graph, batch)
     }
@@ -3398,8 +3405,8 @@ impl CraqleNode {
         durability: CraqleRequestDurability,
     ) -> Result<Batch> {
         let policy = policy.normalized();
+        self.reconcile_pending(&graph);
         self.ensure_policy_action(&graph, &policy, auth, Action::Write)?;
-        self.reconcile_pending(&graph)?;
         let batch = self
             .manager_for_durability(durability)
             .import_jsonld(graph.clone(), jsonld)?;
@@ -3454,8 +3461,8 @@ impl CraqleNode {
         write: RoCrateWrite<'_>,
     ) -> Result<Batch> {
         let policy = write.policy.normalized();
+        self.reconcile_pending(&write.graph);
         self.ensure_policy_action(&write.graph, &policy, auth, Action::Write)?;
-        self.reconcile_pending(&write.graph)?;
         let batch = self
             .manager_with(write.durability, write.actor)
             .with_commit(write.commit)
@@ -3597,17 +3604,19 @@ impl CraqleNode {
             return Ok(None);
         }
 
-        let mut authorized = HashSet::new();
-        for change in &changes {
-            let graph = match change {
+        let graphs = changes
+            .iter()
+            .map(|change| match change {
                 CoreChange::Insert { graph, .. } | CoreChange::Delete { graph, .. } => graph,
-            };
-            if authorized.insert(graph.clone()) {
-                self.ensure_graph_action(graph, auth, Action::Write)?;
-            }
+            })
+            .collect::<HashSet<_>>();
+        for graph in &graphs {
+            self.reconcile_pending(graph);
+        }
+        for graph in graphs {
+            self.ensure_graph_action(graph, auth, Action::Write)?;
         }
         let graph = single_change_graph(&changes)?;
-        self.reconcile_pending(&graph)?;
         let batch = self.replication.local_apply_changes(&graph, changes)?;
         Ok(Some(self.finish_batch(&graph, batch)?))
     }
@@ -3619,8 +3628,8 @@ impl CraqleNode {
         graph: &GraphId,
         quads: Vec<(CoreEncodedTerm, CoreEncodedTerm, CoreEncodedTerm)>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.reconcile_pending(graph)?;
         let batch = self.replication.local_insert_quads(graph, quads)?;
         self.finish_batch(graph, batch)
     }
@@ -3632,8 +3641,8 @@ impl CraqleNode {
         graph: &GraphId,
         changes: Vec<CoreChange>,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.reconcile_pending(graph)?;
         let batch = self.replication.local_apply_changes(graph, changes)?;
         self.finish_batch(graph, batch)
     }
@@ -3664,8 +3673,8 @@ impl CraqleNode {
         old_value: Option<&str>,
         new_value: &str,
     ) -> Result<Batch> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
-        self.reconcile_pending(graph)?;
         let batch = self.manager().update_property(
             graph,
             rocrate::PropertyUpdate {

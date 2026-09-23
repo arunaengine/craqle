@@ -13,6 +13,7 @@ use craqle::{
     HistoryPoint, HistoryRestore, MaterializedQuadChange, MutationCommit, MutationId,
     MutationRequest, RoCrateWrite, SearchStorage,
 };
+use craqle::{GrantAuthorizer, PermissionGrant, PermissionLevel};
 use irokle::{Irokle, MemoryStorage, OpId};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, irokle::Event)]
@@ -1755,4 +1756,90 @@ fn recovered_dependencies_converge() {
     assert_eq!(recovered.clock, replayed.clock);
     assert!(!recovered.quads.iter().any(|quad| quad.object == object));
     assert!(!replayed.quads.iter().any(|quad| quad.object == object));
+}
+
+/// A second node on the same Irokle node publishes a revocation this node has not applied.
+fn pending_revocation(fixture: &Fixture) -> (CraqleNode, GrantAuthorizer) {
+    let other = CraqleNode::open_with_options(
+        fixture.directory.path().join("revoker"),
+        CraqleOptions::new()
+            .with_search_storage(SearchStorage::Memory)
+            .with_irokle(fixture.native.clone(), CraqleIrokleOptions::new()),
+    )
+    .unwrap();
+    let writer = GrantAuthorizer::new(vec![PermissionGrant::new(
+        "/history",
+        PermissionLevel::Write,
+    )]);
+    let revoked = GraphPolicy {
+        public: true,
+        permission_paths: vec!["/elsewhere".into()],
+    };
+    other
+        .set_graph_policy(&AllowAllAuthorizer, &fixture.graph, revoked)
+        .unwrap();
+    (other, writer)
+}
+
+#[test]
+fn revoked_writes_denied() {
+    type Write = fn(&Fixture, &GrantAuthorizer) -> Option<CraqleErrorKind>;
+    let writes: [Write; 4] = [
+        |fixture, auth| {
+            fixture
+                .node
+                .apply_changes(auth, &fixture.graph, vec![keyword(fixture, "denied")])
+                .err()
+                .map(|error| error.kind())
+        },
+        |fixture, auth| {
+            fixture
+                .node
+                .apply_mutation(
+                    auth,
+                    MutationRequest {
+                        id: MutationId::new(),
+                        admission_sequence: None,
+                        graph: fixture.graph.clone(),
+                        changes: vec![keyword(fixture, "denied")],
+                    },
+                )
+                .err()
+                .map(|error| error.kind())
+        },
+        |fixture, auth| {
+            let update = format!(
+                "INSERT DATA {{ GRAPH <{0}> {{ <{0}> <http://schema.org/keywords> \"denied\" }} }}",
+                fixture.graph.as_str()
+            );
+            fixture
+                .node
+                .apply_sparql_update(auth, &update)
+                .err()
+                .map(|error| error.kind())
+        },
+        |fixture, auth| {
+            let policy = fixture.node.graph_policy(&fixture.graph).unwrap();
+            fixture
+                .node
+                .apply_rocrate_document_checked_with_policy(
+                    auth,
+                    fixture.graph.clone(),
+                    &fixture.renamed("Denied"),
+                    policy,
+                )
+                .err()
+                .map(|error| error.kind())
+        },
+    ];
+    for write in writes {
+        let fixture = Fixture::new();
+        let (_other, writer) = pending_revocation(&fixture);
+        let content = fixture.content();
+        assert_eq!(
+            write(&fixture, &writer),
+            Some(CraqleErrorKind::Unauthorized)
+        );
+        assert_eq!(fixture.content(), content);
+    }
 }
