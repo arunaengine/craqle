@@ -61,6 +61,7 @@ mod store;
 mod validation_delta;
 
 mod auth;
+mod history;
 #[cfg(feature = "shacl-core")]
 pub mod shacl;
 mod sync;
@@ -137,6 +138,7 @@ pub use auth::{
     Action, AllowAllAuthorizer, AuthorizationError, Authorizer, DenyAllAuthorizer, GrantAuthorizer,
     PermissionGrant, PermissionLevel,
 };
+pub use history::{GraphHistory, HistoryProjection};
 pub use irokle;
 
 /// Stable high-level classification for public Craqle failures.

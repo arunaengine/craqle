@@ -372,6 +372,10 @@ name = "graph_existence"
 path = "tests/graph_existence.rs"
 
 [[test]]
+name = "history"
+path = "tests/history.rs"
+
+[[test]]
 name = "maintenance_crash"
 path = "tests/maintenance_crash.rs"
 
