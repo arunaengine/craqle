@@ -237,6 +237,7 @@ const GRAPH_CLOCK_PREFIX: u8 = b'K';
 /// Persisted, clock-tagged graph diagnostics.
 const GRAPH_DIAGNOSTICS_PREFIX: u8 = b'O';
 const DISK_FORMAT_KEY: &[u8] = b"\0craqle-authoritative-format";
+const LITERAL_ALIAS_KEY: &[u8] = b"\0craqle-literal-aliases";
 #[cfg(feature = "shacl-core")]
 const SHACL_BINDING_PREFIX: u8 = b'S';
 #[cfg(feature = "shacl-core")]
@@ -6709,6 +6710,89 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Merges literal aliases that earlier versions stored under their raw spelling.
+    fn repair_literal_aliases(&self) -> Result<()> {
+        if self.graphs.contains_key(LITERAL_ALIAS_KEY)? {
+            return Ok(());
+        }
+        let mut aliases = HashMap::new();
+        for guard in self.db.snapshot().iter(&self.terms) {
+            let (key, value) = guard.into_inner()?;
+            if value.first() != Some(&b'"') {
+                continue;
+            }
+            if let Some(canonical) = EncodedTerm(decode_term_text(value.as_ref())?).canonical() {
+                let alias = decode_term_id(key.as_ref(), "term key")?;
+                aliases.insert(alias, self.encode_term(&canonical)?);
+            }
+        }
+        if !aliases.is_empty() {
+            self.merge_aliases(&aliases)?;
+        }
+        let mut batch = self.buffered_batch();
+        batch.insert(&self.graphs, LITERAL_ALIAS_KEY, []);
+        self.commit_fjall_batch(batch)
+    }
+
+    /// Moves the dots of every quad that uses an alias term onto its canonical quad.
+    fn merge_aliases(&self, aliases: &HashMap<TermId, TermId>) -> Result<()> {
+        let canonical = |id: TermId| aliases.get(&id).copied().unwrap_or(id);
+        let mut batch = self.new_batch();
+        let mut subjects: HashMap<TermId, HashSet<TermId>> = HashMap::new();
+        let mut staged = 0;
+        for guard in self.db.snapshot().iter(&self.quads) {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 64 || dots_empty(value.as_ref()) {
+                continue;
+            }
+            let raw = Self::decode_quad_key(key.as_ref())?;
+            let quad = EncodedQuad {
+                subject: canonical(raw.subject),
+                predicate: canonical(raw.predicate),
+                object: canonical(raw.object),
+                ..raw
+            };
+            if quad == raw {
+                continue;
+            }
+            let target = Self::quad_key(quad.graph, quad.subject, quad.predicate, quad.object);
+            let mut dots = self.current_quad_dots(&batch, &target)?;
+            dots.extend(decode_dots(value.as_ref())?);
+            self.write_quad_state(&mut batch, quad, dots)?;
+            self.write_quad_state(&mut batch, raw, Vec::new())?;
+            subjects.entry(quad.graph).or_default().insert(quad.subject);
+            staged += 1;
+            if staged == QV_BUILD_ROWS {
+                let full = std::mem::replace(&mut batch, self.new_batch());
+                self.commit_aliases(full, std::mem::take(&mut subjects))?;
+                staged = 0;
+            }
+        }
+        self.commit_aliases(batch, subjects)
+    }
+
+    /// Commits merged aliases with the search and SHACL work their graphs now owe.
+    fn commit_aliases(
+        &self,
+        mut batch: WriteBatch,
+        subjects: HashMap<TermId, HashSet<TermId>>,
+    ) -> Result<()> {
+        if subjects.is_empty() {
+            return Ok(());
+        }
+        for (graph_id, subjects) in &subjects {
+            let graph_id = *graph_id;
+            self.enqueue_fts_subjects(&mut batch, FtsEnqueue { graph_id, subjects })?;
+            #[cfg(feature = "shacl-core")]
+            if let Some(graph) = self.decode_term(graph_id)?.to_named_node() {
+                let graph = GraphId(graph);
+                let version = self.graph_version_digest(&graph)?;
+                self.stage_pending_bindings(&mut batch, &graph, version)?;
+            }
+        }
+        self.commit(batch)
+    }
+
     /// Re-queues entities whose repaired orphan visibility changed.
     fn requeue_orphan_changes(
         &self,
@@ -7494,6 +7578,7 @@ impl GraphStore {
         store.restore_receipt_next()?;
         store.restore_dirty_counter()?;
         store.rebuild_search_order()?;
+        store.repair_literal_aliases()?;
         store.repair_diagnostics()?;
         Ok(store)
     }
@@ -7537,7 +7622,7 @@ impl GraphStore {
         }
         for guard in self.graphs.iter() {
             let (key, _) = guard.into_inner()?;
-            if key.as_ref() != DISK_FORMAT_KEY {
+            if key.as_ref() != DISK_FORMAT_KEY && key.as_ref() != LITERAL_ALIAS_KEY {
                 return Ok(false);
             }
         }
@@ -16681,5 +16766,86 @@ mod tests {
             after > before,
             "manual_compact must land pending writes in tables, but bytes went {before} -> {after}"
         );
+    }
+
+    /// Aliases stored raw by earlier versions merge on open; a delete of either spelling removes them.
+    #[test]
+    fn legacy_aliases_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = crate::AllowAllAuthorizer;
+        let predicate =
+            EncodedTerm::from_named_node(&oxrdf::NamedNode::new_unchecked("urn:test:alias:p"));
+        let plain = EncodedTerm("\"x\"".to_owned());
+        let typed = EncodedTerm("\"x\"^^<http://www.w3.org/2001/XMLSchema#string>".to_owned());
+        let graphs = [
+            GraphId::new("urn:test:alias:typed"),
+            GraphId::new("urn:test:alias:plain"),
+        ];
+        let subject = |graph: &GraphId| EncodedTerm::from_named_node(&graph.0);
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            for graph in &graphs {
+                let quads = vec![(subject(graph), predicate.clone(), plain.clone())];
+                node.insert_quads(&auth, graph, quads).unwrap();
+                let store = &node.store;
+                let _commit = store.graph_commit_guard(graph);
+                let mut batch = store.new_batch();
+                let graph_id = store.resolve_term(&subject(graph)).unwrap();
+                let actor = ActorId::random();
+                let counter = store
+                    .next_counter(&mut batch, CounterKey { graph_id, actor })
+                    .unwrap();
+                let quad = EncodedQuad {
+                    graph: graph_id,
+                    subject: graph_id,
+                    predicate: store.resolve_term(&predicate).unwrap(),
+                    object: store.resolve_term(&typed).unwrap(),
+                };
+                let dot = Dot { actor, counter };
+                store
+                    .insert_quad(&mut batch, QuadAdd { quad, dot })
+                    .unwrap();
+                let mut clock = store.vector_clock_id(graph_id).unwrap();
+                clock.advance(actor, counter);
+                let clock = ClockUpdate {
+                    graph_id,
+                    clock: &clock,
+                };
+                store.set_vector_clock(&mut batch, clock).unwrap();
+                // Earlier versions never wrote the repair marker.
+                batch.remove(&store.graphs, LITERAL_ALIAS_KEY);
+                store.commit(batch).unwrap();
+            }
+            node.persist_fjall().unwrap();
+        }
+
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        for (graph, spelling) in graphs.iter().zip([&typed, &plain]) {
+            let objects = |node: &crate::CraqleNode| {
+                let snapshot = node.graph_snapshot(graph).unwrap();
+                let quads = snapshot.quads.into_iter();
+                quads
+                    .map(|quad| (quad.object, quad.dots.len()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(objects(&node), [(plain.clone(), 2)]);
+            let sparql = format!(
+                "SELECT ?o WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
+                graph.as_str()
+            );
+            let rows = match node.query(&auth, &sparql).unwrap() {
+                crate::QueryResults::Solutions(rows) => rows,
+                other => panic!("expected solutions, got {other:?}"),
+            };
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            let delete = crate::MaterializedQuadChange::Delete {
+                graph: graph.clone(),
+                subject: subject(graph),
+                predicate: predicate.clone(),
+                object: spelling.clone(),
+            };
+            node.apply_changes(&auth, graph, vec![delete]).unwrap();
+            assert!(objects(&node).is_empty(), "{spelling:?}");
+        }
     }
 }

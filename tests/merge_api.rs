@@ -378,3 +378,79 @@ fn stale_snapshot_ignored() {
     assert!(beta.merge_batch(&removal).unwrap().applied);
     assert_eq!(current, beta.graph_snapshot(&graph).unwrap());
 }
+
+/// Literal aliases from peers that predate canonical storage are one value in any merge order.
+#[test]
+fn replicated_aliases_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let author = node(tmp.path(), "author");
+    let replica = node(tmp.path(), "replica");
+    let graph = GraphId::new("https://w3id.org/aruna/merge-alias");
+    let setup = apply_doc(&author, &graph, &doc(&graph, 1));
+    let base = author.vector_clock(&graph).unwrap();
+    let local = author
+        .apply_changes(
+            &AllowAllAuthorizer,
+            &graph,
+            vec![keyword_change(&graph, "x", true)],
+        )
+        .unwrap();
+    let subject = EncodedTerm::from_named_node(&graph.0);
+    let predicate = EncodedTerm::from_named_node(&vocab::schema_keywords());
+    let object = EncodedTerm("\"x\"^^<http://www.w3.org/2001/XMLSchema#string>".to_string());
+    let add = MaterializedQuadChange::Insert {
+        graph: graph.clone(),
+        subject: subject.clone(),
+        predicate: predicate.clone(),
+        object: object.clone(),
+    };
+    let legacy = Batch::from_changes(graph.clone(), actor(220), 1, base, vec![add], Utc::now());
+    let legacy = legacy.unwrap();
+
+    assert!(author.merge_batch(&legacy).unwrap().applied);
+    for batch in [&setup, &legacy, &local] {
+        assert!(replica.merge_batch(batch).unwrap().applied);
+    }
+    let keywords = vocab::schema_keywords();
+    for holder in [&author, &replica] {
+        assert_eq!(objects_for(holder, &graph, keywords.as_str()), ["\"x\""]);
+    }
+    assert_eq!(
+        author.graph_snapshot(&graph).unwrap(),
+        replica.graph_snapshot(&graph).unwrap()
+    );
+    // An older holder's snapshot keeps the two spellings apart.
+    let mut split = author.graph_snapshot(&graph).unwrap();
+    let index = split.quads.iter().position(|quad| quad.object.0 == "\"x\"");
+    let aliased = &mut split.quads[index.unwrap()];
+    let mut raw = aliased.clone();
+    raw.object = object.clone();
+    raw.dots = vec![aliased.dots.pop().unwrap()];
+    split.quads.push(raw);
+    assert!(!replica.install_graph_snapshot(&split).unwrap().applied);
+    assert_eq!(
+        author.graph_snapshot(&graph).unwrap(),
+        replica.graph_snapshot(&graph).unwrap()
+    );
+
+    let delete = MaterializedQuadChange::Delete {
+        graph: graph.clone(),
+        subject,
+        predicate,
+        object,
+    };
+    let clock = author.vector_clock(&graph).unwrap();
+    let removal = Batch::from_changes(
+        graph.clone(),
+        actor(220),
+        2,
+        clock,
+        vec![delete],
+        Utc::now(),
+    );
+    let removal = removal.unwrap();
+    for holder in [&author, &replica] {
+        assert!(holder.merge_batch(&removal).unwrap().applied);
+        assert!(objects_for(holder, &graph, keywords.as_str()).is_empty());
+    }
+}

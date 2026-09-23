@@ -2396,8 +2396,11 @@ fn apply_history(
                 ..
             } => (subject, predicate, object),
         };
+        // History reduces literal aliases like replica apply does, so repair compares equal state.
+        let [subject, predicate, object] = [subject, predicate, object]
+            .map(|term| term.canonical().unwrap_or_else(|| term.clone()));
         let index = snapshot.quads.iter().position(|quad| {
-            quad.subject == *subject && quad.predicate == *predicate && quad.object == *object
+            quad.subject == subject && quad.predicate == predicate && quad.object == object
         });
         match op {
             QuadOp::Add { dot, .. } => {

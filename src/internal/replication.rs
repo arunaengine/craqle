@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
 // SPDX-License-Identifier: MIT
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "shacl-core")]
@@ -10,8 +11,8 @@ use std::time::{Duration, Instant};
 use crate::core::{
     ActorId, Batch, ContextTag, CrateRenderHints, CrateViolation, Dot, EncodedTerm, EventId,
     GraphDiagnostics, GraphId, GraphReplicaSnapshot, GraphTombstone, MaterializedQuadChange,
-    QuadOp, TaggedGraphPolicy, TaggedRenderHints, UnsupportedRdfStarTerm as RdfStarError,
-    VectorClock,
+    QuadOp, SnapshotQuadState, TaggedGraphPolicy, TaggedRenderHints,
+    UnsupportedRdfStarTerm as RdfStarError, VectorClock,
 };
 #[cfg(feature = "shacl-core")]
 use crate::rdf_read::StoreReadView;
@@ -2621,11 +2622,16 @@ impl ReplicationEngine {
         cx: &mut BatchTermCtx<'_>,
         terms: QuadTerms<'_>,
     ) -> crate::store::Result<EncodedQuad> {
+        // Replicated literal aliases keep their signed spelling but share the canonical quad.
+        let resolve = |cx: &mut BatchTermCtx<'_>, term: &EncodedTerm| match term.canonical() {
+            Some(canonical) => self.store.resolve_term_cached(cx, &canonical),
+            None => self.store.resolve_term_cached(cx, term),
+        };
         Ok(EncodedQuad {
             graph: terms.graph_id,
-            subject: self.store.resolve_term_cached(cx, terms.subject)?,
-            predicate: self.store.resolve_term_cached(cx, terms.predicate)?,
-            object: self.store.resolve_term_cached(cx, terms.object)?,
+            subject: resolve(cx, terms.subject)?,
+            predicate: resolve(cx, terms.predicate)?,
+            object: resolve(cx, terms.object)?,
         })
     }
 
@@ -3016,10 +3022,11 @@ impl ReplicationEngine {
                 "healthy snapshot digest does not match its authoritative state".to_owned(),
             ));
         }
+        let authoritative = canonical_snapshot(&request.authoritative);
         let tombstoned = self.store.graph_tombstoned(graph)?;
         let result = if tombstoned {
             crate::sync::RepairResult::Tombstoned
-        } else if local == request.authoritative {
+        } else if local == *authoritative {
             crate::sync::RepairResult::Exact
         } else if request.mode == crate::sync::RepairMode::Apply
             && request
@@ -3031,10 +3038,10 @@ impl ReplicationEngine {
         } else {
             crate::sync::RepairResult::Differs
         };
-        let diff = (local != request.authoritative).then(|| crate::sync::RepairDiff {
-            unresolved: crate::sync::missing_dots(&request.authoritative.clock, &local.clock),
+        let diff = (local != *authoritative).then(|| crate::sync::RepairDiff {
+            unresolved: crate::sync::missing_dots(&authoritative.clock, &local.clock),
             local,
-            authoritative: request.authoritative.clone(),
+            authoritative: authoritative.into_owned(),
         });
         Ok(crate::sync::RepairReport {
             audit: crate::sync::RepairAudit {
@@ -3072,9 +3079,9 @@ impl ReplicationEngine {
         {
             report.audit.backup = Some(self.store.backup_snapshot(&report.audit.graph)?);
             report.audit.result = crate::sync::RepairResult::Applied;
-            report.audit.after_digest = Some(snapshot_digest(&request.authoritative)?);
-            self.store
-                .replace_snapshot(&request.authoritative, &report.audit)?;
+            let authoritative = canonical_snapshot(&request.authoritative);
+            report.audit.after_digest = Some(snapshot_digest(&authoritative)?);
+            self.store.replace_snapshot(&authoritative, &report.audit)?;
             let _write = self.store.graph_write_guard(&report.audit.graph);
             let _commit = self.store.graph_commit_guard(&report.audit.graph);
             self.recompute_graph_diagnostics(&report.audit.graph)?;
@@ -3136,6 +3143,7 @@ impl ReplicationEngine {
         receipt: Option<&crate::sync::MutationReceipt>,
     ) -> Result<bool, MergeError> {
         let graph = &snapshot.graph;
+        let snapshot = &*canonical_snapshot(snapshot);
         // An absent dot covered by the other pre-merge clock is an observed removal.
         let local = self.store.graph_snapshot(graph)?;
         let mut clock = local.clock.clone();
@@ -3544,11 +3552,13 @@ fn batch_changes(
                 ..
             } => (subject, predicate, object),
         };
+        let [subject, predicate, object] = [subject, predicate, object]
+            .map(|term| term.canonical().unwrap_or_else(|| term.clone()));
         let key = (subject.clone(), predicate.clone(), object.clone());
         let index = if let Some(index) = indexes.get(&key) {
             *index
         } else {
-            let dots = store.quad_dots(&batch.graph, subject, predicate, object)?;
+            let dots = store.quad_dots(&batch.graph, &subject, &predicate, &object)?;
             let index = quads.len();
             quads.push(BatchQuad {
                 subject: subject.clone(),
@@ -3633,6 +3643,41 @@ fn map_update_error(error: crate::CraqleError) -> UpdateError {
 }
 
 type TermTriple<'a> = (&'a EncodedTerm, &'a EncodedTerm, &'a EncodedTerm);
+
+/// Merges literal aliases into their canonical quads, like applying the same events would.
+fn canonical_snapshot(snapshot: &GraphReplicaSnapshot) -> Cow<'_, GraphReplicaSnapshot> {
+    fn terms(quad: &SnapshotQuadState) -> [&EncodedTerm; 3] {
+        [&quad.subject, &quad.predicate, &quad.object]
+    }
+    let aliased =
+        |quad: &SnapshotQuadState| terms(quad).iter().any(|term| term.canonical().is_some());
+    if !snapshot.quads.iter().any(aliased) {
+        return Cow::Borrowed(snapshot);
+    }
+    let mut quads: BTreeMap<[EncodedTerm; 3], Vec<Dot>> = BTreeMap::new();
+    for quad in &snapshot.quads {
+        let key = terms(quad).map(|term| term.canonical().unwrap_or_else(|| term.clone()));
+        quads.entry(key).or_default().extend(&quad.dots);
+    }
+    let quads = quads
+        .into_iter()
+        .map(|([subject, predicate, object], mut dots)| {
+            dots.sort_unstable_by_key(|dot| (dot.actor, dot.counter));
+            dots.dedup();
+            SnapshotQuadState {
+                subject,
+                predicate,
+                object,
+                dots,
+            }
+        })
+        .collect();
+    Cow::Owned(GraphReplicaSnapshot {
+        graph: snapshot.graph.clone(),
+        clock: snapshot.clock.clone(),
+        quads,
+    })
+}
 
 /// Include unilateral quads so the opposite clock can prove an observed removal.
 fn join_union<'a>(
