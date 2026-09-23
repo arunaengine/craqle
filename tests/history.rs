@@ -1440,6 +1440,48 @@ fn restore_rechecks_policy() {
 }
 
 #[test]
+fn failed_restore_retries() {
+    let fixture = Fixture::new();
+    let original = fixture.heads();
+    let content = fixture.content();
+    fixture.rename("Changed");
+    let admin = Irokle::builder()
+        .with_storage(fixture.native.storage().clone())
+        .with_signer(irokle::Ed25519Signer::from_bytes(&[77; 32]))
+        .build()
+        .unwrap();
+    fixture
+        .node
+        .add_irokle_peer(&fixture.graph, admin.peer_id())
+        .unwrap();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    let control = admin.open_topic::<CraqleGraphEvent>(topic).unwrap();
+    control.remove_peer(fixture.native.peer_id()).unwrap();
+    let request = HistoryRestore {
+        id: Some(MutationId::new()),
+        ..fixture.restore(&original, None)
+    };
+    // Publishing fails while the node is not a topic member, leaving a prepared receipt.
+    assert!(
+        fixture
+            .node
+            .restore_history(&AllowAllAuthorizer, &request)
+            .is_err()
+    );
+    control.add_peer(fixture.native.peer_id()).unwrap();
+    let retry = fixture
+        .node
+        .restore_history(&AllowAllAuthorizer, &request)
+        .unwrap();
+    assert_eq!(retry.map(|restored| restored.id), request.id);
+    assert_eq!(fixture.content(), content);
+}
+
+#[test]
 fn rejects_reused_ids() {
     let fixture = Fixture::new();
     let topic = fixture

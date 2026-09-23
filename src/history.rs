@@ -10,7 +10,7 @@ use crate::{
     Action, AuthorizationError, Authorizer, CommitInfo, CraqleErrorKind, CraqleGraphEvent,
     CraqleNode, CraqleOptions, CraqleSyncError, Dot, EncodedTerm, GraphId, GraphPolicy,
     MaterializedQuadChange, MemoryBudget, MutationId, MutationRequest, QuadOp, Result,
-    SearchStorage,
+    SearchStorage, SourceOutcome,
 };
 use irokle::OpId;
 use irokle::reducer::EventRecord;
@@ -297,7 +297,10 @@ impl CraqleNode {
             if receipt.graph != request.graph {
                 return Err(HistoryError::InvalidRequest.into());
             }
-            return self.restored(topic, Some(receipt));
+            // A prepared receipt is finished below, like a retried `apply_mutation`.
+            if receipt.source != SourceOutcome::Prepared {
+                return self.restored(topic, Some(receipt));
+            }
         }
         let target = self.history_content(&TopicHistory {
             graph: request.graph.clone(),
@@ -322,6 +325,12 @@ impl CraqleNode {
         let policy = self.history_policy(&request.graph)?;
         auth.authorize(&request.graph, &policy, Action::Read)?;
         auth.authorize(&request.graph, &policy, Action::Write)?;
+        if let Some(id) = request.id
+            && let Some(receipt) = self.store.mutation_receipt(&id)?
+            && receipt.source != SourceOutcome::Prepared
+        {
+            return self.restored(topic, Some(receipt));
+        }
         let heads = sync.topic_heads(topic)?.into_iter().collect::<Vec<_>>();
         if let Some(expected) = &request.expected
             && expected.iter().collect::<BTreeSet<_>>() != heads.iter().collect()
