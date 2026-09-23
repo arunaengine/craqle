@@ -227,7 +227,10 @@ impl CraqleNode {
                     actor: body.actor_id,
                     sequence: body.actor_seq,
                     generation: body.generation,
-                    event: entry.record.map(|record| record.event),
+                    event: entry
+                        .record
+                        .filter(|_| !entry.rejected)
+                        .map(|record| record.event),
                     rejected: entry.rejected,
                 }
             })

@@ -1383,3 +1383,39 @@ fn replays_plain_mutations() {
         .unwrap();
     assert_eq!(diff.changes, [fixture.insert("plain")]);
 }
+
+#[test]
+fn hides_store_rejections() {
+    let fixture = Fixture::new();
+    let topic = fixture
+        .node
+        .irokle_topic_id(&fixture.graph)
+        .unwrap()
+        .unwrap();
+    // Decodes and targets this graph, but the store rejects a literal subject.
+    fixture
+        .native
+        .open_topic::<CraqleGraphEvent>(topic)
+        .unwrap()
+        .publish(CraqleGraphEvent::QuadChanges {
+            graph: fixture.graph.clone(),
+            changes: vec![MaterializedQuadChange::Insert {
+                graph: fixture.graph.clone(),
+                subject: EncodedTerm("\"illegal subject\"".into()),
+                predicate: EncodedTerm("<urn:p>".into()),
+                object: EncodedTerm("\"unapplied\"".into()),
+            }],
+        })
+        .unwrap();
+    fixture.node.reconcile_irokle().unwrap();
+    let log = HistoryLog {
+        graph: fixture.graph.clone(),
+        heads: fixture.heads(),
+        limit: 1,
+        max_bytes: 1024 * 1024,
+    };
+    let page = fixture.node.history_log(&AllowAllAuthorizer, &log).unwrap();
+    let rejected = &page.operations[0];
+    assert!(rejected.rejected && rejected.event.is_none());
+    assert!(rejected.changes().is_empty());
+}
