@@ -157,6 +157,77 @@ mod tests {
     }
 
     #[test]
+    fn claimed_op_ids() {
+        let (_tmp, mut net) = setup_network(2);
+        let policy_graph = GraphId::new("urn:test:claimed-policy-id");
+        let delete_graph = GraphId::new("urn:test:claimed-delete-id");
+        for graph in [&policy_graph, &delete_graph] {
+            create_test_crate(&net, 0, graph);
+        }
+        net.sync_until_converged(10).unwrap();
+        net.partition(0, 1);
+        let policy = GraphPolicy {
+            public: true,
+            permission_paths: vec!["/tests/claimed".to_owned()],
+        };
+        net.peer(1)
+            .set_graph_policy(&writer_auth(), &policy_graph, policy.clone())
+            .unwrap();
+        let policy_topic = net.peer(1).irokle_topic_id(&policy_graph).unwrap().unwrap();
+        let delete_topic = net.peer(1).irokle_topic_id(&delete_graph).unwrap().unwrap();
+        net.peer(1).delete_graph_unchecked(&delete_graph).unwrap();
+        // A local writer takes the receipt id each peer record will use before it arrives.
+        let mut prepared = Vec::new();
+        for (graph, topic) in [(&policy_graph, policy_topic), (&delete_graph, delete_topic)] {
+            let heads = net.irokle(1).raw_topic(topic).unwrap().heads().unwrap();
+            assert_eq!(heads.len(), 1);
+            let op = *heads.iter().next().unwrap();
+            let request = MutationRequest {
+                id: MutationId::from_op(op),
+                admission_sequence: None,
+                graph: graph.clone(),
+                changes: vec![MaterializedQuadChange::Insert {
+                    graph: graph.clone(),
+                    subject: EncodedTerm::from_named_node(&graph.0),
+                    predicate: EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    object: literal_term("claimed"),
+                }],
+            };
+            let receipt = net
+                .peer(0)
+                .apply_mutation(&AllowAllAuthorizer, request.clone())
+                .unwrap();
+            assert_eq!(receipt.source, SourceOutcome::Prepared);
+            prepared.push((request, receipt.admission_sequence));
+        }
+        net.heal(0, 1);
+        net.sync_until_converged(10).unwrap();
+        for index in 0..2 {
+            let peer = net.peer(index);
+            assert_eq!(peer.graph_policy(&policy_graph).unwrap(), policy);
+            assert!(!peer.contains_graph(&delete_graph).unwrap());
+            let rejected = peer
+                .list_rejected_replication_records(&AllowAllAuthorizer)
+                .unwrap();
+            assert!(rejected.is_empty());
+        }
+        // The kept receipt still lets the local write publish its own op.
+        let (request, sequence) = prepared.swap_remove(0);
+        let applied = net
+            .peer(0)
+            .apply_mutation(
+                &AllowAllAuthorizer,
+                MutationRequest {
+                    admission_sequence: Some(sequence),
+                    ..request
+                },
+            )
+            .unwrap();
+        assert_eq!(applied.source, SourceOutcome::Applied);
+        net.sync_until_converged(10).unwrap();
+    }
+
+    #[test]
     fn tagged_policy_convergence() {
         let (_tmp, mut net) = setup_network(3);
         let graph = GraphId::new("urn:test:tagged-policy-convergence");

@@ -8534,12 +8534,11 @@ impl GraphStore {
         batch.pending_fts.push(FtsQueueKey::Delete(graph_id));
 
         let _receipt_guard = receipt.map(|receipt| self.receipt_guard(&receipt.id));
-        if let Some(receipt) = receipt {
-            if self.mutation_receipt(&receipt.id)?.is_some() {
-                self.stage_receipt_update(&mut batch, receipt)?;
-            } else if self.stage_receipt(&mut batch, receipt)?.is_some() {
-                return Err(StoreError::ReceiptConflict);
-            }
+        // A receipt already stored under a reused id is kept; the delete still applies.
+        if let Some(receipt) = receipt
+            && self.mutation_receipt(&receipt.id)?.is_none()
+        {
+            self.stage_receipt(&mut batch, receipt)?;
         }
 
         #[cfg(test)]
@@ -8802,10 +8801,9 @@ impl GraphStore {
             graph_meta_key(graph_id),
             postcard::to_allocvec(&meta)?,
         );
-        if self.mutation_receipt(&update.receipt.id)?.is_some() {
-            self.stage_receipt_update(&mut batch, update.receipt)?;
-        } else if self.stage_receipt(&mut batch, update.receipt)?.is_some() {
-            return Err(StoreError::ReceiptConflict);
+        // A receipt already stored under a reused id is kept; the policy still applies.
+        if self.mutation_receipt(&update.receipt.id)?.is_none() {
+            self.stage_receipt(&mut batch, update.receipt)?;
         }
         self.commit(batch)?;
         drop(_receipt_guard);
