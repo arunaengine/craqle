@@ -1904,24 +1904,9 @@ impl SearchIndex {
                 .unwrap_or(0);
             let bytes = candidate_bytes(&subjects).saturating_add(bitset);
             let limit = req.limit.min(crate::MAX_SEARCH_LIMIT);
-            let mut admitted = bytes <= self.query_bytes() / 4 && subjects.len() <= limit;
-            if admitted {
-                let mut postings = 0_u64;
-                for subject in &subjects {
-                    (req.check)()?;
-                    let term = Term::from_field_text(self.f_subject_iri, subject);
-                    postings = postings.saturating_add(
-                        view.searcher
-                            .doc_freq(&term)
-                            .map_err(SearchError::from)
-                            .map_err(E::from)?,
-                    );
-                    if postings > limit as u64 {
-                        admitted = false;
-                        break;
-                    }
-                }
-            }
+            // Postings frequency is a whole-index count that could span graphs this caller
+            // cannot see, so admission relies only on the already-authorized candidate set.
+            let admitted = bytes <= self.query_bytes() / 4 && subjects.len() <= limit;
             if admitted {
                 query = Box::new(BooleanQuery::new(vec![
                     (Occur::Must, query),
@@ -4694,8 +4679,10 @@ mod tests {
                 .unwrap();
         }
         index.commit().unwrap();
+        // Admission no longer declines on whole-index subject postings, so the candidate
+        // restriction applies even though "urn:test:repeated" occurs in many graphs.
         let repeated = || Ok::<_, SearchError>(Some(vec!["urn:test:repeated".to_owned()]));
-        let fallback = index
+        let restricted = index
             .collect_complete(FilterQuery {
                 query: "needle",
                 limit: 1,
@@ -4705,7 +4692,7 @@ mod tests {
                 candidates: Some(&repeated),
             })
             .unwrap();
-        assert_eq!(fallback.len(), 2);
+        assert!(restricted.is_empty());
         let cancelled = std::cell::Cell::new(false);
         let prepare = || {
             cancelled.set(true);

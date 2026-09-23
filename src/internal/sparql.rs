@@ -5092,6 +5092,85 @@ mod tests {
         assert_eq!(execute(&options).unwrap(), 6_000);
     }
 
+    /// A hidden graph reusing an authorized candidate subject must not change whether
+    /// the fts candidate restriction is admitted, or the query fails with a fake row limit.
+    #[test]
+    #[cfg(feature = "search")]
+    fn candidates_ignore_hidden() {
+        let run = |hidden_copies: usize| {
+            let (_directory, store, search, engine) = setup_engine();
+            let graph = GraphId::new("urn:visible");
+            store.create_graph(&graph).unwrap();
+            let resolve = |term: &str| {
+                store
+                    .resolve_term(&EncodedTerm::from_named_node(&NamedNode::new_unchecked(
+                        term,
+                    )))
+                    .unwrap()
+            };
+            let (graph_id, predicate, object) = (
+                resolve(graph.as_str()),
+                resolve("urn:kind"),
+                resolve("urn:wanted"),
+            );
+            let mut batch = store.new_batch();
+            let quad = EncodedQuad {
+                graph: graph_id,
+                subject: resolve("urn:s:target"),
+                predicate,
+                object,
+            };
+            let dot = Dot {
+                actor: ActorId::random(),
+                counter: 1,
+            };
+            store
+                .insert_quad(&mut batch, QuadAdd { quad, dot })
+                .unwrap();
+            store.commit(batch).unwrap();
+            settle_diagnostics(&store, &graph);
+
+            search
+                .index_resource(graph.as_str(), "urn:s:target", Some("needle"))
+                .unwrap();
+            for index in 0..10_000 {
+                search
+                    .index_resource(
+                        graph.as_str(),
+                        &format!("urn:s:off:{index}"),
+                        Some("needle"),
+                    )
+                    .unwrap();
+            }
+            for index in 0..hidden_copies {
+                search
+                    .index_resource(
+                        &format!("urn:hidden:{index}"),
+                        "urn:s:target",
+                        Some("other"),
+                    )
+                    .unwrap();
+            }
+            search.commit().unwrap();
+
+            let text = "SELECT ?g ?s WHERE { SERVICE <urn:craqle:fts> { ?s <urn:craqle:fts:query> \"needle\" ; <urn:craqle:fts:graph> ?g ; <urn:craqle:fts:complete> true } GRAPH ?g { ?s <urn:kind> <urn:wanted> } }";
+            let mut options = QueryOptions::results_only();
+            options.limits.max_intermediate_rows = 50;
+            options.limits.deadline = None;
+            engine
+                .query_with_options(
+                    QueryRun {
+                        sparql: text,
+                        options: &options,
+                    },
+                    &|_, graph: &GraphId| !graph.as_str().starts_with("urn:hidden:"),
+                )
+                .map(|(_, result)| solution_rows(result.results).len())
+        };
+        assert_eq!(run(0).unwrap(), 1);
+        assert_eq!(run(60).unwrap(), 1);
+    }
+
     #[test]
     #[cfg(feature = "search")]
     fn recheck_budget_caches() {
