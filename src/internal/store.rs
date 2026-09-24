@@ -2530,11 +2530,13 @@ pub(crate) struct QvRead<'a> {
     pub(crate) costs: &'a crate::query::context::QueryCost,
 }
 
-/// The graph, byte budget and drain control of one search orphan lookup.
+/// The graph, byte budgets and drain control of one search orphan lookup.
 #[cfg(feature = "search")]
 pub(crate) struct OrphanScope<'a> {
     pub(crate) graph: TermId,
     pub(crate) byte_limit: usize,
+    /// Bytes a stale-diagnostics recompute may hold while it scans the graph.
+    pub(crate) work_limit: usize,
     pub(crate) control: &'a crate::search::queue::DrainControl,
 }
 
@@ -6648,8 +6650,8 @@ impl GraphStore {
         }
     }
 
-    /// Recomputes orphan ids within the scope's byte budget and drain control.
-    /// `None` means the graph did not fit, so the caller keeps its retryable error.
+    /// Recomputes orphan ids within the scope's work budget and drain control.
+    /// `None` means the held rows did not fit, so the caller keeps its retryable error.
     #[cfg(feature = "search")]
     fn bounded_orphan_ids(
         &self,
@@ -6659,7 +6661,7 @@ impl GraphStore {
         let vocab = self.orphan_vocab()?;
         let mut data_entities = HashSet::new();
         let mut adjacency = HashMap::<TermId, Vec<TermId>>::new();
-        let mut bytes = 0usize;
+        let mut held = 0usize;
         for guard in snapshot
             .snapshot
             .prefix(&self.quads, scope.graph.to_be_bytes())
@@ -6668,14 +6670,18 @@ impl GraphStore {
                 return Err(StoreError::Cancelled);
             }
             let (key, value) = guard.into_inner()?;
-            bytes = bytes.saturating_add(key.len() + value.len());
-            if bytes > scope.byte_limit {
-                return Ok(None);
-            }
             if dots_empty(value.as_ref()) {
                 continue;
             }
             let quad = Self::decode_quad_key(key.as_ref())?;
+            let kept =
+                vocab.has_part == Some(quad.predicate) || vocab.rdf_type == Some(quad.predicate);
+            if kept {
+                held = held.saturating_add(4 * std::mem::size_of::<TermId>());
+                if held > scope.work_limit {
+                    return Ok(None);
+                }
+            }
             if vocab.has_part == Some(quad.predicate) {
                 adjacency.entry(quad.subject).or_default().push(quad.object);
                 if quad.subject != scope.graph {
@@ -12619,11 +12625,8 @@ mod tests {
         let store = GraphStore::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:search-orphans");
         store.create_graph(&graph).unwrap();
-        commit_add(
-            &store,
-            &graph,
-            encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o")),
-        );
+        let part = (graph.as_str(), "http://schema.org/hasPart", "urn:o");
+        commit_add(&store, &graph, encode_quad(&store, &graph, part));
         let graph_tid = store
             .lookup_term(&EncodedTerm::from_named_node(&graph.0))
             .unwrap()
@@ -12634,9 +12637,10 @@ mod tests {
             Err(StoreError::InvalidSearchState(_))
         ));
         let control = crate::search::queue::DrainControl::default();
-        let scope = |byte_limit| OrphanScope {
+        let scope = |work_limit| OrphanScope {
             graph: graph_tid,
-            byte_limit,
+            byte_limit: usize::MAX,
+            work_limit,
             control: &control,
         };
         assert!(

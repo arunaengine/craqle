@@ -746,6 +746,7 @@ impl StoreSyncCaches {
             let scope = crate::store::OrphanScope {
                 graph: input.graph_tid,
                 byte_limit: artifact_limit,
+                work_limit: input.byte_limit,
                 control: input.control,
             };
             let orphaned = match input.store.search_orphan_ids(&self.snapshot, scope) {
