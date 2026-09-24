@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::RoCrateVersion;
@@ -2878,11 +2878,18 @@ fn jsonld_quads_bounded(
         collect_context_terms(context, &mut terms, false);
     }
     label_blank_nodes(&mut prepared, "", true, &terms);
-    let jsonld = serde_json::to_vec(&prepared)?;
+    inline_used_context(&mut prepared);
+    parse_jsonld(&serde_json::to_vec(&prepared)?, limits)
+}
+
+fn parse_jsonld(
+    jsonld: &[u8],
+    limits: Option<&RoCrateImportLimits>,
+) -> Result<Vec<Quad>, RoCrateError> {
     let parser = JsonLdParser::new()
         .with_base_iri(JSONLD_BASE_IRI)
         .map_err(|error| RoCrateError::JsonLd(error.to_string()))?
-        .for_slice(&jsonld)
+        .for_slice(jsonld)
         .with_load_document_callback(|url, _| load_context(url));
 
     let mut quads = Vec::new();
@@ -2903,6 +2910,120 @@ fn jsonld_quads_bounded(
         quads.push(quad);
     }
     Ok(quads)
+}
+
+/// Term maps of the embedded contexts, parsed once per process.
+static CONTEXT_TERMS: LazyLock<HashMap<&'static str, serde_json::Map<String, serde_json::Value>>> =
+    LazyLock::new(|| {
+        [
+            (ROCRATE_CONTEXT_11, RoCrateVersion::V1_1.context_bytes()),
+            (ROCRATE_CONTEXT_12, RoCrateVersion::V1_2.context_bytes()),
+            (ROCRATE_CONTEXT_13, RoCrateVersion::V1_3.context_bytes()),
+            (WORKFLOW_CONTEXT_URL, WORKFLOW_RUN_CONTEXT),
+        ]
+        .into_iter()
+        .filter_map(|(url, bytes)| {
+            let mut document = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+            match document.get_mut("@context")?.take() {
+                serde_json::Value::Object(terms) => Some((url, terms)),
+                _ => None,
+            }
+        })
+        .collect()
+    });
+
+/// Replaces top-level embedded contexts with the definitions this document can use.
+/// Unused definitions cannot change expansion, and each full context has thousands.
+fn inline_used_context(document: &mut serde_json::Value) {
+    let Some(object) = document.as_object_mut() else {
+        return;
+    };
+    let mut used = HashSet::new();
+    for (key, value) in object.iter() {
+        if key == "@context" {
+            collect_context_used(value, &mut used);
+        } else {
+            used_term(key, &mut used);
+            collect_used(value, &mut used);
+        }
+    }
+    let Some(context) = object.get_mut("@context") else {
+        return;
+    };
+    match context {
+        serde_json::Value::String(url) => {
+            if let Some(terms) = used_context(url, &used) {
+                *context = terms;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let serde_json::Value::String(url) = item
+                    && let Some(terms) = used_context(url, &used)
+                {
+                    *item = terms;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn used_context(url: &str, used: &HashSet<String>) -> Option<serde_json::Value> {
+    let terms = CONTEXT_TERMS.get(url)?;
+    let mut kept = serde_json::Map::new();
+    let mut pending = terms
+        .keys()
+        .filter(|term| term.starts_with('@') || used.contains(term.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    // A kept definition may name its IRI through another term used as a prefix.
+    while let Some(term) = pending.pop() {
+        if kept.contains_key(&term) {
+            continue;
+        }
+        let Some(definition) = terms.get(&term) else {
+            continue;
+        };
+        if let Some((prefix, _)) = definition.as_str().and_then(|iri| iri.split_once(':')) {
+            pending.push(prefix.to_string());
+        }
+        kept.insert(term, definition.clone());
+    }
+    Some(serde_json::Value::Object(kept))
+}
+
+fn used_term(value: &str, used: &mut HashSet<String>) {
+    if let Some((prefix, _)) = value.split_once(':') {
+        used.insert(prefix.to_string());
+    }
+    used.insert(value.to_string());
+}
+
+fn collect_used(value: &serde_json::Value, used: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::String(text) => used_term(text, used),
+        serde_json::Value::Array(items) => items.iter().for_each(|item| collect_used(item, used)),
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                used_term(key, used);
+                collect_used(value, used);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inline context objects may define terms through the embedded context's terms.
+fn collect_context_used(context: &serde_json::Value, used: &mut HashSet<String>) {
+    match context {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter(|item| item.is_object())
+            .for_each(|item| collect_used(item, used)),
+        serde_json::Value::Object(_) => collect_used(context, used),
+        _ => {}
+    }
 }
 
 fn collect_import_usage(quad: &Quad, blank_nodes: &mut HashSet<String>, literal_bytes: &mut usize) {
@@ -4086,6 +4207,64 @@ fn looks_like_identifier(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn labeled(mut value: serde_json::Value) -> serde_json::Value {
+        let mut terms = HashMap::new();
+        if let Some(context) = value.get("@context") {
+            collect_context_terms(context, &mut terms, false);
+        }
+        label_blank_nodes(&mut value, "", true, &terms);
+        value
+    }
+
+    /// Inlining only the used context terms must not change the expanded triples.
+    #[test]
+    fn inlined_context_equivalent() {
+        let fixtures = [
+            "valid-1.1.json",
+            "valid-1.2.json",
+            "valid-1.3.json",
+            "array-1.3.json",
+            "bioschemas-1.3.json",
+            "custom-1.3.json",
+        ]
+        .map(|name| {
+            let path = format!(
+                "{}/tests/fixtures/rocrate/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+        });
+        let synthetic = serde_json::json!({
+            "@context": [ROCRATE_CONTEXT_11, {"extra": "rdf:value"}],
+            "@graph": [
+                {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"}},
+                {"@id": "./", "@type": ["Dataset", "schema:Thing"], "name": "Root",
+                 "hasPart": [{"@id": "data.csv"}], "extra": "kept", "encodingFormat": "HTML",
+                 "author": {"@type": "Person", "name": "Nested"},
+                 "@reverse": {"isPartOf": {"@id": "#part"}}},
+                {"@id": "data.csv", "@type": "File", "contentSize": "12"}
+            ]
+        });
+        let mut changed = 0;
+        for document in fixtures.into_iter().chain([synthetic]) {
+            let document = labeled(document);
+            let mut full = parse_jsonld(&serde_json::to_vec(&document).unwrap(), None).unwrap();
+            let mut inlined = document.clone();
+            inline_used_context(&mut inlined);
+            changed += usize::from(inlined["@context"] != document["@context"]);
+            let mut pruned = parse_jsonld(&serde_json::to_vec(&inlined).unwrap(), None).unwrap();
+            full.sort_by_key(ToString::to_string);
+            pruned.sort_by_key(ToString::to_string);
+            assert!(!full.is_empty());
+            assert_eq!(full, pruned, "{document}");
+        }
+        assert!(
+            changed >= 5,
+            "only {changed} documents used an embedded context"
+        );
+    }
 
     use crate::sync::{
         CraqleGraphEvent, CraqleGraphSync, CraqleSyncError, SyncResult, TopicCatchup,
