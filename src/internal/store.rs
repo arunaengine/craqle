@@ -1054,7 +1054,7 @@ impl TrimCount {
         self.live.fetch_add(change.added, Ordering::SeqCst);
         let _ = self
             .live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 Some(live.saturating_sub(change.removed))
             });
         if let Some(floor) = change.floor {
