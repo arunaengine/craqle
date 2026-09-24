@@ -981,7 +981,7 @@ impl SearchUpdateWorker {
         #[cfg(not(feature = "search"))]
         {
             let _ = options;
-            return Err(search::SearchError::Disabled.into());
+            Err(search::SearchError::Disabled.into())
         }
         #[cfg(feature = "search")]
         {
