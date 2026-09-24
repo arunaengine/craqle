@@ -67,6 +67,10 @@ mod tests {
         let graphs = env_usize("CRAQLE_PERF_WRITE_GRAPHS", DEFAULT_GRAPHS);
         let samples = env_usize("CRAQLE_PERF_WRITE_SAMPLES", DEFAULT_SAMPLES);
         let entities = env_usize("CRAQLE_PERF_WRITE_ENTITIES", 0);
+        assert!(
+            graphs > 0 && (1..=graphs).contains(&samples),
+            "the profile needs at least one graph and between 1 and {graphs} samples"
+        );
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),
