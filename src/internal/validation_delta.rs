@@ -459,10 +459,7 @@ impl RdfReadView for DeltaReadView<'_, '_> {
         if !self.index.is_empty() {
             context.increment_index_seeks();
         }
-        let base = self
-            .base
-            .snapshot()
-            .raw_quad_cursor(self.base.store(), pattern);
+        let base = self.base.durable_cursor(context, pattern)?;
         Ok(QueryCursor::delta(
             self.base.store(),
             self.base.snapshot(),
@@ -1169,6 +1166,53 @@ mod tests {
         assert!(matches!(cursor.next(), Some(Err(StoreError::Cancelled))));
         assert_eq!(1_024, context.snapshot().candidate_quads);
         assert!(cursor.next().is_none());
+    }
+
+    /// Parent lookups during validation read the query index instead of scanning the graph.
+    #[test]
+    fn inverse_walks_indexed() {
+        let (_directory, store) = setup_store();
+        let graph = GraphId::new("urn:test:indexed-walks");
+        for index in 0..256 {
+            add_quad(
+                &store,
+                &graph,
+                &format!("urn:test:subject-{index}"),
+                "urn:test:name",
+                &format!("urn:test:value-{index}"),
+            );
+        }
+        add_quad(
+            &store,
+            &graph,
+            "urn:test:root",
+            "urn:test:hasPart",
+            "urn:test:child",
+        );
+        store.rebuild_query_indexes().unwrap();
+        let index = DeltaIndex::build(&store, &graph, &[]).unwrap();
+        let view = DeltaReadView::new(StoreReadView::new(&store), &index);
+        let context = ReadContext::for_validation(QueryCancellation::new(), &graph);
+        let (root, predicate, child) = ids(
+            &view,
+            &context,
+            "urn:test:root",
+            "urn:test:hasPart",
+            "urn:test:child",
+        );
+        let parents: Vec<_> = view
+            .inverse_predicate(
+                &context,
+                GraphSelector::Named(view.graph()),
+                predicate,
+                child,
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(1, parents.len());
+        assert_eq!(root, parents[0].subject);
+        assert!(context.snapshot().candidate_quads < 8);
     }
 
     #[test]
