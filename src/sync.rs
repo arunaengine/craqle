@@ -736,7 +736,33 @@ pub(crate) fn applied_clock(
     topic: irokle::TopicId,
     bytes: &[u8],
 ) -> SyncResult<irokle::ActorClock> {
-    Ok(decode_topic_cursor(topic, bytes)?.clock)
+    Ok(stored_cursor(topic, bytes)?.map_or_else(Default::default, |cursor| cursor.clock))
+}
+
+/// A verified version 1 cursor has no branch fence, so the topic replays from its start.
+/// Records a graph clock already covers apply as duplicates; corrupt cursors still fail.
+fn stored_cursor(topic: irokle::TopicId, bytes: &[u8]) -> SyncResult<Option<TopicCursorPayload>> {
+    match decode_topic_cursor(topic, bytes) {
+        Ok(cursor) => Ok(Some(cursor)),
+        Err(CraqleSyncError::ExpiredCursor { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Encodes a version 1 cursor as stores written before branch fences hold it.
+#[cfg(test)]
+pub(crate) fn legacy_cursor(topic: irokle::TopicId, clock: irokle::ActorClock) -> Vec<u8> {
+    let payload = LegacyCursorPayload {
+        version: 1,
+        topic,
+        clock,
+    };
+    let payload_bytes = postcard::to_allocvec(&payload).unwrap();
+    postcard::to_allocvec(&LegacyCursorEnvelope {
+        payload,
+        checksum: *blake3::hash(&payload_bytes).as_bytes(),
+    })
+    .unwrap()
 }
 
 pub fn topic_cursor_digest(bytes: &[u8]) -> [u8; 32] {
@@ -1459,9 +1485,10 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
                 "injected history failure".to_owned(),
             )));
         }
-        let stored = cursor
-            .map(|bytes| decode_topic_cursor(topic_id, bytes))
-            .transpose()?;
+        let stored = match cursor {
+            Some(bytes) => stored_cursor(topic_id, bytes)?,
+            None => None,
+        };
         let page = self.node.storage().read_snapshot(|read| {
             let view = read.topic_view(&topic_id, None)?.ok_or_else(|| {
                 irokle::Error::Storage(format!("missing topic state for {topic_id}"))
@@ -2762,17 +2789,7 @@ mod tests {
             Err(CraqleSyncError::CorruptCursor { .. })
         ));
 
-        let payload = LegacyCursorPayload {
-            version: 1,
-            topic,
-            clock: irokle::ActorClock::default(),
-        };
-        let payload_bytes = postcard::to_allocvec(&payload).unwrap();
-        let legacy = postcard::to_allocvec(&LegacyCursorEnvelope {
-            payload,
-            checksum: *blake3::hash(&payload_bytes).as_bytes(),
-        })
-        .unwrap();
+        let legacy = legacy_cursor(topic, irokle::ActorClock::default());
         assert!(matches!(
             decode_topic_cursor(topic, &legacy),
             Err(CraqleSyncError::ExpiredCursor { .. })
