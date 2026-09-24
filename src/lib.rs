@@ -6220,6 +6220,43 @@ mod tests {
         assert!(pair.replica.contains_graph(&graph).unwrap());
     }
 
+    /// A version 1 cursor written before branch fences replays its topic as duplicates.
+    #[test]
+    fn legacy_cursor_replays() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:legacy-topic-cursor");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "legacy"))
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let cursor = |node: &CraqleNode| {
+            let bytes = node.store.applied_topic_clock(topic.as_bytes()).unwrap();
+            crate::sync::applied_clock(topic, &bytes.unwrap()).unwrap()
+        };
+        let clock = cursor(&pair.replica);
+        let before = pair
+            .replica
+            .export_rocrate(&AllowAllAuthorizer, &graph)
+            .unwrap();
+        let legacy = crate::sync::legacy_cursor(topic, clock.clone());
+        pair.replica
+            .store
+            .set_topic_clock(topic.as_bytes(), &legacy)
+            .unwrap();
+
+        pair.replica.reconcile_irokle().unwrap();
+        let stored = pair.replica.store.applied_topic_clock(topic.as_bytes());
+        assert_ne!(
+            stored.unwrap(),
+            Some(legacy),
+            "replay stores a fenced cursor"
+        );
+        assert_eq!(cursor(&pair.replica), clock);
+        let after = pair.replica.export_rocrate(&AllowAllAuthorizer, &graph);
+        assert_eq!(after.unwrap(), before);
+    }
+
     #[test]
     fn locked_revocation_denies() {
         let pair = replica_pair();

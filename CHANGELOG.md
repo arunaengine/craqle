@@ -146,6 +146,8 @@ All notable changes to Craqle are documented here.
 - Back up Irokle's Fjall database before its first open with this version. Irokle
   upgrades schema 1 to schema 2 in place and resumes an interrupted migration.
   Older Irokle binaries reject schema 2; rollback requires the pre-upgrade backup.
+- Topic cursors stored by 0.2 carry no branch fence. Reconciliation replays such a
+  topic from its start; records a graph clock already covers apply as duplicates.
 - Derived-index repair preserves surviving RDF source state. It cannot reconstruct
   source events lost by older bugs without an authoritative history or healthy replica.
 
