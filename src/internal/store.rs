@@ -11901,8 +11901,6 @@ impl GraphStore {
         Ok(true)
     }
 
-    /// Take the FTS queue lock, recovering from poison: the state it guards
-    /// lives in fjall, not behind the mutex.
     /// Oldest queued search work. Callers hold the queue lock, under which tokens are
     /// minted in increasing order, so no work can appear below a head once seen.
     fn queue_head(&self) -> Result<Option<QueueCursor>> {
@@ -11926,6 +11924,8 @@ impl GraphStore {
         Ok(head)
     }
 
+    /// Take the FTS queue lock, recovering from poison: the state it guards
+    /// lives in fjall, not behind the mutex.
     fn fts_queue_guard(&self) -> MutexGuard<'_, ()> {
         self.fts_queue_lock
             .lock()
