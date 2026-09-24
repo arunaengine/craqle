@@ -5,8 +5,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::core::{EncodedTerm, GraphId};
-use crate::store::{EncodedQuad, TermId};
+#[cfg(feature = "search")]
+use crate::core::EncodedTerm;
+use crate::core::GraphId;
+#[cfg(feature = "search")]
+use crate::store::EncodedQuad;
+use crate::store::TermId;
 
 pub(crate) const SEARCH_META_FORMAT: u16 = 3;
 
@@ -16,6 +20,7 @@ pub(crate) const SEARCH_META_FORMAT: u16 = 3;
 pub(crate) struct GenerationId(pub(crate) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg(feature = "search")]
 pub(crate) struct GraphGeneration {
     pub(crate) graph: GraphId,
     pub(crate) active: Option<GenerationId>,
@@ -23,6 +28,7 @@ pub(crate) struct GraphGeneration {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct ManifestScan {
     pub(crate) index_id: [u8; 16],
     pub(crate) after: Option<TermId>,
@@ -31,6 +37,7 @@ pub(crate) struct ManifestScan {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct ManifestRow {
     pub(crate) graph: GraphId,
     pub(crate) active: Option<GenerationId>,
@@ -42,6 +49,7 @@ pub(crate) struct ManifestRow {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct ManifestPage {
     pub(crate) entries: Vec<ManifestRow>,
     pub(crate) next: Option<TermId>,
@@ -51,6 +59,7 @@ pub(crate) struct ManifestPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg(feature = "search")]
 pub(crate) struct StageJob {
     pub(crate) graph: GraphId,
     pub(crate) target: u64,
@@ -64,6 +73,7 @@ pub(crate) struct StageJob {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct StageRequest {
     pub(crate) index_id: [u8; 16],
     pub(crate) graph: GraphId,
@@ -72,12 +82,14 @@ pub(crate) struct StageRequest {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct GenerationRequest {
     pub(crate) index_id: [u8; 16],
     pub(crate) graph: GraphId,
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct DeleteGeneration {
     pub(crate) index_id: [u8; 16],
     pub(crate) graph: GraphId,
@@ -85,12 +97,14 @@ pub(crate) struct DeleteGeneration {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg(feature = "search")]
 pub(crate) struct CleanupJob {
     pub(crate) graph: GraphId,
     pub(crate) generation: GenerationId,
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct CleanupScan {
     pub(crate) after: Option<GenerationId>,
     pub(crate) row_limit: usize,
@@ -98,6 +112,7 @@ pub(crate) struct CleanupScan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "search")]
 pub(crate) struct OversizedCleanup {
     pub(crate) generation: GenerationId,
     pub(crate) bytes: usize,
@@ -105,6 +120,7 @@ pub(crate) struct OversizedCleanup {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct CleanupPage {
     pub(crate) entries: Vec<CleanupJob>,
     pub(crate) next: Option<GenerationId>,
@@ -115,6 +131,7 @@ pub(crate) struct CleanupPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[cfg(feature = "search")]
 pub(crate) struct GenerationSwitch {
     pub(crate) graph: GraphId,
     pub(crate) previous: Option<GenerationId>,
@@ -145,6 +162,7 @@ pub(crate) struct QueueCursor {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct QueueScan {
     pub(crate) max_token: Option<u64>,
     pub(crate) after: Option<QueueCursor>,
@@ -153,6 +171,7 @@ pub(crate) struct QueueScan {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct QueuePage<T> {
     pub(crate) entries: Vec<T>,
     pub(crate) next: Option<QueueCursor>,
@@ -163,6 +182,7 @@ pub(crate) struct QueuePage<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "search")]
 pub(crate) struct OversizedEntry {
     pub(crate) id: QueueId,
     pub(crate) owed_from: u64,
@@ -194,12 +214,14 @@ pub(crate) struct SearchCoverage {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct RebuildRequest {
     pub(crate) index_id: [u8; 16],
     pub(crate) index_revision: u64,
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct RebuildScan {
     pub(crate) index_id: [u8; 16],
     pub(crate) row_limit: usize,
@@ -207,6 +229,7 @@ pub(crate) struct RebuildScan {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct RebuildPage {
     pub(crate) remaining: bool,
     pub(crate) rows: usize,
@@ -216,6 +239,7 @@ pub(crate) struct RebuildPage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "search")]
 pub(crate) struct ManifestDigest {
     pub(crate) count: u64,
     pub(crate) hash: [u8; 32],
@@ -223,6 +247,7 @@ pub(crate) struct ManifestDigest {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct StageFailure {
     pub(crate) index_id: [u8; 16],
     pub(crate) state: RetryState,
@@ -230,6 +255,7 @@ pub(crate) struct StageFailure {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct GraphScan {
     pub(crate) graph: TermId,
     pub(crate) after: Option<[u8; 64]>,
@@ -238,6 +264,7 @@ pub(crate) struct GraphScan {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct QuadPage {
     pub(crate) entries: Vec<EncodedQuad>,
     pub(crate) rows: usize,
@@ -246,6 +273,7 @@ pub(crate) struct QuadPage {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct SubjectScan {
     pub(crate) graph: TermId,
     pub(crate) subject: TermId,
@@ -255,6 +283,7 @@ pub(crate) struct SubjectScan {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "search")]
 pub(crate) struct SubjectPage {
     pub(crate) entries: Vec<(EncodedTerm, EncodedTerm)>,
     pub(crate) next: Option<(TermId, TermId)>,
@@ -265,12 +294,17 @@ pub(crate) struct SubjectPage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "search")]
 pub(crate) struct OversizedSource {
     pub(crate) bytes: usize,
     pub(crate) limit: usize,
 }
 
 /// Bounds one drain pass over the durable FTS queues.
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "the search stub ignores drain bounds")
+)]
 pub(crate) struct QueueBound {
     /// Maximum eligible entries one drain may hand back.
     pub(crate) chunk: usize,
@@ -301,6 +335,10 @@ impl DrainControl {
     }
 }
 
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "the search stub ignores drain bounds")
+)]
 pub(crate) struct DrainRequest {
     pub(crate) bound: QueueBound,
     pub(crate) control: DrainControl,
@@ -315,6 +353,10 @@ pub(crate) struct DirtyTokens {
 
 /// What one drain pass covered and what it still owes.
 #[derive(Debug, Default)]
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "the search stub ignores drain bounds")
+)]
 pub(crate) struct DrainProgress {
     /// Queue entries committed to the index and then acknowledged.
     pub(crate) covered: usize,
@@ -355,6 +397,11 @@ pub(crate) struct CleanupFailure {
 
 /// A queued subject: one dirty entry in the per-`(graph, subject)` queue.
 #[derive(Clone, Debug)]
+#[cfg(any(test, feature = "search"))]
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "tests without search only count queued rows")
+)]
 pub(crate) struct DirtySubject {
     pub(crate) graph: GraphId,
     pub(crate) subject: TermId,
@@ -363,6 +410,11 @@ pub(crate) struct DirtySubject {
 
 /// A queued whole-graph entry: a reindex or a search-delete.
 #[derive(Clone, Debug)]
+#[cfg(any(test, feature = "search"))]
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "tests without search only count queued rows")
+)]
 pub(crate) struct DirtyGraph {
     pub(crate) graph: GraphId,
     pub(crate) tokens: DirtyTokens,

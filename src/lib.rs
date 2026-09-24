@@ -778,6 +778,10 @@ const SEARCH_WAIT_POLL: Duration = Duration::from_millis(5);
 type SearchReply = std::result::Result<SearchReceipt, MaintenanceFailure>;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "flushes need search")
+)]
 struct MaintenanceFailure {
     kind: CraqleErrorKind,
     source: Arc<dyn std::error::Error + Send + Sync>,
@@ -805,6 +809,7 @@ impl MaintenanceFailure {
         }
     }
 
+    #[cfg(feature = "search")]
     fn into_error(self, target: u64) -> CraqleError {
         CraqleError::SearchMaintenance {
             target,
@@ -834,11 +839,13 @@ impl Drop for FlushPermit {
     }
 }
 
+#[cfg(feature = "search")]
 struct FlushWaiter {
     control: search::queue::DrainControl,
     permit: Arc<FlushPermit>,
 }
 
+#[cfg(feature = "search")]
 impl Drop for FlushWaiter {
     fn drop(&mut self) {
         self.control.cancel();
@@ -847,6 +854,10 @@ impl Drop for FlushWaiter {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "flushes need search")
+)]
 struct FlushRequest {
     requested: u64,
     target: u64,
@@ -857,6 +868,10 @@ struct FlushRequest {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "flushes need search")
+)]
 enum SearchWorkerMessage {
     Wake,
     Flush(FlushRequest),
@@ -877,6 +892,10 @@ impl SearchWorkerMessage {
     }
 }
 
+#[cfg_attr(
+    not(feature = "search"),
+    allow(dead_code, reason = "flushes need search")
+)]
 struct SearchUpdateWorker {
     sender: mpsc::SyncSender<SearchWorkerMessage>,
     store: Arc<GraphStore>,
@@ -1279,7 +1298,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 // Tests synchronously drain the same fixed coverage boundary as the worker.
-#[cfg(test)]
+#[cfg(all(test, feature = "search"))]
 fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
     #[cfg(test)]
     if search.take_drain_panic() {

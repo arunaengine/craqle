@@ -27,13 +27,18 @@ use crate::core::{
 use crate::core::{CrateRenderHints as RenderHints, EventId};
 use crate::memory::{MemoryBudget, MemoryLease};
 use crate::qv_gate::QvCommitGate;
+#[cfg(feature = "search")]
 use crate::search::queue::{
-    CleanupJob, CleanupPage, CleanupScan, DeleteGeneration, DirtyGraph, DirtySubject, DirtyTokens,
-    GenerationId, GenerationRequest, GenerationSwitch, GraphGeneration, GraphScan, ManifestDigest,
-    ManifestPage, ManifestRow, ManifestScan, OversizedCleanup, OversizedEntry, OversizedSource,
-    QuadPage, QueueCursor, QueueId, QueueKind, QueuePage, QueueScan, RebuildPage, RebuildRequest,
-    RebuildScan, RetryState, SEARCH_META_FORMAT, SearchCoverage, StageFailure, StageJob,
-    StageRequest, SubjectPage, SubjectScan,
+    CleanupJob, CleanupPage, CleanupScan, DeleteGeneration, GenerationId, GenerationRequest,
+    GenerationSwitch, GraphGeneration, GraphScan, ManifestDigest, ManifestPage, ManifestRow,
+    ManifestScan, OversizedCleanup, OversizedEntry, OversizedSource, QuadPage, QueueId, QueuePage,
+    QueueScan, RebuildPage, RebuildRequest, RebuildScan, StageFailure, StageJob, StageRequest,
+    SubjectPage, SubjectScan,
+};
+#[cfg(any(test, feature = "search"))]
+use crate::search::queue::{DirtyGraph, DirtySubject};
+use crate::search::queue::{
+    DirtyTokens, QueueCursor, QueueKind, RetryState, SEARCH_META_FORMAT, SearchCoverage,
 };
 use crate::sync::{
     BackupProof, MutationId, MutationLookup, MutationReceipt, MutationStatus, RepairAudit,
@@ -204,17 +209,25 @@ const GRAPH_REINDEX_PREFIX: u8 = b'R';
 const GRAPH_DELETE_PREFIX: u8 = b'X';
 const SEARCH_ORDER_PREFIX: u8 = b'O';
 const SEARCH_FAILURE_PREFIX: u8 = b'F';
+#[cfg(feature = "search")]
 const SEARCH_GENERATION_PREFIX: u8 = b'G';
+#[cfg(feature = "search")]
 const SEARCH_STAGE_PREFIX: u8 = b'S';
+#[cfg(feature = "search")]
 const SEARCH_CLEANUP_PREFIX: u8 = b'L';
+#[cfg(feature = "search")]
 const SEARCH_NEXT_KEY: &[u8] = b"N";
 const SEARCH_COVERAGE_KEY: &[u8] = b"C";
 const SEARCH_HEAD_KEY: &[u8] = b"H";
 const SEARCH_SCHEMA_KEY: &[u8] = b"V";
+#[cfg(feature = "search")]
 const SEARCH_MANIFEST_KEY: &[u8] = b"M";
+#[cfg(feature = "search")]
 const SEARCH_REBUILD_KEY: &[u8] = b"E";
 const SEARCH_COVERAGE_MAGIC: [u8; 2] = *b"SC";
+#[cfg(feature = "search")]
 const SEARCH_GENERATION_MAGIC: [u8; 2] = *b"SG";
+#[cfg(feature = "search")]
 const SEARCH_STAGE_MAGIC: [u8; 2] = *b"SS";
 const SEARCH_ORDER_KEY: &[u8] = b"Q";
 const SEARCH_ORDER_FORMAT: u16 = 1;
@@ -325,6 +338,7 @@ struct CacheBudget {
     subjects: usize,
     objects: usize,
     planner: usize,
+    #[cfg(feature = "shacl-core")]
     shacl: usize,
 }
 
@@ -343,6 +357,7 @@ impl CacheBudget {
                 subjects: SUBJECT_CACHE_BYTES,
                 objects: ORDER_CACHE_BYTES,
                 planner: PLANNER_CACHE_BYTES,
+                #[cfg(feature = "shacl-core")]
                 shacl: 0,
             };
         };
@@ -356,6 +371,7 @@ impl CacheBudget {
             subjects: scaled_ceiling(SUBJECT_CACHE_BYTES, allowed, total),
             objects: scaled_ceiling(ORDER_CACHE_BYTES, allowed, total),
             planner: scaled_ceiling(PLANNER_CACHE_BYTES, allowed, total),
+            #[cfg(feature = "shacl-core")]
             shacl: 0,
         }
     }
@@ -377,6 +393,7 @@ impl CacheBudget {
             subjects: scaled_ceiling(SUBJECT_CACHE_BYTES, cache_allowed, total),
             objects: scaled_ceiling(ORDER_CACHE_BYTES, cache_allowed, total),
             planner: scaled_ceiling(PLANNER_CACHE_BYTES, cache_allowed, total),
+            #[cfg(feature = "shacl-core")]
             shacl,
         }
     }
@@ -930,6 +947,7 @@ struct AckedEntry {
     covered: u64,
 }
 
+#[cfg(feature = "search")]
 struct OrderedQueuePage {
     rows: Vec<(QueueCursor, DirtyTokens)>,
     next: Option<QueueCursor>,
@@ -956,6 +974,7 @@ struct SearchOrderMigration {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct StoredGeneration {
     format: u16,
     index_id: [u8; 16],
@@ -963,6 +982,7 @@ struct StoredGeneration {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct StoredStage {
     format: u16,
     index_id: [u8; 16],
@@ -978,6 +998,7 @@ struct LegacySearchCoverage {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct StoredManifest {
     format: u16,
     index_id: [u8; 16],
@@ -987,6 +1008,7 @@ struct StoredManifest {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct SearchRebuildScan {
     format: u16,
     index_id: [u8; 16],
@@ -995,6 +1017,7 @@ struct SearchRebuildScan {
     done: bool,
 }
 
+#[cfg(feature = "search")]
 struct ManifestChange<'a> {
     index_id: [u8; 16],
     graph: &'a GraphId,
@@ -1382,7 +1405,7 @@ pub struct GraphStore {
     policy_failure: Mutex<Option<GraphId>>,
     /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
     /// between an acknowledgement's token read and its commit.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "search"))]
     fts_ack_stall: Mutex<Option<std::time::Duration>>,
     /// Set by a test to stall a rebuild between its durable scan and the
     /// install; `rebuild_stalled` publishes that the window has been entered.
@@ -1600,6 +1623,7 @@ fn queue_kind_tag(kind: QueueKind) -> u8 {
     }
 }
 
+#[cfg(feature = "search")]
 fn decode_queue_kind(tag: u8) -> Result<QueueKind> {
     match tag {
         0 => Ok(QueueKind::Delete),
@@ -1621,6 +1645,7 @@ fn search_order_key(cursor: QueueCursor) -> [u8; 42] {
     key
 }
 
+#[cfg(feature = "search")]
 fn decode_search_order(bytes: &[u8]) -> Result<QueueCursor> {
     if bytes.len() != 42 || bytes[0] != SEARCH_ORDER_PREFIX {
         return Err(StoreError::InvalidSearchState("queue-order-key-invalid"));
@@ -1646,6 +1671,7 @@ fn search_failure_key(cursor: QueueCursor) -> [u8; 34] {
     key
 }
 
+#[cfg(feature = "search")]
 fn search_generation_key(graph: &GraphId) -> [u8; 17] {
     let term = hash_term(&EncodedTerm::from_named_node(&graph.0));
     let mut key = [0u8; 17];
@@ -1654,12 +1680,14 @@ fn search_generation_key(graph: &GraphId) -> [u8; 17] {
     key
 }
 
+#[cfg(feature = "search")]
 fn search_stage_key(graph: &GraphId) -> [u8; 17] {
     let mut key = search_generation_key(graph);
     key[0] = SEARCH_STAGE_PREFIX;
     key
 }
 
+#[cfg(feature = "search")]
 fn search_cleanup_key(generation: GenerationId) -> [u8; 9] {
     let mut key = [0u8; 9];
     key[0] = SEARCH_CLEANUP_PREFIX;
@@ -1675,6 +1703,7 @@ fn encode_search_coverage(coverage: &SearchCoverage) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "search")]
 fn encode_search_generation(stored: &StoredGeneration) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SEARCH_GENERATION_MAGIC);
@@ -1684,6 +1713,7 @@ fn encode_search_generation(stored: &StoredGeneration) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "search")]
 fn encode_search_stage(stored: &StoredStage) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SEARCH_STAGE_MAGIC);
@@ -1693,6 +1723,7 @@ fn encode_search_stage(stored: &StoredStage) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "search")]
 fn decode_search_generation(bytes: &[u8]) -> Result<StoredGeneration> {
     if !bytes.starts_with(&SEARCH_GENERATION_MAGIC) {
         return Ok(postcard::from_bytes(bytes)?);
@@ -1716,6 +1747,7 @@ fn decode_search_generation(bytes: &[u8]) -> Result<StoredGeneration> {
     })
 }
 
+#[cfg(feature = "search")]
 fn decode_search_stage(bytes: &[u8]) -> Result<StoredStage> {
     if !bytes.starts_with(&SEARCH_STAGE_MAGIC) {
         return Ok(postcard::from_bytes(bytes)?);
@@ -2499,12 +2531,14 @@ pub(crate) struct QvRead<'a> {
 }
 
 /// The graph and byte budget of one search orphan lookup.
+#[cfg(feature = "search")]
 pub(crate) struct OrphanScope {
     pub(crate) graph: TermId,
     pub(crate) byte_limit: usize,
 }
 
 #[derive(Clone)]
+#[cfg(feature = "search")]
 pub(crate) struct SearchSnapshot {
     snapshot: Snapshot,
     terms: Keyspace,
@@ -2513,6 +2547,7 @@ pub(crate) struct SearchSnapshot {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "search")]
 pub(crate) struct SearchManifestSnapshot {
     snapshot: Snapshot,
     terms: Keyspace,
@@ -2521,6 +2556,7 @@ pub(crate) struct SearchManifestSnapshot {
     search_queue: Keyspace,
 }
 
+#[cfg(feature = "search")]
 impl SearchManifestSnapshot {
     pub(crate) fn digest(&self, index_id: [u8; 16]) -> Result<ManifestDigest> {
         let manifest = self
@@ -2558,6 +2594,7 @@ impl SearchManifestSnapshot {
     }
 }
 
+#[cfg(feature = "search")]
 impl SearchSnapshot {
     pub(crate) fn scan_graph(&self, scan: &GraphScan) -> Result<QuadPage> {
         scan_graph_snapshot(&self.snapshot, &self.quads, scan)
@@ -2708,6 +2745,7 @@ impl SearchSnapshot {
     }
 }
 
+#[cfg(feature = "search")]
 fn snapshot_term(snapshot: &Snapshot, terms: &Keyspace, id: TermId) -> Result<EncodedTerm> {
     let value = snapshot
         .get(terms, id.to_be_bytes())?
@@ -2728,6 +2766,7 @@ fn resume_range(prefix: &[u8], after: Option<&[u8]>) -> (Bound<Vec<u8>>, Bound<V
     (lower, Unbounded)
 }
 
+#[cfg(feature = "search")]
 fn scan_graph_snapshot(
     snapshot: &Snapshot,
     quads: &Keyspace,
@@ -3640,6 +3679,7 @@ impl GraphStore {
         StoreReadSnapshot::from(&self.db.snapshot())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
         SearchSnapshot {
             snapshot: self.db.snapshot(),
@@ -3649,6 +3689,7 @@ impl GraphStore {
         }
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_manifest_snapshot(&self) -> Result<SearchManifestSnapshot> {
         let _queue = self.fts_queue_guard();
         Ok(SearchManifestSnapshot {
@@ -5818,7 +5859,7 @@ impl GraphStore {
     }
 
     /// Stall between an acknowledgement's token read and its commit. Test-only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "search"))]
     fn stall_search_ack(&self) {
         let stall = *self
             .fts_ack_stall
@@ -5830,7 +5871,7 @@ impl GraphStore {
     }
 
     /// Widen the acknowledgement's check-and-remove window. Test-only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "search"))]
     pub(crate) fn set_ack_stall(&self, delay: std::time::Duration) {
         *self
             .fts_ack_stall
@@ -6590,6 +6631,7 @@ impl GraphStore {
 
     /// Orphan ids at a search snapshot. Diagnostics commit after their source batch, so
     /// a snapshot between the two recomputes them instead of failing the subject.
+    #[cfg(feature = "search")]
     pub(crate) fn search_orphan_ids(
         &self,
         snapshot: &SearchSnapshot,
@@ -7632,7 +7674,7 @@ impl GraphStore {
             commit_failure: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             policy_failure: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "search"))]
             fts_ack_stall: Mutex::new(None),
             #[cfg(test)]
             rebuild_stall: Mutex::new(None),
@@ -9781,6 +9823,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn ensure_reindex(&self, graph: &GraphId) -> Result<(u64, bool)> {
         let graph_id = self
             .graph_id_for(graph)?
@@ -9885,6 +9928,7 @@ impl GraphStore {
         Ok(result)
     }
 
+    #[cfg(feature = "search")]
     fn ordered_queue(&self, kind: QueueKind, scan: &QueueScan) -> Result<OrderedQueuePage> {
         let after = scan.after.map(search_order_key);
         let mut page = OrderedQueuePage {
@@ -9943,6 +9987,7 @@ impl GraphStore {
         Ok(page)
     }
 
+    #[cfg(feature = "search")]
     fn queue_id(&self, cursor: QueueCursor) -> Result<QueueId> {
         let graph = self
             .decode_term(cursor.graph)?
@@ -9956,6 +10001,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_fts_subjects(&self, scan: &QueueScan) -> Result<QueuePage<DirtySubject>> {
         let page = self.ordered_queue(QueueKind::Subject, scan)?;
         let mut entries = Vec::with_capacity(page.rows.len());
@@ -9989,14 +10035,17 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_fts_reindexes(&self, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
         self.scan_fts_graphs(QueueKind::Reindex, scan)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_fts_deletes(&self, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
         self.scan_fts_graphs(QueueKind::Delete, scan)
     }
 
+    #[cfg(feature = "search")]
     fn scan_fts_graphs(&self, kind: QueueKind, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
         let page = self.ordered_queue(kind, scan)?;
         let mut entries = Vec::with_capacity(page.rows.len());
@@ -10026,6 +10075,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     fn queue_id_cursor(&self, id: &QueueId) -> Result<Option<QueueCursor>> {
         let Some(graph) = self.graph_id_for(&id.graph)? else {
             return Ok(None);
@@ -10038,6 +10088,7 @@ impl GraphStore {
         }))
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn fts_failure(&self, id: &QueueId) -> Result<Option<RetryState>> {
         let Some(cursor) = self.queue_id_cursor(id)? else {
             return Ok(None);
@@ -10048,6 +10099,7 @@ impl GraphStore {
             .transpose()
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn set_fts_failure(&self, state: &RetryState) -> Result<()> {
         let cursor = self
             .queue_id_cursor(&state.id)?
@@ -10063,6 +10115,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn clear_fts_failure(&self, id: &QueueId) -> Result<()> {
         let Some(cursor) = self.queue_id_cursor(id)? else {
             return Ok(());
@@ -10072,6 +10125,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn quarantine_search_failure(&self, failure: &StageFailure) -> Result<()> {
         if !matches!(failure.state.id.kind, QueueKind::Reindex)
             || failure.state.id.subject.is_some()
@@ -10142,6 +10196,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     fn next_search_generation(&self, batch: &mut fjall::OwnedWriteBatch) -> Result<GenerationId> {
         let next = self
             .search_meta
@@ -10157,6 +10212,7 @@ impl GraphStore {
         Ok(GenerationId(next))
     }
 
+    #[cfg(feature = "search")]
     fn generation_hash(graph: &GraphId, generation: GenerationId) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
         hash.update(&(graph.as_str().len() as u64).to_be_bytes());
@@ -10165,6 +10221,7 @@ impl GraphStore {
         *hash.finalize().as_bytes()
     }
 
+    #[cfg(feature = "search")]
     fn stored_manifest(&self) -> Result<Option<StoredManifest>> {
         Ok(self
             .search_meta
@@ -10172,6 +10229,7 @@ impl GraphStore {
             .and_then(|value| postcard::from_bytes(value.as_ref()).ok()))
     }
 
+    #[cfg(feature = "search")]
     fn stage_manifest(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -10235,6 +10293,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_manifest_digest(&self, index_id: [u8; 16]) -> Result<ManifestDigest> {
         Ok(self
             .stored_manifest()?
@@ -10253,6 +10312,7 @@ impl GraphStore {
             }))
     }
 
+    #[cfg(feature = "search")]
     fn queue_search_cleanup(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -10266,6 +10326,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     fn stored_generation(&self, graph: &GraphId) -> Result<Option<StoredGeneration>> {
         let Some(value) = self.search_meta.get(search_generation_key(graph))? else {
             return Ok(None);
@@ -10283,6 +10344,7 @@ impl GraphStore {
         Ok(stored)
     }
 
+    #[cfg(feature = "search")]
     fn stored_search_stage(&self, graph: &GraphId) -> Result<Option<StoredStage>> {
         let Some(value) = self.search_meta.get(search_stage_key(graph))? else {
             return Ok(None);
@@ -10300,6 +10362,7 @@ impl GraphStore {
         Ok(stored)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_search_manifest(
         &self,
         view: &SearchManifestSnapshot,
@@ -10443,6 +10506,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_generation(&self, req: &GenerationRequest) -> Result<GraphGeneration> {
         Ok(self
             .stored_generation(&req.graph)?
@@ -10455,6 +10519,7 @@ impl GraphStore {
             }))
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn ensure_search_generation(
         &self,
         req: &GenerationRequest,
@@ -10523,6 +10588,7 @@ impl GraphStore {
     }
 
     /// Graph generations of every in-flight search stage of one index.
+    #[cfg(feature = "search")]
     pub(crate) fn staged_search_generations(
         &self,
         index_id: [u8; 16],
@@ -10541,6 +10607,7 @@ impl GraphStore {
         Ok(staged)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_stage(&self, req: &GenerationRequest) -> Result<Option<StageJob>> {
         Ok(self
             .stored_search_stage(&req.graph)?
@@ -10548,6 +10615,7 @@ impl GraphStore {
             .map(|stored| stored.job))
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn begin_search_stage(&self, req: &StageRequest) -> Result<StageJob> {
         let _queue = self.fts_queue_guard();
         if self.graph_tombstoned(&req.graph)? {
@@ -10595,6 +10663,7 @@ impl GraphStore {
         Ok(job)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn advance_search_stage(&self, job: &StageJob) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut stored = self
@@ -10626,6 +10695,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn finish_search_stage(&self, job: &StageJob) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut stored = self
@@ -10652,6 +10722,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn switch_search_stage(&self, job: &StageJob) -> Result<GenerationSwitch> {
         let _queue = self.fts_queue_guard();
         let stored = self
@@ -10726,6 +10797,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn delete_search_graph(&self, req: &DeleteGeneration) -> Result<GenerationSwitch> {
         let _queue = self.fts_queue_guard();
         let current = self.stored_generation(&req.graph)?;
@@ -10782,6 +10854,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_search_cleanup(&self, scan: &CleanupScan) -> Result<CleanupPage> {
         let mut entries = Vec::with_capacity(scan.row_limit);
         let mut next = scan.after;
@@ -10846,6 +10919,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn ack_search_cleanup(&self, jobs: &[CleanupJob]) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
@@ -10941,6 +11015,7 @@ impl GraphStore {
         Ok(rebuild)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn bind_search_rebuild(&self, req: &RebuildRequest) -> Result<u64> {
         let _queue = self.fts_queue_guard();
         if let Some(coverage) = self.search_coverage()?
@@ -10998,6 +11073,7 @@ impl GraphStore {
         Ok(rebuild)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn queue_search_rebuild(&self, scan: &RebuildScan) -> Result<RebuildPage> {
         let _queue = self.fts_queue_guard();
         let coverage = self
@@ -11102,6 +11178,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn finish_search_rebuild(&self, coverage: &SearchCoverage) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let current = self
@@ -11170,6 +11247,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn advance_search_coverage(&self, coverage: &SearchCoverage) -> Result<()> {
         let _queue = self.fts_queue_guard();
         if coverage.format != SEARCH_META_FORMAT {
@@ -11211,6 +11289,7 @@ impl GraphStore {
     }
 
     /// Acknowledges covered subjects while preserving later redirty events.
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_fts_queue(&self, queued: &[DirtySubject]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11239,6 +11318,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_reindex(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11265,6 +11345,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_deletes(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11291,6 +11372,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_reindexed(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11325,6 +11407,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_deleted(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11981,6 +12064,7 @@ impl GraphStore {
 
     /// Oldest queued search work. Callers hold the queue lock; every queue insert lowers
     /// the floor to its token first, so the scan never starts past queued work.
+    #[cfg(feature = "search")]
     fn queue_head(&self) -> Result<Option<QueueCursor>> {
         let floor = self.queue_floor.load(Ordering::SeqCst);
         let mut start = [0u8; 9];
@@ -12474,6 +12558,7 @@ mod tests {
     /// Search indexing between a source commit and its diagnostics commit derives the
     /// orphans from its own snapshot instead of failing the subject.
     #[test]
+    #[cfg(feature = "search")]
     fn search_orphans_recomputed() {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
@@ -12502,6 +12587,7 @@ mod tests {
 
     /// A stale queue clear moving work below a checked head keeps coverage fenced.
     #[test]
+    #[cfg(feature = "search")]
     fn stale_clear_coverage() {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
@@ -13255,6 +13341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn search_generations_unique() {
         let (_dir, store) = setup_store();
         let first = GraphId::new("urn:test:search-generation-one");
@@ -13284,6 +13371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn stage_sessions_recover() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:search-stage-session");
@@ -15699,6 +15787,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn dirty_subjects_deduplicate() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
@@ -15729,6 +15818,7 @@ mod tests {
 
     /// Redirtying preserves the oldest token promised to an earlier flush.
     #[test]
+    #[cfg(feature = "search")]
     fn enqueue_keeps_oldest() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
@@ -15791,6 +15881,7 @@ mod tests {
 
     /// An enqueue concurrent with acknowledgement must retain its newer debt.
     #[test]
+    #[cfg(feature = "search")]
     fn acknowledgement_preserves_enqueue() {
         let (_dir, store) = setup_store();
         let store = Arc::new(store);
@@ -15827,6 +15918,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn reindex_queue_roundtrips() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
@@ -16275,6 +16367,7 @@ mod tests {
 
     /// A pre-restart reindex cannot acknowledge post-restart subject debt.
     #[test]
+    #[cfg(feature = "search")]
     fn tokens_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:fts-token-restart");
