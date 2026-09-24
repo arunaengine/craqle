@@ -2530,11 +2530,12 @@ pub(crate) struct QvRead<'a> {
     pub(crate) costs: &'a crate::query::context::QueryCost,
 }
 
-/// The graph and byte budget of one search orphan lookup.
+/// The graph, byte budget and drain control of one search orphan lookup.
 #[cfg(feature = "search")]
-pub(crate) struct OrphanScope {
+pub(crate) struct OrphanScope<'a> {
     pub(crate) graph: TermId,
     pub(crate) byte_limit: usize,
+    pub(crate) control: &'a crate::search::queue::DrainControl,
 }
 
 #[derive(Clone)]
@@ -6635,19 +6636,73 @@ impl GraphStore {
     pub(crate) fn search_orphan_ids(
         &self,
         snapshot: &SearchSnapshot,
-        scope: OrphanScope,
+        scope: OrphanScope<'_>,
     ) -> Result<HashSet<TermId>> {
         match snapshot.orphaned_ids(scope.graph, scope.byte_limit) {
-            Err(StoreError::InvalidSearchState(
-                "search-diagnostics-stale" | "search-diagnostics-missing",
-            )) => self.snapshot_orphan_ids(
-                &snapshot.snapshot,
-                &crate::query::context::ReadContext::default(),
-                scope.graph,
-                &self.orphan_vocab()?,
-            ),
+            Err(
+                error @ StoreError::InvalidSearchState(
+                    "search-diagnostics-stale" | "search-diagnostics-missing",
+                ),
+            ) => self.bounded_orphan_ids(snapshot, &scope)?.ok_or(error),
             result => result,
         }
+    }
+
+    /// Recomputes orphan ids within the scope's byte budget and drain control.
+    /// `None` means the graph did not fit, so the caller keeps its retryable error.
+    #[cfg(feature = "search")]
+    fn bounded_orphan_ids(
+        &self,
+        snapshot: &SearchSnapshot,
+        scope: &OrphanScope<'_>,
+    ) -> Result<Option<HashSet<TermId>>> {
+        let vocab = self.orphan_vocab()?;
+        let mut data_entities = HashSet::new();
+        let mut adjacency = HashMap::<TermId, Vec<TermId>>::new();
+        let mut bytes = 0usize;
+        for guard in snapshot
+            .snapshot
+            .prefix(&self.quads, scope.graph.to_be_bytes())
+        {
+            if scope.control.is_cancelled() {
+                return Err(StoreError::Cancelled);
+            }
+            let (key, value) = guard.into_inner()?;
+            bytes = bytes.saturating_add(key.len() + value.len());
+            if bytes > scope.byte_limit {
+                return Ok(None);
+            }
+            if dots_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = Self::decode_quad_key(key.as_ref())?;
+            if vocab.has_part == Some(quad.predicate) {
+                adjacency.entry(quad.subject).or_default().push(quad.object);
+                if quad.subject != scope.graph {
+                    data_entities.insert(quad.subject);
+                }
+                if quad.object != scope.graph {
+                    data_entities.insert(quad.object);
+                }
+            }
+            if vocab.rdf_type == Some(quad.predicate)
+                && quad.subject != scope.graph
+                && vocab.data_types.contains(&Some(quad.object))
+            {
+                data_entities.insert(quad.subject);
+            }
+        }
+        let mut reachable = HashSet::from([scope.graph]);
+        let mut queue = VecDeque::from([scope.graph]);
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in adjacency.get(&current).into_iter().flatten() {
+                if reachable.insert(neighbor) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        data_entities.retain(|entity| !reachable.contains(entity));
+        Ok(Some(data_entities))
     }
 
     /// Resolves the vocabulary ids used by orphan detection.
@@ -12564,6 +12619,11 @@ mod tests {
         let store = GraphStore::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:search-orphans");
         store.create_graph(&graph).unwrap();
+        commit_add(
+            &store,
+            &graph,
+            encode_quad(&store, &graph, ("urn:s", "urn:p", "urn:o")),
+        );
         let graph_tid = store
             .lookup_term(&EncodedTerm::from_named_node(&graph.0))
             .unwrap()
@@ -12573,16 +12633,27 @@ mod tests {
             snapshot.orphaned_ids(graph_tid, usize::MAX),
             Err(StoreError::InvalidSearchState(_))
         ));
-        let scope = OrphanScope {
+        let control = crate::search::queue::DrainControl::default();
+        let scope = |byte_limit| OrphanScope {
             graph: graph_tid,
-            byte_limit: usize::MAX,
+            byte_limit,
+            control: &control,
         };
         assert!(
             store
-                .search_orphan_ids(&snapshot, scope)
+                .search_orphan_ids(&snapshot, scope(usize::MAX))
                 .unwrap()
                 .is_empty()
         );
+        assert!(matches!(
+            store.search_orphan_ids(&snapshot, scope(1)),
+            Err(StoreError::InvalidSearchState(_))
+        ));
+        control.cancel();
+        assert!(matches!(
+            store.search_orphan_ids(&snapshot, scope(usize::MAX)),
+            Err(StoreError::Cancelled)
+        ));
     }
 
     /// A stale queue clear moving work below a checked head keeps coverage fenced.

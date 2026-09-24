@@ -712,6 +712,7 @@ struct PrepareSubject<'a> {
     subject: TermId,
     byte_limit: usize,
     generation: GenerationId,
+    control: &'a DrainControl,
 }
 
 struct OrphanInput<'a> {
@@ -719,6 +720,7 @@ struct OrphanInput<'a> {
     graph: &'a GraphId,
     graph_tid: TermId,
     byte_limit: usize,
+    control: &'a DrainControl,
 }
 
 struct StoreSyncCaches {
@@ -744,9 +746,11 @@ impl StoreSyncCaches {
             let scope = crate::store::OrphanScope {
                 graph: input.graph_tid,
                 byte_limit: artifact_limit,
+                control: input.control,
             };
             let orphaned = match input.store.search_orphan_ids(&self.snapshot, scope) {
                 Ok(orphaned) => orphaned,
+                Err(crate::store::StoreError::Cancelled) => return Err(SearchError::Cancelled),
                 Err(crate::store::StoreError::LimitExceeded {
                     resource: "search diagnostics rows",
                     limit,
@@ -2855,6 +2859,7 @@ impl SearchIndex {
                     subject: entry.subject,
                     byte_limit,
                     generation,
+                    control: &pass.control,
                 },
             ) {
                 Ok(op) => {
@@ -3604,6 +3609,7 @@ fn prepare_subject_op(
             graph: req.graph,
             graph_tid,
             byte_limit: text_limit,
+            control: req.control,
         })?
         .contains(&req.subject);
     if hidden {
@@ -4073,6 +4079,7 @@ mod tests {
                 subject: graph_tid,
                 byte_limit: node.search.work_bytes(),
                 generation: DIRECT_GENERATION,
+                control: &DrainControl::default(),
             },
             &mut caches,
         )
@@ -4126,6 +4133,7 @@ mod tests {
                 subject: graph_tid,
                 byte_limit: node.search.work_bytes(),
                 generation: DIRECT_GENERATION,
+                control: &DrainControl::default(),
             },
             &mut caches,
         );
@@ -4186,6 +4194,7 @@ mod tests {
                 subject,
                 byte_limit: node.search.work_bytes(),
                 generation: DIRECT_GENERATION,
+                control: &DrainControl::default(),
             },
             &mut caches,
         )
@@ -4205,6 +4214,7 @@ mod tests {
                 subject: absent,
                 byte_limit: node.search.work_bytes(),
                 generation: DIRECT_GENERATION,
+                control: &DrainControl::default(),
             },
             &mut caches,
         )
