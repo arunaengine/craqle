@@ -66,6 +66,7 @@ mod tests {
     fn write_latency_profile() {
         let graphs = env_usize("CRAQLE_PERF_WRITE_GRAPHS", DEFAULT_GRAPHS);
         let samples = env_usize("CRAQLE_PERF_WRITE_SAMPLES", DEFAULT_SAMPLES);
+        let entities = env_usize("CRAQLE_PERF_WRITE_ENTITIES", 0);
         let dir = tempfile::tempdir().unwrap();
         let node = CraqleNode::open_with_options(
             dir.path(),
@@ -99,43 +100,57 @@ mod tests {
             }),
         );
 
+        let policy = |sample: usize| GraphPolicy {
+            public: true,
+            permission_paths: vec![format!("/realm/g/group/meta/doc-{sample}")],
+        };
+        // Each updated crate first holds `entities` files; the timed update adds one more.
+        let with_files = |graph: &GraphId, sample: usize, count: usize| {
+            let exported = node.export_rocrate(&AllowAllAuthorizer, graph).unwrap();
+            let mut document: serde_json::Value = serde_json::from_str(&exported).unwrap();
+            let files = (0..count)
+                .map(|file| format!("./data/file-{sample}-{file}.csv"))
+                .collect::<Vec<_>>();
+            let items = document["@graph"].as_array_mut().unwrap();
+            items.extend(files.iter().map(|id| {
+                serde_json::json!({"@id": id, "@type": "File", "name": id, "encodingFormat": "text/csv"})
+            }));
+            let root = items
+                .iter_mut()
+                .find(|entity| entity["@id"] == graph.as_str())
+                .unwrap();
+            root["hasPart"] = files
+                .iter()
+                .map(|id| serde_json::json!({"@id": id}))
+                .collect();
+            document.to_string()
+        };
+        let apply = |graph: &GraphId, sample: usize, jsonld: &str| {
+            node.apply_rocrate_document_checked_with_policy_and_durability_as(
+                &AllowAllAuthorizer,
+                graph.clone(),
+                jsonld,
+                policy(sample),
+                CraqleRequestDurability::WalAlreadyDurable,
+                None,
+            )
+            .unwrap();
+        };
         let documents = (0..samples)
             .map(|sample| {
                 let graph = graph_id(sample * graphs / samples);
-                let exported = node.export_rocrate(&AllowAllAuthorizer, &graph).unwrap();
-                let mut document: serde_json::Value = serde_json::from_str(&exported).unwrap();
-                let entities = document["@graph"].as_array_mut().unwrap();
-                entities.push(serde_json::json!({
-                    "@id": format!("./data/file-{sample}.csv"),
-                    "@type": "File",
-                    "name": format!("Measured file {sample}"),
-                    "encodingFormat": "text/csv"
-                }));
-                let root = entities
-                    .iter_mut()
-                    .find(|entity| entity["@id"] == graph.as_str())
-                    .unwrap();
-                root["hasPart"] =
-                    serde_json::json!([{ "@id": format!("./data/file-{sample}.csv") }]);
-                (graph, document.to_string())
+                if entities > 0 {
+                    apply(&graph, sample, &with_files(&graph, sample, entities));
+                }
+                let jsonld = with_files(&graph, sample, entities + 1);
+                (graph, jsonld)
             })
             .collect::<Vec<_>>();
         report(
             "apply update",
             timed(samples, |sample| {
                 let (graph, jsonld) = &documents[sample];
-                node.apply_rocrate_document_checked_with_policy_and_durability_as(
-                    &AllowAllAuthorizer,
-                    graph.clone(),
-                    jsonld,
-                    GraphPolicy {
-                        public: true,
-                        permission_paths: vec![format!("/realm/g/group/meta/doc-{sample}")],
-                    },
-                    CraqleRequestDurability::WalAlreadyDurable,
-                    None,
-                )
-                .unwrap();
+                apply(graph, sample, jsonld);
             }),
         );
         report(
