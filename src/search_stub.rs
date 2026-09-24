@@ -8,7 +8,7 @@ pub(crate) mod queue;
 use std::path::Path;
 
 use crate::core::GraphId;
-pub(crate) use crate::search::queue::{DrainRequest, QueueBound};
+pub(crate) use crate::search::queue::DrainRequest;
 use crate::store::GraphStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,20 +63,12 @@ pub(crate) struct FilterQuery<'a, E> {
     pub subject: Option<&'a str>,
     pub allows: &'a dyn Fn(&str) -> std::result::Result<bool, E>,
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
+    #[allow(dead_code, reason = "the disabled search ignores candidate filters")]
     pub candidates: Option<&'a CandidateSource<'a, E>>,
 }
 
 pub(crate) type CandidateSource<'a, E> =
     dyn Fn() -> std::result::Result<Option<Vec<String>>, E> + 'a;
-
-pub(crate) fn stable_hit_key(graph_id: &str, subject_iri: &str) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(graph_id.len() as u64).to_be_bytes());
-    hasher.update(graph_id.as_bytes());
-    hasher.update(&(subject_iri.len() as u64).to_be_bytes());
-    hasher.update(subject_iri.as_bytes());
-    *hasher.finalize().as_bytes()
-}
 
 #[derive(Debug, Default)]
 pub struct SearchIndex;
@@ -207,20 +199,7 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Retain coalesced queue debt for a later search-enabled build.
-    pub fn process_queued_updates(&self, store: &GraphStore, bound: QueueBound) -> Result<usize> {
-        Ok(self
-            .drain_queues(
-                store,
-                DrainRequest {
-                    bound,
-                    control: crate::search::queue::DrainControl::default(),
-                },
-            )?
-            .covered)
-    }
-
-    pub fn drain_queues(
+    pub(crate) fn drain_queues(
         &self,
         _store: &GraphStore,
         _request: DrainRequest,

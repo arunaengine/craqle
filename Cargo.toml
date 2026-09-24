@@ -232,6 +232,10 @@ name = "perf_query_matrix"
 path = "tests/perf/query_matrix.rs"
 
 [[test]]
+name = "perf_write_latency"
+path = "tests/perf/write_latency.rs"
+
+[[test]]
 name = "perf_rocrate_workflows"
 path = "tests/perf/rocrate_workflows.rs"
 

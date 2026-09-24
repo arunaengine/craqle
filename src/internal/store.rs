@@ -27,13 +27,18 @@ use crate::core::{
 use crate::core::{CrateRenderHints as RenderHints, EventId};
 use crate::memory::{MemoryBudget, MemoryLease};
 use crate::qv_gate::QvCommitGate;
+#[cfg(feature = "search")]
 use crate::search::queue::{
-    CleanupJob, CleanupPage, CleanupScan, DeleteGeneration, DirtyGraph, DirtySubject, DirtyTokens,
-    GenerationId, GenerationRequest, GenerationSwitch, GraphGeneration, GraphScan, ManifestDigest,
-    ManifestPage, ManifestRow, ManifestScan, OversizedCleanup, OversizedEntry, OversizedSource,
-    QuadPage, QueueCursor, QueueId, QueueKind, QueuePage, QueueScan, RebuildPage, RebuildRequest,
-    RebuildScan, RetryState, SEARCH_META_FORMAT, SearchCoverage, StageFailure, StageJob,
-    StageRequest, SubjectPage, SubjectScan,
+    CleanupJob, CleanupPage, CleanupScan, DeleteGeneration, GenerationId, GenerationRequest,
+    GenerationSwitch, GraphGeneration, GraphScan, ManifestDigest, ManifestPage, ManifestRow,
+    ManifestScan, OversizedCleanup, OversizedEntry, OversizedSource, QuadPage, QueueId, QueuePage,
+    QueueScan, RebuildPage, RebuildRequest, RebuildScan, StageFailure, StageJob, StageRequest,
+    SubjectPage, SubjectScan,
+};
+#[cfg(any(test, feature = "search"))]
+use crate::search::queue::{DirtyGraph, DirtySubject};
+use crate::search::queue::{
+    DirtyTokens, QueueCursor, QueueKind, RetryState, SEARCH_META_FORMAT, SearchCoverage,
 };
 use crate::sync::{
     BackupProof, MutationId, MutationLookup, MutationReceipt, MutationStatus, RepairAudit,
@@ -204,17 +209,25 @@ const GRAPH_REINDEX_PREFIX: u8 = b'R';
 const GRAPH_DELETE_PREFIX: u8 = b'X';
 const SEARCH_ORDER_PREFIX: u8 = b'O';
 const SEARCH_FAILURE_PREFIX: u8 = b'F';
+#[cfg(feature = "search")]
 const SEARCH_GENERATION_PREFIX: u8 = b'G';
+#[cfg(feature = "search")]
 const SEARCH_STAGE_PREFIX: u8 = b'S';
+#[cfg(feature = "search")]
 const SEARCH_CLEANUP_PREFIX: u8 = b'L';
+#[cfg(feature = "search")]
 const SEARCH_NEXT_KEY: &[u8] = b"N";
 const SEARCH_COVERAGE_KEY: &[u8] = b"C";
 const SEARCH_HEAD_KEY: &[u8] = b"H";
 const SEARCH_SCHEMA_KEY: &[u8] = b"V";
+#[cfg(feature = "search")]
 const SEARCH_MANIFEST_KEY: &[u8] = b"M";
+#[cfg(feature = "search")]
 const SEARCH_REBUILD_KEY: &[u8] = b"E";
 const SEARCH_COVERAGE_MAGIC: [u8; 2] = *b"SC";
+#[cfg(feature = "search")]
 const SEARCH_GENERATION_MAGIC: [u8; 2] = *b"SG";
+#[cfg(feature = "search")]
 const SEARCH_STAGE_MAGIC: [u8; 2] = *b"SS";
 const SEARCH_ORDER_KEY: &[u8] = b"Q";
 const SEARCH_ORDER_FORMAT: u16 = 1;
@@ -325,6 +338,7 @@ struct CacheBudget {
     subjects: usize,
     objects: usize,
     planner: usize,
+    #[cfg(feature = "shacl-core")]
     shacl: usize,
 }
 
@@ -343,6 +357,7 @@ impl CacheBudget {
                 subjects: SUBJECT_CACHE_BYTES,
                 objects: ORDER_CACHE_BYTES,
                 planner: PLANNER_CACHE_BYTES,
+                #[cfg(feature = "shacl-core")]
                 shacl: 0,
             };
         };
@@ -356,6 +371,7 @@ impl CacheBudget {
             subjects: scaled_ceiling(SUBJECT_CACHE_BYTES, allowed, total),
             objects: scaled_ceiling(ORDER_CACHE_BYTES, allowed, total),
             planner: scaled_ceiling(PLANNER_CACHE_BYTES, allowed, total),
+            #[cfg(feature = "shacl-core")]
             shacl: 0,
         }
     }
@@ -377,6 +393,7 @@ impl CacheBudget {
             subjects: scaled_ceiling(SUBJECT_CACHE_BYTES, cache_allowed, total),
             objects: scaled_ceiling(ORDER_CACHE_BYTES, cache_allowed, total),
             planner: scaled_ceiling(PLANNER_CACHE_BYTES, cache_allowed, total),
+            #[cfg(feature = "shacl-core")]
             shacl,
         }
     }
@@ -930,6 +947,7 @@ struct AckedEntry {
     covered: u64,
 }
 
+#[cfg(feature = "search")]
 struct OrderedQueuePage {
     rows: Vec<(QueueCursor, DirtyTokens)>,
     next: Option<QueueCursor>,
@@ -956,6 +974,7 @@ struct SearchOrderMigration {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct StoredGeneration {
     format: u16,
     index_id: [u8; 16],
@@ -963,6 +982,7 @@ struct StoredGeneration {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct StoredStage {
     format: u16,
     index_id: [u8; 16],
@@ -978,6 +998,7 @@ struct LegacySearchCoverage {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct StoredManifest {
     format: u16,
     index_id: [u8; 16],
@@ -987,6 +1008,7 @@ struct StoredManifest {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "search")]
 struct SearchRebuildScan {
     format: u16,
     index_id: [u8; 16],
@@ -995,6 +1017,7 @@ struct SearchRebuildScan {
     done: bool,
 }
 
+#[cfg(feature = "search")]
 struct ManifestChange<'a> {
     index_id: [u8; 16],
     graph: &'a GraphId,
@@ -1008,6 +1031,38 @@ struct DurableCommit {
     batch: fjall::OwnedWriteBatch,
     pending_fts: PendingFts,
     pending_receipts: Vec<MutationReceipt>,
+    receipt_trim: ReceiptTrim,
+}
+
+/// Batch receipt mappings a batch stages; retention settles when the batch commits.
+#[derive(Default)]
+struct ReceiptTrim {
+    mappings: Vec<(Vec<u8>, u64)>,
+}
+
+/// Committed receipt counts and trim floors. Commits that change receipt order hold its
+/// lock from trim selection until the counts are updated, so both stay exact.
+#[derive(Default)]
+struct RetentionState {
+    receipts: usize,
+    batches: usize,
+    /// No committed order key sorts below a floor; `None` scans from the start.
+    receipt_floor: Option<Vec<u8>>,
+    batch_floor: Option<Vec<u8>>,
+}
+
+/// One commit's view of retention: the committed state and what the batch writes.
+struct RetentionTrim<'a> {
+    state: &'a RetentionState,
+    pending: &'a [MutationReceipt],
+    mappings: &'a [(Vec<u8>, u64)],
+}
+
+/// Lowers a floor to an order key a commit inserts below it.
+fn lower_floor(floor: &mut Option<Vec<u8>>, key: &[u8]) {
+    if floor.as_deref().is_some_and(|current| key < current) {
+        *floor = Some(key.to_vec());
+    }
 }
 
 pub struct WriteBatch {
@@ -1019,6 +1074,7 @@ pub struct WriteBatch {
     /// Queue keys staged and tokenized under the queue lock at commit.
     pending_fts: PendingFts,
     pending_receipts: Vec<MutationReceipt>,
+    receipt_trim: ReceiptTrim,
 }
 
 impl WriteBatch {
@@ -1030,6 +1086,7 @@ impl WriteBatch {
             publish: PendingPublish::default(),
             pending_fts: PendingFts::default(),
             pending_receipts: Vec::new(),
+            receipt_trim: ReceiptTrim::default(),
         }
     }
 
@@ -1276,6 +1333,7 @@ pub struct GraphStore {
     write_locks: Vec<Mutex<()>>,
     receipt_locks: Vec<Mutex<()>>,
     receipt_next: AtomicU64,
+    retention: Mutex<RetentionState>,
     #[cfg(test)]
     receipt_lookups: AtomicU64,
     #[cfg(test)]
@@ -1347,7 +1405,7 @@ pub struct GraphStore {
     policy_failure: Mutex<Option<GraphId>>,
     /// Set by a test to stall inside a held [`GraphStore::fts_queue_guard`],
     /// between an acknowledgement's token read and its commit.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "search"))]
     fts_ack_stall: Mutex<Option<std::time::Duration>>,
     /// Set by a test to stall a rebuild between its durable scan and the
     /// install; `rebuild_stalled` publishes that the window has been entered.
@@ -1370,6 +1428,8 @@ pub struct GraphStore {
     /// Serializes FTS queue mutations and is innermost in the store lock order.
     fts_queue_lock: Mutex<()>,
     dirty_counter: AtomicU64,
+    /// No queued search work has a lower token; the scan skips acknowledged tombstones.
+    queue_floor: AtomicU64,
     dirty_committed: AtomicU64,
     /// Number of graph diagnostics recomputations by this store instance.
     diagnostics_computed: AtomicU64,
@@ -1563,6 +1623,7 @@ fn queue_kind_tag(kind: QueueKind) -> u8 {
     }
 }
 
+#[cfg(feature = "search")]
 fn decode_queue_kind(tag: u8) -> Result<QueueKind> {
     match tag {
         0 => Ok(QueueKind::Delete),
@@ -1584,6 +1645,7 @@ fn search_order_key(cursor: QueueCursor) -> [u8; 42] {
     key
 }
 
+#[cfg(feature = "search")]
 fn decode_search_order(bytes: &[u8]) -> Result<QueueCursor> {
     if bytes.len() != 42 || bytes[0] != SEARCH_ORDER_PREFIX {
         return Err(StoreError::InvalidSearchState("queue-order-key-invalid"));
@@ -1609,6 +1671,7 @@ fn search_failure_key(cursor: QueueCursor) -> [u8; 34] {
     key
 }
 
+#[cfg(feature = "search")]
 fn search_generation_key(graph: &GraphId) -> [u8; 17] {
     let term = hash_term(&EncodedTerm::from_named_node(&graph.0));
     let mut key = [0u8; 17];
@@ -1617,12 +1680,14 @@ fn search_generation_key(graph: &GraphId) -> [u8; 17] {
     key
 }
 
+#[cfg(feature = "search")]
 fn search_stage_key(graph: &GraphId) -> [u8; 17] {
     let mut key = search_generation_key(graph);
     key[0] = SEARCH_STAGE_PREFIX;
     key
 }
 
+#[cfg(feature = "search")]
 fn search_cleanup_key(generation: GenerationId) -> [u8; 9] {
     let mut key = [0u8; 9];
     key[0] = SEARCH_CLEANUP_PREFIX;
@@ -1638,6 +1703,7 @@ fn encode_search_coverage(coverage: &SearchCoverage) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "search")]
 fn encode_search_generation(stored: &StoredGeneration) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SEARCH_GENERATION_MAGIC);
@@ -1647,6 +1713,7 @@ fn encode_search_generation(stored: &StoredGeneration) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "search")]
 fn encode_search_stage(stored: &StoredStage) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SEARCH_STAGE_MAGIC);
@@ -1656,6 +1723,7 @@ fn encode_search_stage(stored: &StoredStage) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "search")]
 fn decode_search_generation(bytes: &[u8]) -> Result<StoredGeneration> {
     if !bytes.starts_with(&SEARCH_GENERATION_MAGIC) {
         return Ok(postcard::from_bytes(bytes)?);
@@ -1679,6 +1747,7 @@ fn decode_search_generation(bytes: &[u8]) -> Result<StoredGeneration> {
     })
 }
 
+#[cfg(feature = "search")]
 fn decode_search_stage(bytes: &[u8]) -> Result<StoredStage> {
     if !bytes.starts_with(&SEARCH_STAGE_MAGIC) {
         return Ok(postcard::from_bytes(bytes)?);
@@ -2461,7 +2530,18 @@ pub(crate) struct QvRead<'a> {
     pub(crate) costs: &'a crate::query::context::QueryCost,
 }
 
+/// The graph, byte budgets and drain control of one search orphan lookup.
+#[cfg(feature = "search")]
+pub(crate) struct OrphanScope<'a> {
+    pub(crate) graph: TermId,
+    pub(crate) byte_limit: usize,
+    /// Bytes a stale-diagnostics recompute may hold while it scans the graph.
+    pub(crate) work_limit: usize,
+    pub(crate) control: &'a crate::search::queue::DrainControl,
+}
+
 #[derive(Clone)]
+#[cfg(feature = "search")]
 pub(crate) struct SearchSnapshot {
     snapshot: Snapshot,
     terms: Keyspace,
@@ -2470,6 +2550,7 @@ pub(crate) struct SearchSnapshot {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "search")]
 pub(crate) struct SearchManifestSnapshot {
     snapshot: Snapshot,
     terms: Keyspace,
@@ -2478,6 +2559,7 @@ pub(crate) struct SearchManifestSnapshot {
     search_queue: Keyspace,
 }
 
+#[cfg(feature = "search")]
 impl SearchManifestSnapshot {
     pub(crate) fn digest(&self, index_id: [u8; 16]) -> Result<ManifestDigest> {
         let manifest = self
@@ -2515,6 +2597,7 @@ impl SearchManifestSnapshot {
     }
 }
 
+#[cfg(feature = "search")]
 impl SearchSnapshot {
     pub(crate) fn scan_graph(&self, scan: &GraphScan) -> Result<QuadPage> {
         scan_graph_snapshot(&self.snapshot, &self.quads, scan)
@@ -2665,6 +2748,7 @@ impl SearchSnapshot {
     }
 }
 
+#[cfg(feature = "search")]
 fn snapshot_term(snapshot: &Snapshot, terms: &Keyspace, id: TermId) -> Result<EncodedTerm> {
     let value = snapshot
         .get(terms, id.to_be_bytes())?
@@ -2685,6 +2769,7 @@ fn resume_range(prefix: &[u8], after: Option<&[u8]>) -> (Bound<Vec<u8>>, Bound<V
     (lower, Unbounded)
 }
 
+#[cfg(feature = "search")]
 fn scan_graph_snapshot(
     snapshot: &Snapshot,
     quads: &Keyspace,
@@ -3597,6 +3682,7 @@ impl GraphStore {
         StoreReadSnapshot::from(&self.db.snapshot())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
         SearchSnapshot {
             snapshot: self.db.snapshot(),
@@ -3606,6 +3692,7 @@ impl GraphStore {
         }
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_manifest_snapshot(&self) -> Result<SearchManifestSnapshot> {
         let _queue = self.fts_queue_guard();
         Ok(SearchManifestSnapshot {
@@ -5775,7 +5862,7 @@ impl GraphStore {
     }
 
     /// Stall between an acknowledgement's token read and its commit. Test-only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "search"))]
     fn stall_search_ack(&self) {
         let stall = *self
             .fts_ack_stall
@@ -5787,7 +5874,7 @@ impl GraphStore {
     }
 
     /// Widen the acknowledgement's check-and-remove window. Test-only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "search"))]
     pub(crate) fn set_ack_stall(&self, delay: std::time::Duration) {
         *self
             .fts_ack_stall
@@ -6543,6 +6630,85 @@ impl GraphStore {
             QueryIndexState::Ready => panic!("test helper only degrades query indexes"),
         }
         self.commit_fjall_batch(batch).unwrap();
+    }
+
+    /// Orphan ids at a search snapshot. Diagnostics commit after their source batch, so
+    /// a snapshot between the two recomputes them instead of failing the subject.
+    #[cfg(feature = "search")]
+    pub(crate) fn search_orphan_ids(
+        &self,
+        snapshot: &SearchSnapshot,
+        scope: OrphanScope<'_>,
+    ) -> Result<HashSet<TermId>> {
+        match snapshot.orphaned_ids(scope.graph, scope.byte_limit) {
+            Err(
+                error @ StoreError::InvalidSearchState(
+                    "search-diagnostics-stale" | "search-diagnostics-missing",
+                ),
+            ) => self.bounded_orphan_ids(snapshot, &scope)?.ok_or(error),
+            result => result,
+        }
+    }
+
+    /// Recomputes orphan ids within the scope's work budget and drain control.
+    /// `None` means the held rows did not fit, so the caller keeps its retryable error.
+    #[cfg(feature = "search")]
+    fn bounded_orphan_ids(
+        &self,
+        snapshot: &SearchSnapshot,
+        scope: &OrphanScope<'_>,
+    ) -> Result<Option<HashSet<TermId>>> {
+        let vocab = self.orphan_vocab()?;
+        let mut data_entities = HashSet::new();
+        let mut adjacency = HashMap::<TermId, Vec<TermId>>::new();
+        let mut held = 0usize;
+        for guard in snapshot
+            .snapshot
+            .prefix(&self.quads, scope.graph.to_be_bytes())
+        {
+            if scope.control.is_cancelled() {
+                return Err(StoreError::Cancelled);
+            }
+            let (key, value) = guard.into_inner()?;
+            if dots_empty(value.as_ref()) {
+                continue;
+            }
+            let quad = Self::decode_quad_key(key.as_ref())?;
+            let kept =
+                vocab.has_part == Some(quad.predicate) || vocab.rdf_type == Some(quad.predicate);
+            if kept {
+                held = held.saturating_add(4 * std::mem::size_of::<TermId>());
+                if held > scope.work_limit {
+                    return Ok(None);
+                }
+            }
+            if vocab.has_part == Some(quad.predicate) {
+                adjacency.entry(quad.subject).or_default().push(quad.object);
+                if quad.subject != scope.graph {
+                    data_entities.insert(quad.subject);
+                }
+                if quad.object != scope.graph {
+                    data_entities.insert(quad.object);
+                }
+            }
+            if vocab.rdf_type == Some(quad.predicate)
+                && quad.subject != scope.graph
+                && vocab.data_types.contains(&Some(quad.object))
+            {
+                data_entities.insert(quad.subject);
+            }
+        }
+        let mut reachable = HashSet::from([scope.graph]);
+        let mut queue = VecDeque::from([scope.graph]);
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in adjacency.get(&current).into_iter().flatten() {
+                if reachable.insert(neighbor) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        data_entities.retain(|entity| !reachable.contains(entity));
+        Ok(Some(data_entities))
     }
 
     /// Resolves the vocabulary ids used by orphan detection.
@@ -7508,6 +7674,7 @@ impl GraphStore {
             write_locks: (0..GRAPH_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             receipt_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             receipt_next: AtomicU64::new(1),
+            retention: Mutex::new(RetentionState::default()),
             #[cfg(test)]
             receipt_lookups: AtomicU64::new(0),
             #[cfg(test)]
@@ -7568,7 +7735,7 @@ impl GraphStore {
             commit_failure: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             policy_failure: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "search"))]
             fts_ack_stall: Mutex::new(None),
             #[cfg(test)]
             rebuild_stall: Mutex::new(None),
@@ -7586,6 +7753,7 @@ impl GraphStore {
             delete_stalled: std::sync::atomic::AtomicBool::new(false),
             fts_queue_lock: Mutex::new(()),
             dirty_counter: AtomicU64::new(1),
+            queue_floor: AtomicU64::new(0),
             dirty_committed: AtomicU64::new(0),
             diagnostics_computed: AtomicU64::new(0),
             #[cfg(test)]
@@ -7757,11 +7925,13 @@ impl GraphStore {
             .unwrap_or(0);
         let mut batch = self.buffered_batch();
         let mut staged = 0usize;
+        let mut live = 0usize;
         for guard in self.receipts.iter() {
             let (key, value) = guard.into_inner()?;
             if key.len() != 32 {
                 continue;
             }
+            live += 1;
             let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
             highest = highest.max(receipt.admission_sequence);
             let order = receipt_order_key(&receipt);
@@ -7779,6 +7949,17 @@ impl GraphStore {
         }
         self.receipt_next
             .store(highest.saturating_add(1).max(1), Ordering::SeqCst);
+        let mut batches = 0usize;
+        for guard in self.receipt_order.prefix(BATCH_ORDER_PREFIX) {
+            guard.into_inner()?;
+            batches += 1;
+        }
+        *self.retention_guard() = RetentionState {
+            receipts: live,
+            batches,
+            receipt_floor: None,
+            batch_floor: None,
+        };
         Ok(())
     }
 
@@ -9703,6 +9884,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn ensure_reindex(&self, graph: &GraphId) -> Result<(u64, bool)> {
         let graph_id = self
             .graph_id_for(graph)?
@@ -9807,6 +9989,7 @@ impl GraphStore {
         Ok(result)
     }
 
+    #[cfg(feature = "search")]
     fn ordered_queue(&self, kind: QueueKind, scan: &QueueScan) -> Result<OrderedQueuePage> {
         let after = scan.after.map(search_order_key);
         let mut page = OrderedQueuePage {
@@ -9865,6 +10048,7 @@ impl GraphStore {
         Ok(page)
     }
 
+    #[cfg(feature = "search")]
     fn queue_id(&self, cursor: QueueCursor) -> Result<QueueId> {
         let graph = self
             .decode_term(cursor.graph)?
@@ -9878,6 +10062,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_fts_subjects(&self, scan: &QueueScan) -> Result<QueuePage<DirtySubject>> {
         let page = self.ordered_queue(QueueKind::Subject, scan)?;
         let mut entries = Vec::with_capacity(page.rows.len());
@@ -9911,14 +10096,17 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_fts_reindexes(&self, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
         self.scan_fts_graphs(QueueKind::Reindex, scan)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_fts_deletes(&self, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
         self.scan_fts_graphs(QueueKind::Delete, scan)
     }
 
+    #[cfg(feature = "search")]
     fn scan_fts_graphs(&self, kind: QueueKind, scan: &QueueScan) -> Result<QueuePage<DirtyGraph>> {
         let page = self.ordered_queue(kind, scan)?;
         let mut entries = Vec::with_capacity(page.rows.len());
@@ -9948,6 +10136,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     fn queue_id_cursor(&self, id: &QueueId) -> Result<Option<QueueCursor>> {
         let Some(graph) = self.graph_id_for(&id.graph)? else {
             return Ok(None);
@@ -9960,6 +10149,7 @@ impl GraphStore {
         }))
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn fts_failure(&self, id: &QueueId) -> Result<Option<RetryState>> {
         let Some(cursor) = self.queue_id_cursor(id)? else {
             return Ok(None);
@@ -9970,6 +10160,7 @@ impl GraphStore {
             .transpose()
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn set_fts_failure(&self, state: &RetryState) -> Result<()> {
         let cursor = self
             .queue_id_cursor(&state.id)?
@@ -9985,6 +10176,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn clear_fts_failure(&self, id: &QueueId) -> Result<()> {
         let Some(cursor) = self.queue_id_cursor(id)? else {
             return Ok(());
@@ -9994,6 +10186,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn quarantine_search_failure(&self, failure: &StageFailure) -> Result<()> {
         if !matches!(failure.state.id.kind, QueueKind::Reindex)
             || failure.state.id.subject.is_some()
@@ -10064,6 +10257,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     fn next_search_generation(&self, batch: &mut fjall::OwnedWriteBatch) -> Result<GenerationId> {
         let next = self
             .search_meta
@@ -10079,6 +10273,7 @@ impl GraphStore {
         Ok(GenerationId(next))
     }
 
+    #[cfg(feature = "search")]
     fn generation_hash(graph: &GraphId, generation: GenerationId) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
         hash.update(&(graph.as_str().len() as u64).to_be_bytes());
@@ -10087,6 +10282,7 @@ impl GraphStore {
         *hash.finalize().as_bytes()
     }
 
+    #[cfg(feature = "search")]
     fn stored_manifest(&self) -> Result<Option<StoredManifest>> {
         Ok(self
             .search_meta
@@ -10094,6 +10290,7 @@ impl GraphStore {
             .and_then(|value| postcard::from_bytes(value.as_ref()).ok()))
     }
 
+    #[cfg(feature = "search")]
     fn stage_manifest(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -10157,6 +10354,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_manifest_digest(&self, index_id: [u8; 16]) -> Result<ManifestDigest> {
         Ok(self
             .stored_manifest()?
@@ -10175,6 +10373,7 @@ impl GraphStore {
             }))
     }
 
+    #[cfg(feature = "search")]
     fn queue_search_cleanup(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -10188,6 +10387,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     fn stored_generation(&self, graph: &GraphId) -> Result<Option<StoredGeneration>> {
         let Some(value) = self.search_meta.get(search_generation_key(graph))? else {
             return Ok(None);
@@ -10205,6 +10405,7 @@ impl GraphStore {
         Ok(stored)
     }
 
+    #[cfg(feature = "search")]
     fn stored_search_stage(&self, graph: &GraphId) -> Result<Option<StoredStage>> {
         let Some(value) = self.search_meta.get(search_stage_key(graph))? else {
             return Ok(None);
@@ -10222,6 +10423,7 @@ impl GraphStore {
         Ok(stored)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_search_manifest(
         &self,
         view: &SearchManifestSnapshot,
@@ -10365,6 +10567,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_generation(&self, req: &GenerationRequest) -> Result<GraphGeneration> {
         Ok(self
             .stored_generation(&req.graph)?
@@ -10377,6 +10580,7 @@ impl GraphStore {
             }))
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn ensure_search_generation(
         &self,
         req: &GenerationRequest,
@@ -10445,6 +10649,7 @@ impl GraphStore {
     }
 
     /// Graph generations of every in-flight search stage of one index.
+    #[cfg(feature = "search")]
     pub(crate) fn staged_search_generations(
         &self,
         index_id: [u8; 16],
@@ -10463,6 +10668,7 @@ impl GraphStore {
         Ok(staged)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn search_stage(&self, req: &GenerationRequest) -> Result<Option<StageJob>> {
         Ok(self
             .stored_search_stage(&req.graph)?
@@ -10470,6 +10676,7 @@ impl GraphStore {
             .map(|stored| stored.job))
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn begin_search_stage(&self, req: &StageRequest) -> Result<StageJob> {
         let _queue = self.fts_queue_guard();
         if self.graph_tombstoned(&req.graph)? {
@@ -10517,6 +10724,7 @@ impl GraphStore {
         Ok(job)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn advance_search_stage(&self, job: &StageJob) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut stored = self
@@ -10548,6 +10756,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn finish_search_stage(&self, job: &StageJob) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut stored = self
@@ -10574,6 +10783,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn switch_search_stage(&self, job: &StageJob) -> Result<GenerationSwitch> {
         let _queue = self.fts_queue_guard();
         let stored = self
@@ -10648,6 +10858,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn delete_search_graph(&self, req: &DeleteGeneration) -> Result<GenerationSwitch> {
         let _queue = self.fts_queue_guard();
         let current = self.stored_generation(&req.graph)?;
@@ -10704,6 +10915,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn scan_search_cleanup(&self, scan: &CleanupScan) -> Result<CleanupPage> {
         let mut entries = Vec::with_capacity(scan.row_limit);
         let mut next = scan.after;
@@ -10768,6 +10980,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn ack_search_cleanup(&self, jobs: &[CleanupJob]) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let mut batch = self.buffered_batch();
@@ -10863,6 +11076,7 @@ impl GraphStore {
         Ok(rebuild)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn bind_search_rebuild(&self, req: &RebuildRequest) -> Result<u64> {
         let _queue = self.fts_queue_guard();
         if let Some(coverage) = self.search_coverage()?
@@ -10920,6 +11134,7 @@ impl GraphStore {
         Ok(rebuild)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn queue_search_rebuild(&self, scan: &RebuildScan) -> Result<RebuildPage> {
         let _queue = self.fts_queue_guard();
         let coverage = self
@@ -11024,6 +11239,7 @@ impl GraphStore {
         })
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn finish_search_rebuild(&self, coverage: &SearchCoverage) -> Result<()> {
         let _queue = self.fts_queue_guard();
         let current = self
@@ -11060,13 +11276,12 @@ impl GraphStore {
         if manifest.epoch != coverage.manifest_epoch {
             return Err(StoreError::InvalidSearchState("search-manifest-changed"));
         }
-        if let Some(guard) = self.search_queue.prefix([SEARCH_ORDER_PREFIX]).next() {
-            let (key, _) = guard.into_inner()?;
-            if decode_search_order(key.as_ref())?.token <= coverage.covered {
-                return Err(StoreError::InvalidSearchState(
-                    "search-coverage-debt-remains",
-                ));
-            }
+        if let Some(head) = self.queue_head()?
+            && head.token <= coverage.covered
+        {
+            return Err(StoreError::InvalidSearchState(
+                "search-coverage-debt-remains",
+            ));
         }
         let settled = SearchCoverage {
             rebuild: None,
@@ -11093,6 +11308,7 @@ impl GraphStore {
         self.commit_fjall_batch(batch)
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn advance_search_coverage(&self, coverage: &SearchCoverage) -> Result<()> {
         let _queue = self.fts_queue_guard();
         if coverage.format != SEARCH_META_FORMAT {
@@ -11108,13 +11324,12 @@ impl GraphStore {
         {
             return Err(StoreError::InvalidSearchState("search-manifest-changed"));
         }
-        if let Some(guard) = self.search_queue.prefix([SEARCH_ORDER_PREFIX]).next() {
-            let (key, _) = guard.into_inner()?;
-            if decode_search_order(key.as_ref())?.token <= coverage.covered {
-                return Err(StoreError::InvalidSearchState(
-                    "search-coverage-debt-remains",
-                ));
-            }
+        if let Some(head) = self.queue_head()?
+            && head.token <= coverage.covered
+        {
+            return Err(StoreError::InvalidSearchState(
+                "search-coverage-debt-remains",
+            ));
         }
         if let Some(current) = self.search_coverage()?
             && (current.rebuild.is_some()
@@ -11135,6 +11350,7 @@ impl GraphStore {
     }
 
     /// Acknowledges covered subjects while preserving later redirty events.
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_fts_queue(&self, queued: &[DirtySubject]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11163,6 +11379,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_reindex(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11189,6 +11406,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_deletes(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11215,6 +11433,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_reindexed(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11249,6 +11468,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[cfg(feature = "search")]
     pub(crate) fn acknowledge_deleted(&self, queued: &[DirtyGraph]) -> Result<()> {
         if queued.is_empty() {
             return Ok(());
@@ -11356,34 +11576,95 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Makes room for one more receipt, sparing receipts staged in this batch.
-    fn trim_receipts(&self, batch: &mut WriteBatch) -> Result<()> {
+    fn retention_guard(&self) -> MutexGuard<'_, RetentionState> {
+        self.retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stages retention trims against committed receipts; callers hold the retention lock.
+    fn stage_retention(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        trim: RetentionTrim<'_>,
+    ) -> Result<RetentionState> {
+        let (receipts, receipt_floor) = self.trim_receipt_order(batch, &trim)?;
+        let (batches, batch_floor) = self.trim_batch_mappings(batch, &trim)?;
+        Ok(RetentionState {
+            receipts,
+            batches,
+            receipt_floor,
+            batch_floor,
+        })
+    }
+
+    /// Removes the oldest committed receipts past retention, returning the new count and
+    /// floor. Receipts this batch writes count once and are never removed by it.
+    fn trim_receipt_order(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        trim: &RetentionTrim<'_>,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
+        let mut staged = HashSet::new();
+        let mut added = 0usize;
+        let mut floor = trim.state.receipt_floor.clone();
+        let mut lowest: Option<Vec<u8>> = None;
+        for receipt in trim.pending {
+            if !staged.insert(receipt.id.0) {
+                continue;
+            }
+            if !self.receipts.contains_key(receipt.id.0)? {
+                added += 1;
+            }
+            let order = receipt_order_key(receipt);
+            lower_floor(&mut floor, &order);
+            if lowest
+                .as_deref()
+                .is_none_or(|lowest| order.as_slice() < lowest)
+            {
+                lowest = Some(order.to_vec());
+            }
+        }
+        let live = trim.state.receipts + added;
+        let excess = live.saturating_sub(RECEIPT_RETENTION).min(QV_BUILD_ROWS);
+        if excess == 0 {
+            return Ok((live, floor));
+        }
+        let start = floor.clone().map_or(Bound::Unbounded, Bound::Included);
+        let mut next = floor;
+        let mut advance = true;
         let mut expired = None;
-        let mut kept = 0usize;
         let mut removed = 0usize;
-        for guard in self.receipt_order.iter().rev() {
+        for guard in self
+            .receipt_order
+            .range::<Vec<u8>, _>((start, Bound::Unbounded))
+        {
             let (key, id) = guard.into_inner()?;
             if key.len() != 40 {
                 continue;
             }
-            let staged = batch
-                .pending_receipts
-                .iter()
-                .any(|receipt| receipt.id.0[..] == id[..]);
-            if kept + 1 < RECEIPT_RETENTION || staged {
-                kept += 1;
+            // A receipt this batch rewrites stays live, so the floor must not pass it.
+            if <[u8; 32]>::try_from(id.as_ref()).is_ok_and(|id| staged.contains(&id)) {
+                advance = false;
                 continue;
-            }
-            if removed == QV_BUILD_ROWS {
-                break;
             }
             if let Some(value) = self.receipts.get(&id)? {
                 let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
                 expired = expired.max(Some(receipt.admission_sequence));
             }
-            batch.inner.remove(&self.receipt_order, key);
-            batch.inner.remove(&self.receipts, id);
+            batch.remove(&self.receipt_order, key.clone());
+            batch.remove(&self.receipts, id);
+            if advance {
+                next = Some(key.to_vec());
+            }
             removed += 1;
+            if removed == excess {
+                break;
+            }
+        }
+        // This batch's own keys are not visible to the scan; the floor must stay below them.
+        if let Some(lowest) = lowest {
+            lower_floor(&mut next, &lowest);
         }
         if let Some(expired) = expired {
             let stored = self
@@ -11391,13 +11672,71 @@ impl GraphStore {
                 .get(RECEIPT_EXPIRED_KEY)?
                 .and_then(|value| decode_index_count(value.as_ref()))
                 .unwrap_or(0);
-            batch.inner.insert(
+            batch.insert(
                 &self.receipt_order,
                 RECEIPT_EXPIRED_KEY,
                 stored.max(expired).to_be_bytes(),
             );
         }
-        Ok(())
+        Ok((live - removed, next))
+    }
+
+    /// Removes the oldest committed batch receipts past retention, returning the new
+    /// count and floor. Mappings this batch writes are not committed yet.
+    fn trim_batch_mappings(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        trim: &RetentionTrim<'_>,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
+        let mut staged = HashSet::new();
+        let mut added = 0usize;
+        let mut floor = trim.state.batch_floor.clone();
+        let lowest = trim
+            .mappings
+            .iter()
+            .map(|(_, sequence)| batch_order_key(*sequence))
+            .min();
+        for (key, sequence) in trim.mappings {
+            if staged.insert(key) && !self.receipts.contains_key(key)? {
+                added += 1;
+            }
+            lower_floor(&mut floor, &batch_order_key(*sequence));
+        }
+        let live = trim.state.batches + added;
+        let excess = live.saturating_sub(RECEIPT_RETENTION).min(QV_BUILD_ROWS);
+        if excess == 0 {
+            return Ok((live, floor));
+        }
+        let start = floor.clone().map_or(
+            Bound::Included(BATCH_ORDER_PREFIX.to_vec()),
+            Bound::Included,
+        );
+        let mut next = floor;
+        let mut removed = 0usize;
+        for guard in self
+            .receipt_order
+            .range::<Vec<u8>, _>((start, Bound::Unbounded))
+        {
+            let (order, mapping_key) = guard.into_inner()?;
+            if !order.starts_with(&BATCH_ORDER_PREFIX) {
+                break;
+            }
+            if let Some(value) = self.receipts.get(&mapping_key)? {
+                let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
+                batch.remove(&self.receipts, batch_reverse_key(&mapping.id));
+            }
+            batch.remove(&self.receipt_order, order.clone());
+            batch.remove(&self.receipts, mapping_key);
+            next = Some(order.to_vec());
+            removed += 1;
+            if removed == excess {
+                break;
+            }
+        }
+        if let Some(lowest) = lowest {
+            lower_floor(&mut next, &lowest);
+        }
+        Ok((live - removed, next))
     }
 
     /// Stage first acceptance evidence in the caller's source batch.
@@ -11426,7 +11765,6 @@ impl GraphStore {
         }
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
-        self.trim_receipts(batch)?;
         batch
             .inner
             .insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
@@ -11452,6 +11790,7 @@ impl GraphStore {
         event_id: [u8; 32],
     ) -> Result<MutationReceipt> {
         let _guard = self.receipt_guard(id);
+        let _retention = self.retention_guard();
         let mut receipt = self
             .mutation_receipt(id)?
             .ok_or(StoreError::ReceiptConflict)?;
@@ -11495,32 +11834,6 @@ impl GraphStore {
         })
     }
 
-    fn trim_batch_receipts(&self, batch: &mut fjall::OwnedWriteBatch) -> Result<()> {
-        let mut oldest = None;
-        let mut count = 0usize;
-        for guard in self.receipt_order.prefix(BATCH_ORDER_PREFIX) {
-            let (key, value) = guard.into_inner()?;
-            if oldest.is_none() {
-                oldest = Some((key.to_vec(), value.to_vec()));
-            }
-            count += 1;
-            if count == RECEIPT_RETENTION {
-                break;
-            }
-        }
-        if count == RECEIPT_RETENTION
-            && let Some((order, mapping_key)) = oldest
-        {
-            if let Some(value) = self.receipts.get(&mapping_key)? {
-                let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
-                batch.remove(&self.receipts, batch_reverse_key(&mapping.id));
-            }
-            batch.remove(&self.receipt_order, order);
-            batch.remove(&self.receipts, mapping_key);
-        }
-        Ok(())
-    }
-
     pub(crate) fn stage_batch_receipt(
         &self,
         batch: &mut WriteBatch,
@@ -11550,7 +11863,10 @@ impl GraphStore {
         {
             return Err(StoreError::ReceiptConflict);
         }
-        self.trim_batch_receipts(&mut batch.inner)?;
+        batch
+            .receipt_trim
+            .mappings
+            .push((key.to_vec(), mapping.sequence));
         batch
             .inner
             .insert(&self.receipts, key, postcard::to_allocvec(&mapping)?);
@@ -11659,6 +11975,8 @@ impl GraphStore {
     /// Compare-fenced update for post-commit persistence and repair settlement.
     pub(crate) fn update_receipt(&self, receipt: &MutationReceipt) -> Result<MutationReceipt> {
         let _guard = self.receipt_guard(&receipt.id);
+        // Trims run under this lock, so a trimmed receipt is never written back.
+        let mut retention = self.retention_guard();
         let previous = self
             .mutation_receipt(&receipt.id)?
             .ok_or(StoreError::ReceiptConflict)?;
@@ -11688,6 +12006,7 @@ impl GraphStore {
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
         self.commit_fjall_batch(batch)?;
+        lower_floor(&mut retention.receipt_floor, &receipt_order_key(&stored));
         Ok(stored)
     }
 
@@ -11783,6 +12102,9 @@ impl GraphStore {
                 entry.key.clone(),
                 encode_dirty_tokens(narrowed),
             );
+            // A stale acknowledgement can move queued work below the cached head.
+            self.queue_floor
+                .fetch_min(narrowed.oldest, Ordering::SeqCst);
             batch.insert(
                 &self.search_queue,
                 search_order_key(QueueCursor {
@@ -11799,6 +12121,30 @@ impl GraphStore {
             }
         }
         Ok(true)
+    }
+
+    /// Oldest queued search work. Callers hold the queue lock; every queue insert lowers
+    /// the floor to its token first, so the scan never starts past queued work.
+    #[cfg(feature = "search")]
+    fn queue_head(&self) -> Result<Option<QueueCursor>> {
+        let floor = self.queue_floor.load(Ordering::SeqCst);
+        let mut start = [0u8; 9];
+        start[0] = SEARCH_ORDER_PREFIX;
+        start[1..].copy_from_slice(&floor.to_be_bytes());
+        let head = match self
+            .search_queue
+            .range(start.to_vec()..vec![SEARCH_ORDER_PREFIX + 1])
+            .next()
+        {
+            Some(guard) => Some(decode_search_order(guard.into_inner()?.0.as_ref())?),
+            None => None,
+        };
+        let next = head.map_or_else(
+            || self.dirty_counter.load(Ordering::SeqCst),
+            |head| head.token,
+        );
+        self.queue_floor.fetch_max(next, Ordering::SeqCst);
+        Ok(head)
     }
 
     /// Take the FTS queue lock, recovering from poison: the state it guards
@@ -11836,6 +12182,7 @@ impl GraphStore {
             },
         };
         batch.insert(&self.graphs, bytes, encode_dirty_tokens(tokens));
+        self.queue_floor.fetch_min(tokens.oldest, Ordering::SeqCst);
         batch.insert(
             &self.search_queue,
             search_order_key(key.cursor(tokens.oldest)),
@@ -11869,6 +12216,7 @@ impl GraphStore {
             mut batch,
             pending_fts,
             mut pending_receipts,
+            receipt_trim,
         } = commit;
         let _queue = self.fts_queue_guard();
         let mut search_token = None;
@@ -11894,11 +12242,27 @@ impl GraphStore {
                 search_token.to_be_bytes(),
             );
         }
+        let mut retention = (!pending_receipts.is_empty() || !receipt_trim.mappings.is_empty())
+            .then(|| self.retention_guard());
+        let settled = match &retention {
+            Some(state) => Some(self.stage_retention(
+                &mut batch,
+                RetentionTrim {
+                    state,
+                    pending: &pending_receipts,
+                    mappings: &receipt_trim.mappings,
+                },
+            )?),
+            None => None,
+        };
         let result = self.commit_fjall_batch(batch);
-        if result.is_ok()
-            && let Some(token) = search_token
-        {
-            self.dirty_committed.fetch_max(token, Ordering::SeqCst);
+        if result.is_ok() {
+            if let (Some(state), Some(settled)) = (retention.as_mut(), settled) {
+                **state = settled;
+            }
+            if let Some(token) = search_token {
+                self.dirty_committed.fetch_max(token, Ordering::SeqCst);
+            }
         }
         result
     }
@@ -11911,11 +12275,13 @@ impl GraphStore {
             publish,
             pending_fts,
             pending_receipts,
+            receipt_trim,
         } = batch;
         let commit = DurableCommit {
             batch: inner,
             pending_fts,
             pending_receipts,
+            receipt_trim,
         };
         self.apply_commit(commit, publish)
     }
@@ -12126,41 +12492,220 @@ mod tests {
         assert_eq!(resume_range(&[], None), (Included(Vec::new()), Unbounded));
     }
 
+    fn pending_receipt(graph: &GraphId, nanos: usize) -> MutationReceipt {
+        MutationReceipt {
+            id: MutationId::new(),
+            admission_sequence: 0,
+            graph: graph.clone(),
+            request_digest: [7; 32],
+            event_id: None,
+            topic: None,
+            publish_after: None,
+            topic_epoch: None,
+            topic_genesis: None,
+            search_token: None,
+            repair_graphs: Vec::new(),
+            source: SourceOutcome::Prepared,
+            persistence: crate::sync::PersistenceOutcome::Pending,
+            repairs: crate::sync::RepairState {
+                diagnostics: RepairOutcome::Pending,
+                shacl: RepairOutcome::Pending,
+                search: RepairOutcome::Pending,
+                query_view: RepairOutcome::Pending,
+            },
+            source_version: [0; 32],
+            updated_unix_nanos: i64::try_from(nanos).unwrap(),
+        }
+    }
+
+    fn commit_receipt(store: &GraphStore, graph: &GraphId, nanos: usize) -> MutationReceipt {
+        let receipt = pending_receipt(graph, nanos);
+        let mut batch = store.new_batch();
+        assert!(store.stage_receipt(&mut batch, &receipt).unwrap().is_none());
+        store.commit(batch).unwrap();
+        store.mutation_receipt(&receipt.id).unwrap().unwrap()
+    }
+
+    /// A trim in a batch that never commits changes neither the count nor the trim
+    /// position, and a reopened store still retains exactly the newest receipts.
+    #[test]
+    fn dropped_trim_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphId::new("urn:test:receipt-dropped");
+        let store = GraphStore::open(dir.path()).unwrap();
+        let first = commit_receipt(&store, &graph, 0);
+        let second = commit_receipt(&store, &graph, 1);
+        let third = commit_receipt(&store, &graph, 2);
+        for nanos in 3..RECEIPT_RETENTION {
+            commit_receipt(&store, &graph, nanos);
+        }
+        let mut dropped = store.new_batch();
+        store
+            .stage_receipt(&mut dropped, &pending_receipt(&graph, RECEIPT_RETENTION))
+            .unwrap();
+        drop(dropped);
+        assert!(store.mutation_receipt(&first.id).unwrap().is_some());
+
+        commit_receipt(&store, &graph, RECEIPT_RETENTION + 1);
+        assert!(store.mutation_receipt(&first.id).unwrap().is_none());
+        assert!(store.mutation_receipt(&second.id).unwrap().is_some());
+        drop(store);
+
+        let store = GraphStore::open(dir.path()).unwrap();
+        commit_receipt(&store, &graph, RECEIPT_RETENTION + 2);
+        assert!(store.mutation_receipt(&second.id).unwrap().is_none());
+        assert!(store.mutation_receipt(&third.id).unwrap().is_some());
+    }
+
+    fn retained_receipts(store: &GraphStore) -> usize {
+        store
+            .receipts
+            .iter()
+            .map(|guard| guard.key().unwrap())
+            .filter(|key| key.len() == 32)
+            .count()
+    }
+
+    fn staged_receipt(store: &GraphStore, graph: &GraphId, nanos: usize) -> WriteBatch {
+        let mut batch = store.new_batch();
+        assert!(
+            store
+                .stage_receipt(&mut batch, &pending_receipt(graph, nanos))
+                .unwrap()
+                .is_none()
+        );
+        batch
+    }
+
+    /// Batches staged before either commits still settle retention exactly.
+    #[test]
+    fn overlapping_trims_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:receipt-overlap");
+        for nanos in 0..RECEIPT_RETENTION {
+            commit_receipt(&store, &graph, nanos);
+        }
+        for pair in 0..4 {
+            let nanos = RECEIPT_RETENTION + pair * 2;
+            let first = staged_receipt(&store, &graph, nanos);
+            let second = staged_receipt(&store, &graph, nanos + 1);
+            store.commit(first).unwrap();
+            store.commit(second).unwrap();
+        }
+        commit_receipt(&store, &graph, RECEIPT_RETENTION + 8);
+        assert_eq!(retained_receipts(&store), RECEIPT_RETENTION);
+    }
+
+    /// A receipt committed with an older timestamp than earlier trims expires first.
+    #[test]
+    fn delayed_receipt_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:receipt-delayed");
+        let delayed = staged_receipt(&store, &graph, 0);
+        for nanos in 1..=RECEIPT_RETENTION + 1 {
+            commit_receipt(&store, &graph, nanos);
+        }
+        let id = delayed.pending_receipts[0].id;
+        store.commit(delayed).unwrap();
+        for nanos in 2..=4 {
+            commit_receipt(&store, &graph, RECEIPT_RETENTION + nanos);
+        }
+        assert!(store.mutation_receipt(&id).unwrap().is_none());
+        assert_eq!(retained_receipts(&store), RECEIPT_RETENTION);
+    }
+
+    /// Search indexing between a source commit and its diagnostics commit derives the
+    /// orphans from its own snapshot instead of failing the subject.
+    #[test]
+    #[cfg(feature = "search")]
+    fn search_orphans_recomputed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:search-orphans");
+        store.create_graph(&graph).unwrap();
+        let part = (graph.as_str(), "http://schema.org/hasPart", "urn:o");
+        commit_add(&store, &graph, encode_quad(&store, &graph, part));
+        let graph_tid = store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .unwrap();
+        let snapshot = store.search_snapshot();
+        assert!(matches!(
+            snapshot.orphaned_ids(graph_tid, usize::MAX),
+            Err(StoreError::InvalidSearchState(_))
+        ));
+        let control = crate::search::queue::DrainControl::default();
+        let scope = |work_limit| OrphanScope {
+            graph: graph_tid,
+            byte_limit: usize::MAX,
+            work_limit,
+            control: &control,
+        };
+        assert!(
+            store
+                .search_orphan_ids(&snapshot, scope(usize::MAX))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.search_orphan_ids(&snapshot, scope(1)),
+            Err(StoreError::InvalidSearchState(_))
+        ));
+        control.cancel();
+        assert!(matches!(
+            store.search_orphan_ids(&snapshot, scope(usize::MAX)),
+            Err(StoreError::Cancelled)
+        ));
+    }
+
+    /// A stale queue clear moving work below a checked head keeps coverage fenced.
+    #[test]
+    #[cfg(feature = "search")]
+    fn stale_clear_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:queue-stale");
+        store.create_graph(&graph).unwrap();
+        for _ in 0..3 {
+            store.ensure_reindex(&graph).unwrap();
+            store.clear_fts_queue().unwrap();
+        }
+        let (target, _) = store.ensure_reindex(&graph).unwrap();
+        let coverage = |covered: u64| {
+            let index_id = [7; 16];
+            let manifest = store.search_manifest_digest(index_id).unwrap();
+            SearchCoverage {
+                format: SEARCH_META_FORMAT,
+                index_id,
+                index_revision: 0,
+                covered,
+                rebuild: None,
+                manifest_count: manifest.count,
+                manifest_hash: manifest.hash,
+                manifest_epoch: manifest.epoch,
+            }
+        };
+        store
+            .advance_search_coverage(&coverage(target - 1))
+            .unwrap();
+        store.clear_graph_queue(&graph, target - 2).unwrap();
+        assert!(matches!(
+            store.advance_search_coverage(&coverage(target)),
+            Err(StoreError::InvalidSearchState(
+                "search-coverage-debt-remains"
+            ))
+        ));
+    }
+
     /// Receipts that never settle still leave retention; reopen orders untracked ones again.
     #[test]
     fn pending_receipts_expire() {
         let dir = tempfile::tempdir().unwrap();
         let store = GraphStore::open(dir.path()).unwrap();
         let graph = GraphId::new("urn:test:receipt-retention");
-        let stage = |nanos: usize| {
-            let receipt = MutationReceipt {
-                id: MutationId::new(),
-                admission_sequence: 0,
-                graph: graph.clone(),
-                request_digest: [7; 32],
-                event_id: None,
-                topic: None,
-                publish_after: None,
-                topic_epoch: None,
-                topic_genesis: None,
-                search_token: None,
-                repair_graphs: Vec::new(),
-                source: SourceOutcome::Prepared,
-                persistence: crate::sync::PersistenceOutcome::Pending,
-                repairs: crate::sync::RepairState {
-                    diagnostics: RepairOutcome::Pending,
-                    shacl: RepairOutcome::Pending,
-                    search: RepairOutcome::Pending,
-                    query_view: RepairOutcome::Pending,
-                },
-                source_version: [0; 32],
-                updated_unix_nanos: i64::try_from(nanos).unwrap(),
-            };
-            let mut batch = store.new_batch();
-            assert!(store.stage_receipt(&mut batch, &receipt).unwrap().is_none());
-            store.commit(batch).unwrap();
-            store.mutation_receipt(&receipt.id).unwrap().unwrap()
-        };
+        let stage = |nanos: usize| commit_receipt(&store, &graph, nanos);
         let first = stage(0);
         let second = stage(1);
         for nanos in 2..=RECEIPT_RETENTION {
@@ -12638,6 +13183,7 @@ mod tests {
             publish,
             pending_fts,
             pending_receipts: _,
+            receipt_trim: _,
         } = batch;
         (inner, publish, pending_fts)
     }
@@ -12870,6 +13416,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn search_generations_unique() {
         let (_dir, store) = setup_store();
         let first = GraphId::new("urn:test:search-generation-one");
@@ -12899,6 +13446,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn stage_sessions_recover() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:search-stage-session");
@@ -12969,6 +13517,7 @@ mod tests {
                 batch: inner,
                 pending_fts,
                 pending_receipts: Vec::new(),
+                receipt_trim: ReceiptTrim::default(),
             })
             .unwrap();
         store.indexes_write().publish(&publish);
@@ -13013,6 +13562,7 @@ mod tests {
                     batch: inner,
                     pending_fts,
                     pending_receipts: Vec::new(),
+                    receipt_trim: ReceiptTrim::default(),
                 })
                 .unwrap();
             store.indexes_write().publish(&publish);
@@ -15312,6 +15862,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn dirty_subjects_deduplicate() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
@@ -15342,6 +15893,7 @@ mod tests {
 
     /// Redirtying preserves the oldest token promised to an earlier flush.
     #[test]
+    #[cfg(feature = "search")]
     fn enqueue_keeps_oldest() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
@@ -15404,6 +15956,7 @@ mod tests {
 
     /// An enqueue concurrent with acknowledgement must retain its newer debt.
     #[test]
+    #[cfg(feature = "search")]
     fn acknowledgement_preserves_enqueue() {
         let (_dir, store) = setup_store();
         let store = Arc::new(store);
@@ -15440,6 +15993,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "search")]
     fn reindex_queue_roundtrips() {
         let (_dir, store) = setup_store();
         let graph = GraphId::new("urn:test:graph");
@@ -15710,11 +16264,13 @@ mod tests {
                 publish,
                 pending_fts,
                 pending_receipts: _,
+                receipt_trim: _,
             } = batch;
             let mut durable = DurableCommit {
                 batch: inner,
                 pending_fts,
                 pending_receipts: Vec::new(),
+                receipt_trim: ReceiptTrim::default(),
             };
             let owner = store.qv_gate.try_acquire().unwrap();
             store
@@ -15886,6 +16442,7 @@ mod tests {
 
     /// A pre-restart reindex cannot acknowledge post-restart subject debt.
     #[test]
+    #[cfg(feature = "search")]
     fn tokens_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphId::new("urn:test:fts-token-restart");

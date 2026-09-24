@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::core::{EncodedTerm, GraphId};
 use crate::query::context::{GraphVisibility, QueryReadMode, ReadAccessPath, ReadContext};
 use crate::query::cursor::{
-    DenseCursor, DenseInput, DenseResolver, IndexScan, QueryCursor, RawIndexPattern,
+    DenseCursor, DenseInput, DenseResolver, IndexScan, QueryCursor, RawIndexPattern, RawQuadCursor,
 };
 use crate::store::{
     EncodedQuad, GraphStore, IndexCursorOrder, QueryIndexAdmission, QvRead, QvStat, Result,
@@ -471,6 +471,38 @@ impl<'store> StoreReadView<'store> {
         graph: TermId,
     ) -> Result<Rc<HashSet<TermId>>> {
         orphaned_for_graph(self.store, &self.snapshot, context, graph)
+    }
+
+    /// Durable rows of a named-graph pattern. A lookup by predicate or object with an open
+    /// subject uses the trusted query index; the source order would scan the whole graph.
+    pub(crate) fn durable_cursor(
+        &self,
+        context: &ReadContext<'_>,
+        pattern: QuadPattern,
+    ) -> Result<RawQuadCursor> {
+        let indexed = pattern.subject.is_none()
+            && (pattern.predicate.is_some() || pattern.object.is_some())
+            && matches!(self.read_mode, QueryReadMode::Auto);
+        let Some(graph) = pattern.graph.filter(|_| indexed) else {
+            return Ok(self.snapshot.raw_quad_cursor(self.store, pattern));
+        };
+        if !self.qv_admission(context)?.trusted {
+            return Ok(self.snapshot.raw_quad_cursor(self.store, pattern));
+        }
+        let path = Self::auto_access_path(GraphSelector::Named(graph), pattern);
+        let costs = context.costs();
+        Ok(self
+            .snapshot
+            .query_index_cursor(
+                self.store,
+                &IndexScan {
+                    order: Self::qv_order(path),
+                    pattern,
+                    query_id_limit: None,
+                    costs: &costs,
+                },
+            )?
+            .track_costs(costs))
     }
 
     fn qv_order(path: ReadAccessPath) -> IndexCursorOrder {
