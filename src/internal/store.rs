@@ -6,7 +6,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard as ReadGuard,
     RwLockWriteGuard as WriteGuard, TryLockError,
@@ -1011,58 +1011,34 @@ struct DurableCommit {
     receipt_trim: ReceiptTrim,
 }
 
-/// Receipt count changes and trim positions a batch applies once it commits.
+/// Batch receipt mappings a batch stages; retention settles when the batch commits.
 #[derive(Default)]
 struct ReceiptTrim {
-    receipts: TrimChange,
-    batches: TrimChange,
+    mappings: Vec<(Vec<u8>, u64)>,
 }
 
+/// Committed receipt counts and trim floors. Commits that change receipt order hold its
+/// lock from trim selection until the counts are updated, so both stay exact.
 #[derive(Default)]
-struct TrimChange {
-    added: usize,
-    removed: usize,
-    floor: Option<Vec<u8>>,
+struct RetentionState {
+    receipts: usize,
+    batches: usize,
+    /// No committed order key sorts below a floor; `None` scans from the start.
+    receipt_floor: Option<Vec<u8>>,
+    batch_floor: Option<Vec<u8>>,
 }
 
-/// Committed entries of one retained kind; races only lower the count, so a
-/// trim never evicts a retained entry. The floor skips earlier trims' tombstones.
-#[derive(Default)]
-struct TrimCount {
-    live: AtomicUsize,
-    floor: Mutex<Option<Vec<u8>>>,
+/// One commit's view of retention: the committed state and what the batch writes.
+struct RetentionTrim<'a> {
+    state: &'a RetentionState,
+    pending: &'a [MutationReceipt],
+    mappings: &'a [(Vec<u8>, u64)],
 }
 
-impl TrimCount {
-    fn excess(&self, change: &TrimChange) -> usize {
-        (self.live.load(Ordering::SeqCst) + change.added + 1)
-            .saturating_sub(change.removed)
-            .saturating_sub(RECEIPT_RETENTION)
-            .min(QV_BUILD_ROWS)
-    }
-
-    fn start(&self, change: &TrimChange) -> Option<Vec<u8>> {
-        change.floor.clone().or_else(|| {
-            self.floor
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-        })
-    }
-
-    fn settle(&self, change: TrimChange) {
-        self.live.fetch_add(change.added, Ordering::SeqCst);
-        let _ = self
-            .live
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
-                Some(live.saturating_sub(change.removed))
-            });
-        if let Some(floor) = change.floor {
-            let mut current = self.floor.lock().unwrap_or_else(PoisonError::into_inner);
-            if current.as_ref().is_none_or(|current| *current < floor) {
-                *current = Some(floor);
-            }
-        }
+/// Lowers a floor to an order key a commit inserts below it.
+fn lower_floor(floor: &mut Option<Vec<u8>>, key: &[u8]) {
+    if floor.as_deref().is_some_and(|current| key < current) {
+        *floor = Some(key.to_vec());
     }
 }
 
@@ -1334,8 +1310,7 @@ pub struct GraphStore {
     write_locks: Vec<Mutex<()>>,
     receipt_locks: Vec<Mutex<()>>,
     receipt_next: AtomicU64,
-    receipt_count: TrimCount,
-    batch_receipt_count: TrimCount,
+    retention: Mutex<RetentionState>,
     #[cfg(test)]
     receipt_lookups: AtomicU64,
     #[cfg(test)]
@@ -1430,7 +1405,7 @@ pub struct GraphStore {
     /// Serializes FTS queue mutations and is innermost in the store lock order.
     fts_queue_lock: Mutex<()>,
     dirty_counter: AtomicU64,
-    /// No queued search work has a lower token; skips acknowledged queue tombstones.
+    /// No queued search work has a lower token; the scan skips acknowledged tombstones.
     queue_floor: AtomicU64,
     dirty_committed: AtomicU64,
     /// Number of graph diagnostics recomputations by this store instance.
@@ -2521,6 +2496,12 @@ pub(crate) enum QvStat {
 pub(crate) struct QvRead<'a> {
     pub(crate) stat: QvStat,
     pub(crate) costs: &'a crate::query::context::QueryCost,
+}
+
+/// The graph and byte budget of one search orphan lookup.
+pub(crate) struct OrphanScope {
+    pub(crate) graph: TermId,
+    pub(crate) byte_limit: usize,
 }
 
 #[derive(Clone)]
@@ -6607,6 +6588,26 @@ impl GraphStore {
         self.commit_fjall_batch(batch).unwrap();
     }
 
+    /// Orphan ids at a search snapshot. Diagnostics commit after their source batch, so
+    /// a snapshot between the two recomputes them instead of failing the subject.
+    pub(crate) fn search_orphan_ids(
+        &self,
+        snapshot: &SearchSnapshot,
+        scope: OrphanScope,
+    ) -> Result<HashSet<TermId>> {
+        match snapshot.orphaned_ids(scope.graph, scope.byte_limit) {
+            Err(StoreError::InvalidSearchState(
+                "search-diagnostics-stale" | "search-diagnostics-missing",
+            )) => self.snapshot_orphan_ids(
+                &snapshot.snapshot,
+                &crate::query::context::ReadContext::default(),
+                scope.graph,
+                &self.orphan_vocab()?,
+            ),
+            result => result,
+        }
+    }
+
     /// Resolves the vocabulary ids used by orphan detection.
     fn orphan_vocab(&self) -> Result<OrphanVocab> {
         let id = |named_node: oxrdf::NamedNode| {
@@ -7570,8 +7571,7 @@ impl GraphStore {
             write_locks: (0..GRAPH_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             receipt_locks: (0..COMMIT_LOCK_SHARDS).map(|_| Mutex::new(())).collect(),
             receipt_next: AtomicU64::new(1),
-            receipt_count: TrimCount::default(),
-            batch_receipt_count: TrimCount::default(),
+            retention: Mutex::new(RetentionState::default()),
             #[cfg(test)]
             receipt_lookups: AtomicU64::new(0),
             #[cfg(test)]
@@ -7846,15 +7846,17 @@ impl GraphStore {
         }
         self.receipt_next
             .store(highest.saturating_add(1).max(1), Ordering::SeqCst);
-        self.receipt_count.live.store(live, Ordering::SeqCst);
         let mut batches = 0usize;
         for guard in self.receipt_order.prefix(BATCH_ORDER_PREFIX) {
             guard.into_inner()?;
             batches += 1;
         }
-        self.batch_receipt_count
-            .live
-            .store(batches, Ordering::SeqCst);
+        *self.retention_guard() = RetentionState {
+            receipts: live,
+            batches,
+            receipt_floor: None,
+            batch_floor: None,
+        };
         Ok(())
     }
 
@@ -11430,17 +11432,63 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Makes room for one more receipt by removing the oldest past retention, sparing
-    /// receipts staged in this batch. It scans forward from the last committed trim.
-    fn trim_receipts(&self, batch: &mut WriteBatch) -> Result<()> {
-        let excess = self.receipt_count.excess(&batch.receipt_trim.receipts);
-        if excess == 0 {
-            return Ok(());
+    fn retention_guard(&self) -> MutexGuard<'_, RetentionState> {
+        self.retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stages retention trims against committed receipts; callers hold the retention lock.
+    fn stage_retention(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        trim: RetentionTrim<'_>,
+    ) -> Result<RetentionState> {
+        let (receipts, receipt_floor) = self.trim_receipt_order(batch, &trim)?;
+        let (batches, batch_floor) = self.trim_batch_mappings(batch, &trim)?;
+        Ok(RetentionState {
+            receipts,
+            batches,
+            receipt_floor,
+            batch_floor,
+        })
+    }
+
+    /// Removes the oldest committed receipts past retention, returning the new count and
+    /// floor. Receipts this batch writes count once and are never removed by it.
+    fn trim_receipt_order(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        trim: &RetentionTrim<'_>,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
+        let mut staged = HashSet::new();
+        let mut added = 0usize;
+        let mut floor = trim.state.receipt_floor.clone();
+        let mut lowest: Option<Vec<u8>> = None;
+        for receipt in trim.pending {
+            if !staged.insert(receipt.id.0) {
+                continue;
+            }
+            if !self.receipts.contains_key(receipt.id.0)? {
+                added += 1;
+            }
+            let order = receipt_order_key(receipt);
+            lower_floor(&mut floor, &order);
+            if lowest
+                .as_deref()
+                .is_none_or(|lowest| order.as_slice() < lowest)
+            {
+                lowest = Some(order.to_vec());
+            }
         }
-        let start = self
-            .receipt_count
-            .start(&batch.receipt_trim.receipts)
-            .map_or(Bound::Unbounded, Bound::Excluded);
+        let live = trim.state.receipts + added;
+        let excess = live.saturating_sub(RECEIPT_RETENTION).min(QV_BUILD_ROWS);
+        if excess == 0 {
+            return Ok((live, floor));
+        }
+        let start = floor.clone().map_or(Bound::Unbounded, Bound::Included);
+        let mut next = floor;
+        let mut advance = true;
         let mut expired = None;
         let mut removed = 0usize;
         for guard in self
@@ -11451,39 +11499,100 @@ impl GraphStore {
             if key.len() != 40 {
                 continue;
             }
-            let staged = batch
-                .pending_receipts
-                .iter()
-                .any(|receipt| receipt.id.0[..] == id[..]);
-            if staged {
+            // A receipt this batch rewrites stays live, so the floor must not pass it.
+            if <[u8; 32]>::try_from(id.as_ref()).is_ok_and(|id| staged.contains(&id)) {
+                advance = false;
                 continue;
             }
             if let Some(value) = self.receipts.get(&id)? {
                 let receipt: MutationReceipt = postcard::from_bytes(value.as_ref())?;
                 expired = expired.max(Some(receipt.admission_sequence));
             }
-            batch.inner.remove(&self.receipt_order, key.clone());
-            batch.inner.remove(&self.receipts, id);
-            batch.receipt_trim.receipts.floor = Some(key.to_vec());
+            batch.remove(&self.receipt_order, key.clone());
+            batch.remove(&self.receipts, id);
+            if advance {
+                next = Some(key.to_vec());
+            }
             removed += 1;
             if removed == excess {
                 break;
             }
         }
-        batch.receipt_trim.receipts.removed += removed;
+        // This batch's own keys are not visible to the scan; the floor must stay below them.
+        if let Some(lowest) = lowest {
+            lower_floor(&mut next, &lowest);
+        }
         if let Some(expired) = expired {
             let stored = self
                 .receipt_order
                 .get(RECEIPT_EXPIRED_KEY)?
                 .and_then(|value| decode_index_count(value.as_ref()))
                 .unwrap_or(0);
-            batch.inner.insert(
+            batch.insert(
                 &self.receipt_order,
                 RECEIPT_EXPIRED_KEY,
                 stored.max(expired).to_be_bytes(),
             );
         }
-        Ok(())
+        Ok((live - removed, next))
+    }
+
+    /// Removes the oldest committed batch receipts past retention, returning the new
+    /// count and floor. Mappings this batch writes are not committed yet.
+    fn trim_batch_mappings(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        trim: &RetentionTrim<'_>,
+    ) -> Result<(usize, Option<Vec<u8>>)> {
+        let mut staged = HashSet::new();
+        let mut added = 0usize;
+        let mut floor = trim.state.batch_floor.clone();
+        let lowest = trim
+            .mappings
+            .iter()
+            .map(|(_, sequence)| batch_order_key(*sequence))
+            .min();
+        for (key, sequence) in trim.mappings {
+            if staged.insert(key) && !self.receipts.contains_key(key)? {
+                added += 1;
+            }
+            lower_floor(&mut floor, &batch_order_key(*sequence));
+        }
+        let live = trim.state.batches + added;
+        let excess = live.saturating_sub(RECEIPT_RETENTION).min(QV_BUILD_ROWS);
+        if excess == 0 {
+            return Ok((live, floor));
+        }
+        let start = floor.clone().map_or(
+            Bound::Included(BATCH_ORDER_PREFIX.to_vec()),
+            Bound::Included,
+        );
+        let mut next = floor;
+        let mut removed = 0usize;
+        for guard in self
+            .receipt_order
+            .range::<Vec<u8>, _>((start, Bound::Unbounded))
+        {
+            let (order, mapping_key) = guard.into_inner()?;
+            if !order.starts_with(&BATCH_ORDER_PREFIX) {
+                break;
+            }
+            if let Some(value) = self.receipts.get(&mapping_key)? {
+                let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
+                batch.remove(&self.receipts, batch_reverse_key(&mapping.id));
+            }
+            batch.remove(&self.receipt_order, order.clone());
+            batch.remove(&self.receipts, mapping_key);
+            next = Some(order.to_vec());
+            removed += 1;
+            if removed == excess {
+                break;
+            }
+        }
+        if let Some(lowest) = lowest {
+            lower_floor(&mut next, &lowest);
+        }
+        Ok((live - removed, next))
     }
 
     /// Stage first acceptance evidence in the caller's source batch.
@@ -11512,8 +11621,6 @@ impl GraphStore {
         }
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
-        self.trim_receipts(batch)?;
-        batch.receipt_trim.receipts.added += 1;
         batch
             .inner
             .insert(&self.receipts, stored.id.0, postcard::to_allocvec(&stored)?);
@@ -11539,6 +11646,7 @@ impl GraphStore {
         event_id: [u8; 32],
     ) -> Result<MutationReceipt> {
         let _guard = self.receipt_guard(id);
+        let _retention = self.retention_guard();
         let mut receipt = self
             .mutation_receipt(id)?
             .ok_or(StoreError::ReceiptConflict)?;
@@ -11582,44 +11690,6 @@ impl GraphStore {
         })
     }
 
-    /// Makes room for one more batch receipt by removing the oldest past retention.
-    fn trim_batch_receipts(&self, batch: &mut WriteBatch) -> Result<()> {
-        let change = &batch.receipt_trim.batches;
-        let excess = self.batch_receipt_count.excess(change);
-        if excess == 0 {
-            return Ok(());
-        }
-        let start = self.batch_receipt_count.start(change).map_or(
-            Bound::Included(BATCH_ORDER_PREFIX.to_vec()),
-            Bound::Excluded,
-        );
-        let mut removed = 0usize;
-        for guard in self
-            .receipt_order
-            .range::<Vec<u8>, _>((start, Bound::Unbounded))
-        {
-            let (order, mapping_key) = guard.into_inner()?;
-            if !order.starts_with(&BATCH_ORDER_PREFIX) {
-                break;
-            }
-            if let Some(value) = self.receipts.get(&mapping_key)? {
-                let mapping: StoredBatchReceipt = postcard::from_bytes(value.as_ref())?;
-                batch
-                    .inner
-                    .remove(&self.receipts, batch_reverse_key(&mapping.id));
-            }
-            batch.inner.remove(&self.receipt_order, order.clone());
-            batch.inner.remove(&self.receipts, mapping_key);
-            batch.receipt_trim.batches.floor = Some(order.to_vec());
-            removed += 1;
-            if removed == excess {
-                break;
-            }
-        }
-        batch.receipt_trim.batches.removed += removed;
-        Ok(())
-    }
-
     pub(crate) fn stage_batch_receipt(
         &self,
         batch: &mut WriteBatch,
@@ -11649,8 +11719,10 @@ impl GraphStore {
         {
             return Err(StoreError::ReceiptConflict);
         }
-        self.trim_batch_receipts(batch)?;
-        batch.receipt_trim.batches.added += 1;
+        batch
+            .receipt_trim
+            .mappings
+            .push((key.to_vec(), mapping.sequence));
         batch
             .inner
             .insert(&self.receipts, key, postcard::to_allocvec(&mapping)?);
@@ -11759,6 +11831,8 @@ impl GraphStore {
     /// Compare-fenced update for post-commit persistence and repair settlement.
     pub(crate) fn update_receipt(&self, receipt: &MutationReceipt) -> Result<MutationReceipt> {
         let _guard = self.receipt_guard(&receipt.id);
+        // Trims run under this lock, so a trimmed receipt is never written back.
+        let mut retention = self.retention_guard();
         let previous = self
             .mutation_receipt(&receipt.id)?
             .ok_or(StoreError::ReceiptConflict)?;
@@ -11788,6 +11862,7 @@ impl GraphStore {
         #[cfg(test)]
         self.receipt_writes.fetch_add(1, Ordering::Relaxed);
         self.commit_fjall_batch(batch)?;
+        lower_floor(&mut retention.receipt_floor, &receipt_order_key(&stored));
         Ok(stored)
     }
 
@@ -11883,6 +11958,9 @@ impl GraphStore {
                 entry.key.clone(),
                 encode_dirty_tokens(narrowed),
             );
+            // A stale acknowledgement can move queued work below the cached head.
+            self.queue_floor
+                .fetch_min(narrowed.oldest, Ordering::SeqCst);
             batch.insert(
                 &self.search_queue,
                 search_order_key(QueueCursor {
@@ -11901,8 +11979,8 @@ impl GraphStore {
         Ok(true)
     }
 
-    /// Oldest queued search work. Callers hold the queue lock, under which tokens are
-    /// minted in increasing order, so no work can appear below a head once seen.
+    /// Oldest queued search work. Callers hold the queue lock; every queue insert lowers
+    /// the floor to its token first, so the scan never starts past queued work.
     fn queue_head(&self) -> Result<Option<QueueCursor>> {
         let floor = self.queue_floor.load(Ordering::SeqCst);
         let mut start = [0u8; 9];
@@ -11959,6 +12037,7 @@ impl GraphStore {
             },
         };
         batch.insert(&self.graphs, bytes, encode_dirty_tokens(tokens));
+        self.queue_floor.fetch_min(tokens.oldest, Ordering::SeqCst);
         batch.insert(
             &self.search_queue,
             search_order_key(key.cursor(tokens.oldest)),
@@ -12018,10 +12097,24 @@ impl GraphStore {
                 search_token.to_be_bytes(),
             );
         }
+        let mut retention = (!pending_receipts.is_empty() || !receipt_trim.mappings.is_empty())
+            .then(|| self.retention_guard());
+        let settled = match &retention {
+            Some(state) => Some(self.stage_retention(
+                &mut batch,
+                RetentionTrim {
+                    state,
+                    pending: &pending_receipts,
+                    mappings: &receipt_trim.mappings,
+                },
+            )?),
+            None => None,
+        };
         let result = self.commit_fjall_batch(batch);
         if result.is_ok() {
-            self.receipt_count.settle(receipt_trim.receipts);
-            self.batch_receipt_count.settle(receipt_trim.batches);
+            if let (Some(state), Some(settled)) = (retention.as_mut(), settled) {
+                **state = settled;
+            }
             if let Some(token) = search_token {
                 self.dirty_committed.fetch_max(token, Ordering::SeqCst);
             }
@@ -12317,6 +12410,132 @@ mod tests {
         commit_receipt(&store, &graph, RECEIPT_RETENTION + 2);
         assert!(store.mutation_receipt(&second.id).unwrap().is_none());
         assert!(store.mutation_receipt(&third.id).unwrap().is_some());
+    }
+
+    fn retained_receipts(store: &GraphStore) -> usize {
+        store
+            .receipts
+            .iter()
+            .map(|guard| guard.key().unwrap())
+            .filter(|key| key.len() == 32)
+            .count()
+    }
+
+    fn staged_receipt(store: &GraphStore, graph: &GraphId, nanos: usize) -> WriteBatch {
+        let mut batch = store.new_batch();
+        assert!(
+            store
+                .stage_receipt(&mut batch, &pending_receipt(graph, nanos))
+                .unwrap()
+                .is_none()
+        );
+        batch
+    }
+
+    /// Batches staged before either commits still settle retention exactly.
+    #[test]
+    fn overlapping_trims_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:receipt-overlap");
+        for nanos in 0..RECEIPT_RETENTION {
+            commit_receipt(&store, &graph, nanos);
+        }
+        for pair in 0..4 {
+            let nanos = RECEIPT_RETENTION + pair * 2;
+            let first = staged_receipt(&store, &graph, nanos);
+            let second = staged_receipt(&store, &graph, nanos + 1);
+            store.commit(first).unwrap();
+            store.commit(second).unwrap();
+        }
+        commit_receipt(&store, &graph, RECEIPT_RETENTION + 8);
+        assert_eq!(retained_receipts(&store), RECEIPT_RETENTION);
+    }
+
+    /// A receipt committed with an older timestamp than earlier trims expires first.
+    #[test]
+    fn delayed_receipt_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:receipt-delayed");
+        let delayed = staged_receipt(&store, &graph, 0);
+        for nanos in 1..=RECEIPT_RETENTION + 1 {
+            commit_receipt(&store, &graph, nanos);
+        }
+        let id = delayed.pending_receipts[0].id;
+        store.commit(delayed).unwrap();
+        for nanos in 2..=4 {
+            commit_receipt(&store, &graph, RECEIPT_RETENTION + nanos);
+        }
+        assert!(store.mutation_receipt(&id).unwrap().is_none());
+        assert_eq!(retained_receipts(&store), RECEIPT_RETENTION);
+    }
+
+    /// Search indexing between a source commit and its diagnostics commit derives the
+    /// orphans from its own snapshot instead of failing the subject.
+    #[test]
+    fn search_orphans_recomputed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:search-orphans");
+        store.create_graph(&graph).unwrap();
+        let graph_tid = store
+            .lookup_term(&EncodedTerm::from_named_node(&graph.0))
+            .unwrap()
+            .unwrap();
+        let snapshot = store.search_snapshot();
+        assert!(matches!(
+            snapshot.orphaned_ids(graph_tid, usize::MAX),
+            Err(StoreError::InvalidSearchState(_))
+        ));
+        let scope = OrphanScope {
+            graph: graph_tid,
+            byte_limit: usize::MAX,
+        };
+        assert!(
+            store
+                .search_orphan_ids(&snapshot, scope)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A stale queue clear moving work below a checked head keeps coverage fenced.
+    #[test]
+    fn stale_clear_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:queue-stale");
+        store.create_graph(&graph).unwrap();
+        for _ in 0..3 {
+            store.ensure_reindex(&graph).unwrap();
+            store.clear_fts_queue().unwrap();
+        }
+        let (target, _) = store.ensure_reindex(&graph).unwrap();
+        let coverage = |covered: u64| {
+            let index_id = [7; 16];
+            let manifest = store.search_manifest_digest(index_id).unwrap();
+            SearchCoverage {
+                format: SEARCH_META_FORMAT,
+                index_id,
+                index_revision: 0,
+                covered,
+                rebuild: None,
+                manifest_count: manifest.count,
+                manifest_hash: manifest.hash,
+                manifest_epoch: manifest.epoch,
+            }
+        };
+        store
+            .advance_search_coverage(&coverage(target - 1))
+            .unwrap();
+        store.clear_graph_queue(&graph, target - 2).unwrap();
+        assert!(matches!(
+            store.advance_search_coverage(&coverage(target)),
+            Err(StoreError::InvalidSearchState(
+                "search-coverage-debt-remains"
+            ))
+        ));
     }
 
     /// Receipts that never settle still leave retention; reopen orders untracked ones again.

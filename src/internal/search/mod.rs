@@ -715,6 +715,7 @@ struct PrepareSubject<'a> {
 }
 
 struct OrphanInput<'a> {
+    store: &'a GraphStore,
     graph: &'a GraphId,
     graph_tid: TermId,
     byte_limit: usize,
@@ -740,7 +741,11 @@ impl StoreSyncCaches {
     fn orphaned(&mut self, input: OrphanInput<'_>) -> Result<&HashSet<TermId>> {
         if !self.orphaned_subjects.contains_key(input.graph) {
             let artifact_limit = input.byte_limit / 32;
-            let orphaned = match self.snapshot.orphaned_ids(input.graph_tid, artifact_limit) {
+            let scope = crate::store::OrphanScope {
+                graph: input.graph_tid,
+                byte_limit: artifact_limit,
+            };
+            let orphaned = match input.store.search_orphan_ids(&self.snapshot, scope) {
                 Ok(orphaned) => orphaned,
                 Err(crate::store::StoreError::LimitExceeded {
                     resource: "search diagnostics rows",
@@ -3595,6 +3600,7 @@ fn prepare_subject_op(
     let cache_before = caches.orphan_bytes;
     let hidden = caches
         .orphaned(OrphanInput {
+            store: req.store,
             graph: req.graph,
             graph_tid,
             byte_limit: text_limit,

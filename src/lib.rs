@@ -1208,9 +1208,12 @@ fn run_search_worker(receiver: mpsc::Receiver<SearchWorkerMessage>, ctx: SearchW
                 if pending.is_empty() && progress.covered == 0 && certified == Some(target) {
                     continue;
                 }
-                let completed = ctx
-                    .search
-                    .complete_coverage(&ctx.store, target)
+                let completed = ctx.search.complete_coverage(&ctx.store, target);
+                if completed.as_ref().is_err_and(coverage_debt) {
+                    active = true;
+                    continue;
+                }
+                let completed = completed
                     .map_err(MaintenanceFailure::search)
                     .and_then(|()| ctx.store.persist().map_err(MaintenanceFailure::store));
                 if completed.is_ok() {
@@ -1316,9 +1319,24 @@ fn flush_search_queue(store: &GraphStore, search: &SearchIndex) -> Result<()> {
             break;
         }
     }
-    search.complete_coverage(store, target)?;
-    store.persist()?;
-    Ok(())
+    match search.complete_coverage(store, target) {
+        Err(error) if coverage_debt(&error) => flush_search_queue(store, search),
+        result => {
+            result?;
+            store.persist()?;
+            Ok(())
+        }
+    }
+}
+
+/// A concurrent write narrowed queued work below the drained target; drain it again.
+fn coverage_debt(error: &search::SearchError) -> bool {
+    matches!(
+        error,
+        search::SearchError::Store(store::StoreError::InvalidSearchState(
+            "search-coverage-debt-remains"
+        ))
+    )
 }
 
 /// Name what a flush could not cover, with the first entry's diagnostic.
