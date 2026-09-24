@@ -158,6 +158,28 @@ mod tests {
             }),
         );
         report(
+            "patch entity",
+            timed(samples, |sample| {
+                let request = PatchEntityRequest {
+                    entity: CreateEntityRequest {
+                        graph: documents[sample].0.clone(),
+                        entity_id: format!("./data/patched-{sample}.txt"),
+                        entity_type: "File".to_string(),
+                        name: format!("Patched file {sample}"),
+                        additional_triples: Vec::new(),
+                    },
+                    replaced_predicates: Vec::new(),
+                };
+                node.patch_data_with(
+                    &AllowAllAuthorizer,
+                    request,
+                    CraqleRequestDurability::WalAlreadyDurable,
+                    None,
+                )
+                .unwrap();
+            }),
+        );
+        report(
             "set policy",
             timed(samples, |sample| {
                 node.set_graph_policy(
