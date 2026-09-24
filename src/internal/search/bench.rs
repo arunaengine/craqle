@@ -487,7 +487,7 @@ fn generation_publication() {
                 covered: 0,
             })
             .collect();
-        index.publish_generations(GenerationView::from_rows(index.index_id, rows));
+        index.publish_generations(GenerationView::from_rows(rows));
         let switches = 200;
         let mut lock_ns = Vec::with_capacity(switches);
         let started = Instant::now();

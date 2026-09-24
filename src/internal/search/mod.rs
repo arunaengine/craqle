@@ -215,31 +215,38 @@ struct RepairIntents {
     retry_at_ms: u64,
 }
 
+/// Shared keys keep the per-publish copy of this map free of string allocations.
 #[derive(Clone, Default)]
 struct GenerationView {
-    by_graph: HashMap<String, GenerationId>,
-    active: HashSet<Vec<u8>>,
+    by_graph: HashMap<Arc<str>, GenerationId>,
 }
 
 impl GenerationView {
+    /// Whether `scope` names the active generation of its graph in this index.
+    fn is_active(&self, index_id: [u8; 16], scope: &[u8]) -> bool {
+        let Some(graph) = scope_graph(scope) else {
+            return false;
+        };
+        scope.starts_with(&index_id)
+            && self
+                .by_graph
+                .get(graph)
+                .is_some_and(|generation| scope.ends_with(&generation.0.to_be_bytes()))
+    }
+
     #[cfg(test)]
-    fn from_rows(index_id: [u8; 16], rows: Vec<GraphGeneration>) -> Self {
+    fn from_rows(rows: Vec<GraphGeneration>) -> Self {
         let mut view = Self::default();
-        view.extend(index_id, rows);
+        view.extend(rows);
         view
     }
 
     #[cfg(test)]
-    fn extend(&mut self, index_id: [u8; 16], rows: Vec<GraphGeneration>) {
+    fn extend(&mut self, rows: Vec<GraphGeneration>) {
         self.by_graph.extend(rows.into_iter().filter_map(|row| {
             row.active
-                .map(|generation| (row.graph.as_str().to_string(), generation))
+                .map(|generation| (Arc::from(row.graph.as_str()), generation))
         }));
-        self.active = self
-            .by_graph
-            .iter()
-            .map(|(graph, generation)| generation_scope(index_id, graph, *generation))
-            .collect();
     }
 }
 
@@ -1065,7 +1072,7 @@ impl SearchIndex {
 
     #[cfg(test)]
     fn publish_rows(&self, rows: Vec<GraphGeneration>) {
-        self.publish_generations(GenerationView::from_rows(self.index_id, rows));
+        self.publish_generations(GenerationView::from_rows(rows));
     }
 
     fn publish_generations(&self, generations: GenerationView) {
@@ -1083,17 +1090,12 @@ impl SearchIndex {
         let mut generations = (*published.generations).clone();
         match generation {
             Some(generation) => {
-                generations.by_graph.insert(graph.to_string(), generation);
+                generations.by_graph.insert(Arc::from(graph), generation);
             }
             None => {
                 generations.by_graph.remove(graph);
             }
         }
-        generations.active = generations
-            .by_graph
-            .iter()
-            .map(|(graph, generation)| generation_scope(self.index_id, graph, *generation))
-            .collect();
         *published = Arc::new(SearchView {
             searcher: self.reader.searcher(),
             generations: Arc::new(generations),
@@ -1222,7 +1224,7 @@ impl SearchIndex {
                     }
                     count = count.saturating_add(1);
                     if row.live {
-                        generations.by_graph.insert(graph.to_string(), generation);
+                        generations.by_graph.insert(Arc::from(graph), generation);
                     }
                 }
             }
@@ -1238,11 +1240,6 @@ impl SearchIndex {
                 ));
             }
         }
-        generations.active = generations
-            .by_graph
-            .iter()
-            .map(|(graph, generation)| generation_scope(self.index_id, graph, *generation))
-            .collect();
         let digest = snapshot.digest(self.index_id)?;
         Ok(ManifestState {
             generations,
@@ -2235,9 +2232,10 @@ impl SearchIndex {
     #[cfg(test)]
     fn collect_top_docs(&self, req: TopRequest<'_>) -> Result<Vec<SearchHit>> {
         let generations = req.view.generations.clone();
+        let index_id = self.index_id;
         let collector = BytesFilterCollector::new(
             GENERATION_SCOPE_FIELD.to_string(),
-            move |scope: &[u8]| generations.active.contains(scope),
+            move |scope: &[u8]| generations.is_active(index_id, scope),
             TopDocs::with_limit(req.limit).order_by_score(),
         );
         let top_docs = req.view.searcher.search(req.query, &collector)?;
@@ -3367,7 +3365,7 @@ impl SearchIndex {
                 detail: "generation scope",
             }));
         };
-        if !req.view.generations.active.contains(scope.as_slice()) || !(req.allows)(graph)? {
+        if !req.view.generations.is_active(self.index_id, &scope) || !(req.allows)(graph)? {
             return Ok(None);
         }
         let stable = column_bytes(req.stable, req.doc).and_then(|stable| {
@@ -4994,7 +4992,7 @@ mod tests {
         assert_eq!(1, repaired.len());
         assert_eq!(graph.as_str(), repaired[0].graph_id);
         let scope = generation_scope(node.search.index_id, graph.as_str(), generation);
-        assert!(pinned.generations.active.contains(scope.as_slice()));
+        assert!(pinned.generations.is_active(node.search.index_id, &scope));
     }
 
     #[test]
