@@ -187,6 +187,13 @@ impl<V: RdfReadView> Validator<'_, '_, '_, V> {
             }
         }
         if !emit {
+            // Top-level runs reach property shapes through inherited targets; nested checks do not.
+            for property in &portable.property_shapes {
+                if !conforms {
+                    break;
+                }
+                conforms = self.evaluate_shape(*property, focus, false)?;
+            }
             self.conformance_cache.insert(
                 (shape_id, focus),
                 if conforms {

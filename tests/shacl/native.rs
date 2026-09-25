@@ -1108,6 +1108,59 @@ fn native_logical_constraints() {
 }
 
 #[test]
+fn nested_property_shapes() {
+    // Nested shapes carry only property shapes, which have no targets of their own.
+    let shapes = r#"
+<urn:nested:thing-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:nested:thing-shape> <http://www.w3.org/ns/shacl#targetClass> <urn:nested:Thing> .
+<urn:nested:thing-shape> <http://www.w3.org/ns/shacl#property> <urn:nested:author-property> .
+<urn:nested:author-property> <http://www.w3.org/ns/shacl#path> <urn:nested:author> .
+<urn:nested:person-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:nested:person-shape> <http://www.w3.org/ns/shacl#property> <urn:nested:name-property> .
+<urn:nested:name-property> <http://www.w3.org/ns/shacl#path> <urn:nested:name> .
+<urn:nested:name-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:nested:email-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:nested:email-shape> <http://www.w3.org/ns/shacl#property> <urn:nested:email-property> .
+<urn:nested:email-property> <http://www.w3.org/ns/shacl#path> <urn:nested:email> .
+<urn:nested:email-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+_:single <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:nested:person-shape> .
+_:single <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+_:pair <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:nested:person-shape> .
+_:pair <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:pair-tail .
+_:pair-tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:nested:email-shape> .
+_:pair-tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+"#;
+    let unnamed = r#"
+<urn:nested:thing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:nested:Thing> .
+<urn:nested:thing> <urn:nested:author> <urn:nested:person> .
+"#;
+    let named = format!("{unnamed}<urn:nested:person> <urn:nested:name> \"Ada\" .\n");
+    let author = "<urn:nested:author-property> <http://www.w3.org/ns/shacl#";
+    let cases = [
+        ("node> <urn:nested:person-shape> .", false),
+        ("and> _:single .", false),
+        ("or> _:pair .", false),
+        ("xone> _:pair .", false),
+        ("not> <urn:nested:person-shape> .", true),
+        (
+            "qualifiedValueShape> <urn:nested:person-shape> .\n\
+             <urn:nested:author-property> <http://www.w3.org/ns/shacl#qualifiedMinCount> \
+             \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
+            false,
+        ),
+    ];
+    for (constraint, unnamed_conforms) in cases {
+        let shape_text = format!("{shapes}{author}{constraint}\n");
+        let unnamed_report = rudof_validate(&shape_text, unnamed);
+        assert_eq!(unnamed_report.conforms(), unnamed_conforms, "{constraint}");
+        native_matches_rudof(&shape_text, unnamed);
+        let named_report = rudof_validate(&shape_text, &named);
+        assert_eq!(named_report.conforms(), !unnamed_conforms, "{constraint}");
+        native_matches_rudof(&shape_text, &named);
+    }
+}
+
+#[test]
 fn native_path_forms() {
     let root = iri("urn:test:paths:root");
     let focus = iri("urn:test:paths:focus");
