@@ -64,6 +64,16 @@ All notable changes to Craqle are documented here.
   with the store error when a graph policy cannot be read. Earlier versions hid
   that graph and could return fewer rows, a smaller count, or a false `ASK`.
   A missing or denying policy still hides the graph.
+- SHACL evaluates the property shapes of shapes reached through `sh:node`, `sh:or`,
+  `sh:and`, `sh:not`, `sh:xone` and `sh:qualifiedValueShape`, including on
+  incremental validation. Earlier versions skipped them, so these nested checks
+  could pass or fail wrongly.
+- SHACL checks the property shapes of a property shape on each value node of its
+  path, as the SHACL specification requires. Earlier versions checked them on the
+  parent's focus node, so a chain such as book, author, name could fail wrongly.
+- A search flush on a node that still owes a whole search rebuild now finishes while
+  writes continue. Earlier versions could keep extending the flush to every new write,
+  so the rebuild never completed and the flush never returned.
 
 ### Added
 
@@ -150,6 +160,9 @@ All notable changes to Craqle are documented here.
   topic from its start; records a graph clock already covers apply as duplicates.
 - Derived-index repair preserves surviving RDF source state. It cannot reconstruct
   source events lost by older bugs without an authoritative history or healthy replica.
+- `SHACL_COMPILER_MODEL_VERSION` is now 3 because nested SHACL checks changed.
+  Stored validation reports from earlier versions read as pending and are recomputed
+  once, by full validation, on the next write or revalidation of their binding.
 
 ## 0.2.0 - 2026-08-22
 

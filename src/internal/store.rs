@@ -1431,6 +1431,9 @@ pub struct GraphStore {
     /// No queued search work has a lower token; the scan skips acknowledged tombstones.
     queue_floor: AtomicU64,
     dirty_committed: AtomicU64,
+    /// Highest token a search rebuild scan staged in this process.
+    #[cfg(feature = "search")]
+    rebuild_staged: AtomicU64,
     /// Number of graph diagnostics recomputations by this store instance.
     diagnostics_computed: AtomicU64,
     /// Metadata point reads performed by the O(1) qv2 admission gate.
@@ -7755,6 +7758,8 @@ impl GraphStore {
             dirty_counter: AtomicU64::new(1),
             queue_floor: AtomicU64::new(0),
             dirty_committed: AtomicU64::new(0),
+            #[cfg(feature = "search")]
+            rebuild_staged: AtomicU64::new(0),
             diagnostics_computed: AtomicU64::new(0),
             #[cfg(test)]
             index_admission_probes: AtomicU64::new(0),
@@ -11169,7 +11174,9 @@ impl GraphStore {
                 remaining: false,
                 rows: 0,
                 bytes: 0,
-                target: self.locked_dirty_token(),
+                // Staged scan work may pass the fixed target. After a restart every flush
+                // target is taken from the persisted head, which already covers it.
+                target: state.target.max(self.rebuild_staged.load(Ordering::SeqCst)),
                 oversized: None,
             });
         }
@@ -11230,6 +11237,7 @@ impl GraphStore {
         batch.insert(&self.search_meta, SEARCH_HEAD_KEY, highest.to_be_bytes());
         self.commit_fjall_batch(batch)?;
         self.dirty_committed.fetch_max(highest, Ordering::SeqCst);
+        self.rebuild_staged.fetch_max(highest, Ordering::SeqCst);
         Ok(RebuildPage {
             remaining,
             rows,

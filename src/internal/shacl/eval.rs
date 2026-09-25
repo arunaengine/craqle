@@ -14,7 +14,7 @@ use crate::store::{TermId, hash_term};
 use crate::{EncodedTerm, GraphId, Result};
 
 use super::constraints::{TermMetaCache, language_matches};
-use super::model::{NodeKindPlan, ShapeId};
+use super::model::{NodeKindPlan, ShapeId, ShapeKind};
 use super::paths::{self, PathWork};
 use super::report::{PendingPath, ReportBuilder};
 use super::resolve::{ResolvedConstraint, ResolvedPath, ResolvedSchema};
@@ -183,6 +183,25 @@ impl<V: RdfReadView> Validator<'_, '_, '_, V> {
                 conforms = false;
                 if !emit || self.halted {
                     break;
+                }
+            }
+        }
+        // Top-level node shapes reach property shapes through targets; a property shape's own
+        // property shapes apply to its value nodes.
+        let nested = !emit || portable.kind == ShapeKind::Property;
+        if nested && !portable.property_shapes.is_empty() && (conforms || emit) && !self.halted {
+            let focus_nodes = match portable.kind {
+                ShapeKind::Node => Arc::new(BTreeSet::from([focus])),
+                ShapeKind::Property => self.shape_values(shape_id, focus, None)?,
+            };
+            'values: for value in focus_nodes.iter().copied() {
+                for property in &portable.property_shapes {
+                    if !self.evaluate_shape(*property, value, emit)? {
+                        conforms = false;
+                        if !emit || self.halted {
+                            break 'values;
+                        }
+                    }
                 }
             }
         }

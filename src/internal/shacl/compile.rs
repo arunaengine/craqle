@@ -524,7 +524,7 @@ impl ShaclCompiler {
                 }
                 result => result?,
             };
-        if selection.affected_pairs.is_empty() {
+        if selection.affected_pairs.is_empty() && selection.replaced_shapes.is_empty() {
             let mut report = base_report;
             report.refresh_outcomes(options.blocking_severity);
             report.statistics = Default::default();
@@ -555,9 +555,10 @@ impl ShaclCompiler {
         report
             .results
             .extend(base_report.results.into_iter().filter(|result| {
-                !selection
-                    .affected_pairs
-                    .contains(&(result.source_shape.clone(), result.focus_node.clone()))
+                !selection.replaced_shapes.contains(&result.source_shape)
+                    && !selection
+                        .affected_pairs
+                        .contains(&(result.source_shape.clone(), result.focus_node.clone()))
             }));
         report.results.sort();
         report.refresh_outcomes(options.blocking_severity);
@@ -666,13 +667,7 @@ impl ShaclCompiler {
                         changed_any = true;
                     }
                 }
-                if !shape.dependencies.nested_shapes.is_empty()
-                    && shape
-                        .dependencies
-                        .nested_shapes
-                        .iter()
-                        .any(|nested| global[nested.0 as usize] || affected[nested.0 as usize])
-                {
+                if nested_parent(schema, shape, &|index| global[index] || affected[index]) {
                     if !affected[parent] {
                         affected[parent] = true;
                         changed_any = true;
@@ -720,6 +715,9 @@ impl ShaclCompiler {
             let mut changed_any = false;
             for shape in &schema.portable.shapes {
                 let parent = shape.id.0 as usize;
+                if shape.kind == ShapeKind::Property {
+                    continue;
+                }
                 for property in &shape.property_shapes {
                     let property = property.0 as usize;
                     let next = full_targets[property].max(full_targets[parent]);
@@ -945,6 +943,7 @@ fn validation_bytes(report: &ShaclValidationReport) -> usize {
 struct IncrementalSelection {
     targets: Vec<BTreeSet<TermId>>,
     affected_pairs: HashSet<(EncodedTerm, EncodedTerm)>,
+    replaced_shapes: HashSet<EncodedTerm>,
     full_graph_fallbacks: u64,
 }
 
@@ -1154,20 +1153,20 @@ fn select_incremental_targets<V: RdfReadView>(
             let parent = shape.id.0 as usize;
             for property in &shape.property_shapes {
                 let property = property.0 as usize;
-                let inherited = candidates[parent].clone();
-                let before = candidates[property].len();
-                candidates[property].extend(inherited);
-                changed_any |= candidates[property].len() != before;
+                if shape.kind == ShapeKind::Node {
+                    let inherited = candidates[parent].clone();
+                    let before = candidates[property].len();
+                    candidates[property].extend(inherited);
+                    changed_any |= candidates[property].len() != before;
+                }
                 if global[parent] && !global[property] {
                     global[property] = true;
                     changed_any = true;
                 }
             }
-            if !shape.dependencies.nested_shapes.is_empty()
-                && shape.dependencies.nested_shapes.iter().any(|nested| {
-                    global[nested.0 as usize] || !candidates[nested.0 as usize].is_empty()
-                })
-                && !global[parent]
+            if nested_parent(schema, shape, &|index| {
+                global[index] || !candidates[index].is_empty()
+            }) && !global[parent]
             {
                 global[parent] = true;
                 changed_any = true;
@@ -1219,6 +1218,18 @@ fn select_incremental_targets<V: RdfReadView>(
         }
     }
 
+    // Checks on a property shape's value nodes are rerun in full whenever that shape is global.
+    let mut replaced_shapes = HashSet::new();
+    for shape in &schema.portable.shapes {
+        if shape.kind == ShapeKind::Property {
+            let properties = shape.property_shapes.iter();
+            replaced_shapes.extend(
+                properties
+                    .filter(|property| global[property.0 as usize])
+                    .map(|property| schema.portable.shapes[property.0 as usize].label.clone()),
+            );
+        }
+    }
     let mut affected_pairs = HashSet::new();
     for index in 0..shape_count {
         let mut affected_focus = candidates[index].clone();
@@ -1235,6 +1246,7 @@ fn select_incremental_targets<V: RdfReadView>(
     Ok(IncrementalSelection {
         targets,
         affected_pairs,
+        replaced_shapes,
         full_graph_fallbacks,
     })
 }
@@ -1242,11 +1254,50 @@ fn select_incremental_targets<V: RdfReadView>(
 fn property_shape_parents(schema: &ResolvedSchema) -> Vec<Vec<usize>> {
     let mut parents = vec![Vec::new(); schema.shapes.len()];
     for shape in &schema.portable.shapes {
+        if shape.kind == ShapeKind::Property {
+            continue;
+        }
         for property in &shape.property_shapes {
             parents[property.0 as usize].push(shape.id.0 as usize);
         }
     }
     parents
+}
+
+/// Reports whether a nested shape changed, including property shapes its nested check evaluates.
+fn nested_changed(
+    schema: &ResolvedSchema,
+    nested: ShapeId,
+    changed: &dyn Fn(usize) -> bool,
+) -> bool {
+    let mut pending = vec![nested.0 as usize];
+    let mut seen = HashSet::new();
+    while let Some(shape) = pending.pop() {
+        if !seen.insert(shape) {
+            continue;
+        }
+        if changed(shape) {
+            return true;
+        }
+        let properties = &schema.portable.shapes[shape].property_shapes;
+        pending.extend(properties.iter().map(|property| property.0 as usize));
+    }
+    false
+}
+
+/// Reports whether a shape must re-check all its targets because a shape it evaluates changed.
+fn nested_parent(
+    schema: &ResolvedSchema,
+    shape: &CompiledShape,
+    changed: &dyn Fn(usize) -> bool,
+) -> bool {
+    let chain = shape.kind == ShapeKind::Property && !shape.property_shapes.is_empty();
+    shape
+        .dependencies
+        .nested_shapes
+        .iter()
+        .any(|nested| nested_changed(schema, *nested, changed))
+        || (chain && nested_changed(schema, shape.id, changed))
 }
 
 #[allow(clippy::too_many_arguments)]

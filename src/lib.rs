@@ -7147,6 +7147,94 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "shacl-core")]
+    #[test]
+    fn stale_report_revalidated() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = CraqleNode::open_with_options(
+            directory.path(),
+            CraqleOptions::new().with_search_storage(SearchStorage::Memory),
+        )
+        .unwrap();
+        let data = GraphId::new("urn:test:upgrade:data");
+        let shapes = GraphId::new("urn:test:upgrade:shapes");
+        let quad = |graph: &GraphId, subject: &str, predicate: &str, object: &str| {
+            MaterializedQuadChange::Insert {
+                graph: graph.clone(),
+                subject: EncodedTerm(format!("<urn:test:{subject}>")),
+                predicate: EncodedTerm(format!("<{predicate}>")),
+                object: EncodedTerm(object.to_owned()),
+            }
+        };
+        let sh = "http://www.w3.org/ns/shacl#";
+        let shape_quads = [
+            ("thing-shape", "targetClass", "<urn:test:Thing>"),
+            ("thing-shape", "property", "<urn:test:author>"),
+            ("author", "path", "<urn:test:author>"),
+            ("author", "node", "<urn:test:person-shape>"),
+            ("person-shape", "property", "<urn:test:name>"),
+            ("name", "path", "<urn:test:name>"),
+            (
+                "name",
+                "minCount",
+                "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            ),
+        ]
+        .map(|(subject, local, object)| quad(&shapes, subject, &format!("{sh}{local}"), object));
+        node.apply_unchecked(&shapes, shape_quads.to_vec()).unwrap();
+        let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let thing = [
+            quad(&data, "thing", rdf_type, "<urn:test:Thing>"),
+            quad(&data, "thing", "urn:test:author", "<urn:test:person>"),
+        ];
+        node.apply_unchecked(&data, thing.to_vec()).unwrap();
+        let binding = ShaclBinding {
+            data_graph: data.clone(),
+            shapes_graph: shapes.clone(),
+            policy: ShaclWritePolicy::Enforce,
+            validation_options: ShaclBindingOptions::default(),
+        };
+        let bound = node.bind_shacl(&AllowAllAuthorizer, &binding).unwrap();
+        assert_eq!(bound.state, ShaclValidationState::Invalid);
+
+        // Model version 2 skipped the nested name check and stored this report.
+        let compiler = ShaclCompiler::new(node.store.clone());
+        let schema = compiler
+            .compile(&shapes, &binding.validation_options.compile_options())
+            .unwrap();
+        drop(compiler);
+        let mut previous = Arc::try_unwrap(schema.inner).unwrap();
+        previous.format_version = 2;
+        let stale = ShaclBindingStatus {
+            state: ShaclValidationState::Valid,
+            report: Some(ShaclValidationReport {
+                conforms: true,
+                accepted_by_write_policy: true,
+                results: Vec::new(),
+                statistics: ShaclValidationStatistics::default(),
+            }),
+            schema_fingerprint: previous.plan_fingerprint(),
+            compiler_model_version: previous.format_version,
+            ..bound
+        };
+        let mut batch = node.store.new_batch();
+        node.store.stage_binding_status(&mut batch, &stale).unwrap();
+        node.store.commit(batch).unwrap();
+
+        let status = node
+            .shacl_binding_statuses(&AllowAllAuthorizer, &data)
+            .unwrap();
+        assert_eq!(status[0].state, ShaclValidationState::Pending);
+        let label = quad(&data, "thing", "urn:test:label", "<urn:test:label>");
+        let error = node
+            .apply_changes(&AllowAllAuthorizer, &data, vec![label])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CraqleError::Update(UpdateError::ShaclValidationFailed(_))
+        ));
+    }
+
     /// A bare quad write, skipping the crate-structure rules these tests are
     /// not about.
     fn seed_write(node: &CraqleNode, graph: &GraphId) {

@@ -9,6 +9,7 @@ use crate::query::context::ReadContext;
 use crate::rdf_read::{GraphSelector, QuadPattern, RdfReadView};
 use crate::store::TermId;
 
+use super::model::ShapeKind;
 use super::resolve::{ResolvedSchema, ResolvedTarget};
 
 #[derive(Default)]
@@ -87,7 +88,8 @@ pub(crate) fn resolve_targets<V: RdfReadView + ?Sized>(
     loop {
         let mut changed = false;
         for shape in &schema.portable.shapes {
-            if shape.deactivated {
+            // Property shapes of a property shape are checked on its value nodes instead.
+            if shape.deactivated || shape.kind == ShapeKind::Property {
                 continue;
             }
             let inherited = targets[shape.id.0 as usize].clone();
