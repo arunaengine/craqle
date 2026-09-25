@@ -11169,7 +11169,8 @@ impl GraphStore {
                 remaining: false,
                 rows: 0,
                 bytes: 0,
-                target: self.locked_dirty_token(),
+                // Flush targets taken after the final page already cover its staged work.
+                target: state.target,
                 oversized: None,
             });
         }

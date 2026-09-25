@@ -4333,6 +4333,180 @@ mod tests {
         assert_eq!(graph.as_str(), hits[0].graph_id);
     }
 
+    fn write_needle(store: &GraphStore, graph: &GraphId, index: u64) {
+        let actor = crate::ActorId::from_bytes([43; 32]);
+        let mut clock = crate::VectorClock::new();
+        clock.advance(actor, index + 1);
+        let graph_tid = graph_term(store, graph);
+        let subject = store
+            .encode_term(&EncodedTerm::from_subject_id(&format!(
+                "urn:test:rebuild-writes#s{index}"
+            )))
+            .unwrap();
+        let predicate = store
+            .encode_term(&EncodedTerm::from_named_node(&crate::vocab::schema_name()))
+            .unwrap();
+        let object = store
+            .encode_term(&EncodedTerm(format!("\"rebuildneedle{index}\"")))
+            .unwrap();
+        let mut batch = store.new_batch();
+        store
+            .insert_quad(
+                &mut batch,
+                crate::store::QuadAdd {
+                    quad: crate::store::EncodedQuad {
+                        graph: graph_tid,
+                        subject,
+                        predicate,
+                        object,
+                    },
+                    dot: crate::Dot {
+                        actor,
+                        counter: index + 1,
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .set_vector_clock(
+                &mut batch,
+                crate::store::ClockUpdate {
+                    graph_id: graph_tid,
+                    clock: &clock,
+                },
+            )
+            .unwrap();
+        store
+            .enqueue_fts(
+                &mut batch,
+                crate::store::FtsSubject {
+                    graph_id: graph_tid,
+                    subject,
+                },
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        store
+            .set_graph_diagnostics(graph, &crate::GraphDiagnostics::default())
+            .unwrap();
+    }
+
+    /// A finished rebuild scan must not chase writes that land between drain passes.
+    #[test]
+    fn rebuild_outpaces_writes() {
+        let dir = tempdir().unwrap();
+        let store = GraphStore::open(dir.path()).unwrap();
+        let graph = GraphId::new("urn:test:rebuild-writes");
+        store.create_graph(&graph).unwrap();
+        write_needle(&store, &graph, 0);
+        let search = SearchIndex::open_in_memory().unwrap();
+        search.bind_store(&store).unwrap();
+        assert!(store.search_coverage().unwrap().unwrap().rebuild.is_some());
+        write_needle(&store, &graph, 1);
+
+        let flushed = store.current_dirty_token();
+        let mut target = flushed;
+        let mut settled = false;
+        for index in 2..66 {
+            let progress = search
+                .drain_queues(
+                    &store,
+                    DrainRequest {
+                        bound: QueueBound {
+                            chunk: 50,
+                            max_token: Some(target),
+                        },
+                        control: DrainControl::default(),
+                    },
+                )
+                .unwrap();
+            assert!(progress.failures.is_empty(), "{:?}", progress.failures);
+            write_needle(&store, &graph, index);
+            let raised = progress.recovery.is_some_and(|recovery| recovery > target);
+            target = target.max(progress.recovery.unwrap_or(0));
+            if !progress.remaining && !raised {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the rebuild chased the live write token");
+        search.complete_coverage(&store, target).unwrap();
+        let coverage = store.search_coverage().unwrap().unwrap();
+        assert!(coverage.rebuild.is_none());
+        assert!(coverage.covered >= flushed);
+        for index in 0..2 {
+            let query = format!("rebuildneedle{index}");
+            assert_eq!(1, search.search(&query, 10).unwrap().len(), "{query}");
+        }
+    }
+
+    /// A flush owing a whole rebuild must finish while another thread keeps writing.
+    #[test]
+    fn rebuild_flush_finishes() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempdir().unwrap();
+        let graph = GraphId::new("urn:test:rebuild-flush");
+        {
+            let node = crate::CraqleNode::open(dir.path()).unwrap();
+            node.create_crate(&writer_auth(), crate_request(&graph, "rebuildflush", true))
+                .unwrap();
+        }
+        let search = Arc::new(SearchIndex::open_in_memory().unwrap());
+        search.arm_stage_gate();
+        let node = crate::CraqleNode::from_store_and_search(
+            reopen_store(dir.path()),
+            search.clone(),
+            crate::CraqleOptions::new(),
+        );
+        search.await_stage_gate();
+
+        let stop = AtomicBool::new(false);
+        let written = AtomicUsize::new(0);
+        let (first, first_written) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut index = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    let name = format!("Rebuild Entity {index}");
+                    let entity = format!("data/rebuild-{index:05}.dat");
+                    let added = node.add_data_entity_with_triples(
+                        &writer_auth(),
+                        &graph,
+                        &entity,
+                        "http://schema.org/MediaObject",
+                        &name,
+                        Vec::new(),
+                    );
+                    if added.is_err() {
+                        break;
+                    }
+                    index += 1;
+                    written.store(index, Ordering::SeqCst);
+                    let _ = first.send(());
+                }
+            });
+            let started = first_written.recv_timeout(Duration::from_secs(60));
+            // Writes now land while the worker still owes the rebuild.
+            search.release_stage_gate();
+            let before = written.load(Ordering::SeqCst);
+            let flushed = node.flush_search(&crate::SearchFlushOptions {
+                timeout: Some(Duration::from_secs(120)),
+                ..crate::SearchFlushOptions::default()
+            });
+            stop.store(true, Ordering::SeqCst);
+            started.unwrap();
+            flushed.unwrap();
+            let coverage = node.store.search_coverage().unwrap().unwrap();
+            assert!(coverage.rebuild.is_none());
+            assert_eq!(1, search.search("rebuildflush", 10).unwrap().len());
+            for index in 0..before {
+                let query = format!("\"Rebuild Entity {index}\"");
+                assert!(!search.search(&query, 10).unwrap().is_empty(), "{query}");
+            }
+        });
+    }
+
     #[test]
     fn failure_tracks_oldest() {
         let graph = GraphId::new("urn:test:failure-oldest");

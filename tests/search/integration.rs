@@ -542,7 +542,12 @@ mod tests {
             // Pin the concurrent stream, not just the pre-loop marker: every
             // entity written before the flush must be searchable after it.
             let enqueued_before = written.load(Ordering::SeqCst);
-            node.flush_search_updates().unwrap();
+            // A generous cap turns a livelocked flush into a failure instead of a hang.
+            node.flush_search(&SearchFlushOptions {
+                timeout: Some(std::time::Duration::from_secs(120)),
+                ..SearchFlushOptions::default()
+            })
+            .unwrap();
 
             assert!(
                 enqueued_before > 0,

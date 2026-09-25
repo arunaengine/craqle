@@ -71,6 +71,9 @@ All notable changes to Craqle are documented here.
 - SHACL checks the property shapes of a property shape on each value node of its
   path, as the SHACL specification requires. Earlier versions checked them on the
   parent's focus node, so a chain such as book, author, name could fail wrongly.
+- A search flush on a node that still owes a whole search rebuild now finishes while
+  writes continue. Earlier versions could keep extending the flush to every new write,
+  so the rebuild never completed and the flush never returned.
 
 ### Added
 
