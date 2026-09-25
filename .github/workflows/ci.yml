@@ -64,9 +64,9 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
       - if: matrix.features == ''
-        run: cargo nextest run --locked --no-default-features
+        run: cargo nextest run --profile ci --locked --no-default-features
       - if: matrix.features != ''
-        run: cargo nextest run --locked --no-default-features --features '${{ matrix.features }}'
+        run: cargo nextest run --profile ci --locked --no-default-features --features '${{ matrix.features }}'
       - if: matrix.features == ''
         run: cargo test --locked --no-default-features --doc
       - if: matrix.features != ''
