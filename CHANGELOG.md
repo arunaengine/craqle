@@ -157,6 +157,9 @@ All notable changes to Craqle are documented here.
   topic from its start; records a graph clock already covers apply as duplicates.
 - Derived-index repair preserves surviving RDF source state. It cannot reconstruct
   source events lost by older bugs without an authoritative history or healthy replica.
+- `SHACL_COMPILER_MODEL_VERSION` is now 3 because nested SHACL checks changed.
+  Stored validation reports from earlier versions read as pending and are recomputed
+  once, by full validation, on the next write or revalidation of their binding.
 
 ## 0.2.0 - 2026-08-22
 
