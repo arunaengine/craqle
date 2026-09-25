@@ -5,6 +5,7 @@
   "max_comment_lines": 2,
   "required_roots": [
     ".",
+    ".config",
     ".github",
     ".github/workflows",
     "benches",

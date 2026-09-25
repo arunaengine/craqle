@@ -21,6 +21,7 @@ env:
 jobs:
   style:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: python3 -B scripts/style/tests.py
@@ -28,6 +29,7 @@ jobs:
 
   features:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -53,13 +55,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: stable
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
+        with:
+          tool: cargo-nextest@0.9.140
       - if: matrix.features == ''
-        run: cargo test --locked --no-default-features
+        run: cargo nextest run --locked --no-default-features
       - if: matrix.features != ''
-        run: cargo test --locked --no-default-features --features '${{ matrix.features }}'
+        run: cargo nextest run --locked --no-default-features --features '${{ matrix.features }}'
+      - if: matrix.features == ''
+        run: cargo test --locked --no-default-features --doc
+      - if: matrix.features != ''
+        run: cargo test --locked --no-default-features --features '${{ matrix.features }}' --doc
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -71,6 +81,7 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -81,6 +92,7 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772

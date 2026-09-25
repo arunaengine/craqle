@@ -1,0 +1,7 @@
+# Caps each test at five minutes so a hung test fails instead of stalling CI.
+# Copyright (c) 2026 ArunaStorage Team @ JLU Giessen
+# SPDX-License-Identifier: MIT
+
+[profile.default]
+test-threads = 2
+slow-timeout = { period = "60s", terminate-after = 5 }
