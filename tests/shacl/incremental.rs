@@ -174,6 +174,18 @@ const SHARED_DEPENDENCY_SHAPES: &str = r#"
 <urn:test:matrix-property-b> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
 
+const NESTED_SHAPES: &str = r#"
+<urn:test:thing-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:thing-shape> <http://www.w3.org/ns/shacl#targetClass> <urn:test:Thing> .
+<urn:test:thing-shape> <http://www.w3.org/ns/shacl#property> <urn:test:author-property> .
+<urn:test:author-property> <http://www.w3.org/ns/shacl#path> <urn:test:author> .
+<urn:test:author-property> <http://www.w3.org/ns/shacl#node> <urn:test:person-shape> .
+<urn:test:person-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:test:person-shape> <http://www.w3.org/ns/shacl#property> <urn:test:name-property> .
+<urn:test:name-property> <http://www.w3.org/ns/shacl#path> <urn:test:name> .
+<urn:test:name-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+
 struct ModeCase {
     name: &'static str,
     shapes: &'static str,
@@ -1722,6 +1734,72 @@ fn class_delta_matches() {
     assert_eq!(auto.results, incremental.results);
     assert!(!incremental.conforms);
     assert_eq!(incremental.statistics.full_graph_fallbacks, 1);
+}
+
+#[test]
+fn nested_delta_matches() {
+    // Only the nested shape's property shape reads the changed name predicate.
+    let (_directory, node) = node();
+    let data = GraphId::new("urn:test:nested-data");
+    let shapes = GraphId::new("urn:test:nested-shapes");
+    insert_shape_text(&node, &shapes, NESTED_SHAPES);
+    let name = |insert| {
+        change(
+            &data,
+            insert,
+            "urn:test:person",
+            "urn:test:name",
+            "urn:test:ada",
+        )
+    };
+    node.apply_changes_unchecked(
+        &data,
+        vec![
+            change(
+                &data,
+                true,
+                "urn:test:thing",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "urn:test:Thing",
+            ),
+            change(
+                &data,
+                true,
+                "urn:test:thing",
+                "urn:test:author",
+                "urn:test:person",
+            ),
+            name(true),
+        ],
+    )
+    .unwrap();
+    let schema = node
+        .compile_shacl(&AUTH, &shapes, &ShaclCompileOptions::default())
+        .unwrap();
+    let options = ShaclValidationOptions::default();
+    let delta_options = mode_options(ShaclEvaluationMode::Delta);
+    assert!(
+        node.validate_shacl(&AUTH, &data, &schema, &options)
+            .unwrap()
+            .conforms
+    );
+    for insert in [false, true] {
+        let changes = vec![name(insert)];
+        let incremental = node
+            .validate_shacl_delta(&AUTH, &data, &schema, &changes, &delta_options)
+            .unwrap();
+        node.apply_changes_unchecked(&data, changes).unwrap();
+        let full = node
+            .validate_shacl(&AUTH, &data, &schema, &options)
+            .unwrap();
+        assert_eq!(incremental.conforms, insert);
+        assert_eq!(full.conforms, insert);
+        assert_eq!(incremental.results, full.results);
+        assert_eq!(
+            incremental.statistics.selected_mode,
+            ShaclEvaluationMode::Delta
+        );
+    }
 }
 
 #[test]

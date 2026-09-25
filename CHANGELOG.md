@@ -64,6 +64,10 @@ All notable changes to Craqle are documented here.
   with the store error when a graph policy cannot be read. Earlier versions hid
   that graph and could return fewer rows, a smaller count, or a false `ASK`.
   A missing or denying policy still hides the graph.
+- SHACL evaluates the property shapes of shapes reached through `sh:node`, `sh:or`,
+  `sh:and`, `sh:not`, `sh:xone` and `sh:qualifiedValueShape`, including on
+  incremental validation. Earlier versions skipped them, so these nested checks
+  could pass or fail wrongly.
 
 ### Added
 

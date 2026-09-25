@@ -667,11 +667,9 @@ impl ShaclCompiler {
                     }
                 }
                 if !shape.dependencies.nested_shapes.is_empty()
-                    && shape
-                        .dependencies
-                        .nested_shapes
-                        .iter()
-                        .any(|nested| global[nested.0 as usize] || affected[nested.0 as usize])
+                    && shape.dependencies.nested_shapes.iter().any(|nested| {
+                        nested_changed(schema, *nested, &|index| global[index] || affected[index])
+                    })
                 {
                     if !affected[parent] {
                         affected[parent] = true;
@@ -1165,7 +1163,9 @@ fn select_incremental_targets<V: RdfReadView>(
             }
             if !shape.dependencies.nested_shapes.is_empty()
                 && shape.dependencies.nested_shapes.iter().any(|nested| {
-                    global[nested.0 as usize] || !candidates[nested.0 as usize].is_empty()
+                    nested_changed(schema, *nested, &|index| {
+                        global[index] || !candidates[index].is_empty()
+                    })
                 })
                 && !global[parent]
             {
@@ -1247,6 +1247,27 @@ fn property_shape_parents(schema: &ResolvedSchema) -> Vec<Vec<usize>> {
         }
     }
     parents
+}
+
+/// Reports whether a nested shape changed, including property shapes its nested check evaluates.
+fn nested_changed(
+    schema: &ResolvedSchema,
+    nested: ShapeId,
+    changed: &dyn Fn(usize) -> bool,
+) -> bool {
+    let mut pending = vec![nested.0 as usize];
+    let mut seen = HashSet::new();
+    while let Some(shape) = pending.pop() {
+        if !seen.insert(shape) {
+            continue;
+        }
+        if changed(shape) {
+            return true;
+        }
+        let properties = &schema.portable.shapes[shape].property_shapes;
+        pending.extend(properties.iter().map(|property| property.0 as usize));
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
