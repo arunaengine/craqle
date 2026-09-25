@@ -1161,6 +1161,73 @@ _:pair-tail <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org
 }
 
 #[test]
+fn property_shape_chain() {
+    // A property shape's own property shapes apply to each value node of its path.
+    let shapes = r#"
+<urn:chain:book-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:chain:book-shape> <http://www.w3.org/ns/shacl#property> <urn:chain:author-property> .
+<urn:chain:author-property> <http://www.w3.org/ns/shacl#path> <urn:chain:author> .
+<urn:chain:author-property> <http://www.w3.org/ns/shacl#property> <urn:chain:name-property> .
+<urn:chain:name-property> <http://www.w3.org/ns/shacl#path> <urn:chain:name> .
+<urn:chain:name-property> <http://www.w3.org/ns/shacl#minCount> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+    let shelf = r#"
+<urn:chain:shelf-shape> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<urn:chain:shelf-shape> <http://www.w3.org/ns/shacl#targetClass> <urn:chain:Shelf> .
+<urn:chain:shelf-shape> <http://www.w3.org/ns/shacl#property> <urn:chain:holds-property> .
+<urn:chain:holds-property> <http://www.w3.org/ns/shacl#path> <urn:chain:holds> .
+<urn:chain:holds-property> <http://www.w3.org/ns/shacl#node> <urn:chain:book-shape> .
+"#;
+    let top_level =
+        "<urn:chain:book-shape> <http://www.w3.org/ns/shacl#targetClass> <urn:chain:Book> .\n";
+    let empty = r#"
+<urn:chain:book> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:chain:Book> .
+<urn:chain:shelf> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:chain:Shelf> .
+<urn:chain:shelf> <urn:chain:holds> <urn:chain:book> .
+"#;
+    let unnamed = format!("{empty}<urn:chain:book> <urn:chain:author> <urn:chain:person> .\n");
+    let named = format!("{unnamed}<urn:chain:person> <urn:chain:name> \"Ada\" .\n");
+    let shared = format!(
+        "{unnamed}<urn:chain:other> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:chain:Book> .\n\
+         <urn:chain:other> <urn:chain:author> <urn:chain:person> .\n"
+    );
+    let cases = [
+        (empty.to_owned(), true),
+        (unnamed, false),
+        (named, true),
+        (shared, false),
+    ];
+    let shape_text = format!("{shapes}{top_level}");
+    let (_database, node) = node();
+    for (index, (data, conforms)) in cases.into_iter().enumerate() {
+        assert_eq!(rudof_validate(&shape_text, &data).conforms(), conforms);
+        native_matches_rudof(&shape_text, &data);
+
+        // The reference validator skips these chains inside sh:node, so check spec outcomes.
+        let shape_graph = GraphId::new(&format!("urn:test:chain:shapes:{index}"));
+        let data_graph = GraphId::new(&format!("urn:test:chain:data:{index}"));
+        insert_ntriples(&node, &shape_graph, &format!("{shapes}{shelf}"));
+        insert_ntriples(&node, &data_graph, &data);
+        let schema = node
+            .compile_shacl(
+                &craqle::AllowAllAuthorizer,
+                &shape_graph,
+                &ShaclCompileOptions::default(),
+            )
+            .unwrap();
+        let report = node
+            .validate_shacl(
+                &craqle::AllowAllAuthorizer,
+                &data_graph,
+                &schema,
+                &ShaclValidationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(report.conforms, conforms, "{data}");
+    }
+}
+
+#[test]
 fn native_path_forms() {
     let root = iri("urn:test:paths:root");
     let focus = iri("urn:test:paths:focus");

@@ -68,6 +68,9 @@ All notable changes to Craqle are documented here.
   `sh:and`, `sh:not`, `sh:xone` and `sh:qualifiedValueShape`, including on
   incremental validation. Earlier versions skipped them, so these nested checks
   could pass or fail wrongly.
+- SHACL checks the property shapes of a property shape on each value node of its
+  path, as the SHACL specification requires. Earlier versions checked them on the
+  parent's focus node, so a chain such as book, author, name could fail wrongly.
 
 ### Added
 
