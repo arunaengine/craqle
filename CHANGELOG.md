@@ -6,6 +6,12 @@
 
 All notable changes to Craqle are documented here.
 
+## 0.3.2 - Unreleased
+
+### Changed
+
+- Integrates Irokle 0.3.2 at revision `209f881af3fa4b8ed16e2ca0a0315d663029329e`.
+
 ## 0.3.1 - Unreleased
 
 ### Changed
