@@ -1919,6 +1919,13 @@ fn compile_component(
             }
             .into());
         }
+        IRComponent::SubsetOf(_) => {
+            return Err(ShaclError::UnsupportedComponent {
+                shape: shape.0.clone(),
+                component: "http://www.w3.org/ns/shacl#SubsetOfConstraintComponent".to_owned(),
+            }
+            .into());
+        }
     };
     Ok(Some(plan))
 }

@@ -35,7 +35,7 @@ shacl-core = [
 [dependencies]
 blake3 = "=1.8.7"
 chrono = { version = "0.4.45", features = ["serde"] }
-fjall = "3.1.10"
+fjall = "3.1.12"
 irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "4a35e112b4468f7bba5359cfbee14f221d05807e", features = [
     "fjall",
 ] }
@@ -48,18 +48,18 @@ rocraters = { package = "ro-crate-rs", git = "https://github.com/arunaengine/ro-
     "rdf",
 ] }
 regex = { version = "1.13.1", optional = true }
-shacl = { version = "=0.3.19", default-features = false, optional = true }
-rudof_rdf = { version = "=0.3.19", default-features = false, optional = true }
-rudof_iri = { version = "=0.3.19", default-features = false, optional = true }
+shacl = { version = "=0.3.25", default-features = false, optional = true }
+rudof_rdf = { version = "=0.3.25", default-features = false, optional = true }
+rudof_iri = { version = "=0.3.25", default-features = false, optional = true }
 serde_json = "1.0.151"
 spargebra = { version = "0.4.7", features = ["sparql-12"] }
 spareval = { version = "0.2.7", features = ["sep-0006", "sparql-12"] }
 tantivy = { version = "0.26.2", optional = true }
 globset = "0.4.20"
 serde = { version = "1.0.229", features = ["derive"] }
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 tracing = "0.1.44"
-uuid = { version = "1.26.1", features = ["v4", "serde"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
 rayon = "1.12.0"
 
 [dev-dependencies]
@@ -67,9 +67,9 @@ anyhow = "1.0.104"
 criterion = "0.8.2"
 proptest = "1.11.0"
 tempfile = "3.27.0"
-iroh = "1.2.0"
+iroh = "1.3.0"
 oxigraph = { version = "=0.5.11", default-features = false, features = ["rdf-12"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "partial_loading"

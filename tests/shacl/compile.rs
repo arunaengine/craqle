@@ -309,6 +309,40 @@ fn reject_sparql() {
 }
 
 #[test]
+fn reject_subset_of() {
+    let (_database, node) = node();
+    let graph = GraphId::new("urn:test:shacl:subset-of");
+    let shape = iri("urn:test:subset-shape");
+    let property_shape = sh("PropertyShape");
+    let path = sh("path");
+    let subset_of = sh("subsetOf");
+    let value = iri("urn:test:value");
+    let other = iri("urn:test:other");
+    insert(
+        &node,
+        &graph,
+        &[
+            (&shape, RDF_TYPE, &property_shape),
+            (&shape, &path, &value),
+            (&shape, &subset_of, &other),
+        ],
+    );
+
+    let error = node
+        .compile_shacl(
+            &craqle::AllowAllAuthorizer,
+            &graph,
+            &ShaclCompileOptions::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CraqleError::Shacl(ShaclError::UnsupportedComponent { component, .. })
+            if component.ends_with("SubsetOfConstraintComponent")
+    ));
+}
+
+#[test]
 fn reject_custom_constraints() {
     let (_database, node) = node();
     let graph = GraphId::new("urn:test:shacl:custom-component");
