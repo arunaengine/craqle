@@ -21,7 +21,7 @@ Every graph maps to a deterministic Irokle topic. Craqle publishes local operati
   durable per-graph Irokle topics.
 - Control graph access through host-provided authorizers and persisted policies.
 
-Craqle 0.3 requires Rust 1.97.1 and integrates Irokle 0.3.0. See the
+Craqle 0.3 requires Rust 1.97.1 and integrates Irokle 0.3.1. See the
 [upgrade notes](CHANGELOG.md#upgrading-from-02) before opening an existing database.
 
 ## Open a node
