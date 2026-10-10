@@ -6,6 +6,15 @@
 
 All notable changes to Craqle are documented here.
 
+## 0.3.1 - Unreleased
+
+### Changed
+
+- Integrates Irokle 0.3.1 at revision `4a35e112b4468f7bba5359cfbee14f221d05807e`.
+- Updates fjall, uuid, thiserror and the rudof SHACL crates to their latest releases.
+- SHACL shapes graphs that use the SHACL 1.2 `sh:subsetOf` constraint now fail
+  to compile with an unsupported component error.
+
 ## 0.3.0 - Unreleased
 
 ### Changed
