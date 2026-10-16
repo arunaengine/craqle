@@ -3905,7 +3905,7 @@ dependencies = [
 [[package]]
 name = "ro-crate-rs"
 version = "0.6.0"
-source = "git+https://github.com/arunaengine/ro-crate-rs.git?rev=6201c5aa61b62b1515a5215d4da60c5302e74d04#6201c5aa61b62b1515a5215d4da60c5302e74d04"
+source = "git+https://github.com/arunaengine/ro-crate-rs.git?rev=9cbb366c7569e79220a2c047a54309d596f8d208#9cbb366c7569e79220a2c047a54309d596f8d208"
 dependencies = [
  "chrono",
  "dirs",
