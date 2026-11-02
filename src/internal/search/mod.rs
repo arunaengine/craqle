@@ -307,7 +307,7 @@ struct PrefixScan<'a, E> {
 
 /// The documents of each segment that match a query word by prefix, at constant score.
 #[derive(Clone, Debug)]
-struct PrefixDocs(Arc<HashMap<SegmentId, Vec<DocId>>>);
+struct PrefixDocs(Arc<HashMap<SegmentId, Arc<Vec<DocId>>>>);
 
 impl Query for PrefixDocs {
     fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
@@ -342,7 +342,7 @@ impl Weight for PrefixDocs {
 
 /// One segment's prefix matches in document order, each with the same score.
 struct SortedDocs {
-    docs: Vec<DocId>,
+    docs: Arc<Vec<DocId>>,
     cursor: usize,
     score: Score,
 }
@@ -3423,13 +3423,29 @@ impl SearchIndex {
         let mut segments = HashMap::new();
         for reader in req.searcher.segment_readers() {
             let inverted = (reader.inverted_index(self.f_all_text)).map_err(SearchError::from)?;
-            let mut docs = Vec::new();
-            for word in &words {
-                let mut terms = inverted.terms().range().ge(word.as_bytes());
+            let terms = |word: &str| {
+                let mut range = inverted.terms().range().ge(word.as_bytes());
                 if let Some(end) = prefix_end(word.as_bytes()) {
-                    terms = terms.lt(end);
+                    range = range.lt(end);
                 }
-                let mut terms = terms.into_stream().map_err(SearchError::from)?;
+                range.into_stream().map_err(SearchError::from)
+            };
+            // The postings' document frequencies size the list once, so it never grows.
+            let mut size = 0usize;
+            for word in &words {
+                let mut terms = terms(word)?;
+                while terms.advance() {
+                    (req.check)()?;
+                    size = size.saturating_add(terms.value().doc_freq as usize);
+                }
+            }
+            bytes = bytes.saturating_add(size.saturating_mul(std::mem::size_of::<DocId>()));
+            if bytes > limit {
+                return Err(E::from(SearchError::ItemTooLarge { bytes, limit }));
+            }
+            let mut docs = Vec::with_capacity(size);
+            for word in &words {
+                let mut terms = terms(word)?;
                 while terms.advance() {
                     (req.check)()?;
                     let option = IndexRecordOption::Basic;
@@ -3438,11 +3454,10 @@ impl SearchIndex {
                     .map_err(SearchError::from)?;
                     while !postings.docs().is_empty() {
                         (req.check)()?;
-                        // A scorer copies one segment's list, so each document counts twice.
-                        let block = std::mem::size_of_val(postings.docs()).saturating_mul(2);
-                        bytes = bytes.saturating_add(block);
-                        if bytes > limit {
-                            return Err(E::from(SearchError::ItemTooLarge { bytes, limit }));
+                        if docs.len().saturating_add(postings.docs().len()) > size {
+                            return Err(E::from(SearchError::Damaged {
+                                detail: "postings length",
+                            }));
                         }
                         docs.extend_from_slice(postings.docs());
                         postings.advance();
@@ -3451,7 +3466,7 @@ impl SearchIndex {
             }
             docs.sort_unstable();
             docs.dedup();
-            segments.insert(reader.segment_id(), docs);
+            segments.insert(reader.segment_id(), Arc::new(docs));
         }
         Ok(Some(Box::new(PrefixDocs(Arc::new(segments)))))
     }
@@ -4432,13 +4447,39 @@ mod tests {
                 .unwrap();
         }
         index.commit().unwrap();
-        index.prepared_bytes = 16_384;
+        index.prepared_bytes = 12_796;
         let result = index.search("samd", 10);
         assert!(
             matches!(result, Err(SearchError::ItemTooLarge { .. })),
             "{result:?}"
         );
         assert_eq!(index.search("samd00000001", 10).unwrap().len(), 1);
+    }
+
+    // The expansion charges its lists' exact capacity: 200 matches cost 800 bytes, no more.
+    #[test]
+    fn prefix_budget_exact() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let mut index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..200 {
+            let text = format!("samd{position:08}");
+            let subject = format!("urn:test:exact-budget:{position}");
+            index
+                .index_resource("urn:test:exact-budget", &subject, Some(&text))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        index.prepared_bytes = 12_800;
+        assert_eq!(index.search("samd", 10).unwrap().len(), 10);
+        index.prepared_bytes = 12_796;
+        let result = index.search("samd", 10);
+        assert!(matches!(
+            result,
+            Err(SearchError::ItemTooLarge {
+                bytes: 800,
+                limit: 799
+            })
+        ));
     }
 
     // The prefix expansion checks for cancellation per word and postings block, so it stops there.
