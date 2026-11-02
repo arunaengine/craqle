@@ -487,7 +487,8 @@ impl CraqleNode {
     fn ensure_applied(&self, topic: irokle::TopicId, heads: &[OpId]) -> Result<()> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
         let clock = match self.store.applied_topic_clock(topic.as_bytes())? {
-            Some(bytes) => crate::sync::applied_clock(topic, &bytes)?,
+            Some(bytes) => crate::sync::applied_clock(topic, &bytes, &sync.topic_frontier(topic)?)?
+                .ok_or(HistoryError::NotApplied)?,
             None => irokle::ActorClock::default(),
         };
         for head in heads {

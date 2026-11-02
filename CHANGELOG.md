@@ -12,10 +12,33 @@ All notable changes to Craqle are documented here.
 
 - `CraqleNode::set_policy_with` takes a `PolicyWrite` with an explicit durability.
   `WalAlreadyDurable` sets the policy locally without publishing it or creating the graph topic.
+- `CraqleNode::applied_cursor_digest` returns the digest `repair_irokle_topic_cursor` expects,
+  so a fenced topic can be repaired on a running node.
 
 ### Changed
 
 - Integrates Irokle 0.3.2 at revision `209f881af3fa4b8ed16e2ca0a0315d663029329e`.
+
+### Fixed
+
+- Reconciliation no longer fails with an expired cursor after a local topic reset that keeps
+  the genesis, once the topic again holds every own record the cursor consumed. It resets the
+  cursor to the start of the new epoch and replays the topic; records the graph already holds
+  apply as duplicates.
+- After such a reset, the node publishes nothing to the topic while the topic lacks own records
+  the graph already applied, so Irokle cannot reuse their sequences.
+- A cursor that names another topic genesis stays fenced, since that genesis may reuse actor
+  sequences. Until it is repaired, the node publishes no mutation, policy or deletion to the
+  topic, and history restores treat its records as not applied.
+- Child data entity appends reconcile the graph topic before authorization, like root appends.
+- A topic that stays fenced no longer fails `reconcile_irokle` or the open. It stays stalled and
+  logs one warning until its cursor is repaired, while other graphs open and sync. Other
+  reconcile failures still fail the pass and the open.
+- The once-per-topic fence warning forgets topics that left the local topic list, so a topic
+  that rejoins later warns again.
+- `add_irokle_peer` and `remove_irokle_peer` are refused while the graph's topic is fenced.
+- That refusal also covers a deleted graph, whose topic keeps its reverse binding and cursor
+  after the forward mapping is gone.
 
 ## 0.3.1 - Unreleased
 

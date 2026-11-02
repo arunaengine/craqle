@@ -514,6 +514,8 @@ pub(crate) struct TopicFrontier {
     pub clock: irokle::ActorClock,
     pub epoch: u64,
     pub genesis: irokle::OpId,
+    /// This node's actor in the topic.
+    pub local: irokle::ActorId,
 }
 
 pub(crate) enum TopicRecord {
@@ -731,12 +733,19 @@ fn decode_topic_cursor(
     Ok(envelope.payload)
 }
 
-/// The per-actor positions an applied topic cursor has consumed.
+/// The per-actor positions an applied topic cursor has consumed, or `None` when the
+/// cursor names another branch than `frontier`, whose positions mean nothing here.
 pub(crate) fn applied_clock(
     topic: irokle::TopicId,
     bytes: &[u8],
-) -> SyncResult<irokle::ActorClock> {
-    Ok(stored_cursor(topic, bytes)?.map_or_else(Default::default, |cursor| cursor.clock))
+    frontier: &TopicFrontier,
+) -> SyncResult<Option<irokle::ActorClock>> {
+    Ok(match stored_cursor(topic, bytes)? {
+        Some(cursor) if cursor.epoch != frontier.epoch || cursor.genesis != frontier.genesis => {
+            None
+        }
+        cursor => Some(cursor.map_or_else(Default::default, |cursor| cursor.clock)),
+    })
 }
 
 /// A verified version 1 cursor has no branch fence, so the topic replays from its start.
@@ -747,6 +756,34 @@ fn stored_cursor(topic: irokle::TopicId, bytes: &[u8]) -> SyncResult<Option<Topi
         Err(CraqleSyncError::ExpiredCursor { .. }) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// A cursor at the start of the current epoch when `bytes` names an earlier epoch of the same
+/// genesis whose own records the topic holds again; otherwise the cursor stays fenced.
+pub(crate) fn restart_cursor(
+    topic: irokle::TopicId,
+    bytes: &[u8],
+    frontier: &TopicFrontier,
+) -> SyncResult<Option<Vec<u8>>> {
+    let Some(stored) = stored_cursor(topic, bytes)? else {
+        return Ok(None);
+    };
+    // Another genesis may reuse actor sequences; missing own records would let Irokle reuse theirs.
+    if stored.genesis != frontier.genesis
+        || stored.epoch == frontier.epoch
+        || stored.clock.get(&frontier.local) > frontier.clock.get(&frontier.local)
+    {
+        return Ok(None);
+    }
+    encode_topic_cursor(&TopicCursorPayload {
+        version: TOPIC_CURSOR_VERSION,
+        topic,
+        epoch: frontier.epoch,
+        genesis: frontier.genesis,
+        clock: irokle::ActorClock::default(),
+        target: None,
+    })
+    .map(Some)
 }
 
 /// Encodes a version 1 cursor as stores written before branch fences hold it.
@@ -1013,8 +1050,8 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         Err(CraqleSyncError::NotConfigured)
     }
 
-    /// The sequence of this node's first graph-event record in the topic that the store
-    /// covers neither by apply nor by reconciliation.
+    /// The sequence of this node's first graph-event record the store neither applied nor
+    /// reconciled, or `Some(0)` while a stale cursor or lost own records fence publication.
     fn own_pending(&self, _store: &GraphStore, _topic: irokle::TopicId) -> SyncResult<Option<u64>> {
         Ok(None)
     }
@@ -1698,6 +1735,7 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             clock: view.clock,
             epoch: view.epoch,
             genesis: view.state.genesis,
+            local: irokle::actor_id_for(topic_id, self.node.peer_id()),
         })
     }
 
@@ -1956,16 +1994,25 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
         let Some(graph) = store.topic_graph_binding(topic.as_bytes())? else {
             return Ok(None);
         };
-        let local = irokle::actor_id_for(topic, self.node.peer_id());
+        let frontier = self.topic_frontier(topic)?;
+        let local = frontier.local;
         let applied = store
             .get_vector_clock(&GraphId::new(&graph))?
             .0
             .get(&actor_from_irokle(local))
             .copied()
             .unwrap_or_default();
+        // Own records the topic lost would see Irokle reuse their sequences as duplicates.
+        if applied > frontier.clock.get(&local) {
+            return Ok(Some(0));
+        }
         // The cursor also covers records that reconciliation quarantined.
         let consumed = match store.applied_topic_clock(topic.as_bytes())? {
-            Some(bytes) => applied_clock(topic, &bytes)?.get(&local),
+            Some(bytes) => match applied_clock(topic, &bytes, &frontier)? {
+                Some(clock) => clock.get(&local),
+                // Another branch's cursor: reconcile first, and publish nothing until it is repaired.
+                None => return Ok(Some(0)),
+            },
             None => 0,
         };
         let mut after = applied.max(consumed);

@@ -99,7 +99,7 @@ fn mutation_digest(
 }
 
 /// A retryable failure: this node's own topic records must be reconciled before it publishes.
-fn own_pending() -> UpdateError {
+pub(crate) fn own_pending() -> UpdateError {
     UpdateError::StalePreparedState {
         fence: "this node has topic records that are not applied yet".to_owned(),
     }
@@ -997,6 +997,10 @@ impl ReplicationEngine {
             && let Some(sync) = &self.sync
         {
             let topic = sync.ensure_graph_topic(&self.store, request.graph)?;
+            // Policy records carry no dot, so only the publication fence (`Some(0)`) blocks them.
+            if sync.own_pending(&self.store, topic)? == Some(0) {
+                return Err(own_pending());
+            }
             let frontier = sync.topic_frontier(topic)?;
             let record = sync.publish_policy(&self.store, request.graph, request.tagged)?;
             #[cfg(test)]
@@ -1150,6 +1154,10 @@ impl ReplicationEngine {
             && let Some(sync) = &self.sync
             && let Some(topic) = sync.graph_topic_id(&self.store, graph)?
         {
+            // Deletion records carry no dot, so only the publication fence (`Some(0)`) blocks them.
+            if sync.own_pending(&self.store, topic)? == Some(0) {
+                return Err(own_pending());
+            }
             let frontier = sync.topic_frontier(topic)?;
             let record = sync.publish_delete(&self.store, tombstone)?;
             let CraqleGraphEvent::GraphDeleted { tombstone } = &record.event else {
