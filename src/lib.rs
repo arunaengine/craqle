@@ -3300,6 +3300,8 @@ impl CraqleNode {
         parent_id: &str,
         entities: Vec<NewDataEntity>,
     ) -> Result<AppendDataEntitiesReport> {
+        self.reconcile_pending(graph);
+        let _write = self.lock_graph(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         let report = self
             .manager()
@@ -6545,6 +6547,42 @@ mod tests {
     #[test]
     fn rejoin_missing_applied() {
         rejoin_without_own(110, false);
+    }
+
+    /// A child append reconciles first, so a same-genesis epoch change does not block it.
+    #[test]
+    fn child_append_reconciles() {
+        use irokle::Storage as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (origin_irokle, replica_irokle) = (signed_irokle(106), signed_irokle(107));
+        let (origin_id, replica_id) = (origin_irokle.peer_id(), replica_irokle.peer_id());
+        let origin = member_node(&dir.path().join("origin"), &origin_irokle, &[replica_id]);
+        let replica = member_node(&dir.path().join("replica"), &replica_irokle, &[origin_id]);
+        let graph = GraphId::new("urn:test:child-append-epoch");
+        origin
+            .create_crate(&writer_auth(), crate_request(&graph, "child"))
+            .unwrap();
+        let topic = origin.irokle_topic_id(&graph).unwrap().unwrap();
+        push_topic(&origin_irokle, &replica_irokle, topic);
+        replica.reconcile_irokle().unwrap();
+        replica_irokle.storage().reset_topic(&topic).unwrap();
+        push_topic(&origin_irokle, &replica_irokle, topic);
+        for name in ["first", "second"] {
+            let entity = NewDataEntity {
+                entity_id: format!("{name}.csv"),
+                entity_type: "http://schema.org/MediaObject".to_owned(),
+                name: name.to_owned(),
+                additional_triples: Vec::new(),
+            };
+            replica
+                .append_new_data_entities_under(
+                    &AllowAllAuthorizer,
+                    &graph,
+                    graph.as_str(),
+                    vec![entity],
+                )
+                .unwrap();
+        }
     }
 
     /// A cursor on the current branch stays authoritative and is not replayed.

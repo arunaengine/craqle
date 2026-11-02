@@ -28,6 +28,7 @@ All notable changes to Craqle are documented here.
 - A cursor that names another topic genesis stays fenced, since that genesis may reuse actor
   sequences. Until it is repaired, the node publishes no mutation, policy or deletion to the
   topic, and history restores treat its records as not applied.
+- Child data entity appends reconcile the graph topic before authorization, like root appends.
 
 ## 0.3.1 - Unreleased
 
