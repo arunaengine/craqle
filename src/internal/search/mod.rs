@@ -3396,8 +3396,8 @@ impl SearchIndex {
         })
     }
 
-    /// Documents holding a longer indexed word that starts with a long enough query word; none
-    /// without such a word. More documents than a quarter of the query budget are an error.
+    /// Documents holding a longer indexed word that starts with a long enough query word. Terms are
+    /// kept in word and dictionary order while their documents fit a quarter of the query budget.
     fn prefix_docs<E>(
         &self,
         req: PrefixScan<'_, E>,
@@ -3424,29 +3424,37 @@ impl SearchIndex {
         for reader in req.searcher.segment_readers() {
             let inverted = (reader.inverted_index(self.f_all_text)).map_err(SearchError::from)?;
             let terms = |word: &str| {
-                let mut range = inverted.terms().range().ge(word.as_bytes());
+                let mut range = inverted.terms().range().gt(word.as_bytes());
                 if let Some(end) = prefix_end(word.as_bytes()) {
                     range = range.lt(end);
                 }
                 range.into_stream().map_err(SearchError::from)
             };
-            // The postings' document frequencies size the list once, so it never grows.
-            let mut size = 0usize;
-            for word in &words {
+            // Document frequencies size the list once, so it never grows; the first term whose
+            // documents pass the budget ends the expansion in this and every later segment.
+            let (mut size, mut kept, mut full) = (0usize, 0usize, false);
+            'count: for word in &words {
                 let mut terms = terms(word)?;
                 while terms.advance() {
                     (req.check)()?;
-                    size = size.saturating_add(terms.value().doc_freq as usize);
+                    let next = size.saturating_add(terms.value().doc_freq as usize);
+                    let charge = next.saturating_mul(std::mem::size_of::<DocId>());
+                    if bytes.saturating_add(charge) > limit {
+                        full = true;
+                        break 'count;
+                    }
+                    (size, kept) = (next, kept + 1);
                 }
             }
             bytes = bytes.saturating_add(size.saturating_mul(std::mem::size_of::<DocId>()));
-            if bytes > limit {
-                return Err(E::from(SearchError::ItemTooLarge { bytes, limit }));
-            }
-            let mut docs = Vec::with_capacity(size);
-            for word in &words {
+            let (mut docs, mut read) = (Vec::with_capacity(size), 0usize);
+            'read: for word in &words {
                 let mut terms = terms(word)?;
                 while terms.advance() {
+                    if read == kept {
+                        break 'read;
+                    }
+                    read += 1;
                     (req.check)()?;
                     let option = IndexRecordOption::Basic;
                     let mut postings = (inverted
@@ -3467,6 +3475,9 @@ impl SearchIndex {
             docs.sort_unstable();
             docs.dedup();
             segments.insert(reader.segment_id(), Arc::new(docs));
+            if full {
+                break;
+            }
         }
         Ok(Some(Box::new(PrefixDocs(Arc::new(segments)))))
     }
@@ -4444,29 +4455,76 @@ mod tests {
         assert_eq!(hits[300].subject_iri, "urn:test:tier:prefix");
     }
 
-    // An expansion over its budget fails like other oversized results, never as exact-only hits.
+    // A prefix over its budget keeps the terms that fit in dictionary order; exact hits stay first.
     #[test]
-    fn prefix_budget_fails() {
+    fn prefix_budget_caps() {
         let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
         let mut index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..2 {
+            let subject = format!("urn:test:cap:exact:{position}");
+            index
+                .index_resource("urn:test:cap", &subject, Some("samd"))
+                .unwrap();
+        }
         for position in 0..200 {
             let text = format!("samd{position:08}");
-            let subject = format!("urn:test:budget:{position}");
+            let subject = format!("urn:test:cap:{position}");
             index
-                .index_resource("urn:test:budget", &subject, Some(&text))
+                .index_resource("urn:test:cap", &subject, Some(&text))
                 .unwrap();
         }
         index.commit().unwrap();
         index.prepared_bytes = 12_796;
-        let result = index.search("samd", 10);
-        assert!(
-            matches!(result, Err(SearchError::ItemTooLarge { .. })),
-            "{result:?}"
+        let hits = index.search("samd", 10).unwrap();
+        let subjects = |hits: &[SearchHit]| -> Vec<String> {
+            hits.iter().map(|hit| hit.subject_iri.clone()).collect()
+        };
+        let again = index.search("samd", 10).unwrap();
+        assert_eq!(
+            subjects(&hits),
+            subjects(&again),
+            "the same query keeps the same hits"
         );
-        assert_eq!(index.search("samd00000001", 10).unwrap().len(), 1);
+        let exact: Vec<_> = hits[..2]
+            .iter()
+            .map(|hit| hit.subject_iri.as_str())
+            .collect();
+        assert!(
+            exact.iter().all(|subject| subject.contains(":exact:")),
+            "{exact:?}"
+        );
+        assert!(hits[2..].iter().all(|hit| hit.score == 0.0));
+
+        let view = index.pin_view();
+        let check = || Ok::<(), SearchError>(());
+        let scan = PrefixScan {
+            searcher: &view.searcher,
+            query: "samd",
+            check: &check,
+        };
+        let docs = index.prefix_docs(scan).unwrap().unwrap();
+        let docs = docs.downcast_ref::<PrefixDocs>().unwrap();
+        let mut subjects = Vec::new();
+        for (ord, reader) in view.searcher.segment_readers().iter().enumerate() {
+            for doc in docs
+                .0
+                .get(&reader.segment_id())
+                .map_or(&[][..], |docs| &docs[..])
+            {
+                let address = DocAddress::new(ord as u32, *doc);
+                let stored = view.searcher.doc(address).unwrap();
+                subjects.push(index.doc_to_hit(stored, 0.0).unwrap().subject_iri);
+            }
+        }
+        subjects.sort_by_key(|subject| subject.rsplit(':').next().unwrap().parse::<u32>().ok());
+        let first: Vec<_> = (0..199).map(|n| format!("urn:test:cap:{n}")).collect();
+        assert_eq!(
+            subjects, first,
+            "799 bytes keep the first 199 one-document terms"
+        );
     }
 
-    // The expansion charges its lists' exact capacity: 200 matches cost 800 bytes, no more.
+    // The cap charges the lists' exact capacity: 200 matches cost 800 bytes, no more.
     #[test]
     fn prefix_budget_exact() {
         let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
@@ -4479,17 +4537,22 @@ mod tests {
                 .unwrap();
         }
         index.commit().unwrap();
+        let kept = |index: &SearchIndex| {
+            let view = index.pin_view();
+            let check = || Ok::<(), SearchError>(());
+            let scan = PrefixScan {
+                searcher: &view.searcher,
+                query: "samd",
+                check: &check,
+            };
+            let docs = index.prefix_docs(scan).unwrap().unwrap();
+            let docs = docs.downcast_ref::<PrefixDocs>().unwrap();
+            docs.0.values().map(|docs| docs.len()).sum::<usize>()
+        };
         index.prepared_bytes = 12_800;
-        assert_eq!(index.search("samd", 10).unwrap().len(), 10);
+        assert_eq!(kept(&index), 200, "800 bytes hold all 200 documents");
         index.prepared_bytes = 12_796;
-        let result = index.search("samd", 10);
-        assert!(matches!(
-            result,
-            Err(SearchError::ItemTooLarge {
-                bytes: 800,
-                limit: 799
-            })
-        ));
+        assert_eq!(kept(&index), 199, "799 bytes hold one document less");
     }
 
     // An exact match whose BM25 score rounds to zero still ranks above a prefix-only match.

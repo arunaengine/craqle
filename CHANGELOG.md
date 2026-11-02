@@ -16,6 +16,7 @@ All notable changes to Craqle are documented here.
   so a fenced topic can be repaired on a running node.
 - Full-text search also matches indexed words that start with a query word of at least three
   characters, so `SAMD` finds `SAMD00012345`. Exact word matches rank above such prefix matches.
+  A very broad prefix keeps the prefix matches that fit the query budget instead of failing.
 
 ### Changed
 
