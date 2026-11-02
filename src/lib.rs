@@ -6467,6 +6467,86 @@ mod tests {
         assert_eq!(after.unwrap(), before);
     }
 
+    /// After a reset, a rejoin whose source lacks an own record keeps publication fenced until
+    /// the topic holds that record again, so Irokle never reuses its sequence.
+    fn rejoin_without_own(seed: u8, consumed: bool) {
+        use irokle::Storage as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (source_irokle, replica_irokle, holder_irokle) = (
+            signed_irokle(seed),
+            signed_irokle(seed + 1),
+            signed_irokle(seed + 2),
+        );
+        let (source_id, replica_id, holder_id) = (
+            source_irokle.peer_id(),
+            replica_irokle.peer_id(),
+            holder_irokle.peer_id(),
+        );
+        let source = member_node(
+            &dir.path().join("source"),
+            &source_irokle,
+            &[replica_id, holder_id],
+        );
+        let replica = member_node(&dir.path().join("replica"), &replica_irokle, &[source_id]);
+        let graph = GraphId::new("urn:test:rejoin-without-own");
+        source
+            .create_crate(&writer_auth(), crate_request(&graph, "rejoin"))
+            .unwrap();
+        let topic = source.irokle_topic_id(&graph).unwrap().unwrap();
+        push_topic(&source_irokle, &replica_irokle, topic);
+        replica.reconcile_irokle().unwrap();
+        write_keyword(&replica, &graph, "own");
+        push_topic(&replica_irokle, &holder_irokle, topic);
+        if consumed {
+            replica.reconcile_irokle().unwrap();
+        }
+
+        replica_irokle.storage().reset_topic(&topic).unwrap();
+        push_topic(&source_irokle, &replica_irokle, topic);
+        let pass = replica.reconcile_irokle();
+        assert_eq!(
+            pass.is_err(),
+            consumed,
+            "a consumed own record keeps the cursor fenced"
+        );
+        let sync = replica.sync.clone().unwrap();
+        assert_eq!(sync.own_pending(&replica.store, topic).unwrap(), Some(0));
+        let clock = |irokle: &irokle::Irokle| {
+            let view = irokle.storage().topic_view(&topic, None).unwrap().unwrap();
+            view.clock
+        };
+        let before = clock(&replica_irokle);
+        let error = replica
+            .insert_quads(
+                &AllowAllAuthorizer,
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&graph.0),
+                    EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    keyword_object("reused"),
+                )],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        assert_eq!(clock(&replica_irokle), before, "nothing was published");
+
+        push_topic(&holder_irokle, &replica_irokle, topic);
+        replica.reconcile_irokle().unwrap();
+        write_keyword(&replica, &graph, "after");
+        let export = replica.export_rocrate(&AllowAllAuthorizer, &graph).unwrap();
+        assert!(export.contains("after") && export.contains("own"));
+    }
+
+    #[test]
+    fn rejoin_missing_consumed() {
+        rejoin_without_own(103, true);
+    }
+
+    #[test]
+    fn rejoin_missing_applied() {
+        rejoin_without_own(110, false);
+    }
+
     /// A cursor on the current branch stays authoritative and is not replayed.
     #[test]
     fn matching_cursor_kept() {

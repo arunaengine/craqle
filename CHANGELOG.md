@@ -20,8 +20,11 @@ All notable changes to Craqle are documented here.
 ### Fixed
 
 - Reconciliation no longer fails with an expired cursor after a local topic reset that keeps
-  the genesis. It resets the cursor to the start of the new epoch and replays the topic;
-  records the graph already holds apply as duplicates.
+  the genesis, once the topic again holds every own record the cursor consumed. It resets the
+  cursor to the start of the new epoch and replays the topic; records the graph already holds
+  apply as duplicates.
+- After such a reset, the node publishes nothing to the topic while the topic lacks own records
+  the graph already applied, so Irokle cannot reuse their sequences.
 - A cursor that names another topic genesis stays fenced, since that genesis may reuse actor
   sequences. Until it is repaired, the node publishes no mutation, policy or deletion to the
   topic, and history restores treat its records as not applied.
