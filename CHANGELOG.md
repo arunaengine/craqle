@@ -35,6 +35,8 @@ All notable changes to Craqle are documented here.
   logs one warning until its cursor is repaired, while other graphs open and sync. Other
   reconcile failures still fail the pass and the open.
 - `add_irokle_peer` and `remove_irokle_peer` are refused while the graph's topic is fenced.
+- That refusal also covers a deleted graph, whose topic keeps its reverse binding and cursor
+  after the forward mapping is gone.
 
 ## 0.3.1 - Unreleased
 

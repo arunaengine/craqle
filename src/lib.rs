@@ -2417,9 +2417,11 @@ impl CraqleNode {
     /// Membership records also take an own sequence, so a fenced topic refuses them too.
     fn refuse_fenced(&self, sync: &Arc<dyn sync::CraqleGraphSync>, graph: &GraphId) -> Result<()> {
         self.reconcile_pending(graph);
-        if let Some(topic) = sync.graph_topic_id(&self.store, graph)?
-            && sync.own_pending(&self.store, topic)? == Some(0)
-        {
+        // Deletion drops the forward mapping but keeps the reverse binding and the cursor.
+        let topic = sync
+            .graph_topic_id(&self.store, graph)?
+            .unwrap_or_else(|| crate::sync::graph_topic_id(graph));
+        if sync.own_pending(&self.store, topic)? == Some(0) {
             return Err(crate::replication::own_pending().into());
         }
         Ok(())
@@ -6730,6 +6732,51 @@ mod tests {
         replica.reconcile_irokle().unwrap();
         assert!(!replica.fenced_topics.lock().unwrap().contains(&topic));
         write_keyword(&replica, &graph, "repaired");
+    }
+
+    /// A deleted graph keeps its reverse topic binding and cursor, so membership changes after a
+    /// genesis replacement must still see the fence instead of rebinding and publishing.
+    #[test]
+    fn deleted_graph_fenced() {
+        use irokle::Storage as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (first_irokle, second_irokle) = (signed_irokle(130), signed_irokle(131));
+        let replica_irokle = signed_irokle(132);
+        let (first_id, replica_id) = (first_irokle.peer_id(), replica_irokle.peer_id());
+        let other_id = signed_irokle(133).peer_id();
+        let first = member_node(&dir.path().join("first"), &first_irokle, &[replica_id]);
+        let second = member_node(
+            &dir.path().join("second"),
+            &second_irokle,
+            &[replica_id, other_id],
+        );
+        let replica = member_node(&dir.path().join("replica"), &replica_irokle, &[first_id]);
+        let graph = GraphId::new("urn:test:deleted-graph-fenced");
+        first
+            .create_crate(&writer_auth(), crate_request(&graph, "first"))
+            .unwrap();
+        second
+            .create_crate(&writer_auth(), crate_request(&graph, "second"))
+            .unwrap();
+        let topic = first.irokle_topic_id(&graph).unwrap().unwrap();
+        push_topic(&first_irokle, &replica_irokle, topic);
+        replica.reconcile_irokle().unwrap();
+        replica.delete_graph(&AllowAllAuthorizer, &graph).unwrap();
+        assert_eq!(replica.irokle_topic_id(&graph).unwrap(), None);
+        replica_irokle.storage().reset_topic(&topic).unwrap();
+        push_topic(&second_irokle, &replica_irokle, topic);
+        let clock = || {
+            let view = replica_irokle.storage().topic_view(&topic, None).unwrap();
+            view.unwrap().clock
+        };
+        let before = clock();
+
+        let error = replica.add_irokle_peer(&graph, other_id).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        let error = replica.remove_irokle_peer(&graph, first_id).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        assert_eq!(clock(), before, "nothing was published");
+        assert_eq!(replica.irokle_topic_id(&graph).unwrap(), None);
     }
 
     /// A cursor on the current branch stays authoritative and is not replayed.
