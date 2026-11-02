@@ -3397,7 +3397,7 @@ impl SearchIndex {
     }
 
     /// Documents holding a longer indexed word that starts with a long enough query word; none
-    /// without such a word or when the documents outgrow a quarter of the query budget.
+    /// without such a word. More documents than a quarter of the query budget are an error.
     fn prefix_docs<E>(
         &self,
         req: PrefixScan<'_, E>,
@@ -3442,7 +3442,7 @@ impl SearchIndex {
                         let block = std::mem::size_of_val(postings.docs()).saturating_mul(2);
                         bytes = bytes.saturating_add(block);
                         if bytes > limit {
-                            return Ok(None);
+                            return Err(E::from(SearchError::ItemTooLarge { bytes, limit }));
                         }
                         docs.extend_from_slice(postings.docs());
                         postings.advance();
@@ -4417,6 +4417,28 @@ mod tests {
         let hits = index.search("sample SAMD", 400).unwrap();
         assert_eq!(hits.len(), 301);
         assert_eq!(hits[300].subject_iri, "urn:test:tier:prefix");
+    }
+
+    // An expansion over its budget fails like other oversized results, never as exact-only hits.
+    #[test]
+    fn prefix_budget_fails() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let mut index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..200 {
+            let text = format!("samd{position:08}");
+            let subject = format!("urn:test:budget:{position}");
+            index
+                .index_resource("urn:test:budget", &subject, Some(&text))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        index.prepared_bytes = 16_384;
+        let result = index.search("samd", 10);
+        assert!(
+            matches!(result, Err(SearchError::ItemTooLarge { .. })),
+            "{result:?}"
+        );
+        assert_eq!(index.search("samd00000001", 10).unwrap().len(), 1);
     }
 
     // The prefix expansion checks for cancellation per word and postings block, so it stops there.
