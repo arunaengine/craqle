@@ -20,8 +20,8 @@ use tantivy::TERMINATED;
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::index::SegmentId;
 use tantivy::query::{
-    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, BoostQuery, EnableScoring,
-    Explanation, Occur, Query, QueryParser, Scorer, TermQuery, TermSetQuery, Weight,
+    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, BoostQuery, ConstScoreQuery,
+    EnableScoring, Explanation, Occur, Query, QueryParser, Scorer, TermQuery, TermSetQuery, Weight,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
@@ -1967,7 +1967,7 @@ impl SearchIndex {
         if let Some(prefixes) = prefixes {
             let boosted: Box<dyn Query> = Box::new(BoostQuery::new(prefixes, PREFIX_BOOST));
             parsed = Box::new(BooleanQuery::new(vec![
-                (Occur::Should, parsed),
+                (Occur::Should, floor_exact(parsed)),
                 (Occur::Should, boosted),
             ]));
         }
@@ -3985,6 +3985,16 @@ fn rebuild_shard(graph_iri: &str) -> usize {
     (hasher.finish() % REBUILD_SHARDS as u64) as usize
 }
 
+/// Raises every exact match's score above zero, the score of prefix-only matches. The floor is
+/// lost in any normal score, so it only lifts scores that round to zero.
+fn floor_exact(exact: Box<dyn Query>) -> Box<dyn Query> {
+    let floor = Box::new(ConstScoreQuery::new(exact.box_clone(), Score::MIN_POSITIVE));
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Should, exact),
+        (Occur::Should, floor),
+    ]))
+}
+
 /// Bytes of the largest segment's document bitset.
 fn bitset_bytes(searcher: &Searcher) -> usize {
     searcher
@@ -4480,6 +4490,34 @@ mod tests {
                 limit: 799
             })
         ));
+    }
+
+    // An exact match whose BM25 score rounds to zero still ranks above a prefix-only match.
+    #[test]
+    fn exact_floor_ranks() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        index
+            .index_resource("urn:test:floor", "urn:test:floor:exact", Some("samd"))
+            .unwrap();
+        let text = Some("samd00012345");
+        index
+            .index_resource("urn:test:floor", "urn:test:floor:prefix", text)
+            .unwrap();
+        index.commit().unwrap();
+        let term = |text: &str| -> Box<dyn Query> {
+            let term = Term::from_field_text(index.f_all_text, text);
+            let term = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+            Box::new(BoostQuery::new(term, 0.0))
+        };
+        let query = BooleanQuery::new(vec![
+            (Occur::Should, floor_exact(term("samd"))),
+            (Occur::Should, term("samd00012345")),
+        ]);
+        let searcher = &index.pin_view().searcher;
+        let top = searcher.search(&query, &TopDocs::with_limit(2).order_by_score());
+        let scores: Vec<Score> = top.unwrap().into_iter().map(|(score, _)| score).collect();
+        assert!(scores[0] > 0.0 && scores[1] == 0.0, "{scores:?}");
     }
 
     // The prefix expansion checks for cancellation per word and postings block, so it stops there.
