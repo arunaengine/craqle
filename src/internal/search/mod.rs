@@ -8,19 +8,20 @@ use std::borrow::Cow;
 use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
-use std::ops::Bound;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
 
+use tantivy::SegmentReader;
 use tantivy::TERMINATED;
 #[cfg(test)]
 use tantivy::collector::{BytesFilterCollector, TopDocs};
+use tantivy::index::SegmentId;
 use tantivy::query::{
     AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, BoostQuery, EnableScoring,
-    Occur, Query, QueryParser, RangeQuery, TermQuery, TermSetQuery,
+    Explanation, Occur, Query, QueryParser, Scorer, TermQuery, TermSetQuery, Weight,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
@@ -295,6 +296,82 @@ pub(crate) struct FilterQuery<'a, E> {
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
     /// Optional semijoin hint; the caller retains the original RDF join when it is declined.
     pub candidates: Option<&'a CandidateSource<'a, E>>,
+}
+
+/// A ranked search's query words to expand by prefix, with its cancellation check.
+struct PrefixScan<'a, E> {
+    searcher: &'a Searcher,
+    query: &'a str,
+    check: &'a dyn Fn() -> std::result::Result<(), E>,
+}
+
+/// The documents of each segment that match a query word by prefix, at constant score.
+#[derive(Clone, Debug)]
+struct PrefixDocs(Arc<HashMap<SegmentId, Vec<DocId>>>);
+
+impl Query for PrefixDocs {
+    fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl Weight for PrefixDocs {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        let docs = self
+            .0
+            .get(&reader.segment_id())
+            .cloned()
+            .unwrap_or_default();
+        Ok(Box::new(SortedDocs {
+            docs,
+            cursor: 0,
+            score: boost,
+        }))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        let docs = self.0.get(&reader.segment_id());
+        match docs.is_some_and(|docs| docs.binary_search(&doc).is_ok()) {
+            true => Ok(Explanation::new("PrefixDocs", 1.0)),
+            false => Err(tantivy::TantivyError::InvalidArgument(format!(
+                "document {doc} does not match a prefix"
+            ))),
+        }
+    }
+}
+
+/// One segment's prefix matches in document order, each with the same score.
+struct SortedDocs {
+    docs: Vec<DocId>,
+    cursor: usize,
+    score: Score,
+}
+
+impl DocSet for SortedDocs {
+    fn advance(&mut self) -> DocId {
+        self.cursor = (self.cursor + 1).min(self.docs.len());
+        self.doc()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        let rest = self.docs.get(self.cursor..).unwrap_or_default();
+        self.cursor += rest.partition_point(|doc| *doc < target);
+        self.doc()
+    }
+
+    fn doc(&self) -> DocId {
+        self.docs.get(self.cursor).copied().unwrap_or(TERMINATED)
+    }
+
+    fn size_hint(&self) -> u32 {
+        u32::try_from(self.docs.len()).unwrap_or(u32::MAX)
+    }
+}
+
+impl Scorer for SortedDocs {
+    fn score(&mut self) -> Score {
+        self.score
+    }
 }
 
 pub(crate) type CandidateSource<'a, E> =
@@ -1878,13 +1955,21 @@ impl SearchIndex {
             .map_err(SearchError::from)
             .map_err(E::from)?;
         // Complete matching serves SPARQL text filters, which keep whole-word semantics.
-        let prefixes = match complete {
-            true => Vec::new(),
-            false => (self.prefix_clauses(&view.searcher, &sanitized)).map_err(E::from)?,
+        let scan = PrefixScan {
+            searcher: &view.searcher,
+            query: &sanitized,
+            check: req.check,
         };
-        if !prefixes.is_empty() {
-            let clauses = std::iter::once((Occur::Should, parsed)).chain(prefixes);
-            parsed = Box::new(BooleanQuery::new(clauses.collect()));
+        let prefixes = match complete {
+            true => None,
+            false => self.prefix_docs(scan)?,
+        };
+        if let Some(prefixes) = prefixes {
+            let boosted: Box<dyn Query> = Box::new(BoostQuery::new(prefixes, PREFIX_BOOST));
+            parsed = Box::new(BooleanQuery::new(vec![
+                (Occur::Should, parsed),
+                (Occur::Should, boosted),
+            ]));
         }
         let mut query: Box<dyn Query> = if let Some(subject) = req.subject {
             Box::new(BooleanQuery::new(vec![
@@ -3311,37 +3396,64 @@ impl SearchIndex {
         })
     }
 
-    /// Matches on the longer indexed words that start with each long enough query word; none
-    /// when their per-segment bitsets would exceed a quarter of the query budget.
-    fn prefix_clauses(
+    /// Documents holding a longer indexed word that starts with a long enough query word; none
+    /// without such a word or when the documents outgrow a quarter of the query budget.
+    fn prefix_docs<E>(
         &self,
-        searcher: &Searcher,
-        query: &str,
-    ) -> Result<Vec<(Occur, Box<dyn Query>)>> {
-        let mut analyzer = self.index.tokenizer_for_field(self.f_all_text)?;
-        let mut stream = analyzer.token_stream(query);
+        req: PrefixScan<'_, E>,
+    ) -> std::result::Result<Option<Box<dyn Query>>, E>
+    where
+        E: From<SearchError>,
+    {
+        let mut analyzer =
+            (self.index.tokenizer_for_field(self.f_all_text)).map_err(SearchError::from)?;
+        let mut stream = analyzer.token_stream(req.query);
         let mut words = std::collections::BTreeSet::new();
         while let Some(token) = stream.next() {
             if token.text.chars().count() >= PREFIX_CHARS
-                && has_longer(searcher, self.f_all_text, &token.text)?
+                && has_longer(req.searcher, self.f_all_text, &token.text)?
             {
                 words.insert(token.text.clone());
             }
         }
-        if words.len().saturating_mul(bitset_bytes(searcher)) > self.query_bytes() / 4 {
-            return Ok(Vec::new());
+        if words.is_empty() {
+            return Ok(None);
         }
-        let field = self.f_all_text;
-        let clauses = words.into_iter().map(|word| {
-            let upper = prefix_end(word.as_bytes()).map_or(Bound::Unbounded, |end| {
-                Bound::Excluded(Term::from_field_bytes(field, &end))
-            });
-            let start = Bound::Included(Term::from_field_text(field, &word));
-            let range: Box<dyn Query> = Box::new(RangeQuery::new(start, upper));
-            let boosted: Box<dyn Query> = Box::new(BoostQuery::new(range, PREFIX_BOOST));
-            (Occur::Should, boosted)
-        });
-        Ok(clauses.collect())
+        let (limit, mut bytes) = (self.query_bytes() / 4, 0usize);
+        let mut segments = HashMap::new();
+        for reader in req.searcher.segment_readers() {
+            let inverted = (reader.inverted_index(self.f_all_text)).map_err(SearchError::from)?;
+            let mut docs = Vec::new();
+            for word in &words {
+                let mut terms = inverted.terms().range().ge(word.as_bytes());
+                if let Some(end) = prefix_end(word.as_bytes()) {
+                    terms = terms.lt(end);
+                }
+                let mut terms = terms.into_stream().map_err(SearchError::from)?;
+                while terms.advance() {
+                    (req.check)()?;
+                    let option = IndexRecordOption::Basic;
+                    let mut postings = (inverted
+                        .read_block_postings_from_terminfo(terms.value(), option))
+                    .map_err(SearchError::from)?;
+                    while !postings.docs().is_empty() {
+                        (req.check)()?;
+                        // A scorer copies one segment's list, so each document counts twice.
+                        let block = std::mem::size_of_val(postings.docs()).saturating_mul(2);
+                        bytes = bytes.saturating_add(block);
+                        if bytes > limit {
+                            return Ok(None);
+                        }
+                        docs.extend_from_slice(postings.docs());
+                        postings.advance();
+                    }
+                }
+            }
+            docs.sort_unstable();
+            docs.dedup();
+            segments.insert(reader.segment_id(), docs);
+        }
+        Ok(Some(Box::new(PrefixDocs(Arc::new(segments)))))
     }
 
     /// Whether block-max pruning bounds hold: one segment, one field, and a term union
@@ -4305,6 +4417,41 @@ mod tests {
         let hits = index.search("sample SAMD", 400).unwrap();
         assert_eq!(hits.len(), 301);
         assert_eq!(hits[300].subject_iri, "urn:test:tier:prefix");
+    }
+
+    // The prefix expansion checks for cancellation per word and postings block, so it stops there.
+    #[test]
+    fn prefix_expansion_cancels() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..50 {
+            let text = format!("samd{position:08}");
+            let subject = format!("urn:test:cancel:{position}");
+            index
+                .index_resource("urn:test:cancel", &subject, Some(&text))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let view = index.pin_view();
+        let calls = AtomicU64::new(0);
+        let check = || match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(()),
+            _ => Err(SearchError::Cancelled),
+        };
+        let scan = PrefixScan {
+            searcher: &view.searcher,
+            query: "samd",
+            check: &check,
+        };
+        assert!(matches!(
+            index.prefix_docs(scan),
+            Err(SearchError::Cancelled)
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the expansion stops at the failed check"
+        );
     }
 
     #[test]
