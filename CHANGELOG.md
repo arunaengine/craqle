@@ -8,6 +8,11 @@ All notable changes to Craqle are documented here.
 
 ## 0.3.2 - Unreleased
 
+### Added
+
+- `CraqleNode::set_policy_with` takes a `PolicyWrite` with an explicit durability.
+  `WalAlreadyDurable` sets the policy locally without publishing it or creating the graph topic.
+
 ### Changed
 
 - Integrates Irokle 0.3.2 at revision `209f881af3fa4b8ed16e2ca0a0315d663029329e`.
