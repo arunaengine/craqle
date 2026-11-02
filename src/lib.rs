@@ -1410,10 +1410,13 @@ pub struct CraqleNode {
     reindex_gate: std::sync::Mutex<Option<ReindexGate>>,
 }
 
-struct PolicyWrite<'a> {
-    graph: &'a GraphId,
-    policy: GraphPolicy,
-    durability: CraqleRequestDurability,
+/// A graph policy write for [`CraqleNode::set_policy_with`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyWrite<'a> {
+    pub graph: &'a GraphId,
+    pub policy: GraphPolicy,
+    /// Only a publishing durability emits an Irokle event and creates the graph topic.
+    pub durability: CraqleRequestDurability,
 }
 
 struct BatchFinish<'a> {
@@ -3390,9 +3393,25 @@ impl CraqleNode {
         graph: &GraphId,
         policy: GraphPolicy,
     ) -> Result<()> {
-        let policy = policy.normalized();
-        self.ensure_policy_action(graph, &policy, auth, Action::Write)?;
-        self.persist_graph_policy(graph, policy)?;
+        self.set_policy_with(
+            auth,
+            PolicyWrite {
+                graph,
+                policy,
+                durability: CraqleRequestDurability::Durable,
+            },
+        )
+    }
+
+    /// Set the hidden access policy described by `write`.
+    pub fn set_policy_with(&self, auth: &dyn Authorizer, write: PolicyWrite<'_>) -> Result<()> {
+        let policy = write.policy.normalized();
+        self.ensure_policy_action(write.graph, &policy, auth, Action::Write)?;
+        if !write.durability.persists_fjall() {
+            self.persist_policy(PolicyWrite { policy, ..write })?;
+            return Ok(());
+        }
+        self.persist_graph_policy(write.graph, policy)?;
         self.persist_fjall()
     }
 
@@ -6768,6 +6787,27 @@ mod tests {
             );
         }
         PUBLISH_STALL_MICROS.store(0, Ordering::Relaxed);
+    }
+
+    /// A local policy write must not mint a topic genesis that forks the holders' topic.
+    #[test]
+    fn local_policy_unpublished() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = sync_node(&dir);
+        let graph = GraphId::new("urn:test:local-policy");
+
+        node.set_policy_with(
+            &writer_auth(),
+            PolicyWrite {
+                graph: &graph,
+                policy: policy_at("local"),
+                durability: CraqleRequestDurability::WalAlreadyDurable,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(node.store.graph_policy(&graph).unwrap(), policy_at("local"));
+        assert_eq!(node.bind_irokle_topic(&graph).unwrap(), None);
     }
 
     /// The policy a peer replaying this graph's topic ends up on.
