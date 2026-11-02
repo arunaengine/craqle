@@ -19,9 +19,12 @@ All notable changes to Craqle are documented here.
 
 ### Fixed
 
-- Reconciliation no longer fails with an expired cursor when the applied topic cursor names a
-  replaced topic branch. It resets the cursor to the start of the current branch and replays
-  the topic; records the graph already holds apply as duplicates.
+- Reconciliation no longer fails with an expired cursor after a local topic reset that keeps
+  the genesis. It resets the cursor to the start of the new epoch and replays the topic;
+  records the graph already holds apply as duplicates.
+- A cursor that names another topic genesis stays fenced, since that genesis may reuse actor
+  sequences. Until it is repaired, the node refuses to publish to the topic and history
+  restores treat its records as not applied.
 
 ## 0.3.1 - Unreleased
 

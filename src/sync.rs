@@ -731,12 +731,19 @@ fn decode_topic_cursor(
     Ok(envelope.payload)
 }
 
-/// The per-actor positions an applied topic cursor has consumed.
+/// The per-actor positions an applied topic cursor has consumed, or `None` when the
+/// cursor names another branch than `frontier`, whose positions mean nothing here.
 pub(crate) fn applied_clock(
     topic: irokle::TopicId,
     bytes: &[u8],
-) -> SyncResult<irokle::ActorClock> {
-    Ok(stored_cursor(topic, bytes)?.map_or_else(Default::default, |cursor| cursor.clock))
+    frontier: &TopicFrontier,
+) -> SyncResult<Option<irokle::ActorClock>> {
+    Ok(match stored_cursor(topic, bytes)? {
+        Some(cursor) if cursor.epoch != frontier.epoch || cursor.genesis != frontier.genesis => {
+            None
+        }
+        cursor => Some(cursor.map_or_else(Default::default, |cursor| cursor.clock)),
+    })
 }
 
 /// A verified version 1 cursor has no branch fence, so the topic replays from its start.
@@ -749,8 +756,8 @@ fn stored_cursor(topic: irokle::TopicId, bytes: &[u8]) -> SyncResult<Option<Topi
     }
 }
 
-/// A cursor at the start of the current branch when `bytes` names a replaced one.
-/// Replaying from there applies the records a graph clock already covers as duplicates.
+/// A cursor at the start of the current epoch when `bytes` names an earlier epoch of the same
+/// genesis. Another genesis may reuse actor sequences, so its cursor stays fenced.
 pub(crate) fn restart_cursor(
     topic: irokle::TopicId,
     bytes: &[u8],
@@ -759,7 +766,7 @@ pub(crate) fn restart_cursor(
     let Some(stored) = stored_cursor(topic, bytes)? else {
         return Ok(None);
     };
-    if stored.epoch == frontier.epoch && stored.genesis == frontier.genesis {
+    if stored.genesis != frontier.genesis || stored.epoch == frontier.epoch {
         return Ok(None);
     }
     encode_topic_cursor(&TopicCursorPayload {
@@ -771,14 +778,6 @@ pub(crate) fn restart_cursor(
         target: None,
     })
     .map(Some)
-}
-
-/// The same cursor on a different topic branch, as a replaced topic leaves it.
-#[cfg(test)]
-pub(crate) fn rebranch_cursor(topic: irokle::TopicId, bytes: &[u8]) -> Vec<u8> {
-    let mut payload = decode_topic_cursor(topic, bytes).unwrap();
-    payload.genesis = irokle::OpId::from_bytes([7; 32]);
-    encode_topic_cursor(&payload).unwrap()
 }
 
 /// Encodes a version 1 cursor as stores written before branch fences hold it.
@@ -1045,8 +1044,8 @@ pub(crate) trait CraqleGraphSync: Send + Sync {
         Err(CraqleSyncError::NotConfigured)
     }
 
-    /// The sequence of this node's first graph-event record in the topic that the store
-    /// covers neither by apply nor by reconciliation.
+    /// The sequence of this node's first graph-event record the store neither applied nor
+    /// reconciled, or `Some(0)` while the applied cursor names another topic branch.
     fn own_pending(&self, _store: &GraphStore, _topic: irokle::TopicId) -> SyncResult<Option<u64>> {
         Ok(None)
     }
@@ -1997,7 +1996,11 @@ impl<S: irokle::Storage> CraqleGraphSync for IrokleGraphSync<S> {
             .unwrap_or_default();
         // The cursor also covers records that reconciliation quarantined.
         let consumed = match store.applied_topic_clock(topic.as_bytes())? {
-            Some(bytes) => applied_clock(topic, &bytes)?.get(&local),
+            Some(bytes) => match applied_clock(topic, &bytes, &self.topic_frontier(topic)?)? {
+                Some(clock) => clock.get(&local),
+                // Another branch's cursor: reconcile first, and publish nothing until it is repaired.
+                None => return Ok(Some(0)),
+            },
             None => 0,
         };
         let mut after = applied.max(consumed);
