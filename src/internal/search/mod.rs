@@ -58,8 +58,9 @@ const DAMAGED_GRAPHS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
 /// Query words this long also match the indexed words that start with them.
 const PREFIX_CHARS: usize = 3;
-/// Prefix matches add this constant score, so an exact match of a word ranks first.
-const PREFIX_BOOST: Score = 0.01;
+/// Prefix matches add no score, so they rank after every exact match, whose BM25 score is
+/// positive, and leave the order of exact matches unchanged.
+const PREFIX_BOOST: Score = 0.0;
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v5";
 const INDEX_ID_FILE: &str = ".craqle-index-id";
 const DIRECT_GENERATION: GenerationId = GenerationId(1);
@@ -4283,6 +4284,27 @@ mod tests {
             .rposition(|hit| hit.graph_id == "urn:test:exact");
         assert!(position("urn:test:longer").is_some());
         assert!(last_exact.unwrap() < position("urn:test:longer").unwrap());
+    }
+
+    // Exact matches of one word rank above documents that match every word only by prefix.
+    #[test]
+    fn multiword_exact_first() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..300 {
+            let subject = format!("urn:test:tier:{position}");
+            index
+                .index_resource("urn:test:tier", &subject, Some("sample"))
+                .unwrap();
+        }
+        let text = Some("SAMD00012345 samples");
+        index
+            .index_resource("urn:test:tier", "urn:test:tier:prefix", text)
+            .unwrap();
+        index.commit().unwrap();
+        let hits = index.search("sample SAMD", 400).unwrap();
+        assert_eq!(hits.len(), 301);
+        assert_eq!(hits[300].subject_iri, "urn:test:tier:prefix");
     }
 
     #[test]
