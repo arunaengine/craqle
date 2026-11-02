@@ -23,8 +23,8 @@ All notable changes to Craqle are documented here.
   the genesis. It resets the cursor to the start of the new epoch and replays the topic;
   records the graph already holds apply as duplicates.
 - A cursor that names another topic genesis stays fenced, since that genesis may reuse actor
-  sequences. Until it is repaired, the node refuses to publish to the topic and history
-  restores treat its records as not applied.
+  sequences. Until it is repaired, the node publishes no mutation, policy or deletion to the
+  topic, and history restores treat its records as not applied.
 
 ## 0.3.1 - Unreleased
 

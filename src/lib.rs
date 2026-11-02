@@ -3418,6 +3418,9 @@ impl CraqleNode {
     /// Set the hidden access policy described by `write`.
     pub fn set_policy_with(&self, auth: &dyn Authorizer, write: PolicyWrite<'_>) -> Result<()> {
         let policy = write.policy.normalized();
+        if write.durability.publishes_irokle() {
+            self.reconcile_pending(write.graph);
+        }
         self.ensure_policy_action(write.graph, &policy, auth, Action::Write)?;
         if !write.durability.persists_fjall() {
             self.persist_policy(PolicyWrite { policy, ..write })?;
@@ -4355,6 +4358,7 @@ impl CraqleNode {
     }
 
     pub fn delete_graph(&self, auth: &dyn Authorizer, graph: &GraphId) -> Result<()> {
+        self.reconcile_pending(graph);
         self.ensure_graph_action(graph, auth, Action::Write)?;
         self.delete_authorized(graph)
     }
@@ -6441,6 +6445,19 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        let policy = GraphPolicy {
+            public: true,
+            permission_paths: vec!["/fenced".to_owned()],
+        };
+        let error = replica
+            .set_graph_policy(&AllowAllAuthorizer, &graph, policy)
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        let error = replica
+            .delete_graph(&AllowAllAuthorizer, &graph)
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        assert!(!replica.store.graph_tombstoned(&graph).unwrap());
         assert_eq!(
             frontier(&replica_irokle).1,
             second_clock,
