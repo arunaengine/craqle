@@ -2614,9 +2614,12 @@ impl CraqleNode {
 
         let mut applied = HashSet::new();
         let mut stalled = None;
+        let topics = sync.craqle_topic_ids()?;
+        // A topic reset or evicted without rejoining no longer needs its warning entry.
+        self.fenced_topics().retain(|topic| topics.contains(topic));
         // Topics carry independent cursors, so one stall holds back only its
         // own topic; the first failure is reported once the rest have run.
-        for topic_id in sync.craqle_topic_ids()? {
+        for topic_id in topics {
             match self.reconcile_topic(sync, topic_id) {
                 Ok(pass) => {
                     self.fenced_topics().remove(&topic_id);
@@ -6777,6 +6780,16 @@ mod tests {
         assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
         assert_eq!(clock(), before, "nothing was published");
         assert_eq!(replica.irokle_topic_id(&graph).unwrap(), None);
+    }
+
+    /// A topic that left the topic list, for example by a reset, drops its fenced-warning entry.
+    #[test]
+    fn fenced_entry_pruned() {
+        let pair = replica_pair();
+        let gone = irokle::TopicId::from_bytes([9; 32]);
+        pair.replica.fenced_topics().insert(gone);
+        pair.replica.reconcile_irokle().unwrap();
+        assert!(!pair.replica.fenced_topics().contains(&gone));
     }
 
     /// A cursor on the current branch stays authoritative and is not replayed.

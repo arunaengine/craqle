@@ -34,6 +34,8 @@ All notable changes to Craqle are documented here.
 - A topic that stays fenced no longer fails `reconcile_irokle` or the open. It stays stalled and
   logs one warning until its cursor is repaired, while other graphs open and sync. Other
   reconcile failures still fail the pass and the open.
+- The once-per-topic fence warning forgets topics that left the local topic list, so a topic
+  that rejoins later warns again.
 - `add_irokle_peer` and `remove_irokle_peer` are refused while the graph's topic is fenced.
 - That refusal also covers a deleted graph, whose topic keeps its reverse binding and cursor
   after the forward mapping is gone.
