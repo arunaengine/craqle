@@ -33,6 +33,7 @@ All notable changes to Craqle are documented here.
 - Child data entity appends reconcile the graph topic before authorization, like root appends.
 - A node opens while one of its topics stays fenced. That topic stays stalled and logs one
   warning at open; other graphs open and sync. Other reconcile failures still fail the open.
+- `add_irokle_peer` and `remove_irokle_peer` are refused while the graph's topic is fenced.
 
 ## 0.3.1 - Unreleased
 

@@ -99,7 +99,7 @@ fn mutation_digest(
 }
 
 /// A retryable failure: this node's own topic records must be reconciled before it publishes.
-fn own_pending() -> UpdateError {
+pub(crate) fn own_pending() -> UpdateError {
     UpdateError::StalePreparedState {
         fence: "this node has topic records that are not applied yet".to_owned(),
     }

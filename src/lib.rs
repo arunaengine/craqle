@@ -2409,14 +2409,27 @@ impl CraqleNode {
 
     pub fn add_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        self.refuse_fenced(sync, graph)?;
         sync.add_peer(&self.store, graph, peer)?;
         self.persist_fjall()
     }
 
     pub fn remove_irokle_peer(&self, graph: &GraphId, peer: irokle::PeerId) -> Result<()> {
         let sync = self.sync.as_ref().ok_or(CraqleSyncError::NotConfigured)?;
+        self.refuse_fenced(sync, graph)?;
         sync.remove_peer(&self.store, graph, peer)?;
         self.persist_fjall()
+    }
+
+    /// Membership records also take an own sequence, so a fenced topic refuses them too.
+    fn refuse_fenced(&self, sync: &Arc<dyn sync::CraqleGraphSync>, graph: &GraphId) -> Result<()> {
+        self.reconcile_pending(graph);
+        if let Some(topic) = sync.graph_topic_id(&self.store, graph)?
+            && sync.own_pending(&self.store, topic)? == Some(0)
+        {
+            return Err(crate::replication::own_pending().into());
+        }
+        Ok(())
     }
 
     pub fn irokle_sync_status(&self, graph: &GraphId) -> Result<Vec<irokle::SyncPeerStatus>> {
@@ -6512,6 +6525,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
         assert!(!replica.store.graph_tombstoned(&graph).unwrap());
+        let error = replica.add_irokle_peer(&graph, other_id).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+        let error = replica.remove_irokle_peer(&graph, writer_id).unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
         assert_eq!(
             frontier(&replica_irokle).1,
             second_clock,
