@@ -31,8 +31,9 @@ All notable changes to Craqle are documented here.
   sequences. Until it is repaired, the node publishes no mutation, policy or deletion to the
   topic, and history restores treat its records as not applied.
 - Child data entity appends reconcile the graph topic before authorization, like root appends.
-- A node opens while one of its topics stays fenced. That topic stays stalled and logs one
-  warning at open; other graphs open and sync. Other reconcile failures still fail the open.
+- A topic that stays fenced no longer fails `reconcile_irokle` or the open. It stays stalled and
+  logs one warning until its cursor is repaired, while other graphs open and sync. Other
+  reconcile failures still fail the pass and the open.
 - `add_irokle_peer` and `remove_irokle_peer` are refused while the graph's topic is fenced.
 
 ## 0.3.1 - Unreleased
