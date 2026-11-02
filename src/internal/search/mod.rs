@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
+use std::ops::Bound;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Condvar;
@@ -18,15 +19,15 @@ use tantivy::TERMINATED;
 #[cfg(test)]
 use tantivy::collector::{BytesFilterCollector, TopDocs};
 use tantivy::query::{
-    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, EnableScoring, Occur, Query,
-    QueryParser, TermQuery, TermSetQuery,
+    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, BoostQuery, EnableScoring,
+    Occur, Query, QueryParser, RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
     Value,
 };
 use tantivy::tokenizer::{
-    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, TokenStream,
 };
 use tantivy::{DocAddress, DocId, DocSet, Index, IndexReader, IndexWriter, Score, Searcher};
 use tantivy::{TantivyDocument, Term};
@@ -55,6 +56,10 @@ const REBUILD_SHARDS: usize = 64;
 /// Damaged graphs retained for targeted reindex; overflow escalates to a whole rebuild.
 const DAMAGED_GRAPHS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
+/// Query words this long also match the indexed words that start with them.
+const PREFIX_CHARS: usize = 3;
+/// Prefix matches add this constant score, so an exact match of a word ranks first.
+const PREFIX_BOOST: Score = 0.01;
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v5";
 const INDEX_ID_FILE: &str = ".craqle-index-id";
 const DIRECT_GENERATION: GenerationId = GenerationId(1);
@@ -1866,10 +1871,20 @@ impl SearchIndex {
         let view = self.pin_view();
         self.check_bound(&view).map_err(E::from)?;
         let parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = parser
-            .parse_query(&sanitize_query(req.query))
+        let sanitized = sanitize_query(req.query);
+        let mut parsed = parser
+            .parse_query(&sanitized)
             .map_err(SearchError::from)
             .map_err(E::from)?;
+        // Complete matching serves SPARQL text filters, which keep whole-word semantics.
+        let prefixes = match complete {
+            true => Vec::new(),
+            false => (self.prefix_clauses(&view.searcher, &sanitized)).map_err(E::from)?,
+        };
+        if !prefixes.is_empty() {
+            let clauses = std::iter::once((Occur::Should, parsed)).chain(prefixes);
+            parsed = Box::new(BooleanQuery::new(clauses.collect()));
+        }
         let mut query: Box<dyn Query> = if let Some(subject) = req.subject {
             Box::new(BooleanQuery::new(vec![
                 (Occur::Must, parsed),
@@ -1896,19 +1911,7 @@ impl SearchIndex {
             && let Some(subjects) = prepare()?
         {
             (req.check)()?;
-            let bitset = view
-                .searcher
-                .segment_readers()
-                .iter()
-                .map(|reader| {
-                    (reader.max_doc() as usize)
-                        .div_ceil(64)
-                        .saturating_mul(8)
-                        .saturating_add(64)
-                })
-                .max()
-                .unwrap_or(0);
-            let bytes = candidate_bytes(&subjects).saturating_add(bitset);
+            let bytes = candidate_bytes(&subjects).saturating_add(bitset_bytes(&view.searcher));
             let limit = req.limit.min(crate::MAX_SEARCH_LIMIT);
             // Postings frequency is a whole-index count that could span graphs this caller
             // cannot see, so admission relies only on the already-authorized candidate set.
@@ -3307,6 +3310,39 @@ impl SearchIndex {
         })
     }
 
+    /// Matches on the longer indexed words that start with each long enough query word; none
+    /// when their per-segment bitsets would exceed a quarter of the query budget.
+    fn prefix_clauses(
+        &self,
+        searcher: &Searcher,
+        query: &str,
+    ) -> Result<Vec<(Occur, Box<dyn Query>)>> {
+        let mut analyzer = self.index.tokenizer_for_field(self.f_all_text)?;
+        let mut stream = analyzer.token_stream(query);
+        let mut words = std::collections::BTreeSet::new();
+        while let Some(token) = stream.next() {
+            if token.text.chars().count() >= PREFIX_CHARS
+                && has_longer(searcher, self.f_all_text, &token.text)?
+            {
+                words.insert(token.text.clone());
+            }
+        }
+        if words.len().saturating_mul(bitset_bytes(searcher)) > self.query_bytes() / 4 {
+            return Ok(Vec::new());
+        }
+        let field = self.f_all_text;
+        let clauses = words.into_iter().map(|word| {
+            let upper = prefix_end(word.as_bytes()).map_or(Bound::Unbounded, |end| {
+                Bound::Excluded(Term::from_field_bytes(field, &end))
+            });
+            let start = Bound::Included(Term::from_field_text(field, &word));
+            let range: Box<dyn Query> = Box::new(RangeQuery::new(start, upper));
+            let boosted: Box<dyn Query> = Box::new(BoostQuery::new(range, PREFIX_BOOST));
+            (Occur::Should, boosted)
+        });
+        Ok(clauses.collect())
+    }
+
     /// Whether block-max pruning bounds hold: one segment, one field, and a term union
     /// scored with that segment's own statistics.
     fn pruning_safe(&self, searcher: &Searcher, query: &dyn Query) -> bool {
@@ -3821,6 +3857,45 @@ fn rebuild_shard(graph_iri: &str) -> usize {
     (hasher.finish() % REBUILD_SHARDS as u64) as usize
 }
 
+/// Bytes of the largest segment's document bitset.
+fn bitset_bytes(searcher: &Searcher) -> usize {
+    searcher
+        .segment_readers()
+        .iter()
+        .map(|reader| {
+            (reader.max_doc() as usize)
+                .div_ceil(64)
+                .saturating_mul(8)
+                .saturating_add(64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether an indexed word of `field` starts with `word` and is longer than it.
+fn has_longer(searcher: &Searcher, field: Field, word: &str) -> Result<bool> {
+    let end = prefix_end(word.as_bytes());
+    for reader in searcher.segment_readers() {
+        let inverted = reader.inverted_index(field)?;
+        let mut range = inverted.terms().range().gt(word.as_bytes());
+        if let Some(end) = &end {
+            range = range.lt(end);
+        }
+        if range.into_stream()?.advance() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The smallest byte string after every string that starts with `prefix`.
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+    let mut end = prefix[..=last].to_vec();
+    end[last] += 1;
+    Some(end)
+}
+
 fn sanitize_query(query: &str) -> String {
     let cleaned: String = query
         .chars()
@@ -4173,6 +4248,55 @@ mod tests {
         assert!(bounded.remaining);
         assert!(bounded.bytes <= scan.byte_limit);
         assert!(bounded.rows < page.rows);
+    }
+
+    fn prefix_fixture(descriptions: &[(&str, &str)]) -> (tempfile::TempDir, crate::CraqleNode) {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        for (graph, description) in descriptions {
+            let request = crate_request(&GraphId::new(graph), description, true);
+            node.create_crate(&writer_auth(), request).unwrap();
+        }
+        node.flush_search_updates().unwrap();
+        (dir, node)
+    }
+
+    #[test]
+    fn prefix_finds_accessions() {
+        let (_dir, node) = prefix_fixture(&[("urn:test:accession", "sample SAMD00012345")]);
+        let hits = node.search.search("SAMD", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.graph_id == "urn:test:accession"));
+        assert!(node.search.search("sa", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_ranks_first() {
+        let (_dir, node) = prefix_fixture(&[
+            ("urn:test:longer", "samd00099999"),
+            ("urn:test:exact", "samd"),
+        ]);
+        let hits = node.search.search("samd", 10).unwrap();
+        let position = |graph: &str| hits.iter().position(|hit| hit.graph_id == graph);
+        let last_exact = hits
+            .iter()
+            .rposition(|hit| hit.graph_id == "urn:test:exact");
+        assert!(position("urn:test:longer").is_some());
+        assert!(last_exact.unwrap() < position("urn:test:longer").unwrap());
+    }
+
+    #[test]
+    fn prefix_ignores_patterns() {
+        let (_dir, node) = prefix_fixture(&[("urn:test:pattern", "SAMD00012345")]);
+        for query in [
+            ".*00012345",
+            "s[a-z]md00012345",
+            "(sa|xx)md",
+            "s.m.00012345",
+        ] {
+            assert!(node.search.search(query, 10).unwrap().is_empty(), "{query}");
+        }
+        assert!(!node.search.search("samd0001", 10).unwrap().is_empty());
     }
 
     #[test]
