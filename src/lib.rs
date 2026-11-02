@@ -2599,10 +2599,8 @@ impl CraqleNode {
         Ok(report)
     }
 
-    /// Apply every craqle topic's outstanding records, returning the graphs
-    /// whose content changed. Callers that only want a count read `.len()`.
-    /// A topic whose expired cursor fences publication stays stalled until its cursor is
-    /// repaired; it is logged once and does not fail the pass for the other topics.
+    /// Apply every topic's outstanding records, returning the graphs whose content changed.
+    /// A fenced topic stays stalled until its cursor is repaired and never fails the pass.
     pub fn reconcile_irokle(&self) -> Result<HashSet<GraphId>> {
         let Some(sync) = &self.sync else {
             return Ok(HashSet::new());
