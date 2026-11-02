@@ -12,6 +12,8 @@ All notable changes to Craqle are documented here.
 
 - `CraqleNode::set_policy_with` takes a `PolicyWrite` with an explicit durability.
   `WalAlreadyDurable` sets the policy locally without publishing it or creating the graph topic.
+- `CraqleNode::applied_cursor_digest` returns the digest `repair_irokle_topic_cursor` expects,
+  so a fenced topic can be repaired on a running node.
 
 ### Changed
 
@@ -29,6 +31,8 @@ All notable changes to Craqle are documented here.
   sequences. Until it is repaired, the node publishes no mutation, policy or deletion to the
   topic, and history restores treat its records as not applied.
 - Child data entity appends reconcile the graph topic before authorization, like root appends.
+- A node opens while one of its topics stays fenced. That topic stays stalled and logs one
+  warning at open; other graphs open and sync. Other reconcile failures still fail the open.
 
 ## 0.3.1 - Unreleased
 

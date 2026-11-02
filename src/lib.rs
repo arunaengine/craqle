@@ -1554,16 +1554,26 @@ const OPEN_RECONCILE_BACKOFF: Duration = Duration::from_millis(50);
 /// Catch a node up at open, retrying a stall a transient store or history
 /// failure could clear rather than failing the open on it.
 fn reconcile_at_open(node: &CraqleNode) -> Result<()> {
-    for attempt in 1..OPEN_RECONCILE_ATTEMPTS {
-        match node.reconcile_irokle() {
-            Ok(_) => return Ok(()),
-            Err(error) => {
+    let mut attempt = 1;
+    let fenced = loop {
+        let mut fenced = Vec::new();
+        match node.reconcile_topics(Some(&mut fenced)) {
+            Ok(_) => break fenced,
+            Err(error) if attempt < OPEN_RECONCILE_ATTEMPTS => {
                 tracing::warn!(attempt, %error, "retrying a stalled reconcile at open");
                 std::thread::sleep(OPEN_RECONCILE_BACKOFF);
+                attempt += 1;
             }
+            Err(error) => return Err(error),
         }
+    };
+    for topic in fenced {
+        tracing::warn!(
+            topic = %topic,
+            "opened with a fenced craqle topic; it stays stalled until its cursor is repaired",
+        );
     }
-    node.reconcile_irokle().map(|_| ())
+    Ok(())
 }
 
 impl CraqleNode {
@@ -2584,6 +2594,15 @@ impl CraqleNode {
     /// Apply every craqle topic's outstanding records, returning the graphs
     /// whose content changed. Callers that only want a count read `.len()`.
     pub fn reconcile_irokle(&self) -> Result<HashSet<GraphId>> {
+        self.reconcile_topics(None)
+    }
+
+    /// With `fenced`, a topic whose expired cursor fences publication is collected there instead
+    /// of failing the pass; it stays stalled until an operator repairs its cursor.
+    fn reconcile_topics(
+        &self,
+        mut fenced: Option<&mut Vec<irokle::TopicId>>,
+    ) -> Result<HashSet<GraphId>> {
         let Some(sync) = &self.sync else {
             return Ok(HashSet::new());
         };
@@ -2602,7 +2621,19 @@ impl CraqleNode {
                     applied.extend(pass.applied);
                     stalled = stalled.or(pass.stalled);
                 }
-                Err(error) => stalled = stalled.or(Some(error)),
+                Err(error) => {
+                    if let Some(topics) = &mut fenced
+                        && matches!(
+                            error,
+                            CraqleError::Sync(CraqleSyncError::ExpiredCursor { .. })
+                        )
+                        && sync.own_pending(&self.store, topic_id)? == Some(0)
+                    {
+                        topics.push(topic_id);
+                        continue;
+                    }
+                    stalled = stalled.or(Some(error));
+                }
             }
         }
         // Before the stall reaches the caller: a pass that applied a prefix
@@ -2997,6 +3028,27 @@ impl CraqleNode {
             self.persist_fjall()?;
         }
         Ok(changed)
+    }
+
+    /// The digest `repair_irokle_topic_cursor` expects for the topic's stored applied cursor,
+    /// or `None` when the topic has none.
+    pub fn applied_cursor_digest(
+        &self,
+        auth: &dyn Authorizer,
+        topic: irokle::TopicId,
+    ) -> Result<Option<[u8; 32]>> {
+        let graph = self
+            .store
+            .topic_graph_binding(topic.as_bytes())?
+            .map(|graph| GraphId::new(&graph))
+            .ok_or_else(|| {
+                CraqleError::SyncInputRejected(format!(
+                    "irokle topic {topic} is not bound to a graph"
+                ))
+            })?;
+        self.ensure_graph_action(&graph, auth, Action::Read)?;
+        let cursor = self.store.applied_topic_clock(topic.as_bytes())?;
+        Ok(cursor.map(|bytes| topic_cursor_digest(&bytes)))
     }
 
     pub fn repair_irokle_topic_cursor(
@@ -6583,6 +6635,85 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    /// A fenced topic stalls only itself: the node opens, other graphs sync, the fenced graph
+    /// refuses to publish until an online cursor repair moves it onto the current genesis.
+    #[test]
+    fn fenced_topic_opens() {
+        use irokle::Storage as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (first_irokle, second_irokle) = (signed_irokle(120), signed_irokle(121));
+        let (replica_irokle, healthy_irokle) = (signed_irokle(122), signed_irokle(123));
+        let (first_id, replica_id) = (first_irokle.peer_id(), replica_irokle.peer_id());
+        let other_id = signed_irokle(124).peer_id();
+        let first = member_node(&dir.path().join("first"), &first_irokle, &[replica_id]);
+        let second = member_node(
+            &dir.path().join("second"),
+            &second_irokle,
+            &[replica_id, other_id],
+        );
+        let healthy = member_node(&dir.path().join("healthy"), &healthy_irokle, &[replica_id]);
+        let replica_path = dir.path().join("replica");
+        let replica = member_node(&replica_path, &replica_irokle, &[first_id]);
+        let (graph, kept) = (
+            GraphId::new("urn:test:fenced-topic-open"),
+            GraphId::new("urn:test:healthy-topic-open"),
+        );
+        first
+            .create_crate(&writer_auth(), crate_request(&graph, "first"))
+            .unwrap();
+        healthy
+            .create_crate(&writer_auth(), crate_request(&kept, "healthy"))
+            .unwrap();
+        second
+            .create_crate(&writer_auth(), crate_request(&graph, "second"))
+            .unwrap();
+        let topic = first.irokle_topic_id(&graph).unwrap().unwrap();
+        let kept_topic = healthy.irokle_topic_id(&kept).unwrap().unwrap();
+        push_topic(&first_irokle, &replica_irokle, topic);
+        push_topic(&healthy_irokle, &replica_irokle, kept_topic);
+        replica.reconcile_irokle().unwrap();
+        replica_irokle.storage().reset_topic(&topic).unwrap();
+        push_topic(&second_irokle, &replica_irokle, topic);
+        drop(replica);
+
+        let replica = member_node(&replica_path, &replica_irokle, &[first_id]);
+        write_keyword(&healthy, &kept, "synced");
+        push_topic(&healthy_irokle, &replica_irokle, kept_topic);
+        assert!(
+            replica.reconcile_irokle().is_err(),
+            "the fenced topic still stalls"
+        );
+        let export = replica.export_rocrate(&AllowAllAuthorizer, &kept).unwrap();
+        assert!(export.contains("synced"));
+        let error = replica
+            .insert_quads(
+                &AllowAllAuthorizer,
+                &graph,
+                vec![(
+                    EncodedTerm::from_named_node(&graph.0),
+                    EncodedTerm::from_named_node(&vocab::schema_keywords()),
+                    keyword_object("fenced"),
+                )],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), CraqleErrorKind::StalePreparedState);
+
+        let digest = replica
+            .applied_cursor_digest(&AllowAllAuthorizer, topic)
+            .unwrap()
+            .unwrap();
+        replica
+            .repair_irokle_topic_cursor(
+                &AllowAllAuthorizer,
+                topic,
+                digest,
+                irokle::ActorClock::default(),
+            )
+            .unwrap();
+        replica.reconcile_irokle().unwrap();
+        write_keyword(&replica, &graph, "repaired");
     }
 
     /// A cursor on the current branch stays authoritative and is not replayed.
