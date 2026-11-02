@@ -749,6 +749,38 @@ fn stored_cursor(topic: irokle::TopicId, bytes: &[u8]) -> SyncResult<Option<Topi
     }
 }
 
+/// A cursor at the start of the current branch when `bytes` names a replaced one.
+/// Replaying from there applies the records a graph clock already covers as duplicates.
+pub(crate) fn restart_cursor(
+    topic: irokle::TopicId,
+    bytes: &[u8],
+    frontier: &TopicFrontier,
+) -> SyncResult<Option<Vec<u8>>> {
+    let Some(stored) = stored_cursor(topic, bytes)? else {
+        return Ok(None);
+    };
+    if stored.epoch == frontier.epoch && stored.genesis == frontier.genesis {
+        return Ok(None);
+    }
+    encode_topic_cursor(&TopicCursorPayload {
+        version: TOPIC_CURSOR_VERSION,
+        topic,
+        epoch: frontier.epoch,
+        genesis: frontier.genesis,
+        clock: irokle::ActorClock::default(),
+        target: None,
+    })
+    .map(Some)
+}
+
+/// The same cursor on a different topic branch, as a replaced topic leaves it.
+#[cfg(test)]
+pub(crate) fn rebranch_cursor(topic: irokle::TopicId, bytes: &[u8]) -> Vec<u8> {
+    let mut payload = decode_topic_cursor(topic, bytes).unwrap();
+    payload.genesis = irokle::OpId::from_bytes([7; 32]);
+    encode_topic_cursor(&payload).unwrap()
+}
+
 /// Encodes a version 1 cursor as stores written before branch fences hold it.
 #[cfg(test)]
 pub(crate) fn legacy_cursor(topic: irokle::TopicId, clock: irokle::ActorClock) -> Vec<u8> {

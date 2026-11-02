@@ -2669,6 +2669,18 @@ impl CraqleNode {
         topic_id: irokle::TopicId,
     ) -> Result<TopicPass> {
         let mut stored_cursor = self.store.applied_topic_clock(topic_id.as_bytes())?;
+        if let Some(bytes) = &stored_cursor
+            && let Some(restart) =
+                sync::restart_cursor(topic_id, bytes, &sync.topic_frontier(topic_id)?)?
+        {
+            tracing::warn!(
+                topic = %topic_id,
+                "replaying craqle topic whose applied cursor names a replaced branch",
+            );
+            self.store.set_topic_clock(topic_id.as_bytes(), &restart)?;
+            self.store.persist()?;
+            stored_cursor = Some(restart);
+        }
         let mut applied = HashSet::new();
         let mut stalled = None;
         loop {
@@ -6274,6 +6286,102 @@ mod tests {
         assert_eq!(cursor(&pair.replica), clock);
         let after = pair.replica.export_rocrate(&AllowAllAuthorizer, &graph);
         assert_eq!(after.unwrap(), before);
+    }
+
+    /// A cursor naming a replaced topic branch replays the current branch as duplicates.
+    #[test]
+    fn stale_branch_replays() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:stale-branch-cursor");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "stale"))
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let sync = pair.replica.sync.clone().unwrap();
+        let stale_cursor = || {
+            let frontier = sync.topic_frontier(topic).unwrap();
+            let current = sync.topic_cursor_at(topic, &frontier.clock).unwrap();
+            crate::sync::rebranch_cursor(topic, &current)
+        };
+        let export = |node: &CraqleNode| node.export_rocrate(&AllowAllAuthorizer, &graph).unwrap();
+        let before = export(&pair.replica);
+        let applied = pair.replica.store.applied_topic_clock(topic.as_bytes());
+
+        let stale = stale_cursor();
+        pair.replica
+            .store
+            .set_topic_clock(topic.as_bytes(), &stale)
+            .unwrap();
+        let pass = pair.replica.reconcile_topic(&sync, topic).unwrap();
+        assert!(pass.stalled.is_none());
+        assert!(
+            pass.applied.is_empty(),
+            "applied records must replay as duplicates"
+        );
+        assert_eq!(
+            pair.replica
+                .store
+                .applied_topic_clock(topic.as_bytes())
+                .unwrap(),
+            applied.unwrap(),
+            "replay ends at the cursor a fresh pass stores"
+        );
+        assert_eq!(export(&pair.replica), before);
+
+        // The stale cursor covers this record, so only the replay delivers it.
+        write_keyword(&pair.origin, &graph, "later");
+        pair.replica
+            .store
+            .set_topic_clock(topic.as_bytes(), &stale_cursor())
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let fresh = CraqleNode::open_with_options(
+            pair._dir.path().join("fresh"),
+            CraqleOptions::new()
+                .with_search_storage(SearchStorage::Memory)
+                .with_irokle(pair.irokle.clone(), CraqleIrokleOptions::new()),
+        )
+        .unwrap();
+        fresh.reconcile_irokle().unwrap();
+        assert_ne!(export(&pair.replica), before);
+        assert_eq!(export(&pair.replica), export(&fresh));
+    }
+
+    /// A cursor on the current branch stays authoritative and is not replayed.
+    #[test]
+    fn matching_cursor_kept() {
+        let pair = replica_pair();
+        let graph = GraphId::new("urn:test:matching-branch-cursor");
+        pair.origin
+            .create_crate(&writer_auth(), crate_request(&graph, "matching"))
+            .unwrap();
+        pair.replica.reconcile_irokle().unwrap();
+        let topic = pair.origin.irokle_topic_id(&graph).unwrap().unwrap();
+        let sync = pair.replica.sync.clone().unwrap();
+        let before = pair
+            .replica
+            .export_rocrate(&AllowAllAuthorizer, &graph)
+            .unwrap();
+
+        write_keyword(&pair.origin, &graph, "covered");
+        let frontier = sync.topic_frontier(topic).unwrap();
+        let current = sync.topic_cursor_at(topic, &frontier.clock).unwrap();
+        pair.replica
+            .store
+            .set_topic_clock(topic.as_bytes(), &current)
+            .unwrap();
+        let pass = pair.replica.reconcile_topic(&sync, topic).unwrap();
+        assert!(pass.stalled.is_none() && pass.applied.is_empty());
+        assert_eq!(
+            pair.replica
+                .store
+                .applied_topic_clock(topic.as_bytes())
+                .unwrap(),
+            Some(current)
+        );
+        let after = pair.replica.export_rocrate(&AllowAllAuthorizer, &graph);
+        assert_eq!(after.unwrap(), before, "a matching cursor must not replay");
     }
 
     #[test]

@@ -17,6 +17,12 @@ All notable changes to Craqle are documented here.
 
 - Integrates Irokle 0.3.2 at revision `209f881af3fa4b8ed16e2ca0a0315d663029329e`.
 
+### Fixed
+
+- Reconciliation no longer fails with an expired cursor when the applied topic cursor names a
+  replaced topic branch. It resets the cursor to the start of the current branch and replays
+  the topic; records the graph already holds apply as duplicates.
+
 ## 0.3.1 - Unreleased
 
 ### Changed
