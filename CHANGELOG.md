@@ -14,6 +14,9 @@ All notable changes to Craqle are documented here.
   `WalAlreadyDurable` sets the policy locally without publishing it or creating the graph topic.
 - `CraqleNode::applied_cursor_digest` returns the digest `repair_irokle_topic_cursor` expects,
   so a fenced topic can be repaired on a running node.
+- Full-text search also matches indexed words that start with a query word of at least three
+  characters, so `SAMD` finds `SAMD00012345`. Exact word matches rank above such prefix matches.
+  A very broad prefix keeps the prefix matches that fit the query budget instead of failing.
 
 ### Changed
 

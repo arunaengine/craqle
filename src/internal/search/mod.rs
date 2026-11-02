@@ -14,19 +14,21 @@ use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
 
+use tantivy::SegmentReader;
 use tantivy::TERMINATED;
 #[cfg(test)]
 use tantivy::collector::{BytesFilterCollector, TopDocs};
+use tantivy::index::SegmentId;
 use tantivy::query::{
-    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, EnableScoring, Occur, Query,
-    QueryParser, TermQuery, TermSetQuery,
+    AllQuery, Bm25StatisticsProvider as _, Bm25Weight, BooleanQuery, BoostQuery, ConstScoreQuery,
+    EnableScoring, Explanation, Occur, Query, QueryParser, Scorer, TermQuery, TermSetQuery, Weight,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT, TextFieldIndexing,
     Value,
 };
 use tantivy::tokenizer::{
-    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+    AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, TokenStream,
 };
 use tantivy::{DocAddress, DocId, DocSet, Index, IndexReader, IndexWriter, Score, Searcher};
 use tantivy::{TantivyDocument, Term};
@@ -55,6 +57,11 @@ const REBUILD_SHARDS: usize = 64;
 /// Damaged graphs retained for targeted reindex; overflow escalates to a whole rebuild.
 const DAMAGED_GRAPHS: usize = 64;
 const ALL_TEXT_TOKENIZER: &str = "craqle_text_v2";
+/// Query words this long also match the indexed words that start with them.
+const PREFIX_CHARS: usize = 3;
+/// Prefix matches add no score, so they rank after every exact match, whose BM25 score is
+/// positive, and leave the order of exact matches unchanged.
+const PREFIX_BOOST: Score = 0.0;
 const INDEX_VERSION_FIELD: &str = "_craqle_search_index_v5";
 const INDEX_ID_FILE: &str = ".craqle-index-id";
 const DIRECT_GENERATION: GenerationId = GenerationId(1);
@@ -289,6 +296,82 @@ pub(crate) struct FilterQuery<'a, E> {
     pub check: &'a dyn Fn() -> std::result::Result<(), E>,
     /// Optional semijoin hint; the caller retains the original RDF join when it is declined.
     pub candidates: Option<&'a CandidateSource<'a, E>>,
+}
+
+/// A ranked search's query words to expand by prefix, with its cancellation check.
+struct PrefixScan<'a, E> {
+    searcher: &'a Searcher,
+    query: &'a str,
+    check: &'a dyn Fn() -> std::result::Result<(), E>,
+}
+
+/// The documents of each segment that match a query word by prefix, at constant score.
+#[derive(Clone, Debug)]
+struct PrefixDocs(Arc<HashMap<SegmentId, Arc<Vec<DocId>>>>);
+
+impl Query for PrefixDocs {
+    fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl Weight for PrefixDocs {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        let docs = self
+            .0
+            .get(&reader.segment_id())
+            .cloned()
+            .unwrap_or_default();
+        Ok(Box::new(SortedDocs {
+            docs,
+            cursor: 0,
+            score: boost,
+        }))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        let docs = self.0.get(&reader.segment_id());
+        match docs.is_some_and(|docs| docs.binary_search(&doc).is_ok()) {
+            true => Ok(Explanation::new("PrefixDocs", 1.0)),
+            false => Err(tantivy::TantivyError::InvalidArgument(format!(
+                "document {doc} does not match a prefix"
+            ))),
+        }
+    }
+}
+
+/// One segment's prefix matches in document order, each with the same score.
+struct SortedDocs {
+    docs: Arc<Vec<DocId>>,
+    cursor: usize,
+    score: Score,
+}
+
+impl DocSet for SortedDocs {
+    fn advance(&mut self) -> DocId {
+        self.cursor = (self.cursor + 1).min(self.docs.len());
+        self.doc()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        let rest = self.docs.get(self.cursor..).unwrap_or_default();
+        self.cursor += rest.partition_point(|doc| *doc < target);
+        self.doc()
+    }
+
+    fn doc(&self) -> DocId {
+        self.docs.get(self.cursor).copied().unwrap_or(TERMINATED)
+    }
+
+    fn size_hint(&self) -> u32 {
+        u32::try_from(self.docs.len()).unwrap_or(u32::MAX)
+    }
+}
+
+impl Scorer for SortedDocs {
+    fn score(&mut self) -> Score {
+        self.score
+    }
 }
 
 pub(crate) type CandidateSource<'a, E> =
@@ -1866,10 +1949,28 @@ impl SearchIndex {
         let view = self.pin_view();
         self.check_bound(&view).map_err(E::from)?;
         let parser = QueryParser::for_index(&self.index, vec![self.f_all_text]);
-        let parsed = parser
-            .parse_query(&sanitize_query(req.query))
+        let sanitized = sanitize_query(req.query);
+        let mut parsed = parser
+            .parse_query(&sanitized)
             .map_err(SearchError::from)
             .map_err(E::from)?;
+        // Complete matching serves SPARQL text filters, which keep whole-word semantics.
+        let scan = PrefixScan {
+            searcher: &view.searcher,
+            query: &sanitized,
+            check: req.check,
+        };
+        let prefixes = match complete {
+            true => None,
+            false => self.prefix_docs(scan)?,
+        };
+        if let Some(prefixes) = prefixes {
+            let boosted: Box<dyn Query> = Box::new(BoostQuery::new(prefixes, PREFIX_BOOST));
+            parsed = Box::new(BooleanQuery::new(vec![
+                (Occur::Should, floor_exact(parsed)),
+                (Occur::Should, boosted),
+            ]));
+        }
         let mut query: Box<dyn Query> = if let Some(subject) = req.subject {
             Box::new(BooleanQuery::new(vec![
                 (Occur::Must, parsed),
@@ -1896,19 +1997,7 @@ impl SearchIndex {
             && let Some(subjects) = prepare()?
         {
             (req.check)()?;
-            let bitset = view
-                .searcher
-                .segment_readers()
-                .iter()
-                .map(|reader| {
-                    (reader.max_doc() as usize)
-                        .div_ceil(64)
-                        .saturating_mul(8)
-                        .saturating_add(64)
-                })
-                .max()
-                .unwrap_or(0);
-            let bytes = candidate_bytes(&subjects).saturating_add(bitset);
+            let bytes = candidate_bytes(&subjects).saturating_add(bitset_bytes(&view.searcher));
             let limit = req.limit.min(crate::MAX_SEARCH_LIMIT);
             // Postings frequency is a whole-index count that could span graphs this caller
             // cannot see, so admission relies only on the already-authorized candidate set.
@@ -3307,6 +3396,92 @@ impl SearchIndex {
         })
     }
 
+    /// Documents holding a longer indexed word that starts with a long enough query word. Terms are
+    /// kept in word and dictionary order while their documents fit a quarter of the query budget.
+    fn prefix_docs<E>(
+        &self,
+        req: PrefixScan<'_, E>,
+    ) -> std::result::Result<Option<Box<dyn Query>>, E>
+    where
+        E: From<SearchError>,
+    {
+        let mut analyzer =
+            (self.index.tokenizer_for_field(self.f_all_text)).map_err(SearchError::from)?;
+        let mut stream = analyzer.token_stream(req.query);
+        let mut words = std::collections::BTreeSet::new();
+        while let Some(token) = stream.next() {
+            if token.text.chars().count() >= PREFIX_CHARS
+                && has_longer(req.searcher, self.f_all_text, &token.text)?
+            {
+                words.insert(token.text.clone());
+            }
+        }
+        if words.is_empty() {
+            return Ok(None);
+        }
+        let (limit, mut bytes) = (self.query_bytes() / 4, 0usize);
+        let mut segments = HashMap::new();
+        for reader in req.searcher.segment_readers() {
+            let inverted = (reader.inverted_index(self.f_all_text)).map_err(SearchError::from)?;
+            let terms = |word: &str| {
+                let mut range = inverted.terms().range().gt(word.as_bytes());
+                if let Some(end) = prefix_end(word.as_bytes()) {
+                    range = range.lt(end);
+                }
+                range.into_stream().map_err(SearchError::from)
+            };
+            // Document frequencies size the list once, so it never grows; the first term whose
+            // documents pass the budget ends the expansion in this and every later segment.
+            let (mut size, mut kept, mut full) = (0usize, 0usize, false);
+            'count: for word in &words {
+                let mut terms = terms(word)?;
+                while terms.advance() {
+                    (req.check)()?;
+                    let next = size.saturating_add(terms.value().doc_freq as usize);
+                    let charge = next.saturating_mul(std::mem::size_of::<DocId>());
+                    if bytes.saturating_add(charge) > limit {
+                        full = true;
+                        break 'count;
+                    }
+                    (size, kept) = (next, kept + 1);
+                }
+            }
+            bytes = bytes.saturating_add(size.saturating_mul(std::mem::size_of::<DocId>()));
+            let (mut docs, mut read) = (Vec::with_capacity(size), 0usize);
+            'read: for word in &words {
+                let mut terms = terms(word)?;
+                while terms.advance() {
+                    if read == kept {
+                        break 'read;
+                    }
+                    read += 1;
+                    (req.check)()?;
+                    let option = IndexRecordOption::Basic;
+                    let mut postings = (inverted
+                        .read_block_postings_from_terminfo(terms.value(), option))
+                    .map_err(SearchError::from)?;
+                    while !postings.docs().is_empty() {
+                        (req.check)()?;
+                        if docs.len().saturating_add(postings.docs().len()) > size {
+                            return Err(E::from(SearchError::Damaged {
+                                detail: "postings length",
+                            }));
+                        }
+                        docs.extend_from_slice(postings.docs());
+                        postings.advance();
+                    }
+                }
+            }
+            docs.sort_unstable();
+            docs.dedup();
+            segments.insert(reader.segment_id(), Arc::new(docs));
+            if full {
+                break;
+            }
+        }
+        Ok(Some(Box::new(PrefixDocs(Arc::new(segments)))))
+    }
+
     /// Whether block-max pruning bounds hold: one segment, one field, and a term union
     /// scored with that segment's own statistics.
     fn pruning_safe(&self, searcher: &Searcher, query: &dyn Query) -> bool {
@@ -3821,6 +3996,55 @@ fn rebuild_shard(graph_iri: &str) -> usize {
     (hasher.finish() % REBUILD_SHARDS as u64) as usize
 }
 
+/// Raises every exact match's score above zero, the score of prefix-only matches. The floor is
+/// lost in any normal score, so it only lifts scores that round to zero.
+fn floor_exact(exact: Box<dyn Query>) -> Box<dyn Query> {
+    let floor = Box::new(ConstScoreQuery::new(exact.box_clone(), Score::MIN_POSITIVE));
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Should, exact),
+        (Occur::Should, floor),
+    ]))
+}
+
+/// Bytes of the largest segment's document bitset.
+fn bitset_bytes(searcher: &Searcher) -> usize {
+    searcher
+        .segment_readers()
+        .iter()
+        .map(|reader| {
+            (reader.max_doc() as usize)
+                .div_ceil(64)
+                .saturating_mul(8)
+                .saturating_add(64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether an indexed word of `field` starts with `word` and is longer than it.
+fn has_longer(searcher: &Searcher, field: Field, word: &str) -> Result<bool> {
+    let end = prefix_end(word.as_bytes());
+    for reader in searcher.segment_readers() {
+        let inverted = reader.inverted_index(field)?;
+        let mut range = inverted.terms().range().gt(word.as_bytes());
+        if let Some(end) = &end {
+            range = range.lt(end);
+        }
+        if range.into_stream()?.advance() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The smallest byte string after every string that starts with `prefix`.
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+    let mut end = prefix[..=last].to_vec();
+    end[last] += 1;
+    Some(end)
+}
+
 fn sanitize_query(query: &str) -> String {
     let cleaned: String = query
         .chars()
@@ -4173,6 +4397,239 @@ mod tests {
         assert!(bounded.remaining);
         assert!(bounded.bytes <= scan.byte_limit);
         assert!(bounded.rows < page.rows);
+    }
+
+    fn prefix_fixture(descriptions: &[(&str, &str)]) -> (tempfile::TempDir, crate::CraqleNode) {
+        let dir = tempdir().unwrap();
+        let node = crate::CraqleNode::open(dir.path()).unwrap();
+        for (graph, description) in descriptions {
+            let request = crate_request(&GraphId::new(graph), description, true);
+            node.create_crate(&writer_auth(), request).unwrap();
+        }
+        node.flush_search_updates().unwrap();
+        (dir, node)
+    }
+
+    #[test]
+    fn prefix_finds_accessions() {
+        let (_dir, node) = prefix_fixture(&[("urn:test:accession", "sample SAMD00012345")]);
+        let hits = node.search.search("SAMD", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.graph_id == "urn:test:accession"));
+        assert!(node.search.search("sa", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_ranks_first() {
+        let (_dir, node) = prefix_fixture(&[
+            ("urn:test:longer", "samd00099999"),
+            ("urn:test:exact", "samd"),
+        ]);
+        let hits = node.search.search("samd", 10).unwrap();
+        let position = |graph: &str| hits.iter().position(|hit| hit.graph_id == graph);
+        let last_exact = hits
+            .iter()
+            .rposition(|hit| hit.graph_id == "urn:test:exact");
+        assert!(position("urn:test:longer").is_some());
+        assert!(last_exact.unwrap() < position("urn:test:longer").unwrap());
+    }
+
+    // Exact matches of one word rank above documents that match every word only by prefix.
+    #[test]
+    fn multiword_exact_first() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..300 {
+            let subject = format!("urn:test:tier:{position}");
+            index
+                .index_resource("urn:test:tier", &subject, Some("sample"))
+                .unwrap();
+        }
+        let text = Some("SAMD00012345 samples");
+        index
+            .index_resource("urn:test:tier", "urn:test:tier:prefix", text)
+            .unwrap();
+        index.commit().unwrap();
+        let hits = index.search("sample SAMD", 400).unwrap();
+        assert_eq!(hits.len(), 301);
+        assert_eq!(hits[300].subject_iri, "urn:test:tier:prefix");
+    }
+
+    // A prefix over its budget keeps the terms that fit in dictionary order; exact hits stay first.
+    #[test]
+    fn prefix_budget_caps() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let mut index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..2 {
+            let subject = format!("urn:test:cap:exact:{position}");
+            index
+                .index_resource("urn:test:cap", &subject, Some("samd"))
+                .unwrap();
+        }
+        for position in 0..200 {
+            let text = format!("samd{position:08}");
+            let subject = format!("urn:test:cap:{position}");
+            index
+                .index_resource("urn:test:cap", &subject, Some(&text))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        index.prepared_bytes = 12_796;
+        let hits = index.search("samd", 10).unwrap();
+        let subjects = |hits: &[SearchHit]| -> Vec<String> {
+            hits.iter().map(|hit| hit.subject_iri.clone()).collect()
+        };
+        let again = index.search("samd", 10).unwrap();
+        assert_eq!(
+            subjects(&hits),
+            subjects(&again),
+            "the same query keeps the same hits"
+        );
+        let exact: Vec<_> = hits[..2]
+            .iter()
+            .map(|hit| hit.subject_iri.as_str())
+            .collect();
+        assert!(
+            exact.iter().all(|subject| subject.contains(":exact:")),
+            "{exact:?}"
+        );
+        assert!(hits[2..].iter().all(|hit| hit.score == 0.0));
+
+        let view = index.pin_view();
+        let check = || Ok::<(), SearchError>(());
+        let scan = PrefixScan {
+            searcher: &view.searcher,
+            query: "samd",
+            check: &check,
+        };
+        let docs = index.prefix_docs(scan).unwrap().unwrap();
+        let docs = docs.downcast_ref::<PrefixDocs>().unwrap();
+        let mut subjects = Vec::new();
+        for (ord, reader) in view.searcher.segment_readers().iter().enumerate() {
+            for doc in docs
+                .0
+                .get(&reader.segment_id())
+                .map_or(&[][..], |docs| &docs[..])
+            {
+                let address = DocAddress::new(ord as u32, *doc);
+                let stored = view.searcher.doc(address).unwrap();
+                subjects.push(index.doc_to_hit(stored, 0.0).unwrap().subject_iri);
+            }
+        }
+        subjects.sort_by_key(|subject| subject.rsplit(':').next().unwrap().parse::<u32>().ok());
+        let first: Vec<_> = (0..199).map(|n| format!("urn:test:cap:{n}")).collect();
+        assert_eq!(
+            subjects, first,
+            "799 bytes keep the first 199 one-document terms"
+        );
+    }
+
+    // The cap charges the lists' exact capacity: 200 matches cost 800 bytes, no more.
+    #[test]
+    fn prefix_budget_exact() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let mut index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..200 {
+            let text = format!("samd{position:08}");
+            let subject = format!("urn:test:exact-budget:{position}");
+            index
+                .index_resource("urn:test:exact-budget", &subject, Some(&text))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let kept = |index: &SearchIndex| {
+            let view = index.pin_view();
+            let check = || Ok::<(), SearchError>(());
+            let scan = PrefixScan {
+                searcher: &view.searcher,
+                query: "samd",
+                check: &check,
+            };
+            let docs = index.prefix_docs(scan).unwrap().unwrap();
+            let docs = docs.downcast_ref::<PrefixDocs>().unwrap();
+            docs.0.values().map(|docs| docs.len()).sum::<usize>()
+        };
+        index.prepared_bytes = 12_800;
+        assert_eq!(kept(&index), 200, "800 bytes hold all 200 documents");
+        index.prepared_bytes = 12_796;
+        assert_eq!(kept(&index), 199, "799 bytes hold one document less");
+    }
+
+    // An exact match whose BM25 score rounds to zero still ranks above a prefix-only match.
+    #[test]
+    fn exact_floor_ranks() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        index
+            .index_resource("urn:test:floor", "urn:test:floor:exact", Some("samd"))
+            .unwrap();
+        let text = Some("samd00012345");
+        index
+            .index_resource("urn:test:floor", "urn:test:floor:prefix", text)
+            .unwrap();
+        index.commit().unwrap();
+        let term = |text: &str| -> Box<dyn Query> {
+            let term = Term::from_field_text(index.f_all_text, text);
+            let term = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+            Box::new(BoostQuery::new(term, 0.0))
+        };
+        let query = BooleanQuery::new(vec![
+            (Occur::Should, floor_exact(term("samd"))),
+            (Occur::Should, term("samd00012345")),
+        ]);
+        let searcher = &index.pin_view().searcher;
+        let top = searcher.search(&query, &TopDocs::with_limit(2).order_by_score());
+        let scores: Vec<Score> = top.unwrap().into_iter().map(|(score, _)| score).collect();
+        assert!(scores[0] > 0.0 && scores[1] == 0.0, "{scores:?}");
+    }
+
+    // The prefix expansion checks for cancellation per word and postings block, so it stops there.
+    #[test]
+    fn prefix_expansion_cancels() {
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).with_search_writer(20_000_000);
+        let index = SearchIndex::memory_with_budget(budget).unwrap();
+        for position in 0..50 {
+            let text = format!("samd{position:08}");
+            let subject = format!("urn:test:cancel:{position}");
+            index
+                .index_resource("urn:test:cancel", &subject, Some(&text))
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let view = index.pin_view();
+        let calls = AtomicU64::new(0);
+        let check = || match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(()),
+            _ => Err(SearchError::Cancelled),
+        };
+        let scan = PrefixScan {
+            searcher: &view.searcher,
+            query: "samd",
+            check: &check,
+        };
+        assert!(matches!(
+            index.prefix_docs(scan),
+            Err(SearchError::Cancelled)
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the expansion stops at the failed check"
+        );
+    }
+
+    #[test]
+    fn prefix_ignores_patterns() {
+        let (_dir, node) = prefix_fixture(&[("urn:test:pattern", "SAMD00012345")]);
+        for query in [
+            ".*00012345",
+            "s[a-z]md00012345",
+            "(sa|xx)md",
+            "s.m.00012345",
+        ] {
+            assert!(node.search.search(query, 10).unwrap().is_empty(), "{query}");
+        }
+        assert!(!node.search.search("samd0001", 10).unwrap().is_empty());
     }
 
     #[test]
