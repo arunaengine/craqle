@@ -4699,6 +4699,12 @@ impl CraqleNode {
         Ok(self.store.persist()?)
     }
 
+    /// The graph store's Fjall database. Its snapshots give a consistent copy of the
+    /// authoritative graph data while the node keeps running, for example for backups.
+    pub fn store_database(&self) -> fjall::Database {
+        self.store.database().clone()
+    }
+
     /// Apply each replicated compare-and-set under the graph write lock.
     /// This preserves tombstone, policy, and context ordering across peers.
     #[cfg(test)]
