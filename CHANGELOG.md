@@ -22,6 +22,8 @@ All notable changes to Craqle are documented here.
 
 - Integrates Irokle 0.3.2 at revision `209f881af3fa4b8ed16e2ca0a0315d663029329e`.
 - Uses ro-crate-rs at revision `9cbb366c7569e79220a2c047a54309d596f8d208`, which moves to zip 9.
+- Updates tantivy to 0.27, rustls to 0.23.46, and the Oxigraph RDF crates, fjall, uuid and
+  serde_json to their latest releases. Existing search indexes stay readable.
 
 ### Fixed
 
