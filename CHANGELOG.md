@@ -18,8 +18,9 @@ All notable changes to Craqle are documented here.
   characters, so `SAMD` finds `SAMD00012345`. Exact word matches rank above such prefix matches.
   A very broad prefix keeps the prefix matches that fit the query budget instead of failing.
 - `CraqleNode::store_database` returns the graph store's Fjall database for live backups.
-- `CraqleNode::plan_remove_data` plans removing one root-linked data entity: the triples it
-  holds and the root's `hasPart` link to it, without side effects. Other subjects stay.
+- `CraqleNode::plan_remove_data` plans removing one root-linked `File` entity (also typed
+  `MediaObject`): the triples it holds and the root's `hasPart` link to it, without side
+  effects. Other subjects stay, also their references to it; other entities are refused.
 
 ### Changed
 

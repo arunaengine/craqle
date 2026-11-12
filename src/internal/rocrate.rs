@@ -737,7 +737,7 @@ impl RoCrateManager {
         Ok(changes)
     }
 
-    /// The changes removing one root-linked data entity: every triple it holds and the root's
+    /// The changes removing one root-linked `File` entity: every triple it holds and the root's
     /// `hasPart` link to it. Other subjects stay, also those that still reference it.
     pub(crate) fn plan_remove_data(
         &self,
@@ -758,19 +758,23 @@ impl RoCrateManager {
                     child_id: &entity_id,
                 },
             )?;
-        if !linked {
+        let stored = self.stored_subject_triples(&cx, &entity_id)?;
+        // Only a file is removed here; a linked person or work is a contextual entity.
+        let kind = EncodedTerm::from_named_node(&vocab::rdf_type());
+        let file =
+            (stored.iter()).any(|(predicate, object)| *predicate == kind && file_class(object));
+        if !linked || !file {
             return Err(RoCrateError::EntityNotFound(entity_id));
         }
         let subject = encoded_subject(&entity_id);
-        let mut changes: Vec<MaterializedQuadChange> =
-            (self.stored_subject_triples(&cx, &entity_id)?.into_iter())
-                .map(|(predicate, object)| MaterializedQuadChange::Delete {
-                    graph: graph_id.clone(),
-                    subject: subject.clone(),
-                    predicate,
-                    object,
-                })
-                .collect();
+        let mut changes: Vec<MaterializedQuadChange> = (stored.into_iter())
+            .map(|(predicate, object)| MaterializedQuadChange::Delete {
+                graph: graph_id.clone(),
+                subject: subject.clone(),
+                predicate,
+                object,
+            })
+            .collect();
         changes.push(MaterializedQuadChange::Delete {
             graph: graph_id.clone(),
             subject: encoded_subject(parent_id),
@@ -3256,6 +3260,21 @@ fn reassert_entity(
         }
     }
     Ok(())
+}
+
+/// Whether a stored type names RO-Crate's `File`, which the 1.1 and 1.2 contexts map to
+/// `schema:MediaObject`.
+fn file_class(term: &EncodedTerm) -> bool {
+    ["http://schema.org/", "https://schema.org/"]
+        .iter()
+        .any(|base| {
+            ["File", "MediaObject"].iter().any(|name| {
+                *term
+                    == EncodedTerm::from_named_node(&NamedNode::new_unchecked(format!(
+                        "{base}{name}"
+                    )))
+            })
+        })
 }
 
 fn entity_subject_triples(

@@ -598,3 +598,51 @@ fn removal_meets_patch() {
         .collect();
     assert_eq!(names, ["\"renamed.raw\""]);
 }
+
+#[test]
+fn removal_needs_file() {
+    // Linked contextual entities are refused without a change; a removed file's incoming
+    // references from other subjects stay.
+    let tmp = tempfile::tempdir().unwrap();
+    let planner = node(tmp.path(), "planner");
+    let graph = GraphId::new("https://w3id.org/aruna/merge-remove-file");
+    let root = graph.as_str();
+    let jsonld = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}, "about": {"@id": root}},
+            {"@id": root, "@type": "Dataset", "name": "Files", "description": "d",
+             "datePublished": "2026-06-10",
+             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+             "hasPart": [{"@id": "./a.raw"}, {"@id": "#alice"}, {"@id": "#notes"}]},
+            {"@id": "./a.raw", "@type": "File", "name": "a.raw", "author": {"@id": "#alice"}},
+            {"@id": "#alice", "@type": "Person", "name": "Alice"},
+            {"@id": "#notes", "@type": "CreativeWork", "name": "Notes", "about": {"@id": "./a.raw"}}
+        ]
+    });
+    apply_doc(&planner, &graph, &jsonld.to_string());
+    let before = planner.graph_snapshot(&graph).unwrap();
+    let remove = |entity_id: &str| RemoveEntityRequest {
+        graph: graph.clone(),
+        entity_id: entity_id.to_string(),
+    };
+    for contextual in ["#alice", "#notes"] {
+        let refused = planner.plan_remove_data(&AllowAllAuthorizer, &remove(contextual));
+        assert!(refused.is_err(), "{contextual}");
+    }
+    assert_eq!(before, planner.graph_snapshot(&graph).unwrap());
+    let planned = planner
+        .plan_remove_data(&AllowAllAuthorizer, &remove("./a.raw"))
+        .unwrap();
+    let batch = planned_batch(&planner, &graph, (212, planned));
+    assert!(planner.merge_batch(&batch).unwrap().applied);
+    let about = objects_for(&planner, &graph, vocab::schema_about().as_str());
+    assert!(
+        about.iter().any(|object| object.contains("a.raw")),
+        "{about:?}"
+    );
+    let (own, linked) = entity_state(&planner, &graph, "a.raw");
+    assert!(!linked);
+    assert!(own.is_empty(), "{own:?}");
+}
