@@ -3727,9 +3727,8 @@ impl CraqleNode {
         Ok(changes)
     }
 
-    /// Plan removing one root-linked data entity without applying side effects: every triple
-    /// it holds and the root's `hasPart` link to it. Other subjects, also those that still
-    /// reference it, stay; the root, the descriptor or an unlinked id answer entity not found.
+    /// Plan removing one root-linked `File` entity and the root's `hasPart` link to it, without
+    /// side effects. Other subjects stay; any other entity answers entity not found.
     pub fn plan_remove_data(
         &self,
         auth: &dyn Authorizer,
