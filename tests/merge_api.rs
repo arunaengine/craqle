@@ -615,8 +615,10 @@ fn removal_needs_file() {
             {"@id": root, "@type": "Dataset", "name": "Files", "description": "d",
              "datePublished": "2026-06-10",
              "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
-             "hasPart": [{"@id": "./a.raw"}, {"@id": "#alice"}, {"@id": "#notes"}]},
+             "hasPart": [{"@id": "./a.raw"}, {"@id": "#alice"}, {"@id": "#notes"},
+                         {"@id": "#output"}]},
             {"@id": "./a.raw", "@type": "File", "name": "a.raw", "author": {"@id": "#alice"}},
+            {"@id": "#output", "@type": "File", "name": "Output"},
             {"@id": "#alice", "@type": "Person", "name": "Alice"},
             {"@id": "#notes", "@type": "CreativeWork", "name": "Notes", "about": {"@id": "./a.raw"}}
         ]
@@ -627,7 +629,7 @@ fn removal_needs_file() {
         graph: graph.clone(),
         entity_id: entity_id.to_string(),
     };
-    for contextual in ["#alice", "#notes"] {
+    for contextual in ["#alice", "#notes", "#output"] {
         let refused = planner.plan_remove_data(&AllowAllAuthorizer, &remove(contextual));
         assert!(refused.is_err(), "{contextual}");
     }

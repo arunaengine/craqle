@@ -748,9 +748,10 @@ impl RoCrateManager {
         let cx = self.crate_ctx(graph_id)?;
         self.require_rocrate_initialized(&cx)?;
         let parent_id = cx.root_id();
-        // The root and the descriptor are never data entities of the crate.
+        // The root, the descriptor and `#` entities are never data entities of the crate.
         let linked = entity_id != parent_id
             && entity_id != METADATA_ID
+            && !entity_id.starts_with('#')
             && self.has_part_link(
                 &cx,
                 HasPartLink {
