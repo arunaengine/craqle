@@ -507,3 +507,94 @@ fn replicated_aliases_merge() {
         assert!(objects_for(holder, &graph, keywords.as_str()).is_empty());
     }
 }
+
+/// A batch of `changes` planned on `node` by a fresh `actor`.
+fn planned_batch(
+    node: &CraqleNode,
+    graph: &GraphId,
+    (seed, changes): (u8, Vec<MaterializedQuadChange>),
+) -> Batch {
+    let clock = node.vector_clock(graph).unwrap();
+    Batch::from_changes(graph.clone(), actor(seed), 1, clock, changes, Utc::now()).unwrap()
+}
+
+/// The quads of `graph` about `subject`, and whether the root links it.
+fn entity_state(
+    node: &CraqleNode,
+    graph: &GraphId,
+    subject: &str,
+) -> (Vec<(String, String)>, bool) {
+    let quads = node.graph_snapshot(graph).unwrap().quads;
+    let own = (quads.iter())
+        .filter(|quad| quad.subject.0.contains(subject))
+        .map(|quad| (quad.predicate.0.clone(), quad.object.0.clone()))
+        .collect();
+    let linked = quads.iter().any(|quad| {
+        quad.predicate.0 == format!("<{}>", vocab::schema_has_part().as_str())
+            && quad.object.0.contains(subject)
+    });
+    (own, linked)
+}
+
+#[test]
+fn removal_meets_patch() {
+    // A file renamed on one replica while another removes it keeps its type and root link with
+    // the new name, whichever batch merges first: the concurrent write wins.
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = GraphId::new("https://w3id.org/aruna/merge-remove-patch");
+    let origin = node(tmp.path(), "origin");
+    apply_doc(&origin, &graph, &doc(&graph, 2));
+    let base = origin.graph_snapshot(&graph).unwrap();
+    let replica = |name: &str| {
+        let replica = node(tmp.path(), name);
+        assert!(replica.install_graph_snapshot(&base).unwrap().applied);
+        replica
+    };
+    let (remover, patcher) = (replica("remover"), replica("patcher"));
+    let removal = RemoveEntityRequest {
+        graph: graph.clone(),
+        entity_id: "./data/file-0.raw".to_string(),
+    };
+    let removal = remover
+        .plan_remove_data(&AllowAllAuthorizer, &removal)
+        .unwrap();
+    let removal = planned_batch(&remover, &graph, (210, removal));
+    let patch = PatchEntityRequest {
+        entity: CreateEntityRequest {
+            graph: graph.clone(),
+            entity_id: "./data/file-0.raw".to_string(),
+            entity_type: "File".to_string(),
+            name: "renamed.raw".to_string(),
+            additional_triples: Vec::new(),
+        },
+        replaced_predicates: vec![vocab::schema_name()],
+    };
+    let patch = patcher
+        .plan_patch_data(&AllowAllAuthorizer, &patch)
+        .unwrap();
+    let patch = planned_batch(&patcher, &graph, (211, patch));
+    let (first, second) = (replica("first"), replica("second"));
+    for batch in [&removal, &patch] {
+        assert!(first.merge_batch(batch).unwrap().applied);
+    }
+    for batch in [&patch, &removal] {
+        assert!(second.merge_batch(batch).unwrap().applied);
+    }
+    assert_eq!(
+        first.graph_snapshot(&graph).unwrap(),
+        second.graph_snapshot(&graph).unwrap()
+    );
+    let (own, linked) = entity_state(&first, &graph, "file-0.raw");
+    assert!(linked, "{own:?}");
+    let kind = format!("<{}>", vocab::rdf_type().as_str());
+    assert!(
+        own.iter().any(|(predicate, _)| *predicate == kind),
+        "{own:?}"
+    );
+    let name = format!("<{}>", vocab::schema_name().as_str());
+    let names: Vec<&String> = (own.iter())
+        .filter(|(predicate, _)| *predicate == name)
+        .map(|(_, object)| object)
+        .collect();
+    assert_eq!(names, ["\"renamed.raw\""]);
+}
