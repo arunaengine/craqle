@@ -719,33 +719,69 @@ impl RoCrateManager {
         if !self.visible_subject_exists(&cx, parent_id)? {
             return Err(RoCrateError::EntityNotFound(parent_id.to_string()));
         }
+        let entity = EntitySpec {
+            entity_id: &entity_id,
+            entity_type,
+            name,
+            additional_triples,
+        };
         let mut changes = self.patch_subject_changes(
             &cx,
             SubjectPatch {
                 subject_id: &entity_id,
-                desired: entity_subject_triples(&EntitySpec {
-                    entity_id: &entity_id,
-                    entity_type,
-                    name,
-                    additional_triples,
-                })?,
+                desired: entity_subject_triples(&entity)?,
                 replaced_predicates,
             },
         )?;
-        if !self.has_part_link(
-            &cx,
-            HasPartLink {
-                parent_id,
-                child_id: &entity_id,
-            },
-        )? {
-            changes.push(insert_change(
-                graph_id,
-                parent_id,
-                &vocab::schema_has_part(),
-                encoded_subject(&entity_id),
-            ));
+        reassert_entity(&cx, &entity, &mut changes)?;
+        Ok(changes)
+    }
+
+    /// The changes removing one root-linked `File` entity: every triple it holds and the root's
+    /// `hasPart` link to it. Other subjects stay, also those that still reference it.
+    pub(crate) fn plan_remove_data(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let entity_id = normalize_entity_id(entity_id);
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
+        let parent_id = cx.root_id();
+        // The root, the descriptor and `#` entities are never data entities of the crate.
+        let linked = entity_id != parent_id
+            && entity_id != METADATA_ID
+            && !entity_id.starts_with('#')
+            && self.has_part_link(
+                &cx,
+                HasPartLink {
+                    parent_id,
+                    child_id: &entity_id,
+                },
+            )?;
+        let stored = self.stored_subject_triples(&cx, &entity_id)?;
+        // Only a file is removed here; a linked person or work is a contextual entity.
+        let kind = EncodedTerm::from_named_node(&vocab::rdf_type());
+        let file =
+            (stored.iter()).any(|(predicate, object)| *predicate == kind && file_class(object));
+        if !linked || !file {
+            return Err(RoCrateError::EntityNotFound(entity_id));
         }
+        let subject = encoded_subject(&entity_id);
+        let mut changes: Vec<MaterializedQuadChange> = (stored.into_iter())
+            .map(|(predicate, object)| MaterializedQuadChange::Delete {
+                graph: graph_id.clone(),
+                subject: subject.clone(),
+                predicate,
+                object,
+            })
+            .collect();
+        changes.push(MaterializedQuadChange::Delete {
+            graph: graph_id.clone(),
+            subject: encoded_subject(parent_id),
+            predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
+            object: subject,
+        });
         Ok(changes)
     }
 
@@ -1374,7 +1410,9 @@ impl RoCrateManager {
             return Err(RoCrateError::EntityNotFound(upsert.parent_id.to_string()));
         }
         let mut changes = self.replace_subject_changes(cx, &upsert.entity)?;
-        if !self.has_part_link(
+        if upsert.parent_id == cx.root_id() {
+            reassert_entity(cx, &upsert.entity, &mut changes)?;
+        } else if !self.has_part_link(
             cx,
             HasPartLink {
                 parent_id: upsert.parent_id,
@@ -3194,6 +3232,50 @@ fn remap_node(node: NamedNode, import_root: Option<&str>, graph_id: &GraphId) ->
         iri.to_string()
     };
     EncodedTerm::from_named_node(&NamedNode::new_unchecked(mapped))
+}
+
+/// Adds inserts of a root data entity's type, name and root link even when they are stored, so
+/// they carry the writer's fresh dot and a concurrent removal does not strip them (add wins).
+fn reassert_entity(
+    cx: &CrateCtx,
+    entity: &EntitySpec<'_>,
+    changes: &mut Vec<MaterializedQuadChange>,
+) -> Result<(), RoCrateError> {
+    let subject = encoded_subject(entity.entity_id);
+    let link = MaterializedQuadChange::Insert {
+        graph: cx.graph.clone(),
+        subject: encoded_subject(cx.root_id()),
+        predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
+        object: subject.clone(),
+    };
+    let own = entity_subject_triples(entity)?.into_iter().take(2);
+    let own = own.map(|(predicate, object)| MaterializedQuadChange::Insert {
+        graph: cx.graph.clone(),
+        subject: subject.clone(),
+        predicate,
+        object,
+    });
+    for insert in own.chain([link]) {
+        if !changes.contains(&insert) {
+            changes.push(insert);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a stored type names RO-Crate's `File`, which the 1.1 and 1.2 contexts map to
+/// `schema:MediaObject`.
+fn file_class(term: &EncodedTerm) -> bool {
+    ["http://schema.org/", "https://schema.org/"]
+        .iter()
+        .any(|base| {
+            ["File", "MediaObject"].iter().any(|name| {
+                *term
+                    == EncodedTerm::from_named_node(&NamedNode::new_unchecked(format!(
+                        "{base}{name}"
+                    )))
+            })
+        })
 }
 
 fn entity_subject_triples(

@@ -18,6 +18,9 @@ All notable changes to Craqle are documented here.
   characters, so `SAMD` finds `SAMD00012345`. Exact word matches rank above such prefix matches.
   A very broad prefix keeps the prefix matches that fit the query budget instead of failing.
 - `CraqleNode::store_database` returns the graph store's Fjall database for live backups.
+- `CraqleNode::plan_remove_data` plans removing one root-linked `File` entity (also typed
+  `MediaObject`): the triples it holds and the root's `hasPart` link to it, without side
+  effects. Other subjects stay, also their references to it; other entities are refused.
 
 ### Changed
 
@@ -25,6 +28,9 @@ All notable changes to Craqle are documented here.
 - Uses ro-crate-rs at revision `9cbb366c7569e79220a2c047a54309d596f8d208`, which moves to zip 9.
 - Updates tantivy to 0.27, rustls to 0.23.46, and the Oxigraph RDF crates, fjall, uuid and
   serde_json to their latest releases. Existing search indexes stay readable.
+- Upserts and patches of a root data entity write its type, name and root `hasPart` link again
+  under their new dot, so a concurrent `plan_remove_data` cannot leave the edited entity
+  without them: the concurrent write wins.
 
 ### Fixed
 

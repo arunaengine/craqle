@@ -314,6 +314,59 @@ fn plan_patch_merges() {
 }
 
 #[test]
+fn plan_remove_merges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let planner = node(tmp.path(), "planner");
+    let graph = GraphId::new("https://w3id.org/aruna/merge-plan-remove");
+    apply_doc(&planner, &graph, &doc(&graph, 2));
+    let before = planner.graph_snapshot(&graph).unwrap();
+    let remove = |entity_id: &str| RemoveEntityRequest {
+        graph: graph.clone(),
+        entity_id: entity_id.to_string(),
+    };
+    for refused in [
+        graph.as_str(),
+        "ro-crate-metadata.json",
+        "./data/missing.raw",
+    ] {
+        let error = planner.plan_remove_data(&AllowAllAuthorizer, &remove(refused));
+        assert!(error.is_err(), "{refused}");
+    }
+
+    let planned = planner
+        .plan_remove_data(&AllowAllAuthorizer, &remove("./data/file-0.raw"))
+        .unwrap();
+    assert_eq!(before, planner.graph_snapshot(&graph).unwrap());
+    let holder = node(tmp.path(), "holder");
+    assert!(holder.install_graph_snapshot(&before).unwrap().applied);
+    let batch = Batch::from_changes(
+        graph.clone(),
+        actor(205),
+        1,
+        planner.vector_clock(&graph).unwrap(),
+        planned,
+        Utc::now(),
+    )
+    .unwrap();
+    assert!(planner.merge_batch(&batch).unwrap().applied);
+    assert!(holder.merge_batch(&batch).unwrap().applied);
+    assert_eq!(
+        planner.graph_snapshot(&graph).unwrap(),
+        holder.graph_snapshot(&graph).unwrap()
+    );
+    // The removed file and its link are gone; the other file, its link and the root stay.
+    let parts = objects_for(&planner, &graph, vocab::schema_has_part().as_str());
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].contains("file-1.raw"), "{parts:?}");
+    let names = objects_for(&planner, &graph, vocab::schema_name().as_str());
+    assert!(names.contains(&"\"file-1.raw\"".to_string()));
+    assert!(!names.contains(&"\"file-0.raw\"".to_string()));
+    assert!(names.contains(&"\"Merge Dataset\"".to_string()));
+    let again = planner.plan_remove_data(&AllowAllAuthorizer, &remove("./data/file-0.raw"));
+    assert!(again.is_err());
+}
+
+#[test]
 fn rejects_foreign_graph() {
     let graph = GraphId::new("https://w3id.org/aruna/merge-builder");
     let other = GraphId::new("https://w3id.org/aruna/merge-builder-other");
@@ -453,4 +506,145 @@ fn replicated_aliases_merge() {
         assert!(holder.merge_batch(&removal).unwrap().applied);
         assert!(objects_for(holder, &graph, keywords.as_str()).is_empty());
     }
+}
+
+/// A batch of `changes` planned on `node` by a fresh `actor`.
+fn planned_batch(
+    node: &CraqleNode,
+    graph: &GraphId,
+    (seed, changes): (u8, Vec<MaterializedQuadChange>),
+) -> Batch {
+    let clock = node.vector_clock(graph).unwrap();
+    Batch::from_changes(graph.clone(), actor(seed), 1, clock, changes, Utc::now()).unwrap()
+}
+
+/// The quads of `graph` about `subject`, and whether the root links it.
+fn entity_state(
+    node: &CraqleNode,
+    graph: &GraphId,
+    subject: &str,
+) -> (Vec<(String, String)>, bool) {
+    let quads = node.graph_snapshot(graph).unwrap().quads;
+    let own = (quads.iter())
+        .filter(|quad| quad.subject.0.contains(subject))
+        .map(|quad| (quad.predicate.0.clone(), quad.object.0.clone()))
+        .collect();
+    let linked = quads.iter().any(|quad| {
+        quad.predicate.0 == format!("<{}>", vocab::schema_has_part().as_str())
+            && quad.object.0.contains(subject)
+    });
+    (own, linked)
+}
+
+#[test]
+fn removal_meets_patch() {
+    // A file renamed on one replica while another removes it keeps its type and root link with
+    // the new name, whichever batch merges first: the concurrent write wins.
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = GraphId::new("https://w3id.org/aruna/merge-remove-patch");
+    let origin = node(tmp.path(), "origin");
+    apply_doc(&origin, &graph, &doc(&graph, 2));
+    let base = origin.graph_snapshot(&graph).unwrap();
+    let replica = |name: &str| {
+        let replica = node(tmp.path(), name);
+        assert!(replica.install_graph_snapshot(&base).unwrap().applied);
+        replica
+    };
+    let (remover, patcher) = (replica("remover"), replica("patcher"));
+    let removal = RemoveEntityRequest {
+        graph: graph.clone(),
+        entity_id: "./data/file-0.raw".to_string(),
+    };
+    let removal = remover
+        .plan_remove_data(&AllowAllAuthorizer, &removal)
+        .unwrap();
+    let removal = planned_batch(&remover, &graph, (210, removal));
+    let patch = PatchEntityRequest {
+        entity: CreateEntityRequest {
+            graph: graph.clone(),
+            entity_id: "./data/file-0.raw".to_string(),
+            entity_type: "File".to_string(),
+            name: "renamed.raw".to_string(),
+            additional_triples: Vec::new(),
+        },
+        replaced_predicates: vec![vocab::schema_name()],
+    };
+    let patch = patcher
+        .plan_patch_data(&AllowAllAuthorizer, &patch)
+        .unwrap();
+    let patch = planned_batch(&patcher, &graph, (211, patch));
+    let (first, second) = (replica("first"), replica("second"));
+    for batch in [&removal, &patch] {
+        assert!(first.merge_batch(batch).unwrap().applied);
+    }
+    for batch in [&patch, &removal] {
+        assert!(second.merge_batch(batch).unwrap().applied);
+    }
+    assert_eq!(
+        first.graph_snapshot(&graph).unwrap(),
+        second.graph_snapshot(&graph).unwrap()
+    );
+    let (own, linked) = entity_state(&first, &graph, "file-0.raw");
+    assert!(linked, "{own:?}");
+    let kind = format!("<{}>", vocab::rdf_type().as_str());
+    assert!(
+        own.iter().any(|(predicate, _)| *predicate == kind),
+        "{own:?}"
+    );
+    let name = format!("<{}>", vocab::schema_name().as_str());
+    let names: Vec<&String> = (own.iter())
+        .filter(|(predicate, _)| *predicate == name)
+        .map(|(_, object)| object)
+        .collect();
+    assert_eq!(names, ["\"renamed.raw\""]);
+}
+
+#[test]
+fn removal_needs_file() {
+    // Linked contextual entities are refused without a change; a removed file's incoming
+    // references from other subjects stay.
+    let tmp = tempfile::tempdir().unwrap();
+    let planner = node(tmp.path(), "planner");
+    let graph = GraphId::new("https://w3id.org/aruna/merge-remove-file");
+    let root = graph.as_str();
+    let jsonld = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}, "about": {"@id": root}},
+            {"@id": root, "@type": "Dataset", "name": "Files", "description": "d",
+             "datePublished": "2026-06-10",
+             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
+             "hasPart": [{"@id": "./a.raw"}, {"@id": "#alice"}, {"@id": "#notes"},
+                         {"@id": "#output"}]},
+            {"@id": "./a.raw", "@type": "File", "name": "a.raw", "author": {"@id": "#alice"}},
+            {"@id": "#output", "@type": "File", "name": "Output"},
+            {"@id": "#alice", "@type": "Person", "name": "Alice"},
+            {"@id": "#notes", "@type": "CreativeWork", "name": "Notes", "about": {"@id": "./a.raw"}}
+        ]
+    });
+    apply_doc(&planner, &graph, &jsonld.to_string());
+    let before = planner.graph_snapshot(&graph).unwrap();
+    let remove = |entity_id: &str| RemoveEntityRequest {
+        graph: graph.clone(),
+        entity_id: entity_id.to_string(),
+    };
+    for contextual in ["#alice", "#notes", "#output"] {
+        let refused = planner.plan_remove_data(&AllowAllAuthorizer, &remove(contextual));
+        assert!(refused.is_err(), "{contextual}");
+    }
+    assert_eq!(before, planner.graph_snapshot(&graph).unwrap());
+    let planned = planner
+        .plan_remove_data(&AllowAllAuthorizer, &remove("./a.raw"))
+        .unwrap();
+    let batch = planned_batch(&planner, &graph, (212, planned));
+    assert!(planner.merge_batch(&batch).unwrap().applied);
+    let about = objects_for(&planner, &graph, vocab::schema_about().as_str());
+    assert!(
+        about.iter().any(|object| object.contains("a.raw")),
+        "{about:?}"
+    );
+    let (own, linked) = entity_state(&planner, &graph, "a.raw");
+    assert!(!linked);
+    assert!(own.is_empty(), "{own:?}");
 }

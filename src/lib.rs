@@ -672,6 +672,13 @@ pub struct PatchEntityRequest {
     pub replaced_predicates: Vec<NamedNode>,
 }
 
+/// Input for removing one root-linked data entity.
+#[derive(Debug, Clone)]
+pub struct RemoveEntityRequest {
+    pub graph: GraphId,
+    pub entity_id: String,
+}
+
 /// Search hit together with hydrated RDF properties.
 #[derive(Debug, Clone)]
 pub struct HydratedSearchHit {
@@ -3716,6 +3723,20 @@ impl CraqleNode {
             &request.entity.additional_triples,
             &request.replaced_predicates,
         )?;
+        self.replication.check_planned_changes(graph, &changes)?;
+        Ok(changes)
+    }
+
+    /// Plan removing one root-linked `File` entity and the root's `hasPart` link to it, without
+    /// side effects. Other subjects stay; any other entity answers entity not found.
+    pub fn plan_remove_data(
+        &self,
+        auth: &dyn Authorizer,
+        request: &RemoveEntityRequest,
+    ) -> Result<Vec<MaterializedQuadChange>> {
+        let graph = &request.graph;
+        self.ensure_graph_action(graph, auth, Action::Write)?;
+        let changes = self.manager().plan_remove_data(graph, &request.entity_id)?;
         self.replication.check_planned_changes(graph, &changes)?;
         Ok(changes)
     }
