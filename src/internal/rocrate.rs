@@ -749,6 +749,49 @@ impl RoCrateManager {
         Ok(changes)
     }
 
+    /// The changes removing one root-linked data entity: every triple it holds and the root's
+    /// `hasPart` link to it. Other subjects stay, also those that still reference it.
+    pub(crate) fn plan_remove_data(
+        &self,
+        graph_id: &GraphId,
+        entity_id: &str,
+    ) -> Result<Vec<MaterializedQuadChange>, RoCrateError> {
+        let entity_id = normalize_entity_id(entity_id);
+        let cx = self.crate_ctx(graph_id)?;
+        self.require_rocrate_initialized(&cx)?;
+        let parent_id = cx.root_id();
+        // The root and the descriptor are never data entities of the crate.
+        let linked = entity_id != parent_id
+            && entity_id != METADATA_ID
+            && self.has_part_link(
+                &cx,
+                HasPartLink {
+                    parent_id,
+                    child_id: &entity_id,
+                },
+            )?;
+        if !linked {
+            return Err(RoCrateError::EntityNotFound(entity_id));
+        }
+        let subject = encoded_subject(&entity_id);
+        let mut changes: Vec<MaterializedQuadChange> =
+            (self.stored_subject_triples(&cx, &entity_id)?.into_iter())
+                .map(|(predicate, object)| MaterializedQuadChange::Delete {
+                    graph: graph_id.clone(),
+                    subject: subject.clone(),
+                    predicate,
+                    object,
+                })
+                .collect();
+        changes.push(MaterializedQuadChange::Delete {
+            graph: graph_id.clone(),
+            subject: encoded_subject(parent_id),
+            predicate: EncodedTerm::from_named_node(&vocab::schema_has_part()),
+            object: subject,
+        });
+        Ok(changes)
+    }
+
     pub(crate) fn append_root_entities(
         &self,
         graph_id: &GraphId,
