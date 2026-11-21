@@ -309,7 +309,8 @@ fn plan_patch_merges() {
     );
     assert!(
         objects_for(&planner, &graph, vocab::schema_name().as_str())
-            .contains(&"\"renamed.raw\"".to_string())
+            .iter()
+            .any(|name| name == "\"renamed.raw\"")
     );
 }
 
@@ -359,9 +360,9 @@ fn plan_remove_merges() {
     assert_eq!(parts.len(), 1);
     assert!(parts[0].contains("file-1.raw"), "{parts:?}");
     let names = objects_for(&planner, &graph, vocab::schema_name().as_str());
-    assert!(names.contains(&"\"file-1.raw\"".to_string()));
-    assert!(!names.contains(&"\"file-0.raw\"".to_string()));
-    assert!(names.contains(&"\"Merge Dataset\"".to_string()));
+    assert!(names.iter().any(|name| name == "\"file-1.raw\""));
+    assert!(!names.iter().any(|name| name == "\"file-0.raw\""));
+    assert!(names.iter().any(|name| name == "\"Merge Dataset\""));
     let again = planner.plan_remove_data(&AllowAllAuthorizer, &remove("./data/file-0.raw"));
     assert!(again.is_err());
 }

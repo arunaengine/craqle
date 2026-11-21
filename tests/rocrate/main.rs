@@ -2775,11 +2775,13 @@ mod tests {
         let summary = parsed(&summary_json);
         assert_entities_linked(&summary, &graph);
         assert!(
-            graph_ids(&summary).contains(&"./profile/mode.json".to_string()),
+            graph_ids(&summary)
+                .iter()
+                .any(|id| id == "./profile/mode.json"),
             "the fixture must put a data entity in the summary, or this proves nothing"
         );
         assert!(
-            !graph_ids(&summary).contains(&"./data/one.txt".to_string()),
+            !graph_ids(&summary).iter().any(|id| id == "./data/one.txt"),
             "ordinary root hasPart files stay out of summary exports"
         );
 
@@ -2809,7 +2811,8 @@ mod tests {
         );
         assert!(
             graph_ids(&parsed(&mgr.export_jsonld_summary(&reimported).unwrap()))
-                .contains(&"./profile/mode.json".to_string()),
+                .iter()
+                .any(|id| id == "./profile/mode.json"),
             "the artifact must survive the summary round trip"
         );
     }
