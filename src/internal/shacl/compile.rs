@@ -15,8 +15,9 @@ use rudof_iri::IriS;
 use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_core::SHACLPath;
 use rudof_rdf::rdf_core::term::Object;
+use rudof_rdf::rdf_core::term::literal::ConcreteLiteral;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
-use shacl::ir::{IRComponent, IRSchema, IRShape, ShapeLabelIdx};
+use shacl::ir::{IRComponent, IRNodeExpr, IRSchema, IRShape, IRTarget, ShapeLabelIdx};
 use shacl::rdf::ShaclParser;
 use shacl::types::{NodeKind, Severity, Target};
 
@@ -1739,6 +1740,7 @@ fn compile_model(
             .into());
         }
         let messages = compile_messages(shape);
+        let deactivated = compile_deactivated(&label.0, shape.deactivated())?;
         let dependencies =
             dependencies::analyze(&targets, path.as_ref(), &constraints, &property_shapes);
         shapes.push(CompiledShape {
@@ -1754,7 +1756,7 @@ fn compile_model(
             property_shapes: property_shapes.into_boxed_slice(),
             severity: compile_severity(shape.severity()),
             messages,
-            deactivated: shape.deactivated(),
+            deactivated,
             dependencies,
         });
     }
@@ -1766,9 +1768,32 @@ fn compile_model(
     })
 }
 
-fn compile_target(shape: &EncodedTerm, target: &Target) -> Result<TargetPlan> {
+/// Whether a shape is deactivated: `sh:deactivated` absent, or a constant boolean. Any other node
+/// expression is unsupported and fails explicitly instead of looking active or inactive.
+fn compile_deactivated(shape: &str, deactivated: Option<&IRNodeExpr>) -> Result<bool> {
+    let Some(expression) = deactivated else {
+        return Ok(false);
+    };
+    match expression.as_constant() {
+        Some(Object::Literal(ConcreteLiteral::BooleanLiteral(deactivated))) => Ok(deactivated),
+        _ => Err(ShaclError::UnsupportedComponent {
+            shape: shape.to_owned(),
+            component: "http://www.w3.org/ns/shacl#deactivated".to_owned(),
+        }
+        .into()),
+    }
+}
+
+fn compile_target(shape: &EncodedTerm, target: &IRTarget) -> Result<TargetPlan> {
     match target {
-        Target::Node(node) => Ok(TargetPlan::Node(encoded_object(node)?)),
+        Target::Node(node) => match node.as_constant() {
+            Some(node) => Ok(TargetPlan::Node(encoded_object(&node)?)),
+            None => Err(ShaclError::UnsupportedComponent {
+                shape: shape.0.clone(),
+                component: "http://www.w3.org/ns/shacl#targetNode".to_owned(),
+            }
+            .into()),
+        },
         Target::Class(class) => Ok(TargetPlan::Class(encoded_object(class)?)),
         Target::SubjectsOf(predicate) => Ok(TargetPlan::SubjectsOf(encoded_iri(predicate))),
         Target::ObjectsOf(predicate) => Ok(TargetPlan::ObjectsOf(encoded_iri(predicate))),
