@@ -2270,7 +2270,8 @@ mod tests {
                 .graph_diagnostics(&graph)
                 .unwrap()
                 .orphaned_entities
-                .contains(&"urn:test:orphan-filter:orphan".to_string())
+                .iter()
+                .any(|entity| entity == "urn:test:orphan-filter:orphan")
         );
 
         let view = StoreReadView::new(&store);
