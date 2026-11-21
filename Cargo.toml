@@ -36,7 +36,7 @@ shacl-core = [
 blake3 = "=1.8.7"
 chrono = { version = "0.4.45", features = ["serde"] }
 fjall = "3.1.13"
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "e489a735d034eaba7a4a65db88477971f95522d3", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "063d8be559f6f181257b22cca2d4cbde7d046969", features = [
     "fjall",
 ] }
 oxrdf = { version = "0.3.5", features = ["rdf-12", "serde"] }

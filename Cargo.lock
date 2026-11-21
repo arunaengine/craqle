@@ -2130,7 +2130,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.3.2"
-source = "git+https://github.com/arunaengine/irokle.git?rev=e489a735d034eaba7a4a65db88477971f95522d3#e489a735d034eaba7a4a65db88477971f95522d3"
+source = "git+https://github.com/arunaengine/irokle.git?rev=063d8be559f6f181257b22cca2d4cbde7d046969#063d8be559f6f181257b22cca2d4cbde7d046969"
 dependencies = [
  "blake3",
  "bytes",
@@ -2151,7 +2151,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?rev=e489a735d034eaba7a4a65db88477971f95522d3#e489a735d034eaba7a4a65db88477971f95522d3"
+source = "git+https://github.com/arunaengine/irokle.git?rev=063d8be559f6f181257b22cca2d4cbde7d046969#063d8be559f6f181257b22cca2d4cbde7d046969"
 dependencies = [
  "proc-macro2",
  "quote",
